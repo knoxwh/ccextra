@@ -1,0 +1,10 @@
+# 加速编译配置
+
+[build]
+# 让 Cargo 自动使用所有逻辑核心（不 hardcode，避免在核少机器上过载）
+# jobs = N  # 去掉，用默认值
+
+# 如需快速链接器，先安装：brew install zld
+# 然后取消注释：
+# [target.aarch64-apple-darwin]
+# rustflags = ["-C", "linker=zld"]

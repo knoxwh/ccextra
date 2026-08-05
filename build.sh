@@ -12,21 +12,23 @@ if lsof -ti :8222 >/dev/null 2>&1; then
     WAS_RUNNING=true
 fi
 
-# 如果进程在跑,先 stop
-if [ "$WAS_RUNNING" = true ]; then
-    echo "=== Services running, stopping before build ==="
-    "$SCRIPT_DIR/stop.sh"
-fi
-
 echo "=== Building ccextra ==="
 cargo build --release
-cp "$SCRIPT_DIR/target/release/ccextra" "$SCRIPT_DIR/ccextra"
-echo "ccextra → $SCRIPT_DIR/ccextra"
 
 echo "=== Build complete ==="
 
-# 如果之前有进程跑,build 后重新启动
+# build 成功后再停服
 if [ "$WAS_RUNNING" = true ]; then
-    echo "=== Restarting services ==="
+    echo "=== Stopping running service ==="
+    "$SCRIPT_DIR/stop.sh"
+fi
+
+# 替换二进制
+cp "$SCRIPT_DIR/target/release/ccextra" "$SCRIPT_DIR/ccextra"
+echo "ccextra → $SCRIPT_DIR/ccextra"
+
+# 重启
+if [ "$WAS_RUNNING" = true ]; then
+    echo "=== Starting service ==="
     "$SCRIPT_DIR/start.sh"
 fi

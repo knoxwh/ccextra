@@ -67,7 +67,8 @@ tiktoken-rs = "0.11"
 clap = { version = "4.4", features = ["derive"] }
 
 [profile.release]
-# 弃 LTO + 单 codegen 单元(编译慢),改多 codegen 单元并行提速
-lto = false
-codegen-units = 16
-strip = true
+opt-level = 3          # 最大运行时优化
+lto = "fat"            # 全程序链接时优化，消除跨 crate 开销
+codegen-units = 1      # 单编译单元，允许最大范围内联
+strip = true           # 裁掉符号表
+panic = "abort"        # 去掉 unwinding 代码，减体积 + 轻微提速
