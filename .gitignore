@@ -1,0 +1,19 @@
+# ccextra
+
+/target/
+/Cargo.lock
+*.swp
+*.swo
+*~
+.DS_Store
+
+# 配置文件(带密钥)
+config.yaml
+config.*.yaml
+!config.example.yaml
+
+# 编译产物
+/ccextra
+
+# 运行时日志
+/logs/

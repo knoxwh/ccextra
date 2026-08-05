@@ -1,0 +1,29 @@
+[package]
+name = "ccextra-server"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+authors.workspace = true
+license.workspace = true
+
+[dependencies]
+ccextra-core.workspace = true
+
+serde.workspace = true
+serde_json.workspace = true
+axum.workspace = true
+tokio.workspace = true
+tower.workspace = true
+tower-http.workspace = true
+reqwest.workspace = true
+futures.workspace = true
+futures-util.workspace = true
+async-stream = "0.3"
+tokio-stream.workspace = true
+bytes.workspace = true
+anyhow.workspace = true
+thiserror.workspace = true
+tracing.workspace = true
+globset.workspace = true
+
+[dev-dependencies]

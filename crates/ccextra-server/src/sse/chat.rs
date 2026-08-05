@@ -1,0 +1,646 @@
+// OpenAI chat/completions SSE → Anthropic messages SSE 状态机
+//
+// 采用 ai-gateway 的"单 active block"模型(相比 CPA 三独立 flag 更简洁):
+// - 任意时刻只有一个 active block(text 或 thinking),切换类型时先 close 再开
+// - tool 调用独立 pending map,不占 active block,完工时 flush 完整 input_json
+// - finish 时统一 finalize(close 全部 + message_delta + message_stop)
+//
+// 核心难点:工具调用 index 对齐。OpenAI 的 tool_calls[N] 用 index 标识,
+// Anthropic 的 content_block 用连续 index 分配。两者需映射。
+
+use std::collections::HashMap;
+
+use async_stream::stream;
+use bytes::Bytes;
+use futures::Stream;
+use futures::StreamExt;
+use serde_json::{json, Value};
+
+use super::parser::SseParser;
+use super::SseStreamPin;
+
+/// active block 类型
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum BlockType {
+    Text,
+    Thinking,
+}
+
+/// 单条工具调用累积状态
+struct ToolCall {
+    id: String,
+    name: String,
+    arguments: String,
+    block_index: i64,
+    started: bool,
+    start_emitted: bool,
+    closed: bool,
+}
+
+/// OpenAI chat → Anthropic 状态机
+struct ChatRelay {
+    started: bool,
+    finished: bool,
+    model: String,
+    id: String,
+    finish_reason: String,
+
+    // 单 active block
+    active_block: Option<(BlockType, i64)>,
+    next_block_index: i64,
+
+    // 待发 tool calls(按 OpenAI index 索引)
+    tool_calls: HashMap<usize, ToolCall>,
+    saw_tool_call: bool,
+
+    // usage
+    usage_seen: bool,
+    usage_input: i64,
+    usage_output: i64,
+    usage_cached: i64,
+    // 已发射的 thinking 片段(去重)
+    thinking_parts: Vec<String>,
+}
+
+impl ChatRelay {
+    fn new() -> Self {
+        Self {
+            started: false,
+            finished: false,
+            model: String::new(),
+            id: String::new(),
+            finish_reason: String::new(),
+            active_block: None,
+            next_block_index: 0,
+            tool_calls: HashMap::new(),
+            saw_tool_call: false,
+            usage_seen: false,
+            usage_input: 0,
+            usage_output: 0,
+            usage_cached: 0,
+            thinking_parts: Vec::new(),
+        }
+    }
+
+    /// 处理一个 SSE 事件,产出 anthropic 字节事件
+    fn process(&mut self, ev: &super::parser::SseEvent) -> Vec<Bytes> {
+        // [DONE] 标记
+        if ev.data.trim() == "[DONE]" {
+            return self.finish();
+        }
+
+        let root: Value = match serde_json::from_str(&ev.data) {
+            Ok(v) => v,
+            Err(_) => return Vec::new(),
+        };
+
+        // 身份 + usage(任意 chunk 缓存)
+        if !self.started {
+            if let Some(id) = root.get("id").and_then(|v| v.as_str()) {
+                if !id.is_empty() {
+                    self.id = id.to_string();
+                }
+            }
+        }
+        if let Some(model) = root.get("model").and_then(|v| v.as_str()) {
+            if !model.is_empty() {
+                self.model = model.to_string();
+            }
+        }
+        if let Some(usage) = root.get("usage") {
+            if !usage.is_null() {
+                self.cache_usage(usage);
+            }
+        }
+
+        let Some(delta) = root.pointer("/choices/0/delta") else {
+            return Vec::new();
+        };
+
+        let mut frames = self.ensure_started();
+
+        // reasoning → thinking
+        for text in collect_reasoning_texts(delta) {
+            if self.thinking_distinct(&text) {
+                frames.extend(self.emit_content_delta(BlockType::Thinking, &text));
+            }
+        }
+
+        // content → text
+        if let Some(text) = delta.get("content").and_then(|v| v.as_str()) {
+            if !text.is_empty() {
+                frames.extend(self.emit_content_delta(BlockType::Text, text));
+            }
+        }
+
+        // tool_calls
+        if let Some(tool_calls) = delta.get("tool_calls").and_then(|v| v.as_array()) {
+            self.collect_tool_calls(tool_calls);
+        }
+
+        // finish_reason
+        if let Some(fr) = root.pointer("/choices/0/finish_reason").and_then(|v| v.as_str()) {
+            if !fr.is_empty() {
+                self.finish_reason = if self.saw_tool_call {
+                    "tool_calls".to_string()
+                } else if fr == "tool_calls" {
+                    "stop".to_string()
+                } else {
+                    fr.to_string()
+                };
+            }
+        }
+
+        // finish_reason 且 usage 可用 → finalize
+        let usage_in_chunk = root.get("usage").map(|u| !u.is_null()).unwrap_or(false);
+        if !self.finish_reason.is_empty() && (usage_in_chunk || self.usage_seen) {
+            frames.extend(self.finalize());
+        }
+
+        frames
+    }
+
+    /// 缓存 usage 并做 cached 减法(与 CPA extractOpenAIUsage 一致)
+    fn cache_usage(&mut self, usage: &Value) {
+        let mut input = usage.get("prompt_tokens").and_then(|v| v.as_i64()).unwrap_or(0);
+        self.usage_output = usage.get("completion_tokens").and_then(|v| v.as_i64()).unwrap_or(0);
+        self.usage_cached = usage
+            .pointer("/prompt_tokens_details/cached_tokens")
+            .and_then(|v| v.as_i64())
+            .unwrap_or(0);
+        if self.usage_cached > 0 {
+            input = (input - self.usage_cached).max(0);
+        }
+        self.usage_input = input;
+        self.usage_seen = true;
+    }
+
+    /// 流结束([DONE]):兜底 finalize
+    fn finish(&mut self) -> Vec<Bytes> {
+        if self.finished {
+            return Vec::new();
+        }
+        self.finalize()
+    }
+
+    /// 统一收尾:close active + flush tool calls + message_delta + message_stop
+    fn finalize(&mut self) -> Vec<Bytes> {
+        if self.finished {
+            return Vec::new();
+        }
+        let mut frames = self.ensure_started();
+        self.close_active_block(&mut frames);
+        self.flush_pending_tool_calls(&mut frames);
+
+        let mut event = json!({
+            "type": "message_delta",
+            "delta": {"stop_reason": map_finish_reason(&self.finish_reason), "stop_sequence": null},
+            "usage": {"input_tokens": self.usage_input, "output_tokens": self.usage_output}
+        });
+        if self.usage_cached > 0 {
+            event["usage"]["cache_read_input_tokens"] = json!(self.usage_cached);
+        }
+        frames.push(sse("message_delta", &event));
+        frames.push(sse("message_stop", &json!({"type": "message_stop"})));
+
+        self.finished = true;
+        frames
+    }
+
+    /// 确保 message_start 已发
+    fn ensure_started(&mut self) -> Vec<Bytes> {
+        if self.started {
+            return Vec::new();
+        }
+        self.started = true;
+        vec![sse(
+            "message_start",
+            &json!({
+                "type": "message_start",
+                "message": {
+                    "id": self.id,
+                    "type": "message",
+                    "role": "assistant",
+                    "model": self.model,
+                    "content": [],
+                    "stop_reason": null,
+                    "stop_sequence": null,
+                    "usage": {"input_tokens": 0, "output_tokens": 0}
+                }
+            }),
+        )]
+    }
+
+    /// 发 content_block_delta,自动开块(切换类型先 close 当前)
+    fn emit_content_delta(&mut self, block_type: BlockType, content: &str) -> Vec<Bytes> {
+        // 发新内容前关掉待发 tool calls(它们不占 active block)
+        let mut frames = self.close_pending_tool_calls();
+        frames.extend(self.ensure_block(block_type));
+        let Some((_, index)) = self.active_block else {
+            return frames;
+        };
+        let delta = match block_type {
+            BlockType::Text => json!({"type": "text_delta", "text": content}),
+            BlockType::Thinking => json!({"type": "thinking_delta", "thinking": content}),
+        };
+        frames.push(sse(
+            "content_block_delta",
+            &json!({"type": "content_block_delta", "index": index, "delta": delta}),
+        ));
+        frames
+    }
+
+    /// 确保 active block 与目标类型一致;不一致则 close 当前再开
+    fn ensure_block(&mut self, block_type: BlockType) -> Vec<Bytes> {
+        let mut frames = self.ensure_started();
+        if let Some((active, _)) = self.active_block {
+            if active == block_type {
+                return frames;
+            }
+        }
+        self.close_active_block(&mut frames);
+        let index = self.next_block_index;
+        self.next_block_index += 1;
+        let content_block = match block_type {
+            BlockType::Text => json!({"type": "text", "text": ""}),
+            BlockType::Thinking => json!({"type": "thinking", "thinking": ""}),
+        };
+        frames.push(sse(
+            "content_block_start",
+            &json!({"type": "content_block_start", "index": index, "content_block": content_block}),
+        ));
+        self.active_block = Some((block_type, index));
+        frames
+    }
+
+    /// close 当前 active block
+    fn close_active_block(&mut self, frames: &mut Vec<Bytes>) {
+        if let Some((_, index)) = self.active_block.take() {
+            frames.push(sse(
+                "content_block_stop",
+                &json!({"type": "content_block_stop", "index": index}),
+            ));
+        }
+    }
+
+    /// 累积 tool_calls 增量
+    fn collect_tool_calls(&mut self, tool_calls: &[Value]) {
+        for tc in tool_calls {
+            let index = tc.get("index").and_then(|v| v.as_u64()).unwrap_or(0) as usize;
+            let call = self.tool_calls.entry(index).or_insert_with(|| ToolCall {
+                id: String::new(),
+                name: String::new(),
+                arguments: String::new(),
+                block_index: -1,
+                started: false,
+                start_emitted: false,
+                closed: false,
+            });
+
+            if let Some(id) = tc.get("id").and_then(|v| v.as_str()) {
+                if !id.is_empty() {
+                    call.id = id.to_string();
+                }
+            }
+
+            if let Some(function) = tc.get("function") {
+                if let Some(name) = function.get("name").and_then(|v| v.as_str()) {
+                    if !name.is_empty() {
+                        call.name = name.to_string();
+                    }
+                }
+                if let Some(args) = function.get("arguments") {
+                    match args {
+                        Value::String(s) if !s.is_empty() => call.arguments.push_str(s),
+                        Value::Object(_) | Value::Array(_) => {
+                            call.arguments = args.to_string();
+                        }
+                        _ => {}
+                    }
+                }
+            }
+
+            // name+id 齐了 → 发 start
+            if !call.started && !call.name.is_empty() && !call.id.is_empty() {
+                self.emit_tool_use_start(index);
+            }
+        }
+    }
+
+    /// 分配 tool_use 的 block index(帧在 flush 时发)
+    fn emit_tool_use_start(&mut self, openai_index: usize) {
+        let call = self.tool_calls.get_mut(&openai_index).unwrap();
+        if call.started {
+            return;
+        }
+        call.block_index = self.next_block_index;
+        self.next_block_index += 1;
+        call.started = true;
+        self.active_block = None; // 工具不占 active block
+        self.saw_tool_call = true;
+    }
+
+    /// 发一条 tool_use 的 content_block_start 帧(幂等)
+    fn tool_use_start_frame(&mut self, openai_index: usize, frames: &mut Vec<Bytes>) {
+        let call = self.tool_calls.get_mut(&openai_index).unwrap();
+        if call.start_emitted {
+            return;
+        }
+        let id = call.id.clone();
+        let name = call.name.clone();
+        let index = call.block_index;
+        call.start_emitted = true;
+        frames.push(sse(
+            "content_block_start",
+            &json!({
+                "type": "content_block_start",
+                "index": index,
+                "content_block": {"type": "tool_use", "id": id, "name": name, "input": {}}
+            }),
+        ));
+    }
+
+    /// 关闭所有待发 tool calls(发完整 input_json + stop)
+    fn flush_pending_tool_calls(&mut self, frames: &mut Vec<Bytes>) {
+        let mut indexes: Vec<usize> = self.tool_calls.keys().copied().collect();
+        indexes.sort_unstable();
+        for index in indexes {
+            let (closed, started, name_empty) = match self.tool_calls.get(&index) {
+                Some(c) => (c.closed, c.started, c.name.is_empty()),
+                None => continue,
+            };
+            if closed {
+                continue;
+            }
+            if !started {
+                // 有 name 但没 id:兜底补分配
+                if name_empty {
+                    continue;
+                }
+                self.emit_tool_use_start(index);
+            }
+            self.tool_use_start_frame(index, frames);
+            let call = self.tool_calls.get(&index).unwrap();
+            if !call.arguments.is_empty() {
+                frames.push(sse(
+                    "content_block_delta",
+                    &json!({
+                        "type": "content_block_delta",
+                        "index": call.block_index,
+                        "delta": {"type": "input_json_delta", "partial_json": call.arguments}
+                    }),
+                ));
+            }
+            frames.push(sse(
+                "content_block_stop",
+                &json!({"type": "content_block_stop", "index": call.block_index}),
+            ));
+            self.tool_calls.get_mut(&index).unwrap().closed = true;
+        }
+    }
+
+    /// 关闭待发 tool calls(发新 text/thinking 前调用)
+    fn close_pending_tool_calls(&mut self) -> Vec<Bytes> {
+        let mut frames = Vec::new();
+        let mut indexes: Vec<usize> = self.tool_calls.keys().copied().collect();
+        indexes.sort_unstable();
+        for index in indexes {
+            let (closed, started, block_index) = match self.tool_calls.get(&index) {
+                Some(c) => (c.closed, c.started, c.block_index),
+                None => continue,
+            };
+            if closed || !started {
+                continue;
+            }
+            self.tool_use_start_frame(index, &mut frames);
+            frames.push(sse(
+                "content_block_stop",
+                &json!({"type": "content_block_stop", "index": block_index}),
+            ));
+            self.tool_calls.get_mut(&index).unwrap().closed = true;
+        }
+        frames
+    }
+
+    /// thinking 去重:空白或重复片段跳过
+    fn thinking_distinct(&mut self, text: &str) -> bool {
+        let trimmed = text.trim();
+        if trimmed.is_empty() {
+            return false;
+        }
+        if self.thinking_parts.iter().any(|p| p.trim() == trimmed) {
+            return false;
+        }
+        self.thinking_parts.push(text.to_string());
+        true
+    }
+}
+
+/// 从 delta 的多种字段提取 reasoning 文本
+fn collect_reasoning_texts(delta: &Value) -> Vec<String> {
+    let mut texts = Vec::new();
+    if let Some(v) = delta.get("reasoning_content") {
+        collect_reasoning_value(v, &mut texts);
+    }
+    if let Some(v) = delta.get("reasoning") {
+        collect_reasoning_value(v, &mut texts);
+    }
+    if let Some(v) = delta.get("thinking") {
+        collect_reasoning_value(v, &mut texts);
+    }
+    texts
+}
+
+fn collect_reasoning_value(node: &Value, out: &mut Vec<String>) {
+    match node {
+        Value::String(s) if !s.is_empty() => out.push(s.clone()),
+        Value::Array(arr) => {
+            for item in arr {
+                collect_reasoning_value(item, out);
+            }
+        }
+        Value::Object(obj) => {
+            if let Some(Value::String(s)) = obj.get("text") {
+                if !s.is_empty() {
+                    out.push(s.clone());
+                }
+            }
+        }
+        _ => {}
+    }
+}
+
+/// OpenAI finish_reason → Anthropic stop_reason
+fn map_finish_reason(reason: &str) -> &'static str {
+    match reason {
+        "stop" => "end_turn",
+        "length" => "max_tokens",
+        "tool_calls" => "tool_use",
+        "function_call" => "tool_use",
+        _ => "end_turn",
+    }
+}
+
+/// 序列化一个 SSE 事件:event 行 + data 行 + 空行
+fn sse(event: &str, data: &Value) -> Bytes {
+    let mut s = String::from("event: ");
+    s.push_str(event);
+    s.push('\n');
+    s.push_str("data: ");
+    s.push_str(&data.to_string());
+    s.push_str("\n\n");
+    Bytes::from(s)
+}
+
+/// Claude 直通:字节级转发,不解析
+pub fn relay_claude_passthrough<S>(stream: S) -> SseStreamPin
+where
+    S: Stream<Item = Result<Bytes, reqwest::Error>> + Send + 'static,
+{
+    Box::pin(
+        stream.map(|chunk| chunk.map_err(std::io::Error::other)),
+    )
+}
+
+/// OpenAI chat → Anthropic SSE 状态机(realtime)
+pub fn relay_openai_chat_to_anthropic<S>(stream: S) -> SseStreamPin
+where
+    S: Stream<Item = Result<Bytes, reqwest::Error>> + Send + 'static,
+{
+    let mut stream = Box::pin(stream);
+    let mut parser = SseParser::new();
+    let mut relay = ChatRelay::new();
+
+    Box::pin(stream! {
+        loop {
+            let Some(chunk) = stream.next().await else { break };
+            let chunk = match chunk {
+                Ok(c) => c,
+                Err(e) => {
+                    yield Err(std::io::Error::other(e));
+                    break;
+                }
+            };
+            for ev in parser.push(&chunk) {
+                for out in relay.process(&ev) {
+                    yield Ok(out);
+                }
+            }
+        }
+        // 流结束 flush
+        for ev in parser.finish() {
+            for out in relay.process(&ev) {
+                yield Ok(out);
+            }
+        }
+    })
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn test_sse_format() {
+        let b = sse("message_start", &json!({"type": "message_start"}));
+        assert_eq!(b, Bytes::from("event: message_start\ndata: {\"type\":\"message_start\"}\n\n"));
+    }
+
+    #[test]
+    fn test_text_stream() {
+        let mut r = ChatRelay::new();
+        let ev1 = super::super::parser::SseEvent {
+            event: Some("chat.completion.chunk".into()),
+            data: r#"{"id":"1","choices":[{"delta":{"content":"hi "}}]}"#.into(),
+        };
+        let out1 = r.process(&ev1);
+        // 首 chunk 应发 message_start + content_block_start + content_block_delta
+        assert!(out1.iter().any(|b| b.starts_with(b"event: message_start")));
+        assert!(out1.iter().any(|b| b.starts_with(b"event: content_block_start")));
+        assert!(out1.iter().any(|b| b.starts_with(b"event: content_block_delta")));
+
+        let ev2 = super::super::parser::SseEvent {
+            event: Some("chat.completion.chunk".into()),
+            data: r#"{"id":"1","choices":[{"delta":{"content":"there"},"finish_reason":"stop"}],"usage":{"prompt_tokens":10,"completion_tokens":5}}"#.into(),
+        };
+        let out2 = r.process(&ev2);
+        // 应发 content_block_stop + message_delta + message_stop
+        assert!(out2.iter().any(|b| b.starts_with(b"event: content_block_stop")));
+        assert!(out2.iter().any(|b| b.starts_with(b"event: message_delta")));
+        assert!(out2.iter().any(|b| b.starts_with(b"event: message_stop")));
+    }
+
+    #[test]
+    fn test_tool_call_stream() {
+        let mut r = ChatRelay::new();
+        // chunk1: tool_calls 第一个片段,id+name(ai 模型下仅累积,finish 才 flush 发 start)
+        let out1 = r.process(&super::super::parser::SseEvent {
+            event: Some("c".into()),
+            data: r#"{"choices":[{"delta":{"tool_calls":[{"index":0,"id":"call_1","function":{"name":"get_weather","arguments":""}}]}}]}"#.into(),
+        });
+        // 会发 message_start,但工具 start 帧延迟到 finish 才发
+        assert!(out1.iter().any(|b| b.starts_with(b"event: message_start")));
+        assert!(!out1.iter().any(|b| b.starts_with(b"event: content_block_start")));
+
+        // chunk2: arguments 增量(累积,不在流中逐段发)
+        let out2 = r.process(&super::super::parser::SseEvent {
+            event: Some("c".into()),
+            data: r#"{"choices":[{"delta":{"tool_calls":[{"index":0,"function":{"arguments":"{\"city\":"}}]}}]}"#.into(),
+        });
+        assert!(out2.is_empty());
+
+        // chunk3: finish_reason + usage → 关闭块 + 发完整 input_json_delta
+        let out3 = r.process(&super::super::parser::SseEvent {
+            event: Some("c".into()),
+            data: r#"{"choices":[{"delta":{},"finish_reason":"tool_calls"}],"usage":{"prompt_tokens":10,"completion_tokens":5}}"#.into(),
+        });
+        assert!(out3.iter().any(|b| b.starts_with(b"event: content_block_stop")));
+        assert!(out3.iter().any(|b| b.starts_with(b"event: content_block_delta")));
+        assert!(out3.iter().any(|b| b.starts_with(b"event: message_delta")));
+    }
+
+    #[test]
+    fn test_reasoning_deduplication() {
+        let mut r = ChatRelay::new();
+        // 第一次发 reasoning
+        let out1 = r.process(&super::super::parser::SseEvent {
+            event: Some("c".into()),
+            data: r#"{"id":"1","choices":[{"delta":{"reasoning_content":"thinking A"}}]}"#.into(),
+        });
+        assert!(out1.iter().any(|b| String::from_utf8_lossy(b).contains("thinking A")));
+
+        // 重复发同样的 reasoning(去重)
+        let out2 = r.process(&super::super::parser::SseEvent {
+            event: Some("c".into()),
+            data: r#"{"choices":[{"delta":{"reasoning_content":"thinking A"}}]}"#.into(),
+        });
+        assert!(out2.is_empty());
+
+        // 新 reasoning 应发出
+        let out3 = r.process(&super::super::parser::SseEvent {
+            event: Some("c".into()),
+            data: r#"{"choices":[{"delta":{"reasoning_content":"thinking B"}}]}"#.into(),
+        });
+        assert!(out3.iter().any(|b| String::from_utf8_lossy(b).contains("thinking B")));
+    }
+
+    #[test]
+    fn test_done_marker_triggers_finish() {
+        let mut r = ChatRelay::new();
+        r.started = true; // 模拟已开始
+        let out = r.process(&super::super::parser::SseEvent {
+            event: None,
+            data: "[DONE]".into(),
+        });
+        assert!(out.iter().any(|b| b.starts_with(b"event: message_stop")));
+    }
+
+    #[test]
+    fn test_finish_reason_mapping() {
+        assert_eq!(map_finish_reason("stop"), "end_turn");
+        assert_eq!(map_finish_reason("length"), "max_tokens");
+        assert_eq!(map_finish_reason("tool_calls"), "tool_use");
+        assert_eq!(map_finish_reason("function_call"), "tool_use");
+        assert_eq!(map_finish_reason("unknown"), "end_turn");
+    }
+}

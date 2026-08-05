@@ -1,0 +1,27 @@
+[package]
+name = "ccextra-core"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+authors.workspace = true
+license.workspace = true
+
+[dependencies]
+serde.workspace = true
+serde_json.workspace = true
+anyhow.workspace = true
+thiserror.workspace = true
+sha2.workspace = true
+hex.workspace = true
+globset.workspace = true
+tracing.workspace = true
+
+# 来自 tklite-core cache_stabilization 的依赖
+md-5 = "0.10"
+lru = "0.12"
+regex = "1"
+http = "1"
+
+[dev-dependencies]
+proptest = "1"
+tracing-subscriber = { version = "0.3", default-features = false, features = ["fmt", "ansi"] }
