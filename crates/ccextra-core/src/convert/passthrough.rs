@@ -3,8 +3,8 @@
 // 注意:这里仍要 parse 顶层(修改 model),但尽量保持其他字段不动。
 // serde_json 的 preserve_order feature 保证 Map 顺序,最小化字节变化。
 
-use serde_json::Value;
 use super::Result;
+use serde_json::Value;
 
 /// Claude 直通转换:只改 model 字段
 ///

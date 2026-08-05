@@ -20,8 +20,7 @@ use crate::cache_stabilization::smoosh_split::split_smooshed_reminders;
 use crate::cache_stabilization::sort_stabilization::stabilize_block_sort;
 use crate::cache_stabilization::tool_def_normalize::{
     any_tool_has_cache_control, normalize_tool_definitions_openai_chat,
-    normalize_tool_definitions_responses, sort_schema_keys_recursive,
-    sort_tools_deterministically,
+    normalize_tool_definitions_responses, sort_schema_keys_recursive, sort_tools_deterministically,
 };
 use crate::cache_stabilization::tool_input_normalize::normalize_tool_use_inputs;
 use crate::cache_stabilization::volatile_detector::{
@@ -98,8 +97,7 @@ pub fn normalize_anthropic_full(body: &mut Value) -> NormalizeCounts {
     counts.volatile_count = strip_volatile_from_prefix(body, VolatileApiKind::Anthropic);
 
     // 8. cache_control 自动注入
-    if let AutoPlaceOutcome::Applied { placed_count, .. } =
-        auto_place_anthropic_cache_control(body)
+    if let AutoPlaceOutcome::Applied { placed_count, .. } = auto_place_anthropic_cache_control(body)
     {
         counts.cache_control_placed = placed_count;
     }
@@ -246,9 +244,15 @@ mod tests {
 
         let counts = normalize_anthropic_pretransform(&mut body);
 
-        assert!(counts.rstrip_count > 0, "trailing whitespace should collapse");
+        assert!(
+            counts.rstrip_count > 0,
+            "trailing whitespace should collapse"
+        );
         let content = body["messages"][0]["content"][0]["text"].as_str().unwrap();
-        assert!(content.ends_with("</system-reminder>"), "collapsed: {content:?}");
+        assert!(
+            content.ends_with("</system-reminder>"),
+            "collapsed: {content:?}"
+        );
     }
 
     #[test]
@@ -298,7 +302,10 @@ mod tests {
 
         assert!(counts.sort_count > 0, "skill listing should be sorted");
         let content = body["messages"][0]["content"].as_str().unwrap();
-        assert!(content.contains("- alpha\n- mid\n- zed"), "items sorted: {content}");
+        assert!(
+            content.contains("- alpha\n- mid\n- zed"),
+            "items sorted: {content}"
+        );
     }
 
     #[test]
@@ -313,9 +320,15 @@ mod tests {
 
         let counts = normalize_target_post(&mut body, TargetShape::OpenAiChat);
 
-        assert!(counts.rstrip_count > 0, "trailing whitespace should collapse");
+        assert!(
+            counts.rstrip_count > 0,
+            "trailing whitespace should collapse"
+        );
         let content = body["messages"][0]["content"].as_str().unwrap();
-        assert!(content.ends_with("</system-reminder>"), "collapsed: {content:?}");
+        assert!(
+            content.ends_with("</system-reminder>"),
+            "collapsed: {content:?}"
+        );
     }
 
     #[test]

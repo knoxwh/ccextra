@@ -1,14 +1,14 @@
 use anyhow::Result;
-use clap::Parser;
 use ccextra_core::cache_stabilization::drift_detector::DriftState;
 use ccextra_server::http::{AppState, ReloadData};
-use ccextra_server::upstream::UpstreamClient;
 use ccextra_server::serve;
+use ccextra_server::upstream::UpstreamClient;
+use clap::Parser;
 use std::sync::Arc;
 use time::UtcOffset;
 use tokio::sync::RwLock;
 use tracing_subscriber::{
-    EnvFilter, fmt::time::OffsetTime, layer::SubscriberExt, util::SubscriberInitExt,
+    fmt::time::OffsetTime, layer::SubscriberExt, util::SubscriberInitExt, EnvFilter,
 };
 
 mod config;

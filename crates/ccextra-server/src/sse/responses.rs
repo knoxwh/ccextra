@@ -1574,7 +1574,10 @@ mod tests {
     fn test_function_call_tool_name_restored() {
         // 请求侧缩短的名,响应侧还原(对齐 CPA buildReverseMap)
         let mut names = HashMap::new();
-        names.insert("mcp__short".to_string(), "mcp__very_long_original_name".to_string());
+        names.insert(
+            "mcp__short".to_string(),
+            "mcp__very_long_original_name".to_string(),
+        );
         let mut r = ResponsesRelay::new(None);
         r.tool_names = Some(Arc::new(names));
         r.process(&created());

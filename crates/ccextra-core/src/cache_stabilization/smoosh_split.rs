@@ -160,8 +160,14 @@ mod tests {
         assert_eq!(count, 2);
         let content = &body["messages"][0]["content"];
         assert_eq!(content[0]["content"], "output");
-        assert_eq!(content[1]["text"], "<system-reminder>\nA\n</system-reminder>");
-        assert_eq!(content[2]["text"], "<system-reminder>\nB\n</system-reminder>");
+        assert_eq!(
+            content[1]["text"],
+            "<system-reminder>\nA\n</system-reminder>"
+        );
+        assert_eq!(
+            content[2]["text"],
+            "<system-reminder>\nB\n</system-reminder>"
+        );
     }
 
     #[test]
@@ -207,7 +213,10 @@ mod tests {
     fn openai_branches_return_zero() {
         let mut body = json!({"messages": [{"role": "user", "content": [{"type": "tool_result", "content": "x\n\n<system-reminder>\nA\n</system-reminder>"}]}]});
         assert_eq!(split_smooshed_reminders(&mut body, ApiKind::OpenAiChat), 0);
-        assert_eq!(split_smooshed_reminders(&mut body, ApiKind::OpenAiResponses), 0);
+        assert_eq!(
+            split_smooshed_reminders(&mut body, ApiKind::OpenAiResponses),
+            0
+        );
     }
 
     #[test]
@@ -249,7 +258,13 @@ mod tests {
         assert_eq!(content[1]["text"], "mid");
         assert_eq!(content[2]["content"], "out2");
         // 正向顺序:A 在 B 之前。
-        assert_eq!(content[3]["text"], "<system-reminder>\nA\n</system-reminder>");
-        assert_eq!(content[4]["text"], "<system-reminder>\nB\n</system-reminder>");
+        assert_eq!(
+            content[3]["text"],
+            "<system-reminder>\nA\n</system-reminder>"
+        );
+        assert_eq!(
+            content[4]["text"],
+            "<system-reminder>\nB\n</system-reminder>"
+        );
     }
 }

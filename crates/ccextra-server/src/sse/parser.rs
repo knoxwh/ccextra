@@ -196,7 +196,9 @@ mod tests {
     fn test_utf8_split_across_chunks() {
         // "中" = E4 B8 AD,被 chunk 边界切成两半,不得产生 U+FFFD 乱码
         let mut p = SseParser::new();
-        assert!(p.push(&[b'd', b'a', b't', b'a', b':', b' ', 0xE4, 0xB8]).is_empty());
+        assert!(p
+            .push(&[b'd', b'a', b't', b'a', b':', b' ', 0xE4, 0xB8])
+            .is_empty());
         let events = p.push(&[0xAD, b'\n', b'\n']);
         assert_eq!(events.len(), 1);
         assert_eq!(events[0].data, "中");

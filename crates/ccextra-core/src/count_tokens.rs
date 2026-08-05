@@ -52,7 +52,9 @@ pub fn count_claude_input_tokens(payload: &str) -> Result<TokenCount, String> {
     };
     let joined = segments.join("\n");
     let count = enc.count_ordinary(&joined);
-    Ok(TokenCount { input_tokens: count })
+    Ok(TokenCount {
+        input_tokens: count,
+    })
 }
 
 /// system:字符串或 block 数组,取 text 字段(对齐 CPA collectClaudeSystemTokenSegments)
@@ -74,7 +76,9 @@ fn collect_system(system: Option<&Value>, segments: &mut Vec<String>) {
 /// messages:role + content 递归(对齐 CPA collectClaudeMessageTokenSegments)
 fn collect_messages(messages: Option<&Value>, segments: &mut Vec<String>) {
     let Some(messages) = messages else { return };
-    let Some(arr) = messages.as_array() else { return };
+    let Some(arr) = messages.as_array() else {
+        return;
+    };
     for msg in arr {
         if let Some(role) = msg.get("role").and_then(|v| v.as_str()) {
             push_trimmed(segments, role);
@@ -107,12 +111,24 @@ fn collect_content(content: Option<&Value>, segments: &mut Vec<String>) {
                     }
                 }
                 "tool_use" | "server_tool_use" | "mcp_tool_use" => {
-                    push_trimmed(segments, content.get("id").and_then(|v| v.as_str()).unwrap_or(""));
-                    push_trimmed(segments, content.get("name").and_then(|v| v.as_str()).unwrap_or(""));
+                    push_trimmed(
+                        segments,
+                        content.get("id").and_then(|v| v.as_str()).unwrap_or(""),
+                    );
+                    push_trimmed(
+                        segments,
+                        content.get("name").and_then(|v| v.as_str()).unwrap_or(""),
+                    );
                     push_json(segments, content.get("input"));
                 }
                 "tool_result" | "mcp_tool_result" => {
-                    push_trimmed(segments, content.get("tool_use_id").and_then(|v| v.as_str()).unwrap_or(""));
+                    push_trimmed(
+                        segments,
+                        content
+                            .get("tool_use_id")
+                            .and_then(|v| v.as_str())
+                            .unwrap_or(""),
+                    );
                     collect_content(content.get("content"), segments);
                 }
                 "image" | "input_audio" | "audio" | "video" | "redacted_thinking" => {}
@@ -133,21 +149,46 @@ fn collect_tools(tools: Option<&Value>, segments: &mut Vec<String>) {
     let Some(tools) = tools else { return };
     let Some(arr) = tools.as_array() else { return };
     for tool in arr {
-        push_trimmed(segments, tool.get("type").and_then(|v| v.as_str()).unwrap_or(""));
-        push_trimmed(segments, tool.get("name").and_then(|v| v.as_str()).unwrap_or(""));
-        push_trimmed(segments, tool.get("description").and_then(|v| v.as_str()).unwrap_or(""));
+        push_trimmed(
+            segments,
+            tool.get("type").and_then(|v| v.as_str()).unwrap_or(""),
+        );
+        push_trimmed(
+            segments,
+            tool.get("name").and_then(|v| v.as_str()).unwrap_or(""),
+        );
+        push_trimmed(
+            segments,
+            tool.get("description")
+                .and_then(|v| v.as_str())
+                .unwrap_or(""),
+        );
         push_json(segments, tool.get("input_schema"));
     }
 }
 
 /// tool_choice:字符串或 {type,name}(对齐 CPA collectClaudeToolChoiceTokenSegments)
 fn collect_tool_choice(tool_choice: Option<&Value>, segments: &mut Vec<String>) {
-    let Some(tool_choice) = tool_choice else { return };
+    let Some(tool_choice) = tool_choice else {
+        return;
+    };
     match tool_choice {
         Value::String(s) => push_trimmed(segments, s),
         Value::Object(_) => {
-            push_trimmed(segments, tool_choice.get("type").and_then(|v| v.as_str()).unwrap_or(""));
-            push_trimmed(segments, tool_choice.get("name").and_then(|v| v.as_str()).unwrap_or(""));
+            push_trimmed(
+                segments,
+                tool_choice
+                    .get("type")
+                    .and_then(|v| v.as_str())
+                    .unwrap_or(""),
+            );
+            push_trimmed(
+                segments,
+                tool_choice
+                    .get("name")
+                    .and_then(|v| v.as_str())
+                    .unwrap_or(""),
+            );
         }
         _ => {}
     }
@@ -211,8 +252,14 @@ mod tests {
             "tools": [{"type": "function", "name": "get_weather", "description": "weather",
                        "input_schema": {"type": "object", "properties": {}}}]
         });
-        let with_tools = count_claude_input_tokens(&body.to_string()).unwrap().input_tokens;
-        let without = count_claude_input_tokens(&json!({"messages": [{"role": "user", "content": "hi"}]}).to_string()).unwrap().input_tokens;
+        let with_tools = count_claude_input_tokens(&body.to_string())
+            .unwrap()
+            .input_tokens;
+        let without = count_claude_input_tokens(
+            &json!({"messages": [{"role": "user", "content": "hi"}]}).to_string(),
+        )
+        .unwrap()
+        .input_tokens;
         assert!(with_tools > without);
     }
 

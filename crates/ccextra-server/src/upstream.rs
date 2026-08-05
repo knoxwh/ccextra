@@ -35,7 +35,9 @@ fn user_agent(protocol: Protocol) -> &'static str {
     match protocol {
         Protocol::Claude => "claude-cli/2.1.221",
         Protocol::OpenAiChat => "claude-cli/2.1.221",
-        Protocol::OpenAiResponses => "codex_cli_rs/0.146.0 (Mac OS 26.5.1; aarch64) iTerm.app/3.6.10",
+        Protocol::OpenAiResponses => {
+            "codex_cli_rs/0.146.0 (Mac OS 26.5.1; aarch64) iTerm.app/3.6.10"
+        }
     }
 }
 
@@ -59,7 +61,10 @@ impl UpstreamClient {
         match provider_proxy {
             Some(p) if !p.is_empty() && p != "direct" => p.to_string(),
             Some(_) => "direct".to_string(), // "direct"/"" → 直连
-            None => self.global_proxy.clone().unwrap_or_else(|| "direct".to_string()),
+            None => self
+                .global_proxy
+                .clone()
+                .unwrap_or_else(|| "direct".to_string()),
         }
     }
 
@@ -75,7 +80,10 @@ impl UpstreamClient {
             builder = builder.proxy(proxy);
         }
         let client = builder.build().unwrap_or_else(|_| Client::new());
-        self.clients.lock().unwrap().insert(proxy_key.to_string(), client.clone());
+        self.clients
+            .lock()
+            .unwrap()
+            .insert(proxy_key.to_string(), client.clone());
         client
     }
 
@@ -102,7 +110,11 @@ impl UpstreamClient {
     ) -> anyhow::Result<UpstreamResponse> {
         let proxy_key = self.resolve_proxy(provider_proxy);
         let client = self.client_for(&proxy_key);
-        let url = format!("{}{}", base_url.trim_end_matches('/'), endpoint_path(protocol));
+        let url = format!(
+            "{}{}",
+            base_url.trim_end_matches('/'),
+            endpoint_path(protocol)
+        );
 
         let mut req = client
             .post(&url)
@@ -156,17 +168,35 @@ mod tests {
     fn test_url_join_no_double_version() {
         // openai 协议:base_url 已含版本前缀,路径不再重复 /v1
         let base = "https://dashscope.aliyuncs.com/compatible-mode/v1";
-        let url = format!("{}{}", base.trim_end_matches('/'), endpoint_path(Protocol::OpenAiChat));
-        assert_eq!(url, "https://dashscope.aliyuncs.com/compatible-mode/v1/chat/completions");
+        let url = format!(
+            "{}{}",
+            base.trim_end_matches('/'),
+            endpoint_path(Protocol::OpenAiChat)
+        );
+        assert_eq!(
+            url,
+            "https://dashscope.aliyuncs.com/compatible-mode/v1/chat/completions"
+        );
 
         // 自定义版本前缀(如 /v3):同样不重复
         let base = "https://ark.cn-beijing.volces.com/api/v3";
-        let url = format!("{}{}", base.trim_end_matches('/'), endpoint_path(Protocol::OpenAiChat));
-        assert_eq!(url, "https://ark.cn-beijing.volces.com/api/v3/chat/completions");
+        let url = format!(
+            "{}{}",
+            base.trim_end_matches('/'),
+            endpoint_path(Protocol::OpenAiChat)
+        );
+        assert_eq!(
+            url,
+            "https://ark.cn-beijing.volces.com/api/v3/chat/completions"
+        );
 
         // claude 协议:base_url 不含版本,路径带 /v1
         let base = "https://example.com/claude-proxy";
-        let url = format!("{}{}", base.trim_end_matches('/'), endpoint_path(Protocol::Claude));
+        let url = format!(
+            "{}{}",
+            base.trim_end_matches('/'),
+            endpoint_path(Protocol::Claude)
+        );
         assert_eq!(url, "https://example.com/claude-proxy/v1/messages");
     }
 

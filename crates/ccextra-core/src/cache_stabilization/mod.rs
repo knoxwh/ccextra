@@ -30,14 +30,14 @@
 //!   tool 定义的排序由 [`tool_def_normalize`] 处理。
 
 pub mod anthropic_cache_control;
+pub mod content_strip;
 pub mod drift_detector;
 pub mod json_walker;
 pub mod reminder_rstrip;
 pub mod smoosh_split;
-pub mod content_strip;
-pub mod tool_input_normalize;
 pub mod sort_stabilization;
 pub mod tool_def_normalize;
+pub mod tool_input_normalize;
 pub mod volatile_detector;
 
 pub use content_strip::strip_bookkeeping_content;

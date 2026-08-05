@@ -545,7 +545,10 @@ struct ParentBaseline {
 }
 
 /// 由一个互斥锁守护的两个基线：会话级完整哈希加上父级 system/tools 基线。
-type DriftCaches = (LruCache<String, StructuralHash>, LruCache<String, ParentBaseline>);
+type DriftCaches = (
+    LruCache<String, StructuralHash>,
+    LruCache<String, ParentBaseline>,
+);
 
 /// 有界 会话 → 上次所见哈希 状态。
 ///
@@ -567,10 +570,7 @@ impl DriftState {
     pub fn new(capacity: usize) -> Self {
         let cap = NonZeroUsize::new(capacity).expect("DriftState capacity must be > 0");
         Self {
-            cache: Arc::new(Mutex::new((
-                LruCache::new(cap),
-                LruCache::new(cap),
-            ))),
+            cache: Arc::new(Mutex::new((LruCache::new(cap), LruCache::new(cap)))),
         }
     }
 }
@@ -1079,16 +1079,15 @@ mod tests {
     #[test]
     fn session_key_prefers_claude_code_session_id() {
         let mut headers = HeaderMap::new();
-        headers.insert(
-            "x-claude-code-session-id",
-            "cc-sess-0123".parse().unwrap(),
-        );
+        headers.insert("x-claude-code-session-id", "cc-sess-0123".parse().unwrap());
         headers.insert("x-tklite-session-key", "codex:opaque".parse().unwrap());
         headers.insert("x-request-id", "req-abc123".parse().unwrap());
         let body = anthropic_body("sys", json!([]), vec!["hi"]);
         let id = derive_session_key(&headers, &body, ApiKind::Anthropic);
         assert_eq!(id.parent, "claude-code:cc-sess-0123");
-        assert!(id.conversation.starts_with("claude-code:cc-sess-0123:conv:"));
+        assert!(id
+            .conversation
+            .starts_with("claude-code:cc-sess-0123:conv:"));
     }
 
     #[test]

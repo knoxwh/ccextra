@@ -230,15 +230,17 @@ mod tests {
     fn cross_turn_stable_after_strip() {
         // 仅记账数字不同的两个 body,剥离后必须字节完全相同
         // (核心缓存收益断言)。
-        let mk = |n: u32| json!({
-            "messages": [{
-                "role": "user",
-                "content": [
-                    {"type": "text", "text": "stable work"},
-                    reminder(&format!("Token usage: {n}/200; {} remaining", 200 - n))
-                ]
-            }]
-        });
+        let mk = |n: u32| {
+            json!({
+                "messages": [{
+                    "role": "user",
+                    "content": [
+                        {"type": "text", "text": "stable work"},
+                        reminder(&format!("Token usage: {n}/200; {} remaining", 200 - n))
+                    ]
+                }]
+            })
+        };
         let mut a = mk(50);
         let mut b = mk(150);
         strip_bookkeeping_content(&mut a, ApiKind::Anthropic);
@@ -250,7 +252,10 @@ mod tests {
     fn openai_branches_return_zero() {
         let mut body = json!({"messages": [{"role": "user", "content": [reminder("Token usage: 1/2; 1 remaining")]}]});
         assert_eq!(strip_bookkeeping_content(&mut body, ApiKind::OpenAiChat), 0);
-        assert_eq!(strip_bookkeeping_content(&mut body, ApiKind::OpenAiResponses), 0);
+        assert_eq!(
+            strip_bookkeeping_content(&mut body, ApiKind::OpenAiResponses),
+            0
+        );
     }
 
     #[test]
@@ -269,7 +274,10 @@ mod tests {
         });
         let original = body.clone();
         let count = strip_bookkeeping_content(&mut body, ApiKind::Anthropic);
-        assert_eq!(count, 0, "stacked block must be preserved (no single-line match)");
+        assert_eq!(
+            count, 0,
+            "stacked block must be preserved (no single-line match)"
+        );
         assert_eq!(body, original);
     }
 }

@@ -80,7 +80,11 @@ fn find_trailing_comment(line: &str) -> Option<&str> {
             '"' => in_quotes = !in_quotes,
             '#' if !in_quotes => {
                 let comment = line[i..].trim();
-                return if comment.is_empty() { None } else { Some(comment) };
+                return if comment.is_empty() {
+                    None
+                } else {
+                    Some(comment)
+                };
             }
             _ => {}
         }
@@ -200,7 +204,10 @@ logging:
         let rules = config.payload.unwrap();
         assert_eq!(rules.len(), 1);
         assert_eq!(rules[0].models.len(), 2);
-        assert_eq!(rules[0].params.get("max_tokens").unwrap(), &serde_json::json!(32000));
+        assert_eq!(
+            rules[0].params.get("max_tokens").unwrap(),
+            &serde_json::json!(32000)
+        );
     }
 
     #[test]

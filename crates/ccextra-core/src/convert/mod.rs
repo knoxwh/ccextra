@@ -24,7 +24,8 @@ const CLAUDE_CODE_ATTRIBUTION_PREFIX: &str = "x-anthropic-billing-header:";
 
 /// 是否为 Claude Code 计费归属文本(前导空白后以前缀开头)
 pub fn is_attribution_text(text: &str) -> bool {
-    text.trim_start().starts_with(CLAUDE_CODE_ATTRIBUTION_PREFIX)
+    text.trim_start()
+        .starts_with(CLAUDE_CODE_ATTRIBUTION_PREFIX)
 }
 
 /// type:object 节点递归补 properties:{}(对齐 CPA normalizeObjectSchemaProperties)。
@@ -46,9 +47,12 @@ pub fn normalize_object_schema_properties(schema: serde_json::Value) -> serde_js
             }
             Value::Object(map)
         }
-        Value::Array(items) => {
-            Value::Array(items.into_iter().map(normalize_object_schema_properties).collect())
-        }
+        Value::Array(items) => Value::Array(
+            items
+                .into_iter()
+                .map(normalize_object_schema_properties)
+                .collect(),
+        ),
         other => other,
     }
 }

@@ -217,13 +217,15 @@ mod tests {
     #[test]
     fn cross_turn_stable() {
         // 相同的 input,不同的键顺序——归一化后完全相同。
-        let mk = |input: Value| json!({
-            "tools": tools(),
-            "messages": [{
-                "role": "assistant",
-                "content": [{"type": "tool_use", "id": "t1", "name": "edit_file", "input": input}]
-            }]
-        });
+        let mk = |input: Value| {
+            json!({
+                "tools": tools(),
+                "messages": [{
+                    "role": "assistant",
+                    "content": [{"type": "tool_use", "id": "t1", "name": "edit_file", "input": input}]
+                }]
+            })
+        };
         let mut a = mk(json!({"content": "c", "path": "/p"}));
         let mut b = mk(json!({"path": "/p", "content": "c"}));
         normalize_tool_use_inputs(&mut a, ApiKind::Anthropic);
@@ -234,9 +236,15 @@ mod tests {
     #[test]
     fn no_tools_or_no_messages_returns_zero() {
         let mut no_tools = json!({"messages": [{"role": "assistant", "content": []}]});
-        assert_eq!(normalize_tool_use_inputs(&mut no_tools, ApiKind::Anthropic), 0);
+        assert_eq!(
+            normalize_tool_use_inputs(&mut no_tools, ApiKind::Anthropic),
+            0
+        );
         let mut no_msgs = json!({"tools": tools()});
-        assert_eq!(normalize_tool_use_inputs(&mut no_msgs, ApiKind::Anthropic), 0);
+        assert_eq!(
+            normalize_tool_use_inputs(&mut no_msgs, ApiKind::Anthropic),
+            0
+        );
     }
 
     #[test]
@@ -261,7 +269,10 @@ mod tests {
     fn openai_branches_return_zero() {
         let mut body = json!({"tools": tools(), "messages": []});
         assert_eq!(normalize_tool_use_inputs(&mut body, ApiKind::OpenAiChat), 0);
-        assert_eq!(normalize_tool_use_inputs(&mut body, ApiKind::OpenAiResponses), 0);
+        assert_eq!(
+            normalize_tool_use_inputs(&mut body, ApiKind::OpenAiResponses),
+            0
+        );
     }
 
     #[test]

@@ -137,7 +137,8 @@ pub fn convert_to_openai_chat(body: &mut Value, upstream_model: &str) -> Result<
                 }
             });
             if let Some(schema) = tool.get("input_schema") {
-                fn_obj["function"]["parameters"] = super::normalize_object_schema_properties(schema.clone());
+                fn_obj["function"]["parameters"] =
+                    super::normalize_object_schema_properties(schema.clone());
             }
             openai_tools.push(fn_obj);
         }
@@ -208,15 +209,17 @@ fn system_reminder_text(content: &Value) -> Option<String> {
 fn convert_message(role: &str, content: &Value) -> Result<Vec<Value>> {
     // 字符串内容:统一为 text 数组(保留 ai-gateway 形态归一化)。
     // CC 客户端同一条消息当轮发数组、历史重建发字符串,若不统一,跨轮字节
-    // 漂移破坏上游缓存前缀(4096 回归)。空内容输出空数组。
+    // 漂移破坏上游缓存前缀(4096 回归)。空字符串丢弃消息(对齐 CPA)。
     if let Some(s) = content.as_str() {
         if s.is_empty() {
-            return Ok(vec![json!({"role": role, "content": []})]);
+            return Ok(Vec::new());
         }
-        return Ok(vec![json!({"role": role, "content": [{"type": "text", "text": s}]})]);
+        return Ok(vec![
+            json!({"role": role, "content": [{"type": "text", "text": s}]}),
+        ]);
     }
 
-    // 空内容(缺失/null):丢弃消息(对齐 CPA,content 缺失/null 不进入数组/字符串分支)
+    // 空内容(缺失/null):丢弃消息(对齐 CPA)
     if content.is_null() {
         return Ok(Vec::new());
     }
@@ -327,8 +330,6 @@ fn convert_message(role: &str, content: &Value) -> Result<Vec<Value>> {
     } else if !content_items.is_empty() {
         // 非 assistant(通常 user):纯 content
         out.push(json!({"role": role, "content": content_items}));
-    } else if role == "user" && content.is_null() {
-        out.push(json!({"role": role, "content": ""}));
     }
 
     Ok(out)
@@ -353,9 +354,8 @@ fn convert_tool_result_content(content: &Value) -> Value {
                             "type": "text",
                             "text": p.get("text").and_then(|v| v.as_str()).unwrap_or("")
                         })),
-                        Some("image") => image_to_url(p).map(|url| {
-                            json!({"type": "image_url", "image_url": {"url": url}})
-                        }),
+                        Some("image") => image_to_url(p)
+                            .map(|url| json!({"type": "image_url", "image_url": {"url": url}})),
                         _ => None,
                     })
                     .collect();
@@ -408,11 +408,18 @@ fn image_to_url(part: &Value) -> Option<String> {
                 let data = source.get("data").and_then(|v| v.as_str())?;
                 Some(format!("data:{media_type};base64,{data}"))
             }
-            Some("url") => source.get("url").and_then(|v| v.as_str()).map(|s| s.to_string()),
+            Some("url") => source
+                .get("url")
+                .and_then(|v| v.as_str())
+                .map(|s| s.to_string()),
             _ => None,
         }
     });
-    url.or_else(|| part.get("url").and_then(|v| v.as_str()).map(|s| s.to_string()))
+    url.or_else(|| {
+        part.get("url")
+            .and_then(|v| v.as_str())
+            .map(|s| s.to_string())
+    })
 }
 
 /// tool_choice 映射:auto→auto, any→required, tool→specific function
@@ -423,10 +430,7 @@ fn convert_tool_choice(tc: &Value) -> Option<Value> {
         "any" => Some(json!("required")),
         "none" => Some(json!("none")),
         "tool" => {
-            let name = tc
-                .get("name")
-                .and_then(|v| v.as_str())
-                .unwrap_or("");
+            let name = tc.get("name").and_then(|v| v.as_str()).unwrap_or("");
             Some(json!({"type": "function", "function": {"name": name}}))
         }
         _ => None,
@@ -523,7 +527,10 @@ mod tests {
         });
         convert_to_openai_chat(&mut body, "gpt").unwrap();
         assert_eq!(body["tools"][0]["type"], "function");
-        assert_eq!(body["tools"][0]["function"]["parameters"]["properties"]["a"]["type"], "string");
+        assert_eq!(
+            body["tools"][0]["function"]["parameters"]["properties"]["a"]["type"],
+            "string"
+        );
     }
 
     #[test]
@@ -701,7 +708,10 @@ mod tests {
             }]
         });
         convert_to_openai_chat(&mut body, "gpt").unwrap();
-        assert_eq!(body["tools"][0]["function"]["parameters"]["properties"], json!({}));
+        assert_eq!(
+            body["tools"][0]["function"]["parameters"]["properties"],
+            json!({})
+        );
     }
 
     #[test]
@@ -726,6 +736,51 @@ mod tests {
         convert_to_openai_chat(&mut body, "gpt").unwrap();
         assert_eq!(body["temperature"], 0.5);
         assert!(body.get("top_p").is_none());
+    }
+
+    #[test]
+    fn test_empty_string_content_dropped() {
+        // 空字符串 content 丢弃消息(对齐 CPA)
+        let mut body = json!({
+            "model": "test",
+            "messages": [
+                {"role": "user", "content": ""},
+                {"role": "assistant", "content": ""}
+            ]
+        });
+        convert_to_openai_chat(&mut body, "gpt").unwrap();
+        let msgs = body["messages"].as_array().unwrap();
+        assert_eq!(msgs.len(), 0);
+    }
+
+    #[test]
+    fn test_null_content_dropped() {
+        // null content 丢弃消息(对齐 CPA)
+        let mut body = json!({
+            "model": "test",
+            "messages": [
+                {"role": "user", "content": null},
+                {"role": "assistant", "content": null}
+            ]
+        });
+        convert_to_openai_chat(&mut body, "gpt").unwrap();
+        let msgs = body["messages"].as_array().unwrap();
+        assert_eq!(msgs.len(), 0);
+    }
+
+    #[test]
+    fn test_empty_array_content_no_message() {
+        // 空数组 content 无实际内容项 → 不输出消息(对齐 CPA)
+        let mut body = json!({
+            "model": "test",
+            "messages": [
+                {"role": "user", "content": []},
+                {"role": "assistant", "content": []}
+            ]
+        });
+        convert_to_openai_chat(&mut body, "gpt").unwrap();
+        let msgs = body["messages"].as_array().unwrap();
+        assert_eq!(msgs.len(), 0);
     }
 
     #[test]
@@ -772,8 +827,14 @@ mod tests {
         let msgs = body["messages"].as_array().unwrap();
         assert_eq!(msgs.len(), 2);
         assert_eq!(msgs[1]["role"], "user");
-        assert!(msgs[1]["content"][0]["text"].as_str().unwrap().contains("<system-reminder>"));
-        assert!(msgs[1]["content"][0]["text"].as_str().unwrap().contains("Token usage"));
+        assert!(msgs[1]["content"][0]["text"]
+            .as_str()
+            .unwrap()
+            .contains("<system-reminder>"));
+        assert!(msgs[1]["content"][0]["text"]
+            .as_str()
+            .unwrap()
+            .contains("Token usage"));
     }
 
     #[test]
@@ -819,10 +880,23 @@ mod tests {
             "user": "u1"
         });
         convert_to_openai_chat(&mut body, "gpt").unwrap();
-        let keys: Vec<&str> = body.as_object().unwrap().keys().map(|k| k.as_str()).collect();
+        let keys: Vec<&str> = body
+            .as_object()
+            .unwrap()
+            .keys()
+            .map(|k| k.as_str())
+            .collect();
         let expected = [
-            "model", "max_tokens", "temperature", "stop", "stream",
-            "reasoning_effort", "messages", "tools", "tool_choice", "user",
+            "model",
+            "max_tokens",
+            "temperature",
+            "stop",
+            "stream",
+            "reasoning_effort",
+            "messages",
+            "tools",
+            "tool_choice",
+            "user",
             "stream_options",
         ];
         assert_eq!(keys, expected);
@@ -838,7 +912,10 @@ mod tests {
             "messages": [{"role": "user", "content": "hi"}]
         });
         convert_to_openai_chat(&mut body, "gpt").unwrap();
-        assert!(body.get("stream_options").is_none(), "非流不应注入 stream_options");
+        assert!(
+            body.get("stream_options").is_none(),
+            "非流不应注入 stream_options"
+        );
 
         // stream 缺省 = true → 注入
         let mut body2 = json!({
@@ -859,7 +936,9 @@ mod tests {
             ]}]
         });
         convert_to_openai_chat(&mut body, "gpt").unwrap();
-        let url = body["messages"][0]["content"][0]["image_url"]["url"].as_str().unwrap();
+        let url = body["messages"][0]["content"][0]["image_url"]["url"]
+            .as_str()
+            .unwrap();
         assert!(url.starts_with("data:application/octet-stream;base64,AAAA"));
     }
 
@@ -873,7 +952,9 @@ mod tests {
             ]}]
         });
         convert_to_openai_chat(&mut body, "gpt").unwrap();
-        let url = body["messages"][0]["content"][0]["image_url"]["url"].as_str().unwrap();
+        let url = body["messages"][0]["content"][0]["image_url"]["url"]
+            .as_str()
+            .unwrap();
         assert_eq!(url, "https://example.com/img.png");
     }
 }

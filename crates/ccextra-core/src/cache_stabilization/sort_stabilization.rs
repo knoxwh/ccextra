@@ -175,7 +175,10 @@ fn sort_skills_block(s: &mut String, re: &regex::Regex) -> usize {
         sorted.sort_unstable();
         if entries == sorted {
             // 已排序：原样返回原始文本，使替换成为逐字节的空操作。
-            return caps.get(0).map(|m| m.as_str().to_string()).unwrap_or_default();
+            return caps
+                .get(0)
+                .map(|m| m.as_str().to_string())
+                .unwrap_or_default();
         }
         n += 1;
         format!("{}{}{}", header, sorted.join("\n"), footer)
@@ -202,7 +205,10 @@ fn sort_deferred_block(s: &mut String, re: &regex::Regex) -> usize {
         let original = tools.clone();
         tools.sort_unstable();
         if tools == original {
-            return caps.get(0).map(|m| m.as_str().to_string()).unwrap_or_default();
+            return caps
+                .get(0)
+                .map(|m| m.as_str().to_string())
+                .unwrap_or_default();
         }
         n += 1;
         format!("{}{}{}", header, tools.join("\n"), footer)

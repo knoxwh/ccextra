@@ -47,8 +47,8 @@ pub struct ProviderConfig {
 
 #[derive(Debug, Clone, Deserialize, Default)]
 pub struct ModelConfig {
-    pub name: String,      // 上游真实名
-    pub alias: String,     // 入站别名
+    pub name: String,  // 上游真实名
+    pub alias: String, // 入站别名
     /// 模型上下文上限(可选);缺省 max_input_tokens=200000, max_tokens=64000
     #[serde(default)]
     pub max_input_tokens: Option<u64>,
@@ -119,21 +119,19 @@ mod tests {
 
     #[test]
     fn test_resolve_route() {
-        let providers = vec![
-            ProviderConfig {
-                name: "test-claude".into(),
-                protocol: Protocol::Claude,
-                base_url: "https://example.com".into(),
-                key: "sk-test".into(),
-                proxy_url: None,
-                prompt_cache_key: false,
-                models: vec![ModelConfig {
-                    name: "claude-opus-5".into(),
-                    alias: "test-opus-5".into(),
-                    ..Default::default()
-                }],
-            },
-        ];
+        let providers = vec![ProviderConfig {
+            name: "test-claude".into(),
+            protocol: Protocol::Claude,
+            base_url: "https://example.com".into(),
+            key: "sk-test".into(),
+            proxy_url: None,
+            prompt_cache_key: false,
+            models: vec![ModelConfig {
+                name: "claude-opus-5".into(),
+                alias: "test-opus-5".into(),
+                ..Default::default()
+            }],
+        }];
 
         let route = resolve_route("test-opus-5", &providers).unwrap();
         assert_eq!(route.provider, "test-claude");

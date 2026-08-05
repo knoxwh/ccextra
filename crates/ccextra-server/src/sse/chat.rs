@@ -145,7 +145,10 @@ impl ChatRelay {
         }
 
         // finish_reason
-        if let Some(fr) = root.pointer("/choices/0/finish_reason").and_then(|v| v.as_str()) {
+        if let Some(fr) = root
+            .pointer("/choices/0/finish_reason")
+            .and_then(|v| v.as_str())
+        {
             if !fr.is_empty() {
                 self.finish_reason = if self.saw_tool_call {
                     "tool_calls".to_string()
@@ -168,8 +171,14 @@ impl ChatRelay {
 
     /// 缓存 usage 并做 cached 减法(与 CPA extractOpenAIUsage 一致)
     fn cache_usage(&mut self, usage: &Value) {
-        let mut input = usage.get("prompt_tokens").and_then(|v| v.as_i64()).unwrap_or(0);
-        self.usage_output = usage.get("completion_tokens").and_then(|v| v.as_i64()).unwrap_or(0);
+        let mut input = usage
+            .get("prompt_tokens")
+            .and_then(|v| v.as_i64())
+            .unwrap_or(0);
+        self.usage_output = usage
+            .get("completion_tokens")
+            .and_then(|v| v.as_i64())
+            .unwrap_or(0);
         self.usage_cached = usage
             .pointer("/prompt_tokens_details/cached_tokens")
             .and_then(|v| v.as_i64())
@@ -578,9 +587,7 @@ pub fn relay_claude_passthrough<S>(stream: S) -> SseStreamPin
 where
     S: Stream<Item = Result<Bytes, reqwest::Error>> + Send + 'static,
 {
-    Box::pin(
-        stream.map(|chunk| chunk.map_err(std::io::Error::other)),
-    )
+    Box::pin(stream.map(|chunk| chunk.map_err(std::io::Error::other)))
 }
 
 /// OpenAI chat → Anthropic SSE 状态机(realtime)
@@ -634,7 +641,10 @@ mod tests {
     #[test]
     fn test_sse_format() {
         let b = sse("message_start", &json!({"type": "message_start"}));
-        assert_eq!(b, Bytes::from("event: message_start\ndata: {\"type\":\"message_start\"}\n\n"));
+        assert_eq!(
+            b,
+            Bytes::from("event: message_start\ndata: {\"type\":\"message_start\"}\n\n")
+        );
     }
 
     #[test]
@@ -664,8 +674,12 @@ mod tests {
         let out1 = r.process(&ev1);
         // 首 chunk 应发 message_start + content_block_start + content_block_delta
         assert!(out1.iter().any(|b| b.starts_with(b"event: message_start")));
-        assert!(out1.iter().any(|b| b.starts_with(b"event: content_block_start")));
-        assert!(out1.iter().any(|b| b.starts_with(b"event: content_block_delta")));
+        assert!(out1
+            .iter()
+            .any(|b| b.starts_with(b"event: content_block_start")));
+        assert!(out1
+            .iter()
+            .any(|b| b.starts_with(b"event: content_block_delta")));
 
         let ev2 = super::super::parser::SseEvent {
             event: Some("chat.completion.chunk".into()),
@@ -673,7 +687,9 @@ mod tests {
         };
         let out2 = r.process(&ev2);
         // 应发 content_block_stop + message_delta + message_stop
-        assert!(out2.iter().any(|b| b.starts_with(b"event: content_block_stop")));
+        assert!(out2
+            .iter()
+            .any(|b| b.starts_with(b"event: content_block_stop")));
         assert!(out2.iter().any(|b| b.starts_with(b"event: message_delta")));
         assert!(out2.iter().any(|b| b.starts_with(b"event: message_stop")));
     }
@@ -688,7 +704,9 @@ mod tests {
         });
         // 会发 message_start,但工具 start 帧延迟到 finish 才发
         assert!(out1.iter().any(|b| b.starts_with(b"event: message_start")));
-        assert!(!out1.iter().any(|b| b.starts_with(b"event: content_block_start")));
+        assert!(!out1
+            .iter()
+            .any(|b| b.starts_with(b"event: content_block_start")));
 
         // chunk2: arguments 增量(累积,不在流中逐段发)
         let out2 = r.process(&super::super::parser::SseEvent {
@@ -702,8 +720,12 @@ mod tests {
             event: Some("c".into()),
             data: r#"{"choices":[{"delta":{},"finish_reason":"tool_calls"}],"usage":{"prompt_tokens":10,"completion_tokens":5}}"#.into(),
         });
-        assert!(out3.iter().any(|b| b.starts_with(b"event: content_block_stop")));
-        assert!(out3.iter().any(|b| b.starts_with(b"event: content_block_delta")));
+        assert!(out3
+            .iter()
+            .any(|b| b.starts_with(b"event: content_block_stop")));
+        assert!(out3
+            .iter()
+            .any(|b| b.starts_with(b"event: content_block_delta")));
         assert!(out3.iter().any(|b| b.starts_with(b"event: message_delta")));
     }
 
@@ -715,7 +737,9 @@ mod tests {
             event: Some("c".into()),
             data: r#"{"id":"1","choices":[{"delta":{"reasoning_content":"thinking A"}}]}"#.into(),
         });
-        assert!(out1.iter().any(|b| String::from_utf8_lossy(b).contains("thinking A")));
+        assert!(out1
+            .iter()
+            .any(|b| String::from_utf8_lossy(b).contains("thinking A")));
 
         // 重复发同样的 reasoning(去重)
         let out2 = r.process(&super::super::parser::SseEvent {
@@ -729,7 +753,9 @@ mod tests {
             event: Some("c".into()),
             data: r#"{"choices":[{"delta":{"reasoning_content":"thinking B"}}]}"#.into(),
         });
-        assert!(out3.iter().any(|b| String::from_utf8_lossy(b).contains("thinking B")));
+        assert!(out3
+            .iter()
+            .any(|b| String::from_utf8_lossy(b).contains("thinking B")));
     }
 
     #[test]

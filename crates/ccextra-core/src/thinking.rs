@@ -59,7 +59,13 @@ const THRESHOLD_MEDIUM: i64 = 8192;
 const THRESHOLD_HIGH: i64 = 24576;
 
 /// 默认支持集(无 registry 时用安全的通用集,排除 auto/none/minimal)
-pub const DEFAULT_SUPPORTED: [Level; 5] = [Level::Low, Level::Medium, Level::High, Level::XHigh, Level::Max];
+pub const DEFAULT_SUPPORTED: [Level; 5] = [
+    Level::Low,
+    Level::Medium,
+    Level::High,
+    Level::XHigh,
+    Level::Max,
+];
 
 /// budget → level(参考 CPA ConvertBudgetToLevel)
 pub fn budget_to_level(budget: i64) -> Option<Level> {
@@ -128,7 +134,16 @@ mod tests {
 
     #[test]
     fn test_level_parse_roundtrip() {
-        for l in [Level::None, Level::Auto, Level::Minimal, Level::Low, Level::Medium, Level::High, Level::XHigh, Level::Max] {
+        for l in [
+            Level::None,
+            Level::Auto,
+            Level::Minimal,
+            Level::Low,
+            Level::Medium,
+            Level::High,
+            Level::XHigh,
+            Level::Max,
+        ] {
             assert_eq!(Level::parse(l.as_str()).unwrap(), l);
         }
         assert_eq!(Level::parse("HIGH"), Some(Level::High));

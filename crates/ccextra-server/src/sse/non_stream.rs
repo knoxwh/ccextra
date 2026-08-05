@@ -230,7 +230,7 @@ pub fn openai_chat_to_anthropic(body: &Value) -> Option<Value> {
         }
     }
 
-    // usage:mixed format(prompt_tokens/completion_tokens/…_details.cached,对齐 CPA cache_usage)
+    // usage:prompt_tokens/completion_tokens(对齐 OpenAI Chat API)
     let mut input_tokens = 0;
     let mut output_tokens = 0;
     let mut cached = 0;
@@ -501,7 +501,10 @@ mod tests {
             }
         });
         let mut rev = HashMap::new();
-        rev.insert("mcp__short".to_string(), "mcp__long_original_name".to_string());
+        rev.insert(
+            "mcp__short".to_string(),
+            "mcp__long_original_name".to_string(),
+        );
         let out = responses_to_anthropic(&body, Some(&rev)).unwrap();
         assert_eq!(out["content"][0]["name"], "mcp__long_original_name");
     }
@@ -528,6 +531,9 @@ mod tests {
         assert_eq!(out["content"][0]["name"], "web_search");
         assert_eq!(out["content"][0]["input"]["query"], "rust async");
         assert_eq!(out["content"][1]["type"], "web_search_tool_result");
-        assert_eq!(out["content"][1]["content"][0]["url"], "https://example.com");
+        assert_eq!(
+            out["content"][1]["content"][0]["url"],
+            "https://example.com"
+        );
     }
 }

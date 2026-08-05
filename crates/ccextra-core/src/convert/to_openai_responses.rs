@@ -76,7 +76,9 @@ fn tool_result_output(content: &Value) -> Value {
                             let media = item
                                 .pointer("/source/media_type")
                                 .and_then(|v| v.as_str())
-                                .or_else(|| item.pointer("/source/mime_type").and_then(|v| v.as_str()))
+                                .or_else(|| {
+                                    item.pointer("/source/mime_type").and_then(|v| v.as_str())
+                                })
                                 .unwrap_or("application/octet-stream");
                             out.push(json!({
                                 "type": "input_image",
@@ -213,23 +215,17 @@ pub fn convert_to_openai_responses(
     // --- messages → input[] ---
     if let Some(messages) = body.get("messages").and_then(|v| v.as_array()) {
         for msg in messages {
-            let role = msg
-                .get("role")
-                .and_then(|v| v.as_str())
-                .unwrap_or("user");
+            let role = msg.get("role").and_then(|v| v.as_str()).unwrap_or("user");
 
             // role=system 消息:reminder 文本 → user message(对齐 CPA
             // ClaudeMessageSystemReminderText)
             if role == "system" {
                 if let Some(text) = claude_system_reminder_text(msg.get("content")) {
-                    openai["input"]
-                        .as_array_mut()
-                        .unwrap()
-                        .push(json!({
-                            "type": "message",
-                            "role": "user",
-                            "content": [{"type": "input_text", "text": text}]
-                        }));
+                    openai["input"].as_array_mut().unwrap().push(json!({
+                        "type": "message",
+                        "role": "user",
+                        "content": [{"type": "input_text", "text": text}]
+                    }));
                 }
                 continue;
             }
@@ -253,16 +249,18 @@ pub fn convert_to_openai_responses(
                 }
             };
 
-            // 字符串内容
+            // 字符串内容(对齐 ai-gateway extractStandardInputTextContent:空串直接跳过)
             if let Some(s) = content.as_str() {
-                let item_type = if role == "assistant" { "output_text" } else { "input_text" };
-                let items = if s.is_empty() {
-                    Vec::new()
+                if s.is_empty() {
+                    continue;
+                }
+                let item_type = if role == "assistant" {
+                    "output_text"
                 } else {
-                    vec![json!({"type": item_type, "text": s})]
+                    "input_text"
                 };
                 openai["input"].as_array_mut().unwrap().push(json!({
-                    "type": "message", "role": role, "content": items
+                    "type": "message", "role": role, "content": vec![json!({"type": item_type, "text": s})]
                 }));
                 continue;
             }
@@ -276,8 +274,11 @@ pub fn convert_to_openai_responses(
                 match ptype {
                     "text" => {
                         if let Some(t) = part.get("text").and_then(|v| v.as_str()) {
-                            let item_type =
-                                if role == "assistant" { "output_text" } else { "input_text" };
+                            let item_type = if role == "assistant" {
+                                "output_text"
+                            } else {
+                                "input_text"
+                            };
                             content_items.push(json!({"type": item_type, "text": t}));
                         }
                     }
@@ -626,10 +627,16 @@ mod tests {
             ]
         });
         convert_to_openai_responses(&mut body, "gpt-5").unwrap();
-        assert_eq!(body["tools"][0]["parameters"], json!({"type": "object", "properties": {}}));
+        assert_eq!(
+            body["tools"][0]["parameters"],
+            json!({"type": "object", "properties": {}})
+        );
         assert_eq!(body["tools"][1]["parameters"]["type"], "object");
         assert_eq!(body["tools"][1]["strict"], false);
-        assert!(body["tools"][1].get("input_schema").is_none(), "input_schema 应剥除");
+        assert!(
+            body["tools"][1].get("input_schema").is_none(),
+            "input_schema 应剥除"
+        );
         assert_eq!(body["tools"][2]["strict"], false);
     }
 
@@ -669,7 +676,10 @@ mod tests {
         });
         convert_to_openai_responses(&mut body, "gpt-5").unwrap();
         assert_eq!(body["input"][0]["type"], "reasoning");
-        assert_eq!(body["input"][0]["encrypted_content"], "gAAAA-claude-looking");
+        assert_eq!(
+            body["input"][0]["encrypted_content"],
+            "gAAAA-claude-looking"
+        );
         assert_eq!(body["input"][1]["type"], "message");
         assert_eq!(body["input"][1]["content"][0]["text"], "answer");
     }
@@ -873,6 +883,39 @@ mod tests {
             "messages": [
                 {"role": "user", "content": null},
                 {"role": "user"},
+                {"role": "user", "content": "keep"}
+            ]
+        });
+        convert_to_openai_responses(&mut body, "gpt-5").unwrap();
+        let input = body["input"].as_array().unwrap();
+        assert_eq!(input.len(), 1);
+        assert_eq!(input[0]["content"][0]["text"], "keep");
+    }
+
+    #[test]
+    fn test_empty_string_content_dropped_in_responses() {
+        // 对齐 ai-gateway extractStandardInputTextContent:空串不产出 message item
+        let mut body = json!({
+            "model": "test",
+            "messages": [
+                {"role": "user", "content": ""},
+                {"role": "assistant", "content": ""},
+                {"role": "user", "content": "real"}
+            ]
+        });
+        convert_to_openai_responses(&mut body, "gpt-5").unwrap();
+        let input = body["input"].as_array().unwrap();
+        assert_eq!(input.len(), 1, "空串 message 应被跳过");
+        assert_eq!(input[0]["content"][0]["text"], "real");
+    }
+
+    #[test]
+    fn test_empty_array_content_no_output() {
+        // 空 content 数组 → 经 flush_message 检查后无 item 产出
+        let mut body = json!({
+            "model": "test",
+            "messages": [
+                {"role": "user", "content": []},
                 {"role": "user", "content": "keep"}
             ]
         });
