@@ -81,30 +81,30 @@ server:
   port: 8222
 
 providers:
-  - name: evol-claude
+  - name: claude
     protocol: claude
-    base_url: https://mg-new.evolai.cn/claude-proxy
+    base_url: https://xxxx
     key: sk-ant-xxx
     models:
       - name: claude-opus-5
-        alias: evol-opus-5
+        alias: claude-opus-5
 
   - name: saic
     protocol: openai_chat
-    base_url: https://dashscope.aliyuncs.com/compatible-mode/v1
+    base_url: https://xxxx/compatible-mode/v1
     key: sk-xxx
     models:
-      - name: glm-5.1-xxx
+      - name: glm-5.1
         alias: glm-5.1
 
   - name: ckff-codex
     protocol: openai_responses
-    base_url: https://ckff.dev/v1
+    base_url: https://xxxx/v1
     key: sk-xxx
     prompt_cache_key: true
     models:
       - name: gpt-5.6-terra
-        alias: ck-gpt-5.6-terra
+        alias: gpt-5.6-terra
 ```
 
 ### 启动
@@ -140,7 +140,7 @@ export ANTHROPIC_AUTH_TOKEN=sk-ccextra-xxx
 # 发送请求
 curl http://127.0.0.1:8222/v1/messages \
   -H "Content-Type: application/json" \
-  -d '{"model": "evol-opus-5", "messages": [{"role": "user", "content": "hi"}], "max_tokens": 1024}'
+  -d '{"model": "claude-opus-5", "messages": [{"role": "user", "content": "hi"}], "max_tokens": 1024}'
 
 # 模型列表（Claude Code 启动时自动调用）
 curl http://127.0.0.1:8222/v1/models -H "x-api-key: sk-ccextra-xxx"
@@ -157,8 +157,8 @@ curl http://127.0.0.1:8222/health
 ```json
 {
   "data": [
-    {"id": "evol-opus-5", "object": "model", "owned_by": "evol-claude",
-     "type": "model", "display_name": "evol-opus-5",
+    {"id": "claude-opus-5", "object": "model", "owned_by": "claude",
+     "type": "model", "display_name": "claude-opus-5",
      "max_input_tokens": 200000, "max_tokens": 64000}
   ]
 }
