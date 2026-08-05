@@ -64,7 +64,7 @@ pub enum TargetShape {
 ///
 /// drift 观测(compute_structural_hash + observe_drift)需要 DriftState,
 /// 由 server 层在调用本函数后单独执行。
-pub fn normalize_anthropic_full(body: &mut Value, _session_key: &str) -> NormalizeCounts {
+pub fn normalize_anthropic_full(body: &mut Value) -> NormalizeCounts {
     let mut counts = NormalizeCounts::default();
 
     // 1. tool_def 排序 + schema 键递归排序
@@ -113,12 +113,40 @@ pub fn normalize_anthropic_full(body: &mut Value, _session_key: &str) -> Normali
     counts
 }
 
-/// 转换后目标 body 二次归一化:tool_def + volatile 剥离
+/// 入站 anthropic 转换前归一化:PreTransform 精简子集(对齐 tklite
+/// `/v1/pretransform/messages`,CPA openai 链路转换前调用)。
 ///
-/// 顺序与 tklite openai 管线一致:
+/// 只跑历史归一化子集:smoosh → content_strip → tool_input → sort → rstrip。
+/// 跳过 tool-def sort、volatile strip、drift、auto cache_control、volatile
+/// detect warn——这些要么在转换后 openai handler 里做(tool-def sort /
+/// volatile strip),要么对 openai 上游无意义(cache_control 转换时丢弃),
+/// 要么留到转换后观测(drift)。
+pub fn normalize_anthropic_pretransform(body: &mut Value) -> NormalizeCounts {
+    NormalizeCounts {
+        // 1. smoosh 拆分
+        smoosh_count: split_smooshed_reminders(body, DriftApiKind::Anthropic),
+        // 2. bookkeeping 剥离
+        bookkeeping_count: strip_bookkeeping_content(body, DriftApiKind::Anthropic),
+        // 3. tool_use.input 键序归一化
+        tool_input_count: normalize_tool_use_inputs(body, DriftApiKind::Anthropic),
+        // 4. system reminder 列表块排序
+        sort_count: stabilize_block_sort(body, DriftApiKind::Anthropic),
+        // 5. 尾部 reminder 空白归一化
+        rstrip_count: normalize_reminder_trailing_whitespace(body, DriftApiKind::Anthropic),
+        ..Default::default()
+    }
+}
+
+/// 转换后目标 body 二次归一化:tool_def + sort + rstrip + volatile
+///
+/// 顺序与 tklite openai 管线(post-transform)一致:
 /// 1. tool_def 归一化(按 chat / responses 形状区分)
-/// 2. volatile 剥离(工具参数里残留的时间戳/UUID)
-pub fn normalize_target_post(body: &mut Value, _session_key: &str, shape: TargetShape) -> NormalizeCounts {
+/// 2. system reminder 列表块排序(CC 注入的 skills/deferred 列表顺序不稳定)
+/// 3. 尾部 reminder 空白归一化(CC 重序列化历史内容时字节漂移 #48734)
+/// 4. volatile 剥离(工具参数里残留的时间戳/UUID)
+///
+/// 2/3 与 tklite openai 对齐:排序在 rstrip 前,两条归一化都落在 drift 检测前。
+pub fn normalize_target_post(body: &mut Value, shape: TargetShape) -> NormalizeCounts {
     let mut counts = NormalizeCounts::default();
 
     // 1. tool_def 归一化
@@ -133,7 +161,17 @@ pub fn normalize_target_post(body: &mut Value, _session_key: &str, shape: Target
         }
     }
 
-    // 2. volatile 剥离(openai 两种形状共用同一 walker)
+    // 2. system reminder 列表块排序(按 openai 形状匹配 walker)
+    let kind = match shape {
+        TargetShape::OpenAiChat => DriftApiKind::OpenAiChat,
+        TargetShape::OpenAiResponses => DriftApiKind::OpenAiResponses,
+    };
+    counts.sort_count = stabilize_block_sort(body, kind);
+
+    // 3. 尾部 reminder 空白归一化
+    counts.rstrip_count = normalize_reminder_trailing_whitespace(body, kind);
+
+    // 4. volatile 剥离(openai 两种形状共用同一 walker)
     counts.volatile_count = strip_volatile_from_prefix(body, VolatileApiKind::OpenAi);
 
     counts
@@ -155,7 +193,7 @@ mod tests {
             "messages": [{"role": "user", "content": "hi"}]
         });
 
-        let counts = normalize_anthropic_full(&mut body, "key");
+        let counts = normalize_anthropic_full(&mut body);
 
         assert!(counts.tool_sorted);
         assert_eq!(body["tools"][0]["name"], "a_tool");
@@ -169,9 +207,64 @@ mod tests {
             "messages": [{"role": "user", "content": "hi"}]
         });
 
-        let counts = normalize_anthropic_full(&mut body, "key");
+        let counts = normalize_anthropic_full(&mut body);
 
         assert!(counts.cache_control_placed > 0);
+    }
+
+    #[test]
+    fn test_pretransform_runs_history_subset() {
+        // 对齐 tklite PreTransform:bookkeeping 剥离生效
+        let mut body = json!({
+            "messages": [
+                {"role": "user", "content": [
+                    {"type": "text", "text": "work"},
+                    {"type": "text", "text": "<system-reminder>\nToken usage: 1/2; 1 remaining\n</system-reminder>"}
+                ]}
+            ]
+        });
+
+        let counts = normalize_anthropic_pretransform(&mut body);
+
+        assert!(counts.bookkeeping_count > 0, "bookkeeping should strip");
+        // 无 tool-def sort / volatile / cache_control 注入
+        assert!(!counts.tool_sorted);
+        assert_eq!(counts.volatile_count, 0);
+        assert_eq!(counts.cache_control_placed, 0);
+    }
+
+    #[test]
+    fn test_pretransform_rstrips_reminder_trailing() {
+        // 对齐 tklite PreTransform:rstrip 折叠尾部空白(独立块,不经 bookkeeping)
+        let mut body = json!({
+            "messages": [
+                {"role": "user", "content": [
+                    {"type": "text", "text": "work\n   </system-reminder>   "}
+                ]}
+            ]
+        });
+
+        let counts = normalize_anthropic_pretransform(&mut body);
+
+        assert!(counts.rstrip_count > 0, "trailing whitespace should collapse");
+        let content = body["messages"][0]["content"][0]["text"].as_str().unwrap();
+        assert!(content.ends_with("</system-reminder>"), "collapsed: {content:?}");
+    }
+
+    #[test]
+    fn test_pretransform_skips_cache_control_injection() {
+        // 没有 cache_control 注入(对齐 PreTransform:转换后 cache 语义丢弃)
+        let mut body = json!({
+            "tools": [{"name": "b", "input_schema": {"type": "object"}}],
+            "messages": [{"role": "user", "content": "hi"}]
+        });
+
+        let counts = normalize_anthropic_pretransform(&mut body);
+
+        assert_eq!(counts.cache_control_placed, 0);
+        assert!(!counts.tool_sorted, "tool-def sort must be skipped");
+        // tools 顺序未被改动
+        assert_eq!(body["tools"][0]["name"], "b");
     }
 
     #[test]
@@ -185,8 +278,64 @@ mod tests {
             "messages": [{"role": "user", "content": "hi"}]
         });
 
-        let counts = normalize_target_post(&mut body, "key", TargetShape::OpenAiChat);
+        let counts = normalize_target_post(&mut body, TargetShape::OpenAiChat);
 
         assert!(counts.tool_sorted);
+    }
+
+    #[test]
+    fn test_target_post_chat_sorts_skill_listing() {
+        // system 里技能列表乱序 → stabilize_block_sort 应排序(对齐 tklite openai)
+        let mut body = json!({
+            "model": "test",
+            "messages": [
+                {"role": "system", "content": "<system-reminder>\nThe following skills are available:\n- zed\n- alpha\n- mid\n</system-reminder>"},
+                {"role": "user", "content": "hi"}
+            ]
+        });
+
+        let counts = normalize_target_post(&mut body, TargetShape::OpenAiChat);
+
+        assert!(counts.sort_count > 0, "skill listing should be sorted");
+        let content = body["messages"][0]["content"].as_str().unwrap();
+        assert!(content.contains("- alpha\n- mid\n- zed"), "items sorted: {content}");
+    }
+
+    #[test]
+    fn test_target_post_chat_rstrip_reminder_trailing() {
+        // 尾部 </system-reminder> 前多余空白 → rstrip 折叠(对齐 tklite openai)
+        let mut body = json!({
+            "model": "test",
+            "messages": [
+                {"role": "user", "content": "work\n   </system-reminder>   "}
+            ]
+        });
+
+        let counts = normalize_target_post(&mut body, TargetShape::OpenAiChat);
+
+        assert!(counts.rstrip_count > 0, "trailing whitespace should collapse");
+        let content = body["messages"][0]["content"].as_str().unwrap();
+        assert!(content.ends_with("</system-reminder>"), "collapsed: {content:?}");
+    }
+
+    #[test]
+    fn test_target_post_is_idempotent() {
+        let mut body = json!({
+            "model": "test",
+            "messages": [
+                {"role": "system", "content": "<system-reminder>\nThe following skills are available:\n- zed\n- alpha\n</system-reminder>"},
+                {"role": "user", "content": "work\n   </system-reminder>   "}
+            ]
+        });
+
+        let c1 = normalize_target_post(&mut body, TargetShape::OpenAiChat);
+        let snapshot = body.clone();
+        let c2 = normalize_target_post(&mut body, TargetShape::OpenAiChat);
+
+        assert!(c1.sort_count > 0, "skill listing should sort");
+        assert!(c1.rstrip_count > 0, "trailing whitespace should collapse");
+        assert_eq!(c2.sort_count, 0, "second pass must not re-sort");
+        assert_eq!(c2.rstrip_count, 0, "second pass must not re-rstrip");
+        assert_eq!(body, snapshot, "second pass must be byte-identical");
     }
 }

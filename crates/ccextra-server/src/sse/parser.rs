@@ -19,10 +19,14 @@ pub struct SseEvent {
 }
 
 /// 跨 chunk 状态化的 SSE 解析器
+///
+/// 缓冲用字节(Vec<u8>)而非 String:多字节 UTF-8 字符(中文等)可能被
+/// TCP 分片切到两个 chunk,from_utf8_lossy 会把两半都变成 U+FFFD。
+/// 按字节找换行,整行齐了才转字符串,规避截断乱码。
 #[derive(Debug, Default)]
 pub struct SseParser {
-    /// 未处理的完整行缓冲
-    buf: String,
+    /// 未处理的完整行字节缓冲
+    buf: Vec<u8>,
     /// 当前事件类型
     event: Option<String>,
     /// 当前事件的 data 行
@@ -36,7 +40,7 @@ impl SseParser {
 
     /// 喂入新字节,返回产生的完整事件
     pub fn push(&mut self, chunk: &[u8]) -> Vec<SseEvent> {
-        self.buf.push_str(&String::from_utf8_lossy(chunk));
+        self.buf.extend_from_slice(chunk);
         self.process_lines()
     }
 
@@ -44,7 +48,7 @@ impl SseParser {
     pub fn finish(&mut self) -> Vec<SseEvent> {
         // 补一个换行,让最后一行也能被处理
         if !self.buf.is_empty() {
-            self.buf.push('\n');
+            self.buf.push(b'\n');
         }
         let mut events = self.process_lines();
         // 末尾可能没有空行,强制 flush 残留事件
@@ -58,12 +62,17 @@ impl SseParser {
     fn process_lines(&mut self) -> Vec<SseEvent> {
         let mut events = Vec::new();
 
-        while let Some(newline) = self.buf.find('\n') {
-            let line = self.buf[..newline].to_string();
-            self.buf = self.buf[newline + 1..].to_string();
+        while let Some(newline) = self.buf.iter().position(|&b| b == b'\n') {
+            let mut line_bytes = self.buf[..newline].to_vec();
+            self.buf.drain(..=newline);
 
             // 去除行尾 \r
-            let line = line.strip_suffix('\r').unwrap_or(&line).to_string();
+            if line_bytes.last() == Some(&b'\r') {
+                line_bytes.pop();
+            }
+
+            // 整行字节齐了才转字符串,跨 chunk 的多字节字符不会被切断
+            let line = String::from_utf8_lossy(&line_bytes);
 
             if line.is_empty() {
                 // 空行结束当前事件
@@ -181,6 +190,16 @@ mod tests {
         let events = p.push(b": this is a comment\ndata: real\n\n");
         assert_eq!(events.len(), 1);
         assert_eq!(events[0].data, "real");
+    }
+
+    #[test]
+    fn test_utf8_split_across_chunks() {
+        // "中" = E4 B8 AD,被 chunk 边界切成两半,不得产生 U+FFFD 乱码
+        let mut p = SseParser::new();
+        assert!(p.push(&[b'd', b'a', b't', b'a', b':', b' ', 0xE4, 0xB8]).is_empty());
+        let events = p.push(&[0xAD, b'\n', b'\n']);
+        assert_eq!(events.len(), 1);
+        assert_eq!(events[0].data, "中");
     }
 
     #[test]

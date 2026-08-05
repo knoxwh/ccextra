@@ -1,11 +1,15 @@
 use anyhow::Result;
 use clap::Parser;
+use ccextra_core::cache_stabilization::drift_detector::DriftState;
 use ccextra_server::http::{AppState, ReloadData};
 use ccextra_server::upstream::UpstreamClient;
 use ccextra_server::serve;
 use std::sync::Arc;
+use time::UtcOffset;
 use tokio::sync::RwLock;
-use tracing_subscriber::{EnvFilter, layer::SubscriberExt, util::SubscriberInitExt};
+use tracing_subscriber::{
+    EnvFilter, fmt::time::OffsetTime, layer::SubscriberExt, util::SubscriberInitExt,
+};
 
 mod config;
 
@@ -28,11 +32,28 @@ async fn main() -> Result<()> {
     let config = Config::load(&cli.config)?;
 
     // 初始化日志:config.logging.level 为默认,RUST_LOG 可覆盖
+    // 本地时区时间戳(CPA/tkLite 风格)+ 无 ANSI + 无 target,适合日志文件
+    let timer_fmt = time::format_description::parse_borrowed::<2>(
+        "[year]-[month]-[day] [hour]:[minute]:[second]",
+    )
+    .expect("valid log timestamp format");
+    let timer = OffsetTime::new(
+        UtcOffset::current_local_offset().unwrap_or(UtcOffset::UTC),
+        timer_fmt,
+    );
     let filter = EnvFilter::try_from_default_env()
         .unwrap_or_else(|_| EnvFilter::builder().parse_lossy(&config.logging.level));
     tracing_subscriber::registry()
         .with(filter)
-        .with(tracing_subscriber::fmt::layer())
+        .with(
+            tracing_subscriber::fmt::layer()
+                .compact()
+                .with_ansi(false)
+                .with_target(false)
+                .with_thread_ids(false)
+                .with_thread_names(false)
+                .with_timer(timer),
+        )
         .init();
 
     tracing::info!("配置加载成功: {} providers", config.providers.len());
@@ -57,6 +78,8 @@ async fn main() -> Result<()> {
         logging: config.logging,
         upstream: UpstreamClient::new(config.server.proxy_url),
         reload,
+        secret: config.secret_key,
+        drift: DriftState::new(1000),
     };
 
     // 启动 HTTP 服务

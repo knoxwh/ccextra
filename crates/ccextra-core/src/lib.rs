@@ -9,8 +9,10 @@
 pub mod cache_stabilization;
 pub mod convert;
 pub mod normalize;
+pub mod prompt_cache;
 pub mod route;
+pub mod secret;
 pub mod session;
+pub mod thinking;
 
 pub use route::{Protocol, RouteDecision};
-pub use session::derive_session_key;

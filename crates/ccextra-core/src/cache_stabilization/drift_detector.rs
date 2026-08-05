@@ -757,9 +757,10 @@ pub struct SessionIdentity {
 ///
 /// 父级 bucket 优先级顺序：
 ///
-/// 1. `x-tklite-session-key` — 来自 CLIProxyAPI 的不透明 sidecar bucket。
-/// 2. `x-request-id` 请求头（SHA-256 哈希）——每请求回退。
-/// 3. 回退 `"anonymous"`。
+/// 1. `x-claude-code-session-id` — Claude Code 原生会话头，整会话稳定。
+/// 2. `x-tklite-session-key` — 来自 CLIProxyAPI 的不透明 sidecar bucket。
+/// 3. `x-request-id` 请求头（SHA-256 哈希）——每请求回退。
+/// 4. 回退 `"anonymous"`。
 ///
 /// 判别器是 `SHA-256(规范化 model + 规范化首条会话消息)`，截断为 16 个
 /// 十六进制字符并与父级 bucket 组合。缺失的 model 哈希为 `"nomodel"`，
@@ -773,8 +774,22 @@ pub fn derive_session_key(headers: &HeaderMap, body: &Value, kind: ApiKind) -> S
     }
 }
 
-/// 旧版仅依赖请求头的 bucket 派生。
+/// 仅依赖请求头的 bucket 派生。
+/// 优先级(对齐 CPA 会话身份链):
+/// 1. `x-claude-code-session-id` — Claude Code 原生会话头,整会话稳定
+/// 2. `x-tklite-session-key` — CLIProxyAPI 不透明 sidecar bucket
+/// 3. `x-request-id`(哈希)— 每请求回退
+/// 4. `anonymous`
 fn derive_parent_bucket(headers: &HeaderMap) -> String {
+    if let Some(session_id) = headers
+        .get(crate::session::CLAUDE_CODE_SESSION_HEADER)
+        .and_then(|v| v.to_str().ok())
+        .map(str::trim)
+        .filter(|v| !v.is_empty())
+    {
+        return format!("claude-code:{}", session_id);
+    }
+
     if let Some(session_key) = headers
         .get("x-tklite-session-key")
         .and_then(|v| v.to_str().ok())
@@ -1059,6 +1074,21 @@ mod tests {
         assert!(id
             .conversation
             .starts_with("tklite:codex:opaque-session-key:conv:"));
+    }
+
+    #[test]
+    fn session_key_prefers_claude_code_session_id() {
+        let mut headers = HeaderMap::new();
+        headers.insert(
+            "x-claude-code-session-id",
+            "cc-sess-0123".parse().unwrap(),
+        );
+        headers.insert("x-tklite-session-key", "codex:opaque".parse().unwrap());
+        headers.insert("x-request-id", "req-abc123".parse().unwrap());
+        let body = anthropic_body("sys", json!([]), vec!["hi"]);
+        let id = derive_session_key(&headers, &body, ApiKind::Anthropic);
+        assert_eq!(id.parent, "claude-code:cc-sess-0123");
+        assert!(id.conversation.starts_with("claude-code:cc-sess-0123:conv:"));
     }
 
     #[test]

@@ -16,11 +16,26 @@ pub struct UpstreamResponse {
 }
 
 /// 按协议取上游请求路径
+///
+/// 版本前缀约定(与 CPA/OpenAI 一致):anthropic 协议 base_url 不含版本,路径带 /v1;
+/// openai 协议 base_url 已含版本前缀(/v1 或 /v3 等),路径不带版本。
 fn endpoint_path(protocol: Protocol) -> &'static str {
     match protocol {
         Protocol::Claude => "/v1/messages",
-        Protocol::OpenAiChat => "/v1/chat/completions",
-        Protocol::OpenAiResponses => "/v1/responses",
+        Protocol::OpenAiChat => "/chat/completions",
+        Protocol::OpenAiResponses => "/responses",
+    }
+}
+
+/// 按协议取 User-Agent(对齐上游期望的客户端标识)
+///
+/// openai chat → claude-cli;responses → codex_cli_rs。部分上游按 UA
+/// 分流缓存/特性,reqwest 默认 UA 会被识别为非官方客户端。
+fn user_agent(protocol: Protocol) -> &'static str {
+    match protocol {
+        Protocol::Claude => "claude-cli/2.1.221",
+        Protocol::OpenAiChat => "claude-cli/2.1.221",
+        Protocol::OpenAiResponses => "codex_cli_rs/0.146.0 (Mac OS 26.5.1; aarch64) iTerm.app/3.6.10",
     }
 }
 
@@ -65,6 +80,15 @@ impl UpstreamClient {
     }
 
     /// 发起上游请求,返回原始响应(字节或流由调用方决定)
+    ///
+    /// - `is_stream`:chat 链路流式时补 `Accept: text/event-stream` /
+    ///   `Cache-Control: no-cache`(对齐 CPA openai_compat_executor)
+    /// - `session_id`:responses 链路发 `Session_id` 头(对齐 CPA cacheHelper,
+    ///   值为 prompt_cache_key,上游按它做缓存亲和)
+    /// - `extra_headers`:claude 直通的透传/重建头(对齐 CPA applyClaudeHeaders
+    ///   的中转场景:anthropic-beta 按 body 条件重建 + caller beta 追加,
+    ///   anthropic-version / x-app / stainless 系列透传)
+    #[allow(clippy::too_many_arguments)]
     pub async fn request(
         &self,
         base_url: &str,
@@ -72,17 +96,32 @@ impl UpstreamClient {
         protocol: Protocol,
         provider_proxy: Option<&str>,
         body: &serde_json::Value,
+        is_stream: bool,
+        session_id: Option<&str>,
+        extra_headers: &[(String, String)],
     ) -> anyhow::Result<UpstreamResponse> {
         let proxy_key = self.resolve_proxy(provider_proxy);
         let client = self.client_for(&proxy_key);
         let url = format!("{}{}", base_url.trim_end_matches('/'), endpoint_path(protocol));
 
-        let resp = client
+        let mut req = client
             .post(&url)
             .bearer_auth(api_key)
-            .json(body)
-            .send()
-            .await?;
+            .header(reqwest::header::USER_AGENT, user_agent(protocol));
+        if is_stream && matches!(protocol, Protocol::OpenAiChat) {
+            req = req
+                .header(reqwest::header::ACCEPT, "text/event-stream")
+                .header(reqwest::header::CACHE_CONTROL, "no-cache");
+        }
+        if let Some(sid) = session_id {
+            if matches!(protocol, Protocol::OpenAiResponses) {
+                req = req.header("Session_id", sid);
+            }
+        }
+        for (name, value) in extra_headers {
+            req = req.header(name.as_str(), value.as_str());
+        }
+        let resp = req.json(body).send().await?;
 
         let status = resp.status();
         Ok(UpstreamResponse { status, body: resp })
@@ -102,8 +141,33 @@ mod tests {
     #[test]
     fn test_endpoint_path_routing() {
         assert_eq!(endpoint_path(Protocol::Claude), "/v1/messages");
-        assert_eq!(endpoint_path(Protocol::OpenAiChat), "/v1/chat/completions");
-        assert_eq!(endpoint_path(Protocol::OpenAiResponses), "/v1/responses");
+        assert_eq!(endpoint_path(Protocol::OpenAiChat), "/chat/completions");
+        assert_eq!(endpoint_path(Protocol::OpenAiResponses), "/responses");
+    }
+
+    #[test]
+    fn test_user_agent_per_protocol() {
+        assert_eq!(user_agent(Protocol::OpenAiChat), "claude-cli/2.1.221");
+        assert!(user_agent(Protocol::OpenAiResponses).starts_with("codex_cli_rs/0.146.0"));
+        assert_eq!(user_agent(Protocol::Claude), "claude-cli/2.1.221");
+    }
+
+    #[test]
+    fn test_url_join_no_double_version() {
+        // openai 协议:base_url 已含版本前缀,路径不再重复 /v1
+        let base = "https://dashscope.aliyuncs.com/compatible-mode/v1";
+        let url = format!("{}{}", base.trim_end_matches('/'), endpoint_path(Protocol::OpenAiChat));
+        assert_eq!(url, "https://dashscope.aliyuncs.com/compatible-mode/v1/chat/completions");
+
+        // 自定义版本前缀(如 /v3):同样不重复
+        let base = "https://ark.cn-beijing.volces.com/api/v3";
+        let url = format!("{}{}", base.trim_end_matches('/'), endpoint_path(Protocol::OpenAiChat));
+        assert_eq!(url, "https://ark.cn-beijing.volces.com/api/v3/chat/completions");
+
+        // claude 协议:base_url 不含版本,路径带 /v1
+        let base = "https://example.com/claude-proxy";
+        let url = format!("{}{}", base.trim_end_matches('/'), endpoint_path(Protocol::Claude));
+        assert_eq!(url, "https://example.com/claude-proxy/v1/messages");
     }
 
     #[test]

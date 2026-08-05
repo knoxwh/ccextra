@@ -60,6 +60,8 @@ struct ChatRelay {
     usage_cached: i64,
     // 已发射的 thinking 片段(去重)
     thinking_parts: Vec<String>,
+    // 空 id 兜底合成计数(CPA SanitizeClaudeToolID 同角色)
+    synthetic_tool_ids: u64,
 }
 
 impl ChatRelay {
@@ -79,6 +81,7 @@ impl ChatRelay {
             usage_output: 0,
             usage_cached: 0,
             thinking_parts: Vec::new(),
+            synthetic_tool_ids: 0,
         }
     }
 
@@ -135,7 +138,7 @@ impl ChatRelay {
 
         // tool_calls
         if let Some(tool_calls) = delta.get("tool_calls").and_then(|v| v.as_array()) {
-            self.collect_tool_calls(tool_calls);
+            frames.extend(self.collect_tool_calls(tool_calls));
         }
 
         // finish_reason
@@ -175,12 +178,29 @@ impl ChatRelay {
         self.usage_seen = true;
     }
 
-    /// 流结束([DONE]):兜底 finalize
+    /// 流结束([DONE] 或 EOF):兜底 finalize
     fn finish(&mut self) -> Vec<Bytes> {
         if self.finished {
             return Vec::new();
         }
         self.finalize()
+    }
+
+    /// 上游流中断:发 anthropic error 事件收尾(对齐 CPA code_handlers 断流兜底)
+    fn stream_error(&mut self, message: &str) -> Vec<Bytes> {
+        if self.finished {
+            return Vec::new();
+        }
+        self.finished = true;
+        let mut frames = self.ensure_started();
+        frames.push(sse(
+            "error",
+            &json!({
+                "type": "error",
+                "error": {"type": "api_error", "message": message}
+            }),
+        ));
+        frames
     }
 
     /// 统一收尾:close active + flush tool calls + message_delta + message_stop
@@ -284,59 +304,74 @@ impl ChatRelay {
     }
 
     /// 累积 tool_calls 增量
-    fn collect_tool_calls(&mut self, tool_calls: &[Value]) {
+    fn collect_tool_calls(&mut self, tool_calls: &[Value]) -> Vec<Bytes> {
+        let mut frames = Vec::new();
         for tc in tool_calls {
             let index = tc.get("index").and_then(|v| v.as_u64()).unwrap_or(0) as usize;
-            let call = self.tool_calls.entry(index).or_insert_with(|| ToolCall {
-                id: String::new(),
-                name: String::new(),
-                arguments: String::new(),
-                block_index: -1,
-                started: false,
-                start_emitted: false,
-                closed: false,
-            });
+            {
+                let call = self.tool_calls.entry(index).or_insert_with(|| ToolCall {
+                    id: String::new(),
+                    name: String::new(),
+                    arguments: String::new(),
+                    block_index: -1,
+                    started: false,
+                    start_emitted: false,
+                    closed: false,
+                });
 
-            if let Some(id) = tc.get("id").and_then(|v| v.as_str()) {
-                if !id.is_empty() {
-                    call.id = id.to_string();
-                }
-            }
-
-            if let Some(function) = tc.get("function") {
-                if let Some(name) = function.get("name").and_then(|v| v.as_str()) {
-                    if !name.is_empty() {
-                        call.name = name.to_string();
+                if let Some(id) = tc.get("id").and_then(|v| v.as_str()) {
+                    if !id.is_empty() {
+                        call.id = id.to_string();
                     }
                 }
-                if let Some(args) = function.get("arguments") {
-                    match args {
-                        Value::String(s) if !s.is_empty() => call.arguments.push_str(s),
-                        Value::Object(_) | Value::Array(_) => {
-                            call.arguments = args.to_string();
+
+                if let Some(function) = tc.get("function") {
+                    if let Some(name) = function.get("name").and_then(|v| v.as_str()) {
+                        if !name.is_empty() {
+                            call.name = name.to_string();
                         }
-                        _ => {}
+                    }
+                    if let Some(args) = function.get("arguments") {
+                        match args {
+                            Value::String(s) if !s.is_empty() => call.arguments.push_str(s),
+                            Value::Object(_) | Value::Array(_) => {
+                                call.arguments = args.to_string();
+                            }
+                            _ => {}
+                        }
                     }
                 }
             }
 
             // name+id 齐了 → 发 start
-            if !call.started && !call.name.is_empty() && !call.id.is_empty() {
-                self.emit_tool_use_start(index);
+            let (started, ready) = match self.tool_calls.get(&index) {
+                Some(c) => (c.started, !c.name.is_empty() && !c.id.is_empty()),
+                None => continue,
+            };
+            if !started && ready {
+                self.emit_tool_use_start(index, &mut frames);
             }
         }
+        frames
     }
 
     /// 分配 tool_use 的 block index(帧在 flush 时发)
-    fn emit_tool_use_start(&mut self, openai_index: usize) {
-        let call = self.tool_calls.get_mut(&openai_index).unwrap();
-        if call.started {
+    fn emit_tool_use_start(&mut self, openai_index: usize, frames: &mut Vec<Bytes>) {
+        let started = self
+            .tool_calls
+            .get(&openai_index)
+            .map(|c| c.started)
+            .unwrap_or(true);
+        if started {
             return;
         }
+        // 工具调用开始前关闭 active text/thinking 块(对齐 CPA emitToolUseStart),
+        // 否则该块永远收不到 content_block_stop
+        self.close_active_block(frames);
+        let call = self.tool_calls.get_mut(&openai_index).unwrap();
         call.block_index = self.next_block_index;
         self.next_block_index += 1;
         call.started = true;
-        self.active_block = None; // 工具不占 active block
         self.saw_tool_call = true;
     }
 
@@ -345,6 +380,11 @@ impl ChatRelay {
         let call = self.tool_calls.get_mut(&openai_index).unwrap();
         if call.start_emitted {
             return;
+        }
+        if call.id.is_empty() {
+            // 空 id 兜底(对齐 CPA SanitizeClaudeToolID 合成 id),避免发非法块
+            self.synthetic_tool_ids += 1;
+            call.id = format!("toolu_ccextra_{}", self.synthetic_tool_ids);
         }
         let id = call.id.clone();
         let name = call.name.clone();
@@ -377,7 +417,7 @@ impl ChatRelay {
                 if name_empty {
                     continue;
                 }
-                self.emit_tool_use_start(index);
+                self.emit_tool_use_start(index, frames);
             }
             self.tool_use_start_frame(index, frames);
             let call = self.tool_calls.get(&index).unwrap();
@@ -405,14 +445,29 @@ impl ChatRelay {
         let mut indexes: Vec<usize> = self.tool_calls.keys().copied().collect();
         indexes.sort_unstable();
         for index in indexes {
-            let (closed, started, block_index) = match self.tool_calls.get(&index) {
-                Some(c) => (c.closed, c.started, c.block_index),
+            let (closed, started) = match self.tool_calls.get(&index) {
+                Some(c) => (c.closed, c.started),
                 None => continue,
             };
             if closed || !started {
                 continue;
             }
             self.tool_use_start_frame(index, &mut frames);
+            // 关闭前补发累积的 arguments(对齐 CPA flush),否则工具 input 变空
+            let (block_index, arguments) = {
+                let call = self.tool_calls.get(&index).unwrap();
+                (call.block_index, call.arguments.clone())
+            };
+            if !arguments.is_empty() {
+                frames.push(sse(
+                    "content_block_delta",
+                    &json!({
+                        "type": "content_block_delta",
+                        "index": block_index,
+                        "delta": {"type": "input_json_delta", "partial_json": arguments}
+                    }),
+                ));
+            }
             frames.push(sse(
                 "content_block_stop",
                 &json!({"type": "content_block_stop", "index": block_index}),
@@ -423,9 +478,15 @@ impl ChatRelay {
     }
 
     /// thinking 去重:空白或重复片段跳过
+    /// 对齐 CPA appendReasoningTextIfDistinct:片段等于任一已发片段、
+    /// 或等于全部已发拼接(累积快照式 provider)都丢弃
     fn thinking_distinct(&mut self, text: &str) -> bool {
         let trimmed = text.trim();
         if trimmed.is_empty() {
+            return false;
+        }
+        let joined = self.thinking_parts.join("");
+        if joined.trim() == trimmed {
             return false;
         }
         if self.thinking_parts.iter().any(|p| p.trim() == trimmed) {
@@ -437,10 +498,26 @@ impl ChatRelay {
 }
 
 /// 从 delta 的多种字段提取 reasoning 文本
+/// (对齐 CPA collectOpenAIReasoningTexts:reasoning_content /
+/// reasoning_details[] / reasoning / thinking 多种供应商拼写)
 fn collect_reasoning_texts(delta: &Value) -> Vec<String> {
     let mut texts = Vec::new();
     if let Some(v) = delta.get("reasoning_content") {
         collect_reasoning_value(v, &mut texts);
+    }
+    if let Some(Value::Array(items)) = delta.get("reasoning_details") {
+        for item in items {
+            // 跳过仅加密项(CPA 同语义)
+            if item.get("encrypted_content").is_some() || item.get("data").is_some() {
+                continue;
+            }
+            for field in ["text", "reasoning", "thinking", "summary"] {
+                if let Some(v) = item.get(field) {
+                    collect_reasoning_value(v, &mut texts);
+                    break;
+                }
+            }
+        }
     }
     if let Some(v) = delta.get("reasoning") {
         collect_reasoning_value(v, &mut texts);
@@ -477,6 +554,7 @@ fn map_finish_reason(reason: &str) -> &'static str {
         "length" => "max_tokens",
         "tool_calls" => "tool_use",
         "function_call" => "tool_use",
+        "content_filter" => "refusal",
         _ => "end_turn",
     }
 }
@@ -517,8 +595,11 @@ where
             let chunk = match chunk {
                 Ok(c) => c,
                 Err(e) => {
-                    yield Err(std::io::Error::other(e));
-                    break;
+                    // 上游中断:发结构化 error 事件,不裸断流
+                    for out in relay.stream_error(&e.to_string()) {
+                        yield Ok(out);
+                    }
+                    return;
                 }
             };
             for ev in parser.push(&chunk) {
@@ -532,6 +613,10 @@ where
             for out in relay.process(&ev) {
                 yield Ok(out);
             }
+        }
+        // EOF 兜底:上游没发 [DONE] 时也保证 message_delta + message_stop
+        for out in relay.finish() {
+            yield Ok(out);
         }
     })
 }

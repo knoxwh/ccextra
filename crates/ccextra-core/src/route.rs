@@ -38,13 +38,22 @@ pub struct ProviderConfig {
     /// 覆盖全局代理;Some("direct") = 直连(缺省 = 用全局)
     #[serde(default)]
     pub proxy_url: Option<String>,
+    /// 注入派生 prompt_cache_key(对齐 CPA support-prompt-cache-key,默认 false;
+    /// 仅 openai_chat / openai_responses 生效)
+    #[serde(default)]
+    pub prompt_cache_key: bool,
     pub models: Vec<ModelConfig>,
 }
 
-#[derive(Debug, Clone, Deserialize)]
+#[derive(Debug, Clone, Deserialize, Default)]
 pub struct ModelConfig {
     pub name: String,      // 上游真实名
     pub alias: String,     // 入站别名
+    /// 模型上下文上限(可选);缺省 max_input_tokens=200000, max_tokens=64000
+    #[serde(default)]
+    pub max_input_tokens: Option<u64>,
+    #[serde(default)]
+    pub max_tokens: Option<u64>,
 }
 
 /// 路由决策:从入站 model 解析到 (provider, protocol, upstream_model)
@@ -99,20 +108,22 @@ mod tests {
     fn test_resolve_route() {
         let providers = vec![
             ProviderConfig {
-                name: "evol-claude".into(),
+                name: "test-claude".into(),
                 protocol: Protocol::Claude,
                 base_url: "https://example.com".into(),
                 key: "sk-test".into(),
                 proxy_url: None,
+                prompt_cache_key: false,
                 models: vec![ModelConfig {
                     name: "claude-opus-5".into(),
-                    alias: "evol-opus-5".into(),
+                    alias: "test-opus-5".into(),
+                    ..Default::default()
                 }],
             },
         ];
 
-        let route = resolve_route("evol-opus-5", &providers).unwrap();
-        assert_eq!(route.provider, "evol-claude");
+        let route = resolve_route("test-opus-5", &providers).unwrap();
+        assert_eq!(route.provider, "test-claude");
         assert_eq!(route.protocol, Protocol::Claude);
         assert_eq!(route.upstream_model, "claude-opus-5");
     }
@@ -133,9 +144,11 @@ mod tests {
                 base_url: "https://a.com".into(),
                 key: "sk-a".into(),
                 proxy_url: None,
+                prompt_cache_key: false,
                 models: vec![ModelConfig {
                     name: "model-a".into(),
                     alias: "shared-alias".into(),
+                    ..Default::default()
                 }],
             },
             ProviderConfig {
@@ -144,9 +157,11 @@ mod tests {
                 base_url: "https://b.com".into(),
                 key: "sk-b".into(),
                 proxy_url: None,
+                prompt_cache_key: false,
                 models: vec![ModelConfig {
                     name: "model-b".into(),
                     alias: "shared-alias".into(),
+                    ..Default::default()
                 }],
             },
         ];

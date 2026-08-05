@@ -23,7 +23,7 @@ mod tests {
     #[test]
     fn test_passthrough_only_changes_model() {
         let mut body = json!({
-            "model": "evol-opus-5",
+            "model": "test-opus-5",
             "messages": [{"role": "user", "content": "test"}],
             "max_tokens": 1024,
             "thinking": {"type": "enabled"}

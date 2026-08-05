@@ -18,53 +18,106 @@ use serde_json::{json, Value};
 use super::{ConvertError, Result};
 
 /// Anthropic messages → OpenAI chat/completions
+///
+/// 对齐 CPA `ConvertClaudeRequestToOpenAI`(openai/claude/openai_claude_request.go):
+/// 顶层键序、system 数组形态、messages 内 role=system 提取、user 透传。
+/// 差异:content 字符串保持数组(参考 ai-gateway 形态归一化,解决客户端跨轮
+/// 数组/字符串漂移,见 convert_message 注释)。
 pub fn convert_to_openai_chat(body: &mut Value, upstream_model: &str) -> Result<()> {
-    let mut openai = json!({
-        "model": upstream_model,
-        "messages": [],
-        "stream": body.get("stream").unwrap_or(&json!(true)).clone(),
-    });
+    let mut openai = serde_json::Map::new();
 
-    // System → messages[0]
+    // 对齐 CPA 顶层键序:model,max_tokens,temperature/top_p,stop,stream,
+    // reasoning_effort,messages,tools,tool_choice,user
+    openai.insert("model".into(), json!(upstream_model));
+
+    // max_tokens 透传
+    if let Some(val) = body.get("max_tokens") {
+        openai.insert("max_tokens".into(), val.clone());
+    }
+    // 对齐 CPA:temperature 与 top_p 互斥,top_p 仅在无 temperature 时发
+    if let Some(val) = body.get("temperature") {
+        openai.insert("temperature".into(), val.clone());
+    } else if let Some(val) = body.get("top_p") {
+        openai.insert("top_p".into(), val.clone());
+    }
+    // stop_sequences → stop(单元素发字符串,对齐 CPA)
+    if let Some(seqs) = body.get("stop_sequences").and_then(|v| v.as_array()) {
+        let stops: Vec<&str> = seqs.iter().filter_map(|s| s.as_str()).collect();
+        if stops.len() == 1 {
+            openai.insert("stop".into(), json!(stops[0]));
+        } else if !stops.is_empty() {
+            openai.insert("stop".into(), json!(stops));
+        }
+    }
+    openai.insert(
+        "stream".into(),
+        body.get("stream").unwrap_or(&json!(true)).clone(),
+    );
+
+    // thinking → reasoning_effort(忠实 CPA thinking 映射)
+    if let Some(effort) = body
+        .get("thinking")
+        .and_then(|t| crate::thinking::resolve_effort(t, &crate::thinking::DEFAULT_SUPPORTED))
+    {
+        openai.insert("reasoning_effort".into(), json!(effort));
+    }
+
+    let mut messages: Vec<Value> = Vec::new();
+
+    // System → messages[0](逐块剥离计费归属与空白,输出 text 数组,对齐 CPA)
     if let Some(system) = body.get("system") {
-        let text = match system {
-            Value::String(s) => s.clone(),
-            Value::Array(blocks) => blocks
-                .iter()
-                .filter_map(|b| b.get("text").and_then(|t| t.as_str()))
-                .collect::<Vec<_>>()
-                .join("\n\n"),
+        let mut items: Vec<Value> = Vec::new();
+        match system {
+            Value::String(s) => {
+                if !s.trim().is_empty() && !super::is_attribution_text(s) {
+                    items.push(json!({"type": "text", "text": s}));
+                }
+            }
+            Value::Array(blocks) => {
+                for b in blocks {
+                    if let Some(t) = b.get("text").and_then(|v| v.as_str()) {
+                        if !t.trim().is_empty() && !super::is_attribution_text(t) {
+                            items.push(json!({"type": "text", "text": t}));
+                        }
+                    }
+                }
+            }
             _ => return Err(ConvertError::InvalidType("system".into())),
-        };
-        if !text.is_empty() {
-            openai["messages"]
-                .as_array_mut()
-                .unwrap()
-                .push(json!({"role": "system", "content": text}));
+        }
+        if !items.is_empty() {
+            messages.push(json!({"role": "system", "content": items}));
         }
     }
 
-    // thinking → reasoning_effort
-    if let Some(effort) = thinking_to_effort(body.get("thinking")) {
-        openai["reasoning_effort"] = json!(effort);
-    }
-
     // Messages 逐条转换
-    if let Some(messages) = body.get("messages").and_then(|v| v.as_array()) {
-        for msg in messages {
+    if let Some(message_arr) = body.get("messages").and_then(|v| v.as_array()) {
+        for msg in message_arr {
             let role = msg
                 .get("role")
                 .and_then(|v| v.as_str())
                 .ok_or_else(|| ConvertError::MissingField("role".into()))?;
             let content = msg.get("content").cloned().unwrap_or(json!(""));
 
+            // messages 内 role=system:提取文本包 <system-reminder> 转 user
+            // (对齐 CPA ClaudeMessageSystemReminderText)
+            if role == "system" {
+                if let Some(reminder) = system_reminder_text(&content) {
+                    messages.push(json!({
+                        "role": "user",
+                        "content": [{"type": "text", "text": reminder}]
+                    }));
+                }
+                continue;
+            }
+
             // 单条消息转换结果(可能展开成多条:tool_result 在前)
             let converted = convert_message(role, &content)?;
-            for m in converted {
-                openai["messages"].as_array_mut().unwrap().push(m);
-            }
+            messages.extend(converted);
         }
     }
+
+    // 对齐 CPA 键序:messages 在 tools 之前
+    openai.insert("messages".into(), json!(messages));
 
     // Tools: input_schema → parameters
     if let Some(tools) = body.get("tools").and_then(|v| v.as_array()) {
@@ -84,85 +137,85 @@ pub fn convert_to_openai_chat(body: &mut Value, upstream_model: &str) -> Result<
                 }
             });
             if let Some(schema) = tool.get("input_schema") {
-                fn_obj["function"]["parameters"] = schema.clone();
+                fn_obj["function"]["parameters"] = super::normalize_object_schema_properties(schema.clone());
             }
             openai_tools.push(fn_obj);
         }
-        openai["tools"] = json!(openai_tools);
+        openai.insert("tools".into(), json!(openai_tools));
     }
 
     // tool_choice 映射
     if let Some(tc) = body.get("tool_choice") {
         if let Some(choice) = convert_tool_choice(tc) {
-            openai["tool_choice"] = choice;
+            openai.insert("tool_choice".into(), choice);
         }
     }
 
-    // stop_sequences → stop
-    if let Some(seqs) = body.get("stop_sequences").and_then(|v| v.as_array()) {
-        let stops: Vec<&str> = seqs.iter().filter_map(|s| s.as_str()).collect();
-        if !stops.is_empty() {
-            openai["stop"] = json!(stops);
-        }
+    // user 参数透传(对齐 CPA)
+    if let Some(user) = body.get("user") {
+        openai.insert("user".into(), user.clone());
     }
 
-    // 其他参数透传
-    for key in &["max_tokens", "max_output_tokens", "temperature", "top_p"] {
-        if let Some(val) = body.get(*key) {
-            openai[key] = val.clone();
-        }
-    }
+    // 对齐 CPA SetBoolIfDifferent(stream_options.include_usage, true):
+    // 强制上游在流尾发 usage chunk。kimi/moonshot 等上游未开启时全程无
+    // usage,响应 usage 全 0,客户端 ccstatusline 无 context 显示。
+    openai.insert("stream_options".into(), json!({"include_usage": true}));
 
-    *body = openai;
+    *body = Value::Object(openai);
     Ok(())
 }
 
-/// thinking.budget_tokens → reasoning_effort level
-fn thinking_to_effort(thinking: Option<&Value>) -> Option<&'static str> {
-    let thinking = thinking?;
-    if !thinking.is_object() {
-        return None;
-    }
-    let ty = thinking.get("type").and_then(|v| v.as_str())?;
-    let budget = match ty {
-        "enabled" => thinking
-            .get("budget_tokens")
-            .and_then(|v| v.as_i64())
-            .unwrap_or(-1),
-        "disabled" => 0,
-        "adaptive" => thinking
-            .get("budget_tokens")
-            .and_then(|v| v.as_i64())
-            .unwrap_or(-1),
+/// messages 内 role=system 消息 → 文本提取,包 <system-reminder> 标记
+/// (对齐 CPA common.ClaudeMessageSystemReminderText)。
+fn system_reminder_text(content: &Value) -> Option<String> {
+    let parts: Vec<&str> = match content {
+        Value::String(s) => {
+            if s.trim().is_empty() || super::is_attribution_text(s) {
+                return None;
+            }
+            vec![s.as_str()]
+        }
+        Value::Array(blocks) => blocks
+            .iter()
+            .filter_map(|b| {
+                if b.get("type").and_then(|t| t.as_str()) != Some("text") {
+                    return None;
+                }
+                let t = b.get("text").and_then(|v| v.as_str())?;
+                if t.trim().is_empty() || super::is_attribution_text(t) {
+                    None
+                } else {
+                    Some(t)
+                }
+            })
+            .collect(),
         _ => return None,
     };
-    Some(budget_to_effort(budget))
-}
-
-/// 预算 → 级别(与 CPA ConvertBudgetToLevel 一致)
-fn budget_to_effort(budget: i64) -> &'static str {
-    match budget {
-        b if b < -1 => "auto",
-        -1 => "auto",
-        0 => "none",
-        b if b <= 512 => "minimal",
-        b if b <= 1024 => "low",
-        b if b <= 8192 => "medium",
-        b if b <= 24576 => "high",
-        _ => "xhigh",
+    if parts.is_empty() {
+        return None;
     }
+    let text = parts.join("\n");
+    if text.trim().is_empty() {
+        return None;
+    }
+    Some(format!("<system-reminder>\n{text}\n</system-reminder>"))
 }
 
 /// 转换单条消息,返回一个或多个 openai 消息(tool_result 展开在前)
 fn convert_message(role: &str, content: &Value) -> Result<Vec<Value>> {
-    // 字符串内容
+    // 字符串内容:统一为 text 数组(保留 ai-gateway 形态归一化)。
+    // CC 客户端同一条消息当轮发数组、历史重建发字符串,若不统一,跨轮字节
+    // 漂移破坏上游缓存前缀(4096 回归)。空内容输出空数组。
     if let Some(s) = content.as_str() {
-        return Ok(vec![json!({"role": role, "content": s})]);
+        if s.is_empty() {
+            return Ok(vec![json!({"role": role, "content": []})]);
+        }
+        return Ok(vec![json!({"role": role, "content": [{"type": "text", "text": s}]})]);
     }
 
-    // 空内容
+    // 空内容(缺失/null):丢弃消息(对齐 CPA,content 缺失/null 不进入数组/字符串分支)
     if content.is_null() {
-        return Ok(vec![json!({"role": role, "content": ""})]);
+        return Ok(Vec::new());
     }
 
     let Some(parts) = content.as_array() else {
@@ -178,11 +231,19 @@ fn convert_message(role: &str, content: &Value) -> Result<Vec<Value>> {
         let ptype = part.get("type").and_then(|v| v.as_str()).unwrap_or("");
         match ptype {
             "thinking" => {
-                // 仅 assistant 映射(防注入);非 assistant 忽略
+                // 仅 assistant 映射(防注入);非 assistant 忽略。
+                // 对齐 CPA shouldMapClaudeThinkingToGPTReasoning:只回放无签名思考
+                // (同链路历史);跨提供方签名块跳过,防上游拒收。
                 if role == "assistant" {
-                    if let Some(t) = part.get("thinking").and_then(|v| v.as_str()) {
-                        if !t.trim().is_empty() {
-                            reasoning_parts.push(t.to_string());
+                    let signed = part
+                        .get("signature")
+                        .and_then(|v| v.as_str())
+                        .is_some_and(|s| !s.trim().is_empty());
+                    if !signed {
+                        if let Some(t) = part.get("thinking").and_then(|v| v.as_str()) {
+                            if !t.trim().is_empty() {
+                                reasoning_parts.push(t.to_string());
+                            }
                         }
                     }
                 }
@@ -190,7 +251,10 @@ fn convert_message(role: &str, content: &Value) -> Result<Vec<Value>> {
             "redacted_thinking" => { /* 显式忽略 */ }
             "text" => {
                 if let Some(t) = part.get("text").and_then(|v| v.as_str()) {
-                    content_items.push(json!({"type": "text", "text": t}));
+                    // 对齐 CPA convertClaudeContentPart:空白块与计费归属块剥离
+                    if !t.trim().is_empty() && !super::is_attribution_text(t) {
+                        content_items.push(json!({"type": "text", "text": t}));
+                    }
                 }
             }
             "image" => {
@@ -226,7 +290,7 @@ fn convert_message(role: &str, content: &Value) -> Result<Vec<Value>> {
                 tool_results.push(json!({
                     "role": "tool",
                     "tool_call_id": tool_call_id,
-                    "content": content_val
+                    "content": convert_tool_result_content(&content_val)
                 }));
             }
             _ => {}
@@ -267,18 +331,85 @@ fn convert_message(role: &str, content: &Value) -> Result<Vec<Value>> {
     Ok(out)
 }
 
-/// image block → data URL(base64)或 url
-fn image_to_url(part: &Value) -> Option<String> {
-    let source = part.get("source")?;
-    let media_type = source.get("media_type").and_then(|v| v.as_str()).unwrap_or("image/png");
-    match source.get("type").and_then(|v| v.as_str()) {
-        Some("base64") => {
-            let data = source.get("data").and_then(|v| v.as_str())?;
-            Some(format!("data:{media_type};base64,{data}"))
+/// tool_result content → openai tool 消息 content(对齐 CPA convertClaudeToolResultContent)
+/// - 字符串 → 原样
+/// - 数组含 image → 保留 parts 数组(text/image_url)
+/// - 纯文本数组 → "\n\n" 连接为字符串(tool role 兼容性最好)
+fn convert_tool_result_content(content: &Value) -> Value {
+    match content {
+        Value::String(_) => content.clone(),
+        Value::Array(parts) => {
+            let has_image = parts
+                .iter()
+                .any(|p| p.get("type").and_then(|t| t.as_str()) == Some("image"));
+            if has_image {
+                let items: Vec<Value> = parts
+                    .iter()
+                    .filter_map(|p| match p.get("type").and_then(|t| t.as_str()) {
+                        Some("text") => Some(json!({
+                            "type": "text",
+                            "text": p.get("text").and_then(|v| v.as_str()).unwrap_or("")
+                        })),
+                        Some("image") => image_to_url(p).map(|url| {
+                            json!({"type": "image_url", "image_url": {"url": url}})
+                        }),
+                        _ => None,
+                    })
+                    .collect();
+                Value::Array(items)
+            } else {
+                let texts: Vec<&str> = parts
+                    .iter()
+                    .filter_map(|p| {
+                        if p.is_string() {
+                            p.as_str()
+                        } else {
+                            p.get("text").and_then(|v| v.as_str())
+                        }
+                    })
+                    .collect();
+                let joined = texts.join("\n\n");
+                if joined.trim().is_empty() {
+                    content.clone()
+                } else {
+                    Value::String(joined)
+                }
+            }
         }
-        Some("url") => source.get("url").and_then(|v| v.as_str()).map(|s| s.to_string()),
-        _ => None,
+        Value::Object(_) => {
+            if content.get("type").and_then(|t| t.as_str()) == Some("image") {
+                if let Some(url) = image_to_url(content) {
+                    return json!([{"type": "image_url", "image_url": {"url": url}}]);
+                }
+            }
+            match content.get("text").and_then(|v| v.as_str()) {
+                Some(t) => Value::String(t.to_string()),
+                None => content.clone(),
+            }
+        }
+        _ => content.clone(),
     }
+}
+
+/// image block → data URL(base64)或 url
+/// 对齐 CPA convertClaudeContentPart:media_type 空默认 application/octet-stream,
+/// 无 source 时回退到顶层 url。
+fn image_to_url(part: &Value) -> Option<String> {
+    let url = part.get("source").and_then(|source| {
+        let media_type = source
+            .get("media_type")
+            .and_then(|v| v.as_str())
+            .unwrap_or("application/octet-stream");
+        match source.get("type").and_then(|v| v.as_str()) {
+            Some("base64") => {
+                let data = source.get("data").and_then(|v| v.as_str())?;
+                Some(format!("data:{media_type};base64,{data}"))
+            }
+            Some("url") => source.get("url").and_then(|v| v.as_str()).map(|s| s.to_string()),
+            _ => None,
+        }
+    });
+    url.or_else(|| part.get("url").and_then(|v| v.as_str()).map(|s| s.to_string()))
 }
 
 /// tool_choice 映射:auto→auto, any→required, tool→specific function
@@ -306,7 +437,7 @@ mod tests {
     #[test]
     fn test_basic_conversion() {
         let mut body = json!({
-            "model": "evol-opus-5",
+            "model": "test-opus-5",
             "messages": [{"role": "user", "content": "hello"}],
             "max_tokens": 1024
         });
@@ -324,7 +455,8 @@ mod tests {
         });
         convert_to_openai_chat(&mut body, "gpt").unwrap();
         assert_eq!(body["messages"][0]["role"], "system");
-        assert_eq!(body["messages"][0]["content"], "You are helpful");
+        // content 为 text 数组(对齐 CPA system 数组形态)
+        assert_eq!(body["messages"][0]["content"][0]["text"], "You are helpful");
     }
 
     #[test]
@@ -403,10 +535,11 @@ mod tests {
             "messages": []
         });
         convert_to_openai_chat(&mut body, "gpt").unwrap();
-        // 空块也应处理,用 \n\n 连接
-        let system_text = body["messages"][0]["content"].as_str().unwrap();
-        assert!(system_text.contains("You are helpful"));
-        assert!(system_text.contains("Answer concisely"));
+        // 空块剥离,text 数组保留非空项(对齐 CPA appendSystemContent)
+        let content = body["messages"][0]["content"].as_array().unwrap();
+        assert_eq!(content.len(), 2);
+        assert_eq!(content[0]["text"], "You are helpful");
+        assert_eq!(content[1]["text"], "Answer concisely");
     }
 
     #[test]
@@ -450,6 +583,149 @@ mod tests {
     }
 
     #[test]
+    fn test_system_attribution_stripped() {
+        let mut body = json!({
+            "model": "test",
+            "system": [
+                {"type": "text", "text": "x-anthropic-billing-header: fp=abc123"},
+                {"type": "text", "text": "Real instructions"}
+            ],
+            "messages": []
+        });
+        convert_to_openai_chat(&mut body, "gpt").unwrap();
+        let content = body["messages"][0]["content"].as_array().unwrap();
+        assert_eq!(content.len(), 1);
+        assert_eq!(content[0]["text"], "Real instructions");
+    }
+
+    #[test]
+    fn test_system_only_attribution_dropped() {
+        let mut body = json!({
+            "model": "test",
+            "system": "  x-anthropic-billing-header: fp=abc123",
+            "messages": [{"role": "user", "content": "hi"}]
+        });
+        convert_to_openai_chat(&mut body, "gpt").unwrap();
+        // system 消息不应存在,messages[0] 直接是 user
+        assert_eq!(body["messages"][0]["role"], "user");
+    }
+
+    #[test]
+    fn test_message_text_attribution_stripped() {
+        let mut body = json!({
+            "model": "test",
+            "messages": [{"role": "user", "content": [
+                {"type": "text", "text": "x-anthropic-billing-header: fp=xyz"},
+                {"type": "text", "text": "real question"}
+            ]}]
+        });
+        convert_to_openai_chat(&mut body, "gpt").unwrap();
+        let content = body["messages"][0]["content"].as_array().unwrap();
+        assert_eq!(content.len(), 1);
+        assert_eq!(content[0]["text"], "real question");
+    }
+
+    #[test]
+    fn test_thinking_signed_skipped_unsigned_mapped() {
+        let mut body = json!({
+            "model": "test",
+            "messages": [{"role": "assistant", "content": [
+                {"type": "thinking", "thinking": "unsigned"},
+                {"type": "thinking", "thinking": "signed", "signature": "sig-1"},
+                {"type": "text", "text": "answer"}
+            ]}]
+        });
+        convert_to_openai_chat(&mut body, "gpt").unwrap();
+        let msg = &body["messages"][0];
+        // 仅无签名思考进 reasoning_content
+        assert_eq!(msg["reasoning_content"], "unsigned");
+        assert_eq!(msg["content"][0]["text"], "answer");
+    }
+
+    #[test]
+    fn test_tool_result_array_joined_to_string() {
+        let mut body = json!({
+            "model": "test",
+            "messages": [
+                {"role": "assistant", "content": [
+                    {"type": "tool_use", "id": "t1", "name": "f", "input": {}}
+                ]},
+                {"role": "user", "content": [
+                    {"type": "tool_result", "tool_use_id": "t1", "content": [
+                        {"type": "text", "text": "part1"},
+                        {"type": "text", "text": "part2"}
+                    ]}
+                ]}
+            ]
+        });
+        convert_to_openai_chat(&mut body, "gpt").unwrap();
+        let tool_msg = &body["messages"][1];
+        assert_eq!(tool_msg["role"], "tool");
+        assert_eq!(tool_msg["content"], "part1\n\npart2");
+    }
+
+    #[test]
+    fn test_tool_result_with_image_keeps_array() {
+        let mut body = json!({
+            "model": "test",
+            "messages": [
+                {"role": "assistant", "content": [
+                    {"type": "tool_use", "id": "t1", "name": "f", "input": {}}
+                ]},
+                {"role": "user", "content": [
+                    {"type": "tool_result", "tool_use_id": "t1", "content": [
+                        {"type": "text", "text": "see:"},
+                        {"type": "image", "source": {"type": "base64", "media_type": "image/png", "data": "AA"}}
+                    ]}
+                ]}
+            ]
+        });
+        convert_to_openai_chat(&mut body, "gpt").unwrap();
+        let content = &body["messages"][1]["content"];
+        assert_eq!(content[0]["type"], "text");
+        assert_eq!(content[1]["type"], "image_url");
+    }
+
+    #[test]
+    fn test_schema_properties_filled() {
+        let mut body = json!({
+            "model": "test",
+            "messages": [],
+            "tools": [{
+                "name": "t",
+                "description": "tool",
+                "input_schema": {"type": "object"}
+            }]
+        });
+        convert_to_openai_chat(&mut body, "gpt").unwrap();
+        assert_eq!(body["tools"][0]["function"]["parameters"]["properties"], json!({}));
+    }
+
+    #[test]
+    fn test_stop_single_is_string() {
+        let mut body = json!({
+            "model": "test",
+            "messages": [],
+            "stop_sequences": ["END"]
+        });
+        convert_to_openai_chat(&mut body, "gpt").unwrap();
+        assert_eq!(body["stop"], "END");
+    }
+
+    #[test]
+    fn test_temperature_suppresses_top_p() {
+        let mut body = json!({
+            "model": "test",
+            "messages": [],
+            "temperature": 0.5,
+            "top_p": 0.9
+        });
+        convert_to_openai_chat(&mut body, "gpt").unwrap();
+        assert_eq!(body["temperature"], 0.5);
+        assert!(body.get("top_p").is_none());
+    }
+
+    #[test]
     fn test_tool_choice_mappings() {
         let mut body = json!({
             "model": "test",
@@ -475,5 +751,106 @@ mod tests {
         convert_to_openai_chat(&mut body3, "gpt").unwrap();
         assert_eq!(body3["tool_choice"]["type"], "function");
         assert_eq!(body3["tool_choice"]["function"]["name"], "search");
+    }
+
+    #[test]
+    fn test_message_system_reminder_to_user() {
+        // messages 内 role=system:提取文本包 <system-reminder> 转 user(对齐 CPA)
+        let mut body = json!({
+            "model": "test",
+            "messages": [
+                {"role": "user", "content": "hi"},
+                {"role": "system", "content": [
+                    {"type": "text", "text": "Token usage: 1/2; 1 remaining"}
+                ]}
+            ]
+        });
+        convert_to_openai_chat(&mut body, "gpt").unwrap();
+        let msgs = body["messages"].as_array().unwrap();
+        assert_eq!(msgs.len(), 2);
+        assert_eq!(msgs[1]["role"], "user");
+        assert!(msgs[1]["content"][0]["text"].as_str().unwrap().contains("<system-reminder>"));
+        assert!(msgs[1]["content"][0]["text"].as_str().unwrap().contains("Token usage"));
+    }
+
+    #[test]
+    fn test_message_system_attribution_reminder_dropped() {
+        // role=system 内容全为 attribution → 不输出 user 消息(对齐 CPA)
+        let mut body = json!({
+            "model": "test",
+            "messages": [
+                {"role": "system", "content": "  x-anthropic-billing-header: fp=abc"}
+            ]
+        });
+        convert_to_openai_chat(&mut body, "gpt").unwrap();
+        let msgs = body["messages"].as_array().unwrap();
+        assert_eq!(msgs.len(), 0);
+    }
+
+    #[test]
+    fn test_user_param_passthrough() {
+        // user 参数透传(对齐 CPA)
+        let mut body = json!({
+            "model": "test",
+            "messages": [],
+            "user": "user-abc"
+        });
+        convert_to_openai_chat(&mut body, "gpt").unwrap();
+        assert_eq!(body["user"], "user-abc");
+    }
+
+    #[test]
+    fn test_top_level_key_order_matches_cpa() {
+        // 对齐 CPA 顶层键序:model,max_tokens,temperature/top_p,stop,stream,
+        // reasoning_effort,messages,tools,tool_choice,user
+        let mut body = json!({
+            "model": "test",
+            "messages": [{"role": "user", "content": "hi"}],
+            "max_tokens": 100,
+            "temperature": 0.5,
+            "stop_sequences": ["END"],
+            "stream": false,
+            "thinking": {"type": "enabled", "budget_tokens": 4096},
+            "tools": [{"name": "t", "input_schema": {"type": "object"}}],
+            "tool_choice": {"type": "auto"},
+            "user": "u1"
+        });
+        convert_to_openai_chat(&mut body, "gpt").unwrap();
+        let keys: Vec<&str> = body.as_object().unwrap().keys().map(|k| k.as_str()).collect();
+        let expected = [
+            "model", "max_tokens", "temperature", "stop", "stream",
+            "reasoning_effort", "messages", "tools", "tool_choice", "user",
+            "stream_options",
+        ];
+        assert_eq!(keys, expected);
+        assert_eq!(body["stream_options"]["include_usage"], true);
+    }
+
+    #[test]
+    fn test_image_media_type_default_octet_stream() {
+        // media_type 缺省 → application/octet-stream(对齐 CPA)
+        let mut body = json!({
+            "model": "test",
+            "messages": [{"role": "user", "content": [
+                {"type": "image", "source": {"type": "base64", "data": "AAAA"}}
+            ]}]
+        });
+        convert_to_openai_chat(&mut body, "gpt").unwrap();
+        let url = body["messages"][0]["content"][0]["image_url"]["url"].as_str().unwrap();
+        assert!(url.starts_with("data:application/octet-stream;base64,AAAA"));
+    }
+
+    #[test]
+    fn test_image_top_level_url_fallback() {
+        // 无 source 时回退顶层 url(对齐 CPA)
+        let mut body = json!({
+            "model": "test",
+            "messages": [{"role": "user", "content": [
+                {"type": "image", "url": "https://example.com/img.png"}
+            ]}]
+        });
+        convert_to_openai_chat(&mut body, "gpt").unwrap();
+        let url = body["messages"][0]["content"][0]["image_url"]["url"].as_str().unwrap();
+        assert_eq!(url, "https://example.com/img.png");
     }
 }

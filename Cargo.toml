@@ -45,11 +45,17 @@ thiserror = "1.0"
 
 # Logging
 tracing = "0.1"
-tracing-subscriber = { version = "0.3", features = ["env-filter", "json"] }
+tracing-subscriber = { version = "0.3", features = ["env-filter", "json", "time"] }
 
 # Crypto (for session key derivation)
 sha2 = "0.10"
 hex = "0.4"
+
+# UUIDv5 (prompt_cache_key 派生,对齐 CPA uuid.NewSHA1(NameSpaceOID, ...))
+uuid = { version = "1", features = ["v5"] }
+
+# Secret key hashing (参考 CPA:明文自动转 bcrypt)
+bcrypt = "0.15"
 
 # Pattern matching (for payload model wildcards)
 globset = "0.4"
@@ -58,6 +64,7 @@ globset = "0.4"
 clap = { version = "4.4", features = ["derive"] }
 
 [profile.release]
-lto = true
-codegen-units = 1
+# 弃 LTO + 单 codegen 单元(编译慢),改多 codegen 单元并行提速
+lto = false
+codegen-units = 16
 strip = true

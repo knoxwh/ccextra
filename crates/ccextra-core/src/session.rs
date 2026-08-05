@@ -1,39 +1,64 @@
-// 会话身份派生:从 messages[0] 内容哈希生成 session_key
+// 会话身份派生(对齐 CPA internal/runtime/executor/helps/claude_code_session.go)
 //
-// 复用 tklite conversation_discriminator 逻辑:
-// - 排除 model 字段(切模型不换桶)
-// - 对 messages[0].content 做 SHA-256
-// - 输出 hex 字符串
+// 优先级:
+// 1. 请求头 X-Claude-Code-Session-Id(Claude Code 原生发送,整会话稳定,
+//    压缩/续接/reminder 注入均不影响)
+// 2. metadata.user_id 尾部 `_session_<uuid>`(或 JSON 形态的 session_id)
+// 3. 兜底:messages[0].content SHA-256(旧行为,仅非 Claude Code 客户端走到)
+// 4. "anonymous"
+//
+// 背景:messages[0] 会被 Claude Code 每请求注入 system-reminder、
+// 上下文压缩后整体替换,不是稳定身份。CPA/tklite 均不依赖它。
 
+use http::HeaderMap;
 use serde_json::Value;
-use sha2::{Digest, Sha256};
 
-/// 从 anthropic messages body 派生 session_key
-///
-/// 输入:完整请求体 JSON
-/// 输出:32 字节哈希的 hex 字符串(64 字符)
-pub fn derive_session_key(body: &Value) -> String {
-    let messages = match body.get("messages").and_then(|v| v.as_array()) {
-        Some(arr) if !arr.is_empty() => arr,
-        _ => return "anonymous".to_string(), // 空 messages 或无效结构
-    };
+/// Claude Code 会话头(小写形式,HeaderMap 查找大小写不敏感)
+pub const CLAUDE_CODE_SESSION_HEADER: &str = "x-claude-code-session-id";
 
-    let first_message = &messages[0];
+/// 提取 Claude Code 会话 ID(对齐 CPA ExtractClaudeCodeSessionID)
+pub fn extract_claude_code_session(headers: &HeaderMap, body: &Value) -> Option<String> {
+    if let Some(v) = headers
+        .get(CLAUDE_CODE_SESSION_HEADER)
+        .and_then(|v| v.to_str().ok())
+    {
+        let v = v.trim();
+        if !v.is_empty() {
+            return Some(v.to_string());
+        }
+    }
+    let user_id = body
+        .get("metadata")
+        .and_then(|m| m.get("user_id"))
+        .and_then(|u| u.as_str())?;
+    session_id_from_user_id(user_id)
+}
 
-    // 只哈希 content,排除 role(固定 user)
-    let content = match first_message.get("content") {
-        Some(c) => c,
-        None => return "anonymous".to_string(),
-    };
-
-    // 规范化 JSON(排除空格差异)
-    let canonical = serde_json::to_string(content).unwrap_or_default();
-
-    let mut hasher = Sha256::new();
-    hasher.update(canonical.as_bytes());
-    let hash = hasher.finalize();
-
-    hex::encode(hash)
+/// user_id 形态(对齐 CPA extractClaudeCodeSessionIDFromPayload):
+/// - "..._session_<hex-uuid>" 尾缀
+/// - JSON 字符串 {"session_id": "..."}
+fn session_id_from_user_id(user_id: &str) -> Option<String> {
+    const MARKER: &str = "_session_";
+    if let Some(idx) = user_id.rfind(MARKER) {
+        let suffix = &user_id[idx + MARKER.len()..];
+        if !suffix.is_empty() && suffix.chars().all(|c| c.is_ascii_hexdigit() || c == '-') {
+            return Some(suffix.to_string());
+        }
+    }
+    if user_id.starts_with('{') {
+        if let Ok(v) = serde_json::from_str::<Value>(user_id) {
+            let sid = v
+                .get("session_id")
+                .and_then(|s| s.as_str())
+                .unwrap_or("")
+                .trim()
+                .to_string();
+            if !sid.is_empty() {
+                return Some(sid);
+            }
+        }
+    }
+    None
 }
 
 #[cfg(test)]
@@ -41,64 +66,68 @@ mod tests {
     use super::*;
     use serde_json::json;
 
+    fn headers_with(name: &str, value: &str) -> HeaderMap {
+        let mut h = HeaderMap::new();
+        h.insert(
+            name.parse::<http::header::HeaderName>().unwrap(),
+            value.parse().unwrap(),
+        );
+        h
+    }
+
     #[test]
-    fn test_derive_session_key_simple() {
+    fn test_header_takes_priority() {
+        let headers = headers_with("x-claude-code-session-id", "sess-abc-123");
         let body = json!({
-            "model": "claude-opus-5",
-            "messages": [
-                {"role": "user", "content": "hello"}
-            ]
+            "metadata": {"user_id": "user_x_session_deadbeef-dead"},
+            "messages": [{"role": "user", "content": "hello"}]
         });
-
-        let key1 = derive_session_key(&body);
-        assert_eq!(key1.len(), 64); // SHA-256 hex = 64 字符
-
-        // 相同 content 应得到相同 key
-        let key2 = derive_session_key(&body);
-        assert_eq!(key1, key2);
+        assert_eq!(
+            extract_claude_code_session(&headers, &body).as_deref(),
+            Some("sess-abc-123")
+        );
     }
 
     #[test]
-    fn test_session_key_ignores_model() {
-        let body1 = json!({
-            "model": "model-a",
-            "messages": [{"role": "user", "content": "test"}]
-        });
-
-        let body2 = json!({
-            "model": "model-b",
-            "messages": [{"role": "user", "content": "test"}]
-        });
-
-        // model 不同但 messages[0] 相同 → session_key 相同
-        assert_eq!(derive_session_key(&body1), derive_session_key(&body2));
-    }
-
-    #[test]
-    fn test_session_key_changes_with_content() {
-        let body1 = json!({
-            "messages": [{"role": "user", "content": "message1"}]
-        });
-
-        let body2 = json!({
-            "messages": [{"role": "user", "content": "message2"}]
-        });
-
-        // content 不同 → session_key 不同
-        assert_ne!(derive_session_key(&body1), derive_session_key(&body2));
-    }
-
-    #[test]
-    fn test_empty_messages() {
+    fn test_header_case_insensitive_and_trimmed() {
+        let headers = headers_with("X-Claude-Code-Session-Id", "  sess-x  ");
         let body = json!({"messages": []});
-        assert_eq!(derive_session_key(&body), "anonymous");
+        assert_eq!(
+            extract_claude_code_session(&headers, &body).as_deref(),
+            Some("sess-x")
+        );
     }
 
     #[test]
-    fn test_missing_content() {
+    fn test_user_id_session_suffix() {
+        let headers = HeaderMap::new();
         let body = json!({
-            "messages": [{"role": "user"}]
+            "metadata": {"user_id": "user_abc_account_def_session_0123abcd-ef01-2345-6789-abcdef012345"},
+            "messages": []
         });
-        assert_eq!(derive_session_key(&body), "anonymous");
+        assert_eq!(
+            extract_claude_code_session(&headers, &body).as_deref(),
+            Some("0123abcd-ef01-2345-6789-abcdef012345")
+        );
+    }
+
+    #[test]
+    fn test_user_id_json_form() {
+        let headers = HeaderMap::new();
+        let body = json!({
+            "metadata": {"user_id": "{\"session_id\": \"json-sess-1\"}"},
+            "messages": []
+        });
+        assert_eq!(
+            extract_claude_code_session(&headers, &body).as_deref(),
+            Some("json-sess-1")
+        );
+    }
+
+    #[test]
+    fn test_no_session_returns_none() {
+        let headers = HeaderMap::new();
+        let body = json!({"messages": [{"role": "user", "content": "hi"}]});
+        assert_eq!(extract_claude_code_session(&headers, &body), None);
     }
 }

@@ -4,6 +4,10 @@ server:
   host: "127.0.0.1"
   port: 8222
 
+# 入口 secret key(可选)。配置后 /v1/models 与 /v1/messages 需 x-api-key 匹配。
+# Claude Code 用 ANTHROPIC_AUTH_TOKEN 或环境变量注入该 key。
+secret_key: "sk-ccextra-xxx"
+
 # Provider 定义
 providers:
   - name: evol-claude
@@ -13,6 +17,8 @@ providers:
     models:
       - name: claude-opus-5
         alias: evol-opus-5
+        max_input_tokens: 200000
+        max_tokens: 64000
       - name: claude-sonnet-5
         alias: evol-sonnet-5
       - name: claude-fable-5
@@ -30,6 +36,9 @@ providers:
     protocol: openai_responses
     base_url: https://ckff.dev/v1
     key: sk-xxx
+    # 注入派生 prompt_cache_key(对齐 CPA support-prompt-cache-key,默认 false)
+    # UUIDv5 按 会话+模型+agent 派生,与 CPA 同桶;仅 openai_chat/openai_responses 生效
+    prompt_cache_key: true
     models:
       - name: gpt-5.6-terra
         alias: ck-gpt-5.6-terra
