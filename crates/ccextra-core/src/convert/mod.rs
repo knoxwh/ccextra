@@ -7,10 +7,13 @@
 use thiserror::Error;
 
 pub mod passthrough;
+pub mod shorten;
 pub mod to_openai_chat;
 pub mod to_openai_responses;
 
 pub use passthrough::convert_passthrough;
+pub use shorten::build_reverse_map;
+pub use shorten::build_short_name_map;
 pub use to_openai_chat::convert_to_openai_chat;
 pub use to_openai_responses::convert_to_openai_responses;
 

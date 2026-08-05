@@ -57,7 +57,7 @@ pub fn convert_to_openai_chat(body: &mut Value, upstream_model: &str) -> Result<
     // thinking → reasoning_effort(忠实 CPA thinking 映射)
     if let Some(effort) = body
         .get("thinking")
-        .and_then(|t| crate::thinking::resolve_effort(t, &crate::thinking::DEFAULT_SUPPORTED))
+        .and_then(|t| crate::thinking::resolve_effort(t))
     {
         openai.insert("reasoning_effort".into(), json!(effort));
     }
@@ -159,7 +159,10 @@ pub fn convert_to_openai_chat(body: &mut Value, upstream_model: &str) -> Result<
     // 对齐 CPA SetBoolIfDifferent(stream_options.include_usage, true):
     // 强制上游在流尾发 usage chunk。kimi/moonshot 等上游未开启时全程无
     // usage,响应 usage 全 0,客户端 ccstatusline 无 context 显示。
-    openai.insert("stream_options".into(), json!({"include_usage": true}));
+    // 仅流式注入:非流请求带 stream_options 部分上游可能拒绝。
+    if body.get("stream").and_then(|v| v.as_bool()).unwrap_or(true) {
+        openai.insert("stream_options".into(), json!({"include_usage": true}));
+    }
 
     *body = Value::Object(openai);
     Ok(())
@@ -809,7 +812,7 @@ mod tests {
             "max_tokens": 100,
             "temperature": 0.5,
             "stop_sequences": ["END"],
-            "stream": false,
+            "stream": true,
             "thinking": {"type": "enabled", "budget_tokens": 4096},
             "tools": [{"name": "t", "input_schema": {"type": "object"}}],
             "tool_choice": {"type": "auto"},
@@ -824,6 +827,26 @@ mod tests {
         ];
         assert_eq!(keys, expected);
         assert_eq!(body["stream_options"]["include_usage"], true);
+    }
+
+    #[test]
+    fn test_stream_options_only_when_streaming() {
+        // 非流请求不注入 stream_options(部分上游会拒绝该字段)
+        let mut body = json!({
+            "model": "test",
+            "stream": false,
+            "messages": [{"role": "user", "content": "hi"}]
+        });
+        convert_to_openai_chat(&mut body, "gpt").unwrap();
+        assert!(body.get("stream_options").is_none(), "非流不应注入 stream_options");
+
+        // stream 缺省 = true → 注入
+        let mut body2 = json!({
+            "model": "test",
+            "messages": [{"role": "user", "content": "hi"}]
+        });
+        convert_to_openai_chat(&mut body2, "gpt").unwrap();
+        assert_eq!(body2["stream_options"]["include_usage"], true);
     }
 
     #[test]

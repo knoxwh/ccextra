@@ -62,10 +62,12 @@ struct ChatRelay {
     thinking_parts: Vec<String>,
     // 空 id 兜底合成计数(CPA SanitizeClaudeToolID 同角色)
     synthetic_tool_ids: u64,
+    // 入站 body 本地估算输入 token(CPA ClaudeInputTokenState;上游未回则填充)
+    estimated_input: Option<usize>,
 }
 
 impl ChatRelay {
-    fn new() -> Self {
+    fn new(estimated_input: Option<usize>) -> Self {
         Self {
             started: false,
             finished: false,
@@ -82,6 +84,7 @@ impl ChatRelay {
             usage_cached: 0,
             thinking_parts: Vec::new(),
             synthetic_tool_ids: 0,
+            estimated_input,
         }
     }
 
@@ -245,7 +248,7 @@ impl ChatRelay {
                     "content": [],
                     "stop_reason": null,
                     "stop_sequence": null,
-                    "usage": {"input_tokens": 0, "output_tokens": 0}
+                    "usage": {"input_tokens": self.estimated_input.unwrap_or(0), "output_tokens": 0}
                 }
             }),
         )]
@@ -548,7 +551,7 @@ fn collect_reasoning_value(node: &Value, out: &mut Vec<String>) {
 }
 
 /// OpenAI finish_reason → Anthropic stop_reason
-fn map_finish_reason(reason: &str) -> &'static str {
+pub(super) fn map_finish_reason(reason: &str) -> &'static str {
     match reason {
         "stop" => "end_turn",
         "length" => "max_tokens",
@@ -581,13 +584,16 @@ where
 }
 
 /// OpenAI chat → Anthropic SSE 状态机(realtime)
-pub fn relay_openai_chat_to_anthropic<S>(stream: S) -> SseStreamPin
+pub fn relay_openai_chat_to_anthropic<S>(
+    stream: S,
+    estimated_input_tokens: Option<usize>,
+) -> SseStreamPin
 where
     S: Stream<Item = Result<Bytes, reqwest::Error>> + Send + 'static,
 {
     let mut stream = Box::pin(stream);
     let mut parser = SseParser::new();
-    let mut relay = ChatRelay::new();
+    let mut relay = ChatRelay::new(estimated_input_tokens);
 
     Box::pin(stream! {
         loop {
@@ -632,8 +638,25 @@ mod tests {
     }
 
     #[test]
+    fn test_message_start_uses_estimated_input() {
+        // 上游未回真实 usage 时,message_start 用入站 body 估算值填充(对齐 CPA)
+        let mut r = ChatRelay::new(Some(567));
+        let out = r.process(&super::super::parser::SseEvent {
+            event: Some("chat.completion.chunk".into()),
+            data: r#"{"id":"1","choices":[{"delta":{"content":"hi"}}]}"#.into(),
+        });
+        let start = out
+            .iter()
+            .find(|b| b.starts_with(b"event: message_start"))
+            .expect("message_start 应存在");
+        let s = String::from_utf8_lossy(start);
+        let v: Value = serde_json::from_str(s.split_once("data: ").unwrap().1.trim()).unwrap();
+        assert_eq!(v["message"]["usage"]["input_tokens"], 567);
+    }
+
+    #[test]
     fn test_text_stream() {
-        let mut r = ChatRelay::new();
+        let mut r = ChatRelay::new(None);
         let ev1 = super::super::parser::SseEvent {
             event: Some("chat.completion.chunk".into()),
             data: r#"{"id":"1","choices":[{"delta":{"content":"hi "}}]}"#.into(),
@@ -657,7 +680,7 @@ mod tests {
 
     #[test]
     fn test_tool_call_stream() {
-        let mut r = ChatRelay::new();
+        let mut r = ChatRelay::new(None);
         // chunk1: tool_calls 第一个片段,id+name(ai 模型下仅累积,finish 才 flush 发 start)
         let out1 = r.process(&super::super::parser::SseEvent {
             event: Some("c".into()),
@@ -686,7 +709,7 @@ mod tests {
 
     #[test]
     fn test_reasoning_deduplication() {
-        let mut r = ChatRelay::new();
+        let mut r = ChatRelay::new(None);
         // 第一次发 reasoning
         let out1 = r.process(&super::super::parser::SseEvent {
             event: Some("c".into()),
@@ -711,7 +734,7 @@ mod tests {
 
     #[test]
     fn test_done_marker_triggers_finish() {
-        let mut r = ChatRelay::new();
+        let mut r = ChatRelay::new(None);
         r.started = true; // 模拟已开始
         let out = r.process(&super::super::parser::SseEvent {
             event: None,

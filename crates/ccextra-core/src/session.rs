@@ -4,11 +4,9 @@
 // 1. 请求头 X-Claude-Code-Session-Id(Claude Code 原生发送,整会话稳定,
 //    压缩/续接/reminder 注入均不影响)
 // 2. metadata.user_id 尾部 `_session_<uuid>`(或 JSON 形态的 session_id)
-// 3. 兜底:messages[0].content SHA-256(旧行为,仅非 Claude Code 客户端走到)
-// 4. "anonymous"
 //
 // 背景:messages[0] 会被 Claude Code 每请求注入 system-reminder、
-// 上下文压缩后整体替换,不是稳定身份。CPA/tklite 均不依赖它。
+// 上下文压缩后整体替换,不是稳定身份。CPA/tklite 均不使用它。
 
 use http::HeaderMap;
 use serde_json::Value;

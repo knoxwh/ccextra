@@ -8,6 +8,7 @@
 
 pub mod cache_stabilization;
 pub mod convert;
+pub mod count_tokens;
 pub mod normalize;
 pub mod prompt_cache;
 pub mod route;

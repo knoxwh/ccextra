@@ -4,7 +4,10 @@
 // - reasoning_summary_text.delta 流式转 thinking_delta(思考过程可见)
 // - output_item.done(reasoning)用 encrypted_content 发 signature_delta 收尾,
 //   下一轮请求侧把 thinking.signature 转回 reasoning.encrypted_content,闭环
-// - tool calls 仍在 completed 时批量重构(规避并发交错,产物等价)
+// - function_call 完整流式状态机(对齐 CPA codexFunctionCallStream:index 队列、
+//   ActiveFunctionCall 串行、arguments delta 缓冲、并行调用 defer 防交错)
+// - web_search_call → server_tool_use + web_search_tool_result
+// - 工具名还原(请求侧超长名缩短,响应侧 buildReverseMap 还原原名)
 // - usage 扣减 cached_tokens;stop_reason 走 CPA 映射表;空轮次合成空 text 块
 
 use async_stream::stream;
@@ -12,7 +15,10 @@ use bytes::Bytes;
 use futures::Stream;
 use futures::StreamExt;
 use serde_json::{json, Value};
+use std::collections::{HashMap, HashSet};
+use std::sync::Arc;
 
+use super::parser::SseEvent;
 use super::parser::SseParser;
 use super::SseStreamPin;
 
@@ -20,6 +26,37 @@ use super::SseStreamPin;
 const FALLBACK_MODEL: &str = "claude-opus-4-1-20250805";
 /// 同一 reasoning item 多个 summary part 的分隔符(CPA codexThinkingSummaryPartSeparator)
 const SUMMARY_PART_SEPARATOR: &str = "\n\n";
+
+/// 单个 function_call 流式块(对齐 CPA codexFunctionCallStream)
+struct FunctionCallStream {
+    call_id: String,
+    name: String,
+    block_index: i64,
+    arguments: String,
+    emitted_arguments_len: usize,
+    has_received_arguments_delta: bool,
+    emit_initial_empty_delta: bool,
+    started: bool,
+    done: bool,
+    closed: bool,
+}
+
+impl FunctionCallStream {
+    fn new() -> Self {
+        Self {
+            call_id: String::new(),
+            name: String::new(),
+            block_index: -1,
+            arguments: String::new(),
+            emitted_arguments_len: 0,
+            has_received_arguments_delta: false,
+            emit_initial_empty_delta: false,
+            started: false,
+            done: false,
+            closed: false,
+        }
+    }
+}
 
 /// OpenAI responses → Anthropic 状态机
 struct ResponsesRelay {
@@ -41,12 +78,28 @@ struct ResponsesRelay {
     thinking_signature: String,
     thinking_summary_seen: bool,
 
-    // tools
+    /// function_call 流式状态(对齐 CPA ConvertCodexResponseToClaudeParams)
+    function_calls: HashMap<String, usize>,
+    function_call_queue: Vec<FunctionCallStream>,
+    active_function_call: Option<usize>,
+    last_function_call: Option<usize>,
+    /// 函数调用期间被 defer 的原始事件(空队时重放)
+    deferred_stream_events: Vec<SseEvent>,
     has_emitted_tool_use: bool,
+
+    /// web_search_call 去重(对齐 CPA WebSearchToolUseIDs / WebSearchToolResultIDs)
+    web_search_tool_use_ids: HashSet<String>,
+    web_search_tool_result_ids: HashSet<String>,
+    last_web_search_tool_use_id: String,
+
+    /// 工具名还原表 short→original(请求转换侧产出)
+    tool_names: Option<Arc<HashMap<String, String>>>,
+    /// 入站 body 本地估算输入 token(CPA ClaudeInputTokenState;上游未回则填充)
+    estimated_input: Option<usize>,
 }
 
 impl ResponsesRelay {
-    fn new() -> Self {
+    fn new(estimated_input: Option<usize>) -> Self {
         Self {
             message_started: false,
             finished: false,
@@ -60,8 +113,33 @@ impl ResponsesRelay {
             thinking_index: -1,
             thinking_signature: String::new(),
             thinking_summary_seen: false,
+            function_calls: HashMap::new(),
+            function_call_queue: Vec::new(),
+            active_function_call: None,
+            last_function_call: None,
+            deferred_stream_events: Vec::new(),
             has_emitted_tool_use: false,
+            web_search_tool_use_ids: HashSet::new(),
+            web_search_tool_result_ids: HashSet::new(),
+            last_web_search_tool_use_id: String::new(),
+            tool_names: None,
+            estimated_input,
         }
+    }
+
+    fn with_tool_names(mut self, tool_names: Option<Arc<HashMap<String, String>>>) -> Self {
+        self.tool_names = tool_names;
+        self
+    }
+
+    /// 工具名还原:short → original(对齐 CPA resolveCodexClaudeToolUseName)
+    fn resolve_tool_name(&self, name: &str) -> String {
+        if let Some(rev) = &self.tool_names {
+            if let Some(orig) = rev.get(name) {
+                return orig.clone();
+            }
+        }
+        name.to_string()
     }
 
     /// 处理一个 SSE 事件,产出 anthropic 字节事件
@@ -71,6 +149,13 @@ impl ResponsesRelay {
             Err(_) => return Vec::new(),
         };
         let event_type = root.get("type").and_then(|v| v.as_str()).unwrap_or("");
+
+        // 函数调用进行中,非关键事件 defer(对齐 CPA shouldDeferCodexStreamEvent):
+        // 避免流式 function_call 的 start/delta 与文本/思考块交错
+        if self.active_function_call.is_some() && should_defer_stream_event(&root, event_type) {
+            self.deferred_stream_events.push(ev.clone());
+            return Vec::new();
+        }
 
         match event_type {
             "error" => vec![stream_error_frame(&root)],
@@ -130,28 +215,72 @@ impl ResponsesRelay {
                     .and_then(|i| i.get("type"))
                     .and_then(|v| v.as_str())
                     .unwrap_or("");
-                if item_type != "reasoning" {
-                    return Vec::new();
+                match item_type {
+                    "reasoning" => {
+                        let mut out = self.stop_text();
+                        // 上一个没 done 的 reasoning item 不得泄漏未关块
+                        out.extend(self.finalize_thinking());
+                        self.thinking_summary_seen = false;
+                        // 兜底快照:仅当 output_item.done 不带 encrypted_content 时用
+                        self.thinking_signature = item
+                            .and_then(|i| i.get("encrypted_content"))
+                            .and_then(|v| v.as_str())
+                            .unwrap_or("")
+                            .to_string();
+                        out
+                    }
+                    "function_call" => {
+                        // 对齐 CPA output_item.added(function_call):先关 thinking/text,
+                        // 登记调用,有名字的发初始空 delta,随后走队列
+                        let mut out = self.finalize_thinking();
+                        out.extend(self.stop_text());
+                        let idx = self.record_function_call(item, Some(&root));
+                        if let Some(i) = idx {
+                            self.update_function_call_identity(i, item, Some(&root));
+                            if !self.function_call_queue[i].name.is_empty() {
+                                self.function_call_queue[i].emit_initial_empty_delta = true;
+                            }
+                        }
+                        out.extend(self.append_function_call_queue());
+                        if self.function_call_queue.is_empty() {
+                            out.extend(self.append_deferred_events());
+                        }
+                        out
+                    }
+                    // web_search_call 的 server_tool_use 等 output_item.done 带 query/results
+                    _ => Vec::new(),
                 }
-                let mut out = self.stop_text();
-                // 上一个没 done 的 reasoning item 不得泄漏未关块
-                out.extend(self.finalize_thinking());
-                self.thinking_summary_seen = false;
-                // 兜底快照:仅当 output_item.done 不带 encrypted_content 时用
-                self.thinking_signature = item
-                    .and_then(|i| i.get("encrypted_content"))
-                    .and_then(|v| v.as_str())
-                    .unwrap_or("")
-                    .to_string();
-                out
             }
             "response.output_item.done" => self.output_item_done(&root),
+            "response.function_call_arguments.delta" => {
+                let idx = self.record_function_call(None, Some(&root));
+                if let Some(i) = idx {
+                    let delta = root.get("delta").and_then(|v| v.as_str()).unwrap_or("");
+                    self.function_call_queue[i].arguments.push_str(delta);
+                    self.function_call_queue[i].has_received_arguments_delta = true;
+                }
+                self.append_buffered_arguments()
+            }
+            "response.function_call_arguments.done" => {
+                let idx = self.record_function_call(None, Some(&root));
+                if let Some(i) = idx {
+                    let args = root.get("arguments").and_then(|v| v.as_str()).unwrap_or("");
+                    let call = &mut self.function_call_queue[i];
+                    if !call.has_received_arguments_delta || args.starts_with(&call.arguments) {
+                        call.arguments = args.to_string();
+                    }
+                }
+                self.append_buffered_arguments()
+            }
             "response.completed" | "response.incomplete" => {
                 let response = root.get("response");
                 self.update_identity(response);
                 let mut out = self.finalize_thinking();
                 out.extend(self.stop_text());
-                out.extend(self.flush_tool_calls(response));
+                out.extend(self.append_function_calls_from_terminal(response));
+                out.extend(self.append_deferred_events());
+                out.extend(self.finalize_thinking());
+                // finalize 内部负责 synthesize_empty_text_block + stop_text + message_delta
                 out.extend(self.finalize(response));
                 out
             }
@@ -208,6 +337,30 @@ impl ResponsesRelay {
                 self.thinking_summary_seen = false;
                 out
             }
+            "function_call" => {
+                // 对齐 CPA output_item.done(function_call):关块、补身份与参数、标 done
+                let mut out = self.finalize_thinking();
+                out.extend(self.stop_text());
+                let idx = self.record_function_call(Some(item), Some(root));
+                if let Some(i) = idx {
+                    self.update_function_call_identity(i, Some(item), Some(root));
+                    let args = item.get("arguments").and_then(|v| v.as_str()).unwrap_or("");
+                    let call = &mut self.function_call_queue[i];
+                    if !call.has_received_arguments_delta || args.starts_with(&call.arguments) {
+                        call.arguments = args.to_string();
+                    }
+                    call.done = true;
+                }
+                out.extend(self.append_function_call_queue());
+                if self.function_call_queue.is_empty() {
+                    out.extend(self.append_deferred_events());
+                }
+                out
+            }
+            "web_search_call" => {
+                // output_item.done 带全量 query/results 才发 server_tool_use + result
+                self.append_web_search_tool_result(root, item)
+            }
             _ => Vec::new(),
         }
     }
@@ -250,7 +403,7 @@ impl ResponsesRelay {
                     "content": [],
                     "stop_reason": null,
                     "stop_sequence": null,
-                    "usage": {"input_tokens": 0, "output_tokens": 0}
+                    "usage": {"input_tokens": self.estimated_input.unwrap_or(0), "output_tokens": 0}
                 }
             }),
         )]
@@ -360,52 +513,344 @@ impl ResponsesRelay {
         out
     }
 
-    /// 从 response.output 批量提取 function_call items → tool_use 块
-    fn flush_tool_calls(&mut self, response: Option<&Value>) -> Vec<Bytes> {
-        let Some(output) = response.and_then(|r| r.get("output")).and_then(|v| v.as_array())
-        else {
+    // ---- function_call 流式状态机(对齐 CPA codex_claude_response.go) ----
+
+    /// 事件 → 候选 key 列表(output_index / call_id / item_id;对齐 CPA codexFunctionCallKeys)
+    fn call_keys(&self, root: Option<&Value>, item: Option<&Value>) -> Vec<String> {
+        let mut keys: Vec<String> = Vec::new();
+        let push = |k: String, keys: &mut Vec<String>| {
+            if !k.is_empty() && !keys.contains(&k) {
+                keys.push(k);
+            }
+        };
+        if let Some(r) = root {
+            if let Some(oi) = r.get("output_index") {
+                push(format!("output:{}", oi), &mut keys);
+            }
+            if let Some(ci) = r.get("call_id").and_then(|v| v.as_str()) {
+                push(format!("call:{ci}"), &mut keys);
+            }
+            if let Some(ii) = r.get("item_id").and_then(|v| v.as_str()) {
+                push(format!("item:{ii}"), &mut keys);
+            }
+        }
+        if let Some(i) = item {
+            if let Some(ci) = i.get("call_id").and_then(|v| v.as_str()) {
+                push(format!("call:{ci}"), &mut keys);
+            }
+            if let Some(ii) = i.get("id").and_then(|v| v.as_str()) {
+                push(format!("item:{ii}"), &mut keys);
+            }
+        }
+        keys
+    }
+
+    /// 按 keys 找已有调用(对齐 CPA codexFunctionCallForKeys)
+    fn function_call_for_keys(&self, keys: &[String]) -> Option<usize> {
+        for k in keys {
+            if let Some(&i) = self.function_calls.get(k) {
+                return Some(i);
+            }
+        }
+        None
+    }
+
+    /// 登记调用(无则新建入队),登记别名(对齐 CPA recordCodexFunctionCall)
+    fn record_function_call(
+        &mut self,
+        item: Option<&Value>,
+        root: Option<&Value>,
+    ) -> Option<usize> {
+        let keys = self.call_keys(root, item);
+        let idx = if !keys.is_empty() {
+            // keys 非空:只按 keys 匹配,miss 则新建(对齐 CPA codexFunctionCallForKeys)
+            match self.function_call_for_keys(&keys) {
+                Some(i) => i,
+                None => {
+                    self.function_call_queue.push(FunctionCallStream::new());
+                    self.function_call_queue.len() - 1
+                }
+            }
+        } else {
+            // keys 为空(delta 事件通常只带 delta)回退到 last(对齐 CPA
+            // codexFunctionCallForEvent 的 fallback)
+            match self.last_function_call {
+                Some(i) => i,
+                None => {
+                    self.function_call_queue.push(FunctionCallStream::new());
+                    self.function_call_queue.len() - 1
+                }
+            }
+        };
+        for k in &keys {
+            self.function_calls.insert(k.clone(), idx);
+        }
+        self.last_function_call = Some(idx);
+        Some(idx)
+    }
+
+    /// 从事件补齐 call_id / name(对齐 CPA updateCodexFunctionCallIdentity)
+    fn update_function_call_identity(
+        &mut self,
+        idx: usize,
+        item: Option<&Value>,
+        root: Option<&Value>,
+    ) {
+        let call = &mut self.function_call_queue[idx];
+        if let Some(i) = item {
+            if let Some(cid) = i.get("call_id").and_then(|v| v.as_str()) {
+                if !cid.is_empty() {
+                    call.call_id = cid.to_string();
+                }
+            }
+            if let Some(n) = i.get("name").and_then(|v| v.as_str()) {
+                if !n.is_empty() {
+                    call.name = n.to_string();
+                }
+            }
+        }
+        let keys = self.call_keys(root, item);
+        for k in &keys {
+            self.function_calls.insert(k.clone(), idx);
+        }
+    }
+
+    /// 追发未发完的参数片段(对齐 CPA appendCodexFunctionCallBufferedArguments)
+    fn append_buffered_arguments(&mut self) -> Vec<Bytes> {
+        let Some(active) = self.active_function_call else {
             return Vec::new();
         };
+        let call = &mut self.function_call_queue[active];
+        if !call.started || call.closed {
+            return Vec::new();
+        }
+        if call.emitted_arguments_len >= call.arguments.len() {
+            return Vec::new();
+        }
+        let delta = call.arguments[call.emitted_arguments_len..].to_string();
+        call.emitted_arguments_len = call.arguments.len();
+        vec![function_call_argument_delta(&delta, call.block_index)]
+    }
+
+    /// 刷新队列:收尾 done 的 active,逐个启动新调用,发参数片段
+    /// (对齐 CPA appendCodexFunctionCallQueue)
+    fn append_function_call_queue(&mut self) -> Vec<Bytes> {
         let mut out = Vec::new();
-        for item in output {
-            let item_type = item.get("type").and_then(|v| v.as_str()).unwrap_or("");
-            if item_type != "function_call" && item_type != "tool_call" {
-                continue;
+
+        loop {
+            // 当前 active:先 flush 参数,再按 done 收尾
+            if let Some(active) = self.active_function_call {
+                out.extend(self.append_buffered_arguments());
+                if !self.function_call_queue[active].done {
+                    return out;
+                }
+                let block_index = self.function_call_queue[active].block_index;
+                out.push(content_block_stop(block_index));
+                if self.next_block_index <= block_index {
+                    self.next_block_index = block_index + 1;
+                }
+                self.function_call_queue[active].closed = true;
+                self.active_function_call = None;
             }
-            // CPA:call_id 优先(codexFunctionCallID),id 兜底
-            let raw_id = item
-                .get("call_id")
-                .and_then(|v| v.as_str())
-                .filter(|s| !s.is_empty())
-                .or_else(|| item.get("id").and_then(|v| v.as_str()))
-                .unwrap_or("");
-            let name = item.get("name").and_then(|v| v.as_str()).unwrap_or("");
-            let args_str = item.get("arguments").and_then(|v| v.as_str()).unwrap_or("");
-            if raw_id.is_empty() || name.is_empty() {
-                continue;
+
+            // 跳过已关闭项(不 remove,保持 map 索引稳定;completed 后统一 clear)
+            let mut pos = 0;
+            while pos < self.function_call_queue.len() && self.function_call_queue[pos].closed {
+                pos += 1;
             }
-            let id = sanitize_tool_id(raw_id);
+            if pos >= self.function_call_queue.len() {
+                return out;
+            }
+            let idx = pos;
+            if self.function_call_queue[idx].name.is_empty() {
+                return out;
+            }
+
             let block_index = self.next_block_index;
             self.next_block_index += 1;
+            let call_id = self.function_call_queue[idx].call_id.clone();
+            let name = self.resolve_tool_name(&self.function_call_queue[idx].name);
+            let emit_empty = self.function_call_queue[idx].emit_initial_empty_delta;
+            out.push(function_call_start(&call_id, &name, block_index));
+            if emit_empty {
+                out.push(function_call_argument_delta("", block_index));
+            }
+            self.function_call_queue[idx].block_index = block_index;
+            self.function_call_queue[idx].started = true;
+            self.active_function_call = Some(idx);
             self.has_emitted_tool_use = true;
-            let input = serde_json::from_str::<Value>(args_str)
-                .ok()
-                .filter(|v| v.is_object())
-                .unwrap_or_else(|| json!({}));
-            out.push(sse(
-                "content_block_start",
-                &json!({
-                    "type": "content_block_start",
-                    "index": block_index,
-                    "content_block": {"type": "tool_use", "id": id, "name": name, "input": input}
-                }),
-            ));
-            out.push(sse(
-                "content_block_stop",
-                &json!({"type": "content_block_stop", "index": block_index}),
-            ));
+            out.extend(self.append_buffered_arguments());
+        }
+    }
+
+    /// completed/incomplete 时从 response.output 补齐函数调用
+    /// (对齐 CPA appendCodexFunctionCallsFromTerminal:避免工具调用在非流式/迟到场景丢失)
+    fn append_function_calls_from_terminal(&mut self, response: Option<&Value>) -> Vec<Bytes> {
+        if let Some(output) = response
+            .and_then(|r| r.get("output"))
+            .and_then(|v| v.as_array())
+        {
+            for (i, item) in output.iter().enumerate() {
+                if item.get("type").and_then(|v| v.as_str()) != Some("function_call") {
+                    continue;
+                }
+                let mut keys = self.call_keys(None, Some(item));
+                if let Some(oi) = item.get("output_index") {
+                    push_key(&mut keys, format!("output:{}", oi));
+                }
+                push_key(&mut keys, format!("output:{i}"));
+                let idx = match self.function_call_for_keys(&keys) {
+                    Some(i) => i,
+                    None => {
+                        self.function_call_queue.push(FunctionCallStream::new());
+                        self.function_call_queue.len() - 1
+                    }
+                };
+                for k in &keys {
+                    self.function_calls.insert(k.clone(), idx);
+                }
+                let args = item.get("arguments").and_then(|v| v.as_str()).unwrap_or("");
+                self.update_function_call_identity(idx, Some(item), None);
+                let call = &mut self.function_call_queue[idx];
+                if !call.has_received_arguments_delta || args.starts_with(&call.arguments) {
+                    call.arguments = args.to_string();
+                }
+                call.done = true;
+            }
+        }
+
+        // 收口:未关闭且无名的调用直接关闭;其余标 done(不重建队列,索引保持稳定)
+        for call in self.function_call_queue.iter_mut() {
+            if call.closed {
+                continue;
+            }
+            if call.name.is_empty() {
+                call.closed = true;
+                continue;
+            }
+            call.done = true;
+        }
+        let out = self.append_function_call_queue();
+        self.clear_function_calls();
+        out
+    }
+
+    /// 清空调用状态(对齐 CPA clearCodexFunctionCalls,completed 后调用)
+    fn clear_function_calls(&mut self) {
+        self.function_calls.clear();
+        self.function_call_queue.clear();
+        self.active_function_call = None;
+        self.last_function_call = None;
+    }
+
+    /// 重放 defer 的事件(对齐 CPA appendDeferredCodexStreamEvents)
+    fn append_deferred_events(&mut self) -> Vec<Bytes> {
+        if self.deferred_stream_events.is_empty() {
+            return Vec::new();
+        }
+        let events = std::mem::take(&mut self.deferred_stream_events);
+        let mut out = Vec::new();
+        for ev in &events {
+            out.extend(self.process(ev));
         }
         out
+    }
+
+    // ---- web_search_call 转换(对齐 CPA codex_claude_response_web_search.go) ----
+
+    /// web_search_call 事件 → server_tool_use + web_search_tool_result
+    fn append_web_search_tool_result(&mut self, root: &Value, item: &Value) -> Vec<Bytes> {
+        let tool_use_id = self.web_search_tool_use_id(root, item);
+        if tool_use_id.is_empty() {
+            return Vec::new();
+        }
+        let mut out = Vec::new();
+        out.extend(self.append_web_search_server_tool_use(root, item));
+
+        if self.web_search_tool_result_ids.contains(&tool_use_id) {
+            return vec![];
+        }
+        let query = web_search_query(root, item);
+        let result_content = web_search_result_content(root, item);
+        let has_action = item.get("action").is_some();
+        if query.is_empty() && result_content.is_empty() && !has_action {
+            return out;
+        }
+
+        let mut start = json!({
+            "type": "content_block_start",
+            "index": self.next_block_index,
+            "content_block": {"type": "web_search_tool_result", "tool_use_id": tool_use_id, "content": []}
+        });
+        if !result_content.is_empty() {
+            start["content_block"]["content"] = Value::Array(result_content);
+        }
+        out.push(sse("content_block_start", &start));
+        out.push(content_block_stop(self.next_block_index));
+        self.web_search_tool_result_ids.insert(tool_use_id.clone());
+        self.next_block_index += 1;
+        if tool_use_id == self.last_web_search_tool_use_id {
+            self.last_web_search_tool_use_id.clear();
+        }
+        out
+    }
+
+    /// server_tool_use 块(去重;query 走 input_json_delta)
+    fn append_web_search_server_tool_use(&mut self, root: &Value, item: &Value) -> Vec<Bytes> {
+        let tool_use_id = self.web_search_tool_use_id(root, item);
+        if tool_use_id.is_empty() {
+            return Vec::new();
+        }
+        let query = web_search_query(root, item);
+        let already_started = self.web_search_tool_use_ids.contains(&tool_use_id);
+        if already_started && query.is_empty() {
+            return Vec::new();
+        }
+
+        let mut out = Vec::new();
+        if !already_started {
+            out.extend(self.stop_text());
+            out.extend(self.finalize_thinking());
+            let start = json!({
+                "type": "content_block_start",
+                "index": self.next_block_index,
+                "content_block": {"type": "server_tool_use", "id": tool_use_id, "name": "web_search", "input": {}}
+            });
+            out.push(sse("content_block_start", &start));
+        }
+        if !query.is_empty() {
+            let partial_json = serde_json::to_string(&json!({"query": query})).unwrap_or_default();
+            out.push(function_call_argument_delta(
+                &partial_json,
+                self.next_block_index,
+            ));
+        }
+        if !already_started {
+            out.push(content_block_stop(self.next_block_index));
+            self.web_search_tool_use_ids.insert(tool_use_id);
+            self.next_block_index += 1;
+        }
+        out
+    }
+
+    /// web_search_call 的 id 提取(对齐 CPA codexWebSearchToolUseID:item/root 多路径 + last 兜底)
+    fn web_search_tool_use_id(&mut self, root: &Value, item: &Value) -> String {
+        for path in ["id", "output_item_id", "call_id", "item_id"] {
+            if let Some(v) = item.get(path).and_then(|v| v.as_str()) {
+                if !v.trim().is_empty() {
+                    return v.trim().to_string();
+                }
+            }
+            if let Some(v) = root.get(path).and_then(|v| v.as_str()) {
+                if !v.trim().is_empty() {
+                    return v.trim().to_string();
+                }
+            }
+        }
+        if !self.last_web_search_tool_use_id.is_empty() {
+            return self.last_web_search_tool_use_id.clone();
+        }
+        format!("web_search_{}", self.next_block_index)
     }
 
     /// 空轮次/纯思考轮次合成空 text 块
@@ -438,8 +883,14 @@ impl ResponsesRelay {
         let mut output_tokens = 0;
         let mut cached = 0;
         if let Some(usage) = response.and_then(|r| r.get("usage")) {
-            input_tokens = usage.get("input_tokens").and_then(|v| v.as_i64()).unwrap_or(0);
-            output_tokens = usage.get("output_tokens").and_then(|v| v.as_i64()).unwrap_or(0);
+            input_tokens = usage
+                .get("input_tokens")
+                .and_then(|v| v.as_i64())
+                .unwrap_or(0);
+            output_tokens = usage
+                .get("output_tokens")
+                .and_then(|v| v.as_i64())
+                .unwrap_or(0);
             cached = usage
                 .pointer("/input_tokens_details/cached_tokens")
                 .and_then(|v| v.as_i64())
@@ -552,7 +1003,7 @@ fn stream_error_frame(root: &Value) -> Bytes {
 
 /// stop_reason 提取(对齐 CPA codexStopReason):
 /// stop_reason > incomplete_details.reason > stop_sequence 推断
-fn codex_stop_reason(r: &Value) -> String {
+pub(super) fn codex_stop_reason(r: &Value) -> String {
     if let Some(sr) = r.get("stop_reason").and_then(|v| v.as_str()) {
         if !sr.is_empty() {
             if sr == "stop" && stop_sequence(r).is_some() {
@@ -561,7 +1012,10 @@ fn codex_stop_reason(r: &Value) -> String {
             return sr.to_string();
         }
     }
-    if let Some(reason) = r.pointer("/incomplete_details/reason").and_then(|v| v.as_str()) {
+    if let Some(reason) = r
+        .pointer("/incomplete_details/reason")
+        .and_then(|v| v.as_str())
+    {
         if !reason.is_empty() {
             return reason.to_string();
         }
@@ -572,7 +1026,7 @@ fn codex_stop_reason(r: &Value) -> String {
     String::new()
 }
 
-fn stop_sequence(r: &Value) -> Option<String> {
+pub(super) fn stop_sequence(r: &Value) -> Option<String> {
     r.get("stop_sequence")
         .and_then(|v| v.as_str())
         .filter(|s| !s.is_empty())
@@ -580,7 +1034,7 @@ fn stop_sequence(r: &Value) -> Option<String> {
 }
 
 /// stop_reason → anthropic(对齐 CPA mapCodexStopReasonToClaude)
-fn map_stop_reason(stop_reason: &str, has_tool_use: bool) -> String {
+pub(super) fn map_stop_reason(stop_reason: &str, has_tool_use: bool) -> String {
     if has_tool_use {
         return "tool_use".to_string();
     }
@@ -590,7 +1044,10 @@ fn map_stop_reason(stop_reason: &str, has_tool_use: bool) -> String {
         // 无工具调用时 CPA 把 tool 类原因映射为 end_turn
         "tool_use" | "tool_calls" | "function_call" => "end_turn".to_string(),
         "content_filter" => "refusal".to_string(),
-        "end_turn" | "stop_sequence" | "pause_turn" | "refusal"
+        "end_turn"
+        | "stop_sequence"
+        | "pause_turn"
+        | "refusal"
         | "model_context_window_exceeded" => stop_reason.to_string(),
         _ => "end_turn".to_string(),
     }
@@ -598,7 +1055,7 @@ fn map_stop_reason(stop_reason: &str, has_tool_use: bool) -> String {
 
 /// tool id 清洗:非法字符 → _,超 64 截断
 /// (对齐 CPA SanitizeClaudeToolID + shortenCodexCallIDIfNeeded)
-fn sanitize_tool_id(id: &str) -> String {
+pub(super) fn sanitize_tool_id(id: &str) -> String {
     let mut out: String = id
         .chars()
         .map(|c| {
@@ -615,6 +1072,126 @@ fn sanitize_tool_id(id: &str) -> String {
     out
 }
 
+/// 函数调用进行中是否 defer 该事件(对齐 CPA shouldDeferCodexStreamEvent)
+fn should_defer_stream_event(root: &Value, event_type: &str) -> bool {
+    match event_type {
+        // 永不 defer:错误/收尾/参数增量(需在函数调用间隙立即处理)
+        "error"
+        | "response.completed"
+        | "response.incomplete"
+        | "response.function_call_arguments.delta"
+        | "response.function_call_arguments.done" => false,
+        // function_call 自身的事件不 defer
+        "response.output_item.added" | "response.output_item.done" => {
+            root.get("item")
+                .and_then(|i| i.get("type"))
+                .and_then(|v| v.as_str())
+                != Some("function_call")
+        }
+        _ => true,
+    }
+}
+
+/// tool_use 块 start(对齐 CPA appendCodexFunctionCallStart)
+fn function_call_start(call_id: &str, name: &str, index: i64) -> Bytes {
+    sse(
+        "content_block_start",
+        &json!({
+            "type": "content_block_start",
+            "index": index,
+            "content_block": {
+                "type": "tool_use",
+                "id": sanitize_tool_id(call_id),
+                "name": name,
+                "input": {}
+            }
+        }),
+    )
+}
+
+/// input_json_delta(对齐 CPA appendCodexFunctionCallArgumentDelta)
+fn function_call_argument_delta(partial_json: &str, index: i64) -> Bytes {
+    sse(
+        "content_block_delta",
+        &json!({
+            "type": "content_block_delta",
+            "index": index,
+            "delta": {"type": "input_json_delta", "partial_json": partial_json}
+        }),
+    )
+}
+
+/// 通用块 stop(对齐 CPA appendCodexFunctionCallStop)
+fn content_block_stop(index: i64) -> Bytes {
+    sse(
+        "content_block_stop",
+        &json!({"type": "content_block_stop", "index": index}),
+    )
+}
+
+/// 追加去重 key(对齐 CPA appendUniqueCodexFunctionCallKey)
+fn push_key(keys: &mut Vec<String>, key: String) {
+    if !key.is_empty() && !keys.contains(&key) {
+        keys.push(key);
+    }
+}
+
+/// web_search_call 的 query(对齐 CPA codexWebSearchQuery:item/root 多路径)
+fn web_search_query(root: &Value, item: &Value) -> String {
+    for path in ["/action/query", "/query", "/input/query"] {
+        if let Some(v) = item.pointer(path).and_then(|v| v.as_str()) {
+            if !v.trim().is_empty() {
+                return v.trim().to_string();
+            }
+        }
+        if let Some(v) = root.pointer(path).and_then(|v| v.as_str()) {
+            if !v.trim().is_empty() {
+                return v.trim().to_string();
+            }
+        }
+    }
+    String::new()
+}
+
+/// web_search_call 的 results → web_search_result 块数组(对齐 CPA codexWebSearchResultContent)
+pub(super) fn web_search_result_content(root: &Value, item: &Value) -> Vec<Value> {
+    let results = item
+        .get("results")
+        .and_then(|v| v.as_array())
+        .or_else(|| root.get("results").and_then(|v| v.as_array()));
+    let Some(results) = results else {
+        return Vec::new();
+    };
+    let mut out = Vec::new();
+    for result in results {
+        let url = result
+            .get("url")
+            .and_then(|v| v.as_str())
+            .unwrap_or("")
+            .trim()
+            .to_string();
+        if url.is_empty() {
+            continue;
+        }
+        let mut title = result
+            .get("title")
+            .and_then(|v| v.as_str())
+            .unwrap_or("")
+            .trim()
+            .to_string();
+        if title.is_empty() {
+            title = url.clone();
+        }
+        out.push(json!({
+            "type": "web_search_result",
+            "title": title,
+            "url": url,
+            "page_age": null
+        }));
+    }
+    out
+}
+
 /// 序列化一个 SSE 事件
 fn sse(event: &str, data: &Value) -> Bytes {
     let mut s = String::from("event: ");
@@ -627,13 +1204,17 @@ fn sse(event: &str, data: &Value) -> Bytes {
 }
 
 /// OpenAI responses → Anthropic SSE 状态机(realtime)
-pub fn relay_responses_to_anthropic<S>(stream: S) -> SseStreamPin
+pub fn relay_responses_to_anthropic<S>(
+    stream: S,
+    estimated_input_tokens: Option<usize>,
+    tool_names: Option<Arc<HashMap<String, String>>>,
+) -> SseStreamPin
 where
     S: Stream<Item = Result<Bytes, reqwest::Error>> + Send + 'static,
 {
     let mut stream = Box::pin(stream);
     let mut parser = SseParser::new();
-    let mut relay = ResponsesRelay::new();
+    let mut relay = ResponsesRelay::new(estimated_input_tokens).with_tool_names(tool_names);
 
     Box::pin(stream! {
         loop {
@@ -671,6 +1252,9 @@ mod tests {
     use super::*;
     use crate::sse::parser::SseEvent;
 
+    fn s(bufs: &[Bytes]) -> String {
+        String::from_utf8_lossy(&bufs.concat()).into_owned()
+    }
     fn ev(data: &str) -> SseEvent {
         SseEvent {
             event: None,
@@ -690,21 +1274,48 @@ mod tests {
     }
 
     #[test]
+    fn test_message_start_uses_estimated_input_when_upstream_silent() {
+        // 上游未回真实 usage 时,message_start 用入站 body 估算值填充(对齐 CPA)
+        let mut r = ResponsesRelay::new(Some(1234));
+        let out = r.process(&created());
+        let start = out
+            .iter()
+            .find(|b| b.starts_with(b"event: message_start"))
+            .expect("message_start 应存在");
+        let v = frame_data(start);
+        assert_eq!(v["message"]["usage"]["input_tokens"], 1234);
+
+        // 未传估算时维持 0(不臆造)
+        let mut r0 = ResponsesRelay::new(None);
+        let out0 = r0.process(&created());
+        let start0 = out0
+            .iter()
+            .find(|b| b.starts_with(b"event: message_start"))
+            .expect("message_start 应存在");
+        let v0 = frame_data(start0);
+        assert_eq!(v0["message"]["usage"]["input_tokens"], 0);
+    }
+
+    #[test]
     fn test_responses_text_stream() {
-        let mut r = ResponsesRelay::new();
+        let mut r = ResponsesRelay::new(None);
         let out1 = r.process(&created());
         assert!(out1.iter().any(|b| b.starts_with(b"event: message_start")));
 
         let out2 = r.process(&ev(
             r#"{"type":"response.output_text.delta","delta":"hello"}"#,
         ));
-        assert!(out2.iter().any(|b| b.starts_with(b"event: content_block_start")));
-        assert!(out2.iter().any(|b| b.starts_with(b"event: content_block_delta")));
+        assert!(out2
+            .iter()
+            .any(|b| b.starts_with(b"event: content_block_start")));
+        assert!(out2
+            .iter()
+            .any(|b| b.starts_with(b"event: content_block_delta")));
     }
 
     #[test]
     fn test_responses_completed_with_tool_call() {
-        let mut r = ResponsesRelay::new();
+        let mut r = ResponsesRelay::new(None);
         r.process(&created());
 
         let out = r.process(&ev(
@@ -734,7 +1345,7 @@ mod tests {
     #[test]
     fn test_reasoning_replay_streaming_with_signature() {
         // 完整闭环:summary 流式可见 + encrypted_content 走 signature_delta
-        let mut r = ResponsesRelay::new();
+        let mut r = ResponsesRelay::new(None);
         r.process(&created());
 
         let out1 = r.process(&ev(
@@ -759,7 +1370,7 @@ mod tests {
     #[test]
     fn test_reasoning_signature_only() {
         // 无 summary 的 reasoning item:开块即收尾,仍带 signature
-        let mut r = ResponsesRelay::new();
+        let mut r = ResponsesRelay::new(None);
         r.process(&created());
         r.process(&ev(
             r#"{"type":"response.output_item.added","item":{"type":"reasoning"}}"#,
@@ -776,7 +1387,7 @@ mod tests {
 
     #[test]
     fn test_reasoning_summary_parts_separated() {
-        let mut r = ResponsesRelay::new();
+        let mut r = ResponsesRelay::new(None);
         r.process(&created());
         r.process(&ev(r#"{"type":"response.reasoning_summary_part.added"}"#));
         r.process(&ev(
@@ -792,7 +1403,7 @@ mod tests {
 
     #[test]
     fn test_usage_subtracts_cached_tokens() {
-        let mut r = ResponsesRelay::new();
+        let mut r = ResponsesRelay::new(None);
         r.process(&created());
         let out = r.process(&ev(
             r#"{"type":"response.completed","response":{"id":"r1","output":[],
@@ -811,7 +1422,7 @@ mod tests {
     #[test]
     fn test_empty_output_synthesizes_text_block() {
         // 空轮次合成空 text 块(CPA synthesizeCodexEmptyTextBlock)
-        let mut r = ResponsesRelay::new();
+        let mut r = ResponsesRelay::new(None);
         let out = r.process(&ev(
             r#"{"type":"response.completed","response":{"id":"r1","output":[]}}"#,
         ));
@@ -823,7 +1434,7 @@ mod tests {
 
     #[test]
     fn test_thinking_only_turn_synthesizes_text_block() {
-        let mut r = ResponsesRelay::new();
+        let mut r = ResponsesRelay::new(None);
         r.process(&created());
         r.process(&ev(
             r#"{"type":"response.output_item.done","item":{"type":"reasoning","encrypted_content":"E"}}"#,
@@ -838,7 +1449,7 @@ mod tests {
 
     #[test]
     fn test_stream_error_event() {
-        let mut r = ResponsesRelay::new();
+        let mut r = ResponsesRelay::new(None);
         let out = r.process(&ev(
             r#"{"type":"error","error":{"type":"invalid_request","code":"cyber_policy","message":"blocked"}}"#,
         ));
@@ -864,7 +1475,7 @@ mod tests {
 
     #[test]
     fn test_stop_sequence_in_message_delta() {
-        let mut r = ResponsesRelay::new();
+        let mut r = ResponsesRelay::new(None);
         let out = r.process(&ev(
             r#"{"type":"response.completed","response":{"id":"r1","output":[],
                 "stop_reason":"stop","stop_sequence":"END"}}"#,
@@ -880,7 +1491,7 @@ mod tests {
 
     #[test]
     fn test_model_fallback() {
-        let mut r = ResponsesRelay::new();
+        let mut r = ResponsesRelay::new(None);
         let out = r.process(&ev(r#"{"type":"response.created","response":{"id":"r1"}}"#));
         let bufs = out.concat();
         let s = String::from_utf8_lossy(&bufs);
@@ -890,7 +1501,7 @@ mod tests {
     #[test]
     fn test_message_item_text_fallback() {
         // 无 delta 流时从 output_item.done(message) 的 content 补发
-        let mut r = ResponsesRelay::new();
+        let mut r = ResponsesRelay::new(None);
         r.process(&created());
         let out = r.process(&ev(
             r#"{"type":"response.output_item.done","item":{"type":"message",
@@ -904,7 +1515,7 @@ mod tests {
 
     #[test]
     fn test_finish_eof_fallback() {
-        let mut r = ResponsesRelay::new();
+        let mut r = ResponsesRelay::new(None);
         r.process(&created());
         let out = r.finish();
         let bufs = out.concat();
@@ -921,5 +1532,111 @@ mod tests {
         assert_eq!(sanitize_tool_id("a.b/c"), "a_b_c");
         let long = "x".repeat(100);
         assert_eq!(sanitize_tool_id(&long).len(), 64);
+    }
+
+    #[test]
+    fn test_function_call_streaming_full_lifecycle() {
+        // 完整生命周期:added → args delta → args done → item done → start/stop
+        let mut r = ResponsesRelay::new(None);
+        r.process(&created());
+
+        let out1 = r.process(&ev(
+            r#"{"type":"response.output_item.added","item":{"type":"function_call","call_id":"call_1","name":"get_weather","output_index":0}}"#,
+        ));
+        let s1 = s(&out1);
+        assert!(s1.contains("content_block_start"));
+        assert!(s1.contains("\"name\":\"get_weather\""));
+        assert!(s1.contains("\"id\":\"call_1\""));
+
+        let out2 = r.process(&ev(
+            r#"{"type":"response.function_call_arguments.delta","delta":"{\"cit"}"#,
+        ));
+        let s2 = s(&out2);
+        assert!(!s2.contains("content_block_start"), "参数增量不应重复开块");
+        assert!(s2.contains("input_json_delta"));
+        assert!(s2.contains("{\\\"cit"));
+
+        let out3 = r.process(&ev(
+            r#"{"type":"response.function_call_arguments.done","call_id":"call_1","arguments":"{\"city\":\"beijing\"}"}"#,
+        ));
+        let s3 = s(&out3);
+        assert!(s3.contains("input_json_delta"));
+        assert!(s3.contains("beijing"));
+
+        let out4 = r.process(&ev(
+            r#"{"type":"response.output_item.done","item":{"type":"function_call","call_id":"call_1","name":"get_weather","arguments":"{\"city\":\"beijing\"}"}}"#,
+        ));
+        let s4 = s(&out4);
+        assert!(s4.contains("content_block_stop"));
+    }
+
+    #[test]
+    fn test_function_call_tool_name_restored() {
+        // 请求侧缩短的名,响应侧还原(对齐 CPA buildReverseMap)
+        let mut names = HashMap::new();
+        names.insert("mcp__short".to_string(), "mcp__very_long_original_name".to_string());
+        let mut r = ResponsesRelay::new(None);
+        r.tool_names = Some(Arc::new(names));
+        r.process(&created());
+
+        let out = r.process(&ev(
+            r#"{"type":"response.output_item.added","item":{"type":"function_call","call_id":"call_9","name":"mcp__short"}}"#,
+        ));
+        let s = s(&out);
+        assert!(s.contains("mcp__very_long_original_name"));
+        assert!(!s.contains("\"name\":\"mcp__short\""));
+    }
+
+    #[test]
+    fn test_function_call_multiple_queued_serially() {
+        // 并发两个调用:串行输出,每个独立 start/delta/stop
+        let mut r = ResponsesRelay::new(None);
+        r.process(&created());
+
+        r.process(&ev(
+            r#"{"type":"response.output_item.added","item":{"type":"function_call","call_id":"a","name":"tool_a","output_index":0}}"#,
+        ));
+        r.process(&ev(
+            r#"{"type":"response.output_item.added","item":{"type":"function_call","call_id":"b","name":"tool_b","output_index":1}}"#,
+        ));
+        let out = r.process(&ev(
+            r#"{"type":"response.output_item.done","item":{"type":"function_call","call_id":"a","name":"tool_a","arguments":"{}"}}"#,
+        ));
+        let s = s(&out);
+        assert!(s.contains("tool_b"), "a 完成后应接着输出 b");
+    }
+
+    #[test]
+    fn test_response_completed_flushes_terminal_calls_with_deferred() {
+        // 无流式事件只有 completed:从 response.output 补发工具调用
+        let mut r = ResponsesRelay::new(None);
+        r.process(&created());
+        let out = r.process(&ev(
+            r#"{"type":"response.completed","response":{"id":"r1","output":[
+                {"type":"function_call","call_id":"call_9","name":"get_weather","arguments":"{\"city\":\"beijing\"}"}
+            ],"usage":{"input_tokens":10,"output_tokens":5}}}"#,
+        ));
+        let s = s(&out);
+        assert!(s.contains("content_block_start"));
+        assert!(s.contains("get_weather"));
+        assert!(s.contains("call_9"));
+        assert!(s.contains("message_delta"));
+        assert!(s.contains("tool_use"));
+    }
+
+    #[test]
+    fn test_web_search_call_streaming() {
+        // web_search_call → server_tool_use + web_search_tool_result
+        let mut r = ResponsesRelay::new(None);
+        r.process(&created());
+        let out = r.process(&ev(
+            r#"{"type":"response.output_item.done","item":{"type":"web_search_call","id":"ws_1","action":{"query":"rust async"},"results":[{"url":"https://example.com","title":"Example"}]}}"#,
+        ));
+        let s = s(&out);
+        assert!(s.contains("server_tool_use"));
+        assert!(s.contains("web_search"));
+        assert!(s.contains("web_search_tool_result"));
+        assert!(s.contains("rust async"));
+        assert!(s.contains("https://example.com"));
     }
 }

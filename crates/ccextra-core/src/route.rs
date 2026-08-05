@@ -65,9 +65,22 @@ pub fn resolve_route(
     inbound_model: &str,
     providers: &[ProviderConfig],
 ) -> Result<RouteDecision, RouteError> {
+    // alias 优先(Claude Code 主对话发别名);name 兜底(部分内部门如
+    // count_tokens 发上游裸名,见 CPA countTokens 场景)
     for provider in providers {
         for model in &provider.models {
             if model.alias == inbound_model {
+                return Ok(RouteDecision {
+                    provider: provider.name.clone(),
+                    protocol: provider.protocol,
+                    upstream_model: model.name.clone(),
+                });
+            }
+        }
+    }
+    for provider in providers {
+        for model in &provider.models {
+            if model.name == inbound_model {
                 return Ok(RouteDecision {
                     provider: provider.name.clone(),
                     protocol: provider.protocol,
@@ -168,5 +181,32 @@ mod tests {
 
         let err = validate_providers(&providers).unwrap_err();
         assert!(matches!(err, RouteError::AliasConflict(_)));
+    }
+
+    #[test]
+    fn test_resolve_route_by_name_fallback() {
+        // 部分内部门(如 count_tokens)发上游裸名,应能兜底路由到该 provider
+        let providers = vec![ProviderConfig {
+            name: "ckff-codex".into(),
+            protocol: Protocol::OpenAiResponses,
+            base_url: "https://ckff.dev".into(),
+            key: "sk-test".into(),
+            proxy_url: None,
+            prompt_cache_key: false,
+            models: vec![ModelConfig {
+                name: "gpt-5.6-terra".into(),
+                alias: "ck-gpt-5.6-terra".into(),
+                ..Default::default()
+            }],
+        }];
+
+        // alias 优先
+        let by_alias = resolve_route("ck-gpt-5.6-terra", &providers).unwrap();
+        assert_eq!(by_alias.upstream_model, "gpt-5.6-terra");
+
+        // name 兜底
+        let by_name = resolve_route("gpt-5.6-terra", &providers).unwrap();
+        assert_eq!(by_name.provider, "ckff-codex");
+        assert_eq!(by_name.upstream_model, "gpt-5.6-terra");
     }
 }

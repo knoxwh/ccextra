@@ -6,8 +6,8 @@
 // - thinking→effort: https://github.com/router-for-me/CLIProxyAPI/blob/main/internal/translator/codex/claude/codex_claude_request.go
 // - 钳制逻辑:       https://github.com/router-for-me/CLIProxyAPI/blob/main/internal/thinking/apply.go
 //
-// 与 CPA 差异:CPA 靠每模型能力表(registry)在 ApplyThinking 钳制非法值;
-// ccextra 无 registry,用调用方传入的 supported 集合钳制,非法值返回 None(不注入)。
+// 与 CPA 差异:CPA 靠每模型能力表(registry)在 executor 的 ApplyThinking 钳制非法值;
+// ccextra 无 registry,转换层直映射不钳制(见 resolve_effort doc),与 CPA 请求转换层一致。
 
 /// 思考级别(对应 CPA ThinkingLevel)
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -75,25 +75,13 @@ pub fn budget_to_level(budget: i64) -> Option<Level> {
     }
 }
 
-/// 钳制到模型支持的最高档(参考 CPA mapConfiguredHighIntent)
-fn clamp_to(level: Level, supported: &[Level]) -> Level {
-    let candidates: Vec<Level> = match level {
-        Level::XHigh => vec![Level::XHigh, Level::Max, Level::High],
-        Level::Max => vec![Level::Max, Level::XHigh, Level::High],
-        other => vec![other],
-    };
-    for c in candidates {
-        if supported.contains(&c) {
-            return c;
-        }
-    }
-    level
-}
-
-/// thinking 配置 → effort 字符串(参考 CPA codex_claude_request.go)
+/// thinking 配置 → effort 字符串(对齐 CPA codex_claude_request.go)
 ///
-/// 返回 None 表示不注入(级别非法或不受支持)。supported 为模型允许的级别集。
-pub fn resolve_effort(thinking: &serde_json::Value, supported: &[Level]) -> Option<&'static str> {
+/// 直映射不钳制:CPA 在请求转换层直接取 ConvertBudgetToLevel 结果,
+/// 级别健全性由 executor 的 ApplyThinking 按模型能力表钳制(ccextra 无 registry,
+/// 转换层忠实透传,与 CPA 请求转换层一致)。返回 None 表示不注入,
+/// 调用方回退默认 effort(CPA reasoningEffort 初始 "medium")。
+pub fn resolve_effort(thinking: &serde_json::Value) -> Option<&'static str> {
     let ty = thinking.get("type")?.as_str()?;
     let level = match ty {
         "enabled" => {
@@ -118,12 +106,7 @@ pub fn resolve_effort(thinking: &serde_json::Value, supported: &[Level]) -> Opti
         "disabled" => Level::None,
         _ => return None,
     };
-    let clamped = clamp_to(level, supported);
-    if supported.contains(&clamped) {
-        Some(clamped.as_str())
-    } else {
-        None
-    }
+    Some(level.as_str())
 }
 
 #[cfg(test)]
@@ -155,45 +138,37 @@ mod tests {
     #[test]
     fn test_resolve_effort_enabled_budget() {
         let t = json!({"type": "enabled", "budget_tokens": 2000});
-        assert_eq!(resolve_effort(&t, &DEFAULT_SUPPORTED), Some("medium"));
+        assert_eq!(resolve_effort(&t), Some("medium"));
     }
 
     #[test]
-    fn test_resolve_effort_auto_clamped_to_none() {
-        // auto 不在默认支持集 → 钳制后仍不支持 → None
+    fn test_resolve_effort_enabled_auto_budget() {
+        // enabled + budget=-1 → budget_to_level(-1)=Auto(与 CPA 转换层一致)
         let t = json!({"type": "enabled", "budget_tokens": -1});
-        assert_eq!(resolve_effort(&t, &DEFAULT_SUPPORTED), None);
+        assert_eq!(resolve_effort(&t), Some("auto"));
     }
 
     #[test]
-    fn test_resolve_effort_disabled_not_in_supported() {
+    fn test_resolve_effort_disabled_none() {
         let t = json!({"type": "disabled"});
-        assert_eq!(resolve_effort(&t, &DEFAULT_SUPPORTED), None);
+        assert_eq!(resolve_effort(&t), Some("none"));
     }
 
     #[test]
     fn test_resolve_effort_adaptive_uses_output_config() {
         let t = json!({"type": "adaptive", "output_config": {"effort": "high"}});
-        assert_eq!(resolve_effort(&t, &DEFAULT_SUPPORTED), Some("high"));
+        assert_eq!(resolve_effort(&t), Some("high"));
     }
 
     #[test]
     fn test_resolve_effort_adaptive_defaults_xhigh() {
         let t = json!({"type": "adaptive"});
-        assert_eq!(resolve_effort(&t, &DEFAULT_SUPPORTED), Some("xhigh"));
-    }
-
-    #[test]
-    fn test_resolve_effort_xhigh_clamped_to_custom_set() {
-        // 支持集不含 xhigh/max,含 high → 钳到 high
-        let t = json!({"type": "adaptive"});
-        let supported = [Level::Low, Level::Medium, Level::High];
-        assert_eq!(resolve_effort(&t, &supported), Some("high"));
+        assert_eq!(resolve_effort(&t), Some("xhigh"));
     }
 
     #[test]
     fn test_resolve_effort_unknown_type() {
         let t = json!({"type": "bogus"});
-        assert_eq!(resolve_effort(&t, &DEFAULT_SUPPORTED), None);
+        assert_eq!(resolve_effort(&t), None);
     }
 }

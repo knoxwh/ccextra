@@ -60,6 +60,9 @@ bcrypt = "0.15"
 # Pattern matching (for payload model wildcards)
 globset = "0.4"
 
+# Local token estimation (count_tokens, 对齐 CPA O200kBase)
+tiktoken-rs = "0.11"
+
 # CLI
 clap = { version = "4.4", features = ["derive"] }
 

@@ -36,6 +36,12 @@ OpenAI `/v1/responses` 协议(Codex CLI 默认)。请求体用 `template.instruc
 **upstream model**  
 发往上游的真实模型名,与入站 alias 可能不同。
 
+**按协议 UA 分流**  
+上游请求按协议用不同 User-Agent:chat → `claude-cli/2.1.221`,responses → `codex_cli_rs/...`。部分上游按 UA 识别客户端并分流缓存/特性,reqwest 默认 UA 会被判为非官方客户端。
+
+**claude 直通头重建**  
+claude 路径的 `anthropic-beta` 头按 body 条件重建(基础集 `claude-code-20250219` + thinking 无 display → `redact-thinking` / tools → `advanced-tool-use` / `effort-2025-11-24` / speed=fast → `fast-mode`),再追加 caller 自带 beta(去重)。`anthropic-version`/`x-app`/`x-stainless-*` 等身份头仅透传(有就转发,没有不补)。对齐 CPA `applyClaudeHeaders` 中转场景。
+
 ## 转换路径
 
 **直通路径 / passthrough**  
@@ -47,10 +53,18 @@ claude 入站 → claude 出站,只改 `model` 字段,其余字节原样保留�
 - anthropic → openai responses
 
 **body-to-body 转换**  
-在 `serde_json::Value` 上原地读写,不经过中间类型。gjson/sjson 风格(Go)或 `value[path] = new_val`(Rust)。每条路径独立实现。顶层键序对齐 CPA(`model,max_tokens,temperature/stop,stream,reasoning_effort,messages,tools,tool_choice,user`)。
+在 `serde_json::Value` 上原地读写,不经过中间类型。gjson/sjson 风格(Go)或 `value[path] = new_val`(Rust)。每条路径独立实现。顶层键序对齐 CPA(`model,max_tokens,temperature/stop,stream,reasoning_effort,messages,tools,tool_choice,user,stream_options`)。
+
+**stream_options.include_usage**  
+转换路径强制注入 `stream_options: {include_usage: true}`,对齐 CPA `SetBoolIfDifferent`。部分上游(kimi/moonshot)未开启时全程无 usage,客户端 statusline 无 context 显示;开启后流尾必发 usage chunk。
+
+**响应错误转 anthropic 形状**  
+上游非 2xx 时的 `{"error":{...}}` body 转 anthropic `{"type":"error","error":{...}}` 形状(对齐 CPA WriteErrorResponse)。`rate_limit`/`requests`/`tokens` 归为 `rate_limit_error`,已知类型透传,其余兜底 `api_error`。
 
 **content 形态归一化**  
-Claude Code 同一条消息当轮发 content 数组、历史重建发字符串;转换器统一输出 text 数组(空串 → `content:[]`,null/missing → 丢弃整条消息),消除跨轮字节漂移——这是周期性缓存 MISS(cache_read 掉 4096 后紧邻请求恢复)的根因。对齐 CPA 的 `JoinRawArray` 数组形态。
+Claude Code 同一条消息当轮发 content 数组、历史重建发字符串;转换器统一输出 text 数组,消除跨轮字节漂移——这是周期性缓存 MISS(cache_read 掉 4096 后紧邻请求恢复)的根因。对齐 CPA 的 `JoinRawArray` 数组形态。空内容两侧语义不同:
+- chat:空串 → `content:[]`;null/缺失 → 丢弃整条消息
+- responses:空串 → `content:[]` 保留消息(assistant 空 content 是 thinking-only/tool 轮的正常信号,不能丢);null/缺失 → 丢弃
 
 ## 缓存归一化
 
@@ -105,6 +119,12 @@ OpenAI chat/responses 的缓存桶标识。对齐 CPA `applyPromptCacheKey`:prov
 
 **reasoning 回放闭环**  
 responses 路径的加密思考跨轮闭环:上游 `reasoning_summary_text.delta` 流式转 `thinking_delta`(可见),`output_item.done` 的 `encrypted_content` 以 `signature_delta` 收尾;下一轮请求侧把 `thinking.signature` 转回 `reasoning.encrypted_content`。对齐 CPA,替代旧的 redacted_thinking 方案(形状不合规范且请求侧丢弃)。
+
+**断流兜底**  
+上游流中断或 EOF 未发终止事件时,状态机兜底发 anthropic `error` 事件(流内错误)或补 `message_delta` + `message_stop`(静默断流),不裸断流。responses 空轮次/纯思考轮次合成空 text 块(Claude 客户端遇零块消息报 "Content block not found")。
+
+**诊断落盘**  
+`logging.request_body: true` 时逐请求把最终上游 body 落盘 `logs/upstream_body_<session前8>_<毫秒>.<protocol>.json`,供逐轮 diff 定位缓存漂移。另含入站 `request_body` 调试日志。
 
 **content_block index 对齐**  
 openai chat 的 `delta.tool_calls[N]` 需映射到 anthropic 的 `content[M]`,首次出现时分配 index 并记录映射。
