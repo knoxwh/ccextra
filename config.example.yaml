@@ -3,6 +3,8 @@
 server:
   host: "127.0.0.1"
   port: 8222
+  # 可选；全局代理兜底，"direct" 表示不走代理
+  proxy_url: "http://127.0.0.1:7897"
 
 # 入口 secret key(可选)。配置后 /v1/models 与 /v1/messages 需 x-api-key 匹配。
 # Claude Code 用 ANTHROPIC_AUTH_TOKEN 或环境变量注入该 key。
@@ -14,6 +16,8 @@ providers:
     protocol: claude
     base_url: https://mg-new.evolai.cn/claude-proxy
     key: sk-ant-xxx
+    # 可选；覆盖全局代理，"direct" 表示不走代理
+    proxy_url: "direct"
     models:
       - name: claude-opus-5
         alias: evol-opus-5
@@ -36,8 +40,8 @@ providers:
     protocol: openai_responses
     base_url: https://ckff.dev/v1
     key: sk-xxx
-    # 注入派生 prompt_cache_key(对齐 CPA support-prompt-cache-key,默认 false)
-    # UUIDv5 按 会话+模型+agent 派生,与 CPA 同桶;仅 openai_chat/openai_responses 生效
+    # 注入派生 prompt_cache_key(provider 级开关,默认 false)
+    # UUIDv5 按 会话+模型+agent 派生,确定性桶;仅 openai_chat/openai_responses 生效
     prompt_cache_key: true
     models:
       - name: gpt-5.6-terra

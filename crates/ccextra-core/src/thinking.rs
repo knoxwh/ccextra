@@ -1,15 +1,11 @@
-// 思考级别映射(忠实移植 CPA,可跟随上游更新)
+// 思考级别映射
 //
-// 参考源:
-// - 阈值与级别:     https://github.com/router-for-me/CLIProxyAPI/blob/main/internal/thinking/convert.go
-// - 级别枚举:       https://github.com/router-for-me/CLIProxyAPI/blob/main/internal/thinking/types.go
-// - thinking→effort: https://github.com/router-for-me/CLIProxyAPI/blob/main/internal/translator/codex/claude/codex_claude_request.go
-// - 钳制逻辑:       https://github.com/router-for-me/CLIProxyAPI/blob/main/internal/thinking/apply.go
-//
-// 与 CPA 差异:CPA 靠每模型能力表(registry)在 executor 的 ApplyThinking 钳制非法值;
-// ccextra 无 registry,转换层直映射不钳制(见 resolve_effort doc),与 CPA 请求转换层一致。
+// 语义:
+// - budget 阈值决定最小/低/中/高级别(auto/none 单列)
+// - thinking 配置 → reasoning.effort 字符串,直映射不钳制
+//   (ccextra 无模型能力表,转换层忠实透传)
 
-/// 思考级别(对应 CPA ThinkingLevel)
+/// 思考级别(与 Anthropic thinking 级别对应)
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum Level {
     None,
@@ -36,7 +32,7 @@ impl Level {
         }
     }
 
-    /// 解析字符串(大小写不敏感,参考 CPA suffix.go)
+    /// 解析字符串(大小写不敏感)
     pub fn parse(s: &str) -> Option<Level> {
         match s.trim().to_ascii_lowercase().as_str() {
             "none" => Some(Level::None),
@@ -52,7 +48,7 @@ impl Level {
     }
 }
 
-/// 阈值(参考 CPA convert.go)
+/// 阈值
 const THRESHOLD_MINIMAL: i64 = 512;
 const THRESHOLD_LOW: i64 = 1024;
 const THRESHOLD_MEDIUM: i64 = 8192;
@@ -67,7 +63,7 @@ pub const DEFAULT_SUPPORTED: [Level; 5] = [
     Level::Max,
 ];
 
-/// budget → level(参考 CPA ConvertBudgetToLevel)
+/// budget → level
 pub fn budget_to_level(budget: i64) -> Option<Level> {
     match budget {
         b if b < -1 => None, // 非法负值
@@ -81,12 +77,10 @@ pub fn budget_to_level(budget: i64) -> Option<Level> {
     }
 }
 
-/// thinking 配置 → effort 字符串(对齐 CPA codex_claude_request.go)
+/// thinking 配置 → effort 字符串
 ///
-/// 直映射不钳制:CPA 在请求转换层直接取 ConvertBudgetToLevel 结果,
-/// 级别健全性由 executor 的 ApplyThinking 按模型能力表钳制(ccextra 无 registry,
-/// 转换层忠实透传,与 CPA 请求转换层一致)。返回 None 表示不注入,
-/// 调用方回退默认 effort(CPA reasoningEffort 初始 "medium")。
+/// 直映射不钳制:转换层直接取 budget→level 结果透传(无模型能力表
+/// 校验)。返回 None 表示不注入,调用方回退默认 effort("medium")。
 pub fn resolve_effort(thinking: &serde_json::Value) -> Option<&'static str> {
     let ty = thinking.get("type")?.as_str()?;
     let level = match ty {
@@ -98,7 +92,7 @@ pub fn resolve_effort(thinking: &serde_json::Value) -> Option<&'static str> {
             budget_to_level(budget)?
         }
         "adaptive" | "auto" => {
-            // 显式 effort 优先(Claude 4.6),缺省 xhigh(与 CPA 一致)
+            // 显式 effort 优先(Claude 4.6),缺省 xhigh
             if let Some(e) = thinking
                 .get("output_config")
                 .and_then(|o| o.get("effort"))
@@ -158,7 +152,7 @@ mod tests {
 
     #[test]
     fn test_resolve_effort_enabled_auto_budget() {
-        // enabled + budget=-1 → budget_to_level(-1)=Auto(与 CPA 转换层一致)
+        // enabled + budget=-1 → budget_to_level(-1)=Auto
         let t = json!({"type": "enabled", "budget_tokens": -1});
         assert_eq!(resolve_effort(&t), Some("auto"));
     }

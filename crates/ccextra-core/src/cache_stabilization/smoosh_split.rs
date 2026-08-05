@@ -39,7 +39,7 @@ fn smoosh_regex() -> &'static regex::Regex {
 pub fn split_smooshed_reminders(body: &mut Value, kind: ApiKind) -> usize {
     match kind {
         ApiKind::Anthropic => split_anthropic_messages(body),
-        // CC 特有模式;Anthropic 形式由 /v1/messages 和 /v1/pretransform/messages 负责
+        // CC 特有模式;Anthropic 形式由入站全量归一化负责
         ApiKind::OpenAiChat | ApiKind::OpenAiResponses => 0,
     }
 }

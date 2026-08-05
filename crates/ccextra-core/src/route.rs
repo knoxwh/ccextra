@@ -38,7 +38,7 @@ pub struct ProviderConfig {
     /// 覆盖全局代理;Some("direct") = 直连(缺省 = 用全局)
     #[serde(default)]
     pub proxy_url: Option<String>,
-    /// 注入派生 prompt_cache_key(对齐 CPA support-prompt-cache-key,默认 false;
+    /// 注入派生 prompt_cache_key(provider 级开关,默认 false;
     /// 仅 openai_chat / openai_responses 生效)
     #[serde(default)]
     pub prompt_cache_key: bool,
@@ -66,7 +66,7 @@ pub fn resolve_route(
     providers: &[ProviderConfig],
 ) -> Result<RouteDecision, RouteError> {
     // alias 优先(Claude Code 主对话发别名);name 兜底(部分内部门如
-    // count_tokens 发上游裸名,见 CPA countTokens 场景)
+    // count_tokens 发上游裸名)
     for provider in providers {
         for model in &provider.models {
             if model.alias == inbound_model {

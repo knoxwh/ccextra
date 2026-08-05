@@ -1,5 +1,5 @@
 // 入口 secret 辅助(纯逻辑,无 IO)
-// 参考 CPA internal/.../looksLikeBcrypt
+// bcrypt 哈希前缀识别
 
 /// 是否为 bcrypt 哈希,用于区分"明文 key"与"已哈希 key"
 pub fn looks_like_bcrypt(s: &str) -> bool {

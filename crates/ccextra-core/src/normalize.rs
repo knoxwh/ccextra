@@ -1,4 +1,4 @@
-// 归一化:编排 tklite 九模块
+// 归一化:编排九模块
 //
 // 三条管线:
 // - normalize_anthropic_full:  入站 anthropic 转换前,九模块全跑
@@ -50,7 +50,7 @@ pub enum TargetShape {
 
 /// 入站 anthropic 转换前归一化:九模块全跑
 ///
-/// 顺序与 tklite Full 一致:
+/// 顺序:
 /// 1. tool_def 排序 + schema 键递归排序(仅当无 cache_control 时)
 /// 2. smoosh 拆分(剥掉 tool_result.content 里的 reminder)
 /// 3. bookkeeping 剥离(历史 user 消息的每轮 reminder)
@@ -111,8 +111,7 @@ pub fn normalize_anthropic_full(body: &mut Value) -> NormalizeCounts {
     counts
 }
 
-/// 入站 anthropic 转换前归一化:PreTransform 精简子集(对齐 tklite
-/// `/v1/pretransform/messages`,CPA openai 链路转换前调用)。
+/// 入站 anthropic 转换前归一化:精简子集(openai 转换链路转换前调用)。
 ///
 /// 只跑历史归一化子集:smoosh → content_strip → tool_input → sort → rstrip。
 /// 跳过 tool-def sort、volatile strip、drift、auto cache_control、volatile
@@ -137,13 +136,13 @@ pub fn normalize_anthropic_pretransform(body: &mut Value) -> NormalizeCounts {
 
 /// 转换后目标 body 二次归一化:tool_def + sort + rstrip + volatile
 ///
-/// 顺序与 tklite openai 管线(post-transform)一致:
+/// 顺序(post-transform):
 /// 1. tool_def 归一化(按 chat / responses 形状区分)
 /// 2. system reminder 列表块排序(CC 注入的 skills/deferred 列表顺序不稳定)
 /// 3. 尾部 reminder 空白归一化(CC 重序列化历史内容时字节漂移 #48734)
 /// 4. volatile 剥离(工具参数里残留的时间戳/UUID)
 ///
-/// 2/3 与 tklite openai 对齐:排序在 rstrip 前,两条归一化都落在 drift 检测前。
+/// 排序在 rstrip 前,两条归一化都落在 drift 检测前。
 pub fn normalize_target_post(body: &mut Value, shape: TargetShape) -> NormalizeCounts {
     let mut counts = NormalizeCounts::default();
 
@@ -212,7 +211,7 @@ mod tests {
 
     #[test]
     fn test_pretransform_runs_history_subset() {
-        // 对齐 tklite PreTransform:bookkeeping 剥离生效
+        // 转换前:bookkeeping 剥离生效
         let mut body = json!({
             "messages": [
                 {"role": "user", "content": [
@@ -233,7 +232,7 @@ mod tests {
 
     #[test]
     fn test_pretransform_rstrips_reminder_trailing() {
-        // 对齐 tklite PreTransform:rstrip 折叠尾部空白(独立块,不经 bookkeeping)
+        // 转换前:rstrip 折叠尾部空白(独立块,不经 bookkeeping)
         let mut body = json!({
             "messages": [
                 {"role": "user", "content": [
@@ -257,7 +256,7 @@ mod tests {
 
     #[test]
     fn test_pretransform_skips_cache_control_injection() {
-        // 没有 cache_control 注入(对齐 PreTransform:转换后 cache 语义丢弃)
+        // 没有 cache_control 注入(转换前不注入:转换后 cache 语义丢弃)
         let mut body = json!({
             "tools": [{"name": "b", "input_schema": {"type": "object"}}],
             "messages": [{"role": "user", "content": "hi"}]
@@ -289,7 +288,7 @@ mod tests {
 
     #[test]
     fn test_target_post_chat_sorts_skill_listing() {
-        // system 里技能列表乱序 → stabilize_block_sort 应排序(对齐 tklite openai)
+        // system 里技能列表乱序 → stabilize_block_sort 应排序
         let mut body = json!({
             "model": "test",
             "messages": [
@@ -310,7 +309,7 @@ mod tests {
 
     #[test]
     fn test_target_post_chat_rstrip_reminder_trailing() {
-        // 尾部 </system-reminder> 前多余空白 → rstrip 折叠(对齐 tklite openai)
+        // 尾部 </system-reminder> 前多余空白 → rstrip 折叠
         let mut body = json!({
             "model": "test",
             "messages": [

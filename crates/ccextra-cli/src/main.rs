@@ -32,7 +32,7 @@ async fn main() -> Result<()> {
     let config = Config::load(&cli.config)?;
 
     // 初始化日志:config.logging.level 为默认,RUST_LOG 可覆盖
-    // 本地时区时间戳(CPA/tkLite 风格)+ 无 ANSI + 无 target,适合日志文件
+    // 本地时区时间戳 + 无 ANSI + 无 target,适合日志文件
     let timer_fmt = time::format_description::parse_borrowed::<2>(
         "[year]-[month]-[day] [hour]:[minute]:[second]",
     )

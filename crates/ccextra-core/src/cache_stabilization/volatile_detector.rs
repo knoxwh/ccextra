@@ -1688,7 +1688,7 @@ mod tests {
 
     #[test]
     fn strips_responses_input_developer_message() {
-        // cliproxyapi 将 Claude system 转换为 OpenAI 的 "developer" 角色
+        // 转换路径将 Claude system 转换为 OpenAI 的 "developer" 角色
         // developer 消息会被剥离（前缀易变策略）。
         let mut body = json!({
             "model": "gpt-5.4",

@@ -79,7 +79,7 @@ fn is_continue_trailer(block: &Value) -> bool {
 pub fn strip_bookkeeping_content(body: &mut Value, kind: ApiKind) -> usize {
     match kind {
         ApiKind::Anthropic => strip_anthropic_messages(body),
-        // CC 特有模式;Anthropic 形式由 /v1/messages 和 /v1/pretransform/messages 负责
+        // CC 特有模式;Anthropic 形式由入站全量归一化负责
         ApiKind::OpenAiChat | ApiKind::OpenAiResponses => 0,
     }
 }

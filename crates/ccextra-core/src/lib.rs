@@ -1,7 +1,7 @@
 // ccextra-core: 纯逻辑,无 IO
 //
 // 职责:
-// - normalize/: 九个 tklite 归一化模块
+// - normalize/: 九个归一化模块
 // - convert/: 三条 body-to-body 转换
 // - route/: model → provider 路由决策
 // - session/: 会话身份派生

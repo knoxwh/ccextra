@@ -1,15 +1,14 @@
-// 工具名缩短(对齐 CPA codex/claude/codex_claude_request.go)
+// 工具名缩短(OpenAI Responses 工具名 ≤64 字符)
 //
-// OpenAI Responses API 要求工具名 ≤64 字符。超长 Claude 工具名(尤其 mcp__ 前缀)
-// 需确定性缩短 + 冲突时唯一 `_N` 后缀,保证同一请求内名字不重复。
-// 响应侧用反向映射还原原名(对齐 buildReverseMapFromClaudeOriginalShortToOriginal)。
+// 超长 Claude 工具名(尤其 mcp__ 前缀)需确定性缩短 + 冲突时唯一 `_N` 后缀,
+// 保证同一请求内名字不重复。响应侧用反向映射还原原名。
 
 use std::collections::HashMap;
 
-/// 名长上限(OpenAI Responses 限制,对齐 CPA const limit = 64)
+/// 名长上限(OpenAI Responses 限制)
 const NAME_LIMIT: usize = 64;
 
-/// mcp__ 前缀工具名缩短:保留 mcp__ + 末段 __ 后的名字(对齐 CPA shortenNameIfNeeded)
+/// mcp__ 前缀工具名缩短:保留 mcp__ + 末段 __ 后的名字
 pub fn shorten_name_if_needed(name: &str) -> String {
     if name.len() <= NAME_LIMIT {
         return name.to_string();
@@ -26,7 +25,7 @@ pub fn shorten_name_if_needed(name: &str) -> String {
     name[..NAME_LIMIT].to_string()
 }
 
-/// 候选名冲突时追加 `_N` 后缀直到唯一(对齐 CPA makeUnique)
+/// 候选名冲突时追加 `_N` 后缀直到唯一
 fn make_unique(cand: String, used: &std::collections::HashSet<String>) -> String {
     if !used.contains(&cand) {
         return cand;
@@ -44,7 +43,7 @@ fn make_unique(cand: String, used: &std::collections::HashSet<String>) -> String
     unreachable!("迭代必有唯一候选")
 }
 
-/// 构建 original→short 映射,保证同名唯一(对齐 CPA buildShortNameMap)
+/// 构建 original→short 映射,保证同名唯一
 pub fn build_short_name_map(names: &[String]) -> HashMap<String, String> {
     let mut used = std::collections::HashSet::new();
     let mut m = HashMap::new();
@@ -57,7 +56,7 @@ pub fn build_short_name_map(names: &[String]) -> HashMap<String, String> {
     m
 }
 
-/// 反向映射 short→original,响应侧还原工具名(对齐 CPA buildReverseMap...)
+/// 反向映射 short→original,响应侧还原工具名
 pub fn build_reverse_map(short_map: &HashMap<String, String>) -> HashMap<String, String> {
     short_map
         .iter()

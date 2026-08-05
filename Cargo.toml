@@ -51,16 +51,16 @@ tracing-subscriber = { version = "0.3", features = ["env-filter", "json", "time"
 sha2 = "0.10"
 hex = "0.4"
 
-# UUIDv5 (prompt_cache_key 派生,对齐 CPA uuid.NewSHA1(NameSpaceOID, ...))
+# UUIDv5 (prompt_cache_key 派生,按模型名+会话键哈希)
 uuid = { version = "1", features = ["v5"] }
 
-# Secret key hashing (参考 CPA:明文自动转 bcrypt)
+# Secret key hashing (明文自动转 bcrypt)
 bcrypt = "0.15"
 
 # Pattern matching (for payload model wildcards)
 globset = "0.4"
 
-# Local token estimation (count_tokens, 对齐 CPA O200kBase)
+# Local token estimation (count_tokens, O200k tokenizer)
 tiktoken-rs = "0.11"
 
 # CLI

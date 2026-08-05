@@ -1,23 +1,23 @@
-// 本地 token 估算:对齐 CPA helps.CountClaudeInputTokens
+// 本地 token 估算
 //
 // Claude Code 的 /context 记账除 Skills 外所有类别都走 API 计数
 // (POST /v1/messages/count_tokens),再回退到非流式 messages.create。
-// 自定义 base URL(非 Anthropic 官方)没有原生 count_tokens 契约,CPA 一律
+// 自定义 base URL(非 Anthropic 官方)没有原生 count_tokens 契约,一律
 // 用本地估算:O200kBase tokenizer 把 system / messages / tools / tool_choice
 // 的文本段收集起来 join 后计数,返回 {"input_tokens": N}。
 //
 // 本模块只做纯函数估算,不持有 IO。tokenizer 用 tiktoken-rs 的 o200k_base
-// (include_str! 内嵌词表,离线可用),与 CPA 的 tiktoken-go O200kBase 对齐。
+// (include_str! 内嵌词表,离线可用)。
 
 use serde::Serialize;
 use serde_json::Value;
 use std::sync::OnceLock;
 
-/// O200kBase tokenizer 进程级缓存(对齐 CPA 惰性初始化 state.codec)。
+/// O200kBase tokenizer 进程级缓存(惰性初始化)。
 /// 词表 include_str! 内嵌,首次调用解析一次,后续请求复用。
 static ENC: OnceLock<tiktoken_rs::CoreBPE> = OnceLock::new();
 
-/// 求 input_tokens 计数的结果(对齐 Anthropic count_tokens 响应形状)
+/// 求 input_tokens 计数的结果(Anthropic count_tokens 响应形状)
 #[derive(Debug, Serialize)]
 pub struct TokenCount {
     pub input_tokens: usize,
@@ -57,7 +57,7 @@ pub fn count_claude_input_tokens(payload: &str) -> Result<TokenCount, String> {
     })
 }
 
-/// system:字符串或 block 数组,取 text 字段(对齐 CPA collectClaudeSystemTokenSegments)
+/// system:字符串或 block 数组,取 text 字段
 fn collect_system(system: Option<&Value>, segments: &mut Vec<String>) {
     let Some(system) = system else { return };
     match system {
@@ -73,7 +73,7 @@ fn collect_system(system: Option<&Value>, segments: &mut Vec<String>) {
     }
 }
 
-/// messages:role + content 递归(对齐 CPA collectClaudeMessageTokenSegments)
+/// messages:role + content 递归
 fn collect_messages(messages: Option<&Value>, segments: &mut Vec<String>) {
     let Some(messages) = messages else { return };
     let Some(arr) = messages.as_array() else {
@@ -87,7 +87,7 @@ fn collect_messages(messages: Option<&Value>, segments: &mut Vec<String>) {
     }
 }
 
-/// content:字符串 / 数组 / 对象块(对齐 CPA collectClaudeContentTokenSegments)
+/// content:字符串 / 数组 / 对象块
 fn collect_content(content: Option<&Value>, segments: &mut Vec<String>) {
     let Some(content) = content else { return };
     match content {
@@ -133,7 +133,7 @@ fn collect_content(content: Option<&Value>, segments: &mut Vec<String>) {
                 }
                 "image" | "input_audio" | "audio" | "video" | "redacted_thinking" => {}
                 _ => {
-                    // 未知块类型:兜底取 text(对齐 CPA default 分支)
+                    // 未知块类型:兜底取 text
                     if let Some(t) = content.get("text").and_then(|v| v.as_str()) {
                         push_trimmed(segments, t);
                     }
@@ -144,7 +144,7 @@ fn collect_content(content: Option<&Value>, segments: &mut Vec<String>) {
     }
 }
 
-/// tools:type/name/description/input_schema(对齐 CPA collectClaudeToolTokenSegments)
+/// tools:type/name/description/input_schema
 fn collect_tools(tools: Option<&Value>, segments: &mut Vec<String>) {
     let Some(tools) = tools else { return };
     let Some(arr) = tools.as_array() else { return };
@@ -167,7 +167,7 @@ fn collect_tools(tools: Option<&Value>, segments: &mut Vec<String>) {
     }
 }
 
-/// tool_choice:字符串或 {type,name}(对齐 CPA collectClaudeToolChoiceTokenSegments)
+/// tool_choice:字符串或 {type,name}
 fn collect_tool_choice(tool_choice: Option<&Value>, segments: &mut Vec<String>) {
     let Some(tool_choice) = tool_choice else {
         return;
@@ -194,7 +194,7 @@ fn collect_tool_choice(tool_choice: Option<&Value>, segments: &mut Vec<String>) 
     }
 }
 
-/// 收集后 trim,空段丢弃(对齐 CPA appendClaudeTokenString)
+/// 收集后 trim,空段丢弃
 fn push_trimmed(segments: &mut Vec<String>, value: &str) {
     let trimmed = value.trim();
     if !trimmed.is_empty() {
@@ -202,7 +202,7 @@ fn push_trimmed(segments: &mut Vec<String>, value: &str) {
     }
 }
 
-/// 收集 JSON 值:字符串原样;对象/数组 compact 后收(对齐 CPA appendClaudeTokenJSON)
+/// 收集 JSON 值:字符串原样;对象/数组 compact 后收
 fn push_json(segments: &mut Vec<String>, value: Option<&Value>) {
     let Some(value) = value else { return };
     match value {
@@ -239,7 +239,7 @@ mod tests {
 
     #[test]
     fn test_count_null_content_still_counts_role() {
-        // role 计入(对齐 CPA collectClaudeMessageTokenSegments),null content 不贡献
+        // role 计入,null content 不贡献
         let body = json!({"model": "x", "messages": [{"role": "user", "content": null}]});
         let r = count_claude_input_tokens(&body.to_string()).unwrap();
         assert!(r.input_tokens > 0);

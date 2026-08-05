@@ -1,8 +1,7 @@
 // Anthropic → OpenAI chat/completions 转换
 //
-// 参考 CPA internal/translator/openai/claude/openai_claude_request.go (500 行)。
-// 请求侧采用 CPA 完整字段映射(ai-gateway 的 Standard 中间层有损:cache_control/
-// image 丢失,故不采用)。
+// 参考转换语义:字段映射完整不丢字段(参考实现的 Standard 中间层有损:
+// cache_control/image 丢失,故不采用)。
 //
 // 主要映射:
 // - system → messages[0] {role: system}
@@ -19,14 +18,13 @@ use super::{ConvertError, Result};
 
 /// Anthropic messages → OpenAI chat/completions
 ///
-/// 对齐 CPA `ConvertClaudeRequestToOpenAI`(openai/claude/openai_claude_request.go):
-/// 顶层键序、system 数组形态、messages 内 role=system 提取、user 透传。
-/// 差异:content 字符串保持数组(参考 ai-gateway 形态归一化,解决客户端跨轮
+/// 对齐 顶层键序、system 数组形态、messages 内 role=system 提取、user 透传。
+/// 差异:content 字符串保持数组(采用跨协议形态归一化,解决客户端跨轮
 /// 数组/字符串漂移,见 convert_message 注释)。
 pub fn convert_to_openai_chat(body: &mut Value, upstream_model: &str) -> Result<()> {
     let mut openai = serde_json::Map::new();
 
-    // 对齐 CPA 顶层键序:model,max_tokens,temperature/top_p,stop,stream,
+    // 对齐 顶层键序:model,max_tokens,temperature/top_p,stop,stream,
     // reasoning_effort,messages,tools,tool_choice,user
     openai.insert("model".into(), json!(upstream_model));
 
@@ -34,13 +32,13 @@ pub fn convert_to_openai_chat(body: &mut Value, upstream_model: &str) -> Result<
     if let Some(val) = body.get("max_tokens") {
         openai.insert("max_tokens".into(), val.clone());
     }
-    // 对齐 CPA:temperature 与 top_p 互斥,top_p 仅在无 temperature 时发
+    // 对齐:temperature 与 top_p 互斥,top_p 仅在无 temperature 时发
     if let Some(val) = body.get("temperature") {
         openai.insert("temperature".into(), val.clone());
     } else if let Some(val) = body.get("top_p") {
         openai.insert("top_p".into(), val.clone());
     }
-    // stop_sequences → stop(单元素发字符串,对齐 CPA)
+    // stop_sequences → stop(单元素发字符串,一致)
     if let Some(seqs) = body.get("stop_sequences").and_then(|v| v.as_array()) {
         let stops: Vec<&str> = seqs.iter().filter_map(|s| s.as_str()).collect();
         if stops.len() == 1 {
@@ -54,7 +52,7 @@ pub fn convert_to_openai_chat(body: &mut Value, upstream_model: &str) -> Result<
         body.get("stream").unwrap_or(&json!(true)).clone(),
     );
 
-    // thinking → reasoning_effort(忠实 CPA thinking 映射)
+    // thinking → reasoning_effort(忠实 thinking 映射)
     if let Some(effort) = body
         .get("thinking")
         .and_then(|t| crate::thinking::resolve_effort(t))
@@ -64,7 +62,7 @@ pub fn convert_to_openai_chat(body: &mut Value, upstream_model: &str) -> Result<
 
     let mut messages: Vec<Value> = Vec::new();
 
-    // System → messages[0](逐块剥离计费归属与空白,输出 text 数组,对齐 CPA)
+    // System → messages[0](逐块剥离计费归属与空白,输出 text 数组,一致)
     if let Some(system) = body.get("system") {
         let mut items: Vec<Value> = Vec::new();
         match system {
@@ -99,7 +97,7 @@ pub fn convert_to_openai_chat(body: &mut Value, upstream_model: &str) -> Result<
             let content = msg.get("content").cloned().unwrap_or(json!(""));
 
             // messages 内 role=system:提取文本包 <system-reminder> 转 user
-            // (对齐 CPA ClaudeMessageSystemReminderText)
+            // (对齐 ClaudeMessageSystemReminderText)
             if role == "system" {
                 if let Some(reminder) = system_reminder_text(&content) {
                     messages.push(json!({
@@ -116,7 +114,7 @@ pub fn convert_to_openai_chat(body: &mut Value, upstream_model: &str) -> Result<
         }
     }
 
-    // 对齐 CPA 键序:messages 在 tools 之前
+    // 对齐 键序:messages 在 tools 之前
     openai.insert("messages".into(), json!(messages));
 
     // Tools: input_schema → parameters
@@ -152,12 +150,12 @@ pub fn convert_to_openai_chat(body: &mut Value, upstream_model: &str) -> Result<
         }
     }
 
-    // user 参数透传(对齐 CPA)
+    // user 参数透传(一致)
     if let Some(user) = body.get("user") {
         openai.insert("user".into(), user.clone());
     }
 
-    // 对齐 CPA SetBoolIfDifferent(stream_options.include_usage, true):
+    // 对齐 SetBoolIfDifferent(stream_options.include_usage, true):
     // 强制上游在流尾发 usage chunk。kimi/moonshot 等上游未开启时全程无
     // usage,响应 usage 全 0,客户端 ccstatusline 无 context 显示。
     // 仅流式注入:非流请求带 stream_options 部分上游可能拒绝。
@@ -170,7 +168,7 @@ pub fn convert_to_openai_chat(body: &mut Value, upstream_model: &str) -> Result<
 }
 
 /// messages 内 role=system 消息 → 文本提取,包 <system-reminder> 标记
-/// (对齐 CPA common.ClaudeMessageSystemReminderText)。
+/// (对齐 common.ClaudeMessageSystemReminderText)。
 fn system_reminder_text(content: &Value) -> Option<String> {
     let parts: Vec<&str> = match content {
         Value::String(s) => {
@@ -207,9 +205,9 @@ fn system_reminder_text(content: &Value) -> Option<String> {
 
 /// 转换单条消息,返回一个或多个 openai 消息(tool_result 展开在前)
 fn convert_message(role: &str, content: &Value) -> Result<Vec<Value>> {
-    // 字符串内容:统一为 text 数组(保留 ai-gateway 形态归一化)。
+    // 字符串内容:统一为 text 数组(保留 跨协议形态归一化)。
     // CC 客户端同一条消息当轮发数组、历史重建发字符串,若不统一,跨轮字节
-    // 漂移破坏上游缓存前缀(4096 回归)。空字符串丢弃消息(对齐 CPA)。
+    // 漂移破坏上游缓存前缀(4096 回归)。空字符串丢弃消息(一致)。
     if let Some(s) = content.as_str() {
         if s.is_empty() {
             return Ok(Vec::new());
@@ -219,7 +217,7 @@ fn convert_message(role: &str, content: &Value) -> Result<Vec<Value>> {
         ]);
     }
 
-    // 空内容(缺失/null):丢弃消息(对齐 CPA)
+    // 空内容(缺失/null):丢弃消息(一致)
     if content.is_null() {
         return Ok(Vec::new());
     }
@@ -238,7 +236,7 @@ fn convert_message(role: &str, content: &Value) -> Result<Vec<Value>> {
         match ptype {
             "thinking" => {
                 // 仅 assistant 映射(防注入);非 assistant 忽略。
-                // 对齐 CPA shouldMapClaudeThinkingToGPTReasoning:只回放无签名思考
+                // 对齐 shouldMapClaudeThinkingToGPTReasoning:只回放无签名思考
                 // (同链路历史);跨提供方签名块跳过,防上游拒收。
                 if role == "assistant" {
                     let signed = part
@@ -257,7 +255,7 @@ fn convert_message(role: &str, content: &Value) -> Result<Vec<Value>> {
             "redacted_thinking" => { /* 显式忽略 */ }
             "text" => {
                 if let Some(t) = part.get("text").and_then(|v| v.as_str()) {
-                    // 对齐 CPA convertClaudeContentPart:空白块与计费归属块剥离
+                    // 对齐 convertClaudeContentPart:空白块与计费归属块剥离
                     if !t.trim().is_empty() && !super::is_attribution_text(t) {
                         content_items.push(json!({"type": "text", "text": t}));
                     }
@@ -335,7 +333,7 @@ fn convert_message(role: &str, content: &Value) -> Result<Vec<Value>> {
     Ok(out)
 }
 
-/// tool_result content → openai tool 消息 content(对齐 CPA convertClaudeToolResultContent)
+/// tool_result content → openai tool 消息 content(对齐 convertClaudeToolResultContent)
 /// - 字符串 → 原样
 /// - 数组含 image → 保留 parts 数组(text/image_url)
 /// - 纯文本数组 → "\n\n" 连接为字符串(tool role 兼容性最好)
@@ -395,7 +393,7 @@ fn convert_tool_result_content(content: &Value) -> Value {
 }
 
 /// image block → data URL(base64)或 url
-/// 对齐 CPA convertClaudeContentPart:media_type 空默认 application/octet-stream,
+/// 对齐 convertClaudeContentPart:media_type 空默认 application/octet-stream,
 /// 无 source 时回退到顶层 url。
 fn image_to_url(part: &Value) -> Option<String> {
     let url = part.get("source").and_then(|source| {
@@ -462,7 +460,7 @@ mod tests {
         });
         convert_to_openai_chat(&mut body, "gpt").unwrap();
         assert_eq!(body["messages"][0]["role"], "system");
-        // content 为 text 数组(对齐 CPA system 数组形态)
+        // content 为 text 数组(对齐 system 数组形态)
         assert_eq!(body["messages"][0]["content"][0]["text"], "You are helpful");
     }
 
@@ -545,7 +543,7 @@ mod tests {
             "messages": []
         });
         convert_to_openai_chat(&mut body, "gpt").unwrap();
-        // 空块剥离,text 数组保留非空项(对齐 CPA appendSystemContent)
+        // 空块剥离,text 数组保留非空项(对齐 appendSystemContent)
         let content = body["messages"][0]["content"].as_array().unwrap();
         assert_eq!(content.len(), 2);
         assert_eq!(content[0]["text"], "You are helpful");
@@ -740,7 +738,7 @@ mod tests {
 
     #[test]
     fn test_empty_string_content_dropped() {
-        // 空字符串 content 丢弃消息(对齐 CPA)
+        // 空字符串 content 丢弃消息(一致)
         let mut body = json!({
             "model": "test",
             "messages": [
@@ -755,7 +753,7 @@ mod tests {
 
     #[test]
     fn test_null_content_dropped() {
-        // null content 丢弃消息(对齐 CPA)
+        // null content 丢弃消息(一致)
         let mut body = json!({
             "model": "test",
             "messages": [
@@ -770,7 +768,7 @@ mod tests {
 
     #[test]
     fn test_empty_array_content_no_message() {
-        // 空数组 content 无实际内容项 → 不输出消息(对齐 CPA)
+        // 空数组 content 无实际内容项 → 不输出消息(一致)
         let mut body = json!({
             "model": "test",
             "messages": [
@@ -813,7 +811,7 @@ mod tests {
 
     #[test]
     fn test_message_system_reminder_to_user() {
-        // messages 内 role=system:提取文本包 <system-reminder> 转 user(对齐 CPA)
+        // messages 内 role=system:提取文本包 <system-reminder> 转 user(一致)
         let mut body = json!({
             "model": "test",
             "messages": [
@@ -839,7 +837,7 @@ mod tests {
 
     #[test]
     fn test_message_system_attribution_reminder_dropped() {
-        // role=system 内容全为 attribution → 不输出 user 消息(对齐 CPA)
+        // role=system 内容全为 attribution → 不输出 user 消息(一致)
         let mut body = json!({
             "model": "test",
             "messages": [
@@ -853,7 +851,7 @@ mod tests {
 
     #[test]
     fn test_user_param_passthrough() {
-        // user 参数透传(对齐 CPA)
+        // user 参数透传(一致)
         let mut body = json!({
             "model": "test",
             "messages": [],
@@ -864,8 +862,8 @@ mod tests {
     }
 
     #[test]
-    fn test_top_level_key_order_matches_cpa() {
-        // 对齐 CPA 顶层键序:model,max_tokens,temperature/top_p,stop,stream,
+    fn test_top_level_key_order() {
+        // 对齐 顶层键序:model,max_tokens,temperature/top_p,stop,stream,
         // reasoning_effort,messages,tools,tool_choice,user
         let mut body = json!({
             "model": "test",
@@ -928,7 +926,7 @@ mod tests {
 
     #[test]
     fn test_image_media_type_default_octet_stream() {
-        // media_type 缺省 → application/octet-stream(对齐 CPA)
+        // media_type 缺省 → application/octet-stream(一致)
         let mut body = json!({
             "model": "test",
             "messages": [{"role": "user", "content": [
@@ -944,7 +942,7 @@ mod tests {
 
     #[test]
     fn test_image_top_level_url_fallback() {
-        // 无 source 时回退顶层 url(对齐 CPA)
+        // 无 source 时回退顶层 url(一致)
         let mut body = json!({
             "model": "test",
             "messages": [{"role": "user", "content": [

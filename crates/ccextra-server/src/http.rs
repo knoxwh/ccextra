@@ -61,14 +61,14 @@ pub struct AppState {
     pub reload: Arc<dyn Fn() -> anyhow::Result<ReloadData> + Send + Sync>,
     /// 入口 secret key;Some 时 /v1/models 与 /v1/messages 需 x-api-key 匹配
     pub secret: Option<String>,
-    /// drift 观测状态(会话 → 上次结构哈希;对齐 tklite openai/anthropic handler)
+    /// drift 观测状态(会话 → 上次结构哈希;按 openai/anthropic handler 分桶)
     pub drift: DriftState,
 }
 
 #[derive(Clone, Debug, serde::Deserialize)]
 pub struct PayloadRule {
     pub models: Vec<String>,
-    /// 限定生效的目标协议;缺省 = 所有协议(参照 cpa payload 的 protocol 字段)
+    /// 限定生效的目标协议;缺省 = 所有协议(参照 payload 的 protocol 字段)
     #[serde(default)]
     pub protocol: Option<Protocol>,
     pub params: serde_json::Map<String, Value>,
@@ -165,7 +165,7 @@ fn extract_key(headers: &HeaderMap) -> &str {
     ""
 }
 
-/// 构建 Anthropic 格式模型列表(参考 CPA GetAvailableModels claude 分支)
+/// 构建 Anthropic 格式模型列表(参考 GetAvailableModels claude 分支)
 fn build_models_list(providers: &[ProviderConfig]) -> Value {
     let mut data = Vec::new();
     for provider in providers {
@@ -187,7 +187,7 @@ fn build_models_list(providers: &[ProviderConfig]) -> Value {
 /// POST /v1/messages/count_tokens:本地 token 估算(带 secret 认证)
 ///
 /// Claude Code 的 /context 记账会调此端点。自定义 base URL 无原生
-/// count_tokens 契约(对齐 CPA:非 Anthropic 官方一律本地估算),直接
+/// count_tokens 契约(非 Anthropic 官方一律本地估算),直接
 /// 用 O200kBase 对请求体估算 input_tokens,不走上游。
 async fn handle_count_tokens(
     State(state): State<AppState>,
@@ -285,7 +285,7 @@ fn apply_payload_overrides(
     }
 }
 
-/// 观测 body 结构漂移(对齐 tklite openai/anthropic handler 的 drift 检测)。
+/// 观测 body 结构漂移(对齐 openai/anthropic handler 的 drift 检测)。
 /// 辅助请求(标题生成等)跳过——它们共享会话键但 body 形状不同,会比较出假漂移。
 /// `enabled` 接 normalize.drift_detector 开关,关闭时跳过观测。
 fn observe_drift_for(
@@ -307,11 +307,11 @@ fn observe_drift_for(
     observe_drift(drift, &identity, structural_hash);
 }
 
-/// 构建 claude 直通的透传/重建头(对齐 CPA applyClaudeHeaders 中转场景)。
+/// 构建 claude 直通的透传/重建头(对齐 applyClaudeHeaders 中转场景)。
 ///
 /// anthropic-beta 按 body 内容条件重建,再追加 caller 自带 beta(去重);
 /// anthropic-version / x-app / stainless 系列等身份头仅透传(有就转发,
-/// 没有不补——中转站不校验,官方上游才需要 CPA 的完整强制集)。
+/// 没有不补——中转站不校验,官方上游才需要完整强制集)。
 fn claude_relay_headers(headers: &HeaderMap, body: &Value) -> Vec<(String, String)> {
     // 1. anthropic-beta 重建(基础集 + body 条件 + caller 追加)
     let mut betas: Vec<String> = vec!["claude-code-20250219".to_string()];
@@ -388,15 +388,15 @@ async fn handle_messages(
         .ok_or_else(|| AppError::new(anyhow::anyhow!("缺少 model 字段")))?
         .to_string();
 
-    // 2. 路由决策(先定协议,再选归一化模式;对齐 CPA 按目标协议分流)
+    // 2. 路由决策(先定协议,再选归一化模式;对齐 按目标协议分流)
     let providers = state.providers.read().await;
     let route = resolve_route(&model, &providers)?;
     let payload_rules = state.payload_rules.read().await;
 
     // 3. 归一化第一遍(按协议:claude 直通全量 / openai 转换前精简)
-    // 对齐 CPA:claude 调 tklite /v1/messages(Full),openai 调
-    // /v1/pretransform/messages(PreTransform 子集,跳过 tool-def sort /
-    // volatile / cache_control / drift——这些在转换后 openai handler 处理)
+    // 对齐:claude 直通走 /v1/messages(全量),openai 走转换前
+    // 精简子集(跳过 tool-def sort / volatile / cache_control / drift——
+    // 这些在转换后 openai handler 处理)
     if state.normalize.enabled {
         match route.protocol {
             Protocol::Claude => {
@@ -425,7 +425,7 @@ async fn handle_messages(
     // Claude Code 会话 ID 须在转换前提取(转换后 metadata 被丢弃),供 prompt_cache_key 用
     let cc_session = extract_claude_code_session(&headers, &body_json);
 
-    // 入站 Claude body 本地估算输入 token(对齐 CPA ClaudeInputTokenState)。
+    // 入站 Claude body 本地估算输入 token(对齐 ClaudeInputTokenState)。
     // 上游流未回真实 usage 时,SSE 状态机 message_start 用此值填充,避免
     // context 记账显示 0。claude 直通不经状态机、非流式不进 SSE,均传 None。
     let estimated_input_tokens = if !is_stream || matches!(route.protocol, Protocol::Claude) {
@@ -478,7 +478,7 @@ async fn handle_messages(
     // 5. payload 参数覆盖(转换后注入;claude 直通需显式 protocol 才生效)
     apply_payload_overrides(&mut body_json, &model, route.protocol, &payload_rules);
 
-    // 6. 对齐 CPA StripPromptCacheRetention:openai 上游拒绝 prompt_cache_retention
+    // 6. 对齐 StripPromptCacheRetention:openai 上游拒绝 prompt_cache_retention
     // (HTTP 400 "Unsupported parameter: prompt_cache_retention"),claude 直通保留
     if !matches!(route.protocol, Protocol::Claude) {
         body_json
@@ -490,7 +490,7 @@ async fn handle_messages(
     let provider = find_provider(&providers, &route.provider)
         .ok_or_else(|| AppError::new(anyhow::anyhow!("provider 未找到: {}", route.provider)))?;
 
-    // prompt_cache_key 注入(provider 级开关;仅 openai 协议;对齐 CPA applyPromptCacheKey)
+    // prompt_cache_key 注入(provider 级开关;仅 openai 协议;对齐 applyPromptCacheKey)
     if provider.prompt_cache_key
         && !matches!(route.protocol, Protocol::Claude)
         && inject_prompt_cache_key(&mut body_json, &headers, cc_session.as_deref())
@@ -522,14 +522,14 @@ async fn handle_messages(
         }
     }
 
-    // claude 直通:透传/重建上游头(对齐 CPA applyClaudeHeaders 中转场景)
+    // claude 直通:透传/重建上游头(对齐 applyClaudeHeaders 中转场景)
     let extra_headers = if matches!(route.protocol, Protocol::Claude) {
         claude_relay_headers(&headers, &body_json)
     } else {
         Vec::new()
     };
 
-    // responses 链路:Session_id 头取注入的 prompt_cache_key(对齐 CPA cacheHelper)
+    // responses 链路:Session_id 头取注入的 prompt_cache_key(对齐 cacheHelper)
     let session_id = if matches!(route.protocol, Protocol::OpenAiResponses) {
         body_json.get("prompt_cache_key").and_then(|v| v.as_str())
     } else {
@@ -552,7 +552,7 @@ async fn handle_messages(
     let status = upstream.status;
 
     // 上游错误:转 anthropic error 形状
-    // (OpenAI 的 {"error":{...}} 直接透传客户端不认,对齐 CPA WriteErrorResponse)
+    // (OpenAI 的 {"error":{...}} 直接透传客户端不认,对齐 WriteErrorResponse)
     if !status.is_success() {
         let body_bytes = upstream.body.bytes().await?;
         return Response::builder()
@@ -726,7 +726,7 @@ mod tests {
 
     #[test]
     fn test_claude_relay_beta_no_redact_when_display_present() {
-        // thinking.display 存在 → 不加 redact-thinking(对齐 CPA)
+        // thinking.display 存在 → 不加 redact-thinking(与直通头重建一致)
         let headers = HeaderMap::new();
         let body = json!({"thinking": {"type": "enabled", "display": "summarized"}});
         let out = claude_relay_headers(&headers, &body);

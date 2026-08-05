@@ -1,14 +1,14 @@
 // OpenAI responses API SSE → Anthropic messages SSE 状态机
 //
-// 对齐 CPA codex_claude_response.go:
+// 对齐响应转换语义:
 // - reasoning_summary_text.delta 流式转 thinking_delta(思考过程可见)
 // - output_item.done(reasoning)用 encrypted_content 发 signature_delta 收尾,
 //   下一轮请求侧把 thinking.signature 转回 reasoning.encrypted_content,闭环
-// - function_call 完整流式状态机(对齐 CPA codexFunctionCallStream:index 队列、
+// - function_call 完整流式状态机(对齐 codexFunctionCallStream:index 队列、
 //   ActiveFunctionCall 串行、arguments delta 缓冲、并行调用 defer 防交错)
 // - web_search_call → server_tool_use + web_search_tool_result
 // - 工具名还原(请求侧超长名缩短,响应侧 buildReverseMap 还原原名)
-// - usage 扣减 cached_tokens;stop_reason 走 CPA 映射表;空轮次合成空 text 块
+// - usage 扣减 cached_tokens;stop_reason 走统一映射表;空轮次合成空 text 块
 
 use async_stream::stream;
 use bytes::Bytes;
@@ -22,12 +22,12 @@ use super::parser::SseEvent;
 use super::parser::SseParser;
 use super::SseStreamPin;
 
-/// message_start 的 model 兜底(CPA 同默认值)
+/// message_start 的 model 兜底(同默认值)
 const FALLBACK_MODEL: &str = "claude-opus-4-1-20250805";
-/// 同一 reasoning item 多个 summary part 的分隔符(CPA codexThinkingSummaryPartSeparator)
+/// 同一 reasoning item 多个 summary part 的分隔符(对齐 codexThinkingSummaryPartSeparator)
 const SUMMARY_PART_SEPARATOR: &str = "\n\n";
 
-/// 单个 function_call 流式块(对齐 CPA codexFunctionCallStream)
+/// 单个 function_call 流式块(对齐 codexFunctionCallStream)
 struct FunctionCallStream {
     call_id: String,
     name: String,
@@ -78,7 +78,7 @@ struct ResponsesRelay {
     thinking_signature: String,
     thinking_summary_seen: bool,
 
-    /// function_call 流式状态(对齐 CPA ConvertCodexResponseToClaudeParams)
+    /// function_call 流式状态(对齐 ConvertCodexResponseToClaudeParams)
     function_calls: HashMap<String, usize>,
     function_call_queue: Vec<FunctionCallStream>,
     active_function_call: Option<usize>,
@@ -87,14 +87,14 @@ struct ResponsesRelay {
     deferred_stream_events: Vec<SseEvent>,
     has_emitted_tool_use: bool,
 
-    /// web_search_call 去重(对齐 CPA WebSearchToolUseIDs / WebSearchToolResultIDs)
+    /// web_search_call 去重(对齐 WebSearchToolUseIDs / WebSearchToolResultIDs)
     web_search_tool_use_ids: HashSet<String>,
     web_search_tool_result_ids: HashSet<String>,
     last_web_search_tool_use_id: String,
 
     /// 工具名还原表 short→original(请求转换侧产出)
     tool_names: Option<Arc<HashMap<String, String>>>,
-    /// 入站 body 本地估算输入 token(CPA ClaudeInputTokenState;上游未回则填充)
+    /// 入站 body 本地估算输入 token(ClaudeInputTokenState;上游未回则填充)
     estimated_input: Option<usize>,
 }
 
@@ -132,7 +132,7 @@ impl ResponsesRelay {
         self
     }
 
-    /// 工具名还原:short → original(对齐 CPA resolveCodexClaudeToolUseName)
+    /// 工具名还原:short → original(对齐 resolveCodexClaudeToolUseName)
     fn resolve_tool_name(&self, name: &str) -> String {
         if let Some(rev) = &self.tool_names {
             if let Some(orig) = rev.get(name) {
@@ -150,7 +150,7 @@ impl ResponsesRelay {
         };
         let event_type = root.get("type").and_then(|v| v.as_str()).unwrap_or("");
 
-        // 函数调用进行中,非关键事件 defer(对齐 CPA shouldDeferCodexStreamEvent):
+        // 函数调用进行中,非关键事件 defer(对齐 shouldDeferCodexStreamEvent):
         // 避免流式 function_call 的 start/delta 与文本/思考块交错
         if self.active_function_call.is_some() && should_defer_stream_event(&root, event_type) {
             self.deferred_stream_events.push(ev.clone());
@@ -230,7 +230,7 @@ impl ResponsesRelay {
                         out
                     }
                     "function_call" => {
-                        // 对齐 CPA output_item.added(function_call):先关 thinking/text,
+                        // 对齐 output_item.added(function_call):先关 thinking/text,
                         // 登记调用,有名字的发初始空 delta,随后走队列
                         let mut out = self.finalize_thinking();
                         out.extend(self.stop_text());
@@ -300,7 +300,7 @@ impl ResponsesRelay {
                 if self.has_text_delta {
                     return Vec::new();
                 }
-                // 无 delta 流时从 item.content 补发文本(CPA 同兜底)
+                // 无 delta 流时从 item.content 补发文本(同兜底)
                 let mut text = String::new();
                 if let Some(parts) = item.get("content").and_then(|v| v.as_array()) {
                     for part in parts {
@@ -338,7 +338,7 @@ impl ResponsesRelay {
                 out
             }
             "function_call" => {
-                // 对齐 CPA output_item.done(function_call):关块、补身份与参数、标 done
+                // 对齐 output_item.done(function_call):关块、补身份与参数、标 done
                 let mut out = self.finalize_thinking();
                 out.extend(self.stop_text());
                 let idx = self.record_function_call(Some(item), Some(root));
@@ -380,7 +380,7 @@ impl ResponsesRelay {
         }
     }
 
-    /// 确保 message_start 已发(model 空时兜底,对齐 CPA)
+    /// 确保 message_start 已发(model 空时兜底)
     fn ensure_started(&mut self) -> Vec<Bytes> {
         if self.message_started {
             return Vec::new();
@@ -513,9 +513,9 @@ impl ResponsesRelay {
         out
     }
 
-    // ---- function_call 流式状态机(对齐 CPA codex_claude_response.go) ----
+    // ---- function_call 流式状态机 ----
 
-    /// 事件 → 候选 key 列表(output_index / call_id / item_id;对齐 CPA codexFunctionCallKeys)
+    /// 事件 → 候选 key 列表(output_index / call_id / item_id;对齐 codexFunctionCallKeys)
     fn call_keys(&self, root: Option<&Value>, item: Option<&Value>) -> Vec<String> {
         let mut keys: Vec<String> = Vec::new();
         let push = |k: String, keys: &mut Vec<String>| {
@@ -545,7 +545,7 @@ impl ResponsesRelay {
         keys
     }
 
-    /// 按 keys 找已有调用(对齐 CPA codexFunctionCallForKeys)
+    /// 按 keys 找已有调用(对齐 codexFunctionCallForKeys)
     fn function_call_for_keys(&self, keys: &[String]) -> Option<usize> {
         for k in keys {
             if let Some(&i) = self.function_calls.get(k) {
@@ -555,7 +555,7 @@ impl ResponsesRelay {
         None
     }
 
-    /// 登记调用(无则新建入队),登记别名(对齐 CPA recordCodexFunctionCall)
+    /// 登记调用(无则新建入队),登记别名(对齐 recordCodexFunctionCall)
     fn record_function_call(
         &mut self,
         item: Option<&Value>,
@@ -563,7 +563,7 @@ impl ResponsesRelay {
     ) -> Option<usize> {
         let keys = self.call_keys(root, item);
         let idx = if !keys.is_empty() {
-            // keys 非空:只按 keys 匹配,miss 则新建(对齐 CPA codexFunctionCallForKeys)
+            // keys 非空:只按 keys 匹配,miss 则新建(对齐 codexFunctionCallForKeys)
             match self.function_call_for_keys(&keys) {
                 Some(i) => i,
                 None => {
@@ -572,8 +572,7 @@ impl ResponsesRelay {
                 }
             }
         } else {
-            // keys 为空(delta 事件通常只带 delta)回退到 last(对齐 CPA
-            // codexFunctionCallForEvent 的 fallback)
+            // keys 为空(delta 事件通常只带 delta)回退到 last(对齐 codexFunctionCallForEvent fallback)
             match self.last_function_call {
                 Some(i) => i,
                 None => {
@@ -589,7 +588,7 @@ impl ResponsesRelay {
         Some(idx)
     }
 
-    /// 从事件补齐 call_id / name(对齐 CPA updateCodexFunctionCallIdentity)
+    /// 从事件补齐 call_id / name(对齐 updateCodexFunctionCallIdentity)
     fn update_function_call_identity(
         &mut self,
         idx: usize,
@@ -615,7 +614,7 @@ impl ResponsesRelay {
         }
     }
 
-    /// 追发未发完的参数片段(对齐 CPA appendCodexFunctionCallBufferedArguments)
+    /// 追发未发完的参数片段(对齐 appendCodexFunctionCallBufferedArguments)
     fn append_buffered_arguments(&mut self) -> Vec<Bytes> {
         let Some(active) = self.active_function_call else {
             return Vec::new();
@@ -633,7 +632,7 @@ impl ResponsesRelay {
     }
 
     /// 刷新队列:收尾 done 的 active,逐个启动新调用,发参数片段
-    /// (对齐 CPA appendCodexFunctionCallQueue)
+    /// (对齐 appendCodexFunctionCallQueue)
     fn append_function_call_queue(&mut self) -> Vec<Bytes> {
         let mut out = Vec::new();
 
@@ -684,7 +683,7 @@ impl ResponsesRelay {
     }
 
     /// completed/incomplete 时从 response.output 补齐函数调用
-    /// (对齐 CPA appendCodexFunctionCallsFromTerminal:避免工具调用在非流式/迟到场景丢失)
+    /// (对齐 appendCodexFunctionCallsFromTerminal:避免工具调用在非流式/迟到场景丢失)
     fn append_function_calls_from_terminal(&mut self, response: Option<&Value>) -> Vec<Bytes> {
         if let Some(output) = response
             .and_then(|r| r.get("output"))
@@ -735,7 +734,7 @@ impl ResponsesRelay {
         out
     }
 
-    /// 清空调用状态(对齐 CPA clearCodexFunctionCalls,completed 后调用)
+    /// 清空调用状态(对齐 clearCodexFunctionCalls,completed 后调用)
     fn clear_function_calls(&mut self) {
         self.function_calls.clear();
         self.function_call_queue.clear();
@@ -743,7 +742,7 @@ impl ResponsesRelay {
         self.last_function_call = None;
     }
 
-    /// 重放 defer 的事件(对齐 CPA appendDeferredCodexStreamEvents)
+    /// 重放 defer 的事件(对齐 appendDeferredCodexStreamEvents)
     fn append_deferred_events(&mut self) -> Vec<Bytes> {
         if self.deferred_stream_events.is_empty() {
             return Vec::new();
@@ -756,7 +755,7 @@ impl ResponsesRelay {
         out
     }
 
-    // ---- web_search_call 转换(对齐 CPA codex_claude_response_web_search.go) ----
+    // ---- web_search_call 转换 ----
 
     /// web_search_call 事件 → server_tool_use + web_search_tool_result
     fn append_web_search_tool_result(&mut self, root: &Value, item: &Value) -> Vec<Bytes> {
@@ -833,7 +832,7 @@ impl ResponsesRelay {
         out
     }
 
-    /// web_search_call 的 id 提取(对齐 CPA codexWebSearchToolUseID:item/root 多路径 + last 兜底)
+    /// web_search_call 的 id 提取(对齐 codexWebSearchToolUseID:item/root 多路径 + last 兜底)
     fn web_search_tool_use_id(&mut self, root: &Value, item: &Value) -> String {
         for path in ["id", "output_item_id", "call_id", "item_id"] {
             if let Some(v) = item.get(path).and_then(|v| v.as_str()) {
@@ -854,7 +853,7 @@ impl ResponsesRelay {
     }
 
     /// 空轮次/纯思考轮次合成空 text 块
-    /// (CPA synthesizeCodexEmptyTextBlock:Claude 客户端遇零块消息报
+    /// (对齐 synthesizeCodexEmptyTextBlock:Claude 客户端遇零块消息报
     /// "Content block not found")
     fn synthesize_empty_text_block(&mut self) -> Vec<Bytes> {
         if self.text_open || self.has_text_delta || self.has_emitted_tool_use || self.thinking_open
@@ -866,7 +865,7 @@ impl ResponsesRelay {
         out
     }
 
-    /// message_delta + message_stop(usage 扣 cached,stop_reason 走 CPA 映射)
+    /// message_delta + message_stop(usage 扣 cached,stop_reason 走统一映射)
     fn finalize(&mut self, response: Option<&Value>) -> Vec<Bytes> {
         if self.finished {
             return Vec::new();
@@ -878,7 +877,7 @@ impl ResponsesRelay {
         out.extend(self.stop_text());
         out.extend(self.synthesize_empty_text_block());
 
-        // usage(CPA extractResponsesUsage:cached 从 input 扣除)
+        // usage(对齐 extractResponsesUsage:cached 从 input 扣除)
         let mut input_tokens = 0;
         let mut output_tokens = 0;
         let mut cached = 0;
@@ -928,7 +927,7 @@ impl ResponsesRelay {
         self.finalize(None)
     }
 
-    /// 上游流中断:发 anthropic error 事件收尾(对齐 CPA code_handlers)
+    /// 上游流中断:发 anthropic error 事件收尾(对齐 code_handlers)
     fn stream_error(&mut self, message: &str) -> Vec<Bytes> {
         if self.finished {
             return Vec::new();
@@ -946,7 +945,7 @@ impl ResponsesRelay {
     }
 }
 
-/// 流内 error 事件 → anthropic error(对齐 CPA codexStreamErrorToClaudeError)
+/// 流内 error 事件 → anthropic error(对齐 codexStreamErrorToClaudeError)
 fn stream_error_frame(root: &Value) -> Bytes {
     let error = root.get("error");
     let mut err_type = error
@@ -1001,7 +1000,7 @@ fn stream_error_frame(root: &Value) -> Bytes {
     )
 }
 
-/// stop_reason 提取(对齐 CPA codexStopReason):
+/// stop_reason 提取(对齐 codexStopReason):
 /// stop_reason > incomplete_details.reason > stop_sequence 推断
 pub(super) fn codex_stop_reason(r: &Value) -> String {
     if let Some(sr) = r.get("stop_reason").and_then(|v| v.as_str()) {
@@ -1033,7 +1032,7 @@ pub(super) fn stop_sequence(r: &Value) -> Option<String> {
         .map(String::from)
 }
 
-/// stop_reason → anthropic(对齐 CPA mapCodexStopReasonToClaude)
+/// stop_reason → anthropic(对齐 mapCodexStopReasonToClaude)
 pub(super) fn map_stop_reason(stop_reason: &str, has_tool_use: bool) -> String {
     if has_tool_use {
         return "tool_use".to_string();
@@ -1041,7 +1040,7 @@ pub(super) fn map_stop_reason(stop_reason: &str, has_tool_use: bool) -> String {
     match stop_reason {
         "" | "stop" | "completed" => "end_turn".to_string(),
         "max_tokens" | "max_output_tokens" => "max_tokens".to_string(),
-        // 无工具调用时 CPA 把 tool 类原因映射为 end_turn
+        // 无工具调用时参考实现把 tool 类原因映射为 end_turn
         "tool_use" | "tool_calls" | "function_call" => "end_turn".to_string(),
         "content_filter" => "refusal".to_string(),
         "end_turn"
@@ -1054,7 +1053,7 @@ pub(super) fn map_stop_reason(stop_reason: &str, has_tool_use: bool) -> String {
 }
 
 /// tool id 清洗:非法字符 → _,超 64 截断
-/// (对齐 CPA SanitizeClaudeToolID + shortenCodexCallIDIfNeeded)
+/// (对齐 SanitizeClaudeToolID + shortenCodexCallIDIfNeeded)
 pub(super) fn sanitize_tool_id(id: &str) -> String {
     let mut out: String = id
         .chars()
@@ -1072,7 +1071,7 @@ pub(super) fn sanitize_tool_id(id: &str) -> String {
     out
 }
 
-/// 函数调用进行中是否 defer 该事件(对齐 CPA shouldDeferCodexStreamEvent)
+/// 函数调用进行中是否 defer 该事件(对齐 shouldDeferCodexStreamEvent)
 fn should_defer_stream_event(root: &Value, event_type: &str) -> bool {
     match event_type {
         // 永不 defer:错误/收尾/参数增量(需在函数调用间隙立即处理)
@@ -1092,7 +1091,7 @@ fn should_defer_stream_event(root: &Value, event_type: &str) -> bool {
     }
 }
 
-/// tool_use 块 start(对齐 CPA appendCodexFunctionCallStart)
+/// tool_use 块 start(对齐 appendCodexFunctionCallStart)
 fn function_call_start(call_id: &str, name: &str, index: i64) -> Bytes {
     sse(
         "content_block_start",
@@ -1109,7 +1108,7 @@ fn function_call_start(call_id: &str, name: &str, index: i64) -> Bytes {
     )
 }
 
-/// input_json_delta(对齐 CPA appendCodexFunctionCallArgumentDelta)
+/// input_json_delta(对齐 appendCodexFunctionCallArgumentDelta)
 fn function_call_argument_delta(partial_json: &str, index: i64) -> Bytes {
     sse(
         "content_block_delta",
@@ -1121,7 +1120,7 @@ fn function_call_argument_delta(partial_json: &str, index: i64) -> Bytes {
     )
 }
 
-/// 通用块 stop(对齐 CPA appendCodexFunctionCallStop)
+/// 通用块 stop(对齐 appendCodexFunctionCallStop)
 fn content_block_stop(index: i64) -> Bytes {
     sse(
         "content_block_stop",
@@ -1129,14 +1128,14 @@ fn content_block_stop(index: i64) -> Bytes {
     )
 }
 
-/// 追加去重 key(对齐 CPA appendUniqueCodexFunctionCallKey)
+/// 追加去重 key(对齐 appendUniqueCodexFunctionCallKey)
 fn push_key(keys: &mut Vec<String>, key: String) {
     if !key.is_empty() && !keys.contains(&key) {
         keys.push(key);
     }
 }
 
-/// web_search_call 的 query(对齐 CPA codexWebSearchQuery:item/root 多路径)
+/// web_search_call 的 query(对齐 codexWebSearchQuery:item/root 多路径)
 fn web_search_query(root: &Value, item: &Value) -> String {
     for path in ["/action/query", "/query", "/input/query"] {
         if let Some(v) = item.pointer(path).and_then(|v| v.as_str()) {
@@ -1153,7 +1152,7 @@ fn web_search_query(root: &Value, item: &Value) -> String {
     String::new()
 }
 
-/// web_search_call 的 results → web_search_result 块数组(对齐 CPA codexWebSearchResultContent)
+/// web_search_call 的 results → web_search_result 块数组(对齐 codexWebSearchResultContent)
 pub(super) fn web_search_result_content(root: &Value, item: &Value) -> Vec<Value> {
     let results = item
         .get("results")
@@ -1275,7 +1274,7 @@ mod tests {
 
     #[test]
     fn test_message_start_uses_estimated_input_when_upstream_silent() {
-        // 上游未回真实 usage 时,message_start 用入站 body 估算值填充(对齐 CPA)
+        // 上游未回真实 usage 时,message_start 用入站 body 估算值填充
         let mut r = ResponsesRelay::new(Some(1234));
         let out = r.process(&created());
         let start = out
@@ -1325,7 +1324,7 @@ mod tests {
         ));
         assert!(out.iter().any(|b| b.starts_with(b"event: message_delta")));
         assert!(out.iter().any(|b| b.starts_with(b"event: message_stop")));
-        // call_id 优先于 id(CPA codexFunctionCallID)
+        // call_id 优先于 id(对齐 codexFunctionCallID)
         let start = out
             .iter()
             .find(|b| b.starts_with(b"event: content_block_start"))
@@ -1421,7 +1420,7 @@ mod tests {
 
     #[test]
     fn test_empty_output_synthesizes_text_block() {
-        // 空轮次合成空 text 块(CPA synthesizeCodexEmptyTextBlock)
+        // 空轮次合成空 text 块(对齐 synthesizeCodexEmptyTextBlock)
         let mut r = ResponsesRelay::new(None);
         let out = r.process(&ev(
             r#"{"type":"response.completed","response":{"id":"r1","output":[]}}"#,
@@ -1572,7 +1571,7 @@ mod tests {
 
     #[test]
     fn test_function_call_tool_name_restored() {
-        // 请求侧缩短的名,响应侧还原(对齐 CPA buildReverseMap)
+        // 请求侧缩短的名,响应侧还原(对齐 buildReverseMap)
         let mut names = HashMap::new();
         names.insert(
             "mcp__short".to_string(),

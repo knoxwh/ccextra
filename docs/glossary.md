@@ -1,6 +1,6 @@
-# ccextra 领域术语表
+# 领域术语表
 
-本文档定义 ccextra 项目的统一语言。仅包含术语,不含实现细节。
+本文档定义 ccextra 项目的统一语言。仅包含术语，不含实现细节。
 
 ## 协议与端点
 
@@ -40,7 +40,7 @@ OpenAI `/v1/responses` 协议(Codex CLI 默认)。请求体用 `template.instruc
 上游请求按协议用不同 User-Agent:chat → `claude-cli/2.1.221`,responses → `codex_cli_rs/...`。部分上游按 UA 识别客户端并分流缓存/特性,reqwest 默认 UA 会被判为非官方客户端。
 
 **claude 直通头重建**  
-claude 路径的 `anthropic-beta` 头按 body 条件重建(基础集 `claude-code-20250219` + thinking 无 display → `redact-thinking` / tools → `advanced-tool-use` / `effort-2025-11-24` / speed=fast → `fast-mode`),再追加 caller 自带 beta(去重)。`anthropic-version`/`x-app`/`x-stainless-*` 等身份头仅透传(有就转发,没有不补)。对齐 CPA `applyClaudeHeaders` 中转场景。
+claude 路径的 `anthropic-beta` 头按 body 条件重建(基础集 `claude-code-20250219` + thinking 无 display → `redact-thinking` / tools → `advanced-tool-use` / `effort-2025-11-24` / speed=fast → `fast-mode`),再追加 caller 自带 beta(去重)。`anthropic-version`/`x-app`/`x-stainless-*` 等身份头仅透传(有就转发,没有不补)。与直通头重建中转场景一致。
 
 ## 转换路径
 
@@ -53,16 +53,16 @@ claude 入站 → claude 出站,只改 `model` 字段,其余字节原样保留�
 - anthropic → openai responses
 
 **body-to-body 转换**  
-在 `serde_json::Value` 上原地读写,不经过中间类型。gjson/sjson 风格(Go)或 `value[path] = new_val`(Rust)。每条路径独立实现。顶层键序对齐 CPA(`model,max_tokens,temperature/stop,stream,reasoning_effort,messages,tools,tool_choice,user,stream_options`)。
+在 `serde_json::Value` 上原地读写,不经过中间类型。gjson/sjson 风格(Go)或 `value[path] = new_val`(Rust)。每条路径独立实现。顶层键序(`model,max_tokens,temperature/stop,stream,reasoning_effort,messages,tools,tool_choice,user,stream_options`)。
 
 **stream_options.include_usage**  
-转换路径强制注入 `stream_options: {include_usage: true}`,对齐 CPA `SetBoolIfDifferent`。部分上游(kimi/moonshot)未开启时全程无 usage,客户端 statusline 无 context 显示;开启后流尾必发 usage chunk。
+转换路径强制注入 `stream_options: {include_usage: true}`,对齐 `SetBoolIfDifferent` 语义。部分上游(kimi/moonshot)未开启时全程无 usage,客户端 statusline 无 context 显示;开启后流尾必发 usage chunk。
 
 **响应错误转 anthropic 形状**  
-上游非 2xx 时的 `{"error":{...}}` body 转 anthropic `{"type":"error","error":{...}}` 形状(对齐 CPA WriteErrorResponse)。`rate_limit`/`requests`/`tokens` 归为 `rate_limit_error`,已知类型透传,其余兜底 `api_error`。
+上游非 2xx 时的 `{"error":{...}}` body 转 anthropic `{"type":"error","error":{...}}` 形状(对齐 `WriteErrorResponse` 语义)。`rate_limit`/`requests`/`tokens` 归为 `rate_limit_error`,已知类型透传,其余兜底 `api_error`。
 
 **content 形态归一化**  
-Claude Code 同一条消息当轮发 content 数组、历史重建发字符串;转换器统一输出 text 数组,消除跨轮字节漂移——这是周期性缓存 MISS(cache_read 掉 4096 后紧邻请求恢复)的根因。对齐 CPA 的 `JoinRawArray` 数组形态。空内容两侧语义不同:
+Claude Code 同一条消息当轮发 content 数组、历史重建发字符串;转换器统一输出 text 数组,消除跨轮字节漂移——这是周期性缓存 MISS(cache_read 掉 4096 后紧邻请求恢复)的根因。对齐 `JoinRawArray` 数组形态。空内容两侧语义不同:
 - chat:空串 → `content:[]`;null/缺失 → 丢弃整条消息
 - responses:空串 → `content:[]` 保留消息(assistant 空 content 是 thinking-only/tool 轮的正常信号,不能丢);null/缺失 → 丢弃
 
@@ -72,15 +72,15 @@ Claude Code 同一条消息当轮发 content 数组、历史重建发字符串;�
 对请求体做确定性字节变换,消除序列化漂移,目标是命中**上游** prompt cache,不做本地响应缓存。
 
 **pretransform 归一化 / 按协议分流**  
-入站 anthropic body 在转换前跑的归一化,按目标协议分流(对齐 CPA):  
+入站 anthropic body 在转换前跑的归一化,按目标协议分流:  
 - claude 直通:`normalize_anthropic_full` 完整九模块,含 `cache_control` 注入  
 - openai 转换路径:`normalize_anthropic_pretransform` 精简五模块子集(smoosh → bookkeeping → tool_input → sort → rstrip),跳过 tool-def sort / volatile / cache_control——这些在转换后处理或对 openai 上游无意义
 
 **post-transform 归一化 / target_post**  
-转换后对目标协议 body 跑的二次归一化:tool_def normalize → sort stabilize → reminder rstrip → volatile strip(对齐 tklite openai 管线)。直通路径跳过此步。
+转换后对目标协议 body 跑的二次归一化:tool_def normalize → sort stabilize → reminder rstrip → volatile strip(对齐 openai 转换后管线)。直通路径跳过此步。
 
 **九模块**  
-照搬 tklite 的九个归一化单元:  
+九个归一化单元:  
 1. tool_def sort — tools 数组按 name 排序,schema key 递归排序  
 2. smoosh_split — 拆 tool_result 尾部折叠的 `</system-reminder>`  
 3. bookkeeping strip — 删历史消息里的 token 账本 reminder  
@@ -95,7 +95,7 @@ Claude Code 同一条消息当轮发 content 数组、历史重建发字符串;�
 同一会话内,system / tools / messages 前缀的结构哈希变化。漂移 = 归一化未覆盖的盲区,WARN 级日志。
 
 **会话身份 / session key**  
-对齐 CPA(`helps.ExtractClaudeCodeSessionID`)的派生链:
+对齐 `helps.ExtractClaudeCodeSessionID` 的派生链:
 1. 请求头 `X-Claude-Code-Session-Id`(Claude Code 原生发送,整会话稳定)
 2. `metadata.user_id` 尾部 `_session_<uuid>`(或 JSON 形态 `session_id`)
 
@@ -104,7 +104,7 @@ Claude Code 同一条消息当轮发 content 数组、历史重建发字符串;�
 注:早期版本的 `messages[0].content` SHA-256 兜底已删除——`messages[0]` 会被每请求注入的 system-reminder 与上下文压缩改变,不是稳定身份。
 
 **prompt_cache_key**  
-OpenAI chat/responses 的缓存桶标识。对齐 CPA `applyPromptCacheKey`:provider 级开关(配置 `prompt_cache_key`,默认 false),按 `UUIDv5(NameSpaceOID, "cli-proxy-api:codex:claude-code" \0 模型 \0 "claude:<会话>:agent:<agent>")` 派生。identity 前缀与 CPA 相同,两个代理命中同一缓存桶。无 Claude Code 会话 ID 或 body 已有 key 时不注入;仅 openai_chat / openai_responses 生效。
+OpenAI chat/responses 的缓存桶标识。对齐 `applyPromptCacheKey`:provider 级开关(配置 `prompt_cache_key`,默认 false),按 `UUIDv5(NameSpaceOID, "cli-proxy-api:codex:claude-code" \0 模型 \0 "claude:<会话>:agent:<agent>")` 派生。identity 前缀固定,确定性派生。无 Claude Code 会话 ID 或 body 已有 key 时不注入;仅 openai_chat / openai_responses 生效。
 
 ## 响应流式
 
@@ -118,7 +118,7 @@ OpenAI chat/responses 的缓存桶标识。对齐 CPA `applyPromptCacheKey`:prov
 - responses → anthropic = `relay_responses_to_anthropic` 状态机
 
 **reasoning 回放闭环**  
-responses 路径的加密思考跨轮闭环:上游 `reasoning_summary_text.delta` 流式转 `thinking_delta`(可见),`output_item.done` 的 `encrypted_content` 以 `signature_delta` 收尾;下一轮请求侧把 `thinking.signature` 转回 `reasoning.encrypted_content`。对齐 CPA,替代旧的 redacted_thinking 方案(形状不合规范且请求侧丢弃)。
+responses 路径的加密思考跨轮闭环:上游 `reasoning_summary_text.delta` 流式转 `thinking_delta`(可见),`output_item.done` 的 `encrypted_content` 以 `signature_delta` 收尾;下一轮请求侧把 `thinking.signature` 转回 `reasoning.encrypted_content`。对齐该语义,替代旧的 redacted_thinking 方案(形状不合规范且请求侧丢弃)。
 
 **断流兜底**  
 上游流中断或 EOF 未发终止事件时,状态机兜底发 anthropic `error` 事件(流内错误)或补 `message_delta` + `message_stop`(静默断流),不裸断流。responses 空轮次/纯思考轮次合成空 text 块(Claude 客户端遇零块消息报 "Content block not found")。
@@ -144,7 +144,7 @@ anthropic 顶层字段,可以是 `string` 或 `block 数组`(含 text / tool_use
 anthropic 请求体顶层 `metadata` 对象,含 `user_id` 等。转换路径静默丢弃(openai 无对应字段)。
 
 **prompt_cache_retention**  
-Claude Code 注入的缓存保留时长参数。openai 上游拒绝(HTTP 400 `Unsupported parameter`),转换路径剥离(对齐 CPA `StripPromptCacheRetention`);claude 直通保留。
+Claude Code 注入的缓存保留时长参数。openai 上游拒绝(HTTP 400 `Unsupported parameter`),转换路径剥离(对齐 `StripPromptCacheRetention`);claude 直通保留。
 
 **计费归属文本 / attribution text**  
 Claude Code 每请求注入 system 的计费+prompt 指纹块,前缀 `x-anthropic-billing-header:`。内容逐请求变化,转换到 openai 侧必须剥离,否则上游缓存前缀每次请求全 miss。
@@ -158,17 +158,14 @@ claude `tool_result` 的 content 转 openai 工具消息:字符串原样;纯文�
 每个 provider 配置一个 `key` 字符串,上游失败直接透传错误,不做凭据级 fallback。MVP 最简模式。
 
 **fail-open**  
-tklite 四原则之一:归一化出错时回退原始 body,不阻断请求。ccextra 继承此语义。
+字节稳定化四原则之一:归一化出错时回退原始 body,不阻断请求。ccextra 继承此语义。
 
 **providers 数组**  
 配置文件顶层 `providers:` 列表(YAML),每项声明 name / protocol / base_url / key / models。
 
 **payload 参数覆盖**  
-按模型名模式(`*glm*` 通配)匹配,覆盖请求体参数(如 `max_tokens` / `temperature`)。类似 CPA 的 `payload.default` / `payload.override` 功能,但简化为单层规则数组。
+按模型名模式(`*glm*` 通配)匹配,覆盖请求体参数(如 `max_tokens` / `temperature`)。单层规则数组。
 
 ## 缩写约定
 
-- **CPA** = CLIProxyAPI,Go 实现的多 provider 网关,ccextra 参考其转换逻辑
-- **tklite** = Rust 实现的字节稳定化 sidecar,ccextra 照搬其九模块归一化
-- **ccr** = claude-code-router,TypeScript 路由网关
 - **MVP** = Minimum Viable Product,第一版能跑的最小范围

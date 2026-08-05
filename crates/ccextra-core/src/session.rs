@@ -1,4 +1,4 @@
-// 会话身份派生(对齐 CPA internal/runtime/executor/helps/claude_code_session.go)
+// 会话身份派生(头优先,user_id 兜底)
 //
 // 优先级:
 // 1. 请求头 X-Claude-Code-Session-Id(Claude Code 原生发送,整会话稳定,
@@ -6,7 +6,7 @@
 // 2. metadata.user_id 尾部 `_session_<uuid>`(或 JSON 形态的 session_id)
 //
 // 背景:messages[0] 会被 Claude Code 每请求注入 system-reminder、
-// 上下文压缩后整体替换,不是稳定身份。CPA/tklite 均不使用它。
+// 上下文压缩后整体替换,不是稳定身份,不采用。
 
 use http::HeaderMap;
 use serde_json::Value;
@@ -14,7 +14,7 @@ use serde_json::Value;
 /// Claude Code 会话头(小写形式,HeaderMap 查找大小写不敏感)
 pub const CLAUDE_CODE_SESSION_HEADER: &str = "x-claude-code-session-id";
 
-/// 提取 Claude Code 会话 ID(对齐 CPA ExtractClaudeCodeSessionID)
+/// 提取 Claude Code 会话 ID(头优先,user_id 兜底)
 pub fn extract_claude_code_session(headers: &HeaderMap, body: &Value) -> Option<String> {
     if let Some(v) = headers
         .get(CLAUDE_CODE_SESSION_HEADER)
@@ -32,7 +32,7 @@ pub fn extract_claude_code_session(headers: &HeaderMap, body: &Value) -> Option<
     session_id_from_user_id(user_id)
 }
 
-/// user_id 形态(对齐 CPA extractClaudeCodeSessionIDFromPayload):
+/// user_id 形态:
 /// - "..._session_<hex-uuid>" 尾缀
 /// - JSON 字符串 {"session_id": "..."}
 fn session_id_from_user_id(user_id: &str) -> Option<String> {

@@ -17,7 +17,7 @@ pub struct UpstreamResponse {
 
 /// 按协议取上游请求路径
 ///
-/// 版本前缀约定(与 CPA/OpenAI 一致):anthropic 协议 base_url 不含版本,路径带 /v1;
+/// 版本前缀约定(与 参考实现/OpenAI 一致):anthropic 协议 base_url 不含版本,路径带 /v1;
 /// openai 协议 base_url 已含版本前缀(/v1 或 /v3 等),路径不带版本。
 fn endpoint_path(protocol: Protocol) -> &'static str {
     match protocol {
@@ -90,10 +90,10 @@ impl UpstreamClient {
     /// 发起上游请求,返回原始响应(字节或流由调用方决定)
     ///
     /// - `is_stream`:chat 链路流式时补 `Accept: text/event-stream` /
-    ///   `Cache-Control: no-cache`(对齐 CPA openai_compat_executor)
-    /// - `session_id`:responses 链路发 `Session_id` 头(对齐 CPA cacheHelper,
+    ///   `Cache-Control: no-cache`(对齐 openai_compat_executor)
+    /// - `session_id`:responses 链路发 `Session_id` 头(对齐 cacheHelper,
     ///   值为 prompt_cache_key,上游按它做缓存亲和)
-    /// - `extra_headers`:claude 直通的透传/重建头(对齐 CPA applyClaudeHeaders
+    /// - `extra_headers`:claude 直通的透传/重建头(对齐 applyClaudeHeaders
     ///   的中转场景:anthropic-beta 按 body 条件重建 + caller beta 追加,
     ///   anthropic-version / x-app / stainless 系列透传)
     #[allow(clippy::too_many_arguments)]

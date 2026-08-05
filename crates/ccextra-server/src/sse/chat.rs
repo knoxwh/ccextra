@@ -1,11 +1,11 @@
 // OpenAI chat/completions SSE → Anthropic messages SSE 状态机
 //
-// 采用 ai-gateway 的"单 active block"模型(相比 CPA 三独立 flag 更简洁):
+// 采用"单 active block"模型(相比三独立 flag 更简洁):
 // - 任意时刻只有一个 active block(text 或 thinking),切换类型时先 close 再开
 // - tool 调用独立 pending map,不占 active block,完工时 flush 完整 input_json
 // - finish 时统一 finalize(close 全部 + message_delta + message_stop)
 //
-// 核心难点:工具调用 index 对齐。OpenAI 的 tool_calls[N] 用 index 标识,
+// 核心难点:工具调用 index 一致。OpenAI 的 tool_calls[N] 用 index 标识,
 // Anthropic 的 content_block 用连续 index 分配。两者需映射。
 
 use std::collections::HashMap;
@@ -60,9 +60,9 @@ struct ChatRelay {
     usage_cached: i64,
     // 已发射的 thinking 片段(去重)
     thinking_parts: Vec<String>,
-    // 空 id 兜底合成计数(CPA SanitizeClaudeToolID 同角色)
+    // 空 id 兜底合成计数(SanitizeClaudeToolID 同角色)
     synthetic_tool_ids: u64,
-    // 入站 body 本地估算输入 token(CPA ClaudeInputTokenState;上游未回则填充)
+    // 入站 body 本地估算输入 token(ClaudeInputTokenState;上游未回则填充)
     estimated_input: Option<usize>,
 }
 
@@ -169,7 +169,7 @@ impl ChatRelay {
         frames
     }
 
-    /// 缓存 usage 并做 cached 减法(与 CPA extractOpenAIUsage 一致)
+    /// 缓存 usage 并做 cached 减法(与 extractOpenAIUsage 一致)
     fn cache_usage(&mut self, usage: &Value) {
         let mut input = usage
             .get("prompt_tokens")
@@ -198,7 +198,7 @@ impl ChatRelay {
         self.finalize()
     }
 
-    /// 上游流中断:发 anthropic error 事件收尾(对齐 CPA code_handlers 断流兜底)
+    /// 上游流中断:发 anthropic error 事件收尾(对齐 code_handlers 断流兜底)
     fn stream_error(&mut self, message: &str) -> Vec<Bytes> {
         if self.finished {
             return Vec::new();
@@ -377,7 +377,7 @@ impl ChatRelay {
         if started {
             return;
         }
-        // 工具调用开始前关闭 active text/thinking 块(对齐 CPA emitToolUseStart),
+        // 工具调用开始前关闭 active text/thinking 块(对齐 emitToolUseStart),
         // 否则该块永远收不到 content_block_stop
         self.close_active_block(frames);
         let call = self.tool_calls.get_mut(&openai_index).unwrap();
@@ -394,7 +394,7 @@ impl ChatRelay {
             return;
         }
         if call.id.is_empty() {
-            // 空 id 兜底(对齐 CPA SanitizeClaudeToolID 合成 id),避免发非法块
+            // 空 id 兜底(对齐 SanitizeClaudeToolID 合成 id),避免发非法块
             self.synthetic_tool_ids += 1;
             call.id = format!("toolu_ccextra_{}", self.synthetic_tool_ids);
         }
@@ -465,7 +465,7 @@ impl ChatRelay {
                 continue;
             }
             self.tool_use_start_frame(index, &mut frames);
-            // 关闭前补发累积的 arguments(对齐 CPA flush),否则工具 input 变空
+            // 关闭前补发累积的 arguments(对齐 flush),否则工具 input 变空
             let (block_index, arguments) = {
                 let call = self.tool_calls.get(&index).unwrap();
                 (call.block_index, call.arguments.clone())
@@ -490,7 +490,7 @@ impl ChatRelay {
     }
 
     /// thinking 去重:空白或重复片段跳过
-    /// 对齐 CPA appendReasoningTextIfDistinct:片段等于任一已发片段、
+    /// 对齐 appendReasoningTextIfDistinct:片段等于任一已发片段、
     /// 或等于全部已发拼接(累积快照式 provider)都丢弃
     fn thinking_distinct(&mut self, text: &str) -> bool {
         let trimmed = text.trim();
@@ -510,7 +510,7 @@ impl ChatRelay {
 }
 
 /// 从 delta 的多种字段提取 reasoning 文本
-/// (对齐 CPA collectOpenAIReasoningTexts:reasoning_content /
+/// (对齐 collectOpenAIReasoningTexts:reasoning_content /
 /// reasoning_details[] / reasoning / thinking 多种供应商拼写)
 fn collect_reasoning_texts(delta: &Value) -> Vec<String> {
     let mut texts = Vec::new();
@@ -519,7 +519,7 @@ fn collect_reasoning_texts(delta: &Value) -> Vec<String> {
     }
     if let Some(Value::Array(items)) = delta.get("reasoning_details") {
         for item in items {
-            // 跳过仅加密项(CPA 同语义)
+            // 跳过仅加密项(同语义)
             if item.get("encrypted_content").is_some() || item.get("data").is_some() {
                 continue;
             }
@@ -649,7 +649,7 @@ mod tests {
 
     #[test]
     fn test_message_start_uses_estimated_input() {
-        // 上游未回真实 usage 时,message_start 用入站 body 估算值填充(对齐 CPA)
+        // 上游未回真实 usage 时,message_start 用入站 body 估算值填充
         let mut r = ChatRelay::new(Some(567));
         let out = r.process(&super::super::parser::SseEvent {
             event: Some("chat.completion.chunk".into()),

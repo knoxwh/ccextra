@@ -1,7 +1,7 @@
 //! PR-E11:将 `tool_use.input` 的键顺序归一化,以匹配工具 schema。
 //!
 //! 历史的 assistant `tool_use.input` 对象在跨轮次时键顺序不稳定,
-//! 导致 cache prefix 出现字节漂移。在转换路径上,CPA 会把 `input.Raw`
+//! 导致 cache prefix 出现字节漂移。在转换路径上,`input.Raw` 会被
 //! 原样嵌入到 OpenAI 的 `arguments` 字符串中,因此该漂移会直接流向上游。
 //!
 //! 本模块对每个 `tool_use.input` 重新排序,使 schema 声明的键按 schema
@@ -23,7 +23,7 @@ use std::collections::{HashMap, HashSet};
 pub fn normalize_tool_use_inputs(body: &mut Value, kind: ApiKind) -> usize {
     match kind {
         ApiKind::Anthropic => normalize_anthropic(body),
-        // CC 特有模式;Anthropic 形式由 /v1/messages 和 /v1/pretransform/messages 负责
+        // CC 特有模式;Anthropic 形式由入站全量归一化负责
         ApiKind::OpenAiChat | ApiKind::OpenAiResponses => 0,
     }
 }

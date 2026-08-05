@@ -1,26 +1,22 @@
-// prompt_cache_key 派生与注入(对齐 CPA applyPromptCacheKey claude 分支)
-//
-// CPA 参考:
-// - internal/runtime/executor/openai_compat_executor.go applyPromptCacheKey
-// - internal/runtime/executor/helps/claude_code_session.go ClaudeCodePromptCache
+// prompt_cache_key 派生与注入
 //
 // 语义:
-// - provider 级开关(默认 false,对应 CPA support-prompt-cache-key)
+// - provider 级开关(默认 false)
 // - 仅 openai_chat / openai_responses 注入(claude 协议无此字段)
 // - body 已有非空 prompt_cache_key 时不覆盖
 // - 无 Claude Code 会话 ID(头或 metadata.user_id)时不注入
-// - identity 前缀保留 "cli-proxy-api:codex:claude-code",与 CPA 同桶,
+// - identity 前缀保留 "cli-proxy-api:codex:claude-code",确定性派生,
 //   切换代理不碎缓存
 
 use http::HeaderMap;
 use serde_json::Value;
 
-/// Claude Code agent 头(CPA ClaudeCodeAgentHeader)
+/// Claude Code agent 头
 pub const CLAUDE_CODE_AGENT_HEADER: &str = "x-claude-code-agent-id";
-/// 根 agent 哨兵(CPA ClaudeCodeMainAgentID)
+/// 根 agent 哨兵
 pub const CLAUDE_CODE_MAIN_AGENT_ID: &str = "main";
 
-/// 提取 Claude Code agent ID(对齐 CPA ExtractClaudeCodeAgentID):头优先,缺省 "main"
+/// 提取 Claude Code agent ID:头优先,缺省 "main"
 pub fn extract_claude_code_agent(headers: &HeaderMap) -> String {
     headers
         .get(CLAUDE_CODE_AGENT_HEADER)
@@ -31,10 +27,10 @@ pub fn extract_claude_code_agent(headers: &HeaderMap) -> String {
         .unwrap_or_else(|| CLAUDE_CODE_MAIN_AGENT_ID.to_string())
 }
 
-/// 派生确定性 prompt_cache_key(对齐 CPA ClaudeCodePromptCache):
+/// 派生确定性 prompt_cache_key:
 /// UUIDv5(NameSpaceOID, "cli-proxy-api:codex:claude-code" \0 model \0 "claude:<session>:agent:<agent>")
 ///
-/// model 或 session_id 为空时返回 None(CPA 同语义)
+/// model 或 session_id 为空时返回 None
 pub fn claude_code_prompt_cache_key(
     model: &str,
     session_id: &str,
@@ -58,7 +54,7 @@ pub fn inject_prompt_cache_key(
     headers: &HeaderMap,
     session_id: Option<&str>,
 ) -> bool {
-    // 已有非空 key 不覆盖(CPA:入站/原始/转换后任一存在即保留)
+    // 已有非空 key 不覆盖(入站/原始/转换后任一存在即保留)
     if let Some(existing) = body.get("prompt_cache_key").and_then(|v| v.as_str()) {
         if !existing.trim().is_empty() {
             return false;
@@ -114,8 +110,7 @@ mod tests {
         assert_eq!(extract_claude_code_agent(&h), "main");
     }
 
-    // 向量由 python3 uuid.uuid5(NAMESPACE_OID, identity) 交叉验证,
-    // 与 CPA uuid.NewSHA1(uuid.NameSpaceOID, ...) 同算法
+    // 向量由 python3 uuid.uuid5(NAMESPACE_OID, identity) 交叉验证
     #[test]
     fn test_known_vector_main_agent() {
         let key = claude_code_prompt_cache_key("gpt-5.6-terra", "sess-abc-123", "main").unwrap();

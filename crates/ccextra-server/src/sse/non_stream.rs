@@ -2,7 +2,7 @@
 //
 // Claude Code 主对话恒走流式;非流式请求(标题生成 / /compact 摘要 /
 // count_tokens 失败回退等)收到上游 JSON 时,须转回 Anthropic messages
-// 形状,否则 SDK 无法解析。对齐 CPA ConvertCodexResponseToClaudeNonStream
+// 形状,否则 SDK 无法解析。对齐 ConvertCodexResponseToClaudeNonStream
 // (responses)与 openai chat message 结构。
 //
 // claude 直通协议上游返回的已是 Anthropic 形状,不经过本模块。
@@ -35,7 +35,7 @@ pub fn responses_to_anthropic(
         for item in output {
             match item.get("type").and_then(|v| v.as_str()).unwrap_or("") {
                 "reasoning" => {
-                    // summary > content 取文本;signature 保留(对齐 CPA)
+                    // summary > content 取文本;signature 保留
                     let mut text = String::new();
                     if let Some(summary) = item.get("summary") {
                         collect_response_parts(summary, &mut text);
@@ -76,7 +76,7 @@ pub fn responses_to_anthropic(
                         item.get("call_id").and_then(|v| v.as_str()).unwrap_or(""),
                     );
                     let raw_name = item.get("name").and_then(|v| v.as_str()).unwrap_or("");
-                    // 请求侧超长名缩短后,响应侧还原原名(对齐 CPA buildReverseMap...)
+                    // 请求侧超长名缩短后,响应侧还原原名(对齐 buildReverseMap...)
                     let name = tool_names
                         .and_then(|rev| rev.get(raw_name))
                         .cloned()
@@ -91,8 +91,7 @@ pub fn responses_to_anthropic(
                         .push(json!({"type": "tool_use", "id": id, "name": name, "input": input}));
                 }
                 "web_search_call" => {
-                    // server_tool_use + web_search_tool_result(对齐 CPA
-                    // appendCodexWebSearchNonStreamContent)
+                    // server_tool_use + web_search_tool_result(对齐 appendCodexWebSearchNonStreamContent)
                     let id = item.get("id").and_then(|v| v.as_str()).unwrap_or("");
                     if id.is_empty() {
                         continue;
@@ -133,7 +132,7 @@ pub fn responses_to_anthropic(
         }
     }
 
-    // usage:cached 从 input 扣(对齐 CPA extractResponsesUsage)
+    // usage:cached 从 input 扣(对齐 extractResponsesUsage)
     let mut input_tokens = 0;
     let mut output_tokens = 0;
     let mut cached = 0;
@@ -180,7 +179,7 @@ pub fn openai_chat_to_anthropic(body: &Value) -> Option<Value> {
     let mut content: Vec<Value> = Vec::new();
     let mut has_tool_use = false;
 
-    // reasoning_content → thinking(多供应商拼写,对齐 CPA CollectOpenAIReasoningTexts)
+    // reasoning_content → thinking(多供应商拼写,对齐 CollectOpenAIReasoningTexts)
     if let Some(r) = message.get("reasoning_content") {
         let text = collect_reasoning_value(r);
         if !text.is_empty() {
@@ -268,7 +267,7 @@ pub fn openai_chat_to_anthropic(body: &Value) -> Option<Value> {
     )
 }
 
-/// 组装 Anthropic messages 非流式响应(基础形状对齐 CPA)
+/// 组装 Anthropic messages 非流式响应(基础形状)
 fn build_message(
     source: &Value,
     content: Vec<Value>,
@@ -311,7 +310,7 @@ fn collect_response_parts(v: &Value, out: &mut String) {
     }
 }
 
-/// reasoning_content:字符串 / 对象 {text} / 数组(对齐 CPA collectOpenAIReasoningTexts)
+/// reasoning_content:字符串 / 对象 {text} / 数组(对齐 collectOpenAIReasoningTexts)
 fn collect_reasoning_value(v: &Value) -> String {
     let mut out = String::new();
     match v {
@@ -484,7 +483,7 @@ mod tests {
 
     #[test]
     fn test_responses_nonstream_tool_name_restored() {
-        // 请求侧缩短的名,响应侧还原原名(对齐 CPA buildReverseMap)
+        // 请求侧缩短的名,响应侧还原原名(对齐 buildReverseMap)
         let body = json!({
             "type": "response.completed",
             "response": {

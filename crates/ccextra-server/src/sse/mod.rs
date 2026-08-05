@@ -23,8 +23,7 @@ pub type SseStreamPin = Pin<Box<dyn Stream<Item = Result<Bytes, io::Error>> + Se
 
 /// 按入站协议分派响应流
 ///
-/// `estimated_input_tokens`:入站 body 的本地估算输入 token(对齐 CPA
-/// ClaudeInputTokenState)。上游流未回真实 usage 时,message_start 用它填充,
+/// `estimated_input_tokens`:入站 body 的本地估算输入 token(对齐 ClaudeInputTokenState)。上游流未回真实 usage 时,message_start 用它填充,
 /// 避免 context 记账显示 0。claude 直通不经过状态机,传 None。
 ///
 /// `tool_names`:short→original 工具名还原表(仅 responses 协议用,请求转换侧

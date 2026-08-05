@@ -1,10 +1,10 @@
-// Anthropic → OpenAI responses 转换(对齐 CPA codex/claude/codex_claude_request.go)
+// Anthropic → OpenAI responses 转换(对齐转换路径字段映射)
 //
-// 主要映射(与 CPA 逐条一致):
+// 主要映射(逐条一致):
 // - system → input[0] developer message(逐 text block 独立 part,过滤计费归属块)
 // - messages → input[]:text→input_text/output_text、thinking(带 GPT 兼容签名)→reasoning、
 //   image→input_image、tool_use→function_call、tool_result→function_call_output
-//   (遇 thinking/tool_use/tool_result 先 flush 文本 message,对齐 CPA flushMessage 顺序)
+//   (遇 thinking/tool_use/tool_result 先 flush 文本 message,对齐 flushMessage 顺序)
 // - tools → codex tools(原名超 64 缩短 + 唯一 _N 后缀;web_search_* → type:"web_search")、
 //   input_schema→parameters(strict=false,剥 cache_control/defer_loading/$schema)
 // - thinking.budget_tokens → reasoning.effort(直映射,不钳制)
@@ -20,29 +20,28 @@ use serde_json::{json, Value};
 use super::shorten::{build_short_name_map, shorten_name_if_needed};
 use super::Result;
 
-/// Claude web search 工具类型(对齐 CPA isClaudeWebSearchToolType)
+/// Claude web search 工具类型(对齐 isClaudeWebSearchToolType)
 fn is_web_search_tool_type(tool_type: &str) -> bool {
     matches!(tool_type, "web_search_20250305" | "web_search_20260209")
 }
 
-/// signature 是否 GPT 兼容(对齐 CPA CompatibleSignatureForProvider(GPT, sig) 的轻量版)
+/// signature 是否 GPT 兼容(对齐 CompatibleSignatureForProvider(GPT, sig) 的轻量版)
 ///
-/// CPA 用完整 Fernet 容器校验;这里按 OpenAI reasoning 签名的确定前缀
+/// 参考实现 用完整 Fernet 容器校验;这里按 OpenAI reasoning 签名的确定前缀
 /// ("gAAAA" 或 base64 首字符 'g')判定,足以区分 Claude/Gemini 签名(以 'C'/'E'/'R'
-/// 开头)与 GPT 签名。Grok 特例按模型名放行(对齐 CPA codexClaudeTargetAcceptsGrokSignature)。
+/// 开头)与 GPT 签名。Grok 特例按模型名放行(对齐 codexClaudeTargetAcceptsGrokSignature)。
 fn signature_compatible_gpt(signature: &str, upstream_model: &str) -> bool {
     let sig = signature.trim();
     if sig.is_empty() {
         return false;
     }
     let first = sig.as_bytes()[0];
-    // GPT Fernet reasoning 首字节 0x80 → base64 首字符 'g'(对齐 CPA
-    // selfDescribingSignatureFirstChars 中 'g' 的判定)
+    // GPT Fernet reasoning 首字节 0x80 → base64 首字符 'g'(一致 selfDescribingSignatureFirstChars 判定)
     let looks_gpt = first == b'g' || sig.starts_with("gAAAA");
     if looks_gpt {
         return true;
     }
-    // Grok encrypted_content 无信封,CPA 对 grok 目标单独放行
+    // Grok encrypted_content 无信封,参考实现 对 grok 目标单独放行
     upstream_model.to_ascii_lowercase().contains("grok")
 }
 
@@ -59,7 +58,7 @@ fn gpt_compatible_signature(signature: Option<&str>, upstream_model: &str) -> Op
     }
 }
 
-/// tool_result content → responses output 数组或字符串(对齐 CPA tool_result 分支)
+/// tool_result content → responses output 数组或字符串(对齐 tool_result 分支)
 fn tool_result_output(content: &Value) -> Value {
     match content {
         Value::Array(items) => {
@@ -105,7 +104,7 @@ fn tool_result_output(content: &Value) -> Value {
     }
 }
 
-/// image block → data URL(对齐 CPA image 分支)
+/// image block → data URL(对齐 image 分支)
 fn image_to_data_url(part: &Value) -> Option<String> {
     let source = part.get("source")?;
     let data = source
@@ -123,7 +122,7 @@ fn image_to_data_url(part: &Value) -> Option<String> {
     Some(format!("data:{media_type};base64,{data}"))
 }
 
-/// input_schema → parameters(对齐 CPA normalizeToolParameters)
+/// input_schema → parameters(对齐 normalizeToolParameters)
 fn normalize_tool_parameters(schema: &Value) -> Value {
     if schema.is_null() || !schema.is_object() {
         return json!({"type": "object", "properties": {}});
@@ -141,7 +140,7 @@ fn normalize_tool_parameters(schema: &Value) -> Value {
     s
 }
 
-/// Claude system 文本块 → 逐块独立 input_text part(对齐 CPA appendSystemText)
+/// Claude system 文本块 → 逐块独立 input_text part(对齐 appendSystemText)
 fn system_content_parts(system: &Value) -> Vec<Value> {
     let mut parts: Vec<Value> = Vec::new();
     let mut push = |text: &str| {
@@ -177,7 +176,7 @@ pub fn convert_to_openai_responses(
         "input": [],
     });
 
-    // --- 工具名缩短映射(对齐 CPA buildReverseMapFromClaudeOriginalToShort) ---
+    // --- 工具名缩短映射(对齐 buildReverseMapFromClaudeOriginalToShort) ---
     let mut tool_name_map: HashMap<String, String> = HashMap::new();
     let mut web_search_names: HashSet<String> = HashSet::new();
     if let Some(tools) = body.get("tools").and_then(|v| v.as_array()) {
@@ -201,7 +200,7 @@ pub fn convert_to_openai_responses(
         tool_name_map = build_short_name_map(&names);
     }
 
-    // --- system → developer message(对齐 CPA system 分支) ---
+    // --- system → developer message(对齐 system 分支) ---
     if let Some(system) = body.get("system") {
         let parts = system_content_parts(system);
         if !parts.is_empty() {
@@ -217,8 +216,7 @@ pub fn convert_to_openai_responses(
         for msg in messages {
             let role = msg.get("role").and_then(|v| v.as_str()).unwrap_or("user");
 
-            // role=system 消息:reminder 文本 → user message(对齐 CPA
-            // ClaudeMessageSystemReminderText)
+            // role=system 消息:reminder 文本 → user message(对齐 ClaudeMessageSystemReminderText)
             if role == "system" {
                 if let Some(text) = claude_system_reminder_text(msg.get("content")) {
                     openai["input"].as_array_mut().unwrap().push(json!({
@@ -249,7 +247,7 @@ pub fn convert_to_openai_responses(
                 }
             };
 
-            // 字符串内容(对齐 ai-gateway extractStandardInputTextContent:空串直接跳过)
+            // 字符串内容(对齐 extractStandardInputTextContent:空串直接跳过)
             if let Some(s) = content.as_str() {
                 if s.is_empty() {
                     continue;
@@ -284,7 +282,7 @@ pub fn convert_to_openai_responses(
                     }
                     "thinking" => {
                         // 带 GPT 兼容签名的思考 → 独立 reasoning item(先 flush 保序);
-                        // 无签名/不兼容签名丢弃,不退化为纯文本(对齐 CPA appendReasoningContent)
+                        // 无签名/不兼容签名丢弃,不退化为纯文本(对齐 appendReasoningContent)
                         if role == "assistant" {
                             if let Some(sig) = gpt_compatible_signature(
                                 part.get("signature").and_then(|v| v.as_str()),
@@ -346,12 +344,12 @@ pub fn convert_to_openai_responses(
         }
     }
 
-    // --- tools → codex tools(对齐 CPA tools 分支) ---
+    // --- tools → codex tools(对齐 tools 分支) ---
     if let Some(tools) = body.get("tools").and_then(|v| v.as_array()) {
         let mut tool_items: Vec<Value> = Vec::new();
         for tool in tools {
             let tool_type = tool.get("type").and_then(|v| v.as_str()).unwrap_or("");
-            // web search 工具特殊映射(对齐 CPA convertClaudeWebSearchToolToCodex)
+            // web search 工具特殊映射(对齐 convertClaudeWebSearchToolToCodex)
             if is_web_search_tool_type(tool_type) {
                 let mut ws = json!({"type": "web_search"});
                 if let Some(domains) = tool.get("allowed_domains").and_then(|v| v.as_array()) {
@@ -385,7 +383,7 @@ pub fn convert_to_openai_responses(
             let schema = tool.get("input_schema").cloned().unwrap_or(json!(null));
             let params = normalize_tool_parameters(&schema);
             t["parameters"] = params;
-            // 剥 codex 不认的字段(对齐 CPA)
+            // 剥 codex 不认的字段(一致)
             if let Some(obj) = t.as_object_mut() {
                 obj.remove("input_schema");
                 obj.remove("cache_control");
@@ -404,7 +402,7 @@ pub fn convert_to_openai_responses(
         openai["tools"] = json!(tool_items);
     }
 
-    // --- tool_choice(对齐 CPA convertClaudeToolChoiceToCodex) ---
+    // --- tool_choice(对齐 convertClaudeToolChoiceToCodex) ---
     match body.get("tool_choice") {
         None | Some(Value::Null) => {
             openai["tool_choice"] = json!("auto");
@@ -449,19 +447,19 @@ pub fn convert_to_openai_responses(
         .unwrap_or(false);
     openai["parallel_tool_calls"] = json!(!disable_parallel);
 
-    // --- reasoning.effort(对齐 CPA thinking 分支,默认 medium) ---
+    // --- reasoning.effort(对齐 thinking 分支,默认 medium) ---
     let effort = body
         .get("thinking")
         .and_then(crate::thinking::resolve_effort)
         .unwrap_or("medium");
     openai["reasoning"] = json!({"effort": effort});
 
-    // --- service_tier:speed=fast → priority(对齐 CPA normalizeCodexServiceTier) ---
+    // --- service_tier:speed=fast → priority(对齐 normalizeCodexServiceTier) ---
     if body.get("speed").and_then(|v| v.as_str()) == Some("fast") {
         openai["service_tier"] = json!("priority");
     }
 
-    // --- codex 固定参数(对齐 CPA) ---
+    // --- codex 固定参数(一致) ---
     openai["stream"] = json!(true);
     openai["store"] = json!(false);
     openai["include"] = json!(["reasoning.encrypted_content"]);
@@ -473,7 +471,7 @@ pub fn convert_to_openai_responses(
     Ok(reverse)
 }
 
-/// role=system 消息的 reminder 文本(对齐 CPA ClaudeMessageSystemReminderText)
+/// role=system 消息的 reminder 文本(对齐 ClaudeMessageSystemReminderText)
 fn claude_system_reminder_text(content: Option<&Value>) -> Option<String> {
     let parts: Vec<String> = match content {
         Some(Value::String(s)) if !s.is_empty() && !super::is_attribution_text(s) => {
@@ -498,7 +496,7 @@ fn claude_system_reminder_text(content: Option<&Value>) -> Option<String> {
     Some(format!("<system-reminder>\n{text}\n</system-reminder>"))
 }
 
-/// call_id 超 64 字符确定性截短(对齐 CPA shortenCodexCallIDIfNeeded)
+/// call_id 超 64 字符确定性截短(对齐 shortenCodexCallIDIfNeeded)
 fn shorten_call_id(id: &str) -> String {
     const LIMIT: usize = 64;
     if id.len() <= LIMIT {
@@ -520,7 +518,7 @@ mod tests {
 
     #[test]
     fn test_system_goes_to_developer_message() {
-        // 对齐 CPA:system → input[0] developer message,非 instructions
+        // 对齐:system → input[0] developer message,非 instructions
         let mut body = json!({
             "model": "test",
             "system": "You are helpful",
@@ -538,7 +536,7 @@ mod tests {
 
     #[test]
     fn test_system_array_blocks_stay_separate_parts() {
-        // 逐 block 独立 part,不 join(对齐 CPA appendSystemText)
+        // 逐 block 独立 part,不 join(对齐 appendSystemText)
         let mut body = json!({
             "model": "test",
             "system": [
@@ -572,7 +570,7 @@ mod tests {
 
     #[test]
     fn test_tool_name_shortened_with_unique_suffix() {
-        // 超长名截断;冲突加 _N(对齐 CPA buildShortNameMap)
+        // 超长名截断;冲突加 _N(对齐 buildShortNameMap)
         let a = "a".repeat(64) + "X";
         let b = "a".repeat(64) + "Y";
         let mut body = json!({
@@ -701,7 +699,7 @@ mod tests {
 
     #[test]
     fn test_reasoning_effort_default_medium() {
-        // 无 thinking → 默认 medium(对齐 CPA reasoningEffort 初值)
+        // 无 thinking → 默认 medium(对齐 reasoningEffort 初值)
         let mut body = json!({"model": "test", "messages": []});
         convert_to_openai_responses(&mut body, "gpt-5").unwrap();
         assert_eq!(body["reasoning"]["effort"], "medium");
@@ -894,7 +892,7 @@ mod tests {
 
     #[test]
     fn test_empty_string_content_dropped_in_responses() {
-        // 对齐 ai-gateway extractStandardInputTextContent:空串不产出 message item
+        // 对齐 extractStandardInputTextContent:空串不产出 message item
         let mut body = json!({
             "model": "test",
             "messages": [

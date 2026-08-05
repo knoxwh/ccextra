@@ -31,7 +31,7 @@
 //! 身份是两级：
 //!
 //! - **父级 bucket** — 由请求头派生：`x-tklite-session-key`
-//!   （不透明的 CLIProxyAPI sidecar），否则为哈希后的 `x-request-id`，
+//!   （外部注入的不透明 sidecar bucket），否则为哈希后的 `x-request-id`，
 //!   否则为 `anonymous`。跟踪 system/tools-only 基线，使历史压缩或
 //!   新会话无法掩盖真实的 prefix 漂移。
 //! - **会话键** — 父级 bucket 加上 `:conv:` 以及
@@ -758,7 +758,7 @@ pub struct SessionIdentity {
 /// 父级 bucket 优先级顺序：
 ///
 /// 1. `x-claude-code-session-id` — Claude Code 原生会话头，整会话稳定。
-/// 2. `x-tklite-session-key` — 来自 CLIProxyAPI 的不透明 sidecar bucket。
+/// 2. `x-tklite-session-key` — 外部注入的不透明 sidecar bucket。
 /// 3. `x-request-id` 请求头（SHA-256 哈希）——每请求回退。
 /// 4. 回退 `"anonymous"`。
 ///
@@ -775,9 +775,9 @@ pub fn derive_session_key(headers: &HeaderMap, body: &Value, kind: ApiKind) -> S
 }
 
 /// 仅依赖请求头的 bucket 派生。
-/// 优先级(对齐 CPA 会话身份链):
+/// 优先级(会话身份链):
 /// 1. `x-claude-code-session-id` — Claude Code 原生会话头,整会话稳定
-/// 2. `x-tklite-session-key` — CLIProxyAPI 不透明 sidecar bucket
+/// 2. `x-tklite-session-key` — 外部注入的不透明 sidecar bucket
 /// 3. `x-request-id`(哈希)— 每请求回退
 /// 4. `anonymous`
 fn derive_parent_bucket(headers: &HeaderMap) -> String {

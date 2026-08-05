@@ -18,7 +18,7 @@ globset.workspace = true
 tracing.workspace = true
 tiktoken-rs.workspace = true
 
-# 来自 tklite-core cache_stabilization 的依赖
+# cache_stabilization 模块依赖
 md-5 = "0.10"
 lru = "0.12"
 regex = "1"
