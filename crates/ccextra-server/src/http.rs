@@ -43,24 +43,36 @@ use tokio::sync::RwLock;
 
 use crate::upstream::UpstreamClient;
 
+/// /reload 可替换的运行时配置。整块写锁替换,单个字段不单独加锁。
+/// 注意 `logging.level` 不生效:EnvFilter 仅启动装载一次(见 cli/main.rs)。
+pub struct RuntimeConfig {
+    pub normalize: NormalizeConfig,
+    pub logging: LoggingConfig,
+    /// 入口 secret key;Some 时需 x-api-key 匹配
+    pub secret: Option<String>,
+    /// 上游 HTTP 客户端(封装全局代理)。每次 /reload 无条件重建,
+    /// 连接池随之丢弃 —— 低频操作,取舍见 docs/design.md §8。
+    pub upstream: UpstreamClient,
+}
+
 /// 热重载结果:闭包重读配置文件,返回新配置
-#[derive(Debug, Clone)]
 pub struct ReloadData {
     pub providers: Vec<ProviderConfig>,
     pub payload_rules: Vec<PayloadRule>,
+    pub normalize: NormalizeConfig,
+    pub logging: LoggingConfig,
+    pub secret: Option<String>,
+    /// 全局代理 URL;"direct"/"" 或 None = 直连
+    pub proxy_url: Option<String>,
 }
 
 #[derive(Clone)]
 pub struct AppState {
     pub providers: Arc<RwLock<Vec<ProviderConfig>>>,
     pub payload_rules: Arc<RwLock<Vec<PayloadRule>>>,
-    pub normalize: NormalizeConfig,
-    pub logging: LoggingConfig,
-    pub upstream: UpstreamClient,
+    pub runtime: Arc<RwLock<RuntimeConfig>>,
     /// 重读配置文件的闭包(由 cli 构造,捕获 config 路径)
     pub reload: Arc<dyn Fn() -> anyhow::Result<ReloadData> + Send + Sync>,
-    /// 入口 secret key;Some 时 /v1/models 与 /v1/messages 需 x-api-key 匹配
-    pub secret: Option<String>,
     /// drift 观测状态(会话 → 上次结构哈希;按 openai/anthropic handler 分桶)
     pub drift: DriftState,
 }
@@ -97,7 +109,7 @@ pub fn app(state: AppState) -> Router {
 }
 
 /// bcrypt 验证结果缓存:key→已验证,避免每请求一次 ~100ms 的 bcrypt verify
-/// 上限 1024 条,超限清空(防内存无限增长);secret 仅启动时加载,热重载不换,缓存安全
+/// 上限 1024 条,超限清空(防内存无限增长);secret 可热重载,/reload 一律清空缓存
 static AUTH_CACHE: OnceLock<StdMutex<HashMap<String, bool>>> = OnceLock::new();
 
 fn auth_cache() -> &'static StdMutex<HashMap<String, bool>> {
@@ -194,7 +206,8 @@ async fn handle_count_tokens(
     headers: HeaderMap,
     body: Body,
 ) -> Result<Response, AppError> {
-    check_secret(&headers, &state.secret)?;
+    let secret = state.runtime.read().await.secret.clone();
+    check_secret(&headers, &secret)?;
     let bytes = to_bytes(body, 10 * 1024 * 1024)
         .await
         .map_err(|e| AppError::new(anyhow::anyhow!("读请求体失败: {e}")))?;
@@ -221,7 +234,8 @@ async fn handle_models(
     State(state): State<AppState>,
     headers: HeaderMap,
 ) -> Result<Response, AppError> {
-    check_secret(&headers, &state.secret)?;
+    let secret = state.runtime.read().await.secret.clone();
+    check_secret(&headers, &secret)?;
     let providers = state.providers.read().await;
     let body = build_models_list(&providers);
     Response::builder()
@@ -235,13 +249,26 @@ async fn health_check() -> &'static str {
     "ok"
 }
 
-/// 热重载:重读配置文件,校验后热更新 providers + payload
+/// 热重载:重读配置文件,校验后更新 providers / payload / 运行时配置。
+///
+/// 三把独立写锁分别获取,非全局原子 —— 期间并发请求可能见到部分更新
+/// (如新 providers 配旧 normalize)。热重载低频,取舍见 docs/design.md §8。
 async fn handle_reload(State(state): State<AppState>) -> Result<&'static str, AppError> {
     let data = (state.reload)().map_err(|e| AppError::new(anyhow::anyhow!("重读配置失败: {e}")))?;
     validate_providers(&data.providers)
         .map_err(|e| AppError::new(anyhow::anyhow!("配置校验失败: {e}")))?;
     *state.providers.write().await = data.providers;
     *state.payload_rules.write().await = data.payload_rules;
+    *state.runtime.write().await = RuntimeConfig {
+        normalize: data.normalize,
+        logging: data.logging,
+        secret: data.secret,
+        upstream: UpstreamClient::new(data.proxy_url),
+    };
+    // secret 可能变更,旧 bcrypt 校验结果一律作废(不比较新旧值)
+    if let Ok(mut cache) = auth_cache().lock() {
+        cache.clear();
+    }
     tracing::info!("配置热重载完成");
     Ok("reloaded")
 }
@@ -371,11 +398,22 @@ async fn handle_messages(
     headers: HeaderMap,
     body: Body,
 ) -> Result<Response, AppError> {
-    check_secret(&headers, &state.secret)?;
+    // 一次性 clone 运行时快照值后立即释放读锁,避免跨 await 持锁阻塞 /reload
+    let (secret, log_request_body, normalize_enabled, normalize_drift_detector, upstream_client) = {
+        let rt = state.runtime.read().await;
+        (
+            rt.secret.clone(),
+            rt.logging.request_body,
+            rt.normalize.enabled,
+            rt.normalize.drift_detector,
+            rt.upstream.clone(),
+        )
+    };
+    check_secret(&headers, &secret)?;
     let bytes = to_bytes(body, 10 * 1024 * 1024)
         .await
         .map_err(|e| AppError::new(anyhow::anyhow!("读请求体失败: {e}")))?;
-    if state.logging.request_body {
+    if log_request_body {
         tracing::debug!("请求体: {}", String::from_utf8_lossy(&bytes));
     }
     let mut body_json: Value = serde_json::from_slice(&bytes)
@@ -397,7 +435,7 @@ async fn handle_messages(
     // 对齐:claude 直通走 /v1/messages(全量),openai 走转换前
     // 精简子集(跳过 tool-def sort / volatile / cache_control / drift——
     // 这些在转换后 openai handler 处理)
-    if state.normalize.enabled {
+    if normalize_enabled {
         match route.protocol {
             Protocol::Claude => {
                 let counts = normalize_anthropic_full(&mut body_json);
@@ -407,7 +445,7 @@ async fn handle_messages(
                     &headers,
                     &body_json,
                     DriftApiKind::Anthropic,
-                    state.normalize.drift_detector,
+                    normalize_drift_detector,
                 );
             }
             _ => {
@@ -445,14 +483,14 @@ async fn handle_messages(
         }
         Protocol::OpenAiChat => {
             convert_to_openai_chat(&mut body_json, &route.upstream_model)?;
-            if state.normalize.enabled {
+            if normalize_enabled {
                 normalize_target_post(&mut body_json, TargetShape::OpenAiChat);
                 observe_drift_for(
                     &state.drift,
                     &headers,
                     &body_json,
                     DriftApiKind::OpenAiChat,
-                    state.normalize.drift_detector,
+                    normalize_drift_detector,
                 );
             }
         }
@@ -462,14 +500,14 @@ async fn handle_messages(
             if !rev.is_empty() {
                 tool_names = Some(Arc::new(rev));
             }
-            if state.normalize.enabled {
+            if normalize_enabled {
                 normalize_target_post(&mut body_json, TargetShape::OpenAiResponses);
                 observe_drift_for(
                     &state.drift,
                     &headers,
                     &body_json,
                     DriftApiKind::OpenAiResponses,
-                    state.normalize.drift_detector,
+                    normalize_drift_detector,
                 );
             }
         }
@@ -487,11 +525,23 @@ async fn handle_messages(
     }
 
     // 7. 上游请求
-    let provider = find_provider(&providers, &route.provider)
-        .ok_or_else(|| AppError::new(anyhow::anyhow!("provider 未找到: {}", route.provider)))?;
+    // 从配置中 clone 出上游所需字段后立即释放两把读锁,避免整个上游请求
+    // (慢上游/长连接建立)期间持锁,防止 /reload 写锁被无限期阻塞。
+    let (upstream_base_url, upstream_key, upstream_proxy, provider_prompt_cache_key) = {
+        let provider = find_provider(&providers, &route.provider)
+            .ok_or_else(|| AppError::new(anyhow::anyhow!("provider 未找到: {}", route.provider)))?;
+        (
+            provider.base_url.clone(),
+            provider.key.clone(),
+            provider.proxy_url.clone(),
+            provider.prompt_cache_key,
+        )
+    };
+    drop(payload_rules);
+    drop(providers);
 
     // prompt_cache_key 注入(provider 级开关;仅 openai 协议;对齐 applyPromptCacheKey)
-    if provider.prompt_cache_key
+    if provider_prompt_cache_key
         && !matches!(route.protocol, Protocol::Claude)
         && inject_prompt_cache_key(&mut body_json, &headers, cc_session.as_deref())
     {
@@ -500,7 +550,7 @@ async fn handle_messages(
 
     // 诊断:request_body 开启时落盘最终上游 body,供逐轮 diff 定位缓存漂移。
     // 文件名按会话+序号,logs/upstream_body_<session前8>_<毫秒>.<protocol>.json
-    if state.logging.request_body {
+    if log_request_body {
         let sess = cc_session
             .as_deref()
             .map(|s| s.chars().take(8).collect::<String>())
@@ -536,13 +586,12 @@ async fn handle_messages(
         None
     };
 
-    let upstream = state
-        .upstream
+    let upstream = upstream_client
         .request(
-            &provider.base_url,
-            &provider.key,
+            &upstream_base_url,
+            &upstream_key,
             route.protocol,
-            provider.proxy_url.as_deref(),
+            upstream_proxy.as_deref(),
             &body_json,
             is_stream,
             session_id,
@@ -797,26 +846,22 @@ mod tests {
                 }],
             },
         ];
-        let reload = Arc::new(|| -> anyhow::Result<ReloadData> {
-            Ok(ReloadData {
-                providers: vec![],
-                payload_rules: vec![],
-            })
-        });
         AppState {
             providers: Arc::new(RwLock::new(providers)),
             payload_rules: Arc::new(RwLock::new(vec![])),
-            normalize: NormalizeConfig {
-                enabled: false,
-                drift_detector: false,
-            },
-            logging: LoggingConfig {
-                level: "info".into(),
-                request_body: false,
-            },
-            upstream: UpstreamClient::new(None),
-            reload,
-            secret: None,
+            runtime: Arc::new(RwLock::new(RuntimeConfig {
+                normalize: NormalizeConfig {
+                    enabled: false,
+                    drift_detector: false,
+                },
+                logging: LoggingConfig {
+                    level: "info".into(),
+                    request_body: false,
+                },
+                secret: None,
+                upstream: UpstreamClient::new(None),
+            })),
+            reload: reload_returning_secret(None),
             drift: DriftState::new(1000),
         }
     }
@@ -1143,8 +1188,8 @@ mod tests {
 
     #[tokio::test]
     async fn test_models_requires_secret() {
-        let mut state = mock_state();
-        state.secret = Some("s3cret".into());
+        let state = mock_state();
+        state.runtime.write().await.secret = Some("s3cret".into());
         let app = app(state);
         // 无 key → 401
         let req = Request::builder()
@@ -1163,6 +1208,152 @@ mod tests {
         assert_eq!(resp.status(), StatusCode::OK);
     }
 
+    /// 构造带指定 secret 的 reload 闭包(providers 保持空,validate 必过)
+    fn reload_returning_secret(
+        secret: Option<String>,
+    ) -> Arc<dyn Fn() -> anyhow::Result<ReloadData> + Send + Sync> {
+        Arc::new(move || {
+            Ok(ReloadData {
+                providers: vec![],
+                payload_rules: vec![],
+                normalize: NormalizeConfig {
+                    enabled: false,
+                    drift_detector: false,
+                },
+                logging: LoggingConfig {
+                    level: "info".into(),
+                    request_body: false,
+                },
+                secret: secret.clone(),
+                proxy_url: None,
+            })
+        })
+    }
+
+    /// /reload 真正把新 secret 装进 RuntimeConfig:重载前无 key 放行,
+    /// 重载后同样请求应 401。删掉 handle_reload 里的 runtime 写入则失败。
+    #[tokio::test]
+    async fn test_reload_applies_new_secret() {
+        let mut state = mock_state();
+        assert!(state.runtime.read().await.secret.is_none());
+        state.reload = reload_returning_secret(Some("sk-after-reload".into()));
+        let app = app(state);
+
+        let models_req = || {
+            Request::builder()
+                .uri("/v1/models")
+                .body(Body::empty())
+                .unwrap()
+        };
+        let before = app.clone().oneshot(models_req()).await.unwrap();
+        assert_eq!(before.status(), StatusCode::OK, "重载前无 secret 应放行");
+
+        let reload = Request::builder()
+            .uri("/reload")
+            .method("POST")
+            .body(Body::empty())
+            .unwrap();
+        let resp = app.clone().oneshot(reload).await.unwrap();
+        assert_eq!(resp.status(), StatusCode::OK, "/reload 应成功");
+
+        let after = app.clone().oneshot(models_req()).await.unwrap();
+        assert_eq!(
+            after.status(),
+            StatusCode::UNAUTHORIZED,
+            "重载后新 secret 应生效"
+        );
+        let ok = Request::builder()
+            .uri("/v1/models")
+            .header("x-api-key", "sk-after-reload")
+            .body(Body::empty())
+            .unwrap();
+        assert_eq!(app.oneshot(ok).await.unwrap().status(), StatusCode::OK);
+    }
+
+    /// /reload 清空 bcrypt 校验缓存:旧 secret 的 hash 命中过缓存后,
+    /// 重载换新 secret,旧明文 key 不得再通过。
+    #[tokio::test]
+    async fn test_reload_clears_auth_cache() {
+        let old_hash = bcrypt::hash("sk-old", 4).unwrap();
+        let new_hash = bcrypt::hash("sk-new", 4).unwrap();
+        let mut state = mock_state();
+        state.runtime.write().await.secret = Some(old_hash);
+        state.reload = reload_returning_secret(Some(new_hash));
+        let app = app(state);
+
+        let with_key = |k: &str| {
+            Request::builder()
+                .uri("/v1/models")
+                .header("x-api-key", k)
+                .body(Body::empty())
+                .unwrap()
+        };
+        // 先命中一次,把 sk-old→true 写进 AUTH_CACHE
+        let r = app.clone().oneshot(with_key("sk-old")).await.unwrap();
+        assert_eq!(r.status(), StatusCode::OK);
+
+        let reload = Request::builder()
+            .uri("/reload")
+            .method("POST")
+            .body(Body::empty())
+            .unwrap();
+        assert_eq!(
+            app.clone().oneshot(reload).await.unwrap().status(),
+            StatusCode::OK
+        );
+
+        let stale = app.clone().oneshot(with_key("sk-old")).await.unwrap();
+        assert_eq!(
+            stale.status(),
+            StatusCode::UNAUTHORIZED,
+            "旧 key 的缓存结果应随 /reload 作废"
+        );
+        let fresh = app.oneshot(with_key("sk-new")).await.unwrap();
+        assert_eq!(fresh.status(), StatusCode::OK, "新 secret 应校验通过");
+    }
+
+    /// /reload 替换 normalize 与全局代理:新 UpstreamClient 带上新 proxy_url。
+    #[tokio::test]
+    async fn test_reload_applies_normalize_and_proxy() {
+        let mut state = mock_state();
+        state.reload = Arc::new(|| {
+            Ok(ReloadData {
+                providers: vec![],
+                payload_rules: vec![],
+                normalize: NormalizeConfig {
+                    enabled: true,
+                    drift_detector: true,
+                },
+                logging: LoggingConfig {
+                    level: "debug".into(),
+                    request_body: true,
+                },
+                secret: None,
+                proxy_url: Some("socks5://127.0.0.1:1080".into()),
+            })
+        });
+        let runtime = state.runtime.clone();
+        let req = Request::builder()
+            .uri("/reload")
+            .method("POST")
+            .body(Body::empty())
+            .unwrap();
+        assert_eq!(
+            app(state).oneshot(req).await.unwrap().status(),
+            StatusCode::OK
+        );
+
+        let rt = runtime.read().await;
+        assert!(rt.normalize.enabled, "normalize 应随 /reload 更新");
+        assert!(rt.normalize.drift_detector);
+        assert!(rt.logging.request_body, "logging 应随 /reload 更新");
+        assert_eq!(
+            rt.upstream.resolve_proxy_for_test(None),
+            "socks5://127.0.0.1:1080",
+            "全局代理应随 /reload 生效"
+        );
+    }
+
     #[tokio::test]
     async fn test_reload_endpoint() {
         let app = app(mock_state());
@@ -1174,5 +1365,73 @@ mod tests {
         let resp = app.oneshot(req).await.unwrap();
         // reload 会失败(mock reload 返回空 providers),但端点应响应
         assert!(resp.status() == StatusCode::OK || resp.status().is_server_error());
+    }
+
+    /// 验证 handle_messages 在上游请求期间不持有配置读锁:
+    /// 慢上游(2s 延迟)进行中时,/reload 应能在 500ms 内完成。
+    #[tokio::test]
+    async fn test_reload_completes_while_request_inflight() {
+        use tokio::io::AsyncWriteExt;
+        use tokio::net::TcpListener;
+
+        // 慢上游:接受连接后延迟 2s 才写响应头
+        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        tokio::spawn(async move {
+            if let Ok((mut sock, _)) = listener.accept().await {
+                tokio::time::sleep(std::time::Duration::from_secs(2)).await;
+                let _ = sock
+                    .write_all(
+                        b"HTTP/1.1 200 OK\r\ncontent-type: application/json\r\ncontent-length: 2\r\n\r\n{}",
+                    )
+                    .await;
+            }
+        });
+
+        let mut state = mock_state();
+        // 让 test-claude 指向慢 mock
+        state.providers.write().await[0].base_url = format!("http://{addr}");
+
+        state.reload = reload_returning_secret(None);
+
+        let app = app(state);
+
+        // 发起进行中请求,不 await 完成
+        let inflight_app = app.clone();
+        tokio::spawn(async move {
+            let req = Request::builder()
+                .uri("/v1/messages")
+                .method("POST")
+                .header("content-type", "application/json")
+                .body(Body::from(
+                    json!({
+                        "model": "test-opus",
+                        "stream": false,
+                        "messages": [{"role": "user", "content": "hi"}]
+                    })
+                    .to_string(),
+                ))
+                .unwrap();
+            let _ = inflight_app.oneshot(req).await;
+        });
+
+        // 等 handler 进入上游请求阶段(已过路由决策)
+        tokio::time::sleep(std::time::Duration::from_millis(300)).await;
+
+        // /reload 应在 500ms 内完成,不被上游请求的锁阻塞
+        let reload_req = Request::builder()
+            .uri("/reload")
+            .method("POST")
+            .body(Body::empty())
+            .unwrap();
+        let result = tokio::time::timeout(
+            std::time::Duration::from_millis(500),
+            app.oneshot(reload_req),
+        )
+        .await;
+        assert!(
+            result.is_ok(),
+            "/reload 超时:handle_messages 在上游请求期间仍持有配置读锁"
+        );
     }
 }

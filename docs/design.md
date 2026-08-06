@@ -123,12 +123,23 @@ Claude Code → ccextra:8222
 ## 7. 性能优化
 
 - `preserve_order`：JSON key 顺序稳定
-- `Arc<RwLock<>>`：热重载并发安全
 - client 缓存：按代理 key 缓存 reqwest::Client
 - bcrypt 验证缓存：避免每请求 ~100ms
 - 多 codegen 单元 + strip：release 增量编译约 4s（弃 LTO 换速度）
 
-## 8. 与现有栈关系
+## 8. 热重载并发模型
+
+`AppState.runtime` 用 `Arc<RwLock<RuntimeConfig>>` 封装 `normalize`/`logging`/`secret`/`upstream`，`/reload` 整块写锁替换；`providers`、`payload_rules` 各自独立 `RwLock`。三把锁分别获取，**非全局原子** —— 窗口内并发请求可能见部分更新（新 providers 配旧 normalize）。热重载低频，可接受。
+
+`handle_messages` 取运行时快照后立即释放读锁（`secret`/`logging`/`normalize` 字段 clone、`UpstreamClient` clone），再 `drop(providers)`/`drop(payload_rules)`，避免跨上游 `await` 持锁阻塞 `/reload`。
+
+`/reload` 无条件重建 `UpstreamClient`（不比较新旧 `proxy_url`），丢弃内部 `reqwest::Client` 连接池缓存。低频操作，取舍可接受；若 proxy_url 未变可复用旧 client 优化。
+
+`auth_cache().clear()` 同样无条件执行，旧 bcrypt 校验结果一律作废 —— secret 未变时代价是几次重算，比漏清风险小。
+
+**不参与热重载**：`logging.level`。`EnvFilter` 仅在启动装载一次（`cli/main.rs`），改级别需重启，或用 `RUST_LOG` 覆盖。
+
+## 9. 与现有栈关系
 
 ccextra 设计为与主力网关并存，独立运行，验证时手动切换，出问题立刻回退。不以替换为目标。
 
@@ -136,6 +147,6 @@ ccextra 设计为与主力网关并存，独立运行，验证时手动切换，
 - ccextra 在 8222 独立运行，验证时切 `ANTHROPIC_BASE_URL` 到 ccextra
 - 定位是长期并存的验证/实验入口，出了问题不影响主链路
 
-## 9. 设计对齐目标
+## 10. 设计对齐目标
 
 转换逻辑、认证、prompt cache key、thinking 映射、reasoning 回放对齐成熟协议网关实现;九模块归一化对齐字节稳定化 sidecar 的缓存稳定化管线。

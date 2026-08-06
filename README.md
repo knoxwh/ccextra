@@ -29,7 +29,7 @@ ccextra :8222  ──  路由 → 归一化 → 协议转换 → 上游请求
 | **字节级直通** | Claude → Claude 只改 model 字段，其余字节原样保留，保住归一化成果 |
 | **prompt 缓存优化** | 九模块归一化消除序列化漂移，命中上游 prompt cache；drift 检测器跨轮观测盲区 |
 | **流式状态机** | 手写 SSE 解析器 + 三条独立转发路径，断流发结构化 error 兜底，不裸断流 |
-| **热重载** | `POST /reload` 无需重启更新配置 |
+| **热重载** | `POST /reload` 无需重启更新 providers / payload / normalize / `logging.request_body` / secret / 全局代理，并清空 bcrypt 校验缓存；`logging.level` 仅启动生效 |
 | **代理支持** | 全局 + 每 provider 覆盖，支持 SOCKS |
 | **参数覆盖** | 按模型名通配符匹配（如 `*glm*`）覆盖请求参数，可限定协议生效 |
 | **入口认证** | 可选 `secret_key`，明文自动转 bcrypt 落盘，校验结果缓存 |
@@ -172,7 +172,7 @@ curl http://127.0.0.1:8222/health
 | ------ | ---- |
 | `server.host` / `server.port` | 监听地址，默认 `127.0.0.1:8222` |
 | `server.proxy_url` | 全局代理兜底，可选；`"direct"` 表示不走代理 |
-| `secret_key` | 入口认证，可选。配置后 `/v1/models` 与 `/v1/messages` 需携带匹配 key，否则 401。支持 `x-api-key` 或 `Authorization: Bearer`。明文自动转 bcrypt 落盘 |
+| `secret_key` | 入口认证，可选。配置后 `/v1/models` 与 `/v1/messages` 需携带匹配 key，否则 401。支持 `x-api-key` 或 `Authorization: Bearer`。明文自动转 bcrypt 落盘。`/reload` 热替换 secret，并清空 bcrypt 校验缓存 |
 | `providers[].protocol` | 上游协议：`claude` / `openai_chat` / `openai_responses` |
 | `providers[].base_url` / `key` | 上游地址与密钥 |
 | `providers[].models[].alias` | 入站模型名 → 上游真实模型名 |

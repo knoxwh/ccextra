@@ -68,6 +68,12 @@ impl UpstreamClient {
         }
     }
 
+    /// 暴露 resolve_proxy 供 crate 内测试断言(如 /reload 后全局代理是否生效)
+    #[cfg(test)]
+    pub(crate) fn resolve_proxy_for_test(&self, provider_proxy: Option<&str>) -> String {
+        self.resolve_proxy(provider_proxy)
+    }
+
     /// 按最终代理取(或构建)client
     fn client_for(&self, proxy_key: &str) -> Client {
         if let Some(c) = self.clients.lock().unwrap().get(proxy_key) {

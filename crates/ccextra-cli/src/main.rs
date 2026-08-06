@@ -1,6 +1,6 @@
 use anyhow::Result;
 use ccextra_core::cache_stabilization::drift_detector::DriftState;
-use ccextra_server::http::{AppState, ReloadData};
+use ccextra_server::http::{AppState, ReloadData, RuntimeConfig};
 use ccextra_server::serve;
 use ccextra_server::upstream::UpstreamClient;
 use clap::Parser;
@@ -69,16 +69,22 @@ async fn main() -> Result<()> {
         Ok(ReloadData {
             providers: cfg.providers,
             payload_rules: cfg.payload.unwrap_or_default(),
+            normalize: cfg.normalize,
+            logging: cfg.logging,
+            secret: cfg.secret_key,
+            proxy_url: cfg.server.proxy_url,
         })
     });
     let state = AppState {
         providers: Arc::new(RwLock::new(config.providers)),
         payload_rules: Arc::new(RwLock::new(config.payload.unwrap_or_default())),
-        normalize: config.normalize,
-        logging: config.logging,
-        upstream: UpstreamClient::new(config.server.proxy_url),
+        runtime: Arc::new(RwLock::new(RuntimeConfig {
+            normalize: config.normalize,
+            logging: config.logging,
+            secret: config.secret_key,
+            upstream: UpstreamClient::new(config.server.proxy_url),
+        })),
         reload,
-        secret: config.secret_key,
         drift: DriftState::new(1000),
     };
 
