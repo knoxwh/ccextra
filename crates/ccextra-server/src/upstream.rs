@@ -15,6 +15,18 @@ pub struct UpstreamResponse {
     pub body: reqwest::Response,
 }
 
+/// 每个请求都要用到的流式头集合,避免在 request 里内联判断
+/// (chat / responses 流式声明 SSE + 防代理缓存;claude 直通不掺头)
+fn stream_headers(protocol: Protocol, is_stream: bool) -> Vec<(&'static str, &'static str)> {
+    if !is_stream || !matches!(protocol, Protocol::OpenAiChat | Protocol::OpenAiResponses) {
+        return Vec::new();
+    }
+    vec![
+        (reqwest::header::ACCEPT.as_str(), "text/event-stream"),
+        (reqwest::header::CACHE_CONTROL.as_str(), "no-cache"),
+    ]
+}
+
 /// 按协议取上游请求路径
 ///
 /// 版本前缀约定(与 参考实现/OpenAI 一致):anthropic 协议 base_url 不含版本,路径带 /v1;
@@ -130,10 +142,8 @@ impl UpstreamClient {
             .post(&url)
             .bearer_auth(api_key)
             .header(reqwest::header::USER_AGENT, user_agent(protocol));
-        if is_stream && matches!(protocol, Protocol::OpenAiChat) {
-            req = req
-                .header(reqwest::header::ACCEPT, "text/event-stream")
-                .header(reqwest::header::CACHE_CONTROL, "no-cache");
+        for (name, value) in stream_headers(protocol, is_stream) {
+            req = req.header(name, value);
         }
         if let Some(sid) = session_id {
             if matches!(protocol, Protocol::OpenAiResponses) {
@@ -172,6 +182,27 @@ mod tests {
         assert_eq!(user_agent(Protocol::OpenAiChat), "claude-cli/2.1.221");
         assert!(user_agent(Protocol::OpenAiResponses).starts_with("codex_cli_rs/0.146.0"));
         assert_eq!(user_agent(Protocol::Claude), "claude-cli/2.1.221");
+    }
+
+    #[test]
+    fn test_stream_headers_chat_and_responses() {
+        let chat = stream_headers(Protocol::OpenAiChat, true);
+        assert_eq!(
+            chat,
+            vec![
+                (reqwest::header::ACCEPT.as_str(), "text/event-stream"),
+                (reqwest::header::CACHE_CONTROL.as_str(), "no-cache"),
+            ]
+        );
+        assert_eq!(stream_headers(Protocol::OpenAiResponses, true), chat);
+    }
+
+    #[test]
+    fn test_stream_headers_absent_for_non_stream_and_claude() {
+        assert!(stream_headers(Protocol::OpenAiChat, false).is_empty());
+        assert!(stream_headers(Protocol::OpenAiResponses, false).is_empty());
+        // claude 直通字节原样转发,不掺头
+        assert!(stream_headers(Protocol::Claude, true).is_empty());
     }
 
     #[test]
