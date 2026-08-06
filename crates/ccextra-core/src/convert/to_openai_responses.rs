@@ -122,6 +122,27 @@ fn image_to_data_url(part: &Value) -> Option<String> {
     Some(format!("data:{media_type};base64,{data}"))
 }
 
+/// Claude custom 工具 tool_use.input → 字符串(对齐 unwrapCustomToolInput)
+///
+/// 响应侧把 custom 工具字符串 input 包成 {"input": str} 对象发回;
+/// 请求侧此处解包还原。格式不符时回退到原始文本。
+fn unwrap_custom_tool_input(input: Option<&Value>) -> String {
+    match input {
+        Some(Value::Object(map)) => {
+            if let Some(inner) = map.get("input") {
+                match inner {
+                    Value::String(s) => s.clone(),
+                    other => other.to_string(),
+                }
+            } else {
+                input.map(|v| v.to_string()).unwrap_or_default()
+            }
+        }
+        Some(Value::String(s)) => s.clone(),
+        _ => String::new(),
+    }
+}
+
 /// input_schema → parameters(对齐 normalizeToolParameters)
 fn normalize_tool_parameters(schema: &Value) -> Value {
     if schema.is_null() || !schema.is_object() {
@@ -179,6 +200,8 @@ pub fn convert_to_openai_responses(
     // --- 工具名缩短映射(对齐 buildReverseMapFromClaudeOriginalToShort) ---
     let mut tool_name_map: HashMap<String, String> = HashMap::new();
     let mut web_search_names: HashSet<String> = HashSet::new();
+    // custom 工具(freeform,无 input_schema)→ Responses type:"custom",input 是字符串
+    let mut custom_tool_names: HashSet<String> = HashSet::new();
     if let Some(tools) = body.get("tools").and_then(|v| v.as_array()) {
         let mut names: Vec<String> = Vec::new();
         for tool in tools {
@@ -190,6 +213,13 @@ pub fn convert_to_openai_responses(
                     }
                 }
                 continue;
+            }
+            if tool_type == "custom" {
+                if let Some(n) = tool.get("name").and_then(|v| v.as_str()) {
+                    if !n.is_empty() {
+                        custom_tool_names.insert(n.to_string());
+                    }
+                }
             }
             if let Some(n) = tool.get("name").and_then(|v| v.as_str()) {
                 if !n.is_empty() {
@@ -212,6 +242,8 @@ pub fn convert_to_openai_responses(
     }
 
     // --- messages → input[] ---
+    // custom 工具调用的 call_id 集合(tool_result 需转 custom_tool_call_output)
+    let mut custom_call_ids: HashSet<String> = HashSet::new();
     if let Some(messages) = body.get("messages").and_then(|v| v.as_array()) {
         for msg in messages {
             let role = msg.get("role").and_then(|v| v.as_str()).unwrap_or("user");
@@ -312,16 +344,31 @@ pub fn convert_to_openai_responses(
                         } else {
                             shorten_name_if_needed(name)
                         };
-                        let args = part
-                            .get("input")
-                            .map(|i| i.to_string())
-                            .unwrap_or_else(|| "{}".to_string());
-                        out_items.push(json!({
-                            "type": "function_call",
-                            "call_id": shorten_call_id(id),
-                            "name": short_name,
-                            "arguments": args
-                        }));
+                        let is_custom = custom_tool_names.contains(name);
+                        let short_id = shorten_call_id(id);
+                        if is_custom {
+                            // custom 工具:Claude tool_use.input 是 {"input": str} 对象,
+                            // 解包回字符串,发 custom_tool_call(对齐转换 custom 分支)
+                            custom_call_ids.insert(short_id.clone());
+                            let input_str = unwrap_custom_tool_input(part.get("input"));
+                            out_items.push(json!({
+                                "type": "custom_tool_call",
+                                "call_id": short_id,
+                                "name": short_name,
+                                "input": input_str
+                            }));
+                        } else {
+                            let args = part
+                                .get("input")
+                                .map(|i| i.to_string())
+                                .unwrap_or_else(|| "{}".to_string());
+                            out_items.push(json!({
+                                "type": "function_call",
+                                "call_id": short_id,
+                                "name": short_name,
+                                "arguments": args
+                            }));
+                        }
                     }
                     "tool_result" => {
                         flush_message(&mut content_items, &mut out_items);
@@ -330,11 +377,20 @@ pub fn convert_to_openai_responses(
                             .and_then(|v| v.as_str())
                             .unwrap_or("");
                         let output = tool_result_output(part.get("content").unwrap_or(&json!("")));
-                        out_items.push(json!({
-                            "type": "function_call_output",
-                            "call_id": shorten_call_id(call_id),
-                            "output": output
-                        }));
+                        let short_id = shorten_call_id(call_id);
+                        if custom_call_ids.contains(&short_id) {
+                            out_items.push(json!({
+                                "type": "custom_tool_call_output",
+                                "call_id": short_id,
+                                "output": output
+                            }));
+                        } else {
+                            out_items.push(json!({
+                                "type": "function_call_output",
+                                "call_id": short_id,
+                                "output": output
+                            }));
+                        }
                     }
                     _ => {}
                 }
@@ -365,6 +421,16 @@ pub fn convert_to_openai_responses(
             }
 
             let mut t = tool.clone();
+            if tool_type == "custom" {
+                // custom 工具保留 type,不套 input_schema(对齐转换 custom 分支)
+                if let Some(obj) = t.as_object_mut() {
+                    obj.remove("input_schema");
+                    obj.remove("cache_control");
+                    obj.remove("defer_loading");
+                }
+                tool_items.push(t);
+                continue;
+            }
             if t.get("type").and_then(|v| v.as_str()) != Some("function") {
                 t["type"] = json!("function");
             }
@@ -429,6 +495,8 @@ pub fn convert_to_openai_responses(
                         };
                         if short.is_empty() {
                             openai["tool_choice"] = json!("auto");
+                        } else if custom_tool_names.contains(name) {
+                            openai["tool_choice"] = json!({"type": "custom", "name": short});
                         } else {
                             openai["tool_choice"] = json!({"type": "function", "name": short});
                         }
@@ -636,6 +704,71 @@ mod tests {
             "input_schema 应剥除"
         );
         assert_eq!(body["tools"][2]["strict"], false);
+    }
+
+    #[test]
+    fn test_custom_tool_round_trip() {
+        // custom 工具声明保留 type;tool_use → custom_tool_call(input 解包);
+        // tool_result → custom_tool_call_output
+        let mut body = json!({
+            "model": "test",
+            "messages": [
+                {"role": "assistant", "content": [
+                    {"type": "tool_use", "id": "t1", "name": "apply_patch",
+                     "input": {"input": "patch-content"}}
+                ]},
+                {"role": "user", "content": [
+                    {"type": "tool_result", "tool_use_id": "t1", "content": "ok"}
+                ]}
+            ],
+            "tools": [
+                {"type": "custom", "name": "apply_patch", "description": "d"}
+            ]
+        });
+        convert_to_openai_responses(&mut body, "gpt-5").unwrap();
+        // 声明保持 custom,不套 input_schema
+        assert_eq!(body["tools"][0]["type"], "custom");
+        assert!(body["tools"][0].get("input_schema").is_none());
+        // tool_use → custom_tool_call,字符串 input 解包
+        assert_eq!(body["input"][0]["type"], "custom_tool_call");
+        assert_eq!(body["input"][0]["name"], "apply_patch");
+        assert_eq!(body["input"][0]["input"], "patch-content");
+        // tool_result → custom_tool_call_output
+        assert_eq!(body["input"][1]["type"], "custom_tool_call_output");
+        assert_eq!(body["input"][1]["output"], "ok");
+    }
+
+    #[test]
+    fn test_custom_tool_choice_mapping() {
+        let mut body = json!({
+            "model": "test",
+            "messages": [],
+            "tool_choice": {"type": "tool", "name": "apply_patch"},
+            "tools": [{"type": "custom", "name": "apply_patch", "description": "d"}]
+        });
+        convert_to_openai_responses(&mut body, "gpt-5").unwrap();
+        assert_eq!(body["tool_choice"]["type"], "custom");
+        assert_eq!(body["tool_choice"]["name"], "apply_patch");
+    }
+
+    #[test]
+    fn test_regular_tool_unaffected_by_custom() {
+        // 非 custom 工具仍走 function_call 路径
+        let mut body = json!({
+            "model": "test",
+            "messages": [
+                {"role": "assistant", "content": [
+                    {"type": "tool_use", "id": "t1", "name": "get_weather", "input": {"city": "bj"}}
+                ]},
+                {"role": "user", "content": [
+                    {"type": "tool_result", "tool_use_id": "t1", "content": "sunny"}
+                ]}
+            ],
+            "tools": [{"name": "get_weather", "input_schema": {"type": "object"}}]
+        });
+        convert_to_openai_responses(&mut body, "gpt-5").unwrap();
+        assert_eq!(body["input"][0]["type"], "function_call");
+        assert_eq!(body["input"][1]["type"], "function_call_output");
     }
 
     #[test]

@@ -70,8 +70,9 @@ pub fn responses_to_anthropic(
                         }
                     }
                 }
-                "function_call" => {
+                "function_call" | "custom_tool_call" => {
                     has_tool_use = true;
+                    let is_custom = item.get("type").and_then(|v| v.as_str()) == Some("custom_tool_call");
                     let id = sanitize_tool_id(
                         item.get("call_id").and_then(|v| v.as_str()).unwrap_or(""),
                     );
@@ -81,12 +82,17 @@ pub fn responses_to_anthropic(
                         .and_then(|rev| rev.get(raw_name))
                         .cloned()
                         .unwrap_or_else(|| raw_name.to_string());
-                    let input = item
-                        .get("arguments")
-                        .and_then(|v| v.as_str())
-                        .and_then(|s| serde_json::from_str::<Value>(s).ok())
-                        .filter(|v| v.is_object())
-                        .unwrap_or_else(|| json!({}));
+                    let input = if is_custom {
+                        // custom 工具 input 是字符串,包成 {"input": str}(对齐响应转换 custom 分支)
+                        let raw = item.get("input").and_then(|v| v.as_str()).unwrap_or("");
+                        json!({"input": raw})
+                    } else {
+                        item.get("arguments")
+                            .and_then(|v| v.as_str())
+                            .and_then(|s| serde_json::from_str::<Value>(s).ok())
+                            .filter(|v| v.is_object())
+                            .unwrap_or_else(|| json!({}))
+                    };
                     content
                         .push(json!({"type": "tool_use", "id": id, "name": name, "input": input}));
                 }
@@ -506,6 +512,31 @@ mod tests {
         );
         let out = responses_to_anthropic(&body, Some(&rev)).unwrap();
         assert_eq!(out["content"][0]["name"], "mcp__long_original_name");
+    }
+
+    #[test]
+    fn test_responses_nonstream_custom_tool_call() {
+        // custom 工具:input 是字符串,包成 {"input": str} 对象
+        let body = json!({
+            "type": "response.completed",
+            "response": {
+                "id": "r1",
+                "model": "gpt-5",
+                "output": [{
+                    "type": "custom_tool_call",
+                    "call_id": "call_1",
+                    "name": "apply_patch",
+                    "input": "patch-data"
+                }],
+                "stop_reason": "end_turn",
+                "usage": {"input_tokens": 10, "output_tokens": 5}
+            }
+        });
+        let out = responses_to_anthropic(&body, None).unwrap();
+        assert_eq!(out["content"][0]["type"], "tool_use");
+        assert_eq!(out["content"][0]["name"], "apply_patch");
+        assert_eq!(out["content"][0]["input"]["input"], "patch-data");
+        assert_eq!(out["stop_reason"], "tool_use");
     }
 
     #[test]

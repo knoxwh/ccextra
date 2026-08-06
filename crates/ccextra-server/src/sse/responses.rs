@@ -28,6 +28,9 @@ const FALLBACK_MODEL: &str = "claude-opus-4-1-20250805";
 const SUMMARY_PART_SEPARATOR: &str = "\n\n";
 
 /// 单个 function_call 流式块(对齐 codexFunctionCallStream)
+///
+/// custom_tool_call 复用同一状态机:`is_custom=true` 时 arguments 存字符串 input
+/// (非 JSON),发 tool_use 时包成 `{"input": str}`(对齐响应转换 custom 分支)。
 struct FunctionCallStream {
     call_id: String,
     name: String,
@@ -36,6 +39,7 @@ struct FunctionCallStream {
     emitted_arguments_len: usize,
     has_received_arguments_delta: bool,
     emit_initial_empty_delta: bool,
+    is_custom: bool,
     started: bool,
     done: bool,
     closed: bool,
@@ -51,6 +55,7 @@ impl FunctionCallStream {
             emitted_arguments_len: 0,
             has_received_arguments_delta: false,
             emit_initial_empty_delta: false,
+            is_custom: false,
             started: false,
             done: false,
             closed: false,
@@ -229,14 +234,29 @@ impl ResponsesRelay {
                             .to_string();
                         out
                     }
-                    "function_call" => {
+                    "function_call" | "custom_tool_call" => {
                         // 对齐 output_item.added(function_call):先关 thinking/text,
                         // 登记调用,有名字的发初始空 delta,随后走队列
+                        let is_custom = item_type == "custom_tool_call";
                         let mut out = self.finalize_thinking();
                         out.extend(self.stop_text());
                         let idx = self.record_function_call(item, Some(&root));
                         if let Some(i) = idx {
                             self.update_function_call_identity(i, item, Some(&root));
+                            self.function_call_queue[i].is_custom = is_custom;
+                            // custom 工具 input 可能是字符串,包成 {"input": str} 回放
+                            if is_custom {
+                                if let Some(input) = item
+                                    .and_then(|i| i.get("input"))
+                                    .and_then(|v| v.as_str())
+                                {
+                                    if !input.is_empty() {
+                                        self.function_call_queue[i].arguments = input.to_string();
+                                        self.function_call_queue[i].has_received_arguments_delta =
+                                            true;
+                                    }
+                                }
+                            }
                             if !self.function_call_queue[i].name.is_empty() {
                                 self.function_call_queue[i].emit_initial_empty_delta = true;
                             }
@@ -268,6 +288,30 @@ impl ResponsesRelay {
                     let call = &mut self.function_call_queue[i];
                     if !call.has_received_arguments_delta || args.starts_with(&call.arguments) {
                         call.arguments = args.to_string();
+                    }
+                }
+                self.append_buffered_arguments()
+            }
+            // custom 工具 input 流(custom_tool_call_input delta/done)
+            "response.custom_tool_call_input.delta" => {
+                let idx = self.record_function_call(None, Some(&root));
+                if let Some(i) = idx {
+                    let delta = root.get("delta").and_then(|v| v.as_str()).unwrap_or("");
+                    let call = &mut self.function_call_queue[i];
+                    call.is_custom = true;
+                    call.arguments.push_str(delta);
+                    call.has_received_arguments_delta = true;
+                }
+                self.append_buffered_arguments()
+            }
+            "response.custom_tool_call_input.done" => {
+                let idx = self.record_function_call(None, Some(&root));
+                if let Some(i) = idx {
+                    let input = root.get("input").and_then(|v| v.as_str()).unwrap_or("");
+                    let call = &mut self.function_call_queue[i];
+                    call.is_custom = true;
+                    if !call.has_received_arguments_delta || input.starts_with(&call.arguments) {
+                        call.arguments = input.to_string();
                     }
                 }
                 self.append_buffered_arguments()
@@ -337,14 +381,20 @@ impl ResponsesRelay {
                 self.thinking_summary_seen = false;
                 out
             }
-            "function_call" => {
+            "function_call" | "custom_tool_call" => {
                 // 对齐 output_item.done(function_call):关块、补身份与参数、标 done
+                let is_custom = item_type == "custom_tool_call";
                 let mut out = self.finalize_thinking();
                 out.extend(self.stop_text());
                 let idx = self.record_function_call(Some(item), Some(root));
                 if let Some(i) = idx {
                     self.update_function_call_identity(i, Some(item), Some(root));
-                    let args = item.get("arguments").and_then(|v| v.as_str()).unwrap_or("");
+                    self.function_call_queue[i].is_custom = is_custom;
+                    let args = if is_custom {
+                        item.get("input").and_then(|v| v.as_str()).unwrap_or("").to_string()
+                    } else {
+                        item.get("arguments").and_then(|v| v.as_str()).unwrap_or("").to_string()
+                    };
                     let call = &mut self.function_call_queue[i];
                     if !call.has_received_arguments_delta || args.starts_with(&call.arguments) {
                         call.arguments = args.to_string();
@@ -623,6 +673,15 @@ impl ResponsesRelay {
         if !call.started || call.closed {
             return Vec::new();
         }
+        // custom 工具:input 是字符串,包成 {"input": str} 一次性发(不逐段流)
+        if call.is_custom {
+            if !call.done || call.emitted_arguments_len >= call.arguments.len() {
+                return Vec::new();
+            }
+            let wrapped = custom_input_json(&call.arguments);
+            call.emitted_arguments_len = call.arguments.len();
+            return vec![function_call_argument_delta(&wrapped, call.block_index)];
+        }
         if call.emitted_arguments_len >= call.arguments.len() {
             return Vec::new();
         }
@@ -690,9 +749,11 @@ impl ResponsesRelay {
             .and_then(|v| v.as_array())
         {
             for (i, item) in output.iter().enumerate() {
-                if item.get("type").and_then(|v| v.as_str()) != Some("function_call") {
+                let item_type = item.get("type").and_then(|v| v.as_str()).unwrap_or("");
+                if item_type != "function_call" && item_type != "custom_tool_call" {
                     continue;
                 }
+                let is_custom = item_type == "custom_tool_call";
                 let mut keys = self.call_keys(None, Some(item));
                 if let Some(oi) = item.get("output_index") {
                     push_key(&mut keys, format!("output:{}", oi));
@@ -708,9 +769,14 @@ impl ResponsesRelay {
                 for k in &keys {
                     self.function_calls.insert(k.clone(), idx);
                 }
-                let args = item.get("arguments").and_then(|v| v.as_str()).unwrap_or("");
+                let args = if is_custom {
+                    item.get("input").and_then(|v| v.as_str()).unwrap_or("").to_string()
+                } else {
+                    item.get("arguments").and_then(|v| v.as_str()).unwrap_or("").to_string()
+                };
                 self.update_function_call_identity(idx, Some(item), None);
                 let call = &mut self.function_call_queue[idx];
+                call.is_custom = is_custom;
                 if !call.has_received_arguments_delta || args.starts_with(&call.arguments) {
                     call.arguments = args.to_string();
                 }
@@ -1079,13 +1145,16 @@ fn should_defer_stream_event(root: &Value, event_type: &str) -> bool {
         | "response.completed"
         | "response.incomplete"
         | "response.function_call_arguments.delta"
-        | "response.function_call_arguments.done" => false,
-        // function_call 自身的事件不 defer
+        | "response.function_call_arguments.done"
+        | "response.custom_tool_call_input.delta"
+        | "response.custom_tool_call_input.done" => false,
+        // function_call / custom_tool_call 自身的事件不 defer
         "response.output_item.added" | "response.output_item.done" => {
-            root.get("item")
+            let it = root
+                .get("item")
                 .and_then(|i| i.get("type"))
-                .and_then(|v| v.as_str())
-                != Some("function_call")
+                .and_then(|v| v.as_str());
+            it != Some("function_call") && it != Some("custom_tool_call")
         }
         _ => true,
     }
@@ -1106,6 +1175,12 @@ fn function_call_start(call_id: &str, name: &str, index: i64) -> Bytes {
             }
         }),
     )
+}
+
+/// custom 工具 input(字符串)→ tool_use.input 的 JSON 文本(包成 {"input": str})
+fn custom_input_json(input: &str) -> String {
+    let escaped = serde_json::to_string(input).unwrap_or_else(|_| "\"\"".to_string());
+    format!(r#"{{"input":{}}}"#, escaped)
 }
 
 /// input_json_delta(对齐 appendCodexFunctionCallArgumentDelta)
@@ -1624,6 +1699,79 @@ mod tests {
         assert!(s.contains("call_9"));
         assert!(s.contains("message_delta"));
         assert!(s.contains("tool_use"));
+    }
+
+    #[test]
+    fn test_custom_tool_call_streaming_full_lifecycle() {
+        // custom 工具:added → input delta → input done → item done,
+        // input 是字符串,包成 {"input": str} 发 tool_use(对齐响应转换 custom 分支)
+        let mut r = ResponsesRelay::new(None);
+        r.process(&created());
+
+        let out1 = r.process(&ev(
+            r#"{"type":"response.output_item.added","item":{"type":"custom_tool_call","call_id":"call_c","name":"apply_patch","input":"","output_index":0}}"#,
+        ));
+        let s1 = s(&out1);
+        assert!(s1.contains("content_block_start"));
+        assert!(s1.contains("\"name\":\"apply_patch\""));
+        assert!(s1.contains("\"id\":\"call_c\""));
+
+        let out2 = r.process(&ev(
+            r#"{"type":"response.custom_tool_call_input.delta","call_id":"call_c","delta":"*** Begin Patch\n"}"#,
+        ));
+        // delta 阶段不立即发流(一次性在 done 发)
+        assert!(!s(&out2).contains("input_json_delta"));
+
+        let out3 = r.process(&ev(
+            r#"{"type":"response.custom_tool_call_input.done","call_id":"call_c","input":"*** Begin Patch\n+hello"}"#,
+        ));
+        assert!(!s(&out3).contains("input_json_delta"));
+
+        let out4 = r.process(&ev(
+            r#"{"type":"response.output_item.done","item":{"type":"custom_tool_call","call_id":"call_c","name":"apply_patch","input":"*** Begin Patch\n+hello"}}"#,
+        ));
+        let s4 = s(&out4);
+        assert!(s4.contains("input_json_delta"));
+        assert!(s4.contains("{\\\"input\\\":\\\"*** Begin Patch"));
+        assert!(s4.contains("content_block_stop"));
+    }
+
+    #[test]
+    fn test_custom_tool_call_from_terminal_output() {
+        // 无流式事件只有 completed:从 response.output 补发 custom 工具调用
+        let mut r = ResponsesRelay::new(None);
+        r.process(&created());
+        let out = r.process(&ev(
+            r#"{"type":"response.completed","response":{"id":"r1","output":[
+                {"type":"custom_tool_call","call_id":"call_c","name":"apply_patch","input":"patch-content"}
+            ],"usage":{"input_tokens":10,"output_tokens":5}}}"#,
+        ));
+        let bufs = out.concat();
+        let s = String::from_utf8_lossy(&bufs);
+        assert!(s.contains("content_block_start"));
+        assert!(s.contains("apply_patch"));
+        assert!(s.contains("call_c"));
+        assert!(s.contains("{\"input\":\"patch-content\"}") || s.contains("{\\\"input\\\":\\\"patch-content\\\"}"));
+        assert!(s.contains("message_delta"));
+        assert!(s.contains("tool_use"));
+    }
+
+    #[test]
+    fn test_custom_tool_call_done_with_full_input_direct() {
+        // output_item.added 直接带完整 input(无 delta 流),done 时一次性发
+        let mut r = ResponsesRelay::new(None);
+        r.process(&created());
+        r.process(&ev(
+            r#"{"type":"response.output_item.added","item":{"type":"custom_tool_call","call_id":"call_x","name":"freeform","input":"pwd","output_index":0}}"#,
+        ));
+        let out = r.process(&ev(
+            r#"{"type":"response.output_item.done","item":{"type":"custom_tool_call","call_id":"call_x","name":"freeform","input":"pwd"}}"#,
+        ));
+        let bufs = out.concat();
+        let s = String::from_utf8_lossy(&bufs);
+        // 字符串 input 包成 {"input": "pwd"} 对象
+        assert!(s.contains("{\\\"input\\\":\\\"pwd\\\"}") || s.contains("{\"input\":\"pwd\"}"));
+        assert!(s.contains("content_block_stop"));
     }
 
     #[test]
