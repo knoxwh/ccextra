@@ -246,9 +246,8 @@ impl ResponsesRelay {
                             self.function_call_queue[i].is_custom = is_custom;
                             // custom 工具 input 可能是字符串,包成 {"input": str} 回放
                             if is_custom {
-                                if let Some(input) = item
-                                    .and_then(|i| i.get("input"))
-                                    .and_then(|v| v.as_str())
+                                if let Some(input) =
+                                    item.and_then(|i| i.get("input")).and_then(|v| v.as_str())
                                 {
                                     if !input.is_empty() {
                                         self.function_call_queue[i].arguments = input.to_string();
@@ -391,9 +390,15 @@ impl ResponsesRelay {
                     self.update_function_call_identity(i, Some(item), Some(root));
                     self.function_call_queue[i].is_custom = is_custom;
                     let args = if is_custom {
-                        item.get("input").and_then(|v| v.as_str()).unwrap_or("").to_string()
+                        item.get("input")
+                            .and_then(|v| v.as_str())
+                            .unwrap_or("")
+                            .to_string()
                     } else {
-                        item.get("arguments").and_then(|v| v.as_str()).unwrap_or("").to_string()
+                        item.get("arguments")
+                            .and_then(|v| v.as_str())
+                            .unwrap_or("")
+                            .to_string()
                     };
                     let call = &mut self.function_call_queue[i];
                     if !call.has_received_arguments_delta || args.starts_with(&call.arguments) {
@@ -770,9 +775,15 @@ impl ResponsesRelay {
                     self.function_calls.insert(k.clone(), idx);
                 }
                 let args = if is_custom {
-                    item.get("input").and_then(|v| v.as_str()).unwrap_or("").to_string()
+                    item.get("input")
+                        .and_then(|v| v.as_str())
+                        .unwrap_or("")
+                        .to_string()
                 } else {
-                    item.get("arguments").and_then(|v| v.as_str()).unwrap_or("").to_string()
+                    item.get("arguments")
+                        .and_then(|v| v.as_str())
+                        .unwrap_or("")
+                        .to_string()
                 };
                 self.update_function_call_identity(idx, Some(item), None);
                 let call = &mut self.function_call_queue[idx];
@@ -1751,7 +1762,10 @@ mod tests {
         assert!(s.contains("content_block_start"));
         assert!(s.contains("apply_patch"));
         assert!(s.contains("call_c"));
-        assert!(s.contains("{\"input\":\"patch-content\"}") || s.contains("{\\\"input\\\":\\\"patch-content\\\"}"));
+        assert!(
+            s.contains("{\"input\":\"patch-content\"}")
+                || s.contains("{\\\"input\\\":\\\"patch-content\\\"}")
+        );
         assert!(s.contains("message_delta"));
         assert!(s.contains("tool_use"));
     }

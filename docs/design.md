@@ -125,7 +125,7 @@ Claude Code → ccextra:8222
 - `preserve_order`：JSON key 顺序稳定
 - client 缓存：按代理 key 缓存 reqwest::Client
 - bcrypt 验证缓存：避免每请求 ~100ms
-- 多 codegen 单元 + strip：release 增量编译约 4s（弃 LTO 换速度）
+- `lto = "fat"` + `codegen-units = 1` + `strip`：优先运行时性能和体积，牺牲 release 编译速度
 
 ## 8. 热重载并发模型
 

@@ -73,7 +73,8 @@ pub fn responses_to_anthropic(
                 }
                 "function_call" | "custom_tool_call" => {
                     has_tool_use = true;
-                    let is_custom = item.get("type").and_then(|v| v.as_str()) == Some("custom_tool_call");
+                    let is_custom =
+                        item.get("type").and_then(|v| v.as_str()) == Some("custom_tool_call");
                     let id = sanitize_tool_id(
                         item.get("call_id").and_then(|v| v.as_str()).unwrap_or(""),
                     );

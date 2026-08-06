@@ -32,7 +32,9 @@ use ccextra_core::normalize::{
     normalize_anthropic_full, normalize_anthropic_pretransform, normalize_target_post, TargetShape,
 };
 use ccextra_core::prompt_cache::inject_prompt_cache_key;
-use ccextra_core::route::{resolve_route, validate_providers, Protocol, ProviderConfig, RouteError};
+use ccextra_core::route::{
+    resolve_route, validate_providers, Protocol, ProviderConfig, RouteError,
+};
 use ccextra_core::secret::looks_like_bcrypt;
 use ccextra_core::session::extract_claude_code_session;
 use globset::Glob;

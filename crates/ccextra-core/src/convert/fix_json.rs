@@ -140,7 +140,10 @@ mod tests {
     #[test]
     fn test_single_quotes_converted() {
         // 对齐 CLIProxyAPI FixJSON 示例
-        assert_eq!(fix_json_quotes("{'a': 1, 'b': '2'}"), r#"{"a": 1, "b": "2"}"#);
+        assert_eq!(
+            fix_json_quotes("{'a': 1, 'b': '2'}"),
+            r#"{"a": 1, "b": "2"}"#
+        );
     }
 
     #[test]
@@ -182,10 +185,7 @@ mod tests {
     #[test]
     fn test_unicode_escape_forwarded() {
         // 非 ASCII 内容透传
-        assert_eq!(
-            fix_json_quotes(r#"{'a': '中文'}"#),
-            r#"{"a": "中文"}"#
-        );
+        assert_eq!(fix_json_quotes(r#"{'a': '中文'}"#), r#"{"a": "中文"}"#);
     }
 
     #[test]

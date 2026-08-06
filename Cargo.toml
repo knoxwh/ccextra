@@ -12,7 +12,7 @@ edition = "2021"
 rust-version = "1.75"
 authors = ["wanghao"]
 license = "MIT"
-repository = "https://github.com/yourusername/ccextra"
+repository = "https://github.com/knoxwh/ccextra"
 
 [workspace.dependencies]
 # Workspace crates
@@ -27,8 +27,7 @@ serde_yaml = "0.9"
 # HTTP server
 axum = { version = "0.7", features = ["macros"] }
 tokio = { version = "1.35", features = ["full"] }
-tower = { version = "0.4", features = ["util"] }
-tower-http = { version = "0.5", features = ["trace", "cors"] }
+tower = { version = "0.5", features = ["util"] }
 
 # HTTP client
 reqwest = { version = "0.12", features = ["stream", "json", "socks", "http2"] }

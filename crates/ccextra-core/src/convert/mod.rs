@@ -12,12 +12,12 @@ pub mod shorten;
 pub mod to_openai_chat;
 pub mod to_openai_responses;
 
+pub use fix_json::fix_json_quotes;
 pub use passthrough::convert_passthrough;
 pub use shorten::build_reverse_map;
 pub use shorten::build_short_name_map;
 pub use to_openai_chat::convert_to_openai_chat;
 pub use to_openai_responses::convert_to_openai_responses;
-pub use fix_json::fix_json_quotes;
 
 /// Claude Code 每请求注入 system 的计费+prompt 指纹块前缀(内容逐请求变化)。
 /// 转换到 openai 侧必须剥离,否则上游缓存前缀每次请求全 miss。
