@@ -17,3 +17,6 @@ config.*.yaml
 
 # 运行时日志
 /logs/
+
+# Claude Code 本地指导文件
+CLAUDE.md
