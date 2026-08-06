@@ -16,7 +16,7 @@ use axum::{
     http::{header, HeaderMap, StatusCode},
     response::{IntoResponse, Response},
     routing::{get, post},
-    Router,
+    Json, Router,
 };
 use bytes::Bytes;
 use ccextra_core::cache_stabilization::drift_detector::derive_session_key as drift_derive_session_key;
@@ -25,14 +25,14 @@ use ccextra_core::cache_stabilization::drift_detector::{
     DriftState,
 };
 use ccextra_core::convert::{
-    convert_passthrough, convert_to_openai_chat, convert_to_openai_responses,
+    convert_passthrough, convert_to_openai_chat, convert_to_openai_responses, ConvertError,
 };
 use ccextra_core::count_tokens::count_claude_input_tokens;
 use ccextra_core::normalize::{
     normalize_anthropic_full, normalize_anthropic_pretransform, normalize_target_post, TargetShape,
 };
 use ccextra_core::prompt_cache::inject_prompt_cache_key;
-use ccextra_core::route::{resolve_route, validate_providers, Protocol, ProviderConfig};
+use ccextra_core::route::{resolve_route, validate_providers, Protocol, ProviderConfig, RouteError};
 use ccextra_core::secret::looks_like_bcrypt;
 use ccextra_core::session::extract_claude_code_session;
 use globset::Glob;
@@ -417,13 +417,13 @@ async fn handle_messages(
         tracing::debug!("请求体: {}", String::from_utf8_lossy(&bytes));
     }
     let mut body_json: Value = serde_json::from_slice(&bytes)
-        .map_err(|e| AppError::new(anyhow::anyhow!("请求体 JSON 解析失败: {e}")))?;
+        .map_err(|e| AppError::bad_request(format!("请求体 JSON 解析失败: {e}")))?;
 
     // 1. 入站 model(复制为 String,避免借用 body_json 阻碍后续可变借用)
     let model = body_json
         .get("model")
         .and_then(|v| v.as_str())
-        .ok_or_else(|| AppError::new(anyhow::anyhow!("缺少 model 字段")))?
+        .ok_or_else(|| AppError::bad_request("缺少 model 字段"))?
         .to_string();
 
     // 2. 路由决策(先定协议,再选归一化模式;对齐 按目标协议分流)
@@ -718,19 +718,65 @@ impl AppError {
             err: anyhow::anyhow!(msg.into()),
         }
     }
+
+    pub fn bad_request(msg: impl Into<String>) -> Self {
+        Self {
+            status: StatusCode::BAD_REQUEST,
+            err: anyhow::anyhow!(msg.into()),
+        }
+    }
+
+    pub fn not_found(msg: impl Into<String>) -> Self {
+        Self {
+            status: StatusCode::NOT_FOUND,
+            err: anyhow::anyhow!(msg.into()),
+        }
+    }
 }
 
 impl IntoResponse for AppError {
     fn into_response(self) -> Response {
-        (self.status, format!("{}: {}", self.status, self.err)).into_response()
+        let error_type = match self.status {
+            StatusCode::BAD_REQUEST => "invalid_request_error",
+            StatusCode::UNAUTHORIZED => "authentication_error",
+            StatusCode::NOT_FOUND => "not_found_error",
+            StatusCode::UNPROCESSABLE_ENTITY => "invalid_request_error",
+            _ => "api_error",
+        };
+        let body = json!({
+            "type": "error",
+            "error": {
+                "type": error_type,
+                "message": self.err.to_string()
+            }
+        });
+        (self.status, Json(body)).into_response()
     }
 }
 
-impl<E> From<E> for AppError
-where
-    E: Into<anyhow::Error>,
-{
-    fn from(err: E) -> Self {
+impl From<RouteError> for AppError {
+    fn from(err: RouteError) -> Self {
+        match err {
+            RouteError::ModelNotFound(_) => Self::not_found(err.to_string()),
+            RouteError::AliasConflict(_) => Self::new(err),
+        }
+    }
+}
+
+impl From<anyhow::Error> for AppError {
+    fn from(err: anyhow::Error) -> Self {
+        Self::new(err)
+    }
+}
+
+impl From<ConvertError> for AppError {
+    fn from(err: ConvertError) -> Self {
+        Self::new(err)
+    }
+}
+
+impl From<reqwest::Error> for AppError {
+    fn from(err: reqwest::Error) -> Self {
         Self::new(err)
     }
 }
@@ -890,7 +936,38 @@ mod tests {
             .body(Body::from(serde_json::to_vec(&body_json).unwrap()))
             .unwrap();
         let resp = app.oneshot(req).await.unwrap();
-        assert_eq!(resp.status(), StatusCode::INTERNAL_SERVER_ERROR);
+        assert_eq!(resp.status(), StatusCode::BAD_REQUEST);
+
+        let body = to_bytes(resp.into_body(), 1024).await.unwrap();
+        let body_json: Value = serde_json::from_slice(&body).unwrap();
+        assert_eq!(body_json["type"], "error");
+        assert_eq!(body_json["error"]["type"], "invalid_request_error");
+        assert!(body_json["error"]["message"]
+            .as_str()
+            .unwrap()
+            .contains("缺少 model 字段"));
+    }
+
+    #[tokio::test]
+    async fn test_invalid_json() {
+        let app = app(mock_state());
+        let req = Request::builder()
+            .uri("/v1/messages")
+            .method("POST")
+            .header("content-type", "application/json")
+            .body(Body::from("{invalid json"))
+            .unwrap();
+        let resp = app.oneshot(req).await.unwrap();
+        assert_eq!(resp.status(), StatusCode::BAD_REQUEST);
+
+        let body = to_bytes(resp.into_body(), 1024).await.unwrap();
+        let body_json: Value = serde_json::from_slice(&body).unwrap();
+        assert_eq!(body_json["type"], "error");
+        assert_eq!(body_json["error"]["type"], "invalid_request_error");
+        assert!(body_json["error"]["message"]
+            .as_str()
+            .unwrap()
+            .contains("JSON 解析失败"));
     }
 
     #[tokio::test]
@@ -907,7 +984,16 @@ mod tests {
             .body(Body::from(serde_json::to_vec(&body_json).unwrap()))
             .unwrap();
         let resp = app.oneshot(req).await.unwrap();
-        assert_eq!(resp.status(), StatusCode::INTERNAL_SERVER_ERROR);
+        assert_eq!(resp.status(), StatusCode::NOT_FOUND);
+
+        let body = to_bytes(resp.into_body(), 1024).await.unwrap();
+        let body_json: Value = serde_json::from_slice(&body).unwrap();
+        assert_eq!(body_json["type"], "error");
+        assert_eq!(body_json["error"]["type"], "not_found_error");
+        assert!(body_json["error"]["message"]
+            .as_str()
+            .unwrap()
+            .contains("未找到"));
     }
 
     #[test]
