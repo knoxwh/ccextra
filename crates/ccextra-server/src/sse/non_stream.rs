@@ -14,6 +14,7 @@ use super::chat::map_finish_reason;
 use super::responses::{
     codex_stop_reason, map_stop_reason, sanitize_tool_id, stop_sequence, web_search_result_content,
 };
+use ccextra_core::convert::fix_json_quotes;
 
 /// OpenAI responses 非流式 body → Anthropic messages body
 ///
@@ -223,10 +224,12 @@ pub fn openai_chat_to_anthropic(body: &Value) -> Option<Value> {
                 .unwrap_or("");
             args_buf.clear();
             collect_json_string(call.pointer("/function/arguments"), &mut args_buf);
-            let input = if args_buf.trim().is_empty() {
+            // 解析前先修单引号(对齐 util.FixJSON):部分上游输出非标准 JSON
+            let fixed = fix_json_quotes(&args_buf);
+            let input = if fixed.trim().is_empty() {
                 json!({})
             } else {
-                serde_json::from_str::<Value>(&args_buf)
+                serde_json::from_str::<Value>(&fixed)
                     .ok()
                     .filter(|v| v.is_object())
                     .unwrap_or_else(|| json!({}))

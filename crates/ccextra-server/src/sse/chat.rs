@@ -18,6 +18,7 @@ use serde_json::{json, Value};
 
 use super::parser::SseParser;
 use super::SseStreamPin;
+use ccextra_core::convert::fix_json_quotes;
 
 /// active block 类型
 #[derive(Clone, Copy, PartialEq, Eq)]
@@ -439,7 +440,7 @@ impl ChatRelay {
                     &json!({
                         "type": "content_block_delta",
                         "index": call.block_index,
-                        "delta": {"type": "input_json_delta", "partial_json": call.arguments}
+                        "delta": {"type": "input_json_delta", "partial_json": fix_json_quotes(&call.arguments)}
                     }),
                 ));
             }
@@ -476,7 +477,7 @@ impl ChatRelay {
                     &json!({
                         "type": "content_block_delta",
                         "index": block_index,
-                        "delta": {"type": "input_json_delta", "partial_json": arguments}
+                        "delta": {"type": "input_json_delta", "partial_json": fix_json_quotes(&arguments)}
                     }),
                 ));
             }
@@ -727,6 +728,38 @@ mod tests {
             .iter()
             .any(|b| b.starts_with(b"event: content_block_delta")));
         assert!(out3.iter().any(|b| b.starts_with(b"event: message_delta")));
+    }
+
+    #[test]
+    fn test_tool_call_single_quote_arguments_fixed() {
+        // 上游增量输出单引号参数(非标准 JSON),flush 时应修复为双引号
+        let mut r = ChatRelay::new(None);
+        r.process(&super::super::parser::SseEvent {
+            event: Some("c".into()),
+            data: r#"{"choices":[{"delta":{"tool_calls":[{"index":0,"id":"call_1","function":{"name":"get_weather","arguments":""}}]}}]}"#.into(),
+        });
+        r.process(&super::super::parser::SseEvent {
+            event: Some("c".into()),
+            data: r#"{"choices":[{"delta":{"tool_calls":[{"index":0,"function":{"arguments":"{'city': 'beij"}}]}}]}"#.into(),
+        });
+        r.process(&super::super::parser::SseEvent {
+            event: Some("c".into()),
+            data: r#"{"choices":[{"delta":{"tool_calls":[{"index":0,"function":{"arguments":"ing'}"}}]}}]}"#.into(),
+        });
+        let out = r.process(&super::super::parser::SseEvent {
+            event: Some("c".into()),
+            data: r#"{"choices":[{"delta":{},"finish_reason":"tool_calls"}],"usage":{"prompt_tokens":10,"completion_tokens":5}}"#.into(),
+        });
+        let joined = out
+            .iter()
+            .map(|b| String::from_utf8_lossy(b).into_owned())
+            .collect::<Vec<_>>()
+            .join("");
+        assert!(
+            joined.contains(r#"\"city\": \"beijing\""#),
+            "单引号参数应被修复,实际: {joined}"
+        );
+        assert!(!joined.contains('\''), "修复后不应残留单引号");
     }
 
     #[test]
