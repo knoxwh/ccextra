@@ -100,11 +100,7 @@ pub fn merge_consecutive_messages(messages: &[serde_json::Value]) -> Vec<serde_j
 
 /// 把 content 追加到已存在的消息里(字符串 → text 数组,数组 → 拼接)。
 /// assistant 轮的 tool_use parts 移到末尾,保持相对顺序(对齐上游)。
-fn append_message_content(
-    msg: &mut serde_json::Value,
-    content: serde_json::Value,
-    role: &str,
-) {
+fn append_message_content(msg: &mut serde_json::Value, content: serde_json::Value, role: &str) {
     use serde_json::Value;
     let new_parts = match &content {
         Value::String(s) => vec![serde_json::json!({"type": "text", "text": s})],
@@ -112,9 +108,9 @@ fn append_message_content(
         other => vec![other.clone()],
     };
     let (tool_parts, non_tool): (Vec<Value>, Vec<Value>) = if role == "assistant" {
-        new_parts.into_iter().partition(|p| {
-            p.get("type").and_then(|t| t.as_str()) == Some("tool_use")
-        })
+        new_parts
+            .into_iter()
+            .partition(|p| p.get("type").and_then(|t| t.as_str()) == Some("tool_use"))
     } else {
         (Vec::new(), new_parts)
     };
@@ -125,8 +121,7 @@ fn append_message_content(
         Some(Value::Array(arr)) => {
             let mut kept: Vec<Value> = Vec::with_capacity(arr.len());
             for p in arr.drain(..) {
-                if role == "assistant"
-                    && p.get("type").and_then(|t| t.as_str()) == Some("tool_use")
+                if role == "assistant" && p.get("type").and_then(|t| t.as_str()) == Some("tool_use")
                 {
                     existing_tools.push(p);
                 } else {

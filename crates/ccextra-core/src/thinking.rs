@@ -107,7 +107,6 @@ fn lookup_model_levels(model: &str) -> Option<Vec<Level>> {
     })
 }
 
-
 /// budget → level
 pub fn budget_to_level(budget: i64) -> Option<Level> {
     match budget {
@@ -129,7 +128,11 @@ pub fn budget_to_level(budget: i64) -> Option<Level> {
 /// `thinking.output_config.effort` / budget 映射。返回 None 表示不注入。
 pub fn resolve_effort_from_body(body: &serde_json::Value) -> Option<&'static str> {
     // thinking 显式 disabled 时忽略残留 effort(对齐上游钳制行为)
-    if body.get("thinking").and_then(|t| t.get("type")).and_then(|v| v.as_str()) == Some("disabled")
+    if body
+        .get("thinking")
+        .and_then(|t| t.get("type"))
+        .and_then(|v| v.as_str())
+        == Some("disabled")
     {
         return Some(Level::None.as_str());
     }
@@ -425,5 +428,4 @@ mod tests {
         // medium 距离 low/high 都是 1,取低
         assert_eq!(clamp_to_nearest(Level::Medium, &supported), Level::Low);
     }
-
 }

@@ -21,10 +21,7 @@ use super::{ConvertError, Result};
 /// 对齐 顶层键序、system 数组形态、messages 内 role=system 提取、user 透传。
 /// 差异:content 字符串保持数组(采用跨协议形态归一化,解决客户端跨轮
 /// 数组/字符串漂移,见 convert_message 注释)。
-pub fn convert_to_openai_chat(
-    body: &mut Value,
-    upstream_model: &str,
-) -> Result<()> {
+pub fn convert_to_openai_chat(body: &mut Value, upstream_model: &str) -> Result<()> {
     let mut openai = serde_json::Map::new();
 
     // 对齐 顶层键序:model,max_tokens,temperature/top_p,stop,stream,

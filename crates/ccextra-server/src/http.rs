@@ -484,10 +484,7 @@ async fn handle_messages(
             convert_passthrough(&mut body_json, &route.upstream_model)?;
         }
         Protocol::OpenAiChat => {
-            convert_to_openai_chat(
-                &mut body_json,
-                &route.upstream_model,
-            )?;
+            convert_to_openai_chat(&mut body_json, &route.upstream_model)?;
             if normalize_enabled {
                 normalize_target_post(&mut body_json, TargetShape::OpenAiChat);
                 observe_drift_for(
@@ -501,10 +498,7 @@ async fn handle_messages(
         }
         Protocol::OpenAiResponses => {
             // reverse map:short→original(超长工具名缩短后,响应侧还原原名)
-            let rev = convert_to_openai_responses(
-                &mut body_json,
-                &route.upstream_model,
-            )?;
+            let rev = convert_to_openai_responses(&mut body_json, &route.upstream_model)?;
             if !rev.is_empty() {
                 tool_names = Some(Arc::new(rev));
             }

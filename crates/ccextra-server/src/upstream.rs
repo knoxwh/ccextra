@@ -18,13 +18,15 @@ pub struct UpstreamResponse {
 /// 每个请求都要用到的流式头集合,避免在 request 里内联判断
 /// (chat / responses 流式声明 SSE;claude 直通不掺头)
 ///
-/// 注意:Codex 官方客户端 responses 协议 **不发** Cache-Control: no-cache,
-/// 仅声明 Accept: text/event-stream。代理误带 no-cache 可能导致上游旁路缓存。
+/// 流式请求显式声明 SSE 并禁止中间缓存复用响应。
 fn stream_headers(protocol: Protocol, is_stream: bool) -> Vec<(&'static str, &'static str)> {
     if !is_stream || !matches!(protocol, Protocol::OpenAiChat | Protocol::OpenAiResponses) {
         return Vec::new();
     }
-    vec![(reqwest::header::ACCEPT.as_str(), "text/event-stream")]
+    vec![
+        (reqwest::header::ACCEPT.as_str(), "text/event-stream"),
+        (reqwest::header::CACHE_CONTROL.as_str(), "no-cache"),
+    ]
 }
 
 /// 按协议取上游请求路径
@@ -112,7 +114,7 @@ impl UpstreamClient {
     /// 发起上游请求,返回原始响应(字节或流由调用方决定)
     ///
     /// - `is_stream`:chat 链路流式时补 `Accept: text/event-stream` /
-    ///   `Cache-Control: no-cache`(对齐 openai_compat_executor)
+    ///   `Cache-Control: no-cache`
     /// - `session_id`:responses 链路发 `Session_id` 头(对齐 cacheHelper,
     ///   值为 prompt_cache_key,上游按它做缓存亲和)
     /// - `extra_headers`:claude 直通的透传/重建头(对齐 applyClaudeHeaders
@@ -195,7 +197,10 @@ mod tests {
         let chat = stream_headers(Protocol::OpenAiChat, true);
         assert_eq!(
             chat,
-            vec![(reqwest::header::ACCEPT.as_str(), "text/event-stream")]
+            vec![
+                (reqwest::header::ACCEPT.as_str(), "text/event-stream"),
+                (reqwest::header::CACHE_CONTROL.as_str(), "no-cache"),
+            ]
         );
         assert_eq!(stream_headers(Protocol::OpenAiResponses, true), chat);
     }
