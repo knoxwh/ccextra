@@ -244,7 +244,12 @@ pub fn convert_to_openai_responses(
     // --- messages → input[] ---
     // custom 工具调用的 call_id 集合(tool_result 需转 custom_tool_call_output)
     let mut custom_call_ids: HashSet<String> = HashSet::new();
-    if let Some(messages) = body.get("messages").and_then(|v| v.as_array()) {
+    // 先合并连续同角色消息,对齐上游 ClaudeMessageAccumulator
+    let merged_messages = body
+        .get("messages")
+        .and_then(|v| v.as_array())
+        .map(|msgs| super::merge_consecutive_messages(msgs));
+    if let Some(messages) = merged_messages.as_deref() {
         for msg in messages {
             let role = msg.get("role").and_then(|v| v.as_str()).unwrap_or("user");
 
@@ -516,10 +521,7 @@ pub fn convert_to_openai_responses(
     openai["parallel_tool_calls"] = json!(!disable_parallel);
 
     // --- reasoning.effort(对齐 thinking 分支,默认 medium) ---
-    let effort = body
-        .get("thinking")
-        .and_then(crate::thinking::resolve_effort)
-        .unwrap_or("medium");
+    let effort = crate::thinking::resolve_effort_from_body(body).unwrap_or("medium");
     openai["reasoning"] = json!({"effort": effort});
 
     // --- service_tier:speed=fast → priority(对齐 normalizeCodexServiceTier) ---
@@ -790,6 +792,31 @@ mod tests {
         assert_eq!(body["input"][0]["name"], "get_weather");
         assert_eq!(body["input"][1]["type"], "function_call_output");
         assert_eq!(body["input"][1]["output"], "sunny");
+    }
+
+    #[test]
+    fn test_consecutive_assistant_turns_merged() {
+        // 连续 assistant 消息(thinking + text/tool)合并为一条输入序列,
+        // 保序:message(output_text) → function_call。
+        let mut body = json!({
+            "model": "test",
+            "messages": [
+                {"role": "assistant", "content": [{"type": "thinking", "thinking": "t1"}]},
+                {"role": "assistant", "content": [
+                    {"type": "text", "text": "answer"},
+                    {"type": "tool_use", "id": "c1", "name": "Read", "input": {"p": "a"}}
+                ]}
+            ]
+        });
+        convert_to_openai_responses(&mut body, "gpt-5").unwrap();
+        let input = body["input"].as_array().unwrap();
+        assert_eq!(input.len(), 2);
+        // 无签名 thinking 丢弃 —— 不产生 reasoning item
+        assert!(input.iter().all(|i| i["type"] != "reasoning"));
+        assert_eq!(input[0]["type"], "message");
+        assert_eq!(input[0]["content"][0]["text"], "answer");
+        assert_eq!(input[1]["type"], "function_call");
+        assert_eq!(input[1]["call_id"], "c1");
     }
 
     #[test]

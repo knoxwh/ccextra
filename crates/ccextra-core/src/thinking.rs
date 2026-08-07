@@ -77,6 +77,29 @@ pub fn budget_to_level(budget: i64) -> Option<Level> {
     }
 }
 
+/// 请求 body → effort 字符串
+///
+/// 优先读取顶层 `output_config.effort`(Claude Code 2.1+ 新格式:
+/// thinking 只含 type,effort 单独放顶层),回退 legacy
+/// `thinking.output_config.effort` / budget 映射。返回 None 表示不注入。
+pub fn resolve_effort_from_body(body: &serde_json::Value) -> Option<&'static str> {
+    // thinking 显式 disabled 时忽略残留 effort(对齐上游钳制行为)
+    if body.get("thinking").and_then(|t| t.get("type")).and_then(|v| v.as_str()) == Some("disabled")
+    {
+        return Some(Level::None.as_str());
+    }
+    // Claude Code 2.1+:effort 在请求顶层 output_config
+    if let Some(e) = body
+        .get("output_config")
+        .and_then(|o| o.get("effort"))
+        .and_then(|v| v.as_str())
+        .and_then(Level::parse)
+    {
+        return Some(e.as_str());
+    }
+    body.get("thinking").and_then(resolve_effort)
+}
+
 /// thinking 配置 → effort 字符串
 ///
 /// 直映射不钳制:转换层直接取 budget→level 结果透传(无模型能力表
@@ -179,5 +202,58 @@ mod tests {
     fn test_resolve_effort_unknown_type() {
         let t = json!({"type": "bogus"});
         assert_eq!(resolve_effort(&t), None);
+    }
+
+    #[test]
+    fn test_resolve_effort_from_body_prefers_top_level_output_config() {
+        // Claude Code 2.1+:thinking 只含 type,effort 在顶层 output_config
+        let b = json!({
+            "thinking": {"type": "adaptive"},
+            "output_config": {"effort": "max"}
+        });
+        assert_eq!(resolve_effort_from_body(&b), Some("max"));
+    }
+
+    #[test]
+    fn test_resolve_effort_from_body_falls_back_to_thinking_effort() {
+        // legacy:effort 内嵌 thinking.output_config
+        let b = json!({
+            "thinking": {"type": "adaptive", "output_config": {"effort": "high"}}
+        });
+        assert_eq!(resolve_effort_from_body(&b), Some("high"));
+    }
+
+    #[test]
+    fn test_resolve_effort_from_body_falls_back_to_budget() {
+        let b = json!({
+            "thinking": {"type": "enabled", "budget_tokens": 8192}
+        });
+        assert_eq!(resolve_effort_from_body(&b), Some("medium"));
+    }
+
+    #[test]
+    fn test_resolve_effort_from_body_disabled_wins() {
+        // 顶层残留 effort 不覆盖 disabled
+        let b = json!({
+            "thinking": {"type": "disabled"},
+            "output_config": {"effort": "max"}
+        });
+        assert_eq!(resolve_effort_from_body(&b), Some("none"));
+    }
+
+    #[test]
+    fn test_resolve_effort_from_body_no_thinking_none() {
+        let b = json!({"model": "x"});
+        assert_eq!(resolve_effort_from_body(&b), None);
+    }
+
+    #[test]
+    fn test_resolve_effort_from_body_invalid_effort_falls_back() {
+        // 顶层 effort 非法 → 回退 thinking 分支
+        let b = json!({
+            "thinking": {"type": "adaptive", "output_config": {"effort": "high"}},
+            "output_config": {"effort": "bogus"}
+        });
+        assert_eq!(resolve_effort_from_body(&b), Some("high"));
     }
 }

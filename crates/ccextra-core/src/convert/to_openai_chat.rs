@@ -52,11 +52,8 @@ pub fn convert_to_openai_chat(body: &mut Value, upstream_model: &str) -> Result<
         body.get("stream").unwrap_or(&json!(true)).clone(),
     );
 
-    // thinking → reasoning_effort(忠实 thinking 映射)
-    if let Some(effort) = body
-        .get("thinking")
-        .and_then(|t| crate::thinking::resolve_effort(t))
-    {
+    // thinking → reasoning_effort(忠实 thinking 映射;顶层 output_config 优先)
+    if let Some(effort) = crate::thinking::resolve_effort_from_body(body) {
         openai.insert("reasoning_effort".into(), json!(effort));
     }
 
@@ -87,9 +84,10 @@ pub fn convert_to_openai_chat(body: &mut Value, upstream_model: &str) -> Result<
         }
     }
 
-    // Messages 逐条转换
+    // Messages 逐条转换(先合并连续同角色消息,对齐上游 ClaudeMessageAccumulator)
     if let Some(message_arr) = body.get("messages").and_then(|v| v.as_array()) {
-        for msg in message_arr {
+        let merged = super::merge_consecutive_messages(message_arr);
+        for msg in &merged {
             let role = msg
                 .get("role")
                 .and_then(|v| v.as_str())
@@ -496,6 +494,31 @@ mod tests {
         assert_eq!(msgs[1]["tool_calls"][0]["function"]["name"], "get_weather");
         assert_eq!(msgs[2]["role"], "tool");
         assert_eq!(msgs[2]["tool_call_id"], "t1");
+    }
+
+    #[test]
+    fn test_consecutive_assistant_turns_merged() {
+        // Claude Code 把一轮 assistant 拆成 thinking + (text+tool_use) 两条消息,
+        // 转换后应合并为一条 assistant(对齐上游 ClaudeMessageAccumulator)。
+        let mut body = json!({
+            "model": "test",
+            "messages": [
+                {"role": "assistant", "content": [{"type": "thinking", "thinking": "t1"}]},
+                {"role": "assistant", "content": [
+                    {"type": "text", "text": "answer"},
+                    {"type": "tool_use", "id": "c1", "name": "Read", "input": {"p": "a"}}
+                ]},
+                {"role": "user", "content": "go"}
+            ]
+        });
+        convert_to_openai_chat(&mut body, "gpt").unwrap();
+        let msgs = body["messages"].as_array().unwrap();
+        assert_eq!(msgs.len(), 2);
+        assert_eq!(msgs[0]["role"], "assistant");
+        assert_eq!(msgs[0]["reasoning_content"], "t1");
+        assert_eq!(msgs[0]["content"][0]["text"], "answer");
+        assert_eq!(msgs[0]["tool_calls"][0]["id"], "c1");
+        assert_eq!(msgs[1]["role"], "user");
     }
 
     #[test]
