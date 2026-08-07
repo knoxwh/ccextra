@@ -25,6 +25,24 @@ fn is_web_search_tool_type(tool_type: &str) -> bool {
     matches!(tool_type, "web_search_20250305" | "web_search_20260209")
 }
 
+/// GPT 上游追加的行为适配块(字节固定,缓存前缀稳定)。
+///
+/// Claude Code 系统词为 Claude 调教,GPT 收到后默认冗长、过度探索、爱用
+/// apply_patch(codex 训练分布里太熟,Claude 编排层不认)。追加此块修正。
+/// 英文固定文本,不配置化;冲突时用户指令(CLAUDE.md)优先,本块只补缺省。
+const GPT_ADAPTER_BLOCK: &str = "\
+You are driven through Claude Code's agent loop via a proxy. Follow its tool and permission flow; Claude-provided instructions (CLAUDE.md, user rules) take precedence over this block.
+Be concise. Default final answers under 10 lines; small changes 2-5 sentences; multi-file work 1-2 bullets per file. Never dump file contents, before/after pairs, or full methods unless explicitly asked.
+Do not over-explore. Answer or act once you have enough; don't re-read files you've already seen; run tests or builds only to verify your own change.
+Don't expose extended reasoning — show conclusions, not the thought process.
+Stop when the task is done: report result plus one next step, then yield. Don't fix unrelated bugs or add unrequested work.
+Never use apply_patch — it is not available in this loop. Edit files only with the tools Claude Code provides (Read, Edit, Write, Bash).";
+
+/// 判定上游是否为 GPT 模型(仅按模型名前缀,对齐约定:responses 协议 + gpt*)
+fn is_gpt_upstream(upstream_model: &str) -> bool {
+    upstream_model.to_ascii_lowercase().starts_with("gpt")
+}
+
 /// signature 是否 GPT 兼容(对齐 CompatibleSignatureForProvider(GPT, sig) 的轻量版)
 ///
 /// 参考实现 用完整 Fernet 容器校验;这里按 OpenAI reasoning 签名的确定前缀
@@ -238,6 +256,28 @@ pub fn convert_to_openai_responses(
                 .as_array_mut()
                 .unwrap()
                 .push(json!({"type": "message", "role": "developer", "content": parts}));
+        }
+    }
+
+    // --- GPT 上游追加适配块 ---
+    // 追加到已有 developer 末尾(前缀字节不变,上游缓存主前缀仍命中);
+    // 无 developer(空 system)时单独建 developer 置于 input[0]。
+    if is_gpt_upstream(upstream_model) {
+        let block = json!({"type": "input_text", "text": GPT_ADAPTER_BLOCK});
+        let input = openai["input"].as_array_mut().unwrap();
+        let existing = input
+            .iter()
+            .position(|m| m.get("role").and_then(|r| r.as_str()) == Some("developer"));
+        match existing {
+            Some(idx) => {
+                if let Some(arr) = input[idx]["content"].as_array_mut() {
+                    arr.push(block);
+                }
+            }
+            None => input.insert(
+                0,
+                json!({"type": "message", "role": "developer", "content": vec![block]}),
+            ),
         }
     }
 
@@ -596,7 +636,7 @@ mod tests {
             "system": "You are helpful",
             "messages": [{"role": "user", "content": "hi"}]
         });
-        let rev = convert_to_openai_responses(&mut body, "gpt-5").unwrap();
+        let rev = convert_to_openai_responses(&mut body, "test-model").unwrap();
         assert_eq!(body["instructions"], "");
         assert_eq!(body["input"][0]["type"], "message");
         assert_eq!(body["input"][0]["role"], "developer");
@@ -604,6 +644,67 @@ mod tests {
         assert_eq!(body["input"][0]["content"][0]["text"], "You are helpful");
         assert_eq!(body["input"][1]["content"][0]["text"], "hi");
         assert!(rev.is_empty(), "无工具时反向映射为空");
+    }
+
+    #[test]
+    fn test_gpt_adapter_block_appended_to_developer() {
+        // gpt 上游:块追加到 developer content 末尾,前缀 system 字节保留
+        let mut body = json!({
+            "model": "test",
+            "system": "You are helpful",
+            "messages": []
+        });
+        convert_to_openai_responses(&mut body, "gpt-5.6-terra").unwrap();
+        let input = body["input"].as_array().unwrap();
+        assert_eq!(input[0]["role"], "developer");
+        let content = input[0]["content"].as_array().unwrap();
+        assert_eq!(content[0]["text"], "You are helpful");
+        assert_eq!(content.last().unwrap()["type"], "input_text");
+        assert_eq!(content.last().unwrap()["text"], GPT_ADAPTER_BLOCK);
+    }
+
+    #[test]
+    fn test_gpt_adapter_creates_developer_when_no_system() {
+        // 空 system:单独建 developer 且置于 input[0],不影响后续消息
+        let mut body = json!({
+            "model": "test",
+            "messages": [{"role": "user", "content": "hi"}]
+        });
+        convert_to_openai_responses(&mut body, "gpt-5.6-sol").unwrap();
+        let input = body["input"].as_array().unwrap();
+        assert_eq!(input[0]["type"], "message");
+        assert_eq!(input[0]["role"], "developer");
+        assert_eq!(input[0]["content"][0]["text"], GPT_ADAPTER_BLOCK);
+        assert_eq!(input[1]["content"][0]["text"], "hi");
+    }
+
+    #[test]
+    fn test_non_gpt_no_adapter_block() {
+        // 非 gpt 上游不注入
+        let mut body = json!({
+            "model": "test",
+            "system": "You are helpful",
+            "messages": []
+        });
+        convert_to_openai_responses(&mut body, "claude-opus-5").unwrap();
+        let content = body["input"][0]["content"].as_array().unwrap();
+        assert_eq!(content.len(), 1);
+        assert_eq!(content[0]["text"], "You are helpful");
+    }
+
+    #[test]
+    fn test_adapter_block_disables_apply_patch() {
+        assert!(GPT_ADAPTER_BLOCK.contains("Never use apply_patch"));
+        assert!(GPT_ADAPTER_BLOCK.contains("Read, Edit, Write, Bash"));
+    }
+
+    #[test]
+    fn test_gpt_match_case_insensitive() {
+        // 前缀判定不区分大小写
+        assert!(is_gpt_upstream("GPT-5.6-terra"));
+        assert!(is_gpt_upstream("gpt-5.6-terra"));
+        assert!(!is_gpt_upstream("claude-opus-5"));
+        assert!(!is_gpt_upstream("o3-mini"));
     }
 
     #[test]
@@ -617,7 +718,7 @@ mod tests {
             ],
             "messages": []
         });
-        convert_to_openai_responses(&mut body, "gpt-5").unwrap();
+        convert_to_openai_responses(&mut body, "test-model").unwrap();
         let content = body["input"][0]["content"].as_array().unwrap();
         assert_eq!(content.len(), 2);
         assert_eq!(content[0]["text"], "Block 1");
@@ -634,7 +735,7 @@ mod tests {
             ],
             "messages": []
         });
-        convert_to_openai_responses(&mut body, "gpt-5").unwrap();
+        convert_to_openai_responses(&mut body, "test-model").unwrap();
         let content = body["input"][0]["content"].as_array().unwrap();
         assert_eq!(content.len(), 1);
         assert_eq!(content[0]["text"], "Real");
@@ -654,7 +755,7 @@ mod tests {
                 {"name": "short_tool", "description": "d", "input_schema": {"type": "object"}}
             ]
         });
-        let rev = convert_to_openai_responses(&mut body, "gpt-5").unwrap();
+        let rev = convert_to_openai_responses(&mut body, "test-model").unwrap();
         let sa = body["tools"][0]["name"].as_str().unwrap();
         let sb = body["tools"][1]["name"].as_str().unwrap();
         assert_eq!(sa.len(), 64);
@@ -677,7 +778,7 @@ mod tests {
             ],
             "tools": [{"name": long.clone(), "input_schema": {"type": "object"}}]
         });
-        let rev = convert_to_openai_responses(&mut body, "gpt-5").unwrap();
+        let rev = convert_to_openai_responses(&mut body, "test-model").unwrap();
         let short = body["tools"][0]["name"].as_str().unwrap();
         assert_eq!(body["input"][0]["type"], "function_call");
         assert_eq!(body["input"][0]["name"], short);
@@ -696,7 +797,7 @@ mod tests {
                 {"name": "c", "input_schema": {"type": "object", "properties": {}}}
             ]
         });
-        convert_to_openai_responses(&mut body, "gpt-5").unwrap();
+        convert_to_openai_responses(&mut body, "test-model").unwrap();
         assert_eq!(
             body["tools"][0]["parameters"],
             json!({"type": "object", "properties": {}})
@@ -729,7 +830,7 @@ mod tests {
                 {"type": "custom", "name": "apply_patch", "description": "d"}
             ]
         });
-        convert_to_openai_responses(&mut body, "gpt-5").unwrap();
+        convert_to_openai_responses(&mut body, "test-model").unwrap();
         // 声明保持 custom,不套 input_schema
         assert_eq!(body["tools"][0]["type"], "custom");
         assert!(body["tools"][0].get("input_schema").is_none());
@@ -750,7 +851,7 @@ mod tests {
             "tool_choice": {"type": "tool", "name": "apply_patch"},
             "tools": [{"type": "custom", "name": "apply_patch", "description": "d"}]
         });
-        convert_to_openai_responses(&mut body, "gpt-5").unwrap();
+        convert_to_openai_responses(&mut body, "test-model").unwrap();
         assert_eq!(body["tool_choice"]["type"], "custom");
         assert_eq!(body["tool_choice"]["name"], "apply_patch");
     }
@@ -770,7 +871,7 @@ mod tests {
             ],
             "tools": [{"name": "get_weather", "input_schema": {"type": "object"}}]
         });
-        convert_to_openai_responses(&mut body, "gpt-5").unwrap();
+        convert_to_openai_responses(&mut body, "test-model").unwrap();
         assert_eq!(body["input"][0]["type"], "function_call");
         assert_eq!(body["input"][1]["type"], "function_call_output");
     }
@@ -788,7 +889,7 @@ mod tests {
                 ]}
             ]
         });
-        convert_to_openai_responses(&mut body, "gpt-5").unwrap();
+        convert_to_openai_responses(&mut body, "test-model").unwrap();
         assert_eq!(body["input"][0]["type"], "function_call");
         assert_eq!(body["input"][0]["call_id"], "t1");
         assert_eq!(body["input"][0]["name"], "get_weather");
@@ -810,7 +911,7 @@ mod tests {
                 ]}
             ]
         });
-        convert_to_openai_responses(&mut body, "gpt-5").unwrap();
+        convert_to_openai_responses(&mut body, "test-model").unwrap();
         let input = body["input"].as_array().unwrap();
         assert_eq!(input.len(), 2);
         // 无签名 thinking 丢弃 —— 不产生 reasoning item
@@ -834,7 +935,7 @@ mod tests {
                 ]}
             ]
         });
-        convert_to_openai_responses(&mut body, "gpt-5").unwrap();
+        convert_to_openai_responses(&mut body, "test-model").unwrap();
         assert_eq!(body["input"][0]["type"], "reasoning");
         assert_eq!(
             body["input"][0]["encrypted_content"],
@@ -863,7 +964,7 @@ mod tests {
     fn test_reasoning_effort_default_medium() {
         // 无 thinking → 默认 medium(对齐 reasoningEffort 初值)
         let mut body = json!({"model": "test", "messages": []});
-        convert_to_openai_responses(&mut body, "gpt-5").unwrap();
+        convert_to_openai_responses(&mut body, "test-model").unwrap();
         assert_eq!(body["reasoning"]["effort"], "medium");
     }
 
@@ -874,7 +975,7 @@ mod tests {
             "thinking": {"type": "enabled", "budget_tokens": 8192},
             "messages": []
         });
-        convert_to_openai_responses(&mut body, "gpt-5").unwrap();
+        convert_to_openai_responses(&mut body, "test-model").unwrap();
         assert_eq!(body["reasoning"]["effort"], "medium");
     }
 
@@ -885,7 +986,7 @@ mod tests {
             "thinking": {"type": "adaptive", "output_config": {"effort": "high"}},
             "messages": []
         });
-        convert_to_openai_responses(&mut body, "gpt-5").unwrap();
+        convert_to_openai_responses(&mut body, "test-model").unwrap();
         assert_eq!(body["reasoning"]["effort"], "high");
     }
 
@@ -905,14 +1006,14 @@ mod tests {
     #[test]
     fn test_service_tier_from_speed() {
         let mut body = json!({"model": "test", "messages": [], "speed": "fast"});
-        convert_to_openai_responses(&mut body, "gpt-5").unwrap();
+        convert_to_openai_responses(&mut body, "test-model").unwrap();
         assert_eq!(body["service_tier"], "priority");
     }
 
     #[test]
     fn test_codex_fixed_fields() {
         let mut body = json!({"model": "test", "messages": []});
-        convert_to_openai_responses(&mut body, "gpt-5").unwrap();
+        convert_to_openai_responses(&mut body, "test-model").unwrap();
         assert_eq!(body["stream"], true);
         assert_eq!(body["store"], false);
         assert_eq!(body["include"][0], "reasoning.encrypted_content");
@@ -926,14 +1027,14 @@ mod tests {
             "messages": [],
             "tool_choice": {"type": "auto", "disable_parallel_tool_use": true}
         });
-        convert_to_openai_responses(&mut body, "gpt-5").unwrap();
+        convert_to_openai_responses(&mut body, "test-model").unwrap();
         assert_eq!(body["parallel_tool_calls"], false);
     }
 
     #[test]
     fn test_tool_choice_mappings() {
         let mut body = json!({"model": "test", "messages": [], "tool_choice": {"type": "any"}});
-        convert_to_openai_responses(&mut body, "gpt-5").unwrap();
+        convert_to_openai_responses(&mut body, "test-model").unwrap();
         assert_eq!(body["tool_choice"], "required");
 
         let mut body2 = json!({
@@ -942,7 +1043,7 @@ mod tests {
             "tool_choice": {"type": "tool", "name": "search"},
             "tools": [{"name": "search", "input_schema": {"type": "object"}}]
         });
-        convert_to_openai_responses(&mut body2, "gpt-5").unwrap();
+        convert_to_openai_responses(&mut body2, "test-model").unwrap();
         assert_eq!(body2["tool_choice"]["type"], "function");
         assert_eq!(body2["tool_choice"]["name"], "search");
     }
@@ -957,7 +1058,7 @@ mod tests {
                 {"type": "function", "name": "f", "input_schema": {"type": "object"}}
             ]
         });
-        convert_to_openai_responses(&mut body, "gpt-5").unwrap();
+        convert_to_openai_responses(&mut body, "test-model").unwrap();
         assert_eq!(body["tools"][0]["type"], "web_search");
         assert_eq!(body["tools"][1]["type"], "function");
     }
@@ -970,7 +1071,7 @@ mod tests {
             "tool_choice": {"type": "tool", "name": "web"},
             "tools": [{"type": "web_search_20250305", "name": "web"}]
         });
-        convert_to_openai_responses(&mut body, "gpt-5").unwrap();
+        convert_to_openai_responses(&mut body, "test-model").unwrap();
         assert_eq!(body["tool_choice"]["type"], "web_search");
     }
 
@@ -983,7 +1084,7 @@ mod tests {
                 {"role": "user", "content": "hi"}
             ]
         });
-        convert_to_openai_responses(&mut body, "gpt-5").unwrap();
+        convert_to_openai_responses(&mut body, "test-model").unwrap();
         assert_eq!(body["input"][0]["type"], "message");
         assert_eq!(body["input"][0]["role"], "user");
         assert!(body["input"][0]["content"][0]["text"]
@@ -1004,7 +1105,7 @@ mod tests {
                 }]
             }]
         });
-        convert_to_openai_responses(&mut body, "gpt-5").unwrap();
+        convert_to_openai_responses(&mut body, "test-model").unwrap();
         assert_eq!(body["input"][0]["type"], "message");
         assert_eq!(
             body["input"][0]["content"][0]["image_url"],
@@ -1028,7 +1129,7 @@ mod tests {
                 }]
             }]
         });
-        convert_to_openai_responses(&mut body, "gpt-5").unwrap();
+        convert_to_openai_responses(&mut body, "test-model").unwrap();
         let output = body["input"][0]["output"].as_array().unwrap();
         assert_eq!(output[0]["type"], "input_text");
         assert_eq!(output[1]["type"], "input_image");
@@ -1045,7 +1146,7 @@ mod tests {
                 ]}
             ]
         });
-        convert_to_openai_responses(&mut body, "gpt-5").unwrap();
+        convert_to_openai_responses(&mut body, "test-model").unwrap();
         assert!(body["input"][0]["call_id"].as_str().unwrap().len() <= 64);
     }
 
@@ -1059,7 +1160,7 @@ mod tests {
                 {"role": "user", "content": "keep"}
             ]
         });
-        convert_to_openai_responses(&mut body, "gpt-5").unwrap();
+        convert_to_openai_responses(&mut body, "test-model").unwrap();
         let input = body["input"].as_array().unwrap();
         assert_eq!(input.len(), 1);
         assert_eq!(input[0]["content"][0]["text"], "keep");
@@ -1076,7 +1177,7 @@ mod tests {
                 {"role": "user", "content": "real"}
             ]
         });
-        convert_to_openai_responses(&mut body, "gpt-5").unwrap();
+        convert_to_openai_responses(&mut body, "test-model").unwrap();
         let input = body["input"].as_array().unwrap();
         assert_eq!(input.len(), 1, "空串 message 应被跳过");
         assert_eq!(input[0]["content"][0]["text"], "real");
@@ -1092,7 +1193,7 @@ mod tests {
                 {"role": "user", "content": "keep"}
             ]
         });
-        convert_to_openai_responses(&mut body, "gpt-5").unwrap();
+        convert_to_openai_responses(&mut body, "test-model").unwrap();
         let input = body["input"].as_array().unwrap();
         assert_eq!(input.len(), 1);
         assert_eq!(input[0]["content"][0]["text"], "keep");
@@ -1109,7 +1210,7 @@ mod tests {
                 ]}
             ]
         });
-        convert_to_openai_responses(&mut body, "gpt-5").unwrap();
+        convert_to_openai_responses(&mut body, "test-model").unwrap();
         assert_eq!(body["input"][0]["type"], "message");
         assert_eq!(body["input"][0]["content"][0]["text"], "let me check");
         assert_eq!(body["input"][1]["type"], "function_call");

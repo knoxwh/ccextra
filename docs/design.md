@@ -19,6 +19,8 @@ convert_to_openai_responses(&mut body, upstream_model);
 
 **放弃星型枢纽理由**：入站单一，矩阵退化为 `1×3=3`，中间类型收益为零，且会丢失 image/cache_control/metadata。
 
+**GPT 上游适配块**：responses 转换在 `upstream_model` 以 `gpt` 前缀（不区分大小写）时，向 developer message 末尾追加固定英文指令（`GPT_ADAPTER_BLOCK`）。动机：Claude Code 系统词按 Claude 调教，缺少 codex prompt 式的输出压缩硬约束，GPT 收到后默认冗长、过度探索、并把 `apply_patch` 当可用工具（codex 训练分布太熟，Claude 编排层不认）。块字节固定、不配置化，追加不改动 system 前缀，上游缓存主前缀仍命中；冲突时用户指令优先。无 system 时单独建 developer 置于 `input[0]`。触发条件与块内容见 `docs/glossary.md` 的 `gpt adapter block` / `gpt trigger`。
+
 ## 2. 字节级直通
 
 claude → claude 只改 model 字段，其余字节原样保留：

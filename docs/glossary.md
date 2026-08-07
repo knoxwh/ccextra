@@ -66,6 +66,12 @@ Claude Code 同一条消息当轮发 content 数组、历史重建发字符串;�
 - chat:空串 → `content:[]`;null/缺失 → 丢弃整条消息
 - responses:空串 → `content:[]` 保留消息(assistant 空 content 是 thinking-only/tool 轮的正常信号,不能丢);null/缺失 → 丢弃
 
+**gpt adapter block / GPT 适配块**  
+responses 路径下,上游模型名以 `gpt` 开头(不区分大小写)时,追加到 developer message 末尾的固定英文行为指令。修正 Claude 编排词对 GPT 的冗长/过度探索/误用 `apply_patch` 倾向。字节固定,不配置化,缓存主前缀稳定。
+
+**gpt trigger**  
+注入适配块的触发条件:`OpenAiResponses` 协议 + 上游模型名小写后以 `gpt` 为前缀。o 系列(o1/o3)不触发。
+
 ## 缓存归一化
 
 **归一化 / normalization**  
