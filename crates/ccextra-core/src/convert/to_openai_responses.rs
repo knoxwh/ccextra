@@ -36,7 +36,7 @@ Be concise. Default final answers under 10 lines; small changes 2-5 sentences; m
 Do not over-explore. Answer or act once you have enough; don't re-read files you've already seen; run tests or builds only to verify your own change.
 Don't expose extended reasoning — show conclusions, not the thought process.
 Stop when the task is done: report result plus one next step, then yield. Don't fix unrelated bugs or add unrequested work.
-Never use apply_patch — it is not available in this loop. Edit files only with the tools Claude Code provides (Read, Edit, Write, Bash).";
+Only call tools declared in this request. Do not assume an apply_patch tool is available unless it is declared.";
 
 /// 判定上游是否为 GPT 模型(仅按模型名前缀,对齐约定:responses 协议 + gpt*)
 fn is_gpt_upstream(upstream_model: &str) -> bool {
@@ -693,9 +693,35 @@ mod tests {
     }
 
     #[test]
-    fn test_adapter_block_disables_apply_patch() {
-        assert!(GPT_ADAPTER_BLOCK.contains("Never use apply_patch"));
-        assert!(GPT_ADAPTER_BLOCK.contains("Read, Edit, Write, Bash"));
+    fn test_adapter_block_requires_declared_tools() {
+        assert!(GPT_ADAPTER_BLOCK.contains("Only call tools declared in this request."));
+        assert!(GPT_ADAPTER_BLOCK
+            .contains("Do not assume an apply_patch tool is available unless it is declared."));
+        assert!(!GPT_ADAPTER_BLOCK.contains("Never use apply_patch"));
+        assert!(!GPT_ADAPTER_BLOCK.contains("Edit files only with the tools Claude Code provides"));
+    }
+
+    #[test]
+    fn test_gpt_adapter_does_not_forbid_declared_apply_patch() {
+        let mut body = json!({
+            "model": "test",
+            "messages": [],
+            "tool_choice": {"type": "tool", "name": "apply_patch"},
+            "tools": [{"type": "custom", "name": "apply_patch", "description": "d"}]
+        });
+
+        convert_to_openai_responses(&mut body, "gpt-5.6-terra").unwrap();
+
+        let adapter = body["input"][0]["content"][0]["text"].as_str().unwrap();
+        assert!(adapter.contains("Only call tools declared in this request."));
+        assert!(adapter
+            .contains("Do not assume an apply_patch tool is available unless it is declared."));
+        assert!(!adapter.contains("Never use apply_patch"));
+        assert!(!adapter.contains("Edit files only with the tools Claude Code provides"));
+        assert_eq!(body["tools"][0]["type"], "custom");
+        assert_eq!(body["tools"][0]["name"], "apply_patch");
+        assert_eq!(body["tool_choice"]["type"], "custom");
+        assert_eq!(body["tool_choice"]["name"], "apply_patch");
     }
 
     #[test]
