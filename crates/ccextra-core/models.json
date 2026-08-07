@@ -1,0 +1,64 @@
+{
+  "models": [
+    {
+      "id": "gpt-5.6-terra",
+      "reasoning_levels": ["low", "medium", "high", "xhigh", "max", "ultra"]
+    },
+    {
+      "id": "gpt-5.6-sol",
+      "reasoning_levels": ["low", "medium", "high", "xhigh", "max", "ultra"]
+    },
+    {
+      "id": "glm-5.1",
+      "reasoning_levels": ["low", "medium", "high", "xhigh"]
+    },
+    {
+      "id": "glm-5.1-27717e1a8a72-glm51",
+      "reasoning_levels": ["low", "medium", "high", "xhigh"]
+    },
+    {
+      "id": "glm-5.2",
+      "reasoning_levels": ["low", "medium", "high", "xhigh", "max"]
+    },
+    {
+      "id": "qwen3.8-max",
+      "reasoning_levels": ["low", "high", "max"]
+    },
+    {
+      "id": "deepseek-v4-flash",
+      "reasoning_levels": ["low", "high", "max"]
+    },
+    {
+      "id": "deepseek-v4-flash-0731",
+      "reasoning_levels": ["low", "high", "max"]
+    },
+    {
+      "id": "kimi-k3",
+      "reasoning_levels": ["low", "high", "max"]
+    },
+    {
+      "id": "kimi/kimi-k3",
+      "reasoning_levels": ["low", "high", "max"]
+    },
+    {
+      "id": "doubao-seed-2-1-pro",
+      "reasoning_levels": ["low", "medium", "high"]
+    },
+    {
+      "id": "doubao-seed-2-1-pro-260628",
+      "reasoning_levels": ["low", "medium", "high"]
+    },
+    {
+      "id": "claude-opus-5",
+      "reasoning_levels": ["low", "medium", "high", "xhigh", "max"]
+    },
+    {
+      "id": "claude-sonnet-5",
+      "reasoning_levels": ["low", "medium", "high", "xhigh", "max"]
+    },
+    {
+      "id": "claude-fable-5",
+      "reasoning_levels": ["low", "medium", "high", "xhigh", "max"]
+    }
+  ]
+}
