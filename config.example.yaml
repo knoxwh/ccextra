@@ -12,44 +12,43 @@ secret_key: "sk-ccextra-xxx"
 
 # Provider 定义
 providers:
-  - name: evol-claude
+  - name: xxx1
     protocol: claude
-    base_url: https://mg-new.evolai.cn/claude-proxy
+    base_url: https://xxx
     key: sk-ant-xxx
     # 可选；覆盖全局代理，"direct" 表示不走代理
     proxy_url: "direct"
     models:
       - name: claude-opus-5
-        alias: evol-opus-5
+        alias: claude-opus-5
         max_input_tokens: 200000
         max_tokens: 64000
       - name: claude-sonnet-5
-        alias: evol-sonnet-5
+        alias: claude-sonnet-5
       - name: claude-fable-5
-        alias: evol-fable-5
+        alias: claude-fable-5
 
-  - name: saic
+  - name: xxx2
     protocol: openai_chat
-    base_url: https://dashscope.aliyuncs.com/compatible-mode/v1
+    base_url: https://xxx
     key: sk-xxx
     models:
-      - name: glm-5.1-27717e1a8a72-glm51
+      - name: glm-5.1
         alias: glm-5.1
         # 可选:覆盖静态注册表的 reasoning_effort 上限
         # 注册表已内置常见模型(glm/gpt/kimi/qwen/doubao/deepseek/claude),按模糊匹配自动降级
         # 仅特情况需手动配置(如注册表遗漏的新模型)
-        # max_reasoning_effort: xhigh
 
-  - name: ckff-codex
+  - name: xxx-codex
     protocol: openai_responses
-    base_url: https://ckff.dev/v1
+    base_url: https://xxx
     key: sk-xxx
     # 注入派生 prompt_cache_key(provider 级开关,默认 false)
     # UUIDv5 按 会话+模型+agent 派生,确定性桶;仅 openai_chat/openai_responses 生效
     prompt_cache_key: true
     models:
       - name: gpt-5.6-terra
-        alias: ck-gpt-5.6-terra
+        alias: gpt-5.6-terra
 
 # Payload 参数覆盖(按模型名模式匹配)
 payload:
