@@ -35,6 +35,10 @@ providers:
     models:
       - name: glm-5.1-27717e1a8a72-glm51
         alias: glm-5.1
+        # 可选:覆盖静态注册表的 reasoning_effort 上限
+        # 注册表已内置常见模型(glm/gpt/kimi/qwen/doubao/deepseek/claude),按模糊匹配自动降级
+        # 仅特情况需手动配置(如注册表遗漏的新模型)
+        # max_reasoning_effort: xhigh
 
   - name: ckff-codex
     protocol: openai_responses

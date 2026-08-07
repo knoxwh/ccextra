@@ -522,6 +522,8 @@ pub fn convert_to_openai_responses(
 
     // --- reasoning.effort(对齐 thinking 分支,默认 medium) ---
     let effort = crate::thinking::resolve_effort_from_body(body).unwrap_or("medium");
+    // 钳制到模型支持级别(查注册表)
+    let effort = crate::thinking::clamp_effort(effort, upstream_model);
     openai["reasoning"] = json!({"effort": effort});
 
     // --- service_tier:speed=fast → priority(对齐 normalizeCodexServiceTier) ---
@@ -885,6 +887,19 @@ mod tests {
         });
         convert_to_openai_responses(&mut body, "gpt-5").unwrap();
         assert_eq!(body["reasoning"]["effort"], "high");
+    }
+
+    #[test]
+    fn test_max_effort_downgraded_to_xhigh() {
+        // glm-5.1 注册表支持到 xhigh,max 自动降级
+        let mut body = json!({
+            "model": "test",
+            "output_config": {"effort": "max"},
+            "thinking": {"type": "adaptive"},
+            "messages": []
+        });
+        convert_to_openai_responses(&mut body, "glm-5.1").unwrap();
+        assert_eq!(body["reasoning"]["effort"], "xhigh");
     }
 
     #[test]

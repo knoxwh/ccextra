@@ -36,7 +36,7 @@ use ccextra_core::route::{
     resolve_route, validate_providers, Protocol, ProviderConfig, RouteError,
 };
 use ccextra_core::secret::looks_like_bcrypt;
-use ccextra_core::session::extract_claude_code_session;
+use ccextra_core::session::{extract_claude_code_session, extract_claude_code_thread};
 use globset::Glob;
 use serde_json::{json, Value};
 use std::collections::HashMap;
@@ -484,7 +484,10 @@ async fn handle_messages(
             convert_passthrough(&mut body_json, &route.upstream_model)?;
         }
         Protocol::OpenAiChat => {
-            convert_to_openai_chat(&mut body_json, &route.upstream_model)?;
+            convert_to_openai_chat(
+                &mut body_json,
+                &route.upstream_model,
+            )?;
             if normalize_enabled {
                 normalize_target_post(&mut body_json, TargetShape::OpenAiChat);
                 observe_drift_for(
@@ -498,7 +501,10 @@ async fn handle_messages(
         }
         Protocol::OpenAiResponses => {
             // reverse map:short→original(超长工具名缩短后,响应侧还原原名)
-            let rev = convert_to_openai_responses(&mut body_json, &route.upstream_model)?;
+            let rev = convert_to_openai_responses(
+                &mut body_json,
+                &route.upstream_model,
+            )?;
             if !rev.is_empty() {
                 tool_names = Some(Arc::new(rev));
             }
@@ -581,11 +587,13 @@ async fn handle_messages(
         Vec::new()
     };
 
-    // responses 链路:Session_id 头取注入的 prompt_cache_key(对齐 cacheHelper)
-    let session_id = if matches!(route.protocol, Protocol::OpenAiResponses) {
-        body_json.get("prompt_cache_key").and_then(|v| v.as_str())
+    // responses 协议:session-id/thread-id 头(对齐 Codex 官方客户端)
+    // - session-id:会话级 UUID(整会话稳定,与 prompt_cache_key 解耦)
+    // - thread-id:线程级 UUID(对齐上游请求关联/日志追踪)
+    let (session_id, thread_id) = if matches!(route.protocol, Protocol::OpenAiResponses) {
+        (cc_session.as_deref(), extract_claude_code_thread(&headers))
     } else {
-        None
+        (None, None)
     };
 
     let upstream = upstream_client
@@ -597,6 +605,7 @@ async fn handle_messages(
             &body_json,
             is_stream,
             session_id,
+            thread_id.as_deref(),
             &extra_headers,
         )
         .await?;

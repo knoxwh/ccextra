@@ -13,6 +13,7 @@ use serde_json::Value;
 
 /// Claude Code 会话头(小写形式,HeaderMap 查找大小写不敏感)
 pub const CLAUDE_CODE_SESSION_HEADER: &str = "x-claude-code-session-id";
+pub const CLAUDE_CODE_THREAD_HEADER: &str = "x-claude-code-thread-id";
 
 /// 提取 Claude Code 会话 ID(头优先,user_id 兜底)
 pub fn extract_claude_code_session(headers: &HeaderMap, body: &Value) -> Option<String> {
@@ -57,6 +58,15 @@ fn session_id_from_user_id(user_id: &str) -> Option<String> {
         }
     }
     None
+}
+
+/// 提取 Claude Code thread ID(仅从头读取)
+pub fn extract_claude_code_thread(headers: &HeaderMap) -> Option<String> {
+    headers
+        .get(CLAUDE_CODE_THREAD_HEADER)
+        .and_then(|v| v.to_str().ok())
+        .map(|s| s.trim().to_string())
+        .filter(|s| !s.is_empty())
 }
 
 #[cfg(test)]

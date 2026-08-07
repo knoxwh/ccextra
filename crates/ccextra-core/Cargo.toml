@@ -24,6 +24,7 @@ md-5 = "0.10"
 lru = "0.12"
 regex = "1"
 http = "1"
+once_cell = "1.21.4"
 
 [dev-dependencies]
 proptest = "1"

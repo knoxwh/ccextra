@@ -16,15 +16,15 @@ pub struct UpstreamResponse {
 }
 
 /// 每个请求都要用到的流式头集合,避免在 request 里内联判断
-/// (chat / responses 流式声明 SSE + 防代理缓存;claude 直通不掺头)
+/// (chat / responses 流式声明 SSE;claude 直通不掺头)
+///
+/// 注意:Codex 官方客户端 responses 协议 **不发** Cache-Control: no-cache,
+/// 仅声明 Accept: text/event-stream。代理误带 no-cache 可能导致上游旁路缓存。
 fn stream_headers(protocol: Protocol, is_stream: bool) -> Vec<(&'static str, &'static str)> {
     if !is_stream || !matches!(protocol, Protocol::OpenAiChat | Protocol::OpenAiResponses) {
         return Vec::new();
     }
-    vec![
-        (reqwest::header::ACCEPT.as_str(), "text/event-stream"),
-        (reqwest::header::CACHE_CONTROL.as_str(), "no-cache"),
-    ]
+    vec![(reqwest::header::ACCEPT.as_str(), "text/event-stream")]
 }
 
 /// 按协议取上游请求路径
@@ -128,6 +128,7 @@ impl UpstreamClient {
         body: &serde_json::Value,
         is_stream: bool,
         session_id: Option<&str>,
+        thread_id: Option<&str>,
         extra_headers: &[(String, String)],
     ) -> anyhow::Result<UpstreamResponse> {
         let proxy_key = self.resolve_proxy(provider_proxy);
@@ -145,10 +146,15 @@ impl UpstreamClient {
         for (name, value) in stream_headers(protocol, is_stream) {
             req = req.header(name, value);
         }
-        if let Some(sid) = session_id {
-            if matches!(protocol, Protocol::OpenAiResponses) {
-                req = req.header("Session_id", sid);
+        // responses 协议:session-id/thread-id/Originator 对齐 Codex 官方客户端
+        if matches!(protocol, Protocol::OpenAiResponses) {
+            if let Some(sid) = session_id {
+                req = req.header("session-id", sid);
             }
+            if let Some(tid) = thread_id {
+                req = req.header("thread-id", tid);
+            }
+            req = req.header("Originator", "codex_cli_rs");
         }
         for (name, value) in extra_headers {
             req = req.header(name.as_str(), value.as_str());
@@ -189,10 +195,7 @@ mod tests {
         let chat = stream_headers(Protocol::OpenAiChat, true);
         assert_eq!(
             chat,
-            vec![
-                (reqwest::header::ACCEPT.as_str(), "text/event-stream"),
-                (reqwest::header::CACHE_CONTROL.as_str(), "no-cache"),
-            ]
+            vec![(reqwest::header::ACCEPT.as_str(), "text/event-stream")]
         );
         assert_eq!(stream_headers(Protocol::OpenAiResponses, true), chat);
     }

@@ -21,7 +21,10 @@ use super::{ConvertError, Result};
 /// 对齐 顶层键序、system 数组形态、messages 内 role=system 提取、user 透传。
 /// 差异:content 字符串保持数组(采用跨协议形态归一化,解决客户端跨轮
 /// 数组/字符串漂移,见 convert_message 注释)。
-pub fn convert_to_openai_chat(body: &mut Value, upstream_model: &str) -> Result<()> {
+pub fn convert_to_openai_chat(
+    body: &mut Value,
+    upstream_model: &str,
+) -> Result<()> {
     let mut openai = serde_json::Map::new();
 
     // 对齐 顶层键序:model,max_tokens,temperature/top_p,stop,stream,
@@ -54,6 +57,8 @@ pub fn convert_to_openai_chat(body: &mut Value, upstream_model: &str) -> Result<
 
     // thinking → reasoning_effort(忠实 thinking 映射;顶层 output_config 优先)
     if let Some(effort) = crate::thinking::resolve_effort_from_body(body) {
+        // 钳制到模型支持级别(查注册表)
+        let effort = crate::thinking::clamp_effort(effort, upstream_model);
         openai.insert("reasoning_effort".into(), json!(effort));
     }
 
@@ -977,5 +982,18 @@ mod tests {
             .as_str()
             .unwrap();
         assert_eq!(url, "https://example.com/img.png");
+    }
+
+    #[test]
+    fn test_max_reasoning_effort_downgraded_to_xhigh() {
+        // glm-5.1 注册表支持到 xhigh,max 自动降级
+        let mut body = json!({
+            "model": "test",
+            "output_config": {"effort": "max"},
+            "thinking": {"type": "adaptive"},
+            "messages": [{"role": "user", "content": "test"}]
+        });
+        convert_to_openai_chat(&mut body, "glm-5.1").unwrap();
+        assert_eq!(body["reasoning_effort"], "xhigh");
     }
 }
