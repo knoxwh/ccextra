@@ -164,6 +164,16 @@ impl ResponsesRelay {
 
         match event_type {
             "error" => vec![stream_error_frame(&root)],
+            // 官方 Codex 终态错误事件:error 嵌在 response.error,提升为顶层复用映射
+            "response.failed" => {
+                let mut failed_root = root.clone();
+                if failed_root.get("error").is_none() {
+                    if let Some(err) = failed_root.pointer("/response/error") {
+                        failed_root["error"] = err.clone();
+                    }
+                }
+                vec![stream_error_frame(&failed_root)]
+            }
             "response.created" => {
                 self.update_identity(root.get("response"));
                 self.ensure_started()
@@ -1543,6 +1553,19 @@ mod tests {
         assert!(s.starts_with("event: error"));
         assert!(s.contains("invalid_request_error"));
         assert!(s.contains("blocked"));
+    }
+
+    #[test]
+    fn test_response_failed_event() {
+        let mut r = ResponsesRelay::new(None);
+        let out = r.process(&ev(
+            r#"{"type":"response.failed","sequence_number":0,"response":{"status":"failed","error":{"type":"server_error","code":"internal_server_error","message":"boom"}}}"#,
+        ));
+        let bufs = out.concat();
+        let s = String::from_utf8_lossy(&bufs);
+        assert!(s.starts_with("event: error"));
+        assert!(s.contains("server_error"));
+        assert!(s.contains("boom"));
     }
 
     #[test]
