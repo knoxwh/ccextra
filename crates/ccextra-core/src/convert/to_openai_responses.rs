@@ -180,29 +180,31 @@ fn normalize_tool_parameters(schema: &Value) -> Value {
     s
 }
 
-/// Claude system 文本块 → 逐块独立 input_text part(对齐 appendSystemText)
-fn system_content_parts(system: &Value) -> Vec<Value> {
-    let mut parts: Vec<Value> = Vec::new();
-    let mut push = |text: &str| {
-        if text.is_empty() || super::is_attribution_text(text) {
-            return;
-        }
-        parts.push(json!({"type": "input_text", "text": text}));
-    };
+/// Claude system 文本块 → 单字符串(合并所有 text blocks,对齐 codex base_instructions)
+fn system_to_instructions_text(system: &Value) -> String {
+    let mut texts: Vec<String> = Vec::new();
     match system {
-        Value::String(s) => push(s),
+        Value::String(s) => {
+            let trimmed = s.trim();
+            if !trimmed.is_empty() && !super::is_attribution_text(trimmed) {
+                texts.push(trimmed.to_string());
+            }
+        }
         Value::Array(blocks) => {
             for b in blocks {
                 if b.get("type").and_then(|v| v.as_str()) == Some("text") {
                     if let Some(t) = b.get("text").and_then(|v| v.as_str()) {
-                        push(t);
+                        let trimmed = t.trim();
+                        if !trimmed.is_empty() && !super::is_attribution_text(trimmed) {
+                            texts.push(trimmed.to_string());
+                        }
                     }
                 }
             }
         }
         _ => {}
     }
-    parts
+    texts.join("\n\n")
 }
 
 /// Anthropic messages → OpenAI responses
@@ -210,9 +212,22 @@ pub fn convert_to_openai_responses(
     body: &mut Value,
     upstream_model: &str,
 ) -> Result<HashMap<String, String>> {
+    // --- system → instructions(对齐 codex base_instructions) ---
+    let mut instructions = String::new();
+    if let Some(system) = body.get("system") {
+        instructions = system_to_instructions_text(system);
+    }
+    // GPT 上游追加适配块到 instructions 末尾
+    if is_gpt_upstream(upstream_model) {
+        if !instructions.is_empty() {
+            instructions.push_str("\n\n");
+        }
+        instructions.push_str(GPT_ADAPTER_BLOCK);
+    }
+
     let mut openai = json!({
         "model": upstream_model,
-        "instructions": "",
+        "instructions": instructions,
         "input": [],
     });
 
@@ -247,39 +262,6 @@ pub fn convert_to_openai_responses(
             }
         }
         tool_name_map = build_short_name_map(&names);
-    }
-
-    // --- system → developer message(对齐 system 分支) ---
-    if let Some(system) = body.get("system") {
-        let parts = system_content_parts(system);
-        if !parts.is_empty() {
-            openai["input"]
-                .as_array_mut()
-                .unwrap()
-                .push(json!({"type": "message", "role": "developer", "content": parts}));
-        }
-    }
-
-    // --- GPT 上游追加适配块 ---
-    // 追加到已有 developer 末尾(前缀字节不变,上游缓存主前缀仍命中);
-    // 无 developer(空 system)时单独建 developer 置于 input[0]。
-    if is_gpt_upstream(upstream_model) {
-        let block = json!({"type": "input_text", "text": GPT_ADAPTER_BLOCK});
-        let input = openai["input"].as_array_mut().unwrap();
-        let existing = input
-            .iter()
-            .position(|m| m.get("role").and_then(|r| r.as_str()) == Some("developer"));
-        match existing {
-            Some(idx) => {
-                if let Some(arr) = input[idx]["content"].as_array_mut() {
-                    arr.push(block);
-                }
-            }
-            None => input.insert(
-                0,
-                json!({"type": "message", "role": "developer", "content": vec![block]}),
-            ),
-        }
     }
 
     // --- messages → input[] ---
@@ -631,67 +613,62 @@ mod tests {
     use serde_json::json;
 
     #[test]
-    fn test_system_goes_to_developer_message() {
-        // 对齐:system → input[0] developer message,非 instructions
+    fn test_system_goes_to_instructions() {
+        // 新行为：system → instructions 字段，而非 developer message
         let mut body = json!({
             "model": "test",
             "system": "You are helpful",
             "messages": [{"role": "user", "content": "hi"}]
         });
         let rev = convert_to_openai_responses(&mut body, "test-model").unwrap();
-        assert_eq!(body["instructions"], "");
-        assert_eq!(body["input"][0]["type"], "message");
-        assert_eq!(body["input"][0]["role"], "developer");
-        assert_eq!(body["input"][0]["content"][0]["type"], "input_text");
-        assert_eq!(body["input"][0]["content"][0]["text"], "You are helpful");
-        assert_eq!(body["input"][1]["content"][0]["text"], "hi");
+        assert_eq!(body["instructions"], "You are helpful");
+        assert_eq!(body["input"][0]["role"], "user");
+        assert_eq!(body["input"][0]["content"][0]["text"], "hi");
         assert!(rev.is_empty(), "无工具时反向映射为空");
     }
 
     #[test]
-    fn test_gpt_adapter_block_appended_to_developer() {
-        // gpt 上游:块追加到 developer content 末尾,前缀 system 字节保留
+    fn test_gpt_adapter_block_appended_to_instructions() {
+        // gpt 上游：GPT_ADAPTER_BLOCK 追加到 instructions 末尾
         let mut body = json!({
             "model": "test",
             "system": "You are helpful",
             "messages": []
         });
         convert_to_openai_responses(&mut body, "gpt-5.6-terra").unwrap();
-        let input = body["input"].as_array().unwrap();
-        assert_eq!(input[0]["role"], "developer");
-        let content = input[0]["content"].as_array().unwrap();
-        assert_eq!(content[0]["text"], "You are helpful");
-        assert_eq!(content.last().unwrap()["type"], "input_text");
-        assert_eq!(content.last().unwrap()["text"], GPT_ADAPTER_BLOCK);
+        let instructions = body["instructions"].as_str().unwrap();
+        assert!(instructions.starts_with("You are helpful"));
+        assert!(instructions.ends_with(GPT_ADAPTER_BLOCK));
+        assert!(instructions.contains("\n\n"));
+        // input 应该为空（没有 messages）
+        assert_eq!(body["input"].as_array().unwrap().len(), 0);
     }
 
     #[test]
-    fn test_gpt_adapter_creates_developer_when_no_system() {
-        // 空 system:单独建 developer 且置于 input[0],不影响后续消息
+    fn test_gpt_adapter_creates_instructions_when_no_system() {
+        // 空 system：instructions 只包含 GPT_ADAPTER_BLOCK
         let mut body = json!({
             "model": "test",
             "messages": [{"role": "user", "content": "hi"}]
         });
         convert_to_openai_responses(&mut body, "gpt-5.6-sol").unwrap();
+        assert_eq!(body["instructions"], GPT_ADAPTER_BLOCK);
         let input = body["input"].as_array().unwrap();
-        assert_eq!(input[0]["type"], "message");
-        assert_eq!(input[0]["role"], "developer");
-        assert_eq!(input[0]["content"][0]["text"], GPT_ADAPTER_BLOCK);
-        assert_eq!(input[1]["content"][0]["text"], "hi");
+        assert_eq!(input[0]["role"], "user");
+        assert_eq!(input[0]["content"][0]["text"], "hi");
     }
 
     #[test]
     fn test_non_gpt_no_adapter_block() {
-        // 非 gpt 上游不注入
+        // 非 gpt 上游不注入 adapter block
         let mut body = json!({
             "model": "test",
             "system": "You are helpful",
             "messages": []
         });
         convert_to_openai_responses(&mut body, "claude-opus-5").unwrap();
-        let content = body["input"][0]["content"].as_array().unwrap();
-        assert_eq!(content.len(), 1);
-        assert_eq!(content[0]["text"], "You are helpful");
+        assert_eq!(body["instructions"], "You are helpful");
+        assert_eq!(body["input"].as_array().unwrap().len(), 0);
     }
 
     #[test]
@@ -722,15 +699,16 @@ mod tests {
 
         convert_to_openai_responses(&mut body, "gpt-5.6-terra").unwrap();
 
-        let adapter = body["input"][0]["content"][0]["text"].as_str().unwrap();
+        // adapter 现在在 instructions 里
+        let instructions = body["instructions"].as_str().unwrap();
         assert!(
-            adapter.contains("inside Claude Code's agent loop, not a standalone Codex session.")
+            instructions.contains("inside Claude Code's agent loop, not a standalone Codex session.")
         );
-        assert!(adapter.contains(
+        assert!(instructions.contains(
             "A declared apply_patch tool is available to use like any other declared tool."
         ));
-        assert!(!adapter.contains("Never use apply_patch"));
-        assert!(!adapter.contains("Edit files only with the tools Claude Code provides"));
+        assert!(!instructions.contains("Never use apply_patch"));
+        assert!(!instructions.contains("Edit files only with the tools Claude Code provides"));
         assert_eq!(body["tools"][0]["type"], "custom");
         assert_eq!(body["tools"][0]["name"], "apply_patch");
         assert_eq!(body["tool_choice"]["type"], "custom");
@@ -747,8 +725,8 @@ mod tests {
     }
 
     #[test]
-    fn test_system_array_blocks_stay_separate_parts() {
-        // 逐 block 独立 part,不 join(对齐 appendSystemText)
+    fn test_system_array_blocks_merged_to_instructions() {
+        // system blocks 合并到 instructions 字段(对齐 codex base_instructions)
         let mut body = json!({
             "model": "test",
             "system": [
@@ -758,10 +736,9 @@ mod tests {
             "messages": []
         });
         convert_to_openai_responses(&mut body, "test-model").unwrap();
-        let content = body["input"][0]["content"].as_array().unwrap();
-        assert_eq!(content.len(), 2);
-        assert_eq!(content[0]["text"], "Block 1");
-        assert_eq!(content[1]["text"], "Block 2");
+        assert_eq!(body["instructions"], "Block 1\n\nBlock 2");
+        // input 应该为空（没有 developer message）
+        assert_eq!(body["input"].as_array().unwrap().len(), 0);
     }
 
     #[test]
@@ -775,9 +752,8 @@ mod tests {
             "messages": []
         });
         convert_to_openai_responses(&mut body, "test-model").unwrap();
-        let content = body["input"][0]["content"].as_array().unwrap();
-        assert_eq!(content.len(), 1);
-        assert_eq!(content[0]["text"], "Real");
+        // attribution 被过滤，只保留 "Real"
+        assert_eq!(body["instructions"], "Real");
     }
 
     #[test]
