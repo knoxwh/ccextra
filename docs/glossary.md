@@ -110,7 +110,7 @@ responses 路径下,上游模型名以 `gpt` 开头(不区分大小写)时,追�
 注:早期版本的 `messages[0].content` SHA-256 兜底已删除——`messages[0]` 会被每请求注入的 system-reminder 与上下文压缩改变,不是稳定身份。
 
 **prompt_cache_key**  
-OpenAI chat/responses 的缓存桶标识。对齐 `applyPromptCacheKey`:provider 级开关(配置 `prompt_cache_key`,默认 false),按 `UUIDv5(NameSpaceOID, "cli-proxy-api:codex:claude-code" \0 模型 \0 "claude:<会话>:agent:<agent>")` 派生。identity 前缀固定,确定性派生。无 Claude Code 会话 ID 或 body 已有 key 时不注入;仅 openai_chat / openai_responses 生效。
+OpenAI chat/responses 的缓存桶标识。对齐 codex CLI 0.147 `prompt_cache_key()`:key = session_id 裸值(取代旧版 `UUIDv5(NameSpaceOID, "cli-proxy-api:codex:claude-code" \0 模型 \0 "claude:<会话>:agent:<agent>")` 派生)。provider 级开关(配置 `prompt_cache_key`,默认 false),仅 openai_chat / openai_responses 生效。无 Claude Code 会话 ID 或 body 已有 key 时不注入。
 
 ## 响应流式
 

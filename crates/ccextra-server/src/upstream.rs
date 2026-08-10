@@ -50,7 +50,7 @@ fn user_agent(protocol: Protocol) -> &'static str {
         Protocol::Claude => "claude-cli/2.1.221",
         Protocol::OpenAiChat => "claude-cli/2.1.221",
         Protocol::OpenAiResponses => {
-            "codex_cli_rs/0.146.0 (Mac OS 26.5.1; aarch64) iTerm.app/3.6.10"
+            "codex_cli_rs/0.147.0 (Mac OS 26.5.1; aarch64) iTerm.app/3.6.10"
         }
     }
 }
@@ -188,7 +188,7 @@ mod tests {
     #[test]
     fn test_user_agent_per_protocol() {
         assert_eq!(user_agent(Protocol::OpenAiChat), "claude-cli/2.1.221");
-        assert!(user_agent(Protocol::OpenAiResponses).starts_with("codex_cli_rs/0.146.0"));
+        assert!(user_agent(Protocol::OpenAiResponses).starts_with("codex_cli_rs/0.147.0"));
         assert_eq!(user_agent(Protocol::Claude), "claude-cli/2.1.221");
     }
 

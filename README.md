@@ -176,7 +176,7 @@ curl http://127.0.0.1:8222/health
 | `providers[].protocol` | 上游协议：`claude` / `openai_chat` / `openai_responses` |
 | `providers[].base_url` / `key` | 上游地址与密钥 |
 | `providers[].models[].alias` | 入站模型名 → 上游真实模型名 |
-| `providers[].prompt_cache_key` | 按会话+模型+agent 派生缓存桶 key，仅 openai 协议生效 |
+| `providers[].prompt_cache_key` | 缓存桶 key = 会话 ID（对齐 codex 0.147），仅 openai 协议生效 |
 | `payload` | 按模型名通配（`*glm*`）覆盖请求参数，可 `protocol` 限定生效范围 |
 | `normalize.enabled` | 归一化总开关；`drift_detector` 开启跨轮漂移观测 |
 | `logging.request_body` | 逐请求落盘上游 body 到 `logs/`，供缓存漂移定位 |
@@ -190,7 +190,7 @@ ccextra/
 │   │   ├── cache_stabilization/  # 九模块归一化
 │   │   ├── convert/              # 三条协议转换路径
 │   │   ├── thinking.rs           # 思考级别映射
-│   │   ├── prompt_cache.rs       # prompt_cache_key 派生/注入
+│   │   ├── prompt_cache.rs       # prompt_cache_key 注入（key=会话 ID，对齐 codex）
 │   │   ├── secret.rs             # 入口 key bcrypt 识别
 │   │   ├── route.rs              # 路由决策
 │   │   ├── session.rs            # 会话身份派生

@@ -542,10 +542,10 @@ async fn handle_messages(
     drop(payload_rules);
     drop(providers);
 
-    // prompt_cache_key 注入(provider 级开关;仅 openai 协议;对齐 applyPromptCacheKey)
+    // prompt_cache_key 注入(provider 级开关;仅 openai 协议;key=session_id,对齐 codex 0.147)
     if provider_prompt_cache_key
         && !matches!(route.protocol, Protocol::Claude)
-        && inject_prompt_cache_key(&mut body_json, &headers, cc_session.as_deref())
+        && inject_prompt_cache_key(&mut body_json, cc_session.as_deref())
     {
         tracing::debug!("prompt_cache_key 已注入");
     }
