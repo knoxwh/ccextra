@@ -562,8 +562,8 @@ pub fn convert_to_openai_responses(
     openai["parallel_tool_calls"] = json!(!disable_parallel);
 
     // --- reasoning.effort(对齐 thinking 分支,默认 medium) ---
+    // 保留入站 reasoning.effort,钳制到模型支持级别(对齐 codex compact.rs:704 保留 turn_context.reasoning_effort)
     let effort = crate::thinking::resolve_effort_from_body(body).unwrap_or("medium");
-    // 钳制到模型支持级别(查注册表)
     let effort = crate::thinking::clamp_effort(effort, upstream_model);
     openai["reasoning"] = json!({"effort": effort});
 
@@ -573,7 +573,8 @@ pub fn convert_to_openai_responses(
     }
 
     // --- codex 固定参数(一致) ---
-    openai["stream"] = json!(true);
+    // stream 保留入站值(对齐 to_openai_chat)
+    openai["stream"] = body.get("stream").unwrap_or(&json!(true)).clone();
     openai["store"] = json!(false);
     openai["include"] = json!(["reasoning.encrypted_content"]);
 
@@ -1049,9 +1050,35 @@ mod tests {
     }
 
     #[test]
+    fn test_effort_preserved_from_body() {
+        // 保留入站 effort(output_config.effort 显式 high),对齐 codex compact.rs:704
+        // 保留 turn_context.reasoning_effort,不因 compact 或其他路径强制覆盖
+        let mut body = json!({
+            "model": "test",
+            "messages": [],
+            "output_config": {"effort": "high"}
+        });
+        convert_to_openai_responses(&mut body, "gpt-5.6-terra").unwrap();
+        assert_eq!(body["reasoning"]["effort"], "high");
+    }
+
+    #[test]
+    fn test_effort_clamped_to_model() {
+        // 超出模型支持上限时钳制到最近级别(glm-5.1 最高 xhigh,max 降为 xhigh)
+        let mut body = json!({
+            "model": "test",
+            "messages": [],
+            "output_config": {"effort": "max"}
+        });
+        convert_to_openai_responses(&mut body, "glm-5.1").unwrap();
+        assert_eq!(body["reasoning"]["effort"], "xhigh");
+    }
+
+    #[test]
     fn test_codex_fixed_fields() {
         let mut body = json!({"model": "test", "messages": []});
         convert_to_openai_responses(&mut body, "test-model").unwrap();
+        // 无 stream 字段默认流式(与历史行为一致)
         assert_eq!(body["stream"], true);
         assert_eq!(body["store"], false);
         assert_eq!(body["include"][0], "reasoning.encrypted_content");
