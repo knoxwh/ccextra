@@ -1,7 +1,7 @@
 // Anthropic → OpenAI responses 转换(对齐转换路径字段映射)
 //
 // 主要映射(逐条一致):
-// - system → input[0] developer message(逐 text block 独立 part,过滤计费归属块)
+// - system → instructions 字段(合并 text blocks,过滤计费归属块,对齐 codex base_instructions)
 // - messages → input[]:text→input_text/output_text、thinking(带 GPT 兼容签名)→reasoning、
 //   image→input_image、tool_use→function_call、tool_result→function_call_output
 //   (遇 thinking/tool_use/tool_result 先 flush 文本 message,对齐 flushMessage 顺序)
@@ -181,6 +181,11 @@ fn normalize_tool_parameters(schema: &Value) -> Value {
 }
 
 /// Claude system 文本块 → 单字符串(合并所有 text blocks,对齐 codex base_instructions)
+///
+/// 注：每个 block 先 trim 再合并,理由：
+/// 1. codex 存储 base_instructions 为单字符串,合并时自然规范化空白
+/// 2. Claude Code 系统提示程序生成,不含前导/尾随空白
+/// 3. 即使上游发送空白块,trim 后更利于缓存命中(减少无意义字节差异)
 fn system_to_instructions_text(system: &Value) -> String {
     let mut texts: Vec<String> = Vec::new();
     match system {
@@ -637,9 +642,9 @@ mod tests {
         });
         convert_to_openai_responses(&mut body, "gpt-5.6-terra").unwrap();
         let instructions = body["instructions"].as_str().unwrap();
-        assert!(instructions.starts_with("You are helpful"));
-        assert!(instructions.ends_with(GPT_ADAPTER_BLOCK));
-        assert!(instructions.contains("\n\n"));
+        // 精确验证结构：system + \n\n + adapter
+        let expected = format!("You are helpful\n\n{}", GPT_ADAPTER_BLOCK);
+        assert_eq!(instructions, expected);
         // input 应该为空（没有 messages）
         assert_eq!(body["input"].as_array().unwrap().len(), 0);
     }
@@ -754,6 +759,37 @@ mod tests {
         convert_to_openai_responses(&mut body, "test-model").unwrap();
         // attribution 被过滤，只保留 "Real"
         assert_eq!(body["instructions"], "Real");
+    }
+
+    #[test]
+    fn test_system_whitespace_only_blocks_dropped() {
+        let mut body = json!({
+            "model": "test",
+            "system": [
+                {"type": "text", "text": "  \n  "},
+                {"type": "text", "text": "Content"},
+                {"type": "text", "text": ""},
+            ],
+            "messages": []
+        });
+        convert_to_openai_responses(&mut body, "test-model").unwrap();
+        // 纯空白块被 trim 后丢弃
+        assert_eq!(body["instructions"], "Content");
+    }
+
+    #[test]
+    fn test_system_blocks_trimmed_before_join() {
+        let mut body = json!({
+            "model": "test",
+            "system": [
+                {"type": "text", "text": "  Block 1  "},
+                {"type": "text", "text": "\n\nBlock 2\n"},
+            ],
+            "messages": []
+        });
+        convert_to_openai_responses(&mut body, "test-model").unwrap();
+        // 每个块先 trim 再用 \n\n 连接
+        assert_eq!(body["instructions"], "Block 1\n\nBlock 2");
     }
 
     #[test]
