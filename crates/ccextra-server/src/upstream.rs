@@ -43,14 +43,14 @@ fn endpoint_path(protocol: Protocol) -> &'static str {
 
 /// 按协议取 User-Agent(对齐上游期望的客户端标识)
 ///
-/// openai chat → claude-cli;responses → codex_cli_rs。部分上游按 UA
+/// openai chat → claude-cli;responses → codex-tui。部分上游按 UA
 /// 分流缓存/特性,reqwest 默认 UA 会被识别为非官方客户端。
 fn user_agent(protocol: Protocol) -> &'static str {
     match protocol {
         Protocol::Claude => "claude-cli/2.1.221",
         Protocol::OpenAiChat => "claude-cli/2.1.221",
         Protocol::OpenAiResponses => {
-            "codex_cli_rs/0.147.0 (Mac OS 26.5.1; aarch64) iTerm.app/3.6.10"
+            "codex-tui/0.147.0 (Mac OS 26.6.1; arm64) ghostty/1.3.1 (codex-tui; 0.147.0)"
         }
     }
 }
@@ -188,7 +188,10 @@ mod tests {
     #[test]
     fn test_user_agent_per_protocol() {
         assert_eq!(user_agent(Protocol::OpenAiChat), "claude-cli/2.1.221");
-        assert!(user_agent(Protocol::OpenAiResponses).starts_with("codex_cli_rs/0.147.0"));
+        assert_eq!(
+            user_agent(Protocol::OpenAiResponses),
+            "codex-tui/0.147.0 (Mac OS 26.6.1; arm64) ghostty/1.3.1 (codex-tui; 0.147.0)"
+        );
         assert_eq!(user_agent(Protocol::Claude), "claude-cli/2.1.221");
     }
 

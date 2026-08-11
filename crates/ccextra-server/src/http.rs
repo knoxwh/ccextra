@@ -37,12 +37,16 @@ use ccextra_core::route::{
 };
 use ccextra_core::secret::looks_like_bcrypt;
 use ccextra_core::session::{extract_claude_code_session, extract_claude_code_thread};
+use futures::StreamExt;
 use globset::Glob;
 use serde_json::{json, Value};
 use std::collections::HashMap;
+use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::sync::{Arc, Mutex as StdMutex, OnceLock};
 use tokio::sync::RwLock;
 
+use crate::sse::parser::{SseEvent, SseParser};
+use crate::sse::SseStreamPin;
 use crate::upstream::UpstreamClient;
 
 /// /reload 可替换的运行时配置。整块写锁替换,单个字段不单独加锁。
@@ -113,6 +117,9 @@ pub fn app(state: AppState) -> Router {
 /// bcrypt 验证结果缓存:key→已验证,避免每请求一次 ~100ms 的 bcrypt verify
 /// 上限 1024 条,超限清空(防内存无限增长);secret 可热重载,/reload 一律清空缓存
 static AUTH_CACHE: OnceLock<StdMutex<HashMap<String, bool>>> = OnceLock::new();
+
+/// 诊断日志请求序号:与毫秒时间戳组合,避免并发请求覆盖同一文件。
+static UPSTREAM_LOG_SEQUENCE: AtomicU64 = AtomicU64::new(0);
 
 fn auth_cache() -> &'static StdMutex<HashMap<String, bool>> {
     AUTH_CACHE.get_or_init(|| StdMutex::new(HashMap::new()))
@@ -551,18 +558,24 @@ async fn handle_messages(
     }
 
     // 诊断:request_body 开启时落盘最终上游 body,供逐轮 diff 定位缓存漂移。
-    // 文件名按会话+序号,logs/upstream_body_<session前8>_<毫秒>.<protocol>.json
+    // 文件名按会话+时间+序号,body 与响应元信息共用同一标识。
+    let sess = cc_session
+        .as_deref()
+        .map(|s| s.chars().take(8).collect::<String>())
+        .unwrap_or_else(|| "nosess".into());
+    let ts = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map(|d| d.as_millis() as u64)
+        .unwrap_or(0);
+    let proto = format!("{:?}", route.protocol).to_lowercase();
+    let request_seq = if log_request_body {
+        UPSTREAM_LOG_SEQUENCE.fetch_add(1, Ordering::Relaxed)
+    } else {
+        0
+    };
+    let log_stem = upstream_log_stem(&sess, ts, request_seq, &proto);
     if log_request_body {
-        let sess = cc_session
-            .as_deref()
-            .map(|s| s.chars().take(8).collect::<String>())
-            .unwrap_or_else(|| "nosess".into());
-        let ts = std::time::SystemTime::now()
-            .duration_since(std::time::UNIX_EPOCH)
-            .map(|d| d.as_millis())
-            .unwrap_or(0);
-        let proto = format!("{:?}", route.protocol).to_lowercase();
-        let path = format!("logs/upstream_body_{sess}_{ts}.{proto}.json");
+        let path = format!("logs/upstream_body_{log_stem}.json");
         let dumped = serde_json::to_vec_pretty(&body_json)
             .ok()
             .and_then(|bytes| {
@@ -605,6 +618,49 @@ async fn handle_messages(
         .await?;
     let status = upstream.status;
 
+    // 诊断:落盘上游响应元信息(与 upstream_body_* 同目录、同会话命名)。
+    // 记录响应头里的上游节点指纹(cf-ray / x-request-id / server / alt-svc /
+    // via / x-served-by / x-cache-status 等),用于判断同一 prompt_cache_key
+    // 的请求是否被网关轮转/分流到不同后端缓存分区——这是缓存批量失效
+    // (命中序列周期性整段归零)的典型外因,请求体逐字节稳定时优先查这里。
+    // 流式响应额外带 response_id(首个 response.created 事件即到,比头部更强
+    // 的会话指纹),从转换前的原始字节流捕获;非流式不上 SSE,拿不到 → null。
+    let meta_base = if log_request_body {
+        let mut rh = serde_json::Map::new();
+        for name in [
+            "cf-ray",
+            "x-request-id",
+            "x-response-id",
+            "server",
+            "alt-svc",
+            "via",
+            "x-served-by",
+            "x-cache-status",
+            "cf-cache-status",
+            "age",
+        ] {
+            if let Some(val) = upstream.body.headers().get(name) {
+                rh.insert(name.into(), json!(val.to_str().unwrap_or("")));
+            }
+        }
+        Some(json!({
+            "ts": ts,
+            "request_seq": request_seq,
+            "session": sess,
+            "protocol": proto,
+            "model": model,
+            "upstream_model": route.upstream_model,
+            "status": status.as_u16(),
+            "prompt_cache_key": body_json.get("prompt_cache_key"),
+            "response_id": Value::Null,
+            "headers": rh,
+        }))
+    } else {
+        None
+    };
+    // 基础 meta 先落盘:错误响应、流式提前断开也保留响应头指纹。
+    let initial_meta_written = meta_base.as_ref().map(write_upstream_meta).unwrap_or(true);
+
     // 上游错误:转 anthropic error 形状
     // (OpenAI 的 {"error":{...}} 直接透传客户端不认,对齐 WriteErrorResponse)
     if !status.is_success() {
@@ -620,7 +676,60 @@ async fn handle_messages(
     if is_stream {
         // 流式:claude 直通字节转发;转换路径走 SSE 状态机
         let stream = upstream.body.bytes_stream();
-        let out = crate::sse::relay(route.protocol, stream, estimated_input_tokens, tool_names);
+        let out = if let Some(meta) = meta_base.as_ref() {
+            // 诊断:从转换前的原始字节流捕获 response_id(inspect 只借不消费,
+            // 字节仍进 relay 转换)。基础 meta 已在 headers 阶段落盘;捕获到
+            // response_id 后覆盖同一文件。客户端中途断开时,基础 meta 仍保留。
+            let shared = Arc::new(StdMutex::new(meta.clone()));
+            let written = Arc::new(AtomicBool::new(initial_meta_written));
+            let sh = Arc::clone(&shared);
+            let wr = Arc::clone(&written);
+            let out = if matches!(route.protocol, Protocol::OpenAiResponses) {
+                let scanner = Arc::new(StdMutex::new(ResponsesIdScanner::new()));
+                let scan = Arc::clone(&scanner);
+                let tapped = stream.inspect(move |res| {
+                    if let Ok(bytes) = res {
+                        let id = scan.lock().unwrap().push(bytes);
+                        if let Some(id) = id {
+                            let mut meta = sh.lock().unwrap();
+                            meta["response_id"] = json!(id);
+                            let ok = write_upstream_meta(&meta);
+                            wr.store(ok, Ordering::Release);
+                        }
+                    }
+                });
+                let relayed =
+                    crate::sse::relay(route.protocol, tapped, estimated_input_tokens, tool_names);
+                let sh = Arc::clone(&shared);
+                let wr = Arc::clone(&written);
+                sse_meta_finalizer(relayed, move || {
+                    if let Some(id) = scanner.lock().unwrap().finish() {
+                        let mut meta = sh.lock().unwrap();
+                        meta["response_id"] = json!(id);
+                        let ok = write_upstream_meta(&meta);
+                        wr.store(ok, Ordering::Release);
+                    }
+                    if !wr.load(Ordering::Acquire) {
+                        let ok = write_upstream_meta(&sh.lock().unwrap());
+                        wr.store(ok, Ordering::Release);
+                    }
+                })
+            } else {
+                let relayed =
+                    crate::sse::relay(route.protocol, stream, estimated_input_tokens, tool_names);
+                let sh = Arc::clone(&shared);
+                let wr = Arc::clone(&written);
+                sse_meta_finalizer(relayed, move || {
+                    if !wr.load(Ordering::Acquire) {
+                        let ok = write_upstream_meta(&sh.lock().unwrap());
+                        wr.store(ok, Ordering::Release);
+                    }
+                })
+            };
+            out
+        } else {
+            crate::sse::relay(route.protocol, stream, estimated_input_tokens, tool_names)
+        };
         Ok(Response::builder()
             .status(status)
             .header(header::CONTENT_TYPE, "text/event-stream")
@@ -655,24 +764,15 @@ async fn handle_messages(
 
 /// 上游错误 body → anthropic 错误形状
 /// `{"type":"error","error":{"type":...,"message":...}}`
+///
+/// 兼容两类上游错误结构:
+/// 1. OpenAI 标准 `{"error":{"type":...,"message":...}}`
+/// 2. 阿里云百炼 `{"code":"Throttling.RateQuota","message":"{\"error\":{...}}"}`——
+///    code/message 平铺在顶层,且 message 是嵌套 JSON 字符串,真实错误藏在里面。
+///    提取不到 error 时不丢真实信息,用顶层 code/message 兜底。
 fn to_anthropic_error(body: &[u8]) -> Vec<u8> {
-    let (raw_type, raw_message) = serde_json::from_slice::<Value>(body)
-        .ok()
-        .and_then(|v| {
-            let err = v.get("error")?;
-            Some((
-                err.get("type")
-                    .and_then(|x| x.as_str())
-                    .unwrap_or("")
-                    .to_string(),
-                err.get("message")
-                    .and_then(|x| x.as_str())
-                    .unwrap_or("")
-                    .to_string(),
-            ))
-        })
-        .unwrap_or_default();
-    let err_type = match raw_type.as_str() {
+    let (raw_type, raw_message) = extract_upstream_error(body);
+    let err_type = match raw_type.to_lowercase().as_str() {
         t @ ("invalid_request_error"
         | "authentication_error"
         | "permission_error"
@@ -680,6 +780,12 @@ fn to_anthropic_error(body: &[u8]) -> Vec<u8> {
         | "rate_limit_error"
         | "overloaded_error") => t.to_string(),
         "rate_limit" | "requests" | "tokens" => "rate_limit_error".to_string(),
+        // 阿里云百炼/OpenAI 的裸类型名(EngineOverloadedError 等)归入语义相近的错误
+        t if t.contains("overload") => "overloaded_error".to_string(),
+        t if t.contains("rate") || t.contains("quota") => "rate_limit_error".to_string(),
+        t if t.contains("auth") || t.contains("apikey") || t.contains("forbidden") => {
+            "authentication_error".to_string()
+        }
         _ => "api_error".to_string(),
     };
     let message = if raw_message.is_empty() {
@@ -692,6 +798,168 @@ fn to_anthropic_error(body: &[u8]) -> Vec<u8> {
         "error": {"type": err_type, "message": message}
     }))
     .unwrap_or_default()
+}
+
+/// 从上游错误 body 提取 (type, message)。优先标准 `error` 对象,其次
+/// 顶层 `code`/`message`(百炼风格),message 为字符串时尝试二次解析嵌套 JSON。
+fn extract_upstream_error(body: &[u8]) -> (String, String) {
+    let Ok(v) = serde_json::from_slice::<Value>(body) else {
+        return (String::new(), String::from_utf8_lossy(body).trim().to_string());
+    };
+
+    // OpenAI 标准结构
+    if let Some(err) = v.get("error") {
+        let t = err
+            .get("type")
+            .and_then(|x| x.as_str())
+            .unwrap_or("")
+            .to_string();
+        let m = err
+            .get("message")
+            .and_then(|x| x.as_str())
+            .unwrap_or("")
+            .to_string();
+        if !t.is_empty() || !m.is_empty() {
+            return (t, m);
+        }
+    }
+
+    // 阿里云百炼风格:顶层 code/message
+    let code = v
+        .get("code")
+        .and_then(|x| x.as_str())
+        .unwrap_or("")
+        .to_string();
+    let msg = v.get("message").cloned();
+    // message 可能是嵌套 JSON 字符串,真实错误对象藏在里面
+    if let Some(Value::String(s)) = &msg {
+        if let Ok(inner) = serde_json::from_str::<Value>(s) {
+            if let Some(err) = inner.get("error") {
+                let t = err
+                    .get("type")
+                    .and_then(|x| x.as_str())
+                    .unwrap_or("")
+                    .to_string();
+                let m = err
+                    .get("message")
+                    .and_then(|x| x.as_str())
+                    .unwrap_or("")
+                    .to_string();
+                if !t.is_empty() || !m.is_empty() {
+                    return (if t.is_empty() { code } else { t }, m);
+                }
+            }
+            // 二次解析的对象里没有 error,直接取其 message(若有)
+            if let Some(m) = inner.get("message").and_then(|x| x.as_str()) {
+                return (code, m.to_string());
+            }
+        }
+    }
+    match msg {
+        // message 是普通字符串(二次解析失败或非嵌套)
+        Some(Value::String(s)) => (code, s),
+        _ => (code, String::new()),
+    }
+}
+
+// ── 上游响应元信息诊断(配合 logs/upstream_body_* 定位缓存漂移)────────────
+
+fn upstream_log_stem(session: &str, ts: u64, sequence: u64, protocol: &str) -> String {
+    format!("{session}_{ts}_{sequence}.{protocol}")
+}
+
+/// 从上游 Responses SSE 字节流中提取首个 response_id。
+/// 复用 SSE 解析器,避免跨 chunk 或 JSON 空白导致误判。
+struct ResponsesIdScanner {
+    parser: SseParser,
+    done: bool,
+}
+
+impl ResponsesIdScanner {
+    fn new() -> Self {
+        Self {
+            parser: SseParser::new(),
+            done: false,
+        }
+    }
+
+    /// 喂入一个 chunk,命中返回 id,否则 None。命中后不再解析。
+    fn push(&mut self, bytes: &[u8]) -> Option<String> {
+        if self.done {
+            return None;
+        }
+        let events = self.parser.push(bytes);
+        self.scan(events)
+    }
+
+    /// 流结束时 flush 没有末尾空行的事件。
+    fn finish(&mut self) -> Option<String> {
+        if self.done {
+            return None;
+        }
+        let events = self.parser.finish();
+        self.scan(events)
+    }
+
+    fn scan(&mut self, events: Vec<SseEvent>) -> Option<String> {
+        for event in events {
+            let Ok(value) = serde_json::from_str::<Value>(&event.data) else {
+                continue;
+            };
+            let created = event.event.as_deref() == Some("response.created")
+                || value.get("type").and_then(Value::as_str) == Some("response.created");
+            if !created {
+                continue;
+            }
+            let Some(id) = value
+                .pointer("/response/id")
+                .and_then(Value::as_str)
+                .filter(|id| !id.is_empty())
+            else {
+                continue;
+            };
+            self.done = true;
+            return Some(id.to_string());
+        }
+        None
+    }
+}
+
+/// 包裹 SSE 输出流:结束后执行一次 on_end(补写漏配的响应元信息)。
+fn sse_meta_finalizer<F>(inner: SseStreamPin, on_end: F) -> SseStreamPin
+where
+    F: FnOnce() + Send + 'static,
+{
+    Box::pin(async_stream::stream! {
+        let mut inner = inner;
+        while let Some(item) = inner.next().await {
+            yield item;
+        }
+        on_end();
+    })
+}
+
+fn write_meta_file(path: &std::path::Path, meta: &Value) -> bool {
+    let Ok(bytes) = serde_json::to_vec_pretty(meta) else {
+        return false;
+    };
+    std::fs::write(path, bytes).is_ok()
+}
+
+/// 落盘上游响应元信息(诊断)。文件名与 upstream_body_* 同会话同 ts,一对一定位。
+fn write_upstream_meta(meta: &Value) -> bool {
+    let ts = meta["ts"].as_u64().unwrap_or(0);
+    let request_seq = meta["request_seq"].as_u64().unwrap_or(0);
+    let sess = meta["session"].as_str().unwrap_or("nosess");
+    let proto = meta["protocol"].as_str().unwrap_or("unknown");
+    let stem = upstream_log_stem(sess, ts, request_seq, proto);
+    let path = format!("logs/upstream_meta_{stem}.json");
+    let ok = std::fs::create_dir_all("logs").is_ok()
+        && write_meta_file(std::path::Path::new(&path), meta);
+    if !ok {
+        tracing::warn!(path = %path, "上游响应元信息落盘失败");
+    }
+    ok
 }
 
 pub async fn serve(addr: &str, state: AppState) -> anyhow::Result<()> {
@@ -793,6 +1061,116 @@ mod tests {
     use axum::http::Request;
     use serde_json::json;
     use tower::util::ServiceExt;
+
+    #[test]
+    fn upstream_log_stem_includes_request_sequence() {
+        let first = upstream_log_stem("sessabcd", 123, 7, "openairesponses");
+        let second = upstream_log_stem("sessabcd", 123, 8, "openairesponses");
+        assert_ne!(first, second);
+        assert_eq!(first, "sessabcd_123_7.openairesponses");
+    }
+
+    #[test]
+    fn write_meta_file_reports_write_failure() {
+        let path = std::env::temp_dir().join(format!(
+            "ccextra-meta-test-{}-{}",
+            std::process::id(),
+            UPSTREAM_LOG_SEQUENCE.fetch_add(1, Ordering::Relaxed),
+        ));
+        std::fs::create_dir_all(&path).unwrap();
+        let meta = json!({"response_id": "resp_1"});
+        assert!(write_meta_file(&path.join("meta.json"), &meta));
+        assert!(!write_meta_file(&path, &meta));
+        std::fs::remove_dir_all(path).unwrap();
+    }
+
+    #[test]
+    fn responses_id_scanner_single_chunk() {
+        // 单 chunk 内命中 response.created 的 id。
+        let mut scanner = ResponsesIdScanner::new();
+        let id = scanner.push(
+            br#"event: response.created
+data: {"type":"response.created","response":{"id":"resp_abc123","model":"gpt-5"}}
+
+"#,
+        );
+        assert_eq!(id.as_deref(), Some("resp_abc123"));
+        // 命中后不再解析后续事件。
+        assert_eq!(scanner.push(b"anything"), None);
+    }
+
+    #[test]
+    fn responses_id_scanner_across_chunks() {
+        // 事件在任意 JSON 字符位置切开仍可命中。
+        let mut scanner = ResponsesIdScanner::new();
+        assert_eq!(
+            scanner.push(
+                br#"event: response.created
+data: {"type":"response.crea"#
+            ),
+            None
+        );
+        assert_eq!(scanner.push(br#"ted","response":{"id":"resp_xyz"#), None);
+        assert_eq!(
+            scanner.push(
+                br#"","model":"gpt-5"}}
+
+"#
+            ),
+            Some("resp_xyz".to_string())
+        );
+    }
+
+    #[test]
+    fn responses_id_scanner_accepts_json_whitespace() {
+        let mut scanner = ResponsesIdScanner::new();
+        let id = scanner.push(
+            br#"event: response.created
+data: { "type": "response.created", "response": { "id": "resp_space" } }
+
+"#,
+        );
+        assert_eq!(id.as_deref(), Some("resp_space"));
+    }
+
+    #[test]
+    fn responses_id_scanner_ignores_non_created_ids() {
+        let mut scanner = ResponsesIdScanner::new();
+        let id = scanner.push(
+            br#"event: response.output_item.added
+data: {"type":"response.output_item.added","item":{"id":"item_1"}}
+
+event: response.created
+data: {"type":"response.created","response":{"id":"resp_1"}}
+
+"#,
+        );
+        assert_eq!(id.as_deref(), Some("resp_1"));
+    }
+
+    #[test]
+    fn responses_id_scanner_accepts_data_type_without_event_name() {
+        let mut scanner = ResponsesIdScanner::new();
+        let id = scanner.push(
+            br#"data: {"type":"response.created","response":{"id":"resp_no_event"}}
+
+"#,
+        );
+        assert_eq!(id.as_deref(), Some("resp_no_event"));
+    }
+
+    #[test]
+    fn responses_id_scanner_flushes_eof_without_empty_line() {
+        let mut scanner = ResponsesIdScanner::new();
+        assert_eq!(
+            scanner.push(
+                br#"event: response.created
+data: {"type":"response.created","response":{"id":"resp_eof"}}"#
+            ),
+            None
+        );
+        assert_eq!(scanner.finish().as_deref(), Some("resp_eof"));
+    }
 
     fn headers_with(pairs: &[(&str, &str)]) -> HeaderMap {
         let mut h = HeaderMap::new();
@@ -1524,5 +1902,58 @@ mod tests {
             result.is_ok(),
             "/reload 超时:handle_messages 在上游请求期间仍持有配置读锁"
         );
+    }
+
+    // ── to_anthropic_error 上游错误透传 ─────────────────────────────────
+
+    #[test]
+    fn upstream_error_openai_standard_shape() {
+        // OpenAI 标准 {"error":{type,message}},透传 type 并映射
+        let body = br#"{"error":{"type":"rate_limit_error","message":"You are sending requests too quickly"}}"#;
+        let out: Value = serde_json::from_slice(&to_anthropic_error(body)).unwrap();
+        assert_eq!(out["error"]["type"], "rate_limit_error");
+        assert_eq!(
+            out["error"]["message"],
+            "You are sending requests too quickly"
+        );
+    }
+
+    #[test]
+    fn upstream_error_bailian_nested_message() {
+        // 阿里云百炼:code/message 平铺,messages 是嵌套 JSON 字符串
+        let body = br#"{"code":"Throttling.RateQuota","message":"{\"error\":{\"message\":\"The engine is currently overloaded, please try again later\",\"type\":\"EngineOverloadedError\",\"param\":null,\"code\":\"EngineOverloadedError\"}}"}"#;
+        let out: Value = serde_json::from_slice(&to_anthropic_error(body)).unwrap();
+        // EngineOverloadedError 含 overload → overloaded_error
+        assert_eq!(out["error"]["type"], "overloaded_error");
+        assert_eq!(
+            out["error"]["message"],
+            "The engine is currently overloaded, please try again later"
+        );
+    }
+
+    #[test]
+    fn upstream_error_bailian_plain_code_message() {
+        // code 含 quota → rate_limit_error;message 为普通字符串直接透传
+        let body = br#"{"code":"Throttling.RateQuota","message":"limit exceeded"}"#;
+        let out: Value = serde_json::from_slice(&to_anthropic_error(body)).unwrap();
+        assert_eq!(out["error"]["type"], "rate_limit_error");
+        assert_eq!(out["error"]["message"], "limit exceeded");
+    }
+
+    #[test]
+    fn upstream_error_bailian_invalid_auth_code() {
+        // code 含 auth → authentication_error
+        let body = br#"{"code":"InvalidApiKey","message":"invalid api key"}"#;
+        let out: Value = serde_json::from_slice(&to_anthropic_error(body)).unwrap();
+        assert_eq!(out["error"]["type"], "authentication_error");
+        assert_eq!(out["error"]["message"], "invalid api key");
+    }
+
+    #[test]
+    fn upstream_error_unparseable_falls_back_to_raw() {
+        // 非 JSON body:兜底 "upstream error"
+        let out: Value = serde_json::from_slice(&to_anthropic_error(b"<html>502 bad gateway</html>")).unwrap();
+        assert_eq!(out["error"]["type"], "api_error");
+        assert_eq!(out["error"]["message"], "<html>502 bad gateway</html>");
     }
 }
