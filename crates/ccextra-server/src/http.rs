@@ -603,67 +603,116 @@ async fn handle_messages(
         (None, None)
     };
 
-    let upstream = upstream_client
-        .request(
-            &upstream_base_url,
-            &upstream_key,
-            route.protocol,
-            upstream_proxy.as_deref(),
-            &body_json,
-            is_stream,
-            session_id,
-            thread_id.as_deref(),
-            &extra_headers,
-        )
-        .await?;
-    let status = upstream.status;
+    let mut upstream = Some(
+        upstream_client
+            .request(
+                &upstream_base_url,
+                &upstream_key,
+                route.protocol,
+                upstream_proxy.as_deref(),
+                &body_json,
+                is_stream,
+                session_id,
+                thread_id.as_deref(),
+                &extra_headers,
+            )
+            .await?,
+    );
+    let mut status = upstream.as_ref().expect("上游响应应存在").status;
+    let mut preloaded_stream = None;
 
-    // 诊断:落盘上游响应元信息(与 upstream_body_* 同目录、同会话命名)。
-    // 记录响应头里的上游节点指纹(cf-ray / x-request-id / server / alt-svc /
-    // via / x-served-by / x-cache-status 等),用于判断同一 prompt_cache_key
-    // 的请求是否被网关轮转/分流到不同后端缓存分区——这是缓存批量失效
-    // (命中序列周期性整段归零)的典型外因,请求体逐字节稳定时优先查这里。
-    // 流式响应额外带 response_id(首个 response.created 事件即到,比头部更强
-    // 的会话指纹),从转换前的原始字节流捕获;非流式不上 SSE,拿不到 → null。
-    let meta_base = if log_request_body {
-        let mut rh = serde_json::Map::new();
-        for name in [
-            "cf-ray",
-            "x-request-id",
-            "x-response-id",
-            "server",
-            "alt-svc",
-            "via",
-            "x-served-by",
-            "x-cache-status",
-            "cf-cache-status",
-            "age",
-        ] {
-            if let Some(val) = upstream.body.headers().get(name) {
-                rh.insert(name.into(), json!(val.to_str().unwrap_or("")));
+    // OpenAI 流在首个 Anthropic SSE 帧前失败时，尚未向客户端输出，可重试一次。
+    // 已取得首帧后立即放行，后续流保持实时转发，不缓冲完整响应。
+    if is_stream
+        && matches!(
+            route.protocol,
+            Protocol::OpenAiChat | Protocol::OpenAiResponses
+        )
+        && status.is_success()
+    {
+        for attempt in 0..=1 {
+            let current = upstream.take().expect("上游响应应存在");
+            status = current.status;
+            let meta_base = upstream_meta_base(
+                log_request_body,
+                current.body.headers(),
+                ts,
+                request_seq,
+                &sess,
+                &proto,
+                &model,
+                &route.upstream_model,
+                status,
+                &body_json,
+            );
+            // 基础 meta 先落盘:错误响应、流式提前断开也保留响应头指纹。
+            let initial_meta_written = meta_base.as_ref().map(write_upstream_meta).unwrap_or(true);
+            let mut out = relay_stream_with_meta(
+                route.protocol,
+                current.body.bytes_stream(),
+                estimated_input_tokens,
+                tool_names.clone(),
+                meta_base,
+                initial_meta_written,
+            );
+            let first = out.next().await;
+            let retry = match &first {
+                Some(Ok(frame)) => is_initial_sse_error(frame),
+                Some(Err(_)) | None => true,
+            };
+            if retry && attempt == 0 {
+                tracing::warn!(
+                    protocol = ?route.protocol,
+                    retry_attempt = attempt + 1,
+                    "首帧转换失败，重试上游请求"
+                );
+                upstream = Some(
+                    upstream_client
+                        .request(
+                            &upstream_base_url,
+                            &upstream_key,
+                            route.protocol,
+                            upstream_proxy.as_deref(),
+                            &body_json,
+                            is_stream,
+                            session_id,
+                            thread_id.as_deref(),
+                            &extra_headers,
+                        )
+                        .await?,
+                );
+                status = upstream.as_ref().expect("上游响应应存在").status;
+                if !status.is_success() {
+                    break;
+                }
+                continue;
             }
+            let Some(first) = first else {
+                return Err(AppError::new(anyhow::anyhow!("上游流在首帧前结束")));
+            };
+            preloaded_stream = Some(prepend_sse_frame(first, out));
+            break;
         }
-        Some(json!({
-            "ts": ts,
-            "request_seq": request_seq,
-            "session": sess,
-            "protocol": proto,
-            "model": model,
-            "upstream_model": route.upstream_model,
-            "status": status.as_u16(),
-            "prompt_cache_key": body_json.get("prompt_cache_key"),
-            "response_id": Value::Null,
-            "headers": rh,
-        }))
-    } else {
-        None
-    };
-    // 基础 meta 先落盘:错误响应、流式提前断开也保留响应头指纹。
-    let initial_meta_written = meta_base.as_ref().map(write_upstream_meta).unwrap_or(true);
+    }
 
     // 上游错误:转 anthropic error 形状
     // (OpenAI 的 {"error":{...}} 直接透传客户端不认,对齐 WriteErrorResponse)
     if !status.is_success() {
+        let upstream = upstream.take().expect("上游响应应存在");
+        if let Some(meta) = upstream_meta_base(
+            log_request_body,
+            upstream.body.headers(),
+            ts,
+            request_seq,
+            &sess,
+            &proto,
+            &model,
+            &route.upstream_model,
+            status,
+            &body_json,
+        ) {
+            write_upstream_meta(&meta);
+        }
         let body_bytes = upstream.body.bytes().await?;
         return Response::builder()
             .status(status)
@@ -674,61 +723,32 @@ async fn handle_messages(
 
     // 7. 响应转换
     if is_stream {
-        // 流式:claude 直通字节转发;转换路径走 SSE 状态机
-        let stream = upstream.body.bytes_stream();
-        let out = if let Some(meta) = meta_base.as_ref() {
-            // 诊断:从转换前的原始字节流捕获 response_id(inspect 只借不消费,
-            // 字节仍进 relay 转换)。基础 meta 已在 headers 阶段落盘;捕获到
-            // response_id 后覆盖同一文件。客户端中途断开时,基础 meta 仍保留。
-            let shared = Arc::new(StdMutex::new(meta.clone()));
-            let written = Arc::new(AtomicBool::new(initial_meta_written));
-            let sh = Arc::clone(&shared);
-            let wr = Arc::clone(&written);
-            let out = if matches!(route.protocol, Protocol::OpenAiResponses) {
-                let scanner = Arc::new(StdMutex::new(ResponsesIdScanner::new()));
-                let scan = Arc::clone(&scanner);
-                let tapped = stream.inspect(move |res| {
-                    if let Ok(bytes) = res {
-                        let id = scan.lock().unwrap().push(bytes);
-                        if let Some(id) = id {
-                            let mut meta = sh.lock().unwrap();
-                            meta["response_id"] = json!(id);
-                            let ok = write_upstream_meta(&meta);
-                            wr.store(ok, Ordering::Release);
-                        }
-                    }
-                });
-                let relayed =
-                    crate::sse::relay(route.protocol, tapped, estimated_input_tokens, tool_names);
-                let sh = Arc::clone(&shared);
-                let wr = Arc::clone(&written);
-                sse_meta_finalizer(relayed, move || {
-                    if let Some(id) = scanner.lock().unwrap().finish() {
-                        let mut meta = sh.lock().unwrap();
-                        meta["response_id"] = json!(id);
-                        let ok = write_upstream_meta(&meta);
-                        wr.store(ok, Ordering::Release);
-                    }
-                    if !wr.load(Ordering::Acquire) {
-                        let ok = write_upstream_meta(&sh.lock().unwrap());
-                        wr.store(ok, Ordering::Release);
-                    }
-                })
-            } else {
-                let relayed =
-                    crate::sse::relay(route.protocol, stream, estimated_input_tokens, tool_names);
-                let sh = Arc::clone(&shared);
-                let wr = Arc::clone(&written);
-                sse_meta_finalizer(relayed, move || {
-                    if !wr.load(Ordering::Acquire) {
-                        let ok = write_upstream_meta(&sh.lock().unwrap());
-                        wr.store(ok, Ordering::Release);
-                    }
-                })
-            };
+        // 流式:claude 直通字节转发;转换路径走 SSE 状态机。
+        let out = if let Some(out) = preloaded_stream {
             out
         } else {
-            crate::sse::relay(route.protocol, stream, estimated_input_tokens, tool_names)
+            let upstream = upstream.take().expect("上游响应应存在");
+            let meta_base = upstream_meta_base(
+                log_request_body,
+                upstream.body.headers(),
+                ts,
+                request_seq,
+                &sess,
+                &proto,
+                &model,
+                &route.upstream_model,
+                status,
+                &body_json,
+            );
+            let initial_meta_written = meta_base.as_ref().map(write_upstream_meta).unwrap_or(true);
+            relay_stream_with_meta(
+                route.protocol,
+                upstream.body.bytes_stream(),
+                estimated_input_tokens,
+                tool_names,
+                meta_base,
+                initial_meta_written,
+            )
         };
         Ok(Response::builder()
             .status(status)
@@ -739,6 +759,21 @@ async fn handle_messages(
     } else {
         // 非流:上游 JSON 转回 Anthropic messages 形状(Claude Code 的
         // 标题生成 / /compact 回退等非流式请求;claude 直通已是 Anthropic 形状)。
+        let upstream = upstream.take().expect("上游响应应存在");
+        if let Some(meta) = upstream_meta_base(
+            log_request_body,
+            upstream.body.headers(),
+            ts,
+            request_seq,
+            &sess,
+            &proto,
+            &model,
+            &route.upstream_model,
+            status,
+            &body_json,
+        ) {
+            write_upstream_meta(&meta);
+        }
         let body_bytes = upstream.body.bytes().await?;
         let converted = match serde_json::from_slice::<Value>(&body_bytes) {
             Ok(v) => match route.protocol {
@@ -804,7 +839,10 @@ fn to_anthropic_error(body: &[u8]) -> Vec<u8> {
 /// 顶层 `code`/`message`(百炼风格),message 为字符串时尝试二次解析嵌套 JSON。
 fn extract_upstream_error(body: &[u8]) -> (String, String) {
     let Ok(v) = serde_json::from_slice::<Value>(body) else {
-        return (String::new(), String::from_utf8_lossy(body).trim().to_string());
+        return (
+            String::new(),
+            String::from_utf8_lossy(body).trim().to_string(),
+        );
     };
 
     // OpenAI 标准结构
@@ -960,6 +998,119 @@ fn write_upstream_meta(meta: &Value) -> bool {
         tracing::warn!(path = %path, "上游响应元信息落盘失败");
     }
     ok
+}
+
+/// 构造上游响应诊断元信息。流式首帧重试后以最终响应头覆盖同一文件。
+#[allow(clippy::too_many_arguments)]
+fn upstream_meta_base(
+    enabled: bool,
+    headers: &reqwest::header::HeaderMap,
+    ts: u64,
+    request_seq: u64,
+    session: &str,
+    protocol: &str,
+    model: &str,
+    upstream_model: &str,
+    status: reqwest::StatusCode,
+    body: &Value,
+) -> Option<Value> {
+    if !enabled {
+        return None;
+    }
+    let mut response_headers = serde_json::Map::new();
+    for name in [
+        "cf-ray",
+        "x-request-id",
+        "x-response-id",
+        "server",
+        "alt-svc",
+        "via",
+        "x-served-by",
+        "x-cache-status",
+        "cf-cache-status",
+        "age",
+    ] {
+        if let Some(value) = headers.get(name) {
+            response_headers.insert(name.into(), json!(value.to_str().unwrap_or("")));
+        }
+    }
+    Some(json!({
+        "ts": ts,
+        "request_seq": request_seq,
+        "session": session,
+        "protocol": protocol,
+        "model": model,
+        "upstream_model": upstream_model,
+        "status": status.as_u16(),
+        "prompt_cache_key": body.get("prompt_cache_key"),
+        "response_id": Value::Null,
+        "headers": response_headers,
+    }))
+}
+
+/// 包裹转换流并维护可选响应诊断。首帧门控会先轮询该流，故诊断也必须在此处接入。
+fn relay_stream_with_meta<S>(
+    protocol: Protocol,
+    stream: S,
+    estimated_input_tokens: Option<usize>,
+    tool_names: Option<Arc<HashMap<String, String>>>,
+    meta_base: Option<Value>,
+    initial_meta_written: bool,
+) -> SseStreamPin
+where
+    S: futures::Stream<Item = Result<Bytes, reqwest::Error>> + Send + 'static,
+{
+    let Some(meta) = meta_base else {
+        return crate::sse::relay(protocol, stream, estimated_input_tokens, tool_names);
+    };
+    let shared = Arc::new(StdMutex::new(meta));
+    let written = Arc::new(AtomicBool::new(initial_meta_written));
+    if matches!(protocol, Protocol::OpenAiResponses) {
+        let scanner = Arc::new(StdMutex::new(ResponsesIdScanner::new()));
+        let scan = Arc::clone(&scanner);
+        let shared_for_scan = Arc::clone(&shared);
+        let written_for_scan = Arc::clone(&written);
+        let tapped = stream.inspect(move |result| {
+            if let Ok(bytes) = result {
+                if let Some(id) = scan.lock().unwrap().push(bytes) {
+                    let mut meta = shared_for_scan.lock().unwrap();
+                    meta["response_id"] = json!(id);
+                    let ok = write_upstream_meta(&meta);
+                    written_for_scan.store(ok, Ordering::Release);
+                }
+            }
+        });
+        let relayed = crate::sse::relay(protocol, tapped, estimated_input_tokens, tool_names);
+        sse_meta_finalizer(relayed, move || {
+            if let Some(id) = scanner.lock().unwrap().finish() {
+                let mut meta = shared.lock().unwrap();
+                meta["response_id"] = json!(id);
+                let ok = write_upstream_meta(&meta);
+                written.store(ok, Ordering::Release);
+            }
+            if !written.load(Ordering::Acquire) {
+                let ok = write_upstream_meta(&shared.lock().unwrap());
+                written.store(ok, Ordering::Release);
+            }
+        })
+    } else {
+        let relayed = crate::sse::relay(protocol, stream, estimated_input_tokens, tool_names);
+        sse_meta_finalizer(relayed, move || {
+            if !written.load(Ordering::Acquire) {
+                let ok = write_upstream_meta(&shared.lock().unwrap());
+                written.store(ok, Ordering::Release);
+            }
+        })
+    }
+}
+
+/// 首个转换帧已是 error 时，尚未向客户端发字节，可安全重试上游一次。
+fn is_initial_sse_error(frame: &Bytes) -> bool {
+    frame.starts_with(b"event: error\n")
+}
+
+fn prepend_sse_frame(first: Result<Bytes, std::io::Error>, rest: SseStreamPin) -> SseStreamPin {
+    Box::pin(futures::stream::once(async move { first }).chain(rest))
 }
 
 pub async fn serve(addr: &str, state: AppState) -> anyhow::Result<()> {
@@ -1293,6 +1444,78 @@ data: {"type":"response.created","response":{"id":"resp_eof"}}"#
             reload: reload_returning_secret(None),
             drift: DriftState::new(1000),
         }
+    }
+
+    /// 首次上游 200 空流尚未向客户端输出时，应重试一次并转发第二次结果。
+    #[tokio::test]
+    async fn test_openai_responses_retries_empty_stream_before_output() {
+        use ccextra_core::route::{ModelConfig, Protocol};
+
+        let attempts = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+        let handler_attempts = Arc::clone(&attempts);
+        let upstream = Router::new().route(
+            "/responses",
+            post(move || {
+                let attempts = Arc::clone(&handler_attempts);
+                async move {
+                    let body = if attempts.fetch_add(1, Ordering::SeqCst) == 0 {
+                        String::new()
+                    } else {
+                        concat!(
+                            "event: response.created\n",
+                            "data: {\"type\":\"response.created\",\"response\":{\"id\":\"resp_retry\",\"model\":\"gpt-5\"}}\n\n",
+                            "event: response.output_text.delta\n",
+                            "data: {\"type\":\"response.output_text.delta\",\"delta\":\"retry ok\"}\n\n",
+                            "event: response.completed\n",
+                            "data: {\"type\":\"response.completed\",\"response\":{\"id\":\"resp_retry\",\"output\":[],\"usage\":{\"input_tokens\":1,\"output_tokens\":1}}}\n\n"
+                        )
+                        .to_string()
+                    };
+                    ([(header::CONTENT_TYPE, "text/event-stream")], body)
+                }
+            }),
+        );
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let upstream_addr = listener.local_addr().unwrap();
+        let server = tokio::spawn(async move {
+            axum::serve(listener, upstream).await.unwrap();
+        });
+
+        let state = mock_state();
+        state.providers.write().await.push(ProviderConfig {
+            name: "test-responses".into(),
+            protocol: Protocol::OpenAiResponses,
+            base_url: format!("http://{upstream_addr}"),
+            key: "sk-test".into(),
+            proxy_url: Some("direct".into()),
+            prompt_cache_key: false,
+            models: vec![ModelConfig {
+                name: "gpt-5".into(),
+                alias: "test-responses".into(),
+                ..Default::default()
+            }],
+        });
+        let app = app(state);
+        let request = Request::builder()
+            .uri("/v1/messages")
+            .method("POST")
+            .header("content-type", "application/json")
+            .body(Body::from(
+                serde_json::to_vec(&json!({
+                    "model": "test-responses",
+                    "max_tokens": 64,
+                    "stream": true,
+                    "messages": [{"role": "user", "content": "hi"}]
+                }))
+                .unwrap(),
+            ))
+            .unwrap();
+        let response = app.oneshot(request).await.unwrap();
+        let response_body = to_bytes(response.into_body(), 1024 * 1024).await.unwrap();
+        server.abort();
+
+        assert_eq!(attempts.load(Ordering::SeqCst), 2);
+        assert!(String::from_utf8_lossy(&response_body).contains("retry ok"));
     }
 
     #[tokio::test]
@@ -1952,7 +2175,8 @@ data: {"type":"response.created","response":{"id":"resp_eof"}}"#
     #[test]
     fn upstream_error_unparseable_falls_back_to_raw() {
         // 非 JSON body:兜底 "upstream error"
-        let out: Value = serde_json::from_slice(&to_anthropic_error(b"<html>502 bad gateway</html>")).unwrap();
+        let out: Value =
+            serde_json::from_slice(&to_anthropic_error(b"<html>502 bad gateway</html>")).unwrap();
         assert_eq!(out["error"]["type"], "api_error");
         assert_eq!(out["error"]["message"], "<html>502 bad gateway</html>");
     }

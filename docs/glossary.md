@@ -127,7 +127,7 @@ OpenAI chat/responses 的缓存桶标识。对齐 codex CLI 0.147 `prompt_cache_
 responses 路径的加密思考跨轮闭环:上游 `reasoning_summary_text.delta` 流式转 `thinking_delta`(可见),`output_item.done` 的 `encrypted_content` 以 `signature_delta` 收尾;下一轮请求侧把 `thinking.signature` 转回 `reasoning.encrypted_content`。对齐该语义,替代旧的 redacted_thinking 方案(形状不合规范且请求侧丢弃)。
 
 **断流兜底**  
-上游流中断或 EOF 未发终止事件时,状态机兜底发 anthropic `error` 事件(流内错误)或补 `message_delta` + `message_stop`(静默断流),不裸断流。responses 空轮次/纯思考轮次合成空 text 块(Claude 客户端遇零块消息报 "Content block not found")。
+OpenAI 转换流尚未输出首个 Anthropic SSE 帧时，若首帧为 `error`，重试上游一次；仅门控首帧，不缓冲完整响应。第二次仍失败、或已输出首帧后发生上游传输错误/EOF 未满足协议终态时，状态机只发 anthropic `error`，不伪造 `message_start` 或正常收尾帧。Chat 的 `[DONE]` 是显式终态；未收到 `[DONE]` 的 EOF 需已有 `finish_reason`。Responses 仅 `response.completed` / `response.incomplete` 正常收尾；`response.failed` 与 `error` 为错误终态。终态后忽略后续帧。responses 空轮次/纯思考轮次合成空 text 块(Claude 客户端遇零块消息报 "Content block not found")。
 
 **诊断落盘**  
 `logging.request_body: true` 时逐请求把最终上游 body 落盘 `logs/upstream_body_<session前8>_<毫秒>.<protocol>.json`,供逐轮 diff 定位缓存漂移。另含入站 `request_body` 调试日志。

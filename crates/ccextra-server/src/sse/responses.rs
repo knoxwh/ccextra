@@ -149,6 +149,10 @@ impl ResponsesRelay {
 
     /// 处理一个 SSE 事件,产出 anthropic 字节事件
     fn process(&mut self, ev: &super::parser::SseEvent) -> Vec<Bytes> {
+        // 已收尾:忽略后续事件,避免 error 后再输出正常收尾事件。
+        if self.finished {
+            return Vec::new();
+        }
         let root: Value = match serde_json::from_str(&ev.data) {
             Ok(v) => v,
             Err(_) => return Vec::new(),
@@ -163,9 +167,13 @@ impl ResponsesRelay {
         }
 
         match event_type {
-            "error" => vec![stream_error_frame(&root)],
-            // 官方 Codex 终态错误事件:error 嵌在 response.error,提升为顶层复用映射
+            "error" => {
+                self.finished = true;
+                vec![stream_error_frame(&root)]
+            }
+            // OpenAI Responses 终态错误事件:error 嵌在 response.error,提升为顶层复用映射
             "response.failed" => {
+                self.finished = true;
                 let mut failed_root = root.clone();
                 if failed_root.get("error").is_none() {
                     if let Some(err) = failed_root.pointer("/response/error") {
@@ -1006,29 +1014,28 @@ impl ResponsesRelay {
         out
     }
 
-    /// EOF 兜底:上游没发 completed 也保证完整收尾
+    /// EOF 兜底:未收到 Responses 终态时显式报 error,不把半个回答包装成正常完成。
     fn finish(&mut self) -> Vec<Bytes> {
         if self.finished {
             return Vec::new();
         }
-        self.finalize(None)
+        // completed/incomplete 分支必已 finalize 置 finished,到此即残缺
+        self.stream_error("upstream stream ended before response completion")
     }
 
-    /// 上游流中断:发 anthropic error 事件收尾(对齐 code_handlers)
+    /// 上游流中断:发 Anthropic error 事件,不伪造 message_start。
     fn stream_error(&mut self, message: &str) -> Vec<Bytes> {
         if self.finished {
             return Vec::new();
         }
         self.finished = true;
-        let mut frames = self.ensure_started();
-        frames.push(sse(
+        vec![sse(
             "error",
             &json!({
                 "type": "error",
                 "error": {"type": "api_error", "message": message}
             }),
-        ));
-        frames
+        )]
     }
 }
 
@@ -1163,6 +1170,7 @@ fn should_defer_stream_event(root: &Value, event_type: &str) -> bool {
     match event_type {
         // 永不 defer:错误/收尾/参数增量(需在函数调用间隙立即处理)
         "error"
+        | "response.failed"
         | "response.completed"
         | "response.incomplete"
         | "response.function_call_arguments.delta"
@@ -1335,7 +1343,7 @@ where
                 yield Ok(out);
             }
         }
-        // EOF 兜底:上游没发 completed 也保证 message_delta + message_stop
+        // EOF 兜底:未见 Responses 终态的残缺流由状态机转 error。
         for out in relay.finish() {
             yield Ok(out);
         }
@@ -1569,6 +1577,43 @@ mod tests {
     }
 
     #[test]
+    fn test_response_failed_during_function_call_is_immediate() {
+        let mut r = ResponsesRelay::new(None);
+        r.process(&created());
+        r.process(&ev(
+            r#"{"type":"response.output_item.added","item":{"type":"function_call","call_id":"call_1","name":"get_weather","output_index":0}}"#,
+        ));
+        let out = r.process(&ev(
+            r#"{"type":"response.failed","response":{"status":"failed","error":{"type":"server_error","message":"boom"}}}"#,
+        ));
+        let s = s(&out);
+        assert!(s.starts_with("event: error"), "失败事件不得延迟,实际: {s}");
+        assert!(s.contains("server_error"), "应保留上游错误类型,实际: {s}");
+        assert!(s.contains("boom"), "应保留上游错误消息,实际: {s}");
+        assert!(r.finish().is_empty(), "失败后 finish 应为空");
+    }
+
+    #[test]
+    fn test_error_event_stops_followup_events() {
+        // 上游 error 后仍发正常事件(部分网关 overloaded 后混续):只保留 error,
+        // 不得再产出 text/delta/stop 混合流,否则 SDK 判 "malformed"。
+        let mut r = ResponsesRelay::new(None);
+        r.process(&created());
+        let out = r.process(&ev(
+            r#"{"type":"error","error":{"type":"overloaded_error","message":"servers overloaded"}}"#,
+        ));
+        assert!(out.iter().any(|b| b.starts_with(b"event: error")));
+        // 后续 completed 等事件一律忽略
+        let after = r.process(&ev(
+            r#"{"type":"response.completed","response":{"id":"r1","output":[]}}"#,
+        ));
+        assert!(after.is_empty(), "error 后不得继续处理,实际: {after:?}");
+        // finish 兜底也不得再产 message_delta/stop
+        let fin = r.finish();
+        assert!(fin.is_empty(), "error 后 finish 应为空,实际: {fin:?}");
+    }
+
+    #[test]
     fn test_stop_reason_mappings() {
         assert_eq!(map_stop_reason("content_filter", false), "refusal");
         assert_eq!(map_stop_reason("max_output_tokens", false), "max_tokens");
@@ -1622,16 +1667,52 @@ mod tests {
     }
 
     #[test]
-    fn test_finish_eof_fallback() {
+    fn test_finish_eof_after_completed_keeps_normal() {
+        // 正常 completed 后 finish 幂等,不再产出(已完成流)
+        let mut r = ResponsesRelay::new(None);
+        r.process(&ev(
+            r#"{"type":"response.completed","response":{"id":"r1","output":[]}}"#,
+        ));
+        assert!(r.finish().is_empty());
+    }
+
+    #[test]
+    fn test_finish_eof_without_completed_errors() {
+        // 残缺流:已发 content delta 但未 completed 就 EOF,显式报 error,不包装成正常收尾
         let mut r = ResponsesRelay::new(None);
         r.process(&created());
+        r.process(&ev(
+            r#"{"type":"response.output_text.delta","delta":"partial"}"#,
+        ));
         let out = r.finish();
         let bufs = out.concat();
         let s = String::from_utf8_lossy(&bufs);
-        assert!(s.contains("message_delta"));
-        assert!(s.contains("message_stop"));
+        assert!(s.contains("event: error"), "残缺流应发 error 帧,实际: {s}");
+        assert!(
+            !s.contains("message_delta"),
+            "残缺流不得发正常 message_delta,实际: {s}"
+        );
+        assert!(
+            !s.contains("message_stop"),
+            "残缺流不得发正常 message_stop,实际: {s}"
+        );
         // 二次 finish 幂等
         assert!(r.finish().is_empty());
+    }
+
+    #[test]
+    fn test_finish_eof_empty_stream_errors() {
+        // 空流:一个事件都没有,EOF 直接报 error
+        let mut r = ResponsesRelay::new(None);
+        let out = r.finish();
+        let bufs = out.concat();
+        let s = String::from_utf8_lossy(&bufs);
+        assert!(s.contains("event: error"), "空流应发 error 帧,实际: {s}");
+        assert!(
+            !s.contains("message_start"),
+            "空流不得伪造 message_start,实际: {s}"
+        );
+        assert!(!s.contains("message_stop"));
     }
 
     #[test]

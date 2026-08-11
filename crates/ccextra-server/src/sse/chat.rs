@@ -91,15 +91,26 @@ impl ChatRelay {
 
     /// 处理一个 SSE 事件,产出 anthropic 字节事件
     fn process(&mut self, ev: &super::parser::SseEvent) -> Vec<Bytes> {
+        if self.finished {
+            return Vec::new();
+        }
         // [DONE] 标记
         if ev.data.trim() == "[DONE]" {
-            return self.finish();
+            return self.finish_done_marker();
         }
 
         let root: Value = match serde_json::from_str(&ev.data) {
             Ok(v) => v,
             Err(_) => return Vec::new(),
         };
+        if let Some(error) = root.get("error").filter(|error| error.is_object()) {
+            let message = error
+                .get("message")
+                .and_then(|value| value.as_str())
+                .or_else(|| root.get("message").and_then(|value| value.as_str()))
+                .unwrap_or("upstream returned an error");
+            return self.stream_error(message);
+        }
 
         // 身份 + usage(任意 chunk 缓存)
         if !self.started {
@@ -191,29 +202,41 @@ impl ChatRelay {
         self.usage_seen = true;
     }
 
-    /// 流结束([DONE] 或 EOF):兜底 finalize
-    fn finish(&mut self) -> Vec<Bytes> {
+    /// [DONE] 是 Chat 的显式终态;已开始消息即使缺 finish_reason 也按 end_turn 收尾。
+    fn finish_done_marker(&mut self) -> Vec<Bytes> {
         if self.finished {
             return Vec::new();
+        }
+        if !self.started {
+            return self.stream_error("upstream stream ended before response start");
         }
         self.finalize()
     }
 
-    /// 上游流中断:发 anthropic error 事件收尾(对齐 code_handlers 断流兜底)
+    /// EOF 兜底:未见 Chat 终态时显式报 error,不把半个回答包装成正常完成。
+    fn finish_eof(&mut self) -> Vec<Bytes> {
+        if self.finished {
+            return Vec::new();
+        }
+        if self.finish_reason.is_empty() {
+            return self.stream_error("upstream stream ended before completion");
+        }
+        self.finalize()
+    }
+
+    /// 上游流中断:发 Anthropic error 事件,不伪造 message_start。
     fn stream_error(&mut self, message: &str) -> Vec<Bytes> {
         if self.finished {
             return Vec::new();
         }
         self.finished = true;
-        let mut frames = self.ensure_started();
-        frames.push(sse(
+        vec![sse(
             "error",
             &json!({
                 "type": "error",
                 "error": {"type": "api_error", "message": message}
             }),
-        ));
-        frames
+        )]
     }
 
     /// 统一收尾:close active + flush tool calls + message_delta + message_stop
@@ -628,8 +651,8 @@ where
                 yield Ok(out);
             }
         }
-        // EOF 兜底:上游没发 [DONE] 时也保证 message_delta + message_stop
-        for out in relay.finish() {
+        // EOF 兜底:未见终态的残缺流由状态机转 error。
+        for out in relay.finish_eof() {
             yield Ok(out);
         }
     })
@@ -792,14 +815,119 @@ mod tests {
     }
 
     #[test]
-    fn test_done_marker_triggers_finish() {
+    fn test_done_marker_without_message_errors() {
+        // 空流仅收到 [DONE]:没有有效消息可收尾,显式报 error。
         let mut r = ChatRelay::new(None);
-        r.started = true; // 模拟已开始
         let out = r.process(&super::super::parser::SseEvent {
             event: None,
             data: "[DONE]".into(),
         });
-        assert!(out.iter().any(|b| b.starts_with(b"event: message_stop")));
+        let buf = out.concat();
+        let s = String::from_utf8_lossy(&buf);
+        assert!(s.contains("event: error"), "残缺 DONE 应发 error,实际: {s}");
+        assert!(
+            !s.contains("message_start"),
+            "残缺流不得伪造 message_start,实际: {s}"
+        );
+        assert!(
+            !s.contains("message_stop"),
+            "残缺流不得发 message_stop,实际: {s}"
+        );
+    }
+
+    #[test]
+    fn test_done_marker_after_content_without_finish_reason_finalizes() {
+        let mut r = ChatRelay::new(None);
+        r.process(&super::super::parser::SseEvent {
+            event: None,
+            data: r#"{"id":"1","model":"m","choices":[{"delta":{"content":"hi"}}]}"#.into(),
+        });
+        let out = r.process(&super::super::parser::SseEvent {
+            event: None,
+            data: "[DONE]".into(),
+        });
+        let buf = out.concat();
+        let s = String::from_utf8_lossy(&buf);
+        assert!(
+            s.contains("event: message_delta"),
+            "[DONE] 应完成消息,实际: {s}"
+        );
+        assert!(
+            s.contains("event: message_stop"),
+            "[DONE] 应停止消息,实际: {s}"
+        );
+        assert!(!s.contains("event: error"), "[DONE] 不应转 error,实际: {s}");
+    }
+
+    #[test]
+    fn test_eof_after_content_without_terminal_errors() {
+        let mut r = ChatRelay::new(None);
+        r.process(&super::super::parser::SseEvent {
+            event: None,
+            data: r#"{"id":"1","model":"m","choices":[{"delta":{"content":"partial"}}]}"#.into(),
+        });
+        let out = r.finish_eof();
+        let buf = out.concat();
+        let s = String::from_utf8_lossy(&buf);
+        assert!(s.contains("event: error"), "残缺 EOF 应发 error,实际: {s}");
+        assert!(
+            !s.contains("message_delta"),
+            "残缺 EOF 不得发正常 message_delta,实际: {s}"
+        );
+        assert!(
+            !s.contains("message_stop"),
+            "残缺 EOF 不得发正常 message_stop,实际: {s}"
+        );
+    }
+
+    #[test]
+    fn test_error_terminal_ignores_followup_chunk() {
+        let mut r = ChatRelay::new(None);
+        r.process(&super::super::parser::SseEvent {
+            event: None,
+            data: "[DONE]".into(),
+        });
+        let out = r.process(&super::super::parser::SseEvent {
+            event: None,
+            data: r#"{"id":"1","model":"m","choices":[{"delta":{"content":"late"}}]}"#.into(),
+        });
+        assert!(out.is_empty(), "error 后续 chunk 应忽略,实际: {out:?}");
+    }
+
+    #[test]
+    fn test_top_level_error_is_forwarded() {
+        let mut r = ChatRelay::new(None);
+        let out = r.process(&super::super::parser::SseEvent {
+            event: None,
+            data: r#"{"error":{"message":"upstream overloaded"}}"#.into(),
+        });
+        let buf = out.concat();
+        let s = String::from_utf8_lossy(&buf);
+        assert!(
+            s.starts_with("event: error"),
+            "顶层 error 应立即转发,实际: {s}"
+        );
+        assert!(
+            s.contains("upstream overloaded"),
+            "应保留上游错误消息,实际: {s}"
+        );
+    }
+
+    #[test]
+    fn test_done_marker_after_finish_reason_stops() {
+        // 正常完成:finish_reason 已由 process 收尾,后续 [DONE] 幂等为空
+        let mut r = ChatRelay::new(None);
+        r.process(&super::super::parser::SseEvent {
+            event: None,
+            data: r#"{"id":"1","model":"m","usage":{"prompt_tokens":1,"completion_tokens":1},
+                "choices":[{"delta":{"content":"hi"},"finish_reason":"stop"}]}"#
+                .into(),
+        });
+        let out = r.process(&super::super::parser::SseEvent {
+            event: None,
+            data: "[DONE]".into(),
+        });
+        assert!(out.is_empty(), "已收尾后 [DONE] 应为空,实际: {out:?}");
     }
 
     #[test]

@@ -100,7 +100,11 @@ openai responses: relay_responses_to_anthropic
                   encrypted_content→signature_delta)
 ```
 
-上游流中断 → 发 anthropic `error` 事件收尾，不裸断流；EOF 兜底保证 `message_delta` + `message_stop`。
+OpenAI 转换流在尚未输出首个 Anthropic SSE 帧时，若首帧为 `error`，重试上游一次；仅门控首帧，不全量缓冲。第二次仍失败、或已输出首帧后的传输错误/未满足终态 EOF，发 anthropic `error` 事件，不裸断流，也不补造 `message_start`、`message_delta` 或 `message_stop`。
+
+- OpenAI Chat：`[DONE]` 是显式终态；已开始的消息即使没有 `finish_reason` 也正常收尾。未收到 `[DONE]` 的 EOF 仅在已有 `finish_reason` 时正常收尾。
+- OpenAI Responses：`response.completed`、`response.incomplete` 正常收尾；`response.failed`、`error` 或缺少该终态的 EOF 发 `error`。
+- 状态机收尾后忽略后续上游事件，避免错误帧与正常收尾帧混合。
 
 ## 6. 管线流程
 
