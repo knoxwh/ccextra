@@ -14,8 +14,9 @@ use async_stream::stream;
 use bytes::Bytes;
 use futures::Stream;
 use futures::StreamExt;
-use serde_json::{json, Value};
+use serde_json::Value;
 
+use super::emit;
 use super::parser::SseParser;
 use super::SseStreamPin;
 use ccextra_core::convert::fix_json_quotes;
@@ -187,22 +188,10 @@ impl ChatRelay {
 
     /// 缓存 usage 并做 cached 减法(与 extractOpenAIUsage 一致)
     fn cache_usage(&mut self, usage: &Value) {
-        let mut input = usage
-            .get("prompt_tokens")
-            .and_then(|v| v.as_i64())
-            .unwrap_or(0);
-        self.usage_output = usage
-            .get("completion_tokens")
-            .and_then(|v| v.as_i64())
-            .unwrap_or(0);
-        self.usage_cached = usage
-            .pointer("/prompt_tokens_details/cached_tokens")
-            .and_then(|v| v.as_i64())
-            .unwrap_or(0);
-        if self.usage_cached > 0 {
-            input = (input - self.usage_cached).max(0);
-        }
+        let (input, output, cached) = super::extract_usage_chat(usage);
         self.usage_input = input;
+        self.usage_output = output;
+        self.usage_cached = cached;
         self.usage_seen = true;
     }
 
@@ -234,13 +223,7 @@ impl ChatRelay {
             return Vec::new();
         }
         self.finished = true;
-        vec![sse(
-            "error",
-            &json!({
-                "type": "error",
-                "error": {"type": "api_error", "message": message}
-            }),
-        )]
+        vec![emit::error_event(message)]
     }
 
     /// 统一收尾:close active + flush tool calls + message_delta + message_stop
@@ -261,16 +244,14 @@ impl ChatRelay {
         }
         self.flush_pending_tool_calls(&mut frames);
 
-        let mut event = json!({
-            "type": "message_delta",
-            "delta": {"stop_reason": map_finish_reason(&self.finish_reason), "stop_sequence": null},
-            "usage": {"input_tokens": self.usage_input, "output_tokens": self.usage_output}
-        });
-        if self.usage_cached > 0 {
-            event["usage"]["cache_read_input_tokens"] = json!(self.usage_cached);
-        }
-        frames.push(sse("message_delta", &event));
-        frames.push(sse("message_stop", &json!({"type": "message_stop"})));
+        frames.push(emit::message_delta(
+            map_finish_reason(&self.finish_reason),
+            None,
+            self.usage_input,
+            self.usage_output,
+            self.usage_cached,
+        ));
+        frames.push(emit::message_stop());
 
         self.finished = true;
         frames
@@ -290,43 +271,26 @@ impl ChatRelay {
             return Vec::new();
         }
         self.started = true;
-        let usage = if self.usage_seen && (self.usage_input > 0 || self.usage_cached > 0) {
+        if self.usage_seen && (self.usage_input > 0 || self.usage_cached > 0) {
             // 真实 usage 已可用:input 为净值(已扣 cached),cache 如实上报。
-            // output 恒 0:Anthropic message_start 规范流开始无输出,且避免
-            // 非零 baseline 被 Claude 当作已输出叠加。
-            json!({
-                "input_tokens": self.usage_input,
-                "output_tokens": 0,
-                "cache_read_input_tokens": self.usage_cached,
-                "cache_creation_input_tokens": 0
-            })
+            vec![emit::message_start(
+                &self.id,
+                &self.model,
+                self.usage_input,
+                self.usage_cached,
+                false,
+            )]
         } else {
             // 上游未回真实 usage(主流上游 usage 只在流尾):入站估算占位,
-            // 量级接近真实;估算缺失时兜底 1,保证 context 不为 0。流尾
-            // message_delta 以真实值覆盖。未知的 cache 显式归零。
-            json!({
-                "input_tokens": self.estimated_input.unwrap_or(1),
-                "output_tokens": 0,
-                "cache_read_input_tokens": 0,
-                "cache_creation_input_tokens": 0
-            })
-        };
-        vec![sse(
-            "message_start",
-            &json!({
-                "type": "message_start",
-                "message": {
-                    "id": self.id,
-                    "type": "message",
-                    "role": "assistant",
-                    "model": self.model,
-                    "content": [],
-                    "stop_reason": null,
-                    "stop_sequence": null,
-                    "usage": usage
-                }
-            }),
-        )]
+            // 量级接近真实;估算缺失时兜底 1。
+            vec![emit::message_start(
+                &self.id,
+                &self.model,
+                self.estimated_input.unwrap_or(1) as i64,
+                0,
+                true,
+            )]
+        }
     }
 
     /// 发 content_block_delta,自动开块(切换类型先 close 当前)
@@ -337,14 +301,10 @@ impl ChatRelay {
         let Some((_, index)) = self.active_block else {
             return frames;
         };
-        let delta = match block_type {
-            BlockType::Text => json!({"type": "text_delta", "text": content}),
-            BlockType::Thinking => json!({"type": "thinking_delta", "thinking": content}),
-        };
-        frames.push(sse(
-            "content_block_delta",
-            &json!({"type": "content_block_delta", "index": index, "delta": delta}),
-        ));
+        frames.push(match block_type {
+            BlockType::Text => emit::content_block_delta_text(index, content),
+            BlockType::Thinking => emit::content_block_delta_thinking(index, content),
+        });
         frames
     }
 
@@ -359,14 +319,10 @@ impl ChatRelay {
         self.close_active_block(&mut frames);
         let index = self.next_block_index;
         self.next_block_index += 1;
-        let content_block = match block_type {
-            BlockType::Text => json!({"type": "text", "text": ""}),
-            BlockType::Thinking => json!({"type": "thinking", "thinking": ""}),
-        };
-        frames.push(sse(
-            "content_block_start",
-            &json!({"type": "content_block_start", "index": index, "content_block": content_block}),
-        ));
+        frames.push(match block_type {
+            BlockType::Text => emit::content_block_start_text(index),
+            BlockType::Thinking => emit::content_block_start_thinking(index),
+        });
         self.active_block = Some((block_type, index));
         frames
     }
@@ -374,10 +330,7 @@ impl ChatRelay {
     /// close 当前 active block
     fn close_active_block(&mut self, frames: &mut Vec<Bytes>) {
         if let Some((_, index)) = self.active_block.take() {
-            frames.push(sse(
-                "content_block_stop",
-                &json!({"type": "content_block_stop", "index": index}),
-            ));
+            frames.push(emit::content_block_stop(index));
         }
     }
 
@@ -468,14 +421,7 @@ impl ChatRelay {
         let name = call.name.clone();
         let index = call.block_index;
         call.start_emitted = true;
-        frames.push(sse(
-            "content_block_start",
-            &json!({
-                "type": "content_block_start",
-                "index": index,
-                "content_block": {"type": "tool_use", "id": id, "name": name, "input": {}}
-            }),
-        ));
+        frames.push(emit::content_block_start_tool_use(index, &id, &name));
     }
 
     /// 关闭所有待发 tool calls(发完整 input_json + stop)
@@ -500,19 +446,12 @@ impl ChatRelay {
             self.tool_use_start_frame(index, frames);
             let call = self.tool_calls.get(&index).unwrap();
             if !call.arguments.is_empty() {
-                frames.push(sse(
-                    "content_block_delta",
-                    &json!({
-                        "type": "content_block_delta",
-                        "index": call.block_index,
-                        "delta": {"type": "input_json_delta", "partial_json": fix_json_quotes(&call.arguments)}
-                    }),
+                frames.push(emit::content_block_delta_input_json(
+                    call.block_index,
+                    &fix_json_quotes(&call.arguments),
                 ));
             }
-            frames.push(sse(
-                "content_block_stop",
-                &json!({"type": "content_block_stop", "index": call.block_index}),
-            ));
+            frames.push(emit::content_block_stop(call.block_index));
             self.tool_calls.get_mut(&index).unwrap().closed = true;
         }
     }
@@ -537,19 +476,12 @@ impl ChatRelay {
                 (call.block_index, call.arguments.clone())
             };
             if !arguments.is_empty() {
-                frames.push(sse(
-                    "content_block_delta",
-                    &json!({
-                        "type": "content_block_delta",
-                        "index": block_index,
-                        "delta": {"type": "input_json_delta", "partial_json": fix_json_quotes(&arguments)}
-                    }),
+                frames.push(emit::content_block_delta_input_json(
+                    block_index,
+                    &fix_json_quotes(&arguments),
                 ));
             }
-            frames.push(sse(
-                "content_block_stop",
-                &json!({"type": "content_block_stop", "index": block_index}),
-            ));
+            frames.push(emit::content_block_stop(block_index));
             self.tool_calls.get_mut(&index).unwrap().closed = true;
         }
         frames
@@ -637,17 +569,6 @@ pub(super) fn map_finish_reason(reason: &str) -> &'static str {
     }
 }
 
-/// 序列化一个 SSE 事件:event 行 + data 行 + 空行
-fn sse(event: &str, data: &Value) -> Bytes {
-    let mut s = String::from("event: ");
-    s.push_str(event);
-    s.push('\n');
-    s.push_str("data: ");
-    s.push_str(&data.to_string());
-    s.push_str("\n\n");
-    Bytes::from(s)
-}
-
 /// Claude 直通:字节级转发,不解析
 pub fn relay_claude_passthrough<S>(stream: S) -> SseStreamPin
 where
@@ -703,10 +624,11 @@ where
 #[cfg(test)]
 mod tests {
     use super::*;
+    use serde_json::json;
 
     #[test]
     fn test_sse_format() {
-        let b = sse("message_start", &json!({"type": "message_start"}));
+        let b = emit::sse("message_start", &json!({"type": "message_start"}));
         assert_eq!(
             b,
             Bytes::from("event: message_start\ndata: {\"type\":\"message_start\"}\n\n")

@@ -18,6 +18,7 @@ use serde_json::{json, Value};
 use std::collections::{HashMap, HashSet};
 use std::sync::Arc;
 
+use super::emit;
 use super::parser::SseEvent;
 use super::parser::SseParser;
 use super::SseStreamPin;
@@ -464,29 +465,12 @@ impl ResponsesRelay {
         } else {
             self.model.as_str()
         };
-        vec![sse(
-            "message_start",
-            &json!({
-                "type": "message_start",
-                "message": {
-                    "id": self.id,
-                    "type": "message",
-                    "role": "assistant",
-                    "model": model,
-                    "content": [],
-                    "stop_reason": null,
-                    "stop_sequence": null,
-                    "usage": {
-                        // 上游流尾才带真实 usage,此处用入站估算占位(context 不跳
-                        // 1);估算缺失时兜底 1,保证不为 0。流尾 message_delta
-                        // 以真实值覆盖。
-                        "input_tokens": self.estimated_input.unwrap_or(1),
-                        "output_tokens": 0,
-                        "cache_read_input_tokens": 0,
-                        "cache_creation_input_tokens": 0
-                    }
-                }
-            }),
+        vec![emit::message_start(
+            &self.id,
+            model,
+            self.estimated_input.unwrap_or(1) as i64,
+            0,
+            true,
         )]
     }
 
@@ -497,14 +481,7 @@ impl ResponsesRelay {
         self.text_index = self.next_block_index;
         self.next_block_index += 1;
         self.text_open = true;
-        vec![sse(
-            "content_block_start",
-            &json!({
-                "type": "content_block_start",
-                "index": self.text_index,
-                "content_block": {"type": "text", "text": ""}
-            }),
-        )]
+        vec![emit::content_block_start_text(self.text_index)]
     }
 
     fn stop_text(&mut self) -> Vec<Bytes> {
@@ -512,21 +489,11 @@ impl ResponsesRelay {
             return Vec::new();
         }
         self.text_open = false;
-        vec![sse(
-            "content_block_stop",
-            &json!({"type": "content_block_stop", "index": self.text_index}),
-        )]
+        vec![emit::content_block_stop(self.text_index)]
     }
 
     fn text_delta(&self, text: &str) -> Vec<Bytes> {
-        vec![sse(
-            "content_block_delta",
-            &json!({
-                "type": "content_block_delta",
-                "index": self.text_index,
-                "delta": {"type": "text_delta", "text": text}
-            }),
-        )]
+        vec![emit::content_block_delta_text(self.text_index, text)]
     }
 
     fn start_thinking(&mut self) -> Vec<Bytes> {
@@ -536,27 +503,16 @@ impl ResponsesRelay {
         self.thinking_index = self.next_block_index;
         self.next_block_index += 1;
         self.thinking_open = true;
-        vec![sse(
-            "content_block_start",
-            &json!({
-                "type": "content_block_start",
-                "index": self.thinking_index,
-                "content_block": {"type": "thinking", "thinking": ""}
-            }),
-        )]
+        vec![emit::content_block_start_thinking(self.thinking_index)]
     }
 
     fn thinking_delta(&self, text: &str) -> Vec<Bytes> {
         if text.is_empty() || !self.thinking_open {
             return Vec::new();
         }
-        vec![sse(
-            "content_block_delta",
-            &json!({
-                "type": "content_block_delta",
-                "index": self.thinking_index,
-                "delta": {"type": "thinking_delta", "thinking": text}
-            }),
+        vec![emit::content_block_delta_thinking(
+            self.thinking_index,
+            text,
         )]
     }
 
@@ -567,19 +523,12 @@ impl ResponsesRelay {
         }
         let mut out = Vec::new();
         if !self.thinking_signature.is_empty() {
-            out.push(sse(
-                "content_block_delta",
-                &json!({
-                    "type": "content_block_delta",
-                    "index": self.thinking_index,
-                    "delta": {"type": "signature_delta", "signature": self.thinking_signature}
-                }),
+            out.push(emit::content_block_delta_signature(
+                self.thinking_index,
+                &self.thinking_signature,
             ));
         }
-        out.push(sse(
-            "content_block_stop",
-            &json!({"type": "content_block_stop", "index": self.thinking_index}),
-        ));
+        out.push(emit::content_block_stop(self.thinking_index));
         self.thinking_open = false;
         out
     }
@@ -879,15 +828,16 @@ impl ResponsesRelay {
             return out;
         }
 
-        let mut start = json!({
-            "type": "content_block_start",
-            "index": self.next_block_index,
-            "content_block": {"type": "web_search_tool_result", "tool_use_id": tool_use_id, "content": []}
-        });
-        if !result_content.is_empty() {
-            start["content_block"]["content"] = Value::Array(result_content);
-        }
-        out.push(sse("content_block_start", &start));
+        let result_content = if result_content.is_empty() {
+            json!([])
+        } else {
+            Value::Array(result_content)
+        };
+        out.push(emit::content_block_start_web_search_result(
+            self.next_block_index,
+            &tool_use_id,
+            &result_content,
+        ));
         out.push(content_block_stop(self.next_block_index));
         self.web_search_tool_result_ids.insert(tool_use_id.clone());
         self.next_block_index += 1;
@@ -913,12 +863,11 @@ impl ResponsesRelay {
         if !already_started {
             out.extend(self.stop_text());
             out.extend(self.finalize_thinking());
-            let start = json!({
-                "type": "content_block_start",
-                "index": self.next_block_index,
-                "content_block": {"type": "server_tool_use", "id": tool_use_id, "name": "web_search", "input": {}}
-            });
-            out.push(sse("content_block_start", &start));
+            out.push(emit::content_block_start_server_tool_use(
+                self.next_block_index,
+                &tool_use_id,
+                "web_search",
+            ));
         }
         if !query.is_empty() {
             let partial_json = serde_json::to_string(&json!({"query": query})).unwrap_or_default();
@@ -981,44 +930,23 @@ impl ResponsesRelay {
         out.extend(self.synthesize_empty_text_block());
 
         // usage(对齐 extractResponsesUsage:cached 从 input 扣除)
-        let mut input_tokens = 0;
-        let mut output_tokens = 0;
-        let mut cached = 0;
-        if let Some(usage) = response.and_then(|r| r.get("usage")) {
-            input_tokens = usage
-                .get("input_tokens")
-                .and_then(|v| v.as_i64())
-                .unwrap_or(0);
-            output_tokens = usage
-                .get("output_tokens")
-                .and_then(|v| v.as_i64())
-                .unwrap_or(0);
-            cached = usage
-                .pointer("/input_tokens_details/cached_tokens")
-                .and_then(|v| v.as_i64())
-                .unwrap_or(0);
-            if cached > 0 {
-                input_tokens = (input_tokens - cached).max(0);
-            }
-        }
+        let (input_tokens, output_tokens, cached) = response
+            .and_then(|r| r.get("usage"))
+            .map(super::extract_usage_responses)
+            .unwrap_or((0, 0, 0));
 
         let stop_seq = response.and_then(stop_sequence);
         let raw_reason = response.map(codex_stop_reason).unwrap_or_default();
         let stop_reason = map_stop_reason(&raw_reason, self.has_emitted_tool_use);
 
-        let mut event = json!({
-            "type": "message_delta",
-            "delta": {
-                "stop_reason": stop_reason,
-                "stop_sequence": stop_seq.clone().map(Value::String).unwrap_or(Value::Null)
-            },
-            "usage": {"input_tokens": input_tokens, "output_tokens": output_tokens}
-        });
-        if cached > 0 {
-            event["usage"]["cache_read_input_tokens"] = json!(cached);
-        }
-        out.push(sse("message_delta", &event));
-        out.push(sse("message_stop", &json!({"type": "message_stop"})));
+        out.push(emit::message_delta(
+            &stop_reason,
+            stop_seq.as_deref(),
+            input_tokens,
+            output_tokens,
+            cached,
+        ));
+        out.push(emit::message_stop());
         out
     }
 
@@ -1037,13 +965,7 @@ impl ResponsesRelay {
             return Vec::new();
         }
         self.finished = true;
-        vec![sse(
-            "error",
-            &json!({
-                "type": "error",
-                "error": {"type": "api_error", "message": message}
-            }),
-        )]
+        vec![emit::error_event(message)]
     }
 }
 
@@ -1096,10 +1018,7 @@ fn stream_error_frame(root: &Value) -> Bytes {
     if code == "cyber_policy" || err_type == "invalid_request" {
         err_type = "invalid_request_error".to_string();
     }
-    sse(
-        "error",
-        &json!({"type": "error", "error": {"type": err_type, "message": message}}),
-    )
+    emit::error_event_typed(&err_type, &message)
 }
 
 /// stop_reason 提取(对齐 codexStopReason):
@@ -1199,19 +1118,7 @@ fn should_defer_stream_event(root: &Value, event_type: &str) -> bool {
 
 /// tool_use 块 start(对齐 appendCodexFunctionCallStart)
 fn function_call_start(call_id: &str, name: &str, index: i64) -> Bytes {
-    sse(
-        "content_block_start",
-        &json!({
-            "type": "content_block_start",
-            "index": index,
-            "content_block": {
-                "type": "tool_use",
-                "id": sanitize_tool_id(call_id),
-                "name": name,
-                "input": {}
-            }
-        }),
-    )
+    emit::content_block_start_tool_use(index, &sanitize_tool_id(call_id), name)
 }
 
 /// custom 工具 input(字符串)→ tool_use.input 的 JSON 文本(包成 {"input": str})
@@ -1222,22 +1129,12 @@ fn custom_input_json(input: &str) -> String {
 
 /// input_json_delta(对齐 appendCodexFunctionCallArgumentDelta)
 fn function_call_argument_delta(partial_json: &str, index: i64) -> Bytes {
-    sse(
-        "content_block_delta",
-        &json!({
-            "type": "content_block_delta",
-            "index": index,
-            "delta": {"type": "input_json_delta", "partial_json": partial_json}
-        }),
-    )
+    emit::content_block_delta_input_json(index, partial_json)
 }
 
 /// 通用块 stop(对齐 appendCodexFunctionCallStop)
 fn content_block_stop(index: i64) -> Bytes {
-    sse(
-        "content_block_stop",
-        &json!({"type": "content_block_stop", "index": index}),
-    )
+    emit::content_block_stop(index)
 }
 
 /// 追加去重 key(对齐 appendUniqueCodexFunctionCallKey)
@@ -1301,17 +1198,6 @@ pub(super) fn web_search_result_content(root: &Value, item: &Value) -> Vec<Value
         }));
     }
     out
-}
-
-/// 序列化一个 SSE 事件
-fn sse(event: &str, data: &Value) -> Bytes {
-    let mut s = String::from("event: ");
-    s.push_str(event);
-    s.push('\n');
-    s.push_str("data: ");
-    s.push_str(&data.to_string());
-    s.push_str("\n\n");
-    Bytes::from(s)
 }
 
 /// OpenAI responses → Anthropic SSE 状态机(realtime)

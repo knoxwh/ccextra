@@ -141,26 +141,10 @@ pub fn responses_to_anthropic(
     }
 
     // usage:cached 从 input 扣(对齐 extractResponsesUsage)
-    let mut input_tokens = 0;
-    let mut output_tokens = 0;
-    let mut cached = 0;
-    if let Some(usage) = response.get("usage") {
-        input_tokens = usage
-            .get("input_tokens")
-            .and_then(|v| v.as_i64())
-            .unwrap_or(0);
-        output_tokens = usage
-            .get("output_tokens")
-            .and_then(|v| v.as_i64())
-            .unwrap_or(0);
-        cached = usage
-            .pointer("/input_tokens_details/cached_tokens")
-            .and_then(|v| v.as_i64())
-            .unwrap_or(0);
-        if cached > 0 {
-            input_tokens = (input_tokens - cached).max(0);
-        }
-    }
+    let (input_tokens, output_tokens, cached) = response
+        .get("usage")
+        .map(super::extract_usage_responses)
+        .unwrap_or((0, 0, 0));
 
     let stop_reason = map_stop_reason(&codex_stop_reason(response), has_tool_use);
     let stop_seq = stop_sequence(response);
@@ -240,26 +224,10 @@ pub fn openai_chat_to_anthropic(body: &Value) -> Option<Value> {
     }
 
     // usage:prompt_tokens/completion_tokens(对齐 OpenAI Chat API)
-    let mut input_tokens = 0;
-    let mut output_tokens = 0;
-    let mut cached = 0;
-    if let Some(usage) = body.get("usage") {
-        input_tokens = usage
-            .get("prompt_tokens")
-            .and_then(|v| v.as_i64())
-            .unwrap_or(0);
-        output_tokens = usage
-            .get("completion_tokens")
-            .and_then(|v| v.as_i64())
-            .unwrap_or(0);
-        cached = usage
-            .pointer("/prompt_tokens_details/cached_tokens")
-            .and_then(|v| v.as_i64())
-            .unwrap_or(0);
-        if cached > 0 {
-            input_tokens = (input_tokens - cached).max(0);
-        }
-    }
+    let (input_tokens, output_tokens, cached) = body
+        .get("usage")
+        .map(super::extract_usage_chat)
+        .unwrap_or((0, 0, 0));
 
     let stop_reason = if has_tool_use {
         "tool_use"

@@ -3,9 +3,11 @@
 // - parser:   手写 SSE 解析器(跨 chunk 累积)
 // - chat:     OpenAI chat SSE → Anthropic SSE 状态机
 // - responses: OpenAI responses SSE → Anthropic SSE 状态机
+// - emit:     无状态帧构造函数(chat/responses 共用)
 // - relay:    按协议分派响应流
 
 pub mod chat;
+pub mod emit;
 pub mod non_stream;
 pub mod parser;
 pub mod responses;
@@ -48,4 +50,48 @@ where
             responses::relay_responses_to_anthropic(stream, estimated_input_tokens, tool_names)
         }
     }
+}
+
+/// 从 OpenAI Chat usage 提取三元组(input, output, cached),cached 已从 input 扣除。
+///
+/// 对齐 extractOpenAIUsage:prompt_tokens - cached (if > 0)。
+pub fn extract_usage_chat(usage: &serde_json::Value) -> (i64, i64, i64) {
+    let mut input = usage
+        .get("prompt_tokens")
+        .and_then(|v| v.as_i64())
+        .unwrap_or(0);
+    let output = usage
+        .get("completion_tokens")
+        .and_then(|v| v.as_i64())
+        .unwrap_or(0);
+    let cached = usage
+        .pointer("/prompt_tokens_details/cached_tokens")
+        .and_then(|v| v.as_i64())
+        .unwrap_or(0);
+    if cached > 0 {
+        input = (input - cached).max(0);
+    }
+    (input, output, cached)
+}
+
+/// 从 OpenAI Responses usage 提取三元组(input, output, cached),cached 已从 input 扣除。
+///
+/// 对齐 extractResponsesUsage:input_tokens - cached (if > 0)。
+pub fn extract_usage_responses(usage: &serde_json::Value) -> (i64, i64, i64) {
+    let mut input = usage
+        .get("input_tokens")
+        .and_then(|v| v.as_i64())
+        .unwrap_or(0);
+    let output = usage
+        .get("output_tokens")
+        .and_then(|v| v.as_i64())
+        .unwrap_or(0);
+    let cached = usage
+        .pointer("/input_tokens_details/cached_tokens")
+        .and_then(|v| v.as_i64())
+        .unwrap_or(0);
+    if cached > 0 {
+        input = (input - cached).max(0);
+    }
+    (input, output, cached)
 }
