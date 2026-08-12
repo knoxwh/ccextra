@@ -47,8 +47,8 @@ fn endpoint_path(protocol: Protocol) -> &'static str {
 /// 分流缓存/特性,reqwest 默认 UA 会被识别为非官方客户端。
 fn user_agent(protocol: Protocol) -> &'static str {
     match protocol {
-        Protocol::Claude => "claude-cli/2.1.221",
-        Protocol::OpenAiChat => "claude-cli/2.1.221",
+        Protocol::Claude => "claude-cli/2.1.228",
+        Protocol::OpenAiChat => "claude-cli/2.1.228",
         Protocol::OpenAiResponses => {
             "codex-tui/0.147.0 (Mac OS 26.6.1; arm64) ghostty/1.3.1 (codex-tui; 0.147.0)"
         }
@@ -187,12 +187,12 @@ mod tests {
 
     #[test]
     fn test_user_agent_per_protocol() {
-        assert_eq!(user_agent(Protocol::OpenAiChat), "claude-cli/2.1.221");
+        assert_eq!(user_agent(Protocol::OpenAiChat), "claude-cli/2.1.228");
         assert_eq!(
             user_agent(Protocol::OpenAiResponses),
             "codex-tui/0.147.0 (Mac OS 26.6.1; arm64) ghostty/1.3.1 (codex-tui; 0.147.0)"
         );
-        assert_eq!(user_agent(Protocol::Claude), "claude-cli/2.1.221");
+        assert_eq!(user_agent(Protocol::Claude), "claude-cli/2.1.228");
     }
 
     #[test]
