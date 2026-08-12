@@ -99,7 +99,7 @@ struct ResponsesRelay {
 
     /// 工具名还原表 short→original(请求转换侧产出)
     tool_names: Option<Arc<HashMap<String, String>>>,
-    /// 入站 body 本地估算输入 token(ClaudeInputTokenState;上游未回则填充)
+    /// 入站 body 本地估算输入 token(http.rs 计算;上游流未回真实 usage 时占位)
     estimated_input: Option<usize>,
 }
 
@@ -476,7 +476,15 @@ impl ResponsesRelay {
                     "content": [],
                     "stop_reason": null,
                     "stop_sequence": null,
-                    "usage": {"input_tokens": self.estimated_input.unwrap_or(0), "output_tokens": 0}
+                    "usage": {
+                        // 上游流尾才带真实 usage,此处用入站估算占位(context 不跳
+                        // 1);估算缺失时兜底 1,保证不为 0。流尾 message_delta
+                        // 以真实值覆盖。
+                        "input_tokens": self.estimated_input.unwrap_or(1),
+                        "output_tokens": 0,
+                        "cache_read_input_tokens": 0,
+                        "cache_creation_input_tokens": 0
+                    }
                 }
             }),
         )]
@@ -1377,8 +1385,8 @@ mod tests {
     }
 
     #[test]
-    fn test_message_start_uses_estimated_input_when_upstream_silent() {
-        // 上游未回真实 usage 时,message_start 用入站 body 估算值填充
+    fn test_message_start_uses_estimated_when_upstream_silent() {
+        // 上游未回真实 usage 时,message_start 用入站估算占位(context 不跳 1)
         let mut r = ResponsesRelay::new(Some(1234));
         let out = r.process(&created());
         let start = out
@@ -1387,16 +1395,7 @@ mod tests {
             .expect("message_start 应存在");
         let v = frame_data(start);
         assert_eq!(v["message"]["usage"]["input_tokens"], 1234);
-
-        // 未传估算时维持 0(不臆造)
-        let mut r0 = ResponsesRelay::new(None);
-        let out0 = r0.process(&created());
-        let start0 = out0
-            .iter()
-            .find(|b| b.starts_with(b"event: message_start"))
-            .expect("message_start 应存在");
-        let v0 = frame_data(start0);
-        assert_eq!(v0["message"]["usage"]["input_tokens"], 0);
+        assert_eq!(v["message"]["usage"]["cache_read_input_tokens"], 0);
     }
 
     #[test]

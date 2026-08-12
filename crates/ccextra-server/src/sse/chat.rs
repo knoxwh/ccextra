@@ -63,7 +63,7 @@ struct ChatRelay {
     thinking_parts: Vec<String>,
     // 空 id 兜底合成计数(SanitizeClaudeToolID 同角色)
     synthetic_tool_ids: u64,
-    // 入站 body 本地估算输入 token(ClaudeInputTokenState;上游未回则填充)
+    // 入站 body 本地估算输入 token(http.rs 计算;上游流未回真实 usage 时占位)
     estimated_input: Option<usize>,
 }
 
@@ -264,11 +264,40 @@ impl ChatRelay {
     }
 
     /// 确保 message_start 已发
+    ///
+    /// usage 填充策略:process 开头已解析过任意 chunk 的 usage(部分上游首
+    /// chunk 即携带),有真实值用真实净值,cache 如实上报(全缓存回合净值
+    /// 可为 0,由 cache_read 撑起 context);否则用入站 body 本地估算占位
+    /// (占位兜底 1),让 cc context 过程中接近真实而非跳 1。流尾
+    /// message_delta 以真实 usage 覆盖(上游全程沉默属残缺上游,delta 如实
+    /// 报 0,不臆造)。cache 字段显式给出(0 或真实),不缺失,避免 Claude
+    /// 把 undefined 当未知叠加。
     fn ensure_started(&mut self) -> Vec<Bytes> {
         if self.started {
             return Vec::new();
         }
         self.started = true;
+        let usage = if self.usage_seen && (self.usage_input > 0 || self.usage_cached > 0) {
+            // 真实 usage 已可用:input 为净值(已扣 cached),cache 如实上报。
+            // output 恒 0:Anthropic message_start 规范流开始无输出,且避免
+            // 非零 baseline 被 Claude 当作已输出叠加。
+            json!({
+                "input_tokens": self.usage_input,
+                "output_tokens": 0,
+                "cache_read_input_tokens": self.usage_cached,
+                "cache_creation_input_tokens": 0
+            })
+        } else {
+            // 上游未回真实 usage(主流上游 usage 只在流尾):入站估算占位,
+            // 量级接近真实;估算缺失时兜底 1,保证 context 不为 0。流尾
+            // message_delta 以真实值覆盖。未知的 cache 显式归零。
+            json!({
+                "input_tokens": self.estimated_input.unwrap_or(1),
+                "output_tokens": 0,
+                "cache_read_input_tokens": 0,
+                "cache_creation_input_tokens": 0
+            })
+        };
         vec![sse(
             "message_start",
             &json!({
@@ -281,7 +310,7 @@ impl ChatRelay {
                     "content": [],
                     "stop_reason": null,
                     "stop_sequence": null,
-                    "usage": {"input_tokens": self.estimated_input.unwrap_or(0), "output_tokens": 0}
+                    "usage": usage
                 }
             }),
         )]
@@ -672,8 +701,8 @@ mod tests {
     }
 
     #[test]
-    fn test_message_start_uses_estimated_input() {
-        // 上游未回真实 usage 时,message_start 用入站 body 估算值填充
+    fn test_message_start_uses_estimated_when_usage_silent() {
+        // 上游未回真实 usage 时,message_start 用入站估算占位(context 不跳 1)
         let mut r = ChatRelay::new(Some(567));
         let out = r.process(&super::super::parser::SseEvent {
             event: Some("chat.completion.chunk".into()),
@@ -686,6 +715,54 @@ mod tests {
         let s = String::from_utf8_lossy(start);
         let v: Value = serde_json::from_str(s.split_once("data: ").unwrap().1.trim()).unwrap();
         assert_eq!(v["message"]["usage"]["input_tokens"], 567);
+        assert_eq!(v["message"]["usage"]["cache_read_input_tokens"], 0);
+    }
+
+    #[test]
+    fn test_message_start_prefers_real_usage_when_present() {
+        // 上游首 chunk 即带真实 usage 时,message_start 用真实净值 + cache,
+        // 不用估算占位(占位可能偏离上游 tokenizer)。
+        let mut r = ChatRelay::new(Some(99999));
+        let out = r.process(&super::super::parser::SseEvent {
+            event: Some("chat.completion.chunk".into()),
+            data: r#"{"id":"1","choices":[{"delta":{"content":"hi"},"finish_reason":"stop"}],
+                "usage":{"prompt_tokens":100,"completion_tokens":20,
+                "prompt_tokens_details":{"cached_tokens":70}}}"#
+                .into(),
+        });
+        let start = out
+            .iter()
+            .find(|b| b.starts_with(b"event: message_start"))
+            .expect("message_start 应存在");
+        let s = String::from_utf8_lossy(start);
+        let v: Value = serde_json::from_str(s.split_once("data: ").unwrap().1.trim()).unwrap();
+        let usage = &v["message"]["usage"];
+        // 真实净值 = prompt - cached = 30,不用占位
+        assert_eq!(usage["input_tokens"], 30);
+        assert_eq!(usage["cache_read_input_tokens"], 70);
+        assert_eq!(usage["cache_creation_input_tokens"], 0);
+    }
+
+    #[test]
+    fn test_message_start_all_cached_uses_real_net_and_read() {
+        // 全缓存回合:净值 0 但 cache_read 有值,仍走真实分支(cache 撑起 context)
+        let mut r = ChatRelay::new(None);
+        let out = r.process(&super::super::parser::SseEvent {
+            event: Some("chat.completion.chunk".into()),
+            data: r#"{"id":"1","choices":[{"delta":{"content":"hi"},"finish_reason":"stop"}],
+                "usage":{"prompt_tokens":70,"completion_tokens":20,
+                "prompt_tokens_details":{"cached_tokens":70}}}"#
+                .into(),
+        });
+        let start = out
+            .iter()
+            .find(|b| b.starts_with(b"event: message_start"))
+            .expect("message_start 应存在");
+        let s = String::from_utf8_lossy(start);
+        let v: Value = serde_json::from_str(s.split_once("data: ").unwrap().1.trim()).unwrap();
+        let usage = &v["message"]["usage"];
+        assert_eq!(usage["input_tokens"], 0);
+        assert_eq!(usage["cache_read_input_tokens"], 70);
     }
 
     #[test]

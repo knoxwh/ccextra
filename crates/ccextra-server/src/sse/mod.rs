@@ -23,8 +23,10 @@ pub type SseStreamPin = Pin<Box<dyn Stream<Item = Result<Bytes, io::Error>> + Se
 
 /// 按入站协议分派响应流
 ///
-/// `estimated_input_tokens`:入站 body 的本地估算输入 token(对齐 ClaudeInputTokenState)。上游流未回真实 usage 时,message_start 用它填充,
-/// 避免 context 记账显示 0。claude 直通不经过状态机,传 None。
+/// `estimated_input_tokens`:入站 body 的本地估算输入 token(对齐
+/// ClaudeInputTokenState)。流中真实 usage 通常只出现在流尾,message_start
+/// 又必须第一帧发,故用它占位,让 cc context 过程中接近真实而非跳 1;
+/// 流尾 message_delta 以真实 usage 覆盖。claude 直通不经过状态机,传 None。
 ///
 /// `tool_names`:short→original 工具名还原表(仅 responses 协议用,请求转换侧
 /// 产出;stream 需 'static,内部用 Arc 共享)。

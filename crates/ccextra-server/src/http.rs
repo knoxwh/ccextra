@@ -473,8 +473,10 @@ async fn handle_messages(
     let cc_session = extract_claude_code_session(&headers, &body_json);
 
     // 入站 Claude body 本地估算输入 token(对齐 ClaudeInputTokenState)。
-    // 上游流未回真实 usage 时,SSE 状态机 message_start 用此值填充,避免
-    // context 记账显示 0。claude 直通不经状态机、非流式不进 SSE,均传 None。
+    // 多数上游流中不带 usage(chat 只在最后 chunk 带,responses 只在流尾),
+    // message_start 又必须第一帧发,故用此值占位,让 cc context 过程中接近
+    // 真实而非跳 1;流尾 message_delta 以真实 usage 覆盖。claude 直通不经
+    // 状态机、非流式不进 SSE,均传 None。
     let estimated_input_tokens = if !is_stream || matches!(route.protocol, Protocol::Claude) {
         None
     } else {
