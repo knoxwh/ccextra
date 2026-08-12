@@ -61,6 +61,8 @@ struct ChatRelay {
     usage_cached: i64,
     // 已发射的 thinking 片段(去重)
     thinking_parts: Vec<String>,
+    // 本回合是否发过 text(兜底判定用)
+    has_text: bool,
     // 空 id 兜底合成计数(SanitizeClaudeToolID 同角色)
     synthetic_tool_ids: u64,
     // 入站 body 本地估算输入 token(http.rs 计算;上游流未回真实 usage 时占位)
@@ -84,6 +86,7 @@ impl ChatRelay {
             usage_output: 0,
             usage_cached: 0,
             thinking_parts: Vec::new(),
+            has_text: false,
             synthetic_tool_ids: 0,
             estimated_input,
         }
@@ -147,6 +150,7 @@ impl ChatRelay {
         // content → text
         if let Some(text) = delta.get("content").and_then(|v| v.as_str()) {
             if !text.is_empty() {
+                self.has_text = true;
                 frames.extend(self.emit_content_delta(BlockType::Text, text));
             }
         }
@@ -246,6 +250,15 @@ impl ChatRelay {
         }
         let mut frames = self.ensure_started();
         self.close_active_block(&mut frames);
+        // reasoning-only 空回合兜底:上游只回 reasoning、无 text 也无工具
+        // (如 DeepSeek 推理回合),把 thinking 文本转成 text 块,避免 Claude
+        // Code 收到零可见内容回合(对齐 sub2api chatMessageToAnthropicBlocks:
+        // text=="" 且无 tool_calls 时 text=reasoning)。
+        if !self.has_text && !self.saw_tool_call && !self.thinking_parts.is_empty() {
+            let content = self.thinking_parts.join("");
+            frames.extend(self.emit_content_delta(BlockType::Text, &content));
+            self.close_active_block(&mut frames);
+        }
         self.flush_pending_tool_calls(&mut frames);
 
         let mut event = json!({
@@ -889,6 +902,80 @@ mod tests {
         assert!(out3
             .iter()
             .any(|b| String::from_utf8_lossy(b).contains("thinking B")));
+    }
+
+    #[test]
+    fn test_reasoning_only_fallback_text() {
+        // 上游只回 reasoning(如 DeepSeek 推理回合):finalize 时 thinking 转 text
+        let mut r = ChatRelay::new(None);
+        r.process(&super::super::parser::SseEvent {
+            event: Some("c".into()),
+            data: r#"{"id":"1","choices":[{"delta":{"reasoning_content":"think step 1"}}]}"#.into(),
+        });
+        r.process(&super::super::parser::SseEvent {
+            event: Some("c".into()),
+            data: r#"{"choices":[{"delta":{"reasoning_content":" think step 2"}}]}"#.into(),
+        });
+        let out = r.process(&super::super::parser::SseEvent {
+            event: Some("c".into()),
+            data: r#"{"choices":[{"delta":{},"finish_reason":"stop"}],"usage":{"prompt_tokens":10,"completion_tokens":5}}"#.into(),
+        });
+        let buf = out.concat();
+        let s = String::from_utf8_lossy(&buf);
+        // 兜底 text 块输出拼接后的 thinking 内容
+        assert!(s.contains("think step 1 think step 2"), "实际: {s}");
+        let text_deltas = s.matches("text_delta").count();
+        assert!(text_deltas >= 1, "应有 text_delta,实际: {s}");
+        assert!(s.contains("message_stop"), "实际: {s}");
+    }
+
+    #[test]
+    fn test_reasoning_only_fallback_skipped_with_text() {
+        // 有 text 的正常回合:不触发兜底,text 只发一次
+        let mut r = ChatRelay::new(None);
+        let out1 = r.process(&super::super::parser::SseEvent {
+            event: Some("c".into()),
+            data: r#"{"id":"1","choices":[{"delta":{"reasoning_content":"think"}}]}"#.into(),
+        });
+        let buf1 = out1.concat();
+        let s1 = String::from_utf8_lossy(&buf1);
+        assert!(
+            s1.contains("thinking_delta"),
+            "thinking 应正常发出,实际: {s1}"
+        );
+        let out = r.process(&super::super::parser::SseEvent {
+            event: Some("c".into()),
+            data: r#"{"choices":[{"delta":{"content":"answer"},"finish_reason":"stop"}],"usage":{"prompt_tokens":10,"completion_tokens":5}}"#.into(),
+        });
+        let buf = out.concat();
+        let s = String::from_utf8_lossy(&buf);
+        assert!(s.contains("answer"), "实际: {s}");
+        assert!(
+            s.matches("text_delta").count() <= 1,
+            "有 text 时不得重复输出兜底,实际: {s}"
+        );
+    }
+
+    #[test]
+    fn test_reasoning_only_fallback_skipped_with_tool() {
+        // reasoning + 工具调用回合:不得兜底成 text(工具回合无可见文本正常)
+        let mut r = ChatRelay::new(None);
+        r.process(&super::super::parser::SseEvent {
+            event: Some("c".into()),
+            data: r#"{"id":"1","choices":[{"delta":{"reasoning_content":"think"}}]}"#.into(),
+        });
+        r.process(&super::super::parser::SseEvent {
+            event: Some("c".into()),
+            data: r#"{"choices":[{"delta":{"tool_calls":[{"index":0,"id":"call_1","function":{"name":"get_weather","arguments":"{}"}}]}}]}"#.into(),
+        });
+        let out = r.process(&super::super::parser::SseEvent {
+            event: Some("c".into()),
+            data: r#"{"choices":[{"delta":{},"finish_reason":"tool_calls"}],"usage":{"prompt_tokens":10,"completion_tokens":5}}"#.into(),
+        });
+        let buf = out.concat();
+        let s = String::from_utf8_lossy(&buf);
+        assert!(!s.contains("text_delta"), "工具回合不得兜底 text,实际: {s}");
+        assert!(s.contains("tool_use"), "应有 tool_use 块,实际: {s}");
     }
 
     #[test]

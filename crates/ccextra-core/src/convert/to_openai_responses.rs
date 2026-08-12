@@ -20,11 +20,6 @@ use serde_json::{json, Value};
 use super::shorten::{build_short_name_map, shorten_name_if_needed};
 use super::Result;
 
-/// Claude web search 工具类型(对齐 isClaudeWebSearchToolType)
-fn is_web_search_tool_type(tool_type: &str) -> bool {
-    matches!(tool_type, "web_search_20250305" | "web_search_20260209")
-}
-
 /// GPT 上游追加的行为适配块(字节固定,缓存前缀稳定)。
 ///
 /// 入站系统词构造自 Claude Code(CLAUDE.md 等),不是 GPT 原生运行环境;
@@ -255,7 +250,7 @@ pub fn convert_to_openai_responses(
         let mut names: Vec<String> = Vec::new();
         for tool in tools {
             let tool_type = tool.get("type").and_then(|v| v.as_str()).unwrap_or("");
-            if is_web_search_tool_type(tool_type) {
+            if super::is_web_search_tool_type(tool_type) {
                 if let Some(n) = tool.get("name").and_then(|v| v.as_str()) {
                     if !n.is_empty() {
                         web_search_names.insert(n.to_string());
@@ -449,7 +444,7 @@ pub fn convert_to_openai_responses(
         for tool in tools {
             let tool_type = tool.get("type").and_then(|v| v.as_str()).unwrap_or("");
             // web search 工具特殊映射(对齐 convertClaudeWebSearchToolToCodex)
-            if is_web_search_tool_type(tool_type) {
+            if super::is_web_search_tool_type(tool_type) {
                 let mut ws = json!({"type": "web_search"});
                 if let Some(domains) = tool.get("allowed_domains").and_then(|v| v.as_array()) {
                     ws["filters"] = json!({"allowed_domains": domains});
@@ -530,15 +525,14 @@ pub fn convert_to_openai_responses(
                     let name = tc.get("name").and_then(|v| v.as_str()).unwrap_or("");
                     if web_search_names.contains(name) {
                         openai["tool_choice"] = json!({"type": "web_search"});
+                    } else if !tool_name_map.contains_key(name) {
+                        // 命名工具未声明 → 降级 auto(对齐 chat 侧 declared 校验;
+                        // sub2api responses 侧无该校验,这里补同一语义)
+                        openai["tool_choice"] = json!("auto");
                     } else {
-                        let short = if let Some(s) = tool_name_map.get(name) {
-                            s.clone()
-                        } else {
-                            shorten_name_if_needed(name)
-                        };
-                        if short.is_empty() {
-                            openai["tool_choice"] = json!("auto");
-                        } else if custom_tool_names.contains(name) {
+                        // 已校验声明:map 必有非空 short,不再判空
+                        let short = tool_name_map.get(name).cloned().unwrap();
+                        if custom_tool_names.contains(name) {
                             openai["tool_choice"] = json!({"type": "custom", "name": short});
                         } else {
                             openai["tool_choice"] = json!({"type": "function", "name": short});
@@ -694,7 +688,8 @@ mod tests {
             GPT_ADAPTER_BLOCK.contains("The user interacts with Claude Code through this loop.")
         );
         assert!(GPT_ADAPTER_BLOCK.contains("Your capabilities are exactly the tools declared"));
-        assert!(GPT_ADAPTER_BLOCK.contains("Do not assume any additional tool or capability is available."));
+        assert!(GPT_ADAPTER_BLOCK
+            .contains("Do not assume any additional tool or capability is available."));
         assert!(GPT_ADAPTER_BLOCK.contains("Read, Edit, Write, Bash, Glob, Grep"));
         assert!(GPT_ADAPTER_BLOCK
             .contains("Do not claim an action succeeded until its tool result confirms it."));
@@ -717,9 +712,8 @@ mod tests {
 
         // adapter 现在在 instructions 里
         let instructions = body["instructions"].as_str().unwrap();
-        assert!(
-            instructions.contains("inside Claude Code's agent loop, not a standalone Codex session.")
-        );
+        assert!(instructions
+            .contains("inside Claude Code's agent loop, not a standalone Codex session."));
         assert!(instructions.contains("built-in Claude Code tools (Read, Edit, Write, Bash"));
         assert!(!instructions.contains("Never use apply_patch"));
         assert!(!instructions.contains("Edit files only with the tools Claude Code provides"));
@@ -1132,6 +1126,16 @@ mod tests {
         convert_to_openai_responses(&mut body2, "test-model").unwrap();
         assert_eq!(body2["tool_choice"]["type"], "function");
         assert_eq!(body2["tool_choice"]["name"], "search");
+
+        // 命名 choice 指向未声明工具 → 降级 auto
+        let mut body3 = json!({
+            "model": "test",
+            "messages": [],
+            "tool_choice": {"type": "tool", "name": "ghost"},
+            "tools": [{"name": "search", "input_schema": {"type": "object"}}]
+        });
+        convert_to_openai_responses(&mut body3, "test-model").unwrap();
+        assert_eq!(body3["tool_choice"], "auto");
     }
 
     #[test]

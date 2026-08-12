@@ -29,6 +29,13 @@ pub fn is_attribution_text(text: &str) -> bool {
         .starts_with(CLAUDE_CODE_ATTRIBUTION_PREFIX)
 }
 
+/// 是否为 Claude 服务端工具(web_search 系列)。此类工具在 chat 转换时
+/// 直接丢弃(无 Chat Completions 等价,对齐 anthropicToolsToChatTools);
+/// responses 转换时映射为 {"type":"web_search"}。
+pub fn is_web_search_tool_type(tool_type: &str) -> bool {
+    matches!(tool_type, "web_search_20250305" | "web_search_20260209")
+}
+
 /// type:object 节点递归补 properties:{}(部分 OpenAI 兼容上游要求 object schema 必须带 properties)。
 pub fn normalize_object_schema_properties(schema: serde_json::Value) -> serde_json::Value {
     use serde_json::Value;

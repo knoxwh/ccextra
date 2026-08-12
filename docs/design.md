@@ -94,7 +94,8 @@ fn test_tool_name_preserved() {
 ```
 claude 直通:      字节级转发,不解析
 openai chat:     relay_openai_chat_to_anthropic
-                 (单 active block + reasoning 去重 + tool_calls index 映射)
+                 (单 active block + reasoning 去重 + tool_calls index 映射 +
+                  reasoning-only 空回合 thinking 转 text 兜底)
 openai responses: relay_responses_to_anthropic
                  (reasoning 回放闭环: summary→thinking_delta +
                   encrypted_content→signature_delta)

@@ -12,6 +12,8 @@
 // - tool_choice 映射
 // - stop_sequences → stop
 
+use std::collections::HashSet;
+
 use serde_json::{json, Value};
 
 use super::{ConvertError, Result};
@@ -118,10 +120,23 @@ pub fn convert_to_openai_chat(body: &mut Value, upstream_model: &str) -> Result<
     openai.insert("messages".into(), json!(messages));
 
     // Tools: input_schema → parameters
+    // 存活工具名集合,供 tool_choice declared 校验:命名 choice 只有在指向
+    // 已声明工具时保留(对齐 sub2api convertAnthropicToolChoiceToChat 的
+    // declared 集合语义)。无存活工具时不写 tools 字段(对齐 sub2api
+    // `len(out.Tools) > 0` 才处理)。
+    let mut declared_tools: HashSet<String> = HashSet::new();
     if let Some(tools) = body.get("tools").and_then(|v| v.as_array()) {
         let mut openai_tools = Vec::new();
         for tool in tools {
             let name = tool.get("name").and_then(|v| v.as_str()).unwrap_or("");
+            // web 服务端工具丢弃(无 Chat Completions 等价,对齐 anthropicToolsToChatTools)
+            let tool_type = tool.get("type").and_then(|v| v.as_str()).unwrap_or("");
+            if super::is_web_search_tool_type(tool_type) {
+                continue;
+            }
+            if !name.is_empty() {
+                declared_tools.insert(name.to_string());
+            }
             let description = tool
                 .get("description")
                 .and_then(|v| v.as_str())
@@ -140,13 +155,17 @@ pub fn convert_to_openai_chat(body: &mut Value, upstream_model: &str) -> Result<
             }
             openai_tools.push(fn_obj);
         }
-        openai.insert("tools".into(), json!(openai_tools));
+        if !openai_tools.is_empty() {
+            openai.insert("tools".into(), json!(openai_tools));
+        }
     }
 
-    // tool_choice 映射
-    if let Some(tc) = body.get("tool_choice") {
-        if let Some(choice) = convert_tool_choice(tc) {
-            openai.insert("tool_choice".into(), choice);
+    // tool_choice 映射(仅当有存活工具时处理,对齐 sub2api 请求侧入口判断)
+    if !declared_tools.is_empty() {
+        if let Some(tc) = body.get("tool_choice") {
+            if let Some(choice) = convert_tool_choice(tc, &declared_tools) {
+                openai.insert("tool_choice".into(), choice);
+            }
         }
     }
 
@@ -421,7 +440,9 @@ fn image_to_url(part: &Value) -> Option<String> {
 }
 
 /// tool_choice 映射:auto→auto, any→required, tool→specific function
-fn convert_tool_choice(tc: &Value) -> Option<Value> {
+/// 命名 choice(tool)只有在指向已声明工具时保留,否则丢弃
+/// (对齐 sub2api convertAnthropicToolChoiceToChat 的 tool 分支)。
+fn convert_tool_choice(tc: &Value, declared: &HashSet<String>) -> Option<Value> {
     let ty = tc.get("type").and_then(|v| v.as_str())?;
     match ty {
         "auto" => Some(json!("auto")),
@@ -429,6 +450,9 @@ fn convert_tool_choice(tc: &Value) -> Option<Value> {
         "none" => Some(json!("none")),
         "tool" => {
             let name = tc.get("name").and_then(|v| v.as_str()).unwrap_or("");
+            if !declared.contains(name) {
+                return None;
+            }
             Some(json!({"type": "function", "function": {"name": name}}))
         }
         _ => None,
@@ -606,13 +630,45 @@ mod tests {
 
     #[test]
     fn test_empty_tools_array() {
+        // 无存活工具时不写 tools 字段(对齐 sub2api `len(out.Tools) > 0`)
         let mut body = json!({
             "model": "test",
             "messages": [],
             "tools": []
         });
         convert_to_openai_chat(&mut body, "gpt").unwrap();
-        assert_eq!(body["tools"].as_array().unwrap().len(), 0);
+        assert!(body.get("tools").is_none());
+    }
+
+    #[test]
+    fn test_web_search_tools_filtered_dropped() {
+        // web 服务端工具丢弃(无 Chat Completions 等价,对齐 anthropicToolsToChatTools);
+        // 全被过滤时整个 tools 字段不写
+        let mut body = json!({
+            "model": "test",
+            "messages": [],
+            "tools": [
+                {"type": "web_search_20250305", "name": "web_search", "input_schema": {"type": "object"}},
+                {"name": "regular", "input_schema": {"type": "object"}}
+            ],
+            "tool_choice": {"type": "tool", "name": "regular"}
+        });
+        convert_to_openai_chat(&mut body, "gpt").unwrap();
+        let tools = body["tools"].as_array().unwrap();
+        assert_eq!(tools.len(), 1);
+        assert_eq!(tools[0]["function"]["name"], "regular");
+        assert_eq!(body["tool_choice"]["function"]["name"], "regular");
+
+        // 只剩 web_search → tools 不写,choice 丢弃
+        let mut body2 = json!({
+            "model": "test",
+            "messages": [],
+            "tools": [{"type": "web_search_20260209", "name": "web_search", "input_schema": {"type": "object"}}],
+            "tool_choice": {"type": "tool", "name": "web_search"}
+        });
+        convert_to_openai_chat(&mut body2, "gpt").unwrap();
+        assert!(body2.get("tools").is_none());
+        assert!(body2.get("tool_choice").is_none());
     }
 
     #[test]
@@ -808,30 +864,44 @@ mod tests {
 
     #[test]
     fn test_tool_choice_mappings() {
+        // 无存活工具 → 不写 tool_choice(对齐 sub2api 入口判断)
         let mut body = json!({
             "model": "test",
             "messages": [],
             "tool_choice": {"type": "auto"}
         });
         convert_to_openai_chat(&mut body, "gpt").unwrap();
-        assert_eq!(body["tool_choice"], "auto");
+        assert!(body.get("tool_choice").is_none());
 
         let mut body2 = json!({
             "model": "test",
             "messages": [],
+            "tools": [{"name": "t", "input_schema": {"type": "object"}}],
             "tool_choice": {"type": "any"}
         });
         convert_to_openai_chat(&mut body2, "gpt").unwrap();
         assert_eq!(body2["tool_choice"], "required");
 
+        // 命名 choice 指向已声明工具 → 保留
         let mut body3 = json!({
             "model": "test",
             "messages": [],
+            "tools": [{"name": "search", "input_schema": {"type": "object"}}],
             "tool_choice": {"type": "tool", "name": "search"}
         });
         convert_to_openai_chat(&mut body3, "gpt").unwrap();
         assert_eq!(body3["tool_choice"]["type"], "function");
         assert_eq!(body3["tool_choice"]["function"]["name"], "search");
+
+        // 命名 choice 指向未声明工具 → 丢弃(对齐 sub2api tool 分支)
+        let mut body4 = json!({
+            "model": "test",
+            "messages": [],
+            "tools": [{"name": "search", "input_schema": {"type": "object"}}],
+            "tool_choice": {"type": "tool", "name": "ghost"}
+        });
+        convert_to_openai_chat(&mut body4, "gpt").unwrap();
+        assert!(body4.get("tool_choice").is_none());
     }
 
     #[test]
