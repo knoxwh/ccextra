@@ -27,17 +27,27 @@ fn is_web_search_tool_type(tool_type: &str) -> bool {
 
 /// GPT 上游追加的行为适配块(字节固定,缓存前缀稳定)。
 ///
-/// Claude Code 系统词不是 GPT 原生运行环境,追加本块明确 agent loop、工具和权限边界,
-/// 同时抑制冗长与过度探索。
+/// 入站系统词构造自 Claude Code(CLAUDE.md 等),不是 GPT 原生运行环境;
+/// 本块以 codex gpt prompt 的结构为骨架(gpt_5_2_prompt 的身份/环境/执行/输出),
+/// 改造成 Claude Code agent loop 语义,明确工具边界与权限,抑制冗长与过度探索。
 /// 英文固定文本,不配置化;冲突时用户指令(CLAUDE.md)优先,本块只补缺省。
 const GPT_ADAPTER_BLOCK: &str = "\
 You are the model operating inside Claude Code's agent loop, not a standalone Codex session. The user interacts with Claude Code through this loop.
+
+## Operating environment
 Treat the supplied system instructions, CLAUDE.md, user instructions, declared tools, permission decisions, and tool results as your complete operating environment. User and project instructions take precedence over this block.
-Your capabilities are exactly the tools declared in the current request. Use only declared tools and follow their schemas. Do not assume any additional tool or capability is available. A declared apply_patch tool is available to use like any other declared tool. Do not claim an action succeeded until its tool result confirms it.
-Be concise. Default final answers under 10 lines; small changes 2-5 sentences; multi-file work 1-2 bullets per file. Never dump file contents, before/after pairs, or full methods unless explicitly asked.
-Do not over-explore. Answer or act once you have enough; don't re-read files you've already seen; run tests or builds only to verify your own change.
+Your capabilities are exactly the tools declared in the current request: the built-in Claude Code tools (Read, Edit, Write, Bash, Glob, Grep) plus any additional declared tools. Use only declared tools and follow their schemas. Do not assume any additional tool or capability is available. Do not claim an action succeeded until its tool result confirms it.
+For a brand-new task with no prior context, be ambitious; when working in an existing codebase, do exactly what the user asks with surgical precision and keep changes minimal and consistent with the codebase style.
+
+## Working style
+You are a coding agent: keep going until the task is fully resolved end-to-end within the current turn, then yield. Solve problems at the root cause rather than surface-level patches. Do not fix unrelated bugs or add unrequested work; you may mention them in the final message.
+You may be in a dirty git worktree. Never revert existing changes you did not make. Never use destructive git commands (e.g. git reset --hard, git checkout --) unless the user explicitly requests them. Prefer git log / git blame for history context.
+Parallelize independent tool calls whenever possible, especially reads. When searching files from Bash, prefer rg over grep when available. Run tests or builds only to verify your own change, not to explore.
+
+## Output
+Be concise. Default final answers under 10 lines; small changes 2-5 sentences; multi-file work 1-2 bullets per file. Never dump file contents, before/after pairs, or entire methods unless explicitly asked; reference file paths instead.
 Don't expose extended reasoning — show conclusions, not the thought process.
-Stop when the task is done: report result plus one next step, then yield. Don't fix unrelated bugs or add unrequested work.";
+Stop when the task is done: report result plus one logical next step, then yield.";
 
 /// 判定上游是否为 GPT 模型(仅按模型名前缀,对齐约定:responses 协议 + gpt*)
 fn is_gpt_upstream(upstream_model: &str) -> bool {
@@ -684,13 +694,14 @@ mod tests {
             GPT_ADAPTER_BLOCK.contains("The user interacts with Claude Code through this loop.")
         );
         assert!(GPT_ADAPTER_BLOCK.contains("Your capabilities are exactly the tools declared"));
-        assert!(GPT_ADAPTER_BLOCK
-            .contains("Do not assume any additional tool or capability is available."));
-        assert!(GPT_ADAPTER_BLOCK.contains(
-            "A declared apply_patch tool is available to use like any other declared tool."
-        ));
+        assert!(GPT_ADAPTER_BLOCK.contains("Do not assume any additional tool or capability is available."));
+        assert!(GPT_ADAPTER_BLOCK.contains("Read, Edit, Write, Bash, Glob, Grep"));
         assert!(GPT_ADAPTER_BLOCK
             .contains("Do not claim an action succeeded until its tool result confirms it."));
+        assert!(GPT_ADAPTER_BLOCK.contains("Never revert existing changes you did not make."));
+        assert!(GPT_ADAPTER_BLOCK.contains("Never use destructive git commands"));
+        assert!(GPT_ADAPTER_BLOCK
+            .contains("Never dump file contents, before/after pairs, or entire methods"));
     }
 
     #[test]
@@ -709,9 +720,7 @@ mod tests {
         assert!(
             instructions.contains("inside Claude Code's agent loop, not a standalone Codex session.")
         );
-        assert!(instructions.contains(
-            "A declared apply_patch tool is available to use like any other declared tool."
-        ));
+        assert!(instructions.contains("built-in Claude Code tools (Read, Edit, Write, Bash"));
         assert!(!instructions.contains("Never use apply_patch"));
         assert!(!instructions.contains("Edit files only with the tools Claude Code provides"));
         assert_eq!(body["tools"][0]["type"], "custom");
