@@ -171,12 +171,46 @@ pub fn openai_chat_to_anthropic(body: &Value) -> Option<Value> {
     let mut content: Vec<Value> = Vec::new();
     let mut has_tool_use = false;
 
-    // reasoning_content → thinking(多供应商拼写,对齐 CollectOpenAIReasoningTexts)
+    // reasoning → thinking(多供应商拼写,对齐 collectOpenAIReasoningTexts:
+    // reasoning_content / reasoning_details[] / reasoning / thinking)。
+    // 全部拼成一块,避免同义字段各推一块 thinking。
+    let mut reasoning_texts = Vec::new();
     if let Some(r) = message.get("reasoning_content") {
         let text = collect_reasoning_value(r);
         if !text.is_empty() {
-            content.push(json!({"type": "thinking", "thinking": text}));
+            reasoning_texts.push(text);
         }
+    }
+    // reasoning_details[](加密条目跳过,text/reasoning/thinking/summary 取首个)
+    if let Some(Value::Array(details)) = message.get("reasoning_details") {
+        for item in details {
+            if item.get("encrypted_content").is_some() || item.get("data").is_some() {
+                continue;
+            }
+            for field in ["text", "reasoning", "thinking", "summary"] {
+                if let Some(v) = item.get(field) {
+                    let text = collect_reasoning_value(v);
+                    if !text.is_empty() {
+                        reasoning_texts.push(text);
+                    }
+                    break;
+                }
+            }
+        }
+    }
+    for field in ["reasoning", "thinking"] {
+        if let Some(r) = message.get(field) {
+            let text = collect_reasoning_value(r);
+            if !text.is_empty() {
+                reasoning_texts.push(text);
+            }
+        }
+    }
+    if !reasoning_texts.is_empty() {
+        content.push(json!({
+            "type": "thinking",
+            "thinking": reasoning_texts.join("\n")
+        }));
     }
 
     // content:text 字符串或 [{type:"text"}]
@@ -451,6 +485,68 @@ mod tests {
         assert_eq!(out["content"][0]["type"], "thinking");
         assert_eq!(out["content"][0]["thinking"], "think");
         assert_eq!(out["stop_reason"], "end_turn");
+    }
+
+    #[test]
+    fn test_chat_nonstream_reasoning_alias_and_details() {
+        // message.reasoning 顶层别名(实测 xAI 网关非流走此字段,对齐
+        // collectOpenAIReasoningTexts 拼写集)+ reasoning_details[] 明文条目
+        let body = json!({
+            "id": "c1",
+            "model": "grok-4.6",
+            "choices": [{
+                "message": {"role": "assistant", "reasoning": "step one",
+                           "content": ""},
+                "finish_reason": "stop"
+            }],
+            "usage": {"prompt_tokens": 1, "completion_tokens": 1}
+        });
+        let out = openai_chat_to_anthropic(&body).unwrap();
+        assert_eq!(out["content"][0]["type"], "thinking");
+        assert_eq!(out["content"][0]["thinking"], "step one");
+
+        // 加密条目跳过,明文 summary 取首
+        let body2 = json!({
+            "id": "c2",
+            "model": "grok-4.6",
+            "choices": [{
+                "message": {"role": "assistant", "content": "",
+                    "reasoning_details": [
+                        {"type": "encrypted_content", "data": "ENCSIG"},
+                        {"type": "summary", "summary": "think sum"}
+                    ]},
+                "finish_reason": "stop"
+            }],
+            "usage": {"prompt_tokens": 1, "completion_tokens": 1}
+        });
+        let out2 = openai_chat_to_anthropic(&body2).unwrap();
+        assert_eq!(out2["content"][0]["type"], "thinking");
+        assert_eq!(out2["content"][0]["thinking"], "think sum");
+
+        // 同义字段合并成一块,不拆多块 thinking
+        let body3 = json!({
+            "id": "c3",
+            "model": "grok-4.6",
+            "choices": [{
+                "message": {
+                    "role": "assistant",
+                    "reasoning_content": "a",
+                    "reasoning": "b",
+                    "content": ""
+                },
+                "finish_reason": "stop"
+            }],
+            "usage": {"prompt_tokens": 1, "completion_tokens": 1}
+        });
+        let out3 = openai_chat_to_anthropic(&body3).unwrap();
+        let thinking: Vec<_> = out3["content"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .filter(|b| b["type"] == "thinking")
+            .collect();
+        assert_eq!(thinking.len(), 1);
+        assert_eq!(thinking[0]["thinking"], "a\nb");
     }
 
     #[test]

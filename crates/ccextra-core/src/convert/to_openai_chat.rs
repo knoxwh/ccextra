@@ -146,12 +146,22 @@ pub fn convert_to_openai_chat(body: &mut Value, upstream_model: &str) -> Result<
                 "function": {
                     "name": name,
                     "description": description,
-                    "parameters": {"type": "object", "properties": {}}
+                    "parameters": {"type": "object", "properties": {}, "required": []}
                 }
             });
             if let Some(schema) = tool.get("input_schema") {
                 fn_obj["function"]["parameters"] =
                     super::normalize_object_schema_properties(schema.clone());
+            }
+            // 严格上游(xAI/new-api)校验:object schema 有 properties 时必须带
+            // required 数组,缺失报 standard_violation "required: null is not
+            // of type array"。幂等,不改变已存在的 required。
+            let params = &mut fn_obj["function"]["parameters"];
+            if params.get("type").and_then(|v| v.as_str()) == Some("object")
+                && params.get("properties").is_some()
+                && params.get("required").is_none()
+            {
+                params["required"] = json!([]);
             }
             openai_tools.push(fn_obj);
         }
@@ -830,6 +840,26 @@ mod tests {
         convert_to_openai_chat(&mut body, "gpt").unwrap();
         let msgs = body["messages"].as_array().unwrap();
         assert_eq!(msgs.len(), 0);
+    }
+
+    #[test]
+    fn test_schema_required_array_filled() {
+        // 严格上游(xAI)校验:properties 存在时 required 必须为数组。
+        // 缺失补 []。已有 required 保持不动(不破坏约束)。
+        let mut body = json!({
+            "model": "test",
+            "messages": [{"role": "user", "content": "hi"}],
+            "tools": [
+                {"name": "bash", "description": "run", "input_schema": {"type": "object", "properties": {"cmd": {"type": "string"}}}},
+                {"name": "strict", "description": "s", "input_schema": {"type": "object", "properties": {"x": {"type": "string"}}, "required": ["x"]}},
+                {"name": "bare", "description": "b"}
+            ]
+        });
+        convert_to_openai_chat(&mut body, "gpt").unwrap();
+        let tools = body["tools"].as_array().unwrap();
+        assert_eq!(tools[0]["function"]["parameters"]["required"], json!([]));
+        assert_eq!(tools[1]["function"]["parameters"]["required"], json!(["x"]));
+        assert_eq!(tools[2]["function"]["parameters"]["required"], json!([]));
     }
 
     #[test]

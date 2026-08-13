@@ -199,18 +199,37 @@ impl ResponsesRelay {
                 self.thinking_summary_seen = true;
                 out
             }
-            "response.reasoning_summary_text.delta" => {
-                let delta = root.get("delta").and_then(|v| v.as_str()).unwrap_or("");
-                let mut out = self.stop_text();
-                out.extend(self.start_thinking());
-                out.extend(self.thinking_delta(delta));
-                out
-            }
+            "response.reasoning_summary_text.delta" => self.plaintext_reasoning_delta(&root),
             // 不关 thinking 块:等 output_item.done 带最终 encrypted_content
-            "response.reasoning_summary_part.done" => Vec::new(),
+            "response.reasoning_summary_part.done" => {
+                self.thinking_summary_seen = true;
+                Vec::new()
+            }
+            // 明文 reasoning 事件兜底(对齐 CPA xaiNormalizeReasoningSummaryData:
+            // reasoning_text.delta 归一到 summary 语义,不得静默丢弃)。xAI/OpenAI
+            // 明文推理流都可走这里,完整推理内容同 summary 进 thinking 块。
+            "response.reasoning_text.delta" => self.plaintext_reasoning_delta(&root),
+            "response.reasoning_text.done" => {
+                self.thinking_summary_seen = true;
+                Vec::new()
+            }
             "response.content_part.added" => {
+                // 明文 reasoning part(part.type = reasoning,对齐 OpenAI Responses
+                // 明文推理的 content_part 形状)与 summary part 同语义:
+                // 块保持打开,分隔符续接
+                let part_type = root.pointer("/part/type").and_then(|v| v.as_str());
+                if part_type == Some("reasoning") {
+                    let mut out = self.stop_text();
+                    if self.thinking_open {
+                        out.extend(self.thinking_delta(SUMMARY_PART_SEPARATOR));
+                    } else {
+                        out.extend(self.start_thinking());
+                    }
+                    self.thinking_summary_seen = true;
+                    return out;
+                }
                 let mut out = self.finalize_thinking();
-                if root.pointer("/part/type").and_then(|v| v.as_str()) == Some("output_text") {
+                if part_type == Some("output_text") {
                     out.extend(self.start_text());
                 }
                 out
@@ -514,6 +533,16 @@ impl ResponsesRelay {
             self.thinking_index,
             text,
         )]
+    }
+
+    /// reasoning delta 统一进块:先收 text,再开 thinking 块发内容
+    /// (reasoning_summary_text.delta 与明文 reasoning_text.delta 共用)
+    fn plaintext_reasoning_delta(&mut self, root: &Value) -> Vec<Bytes> {
+        let delta = root.get("delta").and_then(|v| v.as_str()).unwrap_or("");
+        let mut out = self.stop_text();
+        out.extend(self.start_thinking());
+        out.extend(self.thinking_delta(delta));
+        out
     }
 
     /// 关闭 thinking 块:有 signature 先发 signature_delta(加密内容回放闭环)
@@ -1371,6 +1400,71 @@ mod tests {
         assert!(s.contains("\"type\":\"thinking\""));
         assert!(s.contains("signature_delta"));
         assert!(s.contains("ENC9"));
+    }
+
+    #[test]
+    fn test_reasoning_plaintext_delta() {
+        // 非订阅网关发明文 reasoning_text.delta(无 encrypted_content):内容进 thinking 块
+        let mut r = ResponsesRelay::new(None);
+        r.process(&created());
+        let out = r.process(&ev(
+            r#"{"type":"response.reasoning_text.delta","delta":"明文推理"}"#,
+        ));
+        let so = s(&out);
+        assert!(so.contains("content_block_start"));
+        assert!(so.contains("thinking_delta"));
+        assert!(so.contains("明文推理"));
+        // done 不关块;text 到来时正常收尾
+        let done = r.process(&ev(
+            r#"{"type":"response.reasoning_text.done","item":{"type":"reasoning"}}"#,
+        ));
+        assert!(s(&done).is_empty());
+        let text = r.process(&ev(
+            r#"{"type":"response.output_text.delta","delta":"答案"}"#,
+        ));
+        let st = s(&text);
+        assert!(st.contains("content_block_stop"));
+        assert!(st.contains("text_delta"));
+    }
+
+    #[test]
+    fn test_content_part_added_reasoning_plaintext() {
+        // content_part.added(part.type=reasoning):保持块打开,分隔符续接,不误关块
+        let mut r = ResponsesRelay::new(None);
+        r.process(&created());
+        r.process(&ev(
+            r#"{"type":"response.output_item.added","item":{"type":"reasoning"}}"#,
+        ));
+        let out = r.process(&ev(
+            r#"{"type":"response.content_part.added","part":{"type":"reasoning"}}"#,
+        ));
+        let s1 = s(&out);
+        assert!(
+            s1.contains("content_block_start"),
+            "明文 reasoning part 应开块,实际: {s1}"
+        );
+        let out1b = r.process(&ev(
+            r#"{"type":"response.reasoning_text.delta","delta":"推理中"}"#,
+        ));
+        let s1b = s(&out1b);
+        assert!(
+            s1b.contains("thinking_delta"),
+            "明文 delta 应进块,实际: {s1b}"
+        );
+        assert!(
+            !s1b.contains("content_block_start"),
+            "块应保持打开,实际: {s1b}"
+        );
+        let out2 = r.process(&ev(
+            r#"{"type":"response.content_part.added","part":{"type":"output_text"}}"#,
+        ));
+        let s2 = s(&out2);
+        assert!(
+            s2.contains("content_block_stop"),
+            "output_text part 到来应收尾块,实际: {s2}"
+        );
+        assert!(s2.contains("content_block_start"));
+        assert!(s2.contains("text"));
     }
 
     #[test]

@@ -172,6 +172,42 @@ fn normalize_tool_parameters(schema: &Value) -> Value {
     if schema.is_null() || !schema.is_object() {
         return json!({"type": "object", "properties": {}});
     }
+    // xAI 系上游(对齐 CPA normalizeXAIObjectRootUnionBranchTypes +
+    // xaiFunctionParametersNeedSimplification):root 为 object 且带 root union 时,
+    // 先补缺失 type,仍非 object-only → 整体简化,宁可工具参数不可用也不让请求被拒。
+    // root 非 object 的 schema 不处理直透(对齐 CPA root 检查)。
+    if schema.get("type").and_then(|v| v.as_str()) == Some("object")
+        && ["anyOf", "oneOf"]
+            .iter()
+            .any(|k| schema.get(*k).is_some_and(|v| v.is_array()))
+    {
+        let mut s = schema.clone();
+        // 先补缺失 type(基于补后数据判定,对齐 CPA 先 normalize 后 needSimplification)
+        for union_key in ["anyOf", "oneOf"] {
+            let Some(Value::Array(arr)) = s.get_mut(union_key) else {
+                continue;
+            };
+            for branch_schema in arr.iter_mut() {
+                if branch_schema.get("type").is_none() {
+                    branch_schema["type"] = json!("object");
+                }
+            }
+        }
+        let object_only = ["anyOf", "oneOf"].iter().all(|k| {
+            let Some(Value::Array(arr)) = s.get(*k) else {
+                return true;
+            };
+            arr.iter().all(|b| {
+                b.get("type")
+                    .map(branch_schema_type_is_object_only)
+                    .unwrap_or(false)
+            })
+        });
+        if !object_only {
+            return json!({"type": "object", "properties": {}, "additionalProperties": true});
+        }
+        return s;
+    }
     let mut s = schema.clone();
     let s_type = s.get("type").and_then(|v| v.as_str()).unwrap_or("");
     if s_type.is_empty() {
@@ -183,6 +219,22 @@ fn normalize_tool_parameters(schema: &Value) -> Value {
         s["properties"] = json!({});
     }
     s
+}
+
+/// branch type 是否只允许 object(字符串 "object" 或数组全 "object")
+fn branch_schema_type_is_object_only(t: &Value) -> bool {
+    match t {
+        Value::String(s) => s.eq_ignore_ascii_case("object"),
+        Value::Array(arr) => {
+            !arr.is_empty()
+                && arr.iter().all(|item| {
+                    item.as_str()
+                        .map(|s| s.eq_ignore_ascii_case("object"))
+                        .unwrap_or(false)
+                })
+        }
+        _ => false,
+    }
 }
 
 /// Claude system 文本块 → 单字符串(合并所有 text blocks,对齐 codex base_instructions)
@@ -874,6 +926,55 @@ mod tests {
             "input_schema 应剥除"
         );
         assert_eq!(body["tools"][2]["strict"], false);
+    }
+
+    #[test]
+    fn test_tool_schema_union_non_object_simplified() {
+        // xAI 拒收非 object-only 的 root union:整体简化为安全 schema(对齐 CPA)
+        let mut body = json!({
+            "model": "test",
+            "messages": [],
+            "tools": [
+                {"name": "u", "input_schema": {
+                    "type": "object",
+                    "properties": {"v": {"type": "string"}},
+                    "anyOf": [
+                        {"type": "string"},
+                        {"type": "object", "properties": {"a": {"type": "string"}}}
+                    ]
+                }}
+            ]
+        });
+        convert_to_openai_responses(&mut body, "test-model").unwrap();
+        assert_eq!(
+            body["tools"][0]["parameters"],
+            json!({"type": "object", "properties": {}, "additionalProperties": true})
+        );
+    }
+
+    #[test]
+    fn test_tool_schema_union_missing_type_filled() {
+        // object-only union 分支缺 type → 补 "object",保留原 schema 语义(对齐 CPA)
+        let mut body = json!({
+            "model": "test",
+            "messages": [],
+            "tools": [
+                {"name": "u", "input_schema": {
+                    "type": "object",
+                    "properties": {"v": {"type": "string"}},
+                    "oneOf": [
+                        {"properties": {"a": {"type": "string"}}},
+                        {"type": "object", "properties": {"b": {"type": "integer"}}}
+                    ]
+                }}
+            ]
+        });
+        convert_to_openai_responses(&mut body, "test-model").unwrap();
+        assert_eq!(body["tools"][0]["parameters"]["oneOf"][0]["type"], "object");
+        assert_eq!(
+            body["tools"][0]["parameters"]["properties"]["v"]["type"],
+            "string"
+        );
     }
 
     #[test]
