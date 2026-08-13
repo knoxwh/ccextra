@@ -14,7 +14,7 @@ Claude Code          (ANTHROPIC_BASE_URL → http://127.0.0.1:8222)
      │  POST /v1/messages
      ▼
 ccextra :8222  ──  路由 → 归一化 → 协议转换 → 上游请求
-     │  响应经 SSE 流式沿原路返回
+     │  响应:流式 SSE / 非流 JSON 沿原路返回
      ├── claude            → Claude 原生协议
      ├── openai_chat       → OpenAI Chat Completions
      └── openai_responses  → OpenAI Responses
@@ -51,7 +51,7 @@ Claude Code → ccextra:8222
 8. prompt_cache_key 注入（provider 级开关）+ 诊断落盘（可选）
 9. claude 直通：anthropic-beta 重建 + 身份头透传
 10. 上游请求（reqwest + 按协议 UA + 代理）
-11. 响应转发（流式 SSE 状态机 / 非流直通；上游错误转 anthropic 形状）
+11. 响应转发（流式 SSE 状态机 / 非流: claude 字节直通, openai 走 non_stream 转回 anthropic, 转失败原样回上游字节；上游错误转 anthropic 形状）
     ↓
 上游 Provider
 ```
@@ -214,7 +214,7 @@ ccextra/
 cargo test --workspace
 ```
 
-当前 421 个单元测试，分布在缓存归一化、协议转换、SSE 状态机、HTTP 管线与配置解析等模块。
+当前 505 个单元测试 + 12 个 tokio 测试，分布在缓存归一化、协议转换、SSE 状态机、HTTP 管线与配置解析等模块。
 
 ## 文档
 

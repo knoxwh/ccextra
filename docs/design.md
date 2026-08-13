@@ -19,7 +19,7 @@ convert_to_openai_responses(&mut body, upstream_model);
 
 **放弃星型枢纽理由**：入站单一，矩阵退化为 `1×3=3`，中间类型收益为零，且会丢失 image/cache_control/metadata。
 
-**GPT 上游适配块**：responses 转换在 `upstream_model` 以 `gpt` 前缀（不区分大小写）时，向 developer message 末尾追加固定英文指令（`GPT_ADAPTER_BLOCK`）。动机：Claude Code 系统词按 Claude 调教，缺少 codex prompt 式的输出压缩硬约束，GPT 收到后默认冗长、过度探索、并把 `apply_patch` 当可用工具（codex 训练分布太熟，Claude 编排层不认）。块字节固定、不配置化，追加不改动 system 前缀，上游缓存主前缀仍命中；冲突时用户指令优先。无 system 时单独建 developer 置于 `input[0]`。触发条件与块内容见 `docs/glossary.md` 的 `gpt adapter block` / `gpt trigger`。
+**GPT 上游适配块**：responses 转换在 `upstream_model` 以 `gpt` 前缀（不区分大小写）时，把固定英文指令（`GPT_ADAPTER_BLOCK`）拼到顶层 `instructions` 末尾。动机：Claude Code 系统词按 Claude 调教，缺少 codex prompt 式的输出压缩硬约束，GPT 收到后默认冗长、过度探索、并把 `apply_patch` 当可用工具（codex 训练分布太熟，Claude 编排层不认）。块字节固定、不配置化，追加不改 `input` 前缀，上游缓存主前缀仍命中；冲突时用户指令优先。无 system 时 `instructions` 仅含该块，不另建 developer / `input[0]`。触发条件与块内容见 `docs/glossary.md` 的 `gpt adapter block` / `gpt trigger`。
 
 ## 2. 字节级直通
 
@@ -66,28 +66,13 @@ drift 观测 (三条链路，ancillary 请求跳过)
 
 ```rust
 // ❌ 参考实现把 system 写入 input[0] as developer message
-// ✅ ccextra: system 写入 template.instructions
-openai_body["template"]["instructions"] = json!(instructions_str);
+// ✅ ccextra: system 写入顶层 instructions（对齐 codex base_instructions）
+openai_body["instructions"] = json!(instructions_str);
 ```
 
-**坑2：工具名截断**（responses 路径）
+**坑2：工具名超长**（responses 路径）
 
-```rust
-// ❌ 参考实现工具名超 64 字符时截断 + 加 _1 后缀
-// ✅ ccextra: 工具名保留原样
-openai_body["template"]["tools"][0]["name"] = tool.get("name");
-```
-
-测试验证（`to_openai_responses.rs`）：
-
-```rust
-#[test]
-fn test_tool_name_preserved() {
-    let name = "very_long_tool_name_that_exceeds_sixty_four_characters_in_total_length";
-    // 转换后工具名原样保留，无截断、无后缀
-    assert_eq!(name, body["template"]["tools"][0]["name"]);
-}
-```
+超 64 字符缩短并建 short→original 还原表；流式 / 非流响应按表还原原名。测试：`test_tool_name_shortened_with_unique_suffix`。
 
 ## 5. 响应转发（SSE 状态机）
 
@@ -122,7 +107,7 @@ Claude Code → ccextra:8222
 8. prompt_cache_key 注入 (provider 级开关) + 诊断落盘 (可选)
 9. claude 直通: anthropic-beta 重建 + 身份头透传
 10. 上游请求 (reqwest + 按协议 UA + 代理)
-11. 响应转发 (流式 SSE 状态机 / 非流直通; 上游错误转 anthropic 形状)
+11. 响应转发 (流式 SSE 状态机 / 非流: claude 字节直通, openai 走 non_stream 转回 anthropic, 转失败原样回上游字节; 上游错误转 anthropic 形状)
     ↓
 上游 Provider
 ```

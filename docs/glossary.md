@@ -11,7 +11,7 @@ Anthropic Claude API 的原生协议,端点 `/v1/messages`。入站请求体含 
 OpenAI `/v1/chat/completions` 协议。请求体含 `messages` 数组,响应流式用 `data: {delta: {...}}` SSE 事件。
 
 **openai responses**  
-OpenAI `/v1/responses` 协议(Codex CLI 默认)。请求体用 `template.instructions` + `input` 数组,响应流式用 `output_item` 事件。
+OpenAI `/v1/responses` 协议(Codex CLI 默认)。请求体用顶层 `instructions` + `input` 数组,响应流式用 `output_item` 事件。
 
 **protocol**  
 出站目标协议类型,三种:`claude` / `openai_chat` / `openai_responses`。由 provider 配置决定,不由入站推导。
@@ -37,7 +37,7 @@ OpenAI `/v1/responses` 协议(Codex CLI 默认)。请求体用 `template.instruc
 发往上游的真实模型名,与入站 alias 可能不同。
 
 **按协议 UA 分流**  
-上游请求按协议用不同 User-Agent:chat → `claude-cli/2.1.221`,responses → `codex_cli_rs/...`。部分上游按 UA 识别客户端并分流缓存/特性,reqwest 默认 UA 会被判为非官方客户端。
+上游请求按协议用不同 User-Agent:claude / chat → `claude-cli/2.1.228`,responses → `codex_cli_rs/...`。部分上游按 UA 识别客户端并分流缓存/特性,reqwest 默认 UA 会被判为非官方客户端。
 
 **claude 直通头重建**  
 claude 路径的 `anthropic-beta` 头按 body 条件重建(基础集 `claude-code-20250219` + thinking 无 display → `redact-thinking` / tools → `advanced-tool-use` / `effort-2025-11-24` / speed=fast → `fast-mode`),再追加 caller 自带 beta(去重)。`anthropic-version`/`x-app`/`x-stainless-*` 等身份头仅透传(有就转发,没有不补)。与直通头重建中转场景一致。
@@ -56,7 +56,7 @@ claude 入站 → claude 出站,只改 `model` 字段,其余字节原样保留�
 在 `serde_json::Value` 上原地读写,不经过中间类型。gjson/sjson 风格(Go)或 `value[path] = new_val`(Rust)。每条路径独立实现。顶层键序(`model,max_tokens,temperature/stop,stream,reasoning_effort,messages,tools,tool_choice,user,stream_options`)。
 
 **stream_options.include_usage**  
-转换路径强制注入 `stream_options: {include_usage: true}`,对齐 `SetBoolIfDifferent` 语义。部分上游(kimi/moonshot)未开启时全程无 usage,客户端 statusline 无 context 显示;开启后流尾必发 usage chunk。
+仅 chat 路径、且 `stream` 缺省或为 true 时注入 `stream_options: {include_usage: true}`,对齐 `SetBoolIfDifferent` 语义。`stream: false` 不注入(部分上游拒该字段)。responses 路径无此字段。部分上游(kimi/moonshot)未开启时全程无 usage,客户端 statusline 无 context 显示;开启后流尾必发 usage chunk。
 
 **响应错误转 anthropic 形状**  
 上游非 2xx 时的 `{"error":{...}}` body 转 anthropic `{"type":"error","error":{...}}` 形状(对齐 `WriteErrorResponse` 语义)。`rate_limit`/`requests`/`tokens` 归为 `rate_limit_error`,已知类型透传,其余兜底 `api_error`。
@@ -67,7 +67,7 @@ Claude Code 同一条消息当轮发 content 数组、历史重建发字符串;�
 - responses:空串 → `content:[]` 保留消息(assistant 空 content 是 thinking-only/tool 轮的正常信号,不能丢);null/缺失 → 丢弃
 
 **gpt adapter block / GPT 适配块**  
-responses 路径下,上游模型名以 `gpt` 开头(不区分大小写)时,追加到 developer message 末尾的固定英文行为指令。修正 Claude 编排词对 GPT 的冗长/过度探索/误用 `apply_patch` 倾向。字节固定,不配置化,缓存主前缀稳定。
+responses 路径下,上游模型名以 `gpt` 开头(不区分大小写)时,拼到顶层 `instructions` 末尾的固定英文行为指令。修正 Claude 编排词对 GPT 的冗长/过度探索/误用 `apply_patch` 倾向。字节固定,不配置化,缓存主前缀稳定。无 system 时 `instructions` 仅含该块。
 
 **gpt trigger**  
 注入适配块的触发条件:`OpenAiResponses` 协议 + 上游模型名小写后以 `gpt` 为前缀。o 系列(o1/o3)不触发。
@@ -124,7 +124,7 @@ OpenAI chat/responses 的缓存桶标识。对齐 codex CLI 0.147 `prompt_cache_
 - responses → anthropic = `relay_responses_to_anthropic` 状态机
 
 **reasoning 回放闭环**  
-responses 路径的加密思考跨轮闭环:上游 `reasoning_summary_text.delta` 流式转 `thinking_delta`(可见),`output_item.done` 的 `encrypted_content` 以 `signature_delta` 收尾;下一轮请求侧把 `thinking.signature` 转回 `reasoning.encrypted_content`。对齐该语义,替代旧的 redacted_thinking 方案(形状不合规范且请求侧丢弃)。
+responses 路径:有 `encrypted_content` 时流式 `summary` 转 `thinking_delta`(可见),`output_item.done` 的加密内容以 `signature_delta` 收尾。下一轮有签 thinking 仅当签名 GPT 兼容(`gAAAA` 前缀)或 grok 模型才回放为 `reasoning.encrypted_content`,否则丢弃。无签非空 thinking 回放为明文 `reasoning.content`(与 chat 路径一致)。替代旧的 redacted_thinking 方案(形状不合规范且请求侧丢弃)。
 
 **断流兜底**  
 OpenAI 转换流尚未输出首个 Anthropic SSE 帧时，若首帧为 `error`，重试上游一次；仅门控首帧，不缓冲完整响应。第二次仍失败、或已输出首帧后发生上游传输错误/EOF 未满足协议终态时，状态机只发 anthropic `error`，不伪造 `message_start` 或正常收尾帧。Chat 的 `[DONE]` 是显式终态；未收到 `[DONE]` 的 EOF 需已有 `finish_reason`。Responses 仅 `response.completed` / `response.incomplete` 正常收尾；`response.failed` 与 `error` 为错误终态。终态后忽略后续帧。responses 空轮次/纯思考轮次合成空 text 块(Claude 客户端遇零块消息报 "Content block not found")。
