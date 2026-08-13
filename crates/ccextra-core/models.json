@@ -62,7 +62,7 @@
     },
     {
       "id": "grok-4.6",
-      "reasoning_levels": ["low", "medium", "high"]
+      "reasoning_levels": ["low", "medium", "high", "xhigh"]
     }
   ]
 }

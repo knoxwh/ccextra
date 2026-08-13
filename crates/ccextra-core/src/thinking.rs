@@ -397,9 +397,9 @@ mod tests {
 
     #[test]
     fn test_clamp_effort_registry_grok46() {
-        // grok-4.6 只支持 low/medium/high(对齐 CPA 注册表 xai 系)
-        assert_eq!(clamp_effort("max", "grok-4.6"), "high");
-        assert_eq!(clamp_effort("xhigh", "grok-4.6"), "high");
+        // grok-4.6 支持 low/medium/high/xhigh;max 降到 xhigh
+        assert_eq!(clamp_effort("max", "grok-4.6"), "xhigh");
+        assert_eq!(clamp_effort("xhigh", "grok-4.6"), "xhigh");
         assert_eq!(clamp_effort("high", "grok-4.6"), "high");
         assert_eq!(clamp_effort("medium", "grok-4.6"), "medium");
     }
