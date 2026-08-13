@@ -1,5 +1,7 @@
 # ccextra
 
+**中文** | **[English](README.en.md)**
+
 > 单进程 Rust 代理，把 Claude Code 接到任意上游：协议转换 + prompt 缓存优化 + 上游路由
 
 [![Rust](https://img.shields.io/badge/rust-1.75%2B-orange)](https://www.rust-lang.org/)
@@ -205,7 +207,8 @@ ccextra/
 │   ├── design.md               # 架构设计
 │   └── glossary.md             # 领域术语表
 ├── start.sh / stop.sh / restart.sh / build.sh
-└── README.md
+├── README.md                   # 中文（默认）
+└── README.en.md                # English
 ```
 
 ## 测试
