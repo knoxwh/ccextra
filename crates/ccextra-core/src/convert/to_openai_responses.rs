@@ -351,20 +351,31 @@ pub fn convert_to_openai_responses(
                         }
                     }
                     "thinking" => {
-                        // 带 GPT 兼容签名的思考 → 独立 reasoning item(先 flush 保序);
-                        // 无签名/不兼容签名丢弃,不退化为纯文本(对齐 appendReasoningContent)
+                        // 对齐 CLIProxyAPI 32dfdaeb 策略(同 chat 路径):无签名 thinking
+                        // 回放为明文 reasoning —— 响应侧仅当块带 encrypted_content 时
+                        // 才签名(sse/responses.rs),无加密的链内历史必然无签名;
+                        // 有签名仍须 GPT 兼容,不兼容丢弃(防跨提供方脏签名)
                         if role == "assistant" {
-                            if let Some(sig) = gpt_compatible_signature(
-                                part.get("signature").and_then(|v| v.as_str()),
-                                upstream_model,
-                            ) {
-                                flush_message(&mut content_items, &mut out_items);
-                                out_items.push(json!({
-                                    "type": "reasoning",
-                                    "summary": [],
-                                    "content": null,
-                                    "encrypted_content": sig
-                                }));
+                            let sig = part.get("signature").and_then(|v| v.as_str());
+                            if matches!(sig, Some(s) if !s.trim().is_empty()) {
+                                if let Some(good) = gpt_compatible_signature(sig, upstream_model) {
+                                    flush_message(&mut content_items, &mut out_items);
+                                    out_items.push(json!({
+                                        "type": "reasoning",
+                                        "summary": [],
+                                        "content": null,
+                                        "encrypted_content": good
+                                    }));
+                                }
+                            } else if let Some(t) = part.get("thinking").and_then(|v| v.as_str()) {
+                                if !t.trim().is_empty() {
+                                    flush_message(&mut content_items, &mut out_items);
+                                    out_items.push(json!({
+                                        "type": "reasoning",
+                                        "summary": [],
+                                        "content": t
+                                    }));
+                                }
                             }
                         }
                     }
@@ -967,13 +978,15 @@ mod tests {
         });
         convert_to_openai_responses(&mut body, "test-model").unwrap();
         let input = body["input"].as_array().unwrap();
-        assert_eq!(input.len(), 2);
-        // 无签名 thinking 丢弃 —— 不产生 reasoning item
-        assert!(input.iter().all(|i| i["type"] != "reasoning"));
-        assert_eq!(input[0]["type"], "message");
-        assert_eq!(input[0]["content"][0]["text"], "answer");
-        assert_eq!(input[1]["type"], "function_call");
-        assert_eq!(input[1]["call_id"], "c1");
+        assert_eq!(input.len(), 3);
+        // 无签名 thinking 回放为明文 reasoning item(对齐 chat 路径),保序在
+        // message 之前 —— 同链路历史由本转换器产生,必无签名
+        assert_eq!(input[0]["type"], "reasoning");
+        assert_eq!(input[0]["content"], "t1");
+        assert_eq!(input[1]["type"], "message");
+        assert_eq!(input[1]["content"][0]["text"], "answer");
+        assert_eq!(input[2]["type"], "function_call");
+        assert_eq!(input[2]["call_id"], "c1");
     }
 
     #[test]
