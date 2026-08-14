@@ -124,7 +124,9 @@ OpenAI chat/responses 的缓存桶标识。对齐 codex CLI 0.147 `prompt_cache_
 - responses → anthropic = `relay_responses_to_anthropic` 状态机
 
 **reasoning 回放闭环**  
-responses 路径:有 `encrypted_content` 时流式 `summary` 转 `thinking_delta`(可见),`output_item.done` 的加密内容以 `signature_delta` 收尾。下一轮有签 thinking 仅当签名 GPT 兼容(`gAAAA` 前缀)或 grok 模型才回放为 `reasoning.encrypted_content`,否则丢弃。无签非空 thinking 回放为明文 `reasoning.content`(与 chat 路径一致)。替代旧的 redacted_thinking 方案(形状不合规范且请求侧丢弃)。
+responses 路径:有 `encrypted_content` 时流式 `summary` 转 `thinking_delta`(可见),`output_item.done` 的加密内容以 `signature_delta` 收尾。下一轮有签 thinking 仅当签名 GPT 兼容(`gAAAA` 前缀)或 grok 模型才回放为 `reasoning.encrypted_content`,否则丢弃。无签非空 thinking 回放为明文 `reasoning.content`。替代旧的 redacted_thinking 方案(形状不合规范且请求侧丢弃)。
+
+chat 路径不同:Chat Completions 无 `encrypted_content`。对齐 CPA `shouldMapClaudeThinkingToGPTReasoning` 默认——无/空签名回放正文;有签名仅 `gAAAA` 过门后回放正文;Claude/Gemini/未知/grok 密文整块扔。签名本身不进 `reasoning_content`。无 grok 特例,无 CPA compat。
 
 **断流兜底**  
 OpenAI 转换流尚未输出首个 Anthropic SSE 帧时，若首帧为 `error`，重试上游一次；仅门控首帧，不缓冲完整响应。第二次仍失败、或已输出首帧后发生上游传输错误/EOF 未满足协议终态时，状态机只发 anthropic `error`，不伪造 `message_start` 或正常收尾帧。Chat 的 `[DONE]` 是显式终态；未收到 `[DONE]` 的 EOF 需已有 `finish_reason`。Responses 仅 `response.completed` / `response.incomplete` 正常收尾；`response.failed` 与 `error` 为错误终态。终态后忽略后续帧。responses 空轮次/纯思考轮次合成空 text 块(Claude 客户端遇零块消息报 "Content block not found")。
@@ -141,7 +143,7 @@ openai chat 的 `delta.tool_calls[N]` 需映射到 anthropic 的 `content[M]`,�
 anthropic 的 prompt caching marker,可标记在 system block / message / tool 定义 / content part 上,形如 `{type: "ephemeral"}`。
 
 **thinking**  
-anthropic 的推理块,含 `type: "thinking"` 的 content,可带 `budget_tokens` / `signature` 字段。
+anthropic 的推理块,含 `type: "thinking"` 的 content,可带 `budget_tokens` / `signature` 字段。chat 转换把过门的正文写入 `reasoning_content`(见「reasoning 回放闭环」);responses 把兼容签名写入 `encrypted_content`。
 
 **system**  
 anthropic 顶层字段,可以是 `string` 或 `block 数组`(含 text / tool_use / cache_control)两种形态。

@@ -4,15 +4,18 @@
 //! 作为独立的 `<system-reminder>` 文本块注入到用户消息中,外加一个
 //! "Continue from where you left off." 尾缀。它们的内容每轮都会变化,
 //! 在流式过程中破坏 cache prefix。这些都是仅展示给 *当前* 轮的临时状态
-//! 提示;新一轮会重新注入全新副本,因此删除历史副本不会改变模型行为——
+//! 提示;新一轮会重新注入全新副本,因此历史副本换成稳定占位不改模型行为——
 //! 只会(有利地)影响缓存与计费。
 //!
 //! # 安全性
 //! - 白名单是精确的:7 种记账模式 + 1 种 continue 尾缀。任何其他 reminder
 //!   (技能列表、hook 输出)都会原样保留。
-//! - 仅整块移除;不重写任何文本字节。
-//! - 若某条消息的内容会因此变为空,则保持其不变
-//!   (Anthropic 会拒绝空 content 数组;不插入占位符)。
+//! - 记账块整块移除,不改剩余文本。历史剥空才换成稳定占位
+//!   (不能删条:打断 user/assistant 交替;不能留空数组:Anthropic 拒;
+//!   不能用空白:chat convert 会剥掉整条)。
+//!   最后一条是活尾,剥空则保持原样——Continue / 当轮用量给模型看;
+//!   下轮它变成历史后再占位(边界一次 miss,之后稳)。
+//! - 字符串 content 仅当整段是记账 / continue 才换成同一占位;不中段抠。
 //! - 仅针对 Anthropic walker;OpenAI 分支返回 0。
 //!
 //! # 匹配形态
@@ -26,10 +29,12 @@
 //!   保留。CC 输出的是精确字符串。
 
 use crate::cache_stabilization::drift_detector::ApiKind;
-use serde_json::Value;
+use serde_json::{json, Value};
 use std::sync::OnceLock;
 
 const CONTINUE_TRAILER: &str = "Continue from where you left off.";
+/// 历史纯记账消息的稳定占位。非空白(逃过 convert trim),不匹配白名单(幂等)。
+const BOOKKEEPING_PLACEHOLDER: &str = "<system-reminder>\n[bookkeeping]\n</system-reminder>";
 
 /// `^<system-reminder>\n(INNER)\n</system-reminder>\s*$` — 捕获内部文本,
 /// 以便与记账白名单进行匹配。
@@ -74,8 +79,16 @@ fn is_continue_trailer(block: &Value) -> bool {
         && block.get("text").and_then(Value::as_str) == Some(CONTINUE_TRAILER)
 }
 
+fn is_pure_bookkeeping_string(s: &str) -> bool {
+    s == CONTINUE_TRAILER || is_bookkeeping_reminder(s)
+}
+
+fn placeholder_block() -> Value {
+    json!({"type": "text", "text": BOOKKEEPING_PLACEHOLDER})
+}
+
 /// 从历史用户消息中剥离记账 reminder 和 continue 尾缀。
-/// 返回被移除的块数。
+/// 返回被移除的块数(字符串整段替换计 1)。
 pub fn strip_bookkeeping_content(body: &mut Value, kind: ApiKind) -> usize {
     match kind {
         ApiKind::Anthropic => strip_anthropic_messages(body),
@@ -88,41 +101,60 @@ fn strip_anthropic_messages(body: &mut Value) -> usize {
     let Some(Value::Array(messages)) = body.get_mut("messages") else {
         return 0;
     };
+    let last_idx = messages.len().saturating_sub(1);
     let mut total = 0;
 
-    for msg in messages.iter_mut() {
+    for (idx, msg) in messages.iter_mut().enumerate() {
         if msg.get("role").and_then(Value::as_str) != Some("user") {
             continue;
         }
-        let Some(Value::Array(content)) = msg.get_mut("content") else {
-            continue;
-        };
+        // 最后一条是活尾:Continue / 当轮用量给模型看。下轮变历史再占位。
+        let is_live_tail = idx == last_idx;
 
-        let original_len = content.len();
-        let kept: Vec<Value> = content
-            .iter()
-            .filter(|block| {
-                if is_continue_trailer(block) {
-                    return false;
+        match msg.get_mut("content") {
+            Some(Value::String(s)) => {
+                if !is_pure_bookkeeping_string(s) || is_live_tail {
+                    continue;
                 }
-                if block.get("type").and_then(Value::as_str) == Some("text") {
-                    if let Some(text) = block.get("text").and_then(Value::as_str) {
-                        if is_bookkeeping_reminder(text) {
+                *s = BOOKKEEPING_PLACEHOLDER.to_string();
+                total += 1;
+            }
+            Some(Value::Array(content)) => {
+                let original_len = content.len();
+                let kept: Vec<Value> = content
+                    .iter()
+                    .filter(|block| {
+                        if is_continue_trailer(block) {
                             return false;
                         }
-                    }
-                }
-                true
-            })
-            .cloned()
-            .collect();
+                        if block.get("type").and_then(Value::as_str) == Some("text") {
+                            if let Some(text) = block.get("text").and_then(Value::as_str) {
+                                if is_bookkeeping_reminder(text) {
+                                    return false;
+                                }
+                            }
+                        }
+                        true
+                    })
+                    .cloned()
+                    .collect();
 
-        // 若什么都没移除,或移除会导致数组为空,则保持原样。
-        if kept.len() == original_len || kept.is_empty() {
-            continue;
+                if kept.len() == original_len {
+                    continue;
+                }
+                if kept.is_empty() {
+                    if is_live_tail {
+                        continue;
+                    }
+                    total += original_len;
+                    *content = vec![placeholder_block()];
+                    continue;
+                }
+                total += original_len - kept.len();
+                *content = kept;
+            }
+            _ => {}
         }
-        total += original_len - kept.len();
-        *content = kept;
     }
     total
 }
@@ -193,8 +225,8 @@ mod tests {
     }
 
     #[test]
-    fn leaves_message_unchanged_when_content_would_empty() {
-        // 唯一一块是记账——剥离会使数组为空,因此整条消息保持原样。
+    fn live_tail_pure_bookkeeping_left_intact() {
+        // 最后一条是活尾:Continue / 当轮用量给模型看,剥空则保持原样。
         let original = json!({
             "messages": [{
                 "role": "user",
@@ -205,6 +237,102 @@ mod tests {
         let count = strip_bookkeeping_content(&mut body, ApiKind::Anthropic);
         assert_eq!(count, 0);
         assert_eq!(body, original);
+    }
+
+    #[test]
+    fn historical_pure_bookkeeping_becomes_placeholder() {
+        // 历史纯记账换成稳定占位,不删条(角色交替),不留空数组。
+        let mut body = json!({
+            "messages": [
+                {
+                    "role": "user",
+                    "content": [
+                        reminder("Token usage: 1/2; 1 remaining"),
+                        {"type": "text", "text": "Continue from where you left off."}
+                    ]
+                },
+                {"role": "assistant", "content": [{"type": "text", "text": "ok"}]}
+            ]
+        });
+        let count = strip_bookkeeping_content(&mut body, ApiKind::Anthropic);
+        assert_eq!(count, 2);
+        let content = body["messages"][0]["content"].as_array().unwrap();
+        assert_eq!(content.len(), 1);
+        assert_eq!(content[0]["text"], BOOKKEEPING_PLACEHOLDER);
+        assert_eq!(body["messages"][1]["role"], "assistant");
+    }
+
+    #[test]
+    fn historical_pure_bookkeeping_cross_turn_stable() {
+        // 历史纯记账数字不同 → 占位后字节相同。
+        let mk = |n: u32| {
+            json!({
+                "messages": [
+                    {
+                        "role": "user",
+                        "content": [reminder(&format!(
+                            "Token usage: {n}/200; {} remaining",
+                            200 - n
+                        ))]
+                    },
+                    {"role": "assistant", "content": [{"type": "text", "text": "ok"}]}
+                ]
+            })
+        };
+        let mut a = mk(50);
+        let mut b = mk(150);
+        strip_bookkeeping_content(&mut a, ApiKind::Anthropic);
+        strip_bookkeeping_content(&mut b, ApiKind::Anthropic);
+        assert_eq!(a, b);
+        assert_eq!(
+            a["messages"][0]["content"][0]["text"],
+            BOOKKEEPING_PLACEHOLDER
+        );
+    }
+
+    #[test]
+    fn historical_bookkeeping_string_becomes_placeholder() {
+        let mut body = json!({
+            "messages": [
+                {
+                    "role": "user",
+                    "content": "<system-reminder>\nToken usage: 1/2; 1 remaining\n</system-reminder>"
+                },
+                {"role": "assistant", "content": "ok"}
+            ]
+        });
+        let count = strip_bookkeeping_content(&mut body, ApiKind::Anthropic);
+        assert_eq!(count, 1);
+        assert_eq!(body["messages"][0]["content"], BOOKKEEPING_PLACEHOLDER);
+    }
+
+    #[test]
+    fn live_tail_bookkeeping_string_left_intact() {
+        let original = json!({
+            "messages": [{
+                "role": "user",
+                "content": "<system-reminder>\nToken usage: 1/2; 1 remaining\n</system-reminder>"
+            }]
+        });
+        let mut body = original.clone();
+        assert_eq!(strip_bookkeeping_content(&mut body, ApiKind::Anthropic), 0);
+        assert_eq!(body, original);
+    }
+
+    #[test]
+    fn placeholder_is_idempotent() {
+        let mut body = json!({
+            "messages": [
+                {
+                    "role": "user",
+                    "content": [{"type": "text", "text": BOOKKEEPING_PLACEHOLDER}]
+                },
+                {"role": "assistant", "content": [{"type": "text", "text": "ok"}]}
+            ]
+        });
+        let snapshot = body.clone();
+        assert_eq!(strip_bookkeeping_content(&mut body, ApiKind::Anthropic), 0);
+        assert_eq!(body, snapshot);
     }
 
     #[test]

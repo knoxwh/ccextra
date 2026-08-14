@@ -232,6 +232,21 @@ fn system_reminder_text(content: &Value) -> Option<String> {
     Some(format!("<system-reminder>\n{text}\n</system-reminder>"))
 }
 
+/// 对齐 CPA `shouldMapClaudeThinkingToGPTReasoning` 默认路径。
+///
+/// 无/空签名过(同链路 chat 历史按设计无签)。有签名只认 GPT Fernet
+/// 形状(`gAAAA` 前缀,CPA `InspectGPTReasoningSignature` 的廉价判别)。
+/// 过门回放 thinking 正文;签名本身不进 Chat Completions。
+/// 不抄 responses 的 grok 任意放行,也不抄 CPA compat。
+fn should_map_thinking_to_reasoning(part: &Value) -> bool {
+    let sig = part
+        .get("signature")
+        .and_then(|v| v.as_str())
+        .unwrap_or("")
+        .trim();
+    sig.is_empty() || sig.starts_with("gAAAA")
+}
+
 /// 转换单条消息,返回一个或多个 openai 消息(tool_result 展开在前)
 fn convert_message(role: &str, content: &Value) -> Result<Vec<Value>> {
     // 字符串内容:统一为 text 数组(保留 跨协议形态归一化)。
@@ -264,19 +279,11 @@ fn convert_message(role: &str, content: &Value) -> Result<Vec<Value>> {
         let ptype = part.get("type").and_then(|v| v.as_str()).unwrap_or("");
         match ptype {
             "thinking" => {
-                // 仅 assistant 映射(防注入);非 assistant 忽略。
-                // 对齐 shouldMapClaudeThinkingToGPTReasoning:只回放无签名思考
-                // (同链路历史);跨提供方签名块跳过,防上游拒收。
-                if role == "assistant" {
-                    let signed = part
-                        .get("signature")
-                        .and_then(|v| v.as_str())
-                        .is_some_and(|s| !s.trim().is_empty());
-                    if !signed {
-                        if let Some(t) = part.get("thinking").and_then(|v| v.as_str()) {
-                            if !t.trim().is_empty() {
-                                reasoning_parts.push(t.to_string());
-                            }
+                // 仅 assistant 映射(防注入)。门闩见 should_map_thinking_to_reasoning。
+                if role == "assistant" && should_map_thinking_to_reasoning(part) {
+                    if let Some(t) = part.get("thinking").and_then(|v| v.as_str()) {
+                        if !t.trim().is_empty() {
+                            reasoning_parts.push(t.to_string());
                         }
                     }
                 }
@@ -725,19 +732,39 @@ mod tests {
     }
 
     #[test]
-    fn test_thinking_signed_skipped_unsigned_mapped() {
+    fn test_thinking_signature_gate_maps_unsigned_and_gpt() {
+        // 无签回放; Claude/未知签名整块扔; GPT gAAAA 回放正文,签名不进 body
         let mut body = json!({
             "model": "test",
             "messages": [{"role": "assistant", "content": [
                 {"type": "thinking", "thinking": "unsigned"},
-                {"type": "thinking", "thinking": "signed", "signature": "sig-1"},
+                {"type": "thinking", "thinking": "claude-signed", "signature": "C4x2-opaque"},
+                {"type": "thinking", "thinking": "gpt-signed", "signature": "gAAAA-fake"},
                 {"type": "text", "text": "answer"}
             ]}]
         });
         convert_to_openai_chat(&mut body, "gpt").unwrap();
         let msg = &body["messages"][0];
-        // 仅无签名思考进 reasoning_content
-        assert_eq!(msg["reasoning_content"], "unsigned");
+        assert_eq!(msg["reasoning_content"], "unsigned\n\ngpt-signed");
+        assert_eq!(msg["content"][0]["text"], "answer");
+        let reasoning = msg["reasoning_content"].as_str().unwrap();
+        assert!(!reasoning.contains("gAAAA"));
+        assert!(!reasoning.contains("C4x2"));
+    }
+
+    #[test]
+    fn test_thinking_grok_model_does_not_pass_foreign_signature() {
+        // chat 无 grok 特例: Claude 签名整块扔,不抄 responses 任意放行
+        let mut body = json!({
+            "model": "test",
+            "messages": [{"role": "assistant", "content": [
+                {"type": "thinking", "thinking": "keep-out", "signature": "C4x2 opaque"},
+                {"type": "text", "text": "answer"}
+            ]}]
+        });
+        convert_to_openai_chat(&mut body, "grok-3").unwrap();
+        let msg = &body["messages"][0];
+        assert!(msg.get("reasoning_content").is_none());
         assert_eq!(msg["content"][0]["text"], "answer");
     }
 

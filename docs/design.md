@@ -17,6 +17,8 @@ convert_to_openai_chat(&mut body, upstream_model);
 convert_to_openai_responses(&mut body, upstream_model);
 ```
 
+**thinking 回放(chat vs responses)**：chat 对齐 CPA 默认——签名只当门闩，过门回放正文到 `reasoning_content`，签名不进 Chat Completions。无/空签名过；有签名仅 `gAAAA` 过；Claude/未知整块扔。不抄 responses 的 grok 任意放行，也不抄 CPA compat。responses 仍走 `encrypted_content`（`gAAAA` 或 grok 模型名放行）。
+
 **放弃星型枢纽理由**：入站单一，矩阵退化为 `1×3=3`，中间类型收益为零，且会丢失 image/cache_control/metadata。
 
 **GPT 上游适配块**：responses 转换在 `upstream_model` 以 `gpt` 前缀（不区分大小写）时，把固定英文指令（`GPT_ADAPTER_BLOCK`）拼到顶层 `instructions` 末尾。动机：Claude Code 系统词按 Claude 调教，缺少 codex prompt 式的输出压缩硬约束，GPT 收到后默认冗长、过度探索、并把 `apply_patch` 当可用工具（codex 训练分布太熟，Claude 编排层不认）。块字节固定、不配置化，追加不改 `input` 前缀，上游缓存主前缀仍命中；冲突时用户指令优先。无 system 时 `instructions` 仅含该块，不另建 developer / `input[0]`。触发条件与块内容见 `docs/glossary.md` 的 `gpt adapter block` / `gpt trigger`。

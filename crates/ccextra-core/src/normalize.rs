@@ -113,12 +113,21 @@ pub fn normalize_anthropic_full(body: &mut Value) -> NormalizeCounts {
 
 /// 入站 anthropic 转换前归一化:精简子集(openai 转换链路转换前调用)。
 ///
-/// 只跑历史归一化子集:smoosh → content_strip → tool_input → sort → rstrip。
-/// 跳过 tool-def sort、volatile strip、drift、auto cache_control、volatile
-/// detect warn——这些要么在转换后 openai handler 里做(tool-def sort /
-/// volatile strip),要么对 openai 上游无意义(cache_control 转换时丢弃),
-/// 要么留到转换后观测(drift)。
+/// 跑:schema 键排序 → smoosh → content_strip → tool_input → sort → rstrip。
+/// schema 键必须在 tool_input 之前排:转换把 `tool_use.input` 冻成
+/// `arguments` 字符串,post 无法再改。`tools[]` 数组排序仍留 post
+/// (openai 形状)。跳过 volatile strip、auto cache_control、volatile
+/// detect warn——cache_control 转换时丢弃;volatile / drift 留转换后。
 pub fn normalize_anthropic_pretransform(body: &mut Value) -> NormalizeCounts {
+    // schema 键递归排序(不排 tools[]:那是 openai 形状的 post 职责)
+    if let Some(tools) = body.get_mut("tools").and_then(|t| t.as_array_mut()) {
+        for tool in tools.iter_mut() {
+            if let Some(schema) = tool.get_mut("input_schema") {
+                sort_schema_keys_recursive(schema);
+            }
+        }
+    }
+
     NormalizeCounts {
         // 1. smoosh 拆分
         smoosh_count: split_smooshed_reminders(body, DriftApiKind::Anthropic),
@@ -268,6 +277,60 @@ mod tests {
         assert!(!counts.tool_sorted, "tool-def sort must be skipped");
         // tools 顺序未被改动
         assert_eq!(body["tools"][0]["name"], "b");
+    }
+
+    #[test]
+    fn test_pretransform_sorts_schema_keys_before_tool_input() {
+        // properties 键序跨轮抖动时,tool_use.input 必须按排好的
+        // schema 重排,否则 convert 冻进 arguments 的字符串会 miss。
+        let mk = |props: Value, input: Value| {
+            json!({
+                "tools": [{
+                    "name": "edit_file",
+                    "input_schema": {"type": "object", "properties": props}
+                }],
+                "messages": [{
+                    "role": "assistant",
+                    "content": [{
+                        "type": "tool_use",
+                        "id": "t1",
+                        "name": "edit_file",
+                        "input": input
+                    }]
+                }]
+            })
+        };
+        let mut a = mk(
+            json!({"content": {"type": "string"}, "path": {"type": "string"}}),
+            json!({"content": "c", "path": "/p"}),
+        );
+        let mut b = mk(
+            json!({"path": {"type": "string"}, "content": {"type": "string"}}),
+            json!({"path": "/p", "content": "c"}),
+        );
+
+        let counts_a = normalize_anthropic_pretransform(&mut a);
+        normalize_anthropic_pretransform(&mut b);
+
+        let keys = |body: &Value| -> Vec<String> {
+            body["messages"][0]["content"][0]["input"]
+                .as_object()
+                .unwrap()
+                .keys()
+                .cloned()
+                .collect()
+        };
+        assert_eq!(keys(&a), keys(&b));
+        assert_eq!(keys(&a), vec!["content", "path"]);
+        let props: Vec<String> = a["tools"][0]["input_schema"]["properties"]
+            .as_object()
+            .unwrap()
+            .keys()
+            .cloned()
+            .collect();
+        assert_eq!(props, vec!["content", "path"]);
+        // tools[] 数组仍不排,留给 post
+        assert!(!counts_a.tool_sorted);
     }
 
     #[test]
