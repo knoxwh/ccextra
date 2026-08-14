@@ -41,17 +41,23 @@ fn endpoint_path(protocol: Protocol) -> &'static str {
     }
 }
 
-/// 按协议取 User-Agent(对齐上游期望的客户端标识)
+/// 模型名是否按 *gpt* 匹配(大小写不敏感,含前缀/中缀/后缀)
+fn is_gpt_model(upstream_model: &str) -> bool {
+    upstream_model.to_ascii_lowercase().contains("gpt")
+}
+
+/// 按协议+模型取 User-Agent(对齐上游期望的客户端标识)
 ///
-/// openai chat → claude-cli;responses → codex-tui。部分上游按 UA
-/// 分流缓存/特性,reqwest 默认 UA 会被识别为非官方客户端。
-fn user_agent(protocol: Protocol) -> &'static str {
+/// 仅 responses + *gpt* 用 Codex UA;其余(含 responses 上的 grok 等)
+/// 用 claude-cli。部分上游按 UA 分流缓存/特性,reqwest 默认 UA
+/// 会被识别为非官方客户端。
+fn user_agent(protocol: Protocol, upstream_model: &str) -> &'static str {
+    const CLAUDE_CLI: &str = "claude-cli/2.1.228";
+    const CODEX_TUI: &str =
+        "codex-tui/0.147.0 (Mac OS 26.6.1; arm64) ghostty/1.3.1 (codex-tui; 0.147.0)";
     match protocol {
-        Protocol::Claude => "claude-cli/2.1.228",
-        Protocol::OpenAiChat => "claude-cli/2.1.228",
-        Protocol::OpenAiResponses => {
-            "codex-tui/0.147.0 (Mac OS 26.6.1; arm64) ghostty/1.3.1 (codex-tui; 0.147.0)"
-        }
+        Protocol::OpenAiResponses if is_gpt_model(upstream_model) => CODEX_TUI,
+        _ => CLAUDE_CLI,
     }
 }
 
@@ -141,14 +147,15 @@ impl UpstreamClient {
             endpoint_path(protocol)
         );
 
-        let mut req = client
-            .post(&url)
-            .bearer_auth(api_key)
-            .header(reqwest::header::USER_AGENT, user_agent(protocol));
+        let upstream_model = body.get("model").and_then(|v| v.as_str()).unwrap_or("");
+        let mut req = client.post(&url).bearer_auth(api_key).header(
+            reqwest::header::USER_AGENT,
+            user_agent(protocol, upstream_model),
+        );
         for (name, value) in stream_headers(protocol, is_stream) {
             req = req.header(name, value);
         }
-        // responses 协议:session-id/thread-id/Originator 对齐 Codex 官方客户端
+        // responses 协议:session-id/thread-id 始终带;Originator 仅 *gpt*
         if matches!(protocol, Protocol::OpenAiResponses) {
             if let Some(sid) = session_id {
                 req = req.header("session-id", sid);
@@ -156,7 +163,9 @@ impl UpstreamClient {
             if let Some(tid) = thread_id {
                 req = req.header("thread-id", tid);
             }
-            req = req.header("Originator", "codex_cli_rs");
+            if is_gpt_model(upstream_model) {
+                req = req.header("Originator", "codex_cli_rs");
+            }
         }
         for (name, value) in extra_headers {
             req = req.header(name.as_str(), value.as_str());
@@ -187,12 +196,35 @@ mod tests {
 
     #[test]
     fn test_user_agent_per_protocol() {
-        assert_eq!(user_agent(Protocol::OpenAiChat), "claude-cli/2.1.228");
+        const CLAUDE_CLI: &str = "claude-cli/2.1.228";
+        const CODEX_TUI: &str =
+            "codex-tui/0.147.0 (Mac OS 26.6.1; arm64) ghostty/1.3.1 (codex-tui; 0.147.0)";
         assert_eq!(
-            user_agent(Protocol::OpenAiResponses),
-            "codex-tui/0.147.0 (Mac OS 26.6.1; arm64) ghostty/1.3.1 (codex-tui; 0.147.0)"
+            user_agent(Protocol::OpenAiChat, "gpt-5.6-terra"),
+            CLAUDE_CLI
         );
-        assert_eq!(user_agent(Protocol::Claude), "claude-cli/2.1.228");
+        assert_eq!(
+            user_agent(Protocol::OpenAiResponses, "gpt-5.6-terra"),
+            CODEX_TUI
+        );
+        assert_eq!(
+            user_agent(Protocol::OpenAiResponses, "GPT-5.6-sol"),
+            CODEX_TUI
+        );
+        assert_eq!(
+            user_agent(Protocol::OpenAiResponses, "openai/gpt-5.6"),
+            CODEX_TUI
+        );
+        assert_eq!(
+            user_agent(Protocol::OpenAiResponses, "grok-4.6"),
+            CLAUDE_CLI
+        );
+        assert_eq!(user_agent(Protocol::Claude, "claude-opus-5"), CLAUDE_CLI);
+        assert!(is_gpt_model("gpt-5.6-terra"));
+        assert!(is_gpt_model("ck-gpt-5.6"));
+        assert!(is_gpt_model("openai/GPT-5"));
+        assert!(!is_gpt_model("grok-4.6"));
+        assert!(!is_gpt_model("claude-opus-5"));
     }
 
     #[test]
