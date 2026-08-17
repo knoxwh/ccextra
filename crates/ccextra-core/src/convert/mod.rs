@@ -3,16 +3,27 @@
 // - passthrough: claude → claude 只改 model
 // - to_openai_chat: anthropic → openai chat
 // - to_openai_responses: anthropic → openai responses
+// - to_gemini: anthropic → gemini
 
 use thiserror::Error;
 
+pub mod carrier;
 pub mod fix_json;
+pub mod gemini;
+pub mod gemini_response;
+pub mod message_convert;
 pub mod passthrough;
 pub mod shorten;
 pub mod to_openai_chat;
 pub mod to_openai_responses;
+pub mod tool_id;
+pub mod tool_sanitize;
 
 pub use fix_json::fix_json_quotes;
+pub use gemini::convert_to_gemini;
+pub use gemini_response::{
+    convert_gemini_response, convert_gemini_stream_chunk, finalize_gemini_stream, GeminiStreamState,
+};
 pub use passthrough::convert_passthrough;
 pub use shorten::build_reverse_map;
 pub use shorten::build_short_name_map;

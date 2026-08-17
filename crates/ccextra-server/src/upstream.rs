@@ -38,6 +38,7 @@ fn endpoint_path(protocol: Protocol) -> &'static str {
         Protocol::Claude => "/v1/messages",
         Protocol::OpenAiChat => "/chat/completions",
         Protocol::OpenAiResponses => "/responses",
+        Protocol::Gemini => "/v1beta/models/{model}:streamGenerateContent",
     }
 }
 
@@ -141,13 +142,18 @@ impl UpstreamClient {
     ) -> anyhow::Result<UpstreamResponse> {
         let proxy_key = self.resolve_proxy(provider_proxy);
         let client = self.client_for(&proxy_key);
-        let url = format!(
-            "{}{}",
-            base_url.trim_end_matches('/'),
-            endpoint_path(protocol)
-        );
 
         let upstream_model = body.get("model").and_then(|v| v.as_str()).unwrap_or("");
+
+        // Gemini 端点需要替换 {model} 占位符
+        let endpoint = endpoint_path(protocol);
+        let endpoint = if matches!(protocol, Protocol::Gemini) {
+            endpoint.replace("{model}", upstream_model)
+        } else {
+            endpoint.to_string()
+        };
+
+        let url = format!("{}{}", base_url.trim_end_matches('/'), endpoint);
         let mut req = client.post(&url).bearer_auth(api_key).header(
             reqwest::header::USER_AGENT,
             user_agent(protocol, upstream_model),

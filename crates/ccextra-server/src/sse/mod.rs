@@ -8,6 +8,7 @@
 
 pub mod chat;
 pub mod emit;
+pub mod gemini;
 pub mod non_stream;
 pub mod parser;
 pub mod responses;
@@ -48,6 +49,9 @@ where
         }
         Protocol::OpenAiResponses => {
             responses::relay_responses_to_anthropic(stream, estimated_input_tokens, tool_names)
+        }
+        Protocol::Gemini => {
+            gemini::relay_gemini_to_anthropic(stream, estimated_input_tokens, tool_names)
         }
     }
 }

@@ -522,6 +522,15 @@ async fn handle_messages(
                 );
             }
         }
+        Protocol::Gemini => {
+            use ccextra_core::convert::convert_to_gemini;
+            let (gemini_body, short_to_original, _original_to_claude_id) =
+                convert_to_gemini(&body_json, &route.upstream_model);
+            body_json = gemini_body;
+            if !short_to_original.is_empty() {
+                tool_names = Some(Arc::new(short_to_original));
+            }
+        }
     }
 
     // 5. payload 参数覆盖(转换后注入;claude 直通需显式 protocol 才生效)
@@ -542,7 +551,7 @@ async fn handle_messages(
         let provider = find_provider(&providers, &route.provider)
             .ok_or_else(|| AppError::new(anyhow::anyhow!("provider 未找到: {}", route.provider)))?;
         (
-            provider.base_url.clone(),
+            provider.base_urls()[0].clone(),
             provider.key.clone(),
             provider.proxy_url.clone(),
             provider.prompt_cache_key,
@@ -783,6 +792,13 @@ async fn handle_messages(
                 Protocol::OpenAiChat => crate::sse::non_stream::openai_chat_to_anthropic(&v),
                 Protocol::OpenAiResponses => {
                     crate::sse::non_stream::responses_to_anthropic(&v, tool_names.as_deref())
+                }
+                Protocol::Gemini => {
+                    use ccextra_core::convert::convert_gemini_response;
+                    Some(convert_gemini_response(
+                        &v,
+                        tool_names.as_deref().unwrap_or(&HashMap::new()),
+                    ))
                 }
             },
             Err(_) => None,
@@ -1399,35 +1415,24 @@ data: {"type":"response.created","response":{"id":"resp_eof"}}"#
     }
 
     fn mock_state() -> AppState {
-        use ccextra_core::route::{ModelConfig, Protocol};
-        let providers = vec![
-            ProviderConfig {
-                name: "test-claude".into(),
-                protocol: Protocol::Claude,
-                base_url: "https://mock.example.com".into(),
-                key: "sk-test".into(),
-                proxy_url: None,
-                prompt_cache_key: false,
-                models: vec![ModelConfig {
-                    name: "claude-opus-5".into(),
-                    alias: "test-opus".into(),
-                    ..Default::default()
-                }],
-            },
-            ProviderConfig {
-                name: "test-openai".into(),
-                protocol: Protocol::OpenAiChat,
-                base_url: "https://mock-openai.example.com".into(),
-                key: "sk-openai".into(),
-                proxy_url: Some("direct".into()),
-                prompt_cache_key: false,
-                models: vec![ModelConfig {
-                    name: "gpt-4".into(),
-                    alias: "test-gpt".into(),
-                    ..Default::default()
-                }],
-            },
-        ];
+        let providers_yaml = r#"
+- name: test-claude
+  protocol: claude
+  base_url: "https://mock.example.com"
+  key: sk-test
+  models:
+    - name: claude-opus-5
+      alias: test-opus
+- name: test-openai
+  protocol: openai_chat
+  base_url: "https://mock-openai.example.com"
+  key: sk-openai
+  proxy_url: "direct"
+  models:
+    - name: gpt-4
+      alias: test-gpt
+"#;
+        let providers: Vec<ProviderConfig> = serde_yaml::from_str(providers_yaml).unwrap();
         AppState {
             providers: Arc::new(RwLock::new(providers)),
             payload_rules: Arc::new(RwLock::new(vec![])),
@@ -1451,8 +1456,6 @@ data: {"type":"response.created","response":{"id":"resp_eof"}}"#
     /// 首次上游 200 空流尚未向客户端输出时，应重试一次并转发第二次结果。
     #[tokio::test]
     async fn test_openai_responses_retries_empty_stream_before_output() {
-        use ccextra_core::route::{ModelConfig, Protocol};
-
         let attempts = Arc::new(std::sync::atomic::AtomicUsize::new(0));
         let handler_attempts = Arc::clone(&attempts);
         let upstream = Router::new().route(
@@ -1484,19 +1487,21 @@ data: {"type":"response.created","response":{"id":"resp_eof"}}"#
         });
 
         let state = mock_state();
-        state.providers.write().await.push(ProviderConfig {
-            name: "test-responses".into(),
-            protocol: Protocol::OpenAiResponses,
-            base_url: format!("http://{upstream_addr}"),
-            key: "sk-test".into(),
-            proxy_url: Some("direct".into()),
-            prompt_cache_key: false,
-            models: vec![ModelConfig {
-                name: "gpt-5".into(),
-                alias: "test-responses".into(),
-                ..Default::default()
-            }],
-        });
+        let provider_yaml = format!(
+            r#"
+name: test-responses
+protocol: openai_responses
+base_url: "http://{}"
+key: sk-test
+proxy_url: "direct"
+models:
+  - name: gpt-5
+    alias: test-responses
+"#,
+            upstream_addr
+        );
+        let provider: ProviderConfig = serde_yaml::from_str(&provider_yaml).unwrap();
+        state.providers.write().await.push(provider);
         let app = app(state);
         let request = Request::builder()
             .uri("/v1/messages")
@@ -1727,42 +1732,25 @@ data: {"type":"response.created","response":{"id":"resp_eof"}}"#
 
     #[test]
     fn test_build_models_list() {
-        use ccextra_core::route::ModelConfig;
-        let providers = vec![
-            ProviderConfig {
-                name: "p1".into(),
-                protocol: Protocol::Claude,
-                base_url: "https://x.com".into(),
-                key: "k".into(),
-                proxy_url: None,
-                prompt_cache_key: false,
-                models: vec![ModelConfig {
-                    name: "upstream-a".into(),
-                    alias: "alias-a".into(),
-                    ..Default::default()
-                }],
-            },
-            ProviderConfig {
-                name: "p2".into(),
-                protocol: Protocol::OpenAiChat,
-                base_url: "https://y.com".into(),
-                key: "k".into(),
-                proxy_url: None,
-                prompt_cache_key: false,
-                models: vec![
-                    ModelConfig {
-                        name: "upstream-b".into(),
-                        alias: "alias-b".into(),
-                        ..Default::default()
-                    },
-                    ModelConfig {
-                        name: "upstream-c".into(),
-                        alias: "alias-c".into(),
-                        ..Default::default()
-                    },
-                ],
-            },
-        ];
+        let providers_yaml = r#"
+- name: p1
+  protocol: claude
+  base_url: "https://x.com"
+  key: k
+  models:
+    - name: upstream-a
+      alias: alias-a
+- name: p2
+  protocol: openai_chat
+  base_url: "https://y.com"
+  key: k
+  models:
+    - name: upstream-b
+      alias: alias-b
+    - name: upstream-c
+      alias: alias-c
+"#;
+        let providers: Vec<ProviderConfig> = serde_yaml::from_str(providers_yaml).unwrap();
         let json = build_models_list(&providers);
         let data = json["data"].as_array().unwrap();
         assert_eq!(data.len(), 3);
@@ -1774,21 +1762,18 @@ data: {"type":"response.created","response":{"id":"resp_eof"}}"#
 
     #[test]
     fn test_build_models_list_custom_context() {
-        use ccextra_core::route::ModelConfig;
-        let providers = vec![ProviderConfig {
-            name: "p1".into(),
-            protocol: Protocol::Claude,
-            base_url: "https://x.com".into(),
-            key: "k".into(),
-            proxy_url: None,
-            prompt_cache_key: false,
-            models: vec![ModelConfig {
-                name: "upstream-a".into(),
-                alias: "alias-a".into(),
-                max_input_tokens: Some(128000),
-                max_tokens: Some(32000),
-            }],
-        }];
+        let providers_yaml = r#"
+- name: p1
+  protocol: claude
+  base_url: "https://x.com"
+  key: k
+  models:
+    - name: upstream-a
+      alias: alias-a
+      max_input_tokens: 128000
+      max_tokens: 32000
+"#;
+        let providers: Vec<ProviderConfig> = serde_yaml::from_str(providers_yaml).unwrap();
         let json = build_models_list(&providers);
         let data = json["data"].as_array().unwrap();
         assert_eq!(data[0]["max_input_tokens"], 128000);
@@ -1797,20 +1782,16 @@ data: {"type":"response.created","response":{"id":"resp_eof"}}"#
 
     #[test]
     fn test_build_models_list_default_context() {
-        use ccextra_core::route::ModelConfig;
-        let providers = vec![ProviderConfig {
-            name: "p1".into(),
-            protocol: Protocol::Claude,
-            base_url: "https://x.com".into(),
-            key: "k".into(),
-            proxy_url: None,
-            prompt_cache_key: false,
-            models: vec![ModelConfig {
-                name: "upstream-a".into(),
-                alias: "alias-a".into(),
-                ..Default::default()
-            }],
-        }];
+        let providers_yaml = r#"
+- name: p1
+  protocol: claude
+  base_url: "https://x.com"
+  key: k
+  models:
+    - name: upstream-a
+      alias: alias-a
+"#;
+        let providers: Vec<ProviderConfig> = serde_yaml::from_str(providers_yaml).unwrap();
         let json = build_models_list(&providers);
         let data = json["data"].as_array().unwrap();
         assert_eq!(data[0]["max_input_tokens"], 200000);
@@ -2084,7 +2065,7 @@ data: {"type":"response.created","response":{"id":"resp_eof"}}"#
 
         let mut state = mock_state();
         // 让 test-claude 指向慢 mock
-        state.providers.write().await[0].base_url = format!("http://{addr}");
+        state.providers.write().await[0].set_base_url_for_test(format!("http://{addr}"));
 
         state.reload = reload_returning_secret(None);
 

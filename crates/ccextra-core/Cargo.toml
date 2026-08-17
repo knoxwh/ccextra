@@ -28,3 +28,4 @@ once_cell = "1.21.4"
 [dev-dependencies]
 proptest = "1"
 tracing-subscriber = { version = "0.3", default-features = false, features = ["fmt", "ansi"] }
+serde_yaml = "0.9"

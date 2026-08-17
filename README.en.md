@@ -9,7 +9,7 @@
 [![Workspace](https://img.shields.io/badge/workspace-3%20crates-lightgrey)]()
 [![Docs: design](https://img.shields.io/badge/docs-architecture-informational)](docs/design.md)
 
-One binary, one port. Serves three upstream protocols at once: native Claude, OpenAI Chat Completions, and OpenAI Responses. Routes Claude Code requests by model to the matching provider, and deterministically normalizes request bodies so upstream prompt caches hit as often as possible.
+One binary, one port. Serves four upstream protocols at once: native Claude, OpenAI Chat Completions, OpenAI Responses, and Google Gemini. Routes Claude Code requests by model to the matching provider, and deterministically normalizes request bodies so upstream prompt caches hit as often as possible.
 
 ```
 Claude Code          (ANTHROPIC_BASE_URL → http://127.0.0.1:8222)
@@ -19,14 +19,15 @@ ccextra :8222  ──  route → normalize → convert → upstream
      │  Response: streaming SSE / non-stream JSON back the same path
      ├── claude            → native Claude protocol
      ├── openai_chat       → OpenAI Chat Completions
-     └── openai_responses  → OpenAI Responses
+     ├── openai_responses  → OpenAI Responses
+     └── gemini            → Google Gemini API
 ```
 
 ## Features
 
 | Category | What it does |
 | ---- | ---- |
-| **Multi-protocol** | Native Claude / OpenAI Chat Completions / OpenAI Responses |
+| **Multi-protocol** | Native Claude / OpenAI Chat Completions / OpenAI Responses / Google Gemini |
 | **Model routing** | Inbound model name resolves via alias to exactly one provider. Conflicts fail at startup; no implicit fallback |
 | **Byte-level passthrough** | Claude → Claude changes only the `model` field. Remaining bytes stay intact so normalization is not undone |
 | **Prompt-cache optimization** | Nine-module normalization kills serialization drift so upstream prompt cache can hit. A drift detector watches blind spots across turns |
@@ -107,6 +108,14 @@ providers:
     models:
       - name: gpt-5.6-terra
         alias: gpt-5.6-terra
+
+  - name: gemini
+    protocol: gemini
+    base_url: https://generativelanguage.googleapis.com
+    key: YOUR_GEMINI_API_KEY
+    models:
+      - name: gemini-2.0-flash-exp
+        alias: gemini-flash
 ```
 
 ### Run
@@ -175,7 +184,7 @@ Full knobs live in [`config.example.yaml`](config.example.yaml). Highlights:
 | `server.host` / `server.port` | Listen address. Default `127.0.0.1:8222` |
 | `server.proxy_url` | Global proxy fallback, optional. `"direct"` means no proxy |
 | `secret_key` | Ingress auth, optional. When set, `/v1/models` and `/v1/messages` require a matching key or they 401. Accepts `x-api-key` or `Authorization: Bearer`. Plaintext is hashed to bcrypt and written back. `/reload` swaps the secret and clears the bcrypt verify cache |
-| `providers[].protocol` | Upstream protocol: `claude` / `openai_chat` / `openai_responses` |
+| `providers[].protocol` | Upstream protocol: `claude` / `openai_chat` / `openai_responses` / `gemini` |
 | `providers[].base_url` / `key` | Upstream URL and API key |
 | `providers[].models[].alias` | Inbound model name → real upstream model name |
 | `providers[].prompt_cache_key` | Cache-bucket key = session ID (aligned with Codex 0.147). OpenAI protocols only |
@@ -217,12 +226,13 @@ ccextra/
 cargo test --workspace
 ```
 
-Currently 505 unit tests + 12 tokio tests, covering cache normalization, protocol conversion, SSE state machines, the HTTP pipeline, and config parsing.
+Currently 567 tests (12 + 414 + 141), covering cache normalization, protocol conversion (Claude/OpenAI/Gemini), SSE state machines, the HTTP pipeline, and config parsing.
 
 ## Docs
 
 - **[docs/design.md](docs/design.md)** — Architecture: convert paths, normalization, SSE relay, performance (Chinese)
 - **[docs/glossary.md](docs/glossary.md)** — Domain glossary (Chinese)
+- **[docs/gemini.md](docs/gemini.md)** — Gemini protocol support: tool calling, thinking, streaming (Chinese)
 
 ## License
 
