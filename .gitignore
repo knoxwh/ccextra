@@ -18,6 +18,9 @@ config.*.yaml
 # 运行时日志
 /logs/
 
+# 项目缓存(含 Antigravity 凭证)
+.cache/
+
 # Claude Code 本地指导文件
 CLAUDE.md
 

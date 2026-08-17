@@ -63,6 +63,10 @@
     {
       "id": "grok-4.6",
       "reasoning_levels": ["low", "medium", "high", "xhigh"]
+    },
+    {
+      "id": "gemini-3.7-flash-high",
+      "reasoning_levels": ["minimal", "low", "medium", "high"]
     }
   ]
 }

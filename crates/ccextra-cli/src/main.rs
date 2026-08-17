@@ -1,10 +1,16 @@
 use anyhow::Result;
 use ccextra_core::cache_stabilization::drift_detector::DriftState;
+use ccextra_server::antigravity::{
+    constants::{CALLBACK_PORT, REFRESH_SKEW_SECS},
+    list, resolve_auth_dir, run_login, LoginOptions,
+};
 use ccextra_server::http::{AppState, ReloadData, RuntimeConfig};
 use ccextra_server::serve;
 use ccextra_server::upstream::UpstreamClient;
-use clap::Parser;
+use clap::{Parser, Subcommand};
+use std::path::PathBuf;
 use std::sync::Arc;
+use std::time::SystemTime;
 use time::UtcOffset;
 use tokio::sync::RwLock;
 use tracing_subscriber::{
@@ -20,13 +26,52 @@ use config::Config;
 #[command(about = "Claude Code 请求代理:协议转换 + 缓存优化 + 上游路由")]
 struct Cli {
     /// 配置文件路径
-    #[arg(short, long, default_value = "config.yaml")]
+    #[arg(short, long, default_value = "config.yaml", global = true)]
     config: String,
+    #[command(subcommand)]
+    command: Option<Commands>,
+}
+
+#[derive(Subcommand)]
+enum Commands {
+    /// 浏览器登录 Antigravity 并写入凭证
+    #[command(name = "antigravity-login")]
+    AntigravityLogin {
+        /// 凭证目录,默认配置文件旁 .cache/antigravity
+        #[arg(long)]
+        auth_dir: Option<String>,
+        /// 不自动打开浏览器,只打印 URL
+        #[arg(long)]
+        no_browser: bool,
+        /// 本地回调端口,默认 51121(须与 Google 桌面端 client 一致)
+        #[arg(long)]
+        callback_port: Option<u16>,
+    },
+    /// 列出已保存的 Antigravity 凭证(不打印 token)
+    #[command(name = "antigravity-status")]
+    AntigravityStatus {
+        /// 凭证目录,默认配置文件旁 .cache/antigravity
+        #[arg(long)]
+        auth_dir: Option<String>,
+    },
 }
 
 #[tokio::main]
 async fn main() -> Result<()> {
     let cli = Cli::parse();
+    match cli.command {
+        Some(Commands::AntigravityLogin {
+            auth_dir,
+            no_browser,
+            callback_port,
+        }) => {
+            return cmd_login(&cli.config, auth_dir, no_browser, callback_port).await;
+        }
+        Some(Commands::AntigravityStatus { auth_dir }) => {
+            return cmd_status(&cli.config, auth_dir);
+        }
+        None => {}
+    }
 
     // 加载配置(日志级别依赖配置,故先加载)
     let config = Config::load(&cli.config)?;
@@ -95,4 +140,119 @@ async fn main() -> Result<()> {
     serve(&addr, state).await?;
 
     Ok(())
+}
+
+fn load_optional_config(path: &str) -> Option<Config> {
+    Config::load(path).ok()
+}
+
+fn auth_dir_from(config_path: &str, override_dir: Option<String>) -> PathBuf {
+    let raw = if let Some(dir) = override_dir {
+        Some(dir)
+    } else {
+        load_optional_config(config_path).and_then(|cfg| cfg.auth_dir)
+    };
+    pin_auth_dir(config_path, raw.as_deref())
+}
+
+/// 相对路径钉在配置文件所在目录,不跟进程 cwd 走
+fn pin_auth_dir(config_path: &str, raw: Option<&str>) -> PathBuf {
+    let path = resolve_auth_dir(raw);
+    if path.is_absolute() {
+        return path;
+    }
+    let parent = PathBuf::from(config_path);
+    let base = parent.parent().filter(|p| !p.as_os_str().is_empty());
+    match base {
+        Some(dir) => dir.join(path),
+        None => path,
+    }
+}
+
+async fn cmd_login(
+    config_path: &str,
+    auth_dir: Option<String>,
+    no_browser: bool,
+    callback_port: Option<u16>,
+) -> Result<()> {
+    let cfg = load_optional_config(config_path);
+    // 登录换码/userinfo/project 走 server.proxy_url
+    let proxy_url = cfg.as_ref().and_then(|c| c.server.proxy_url.clone());
+    let opts = LoginOptions {
+        auth_dir: auth_dir_from(config_path, auth_dir),
+        no_browser,
+        callback_port: callback_port.unwrap_or(CALLBACK_PORT),
+        proxy_url,
+    };
+    run_login(opts).await?;
+    Ok(())
+}
+
+fn cmd_status(config_path: &str, auth_dir: Option<String>) -> Result<()> {
+    let dir = auth_dir_from(config_path, auth_dir);
+    let now = SystemTime::now();
+    let entries = list(&dir)?;
+    if entries.is_empty() {
+        println!("无 Antigravity 凭证: {}", dir.display());
+        return Ok(());
+    }
+    println!("auth_dir: {}", dir.display());
+    for (path, cred) in entries {
+        let status = if cred.disabled {
+            "disabled"
+        } else if cred.is_fresh(now, REFRESH_SKEW_SECS) {
+            "fresh"
+        } else {
+            "stale"
+        };
+        let email = if cred.email.is_empty() {
+            "-"
+        } else {
+            cred.email.as_str()
+        };
+        let project = if cred.project_id.is_empty() {
+            "-"
+        } else {
+            cred.project_id.as_str()
+        };
+        println!(
+            "{}  email={email}  project={project}  {status}  expired={}",
+            path.file_name().unwrap_or_default().to_string_lossy(),
+            if cred.expired.is_empty() {
+                "-"
+            } else {
+                cred.expired.as_str()
+            }
+        );
+    }
+    Ok(())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::pin_auth_dir;
+    use std::path::PathBuf;
+
+    #[test]
+    fn pin_default_next_to_config() {
+        let dir = pin_auth_dir("/tmp/proj/config.yaml", None);
+        assert_eq!(dir, PathBuf::from("/tmp/proj/.cache/antigravity"));
+        assert!(!dir.to_string_lossy().contains(".cli-proxy-api"));
+    }
+
+    #[test]
+    fn pin_keeps_absolute_and_tilde() {
+        assert_eq!(
+            pin_auth_dir("/tmp/proj/config.yaml", Some("/abs/creds")),
+            PathBuf::from("/abs/creds")
+        );
+        let home = std::env::var_os("HOME")
+            .or_else(|| std::env::var_os("USERPROFILE"))
+            .map(PathBuf::from)
+            .unwrap();
+        assert_eq!(
+            pin_auth_dir("/tmp/proj/config.yaml", Some("~/.cli-proxy-api")),
+            home.join(".cli-proxy-api")
+        );
+    }
 }

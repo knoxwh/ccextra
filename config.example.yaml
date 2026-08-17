@@ -10,6 +10,9 @@ server:
 # Claude Code 用 ANTHROPIC_AUTH_TOKEN 或环境变量注入该 key。
 secret_key: "sk-ccextra-xxx"
 
+# Antigravity 凭证目录(可选)。默认配置文件旁 .cache/antigravity。
+# auth_dir: ".cache/antigravity"
+
 # Provider 定义
 providers:
   - name: xxx1

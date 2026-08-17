@@ -17,6 +17,9 @@ pub struct Config {
     /// 入口 secret key(可选);配置后 /v1/models 与 /v1/messages 需 x-api-key 匹配
     #[serde(default)]
     pub secret_key: Option<String>,
+    /// Antigravity 凭证目录(可选);默认配置文件旁 `.cache/antigravity`
+    #[serde(default)]
+    pub auth_dir: Option<String>,
 }
 
 #[derive(Debug, Deserialize)]
