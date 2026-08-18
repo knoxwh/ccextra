@@ -33,12 +33,26 @@ fn stream_headers(protocol: Protocol, is_stream: bool) -> Vec<(&'static str, &'s
 ///
 /// 版本前缀约定(与 参考实现/OpenAI 一致):anthropic 协议 base_url 不含版本,路径带 /v1;
 /// openai 协议 base_url 已含版本前缀(/v1 或 /v3 等),路径不带版本。
-fn endpoint_path(protocol: Protocol) -> &'static str {
+fn endpoint_path(protocol: Protocol, is_stream: bool) -> String {
     match protocol {
-        Protocol::Claude => "/v1/messages",
-        Protocol::OpenAiChat => "/chat/completions",
-        Protocol::OpenAiResponses => "/responses",
-        Protocol::Gemini => "/v1beta/models/{model}:streamGenerateContent",
+        Protocol::Claude => "/v1/messages".to_string(),
+        Protocol::OpenAiChat => "/chat/completions".to_string(),
+        Protocol::OpenAiResponses => "/responses".to_string(),
+        Protocol::Gemini => {
+            if is_stream {
+                "/v1beta/models/{model}:streamGenerateContent".to_string()
+            } else {
+                "/v1beta/models/{model}:generateContent".to_string()
+            }
+        }
+        Protocol::Antigravity => {
+            if is_stream {
+                // 对齐 CLIProxyAPI:流式必须 ?alt=sse
+                "/v1internal:streamGenerateContent?alt=sse".to_string()
+            } else {
+                "/v1internal:generateContent".to_string()
+            }
+        }
     }
 }
 
@@ -53,10 +67,12 @@ fn is_gpt_model(upstream_model: &str) -> bool {
 /// 用 claude-cli。部分上游按 UA 分流缓存/特性,reqwest 默认 UA
 /// 会被识别为非官方客户端。
 fn user_agent(protocol: Protocol, upstream_model: &str) -> &'static str {
-    const CLAUDE_CLI: &str = "claude-cli/2.1.228";
+    const CLAUDE_CLI: &str = "claude-cli/2.1.234";
     const CODEX_TUI: &str =
-        "codex-tui/0.147.0 (Mac OS 26.6.1; arm64) ghostty/1.3.1 (codex-tui; 0.147.0)";
+        "codex-tui/0.147.0 (Mac OS 26.6.2; arm64) ghostty/1.3.1 (codex-tui; 0.147.0)";
     match protocol {
+        // Antigravity 上游按 UA 识别客户端,非 antigravity UA 直接 404
+        Protocol::Antigravity => crate::antigravity::constants::REQUEST_UA,
         Protocol::OpenAiResponses if is_gpt_model(upstream_model) => CODEX_TUI,
         _ => CLAUDE_CLI,
     }
@@ -146,18 +162,25 @@ impl UpstreamClient {
         let upstream_model = body.get("model").and_then(|v| v.as_str()).unwrap_or("");
 
         // Gemini 端点需要替换 {model} 占位符
-        let endpoint = endpoint_path(protocol);
+        let endpoint = endpoint_path(protocol, is_stream);
         let endpoint = if matches!(protocol, Protocol::Gemini) {
             endpoint.replace("{model}", upstream_model)
         } else {
-            endpoint.to_string()
+            endpoint
         };
 
         let url = format!("{}{}", base_url.trim_end_matches('/'), endpoint);
-        let mut req = client.post(&url).bearer_auth(api_key).header(
+        // 认证头按协议:Gemini 直连用 x-goog-api-key(对齐 CPA gemini_executor,
+        // generativelanguage 不收 Bearer);其余 Bearer
+        let mut req = client.post(&url).header(
             reqwest::header::USER_AGENT,
             user_agent(protocol, upstream_model),
         );
+        if matches!(protocol, Protocol::Gemini) {
+            req = req.header("x-goog-api-key", api_key);
+        } else {
+            req = req.bearer_auth(api_key);
+        }
         for (name, value) in stream_headers(protocol, is_stream) {
             req = req.header(name, value);
         }
@@ -195,16 +218,30 @@ mod tests {
 
     #[test]
     fn test_endpoint_path_routing() {
-        assert_eq!(endpoint_path(Protocol::Claude), "/v1/messages");
-        assert_eq!(endpoint_path(Protocol::OpenAiChat), "/chat/completions");
-        assert_eq!(endpoint_path(Protocol::OpenAiResponses), "/responses");
+        assert_eq!(endpoint_path(Protocol::Claude, false), "/v1/messages");
+        assert_eq!(
+            endpoint_path(Protocol::OpenAiChat, false),
+            "/chat/completions"
+        );
+        assert_eq!(
+            endpoint_path(Protocol::OpenAiResponses, false),
+            "/responses"
+        );
+        assert_eq!(
+            endpoint_path(Protocol::Gemini, false),
+            "/v1beta/models/{model}:generateContent"
+        );
+        assert_eq!(
+            endpoint_path(Protocol::Gemini, true),
+            "/v1beta/models/{model}:streamGenerateContent"
+        );
     }
 
     #[test]
     fn test_user_agent_per_protocol() {
-        const CLAUDE_CLI: &str = "claude-cli/2.1.228";
+        const CLAUDE_CLI: &str = "claude-cli/2.1.234";
         const CODEX_TUI: &str =
-            "codex-tui/0.147.0 (Mac OS 26.6.1; arm64) ghostty/1.3.1 (codex-tui; 0.147.0)";
+            "codex-tui/0.147.0 (Mac OS 26.6.2; arm64) ghostty/1.3.1 (codex-tui; 0.147.0)";
         assert_eq!(
             user_agent(Protocol::OpenAiChat, "gpt-5.6-terra"),
             CLAUDE_CLI
@@ -261,7 +298,7 @@ mod tests {
         let url = format!(
             "{}{}",
             base.trim_end_matches('/'),
-            endpoint_path(Protocol::OpenAiChat)
+            endpoint_path(Protocol::OpenAiChat, false)
         );
         assert_eq!(
             url,
@@ -273,7 +310,7 @@ mod tests {
         let url = format!(
             "{}{}",
             base.trim_end_matches('/'),
-            endpoint_path(Protocol::OpenAiChat)
+            endpoint_path(Protocol::OpenAiChat, false)
         );
         assert_eq!(
             url,
@@ -285,7 +322,7 @@ mod tests {
         let url = format!(
             "{}{}",
             base.trim_end_matches('/'),
-            endpoint_path(Protocol::Claude)
+            endpoint_path(Protocol::Claude, false)
         );
         assert_eq!(url, "https://example.com/claude-proxy/v1/messages");
     }

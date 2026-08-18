@@ -4,13 +4,15 @@
 // - to_openai_chat: anthropic → openai chat
 // - to_openai_responses: anthropic → openai responses
 // - to_gemini: anthropic → gemini
+// - to_antigravity: anthropic → antigravity
 
 use thiserror::Error;
 
-pub mod carrier;
+pub mod antigravity;
 pub mod fix_json;
 pub mod gemini;
 pub mod gemini_response;
+pub mod gemini_schema;
 pub mod message_convert;
 pub mod passthrough;
 pub mod shorten;
@@ -19,11 +21,13 @@ pub mod to_openai_responses;
 pub mod tool_id;
 pub mod tool_sanitize;
 
+pub use antigravity::convert_to_antigravity;
 pub use fix_json::fix_json_quotes;
 pub use gemini::convert_to_gemini;
 pub use gemini_response::{
     convert_gemini_response, convert_gemini_stream_chunk, finalize_gemini_stream, GeminiStreamState,
 };
+pub use gemini_schema::{clean_json_schema_for_antigravity, clean_json_schema_for_gemini};
 pub use passthrough::convert_passthrough;
 pub use shorten::build_reverse_map;
 pub use shorten::build_short_name_map;

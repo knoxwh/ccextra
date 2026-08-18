@@ -9,7 +9,7 @@
 [![Workspace](https://img.shields.io/badge/workspace-3%20crates-lightgrey)]()
 [![Docs: design](https://img.shields.io/badge/docs-architecture-informational)](docs/design.md)
 
-One binary, one port. Serves four upstream protocols at once: native Claude, OpenAI Chat Completions, OpenAI Responses, and Google Gemini. Routes Claude Code requests by model to the matching provider, and deterministically normalizes request bodies so upstream prompt caches hit as often as possible.
+One binary, one port. Serves five upstream protocols at once: native Claude, OpenAI Chat Completions, OpenAI Responses, Google Gemini, and Antigravity (Cloud Code Assist over OAuth). Routes Claude Code requests by model to the matching provider, and deterministically normalizes request bodies so upstream prompt caches hit as often as possible.
 
 ```
 Claude Code          (ANTHROPIC_BASE_URL → http://127.0.0.1:8222)
@@ -20,14 +20,15 @@ ccextra :8222  ──  route → normalize → convert → upstream
      ├── claude            → native Claude protocol
      ├── openai_chat       → OpenAI Chat Completions
      ├── openai_responses  → OpenAI Responses
-     └── gemini            → Google Gemini API
+     ├── gemini            → Google Gemini API
+     └── antigravity       → Cloud Code Assist (OAuth auto-injected, no manual config)
 ```
 
 ## Features
 
 | Category | What it does |
 | ---- | ---- |
-| **Multi-protocol** | Native Claude / OpenAI Chat Completions / OpenAI Responses / Google Gemini |
+| **Multi-protocol** | Native Claude / OpenAI Chat Completions / OpenAI Responses / Google Gemini / Antigravity |
 | **Model routing** | Inbound model name resolves via alias to exactly one provider. Conflicts fail at startup; no implicit fallback |
 | **Byte-level passthrough** | Claude → Claude changes only the `model` field. Remaining bytes stay intact so normalization is not undone |
 | **Prompt-cache optimization** | Nine-module normalization kills serialization drift so upstream prompt cache can hit. A drift detector watches blind spots across turns |
@@ -46,15 +47,15 @@ Claude Code → ccextra:8222
     ↓
 1. Parse inbound Anthropic body + ingress auth
 2. Route: model → provider → protocol
-3. Pre-transform normalize (full set for Claude / slim subset for OpenAI)
-4. Protocol convert (three body-to-body paths; content shape normalized)
+3. Pre-transform normalize (full set for Claude / slim subset for others; gemini/antigravity skip drift)
+4. Protocol convert (four body-to-body paths + Claude passthrough; content shape normalized)
 5. Post-transform normalize (convert paths only) + drift observe
 6. Payload overrides (wildcard match, optional protocol scope)
 7. Strip prompt_cache_retention (OpenAI paths only)
 8. Inject prompt_cache_key (per-provider switch) + optional diagnostic dump
 9. Claude passthrough: rebuild anthropic-beta + forward identity headers
 10. Upstream request (reqwest + protocol-specific UA + proxy)
-11. Relay response (streaming SSE state machine / non-stream: Claude byte-passthrough, OpenAI via non_stream back to Anthropic; convert failure returns upstream bytes as-is; upstream errors mapped to Anthropic shape)
+11. Relay response (streaming SSE state machine / non-stream: Claude byte-passthrough, OpenAI via non_stream, gemini/antigravity via convert_gemini_response back to Anthropic; convert failure returns upstream bytes as-is; upstream errors mapped to Anthropic shape)
     ↓
 Upstream provider
 ```
@@ -184,7 +185,7 @@ Full knobs live in [`config.example.yaml`](config.example.yaml). Highlights:
 | `server.host` / `server.port` | Listen address. Default `127.0.0.1:8222` |
 | `server.proxy_url` | Global proxy fallback, optional. `"direct"` means no proxy |
 | `secret_key` | Ingress auth, optional. When set, `/v1/models` and `/v1/messages` require a matching key or they 401. Accepts `x-api-key` or `Authorization: Bearer`. Plaintext is hashed to bcrypt and written back. `/reload` swaps the secret and clears the bcrypt verify cache |
-| `providers[].protocol` | Upstream protocol: `claude` / `openai_chat` / `openai_responses` / `gemini` |
+| `providers[].protocol` | Upstream protocol: `claude` / `openai_chat` / `openai_responses` / `gemini` / `antigravity`. Antigravity usually needs no manual entry: at startup ccextra scans `auth_dir` (default `.cache/antigravity`) for OAuth credentials and injects providers automatically |
 | `providers[].base_url` / `key` | Upstream URL and API key |
 | `providers[].models[].alias` | Inbound model name → real upstream model name |
 | `providers[].prompt_cache_key` | Cache-bucket key = session ID (aligned with Codex 0.147). OpenAI protocols only |
@@ -199,7 +200,7 @@ ccextra/
 ├── crates/
 │   ├── ccextra-core/           # Pure logic, no IO
 │   │   ├── cache_stabilization/  # Nine-module normalization
-│   │   ├── convert/              # Three protocol-convert paths
+│   │   ├── convert/              # Protocol-convert paths (claude/openai×2/gemini/antigravity)
 │   │   ├── thinking.rs           # Thinking-level mapping
 │   │   ├── prompt_cache.rs       # prompt_cache_key inject (key = session ID, Codex-aligned)
 │   │   ├── secret.rs             # Ingress key bcrypt recognition
@@ -226,13 +227,12 @@ ccextra/
 cargo test --workspace
 ```
 
-Currently 567 tests (12 + 414 + 141), covering cache normalization, protocol conversion (Claude/OpenAI/Gemini), SSE state machines, the HTTP pipeline, and config parsing.
+Currently 594 tests (12 + 441 + 141), covering cache normalization, protocol conversion (Claude/OpenAI/Gemini/Antigravity), SSE state machines, the HTTP pipeline, and config parsing.
 
 ## Docs
 
-- **[docs/design.md](docs/design.md)** — Architecture: convert paths, normalization, SSE relay, performance (Chinese)
+- **[docs/design.md](docs/design.md)** — Architecture: convert paths, normalization, SSE relay, Gemini/Antigravity protocols, performance (Chinese)
 - **[docs/glossary.md](docs/glossary.md)** — Domain glossary (Chinese)
-- **[docs/gemini.md](docs/gemini.md)** — Gemini protocol support: tool calling, thinking, streaming (Chinese)
 
 ## License
 

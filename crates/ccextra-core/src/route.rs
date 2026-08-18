@@ -12,6 +12,7 @@ pub enum Protocol {
     #[serde(rename = "openai_responses")]
     OpenAiResponses,
     Gemini,
+    Antigravity,
 }
 
 #[derive(Debug, Clone)]
@@ -45,9 +46,40 @@ pub struct ProviderConfig {
     #[serde(default)]
     pub prompt_cache_key: bool,
     pub models: Vec<ModelConfig>,
+    /// 额外元数据(用于 Antigravity 的 project_id 等)
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub metadata: Option<std::collections::HashMap<String, String>>,
 }
 
 impl ProviderConfig {
+    /// 运行时构造 ProviderConfig（用于动态注入，如 Antigravity）
+    pub fn new(
+        name: String,
+        protocol: Protocol,
+        base_url: Vec<String>,
+        key: String,
+        proxy_url: Option<String>,
+        prompt_cache_key: bool,
+        models: Vec<ModelConfig>,
+    ) -> Self {
+        Self {
+            name,
+            protocol,
+            base_url,
+            key,
+            proxy_url,
+            prompt_cache_key,
+            models,
+            metadata: None,
+        }
+    }
+
+    /// 设置 metadata (用于 Antigravity provider)
+    pub fn with_metadata(mut self, metadata: std::collections::HashMap<String, String>) -> Self {
+        self.metadata = Some(metadata);
+        self
+    }
+
     /// 返回 base_url 列表;gemini 多值回退用
     pub fn base_urls(&self) -> &[String] {
         &self.base_url

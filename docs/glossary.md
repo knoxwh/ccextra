@@ -14,7 +14,7 @@ OpenAI `/v1/chat/completions` 协议。请求体含 `messages` 数组,响应流�
 OpenAI `/v1/responses` 协议(Codex CLI 默认)。请求体用顶层 `instructions` + `input` 数组,响应流式用 `output_item` 事件。
 
 **protocol**  
-出站目标协议类型,四种:`claude` / `openai_chat` / `openai_responses` / `gemini`。由 provider 配置决定,不由入站推导。
+出站目标协议类型,五种:`claude` / `openai_chat` / `openai_responses` / `gemini` / `antigravity`。由 provider 配置决定,不由入站推导。
 
 **gemini 协议**  
 第四条独立 body-to-body 路径。入站仍是 anthropic messages；出站是 Gemini 请求体,再由运输层套信封。flash 与 pro 同一转换。不是官方 `generativelanguage` 直连,也不是星型枢纽。
@@ -34,7 +34,7 @@ OpenAI `/v1/responses` 协议(Codex CLI 默认)。请求体用顶层 `instructio
 ## 路由与上游
 
 **provider**  
-上游服务提供商。每个 provider 声明 `protocol` / `base_url` / `key` / `models` 列表。入站 model 通过 alias 解析到唯一 provider。`protocol: gemini` 时 `key` 不用,发前读 `auth_dir` 凭证。
+上游服务提供商。每个 provider 声明 `protocol` / `base_url` / `key` / `models` 列表。入站 model 通过 alias 解析到唯一 provider。`protocol: antigravity` 时 `key` 不用,启动时扫 `auth_dir` OAuth 凭证自动注入 provider。
 
 **model alias**  
 入站请求里的模型名(如 `evol-opus-5`)映射到 provider 内真实上游模型名(如 `claude-opus-5`)的别名。
@@ -46,7 +46,7 @@ OpenAI `/v1/responses` 协议(Codex CLI 默认)。请求体用顶层 `instructio
 发往上游的真实模型名,与入站 alias 可能不同。
 
 **按协议 UA 分流**  
-上游请求按协议+模型分流 User-Agent / Originator:仅 responses + `*gpt*`(大小写不敏感)用 `codex-tui/0.147.0 ...` 且带 `Originator: codex_cli_rs`;claude / chat / 非 gpt 的 responses / gemini 的 HTTP 头用 `claude-cli/2.1.228`,不带 Originator。gemini 信封里另有 `userAgent=antigravity`,与 HTTP 头不是同一字段。部分上游按 UA 识别客户端并分流缓存/特性,reqwest 默认 UA 会被判为非官方客户端。
+上游请求按协议+模型分流 User-Agent / Originator:仅 responses + `*gpt*`(大小写不敏感)用 `codex-tui/0.147.0 ...` 且带 `Originator: codex_cli_rs`;antigravity 用固定 `antigravity/hub/...`(非 antigravity UA 上游直接 404);claude / chat / 非 gpt 的 responses / gemini 用 `claude-cli/2.1.234`,不带 Originator。antigravity 信封里另有 `userAgent=antigravity`,与 HTTP 头不是同一字段。部分上游按 UA 识别客户端并分流缓存/特性,reqwest 默认 UA 会被判为非官方客户端。
 
 **claude 直通头重建**  
 claude 路径的 `anthropic-beta` 头按 body 条件重建(基础集 `claude-code-20250219` + thinking 无 display → `redact-thinking` / tools → `advanced-tool-use` / `effort-2025-11-24` / speed=fast → `fast-mode`),再追加 caller 自带 beta(去重)。`anthropic-version`/`x-app`/`x-stainless-*` 等身份头仅透传(有就转发,没有不补)。与直通头重建中转场景一致。
@@ -57,10 +57,11 @@ claude 路径的 `anthropic-beta` 头按 body 条件重建(基础集 `claude-cod
 claude 入站 → claude 出站,只改 `model` 字段,其余字节原样保留。绕过中间表示,保住归一化字节稳定性。
 
 **转换路径 / conversion path**  
-需要协议翻译的三条路径:  
+需要协议翻译的四条路径:  
 - anthropic → openai chat  
 - anthropic → openai responses  
-- anthropic → Gemini 请求体(运输层再套信封)
+- anthropic → Gemini 请求体
+- anthropic → Antigravity(Gemini 请求体再套信封)
 
 **body-to-body 转换**  
 在 `serde_json::Value` 上原地读写,不经过中间类型。gjson/sjson 风格(Go)或 `value[path] = new_val`(Rust)。每条路径独立实现。顶层键序(`model,max_tokens,temperature/stop,stream,reasoning_effort,messages,tools,tool_choice,user,stream_options`)。
@@ -91,7 +92,7 @@ responses 路径下,上游模型名以 `gpt` 开头(不区分大小写)时,拼�
 入站 anthropic body 在转换前跑的归一化,按目标协议分流:  
 - claude 直通:`normalize_anthropic_full` 完整九模块,含 `cache_control` 注入  
 - openai 转换路径:`normalize_anthropic_pretransform` 精简五模块子集(smoosh → bookkeeping → tool_input → sort → rstrip),跳过 tool-def sort / volatile / cache_control——这些在转换后处理或对 openai 上游无意义  
-- gemini 路径:空臂,不跑九模块,不写 `cachedContent`,不注入 `prompt_cache_key`
+- gemini/antigravity 路径:同跑 `pretransform` 五模块子集(输入仍是 anthropic 形状),不写 `cachedContent`,不注入 `prompt_cache_key`,跳过 post 归一化与 drift
 
 **post-transform 归一化 / target_post**  
 转换后对目标协议 body 跑的二次归一化:tool_def normalize → sort stabilize → reminder rstrip → volatile strip(对齐 openai 转换后管线)。claude 直通与 gemini 路径跳过此步。
@@ -121,7 +122,7 @@ responses 路径下,上游模型名以 `gpt` 开头(不区分大小写)时,拼�
 注:早期版本的 `messages[0].content` SHA-256 兜底已删除——`messages[0]` 会被每请求注入的 system-reminder 与上下文压缩改变,不是稳定身份。
 
 **prompt_cache_key**  
-OpenAI chat/responses 的缓存桶标识。对齐 codex CLI 0.147 `prompt_cache_key()`:key = session_id 裸值(取代旧版 `UUIDv5(NameSpaceOID, "cli-proxy-api:codex:claude-code" \0 模型 \0 "claude:<会话>:agent:<agent>")` 派生)。provider 级开关(配置 `prompt_cache_key`,默认 false),仅 openai_chat / openai_responses 生效。无 Claude Code 会话 ID 或 body 已有 key 时不注入。gemini 路径不注入;账本键与此无关。
+OpenAI chat/responses 的缓存桶标识。对齐 codex CLI 0.147 `prompt_cache_key()`:key = session_id 裸值(取代旧版 `UUIDv5(NameSpaceOID, "cli-proxy-api:codex:claude-code" \0 模型 \0 "claude:<会话>:agent:<agent>")` 派生)。provider 级开关(配置 `prompt_cache_key`,默认 false),仅 openai_chat / openai_responses 生效。无 Claude Code 会话 ID 或 body 已有 key 时不注入。gemini/antigravity 路径不注入。
 
 ## 响应流式
 
@@ -155,7 +156,7 @@ openai chat 的 `delta.tool_calls[N]` 需映射到 anthropic 的 `content[M]`,�
 anthropic 的 prompt caching marker,可标记在 system block / message / tool 定义 / content part 上,形如 `{type: "ephemeral"}`。
 
 **thinking**  
-anthropic 的推理块,含 `type: "thinking"` 的 content,可带 `budget_tokens` / `signature` 字段。chat 转换把过门的正文写入 `reasoning_content`(见「reasoning 回放闭环」);responses 把兼容签名写入 `encrypted_content`。gemini:`enabled` + `budget_tokens` 写 `thinkingBudget`;`adaptive`/`auto` + `output_config.effort` 写 `thinkingLevel`,缺省 `high`。出站签名走 carrier,见「带内回传」。
+anthropic 的推理块,含 `type: "thinking"` 的 content,可带 `budget_tokens` / `signature` 字段。chat 转换把过门的正文写入 `reasoning_content`(见「reasoning 回放闭环」);responses 把兼容签名写入 `encrypted_content`。gemini:`enabled` + `budget_tokens` 写 `thinkingBudget`;`adaptive`/`auto` 有显式 `output_config.effort` 写 `thinkingLevel`,否则 gemini 按注册表 thinking.max 发 `thinkingBudget`、antigravity 兜底 `thinkingLevel=high`。gemini 直连丢全部 thinking 块;antigravity 保留带签名块(见「Gemini 签名与运输」)。
 
 **system**  
 anthropic 顶层字段,可以是 `string` 或 `block 数组`(含 text / tool_use / cache_control)两种形态。
@@ -174,31 +175,22 @@ claude `tool_result` 的 content 转 openai 工具消息:字符串原样;纯文�
 
 ## Gemini 签名与运输
 
-**带内回传**  
-出站把 Gemini `thoughtSignature` 封进 Claude `thinking.signature`;下一轮入站拆开贴回对应 `functionCall`。只活在 Claude 面向线路。不是 prompt cache,也不是 `cachedContent`。
-
-**carrier**  
-带内回传的信封字面量,前缀 `cpa-gemini-carrier-v1:`。方向 `next` / `previous` / `standalone`,目标 `text` / `function` / `any`,后接 raw-std-base64。不是 Claude 原生 thinking 签。
-
-**账本回放**  
-服务端按会话另存 `functionCall` / `thoughtSignature` / part 位置。带内断了用账本找回;找不到补哨兵。不是 prompt 缓存,也不是九模块里的 token 账本 reminder(bookkeeping)。
+**签名透传**  
+出站把 Gemini/Antigravity `thoughtSignature` 封进 Claude `thinking.signature`(signature_delta);下一轮入站 antigravity 路径把带非空签名的 thinking 块还原为 `{thought, text, thoughtSignature}` 贴回,gemini 直连丢全部 thinking 块。CPA 的签名缓存/carrier/账本回放子系统不移植——签名只做客户端透传。
 
 **哨兵**  
-合法但无语义的 `thoughtSignature` 占位:`skip_thought_signature_validator`。每个 model 回合第一个 `functionCall` 必须有合法签或哨兵。不给 `functionResponse` 加签。
+合法但无语义的 `thoughtSignature` 占位:`skip_thought_signature_validator`。入站 `tool_use` 转 `functionCall` 时附上,满足上游签名校验门。不给 `functionResponse` 加签。
 
-**账本键**  
-`claude:{session}:agent:{agent}`;缺 agent 则为 `main`;system 变了再加 `:context:{hash}`（hash = sha256 前 16 字节，输入是 JSON marshal 后剥离 `cache_control` 的 system 值）。读请求头 `X-Claude-Code-Agent-Id`。不是 `prompt_cache_key`,也不把 agent 写进缓存键。
+**VALIDATED 模式**  
+antigravity 且上游模型名含 `claude` 时,强制 `request.toolConfig.functionCallingConfig.mode=VALIDATED`(对齐 CPA executor)。该模式下空对象 schema 必须带占位 `reason` 属性,由 schema 清洗补齐。
 
-**名门**  
-按上游模型名子串决定是否走 Antigravity schema 方言。只认 `claude` / `gemini-3-pro` / `gemini-3.1-pro`。不把凡 pro 或 flash 扩进名门。
-
-**账本门**  
-名字含 `gemini` / `flash` / `agent` 且不含 `claude` 才走账本。Claude 模型不走账本。
+**schema 清洗**  
+gemini/antigravity 工具 `input_schema` 的深度归一(对齐 CPA `internal/util/gemini_schema.go` 四阶段):$ref 内联/转提示、const→enum、约束并入 description、anyOf/oneOf/allOf 展平、不支持关键字移除、required 修剪。gemini 口味强制 enum `type=string` 并去 nullable/title;antigravity 口味 drop 全部 enum 转提示、补占位属性。
 
 ## 配置术语
 
 **单 key 无重试**  
-每个 provider 配置一个 `key` 字符串,上游失败直接透传错误,不做凭据级 fallback。MVP 最简模式。`protocol: gemini` 不用 `key`,读 `auth_dir` 排序后第一份凭证,不切号。
+每个 provider 配置一个 `key` 字符串,上游失败直接透传错误,不做凭据级 fallback。MVP 最简模式。`protocol: antigravity` 不用 `key`,启动时扫 `auth_dir`,每份有效凭证注入一个 provider(多凭证各建 provider,alias 冲突先到者胜出)。
 
 **fail-open**  
 字节稳定化四原则之一:归一化出错时回退原始 body,不阻断请求。ccextra 继承此语义。

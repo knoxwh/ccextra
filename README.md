@@ -9,7 +9,7 @@
 [![Workspace](https://img.shields.io/badge/workspace-3%20crates-lightgrey)]()
 [![Docs: design](https://img.shields.io/badge/docs-architecture-informational)](docs/design.md)
 
-单个二进制，监听一个端口，同时提供 Claude 原生协议、OpenAI Chat Completions、OpenAI Responses、Google Gemini 四种上游接入。把 Claude Code 的请求按模型路由到不同 provider，并通过对请求体的确定性归一化，最大程度命中上游 prompt 缓存。
+单个二进制，监听一个端口，同时提供 Claude 原生协议、OpenAI Chat Completions、OpenAI Responses、Google Gemini、Antigravity（Cloud Code Assist OAuth）五种上游接入。把 Claude Code 的请求按模型路由到不同 provider，并通过对请求体的确定性归一化，最大程度命中上游 prompt 缓存。
 
 ```
 Claude Code          (ANTHROPIC_BASE_URL → http://127.0.0.1:8222)
@@ -20,14 +20,15 @@ ccextra :8222  ──  路由 → 归一化 → 协议转换 → 上游请求
      ├── claude            → Claude 原生协议
      ├── openai_chat       → OpenAI Chat Completions
      ├── openai_responses  → OpenAI Responses
-     └── gemini            → Google Gemini API
+     ├── gemini            → Google Gemini API
+     └── antigravity       → Cloud Code Assist(OAuth 自动注入,无需手配)
 ```
 
 ## 特性
 
 | 类别 | 说明 |
 | ---- | ---- |
-| **多协议接入** | 同时支持 Claude 原生 / OpenAI Chat Completions / OpenAI Responses / Google Gemini 四种上游协议 |
+| **多协议接入** | 同时支持 Claude 原生 / OpenAI Chat Completions / OpenAI Responses / Google Gemini / Antigravity 五种上游协议 |
 | **模型路由** | 入站模型名按 alias 解析到唯一 provider，冲突启动即报错，不做隐式推导 |
 | **字节级直通** | Claude → Claude 只改 model 字段，其余字节原样保留，保住归一化成果 |
 | **prompt 缓存优化** | 九模块归一化消除序列化漂移，命中上游 prompt cache；drift 检测器跨轮观测盲区 |
@@ -46,15 +47,15 @@ Claude Code → ccextra:8222
     ↓
 1. 解析入站 anthropic body + 入口认证
 2. 路由决策 model → provider → protocol
-3. 转换前归一化（claude 全量 / openai 精简子集）
-4. 协议转换（三条 body-to-body，content 形态归一化）
+3. 转换前归一化（claude 全量 / 其余协议精简子集；gemini/antigravity 跳过 drift）
+4. 协议转换（四条 body-to-body + claude 直通，content 形态归一化）
 5. post-transform 归一化（仅转换路径）+ drift 观测
 6. payload 参数覆盖（通配匹配，可限定协议）
 7. 剥离 prompt_cache_retention（仅 openai 路径）
 8. prompt_cache_key 注入（provider 级开关）+ 诊断落盘（可选）
 9. claude 直通：anthropic-beta 重建 + 身份头透传
 10. 上游请求（reqwest + 按协议 UA + 代理）
-11. 响应转发（流式 SSE 状态机 / 非流: claude 字节直通, openai 走 non_stream 转回 anthropic, 转失败原样回上游字节；上游错误转 anthropic 形状）
+11. 响应转发（流式 SSE 状态机 / 非流: claude 字节直通, openai 走 non_stream, gemini/antigravity 走 convert_gemini_response 转回 anthropic, 转失败原样回上游字节；上游错误转 anthropic 形状）
     ↓
 上游 Provider
 ```
@@ -184,7 +185,7 @@ curl http://127.0.0.1:8222/health
 | `server.host` / `server.port` | 监听地址，默认 `127.0.0.1:8222` |
 | `server.proxy_url` | 全局代理兜底，可选；`"direct"` 表示不走代理 |
 | `secret_key` | 入口认证，可选。配置后 `/v1/models` 与 `/v1/messages` 需携带匹配 key，否则 401。支持 `x-api-key` 或 `Authorization: Bearer`。明文自动转 bcrypt 落盘。`/reload` 热替换 secret，并清空 bcrypt 校验缓存 |
-| `providers[].protocol` | 上游协议：`claude` / `openai_chat` / `openai_responses` / `gemini` |
+| `providers[].protocol` | 上游协议：`claude` / `openai_chat` / `openai_responses` / `gemini` / `antigravity`。Antigravity 通常无需手配：启动时自动扫描 `auth_dir`（默认 `.cache/antigravity`）的 OAuth 凭证并注入 provider |
 | `providers[].base_url` / `key` | 上游地址与密钥 |
 | `providers[].models[].alias` | 入站模型名 → 上游真实模型名 |
 | `providers[].prompt_cache_key` | 缓存桶 key = 会话 ID（对齐 codex 0.147），仅 openai 协议生效 |
@@ -199,7 +200,7 @@ ccextra/
 ├── crates/
 │   ├── ccextra-core/           # 纯逻辑，无 IO
 │   │   ├── cache_stabilization/  # 九模块归一化
-│   │   ├── convert/              # 三条协议转换路径
+│   │   ├── convert/              # 协议转换路径(claude/openai×2/gemini/antigravity)
 │   │   ├── thinking.rs           # 思考级别映射
 │   │   ├── prompt_cache.rs       # prompt_cache_key 注入（key=会话 ID，对齐 codex）
 │   │   ├── secret.rs             # 入口 key bcrypt 识别
@@ -226,13 +227,12 @@ ccextra/
 cargo test --workspace
 ```
 
-当前 567 个测试 (12 + 414 + 141)，覆盖缓存归一化、协议转换（Claude/OpenAI/Gemini）、SSE 状态机、HTTP 管线与配置解析等模块。
+当前 594 个测试 (12 + 441 + 141)，覆盖缓存归一化、协议转换（Claude/OpenAI/Gemini/Antigravity）、SSE 状态机、HTTP 管线与配置解析等模块。
 
 ## 文档
 
-- **[docs/design.md](docs/design.md)** — 架构设计：转换路径、归一化、SSE 转发、性能优化
+- **[docs/design.md](docs/design.md)** — 架构设计：转换路径、归一化、SSE 转发、Gemini/Antigravity 协议、性能优化
 - **[docs/glossary.md](docs/glossary.md)** — 领域术语表
-- **[docs/gemini.md](docs/gemini.md)** — Gemini 协议支持：工具调用、思维能力、流式处理
 
 ## 许可
 

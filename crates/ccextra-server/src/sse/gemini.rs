@@ -4,7 +4,9 @@ use super::emit;
 use super::parser::SseParser;
 use super::SseStreamPin;
 use bytes::{BufMut, Bytes, BytesMut};
-use ccextra_core::convert::{convert_gemini_stream_chunk, finalize_gemini_stream, GeminiStreamState};
+use ccextra_core::convert::{
+    convert_gemini_stream_chunk, finalize_gemini_stream, GeminiStreamState,
+};
 use futures::{Stream, StreamExt};
 use std::collections::HashMap;
 use std::sync::Arc;
@@ -67,9 +69,34 @@ where
                             }
                         };
 
-                        // message_start 必须第一帧发送
+                        // Antigravity 信封解包:{"response": {...}} → 内层;
+                        // 对齐 CPA:usageMetadata 可能在信封根,补回内层
+                        let chunk = match chunk.get("response") {
+                            Some(inner) => {
+                                let mut inner = inner.clone();
+                                if inner.get("usageMetadata").is_none() {
+                                    if let Some(u) = chunk.get("usageMetadata") {
+                                        inner["usageMetadata"] = u.clone();
+                                    }
+                                }
+                                inner
+                            }
+                            None => chunk,
+                        };
+
+                        // message_start 必须第一帧发送;id/model 取首 chunk
+                        // 的 responseId/modelVersion(对齐 CPA)
                         if !message_started {
-                            let start_event = emit::message_start("", "", input_tokens as i64, 0, true);
+                            let msg_id = chunk
+                                .get("responseId")
+                                .and_then(|v| v.as_str())
+                                .unwrap_or("");
+                            let model = chunk
+                                .get("modelVersion")
+                                .and_then(|v| v.as_str())
+                                .unwrap_or("");
+                            let start_event =
+                                emit::message_start(msg_id, model, input_tokens as i64, 0, true);
                             yield Ok(start_event);
                             message_started = true;
                         }
@@ -115,31 +142,4 @@ where
             yield Ok(stop_event);
         }
     })
-}
-
-/// 从 Gemini usage 提取三元组 (input, output, cached)
-///
-/// Gemini usageMetadata 格式:
-/// - promptTokenCount
-/// - candidatesTokenCount
-/// - cachedContentTokenCount (如果有缓存)
-pub fn extract_usage_gemini(usage: &serde_json::Value) -> (i64, i64, i64) {
-    let mut input = usage
-        .get("promptTokenCount")
-        .and_then(|v| v.as_i64())
-        .unwrap_or(0);
-    let output = usage
-        .get("candidatesTokenCount")
-        .and_then(|v| v.as_i64())
-        .unwrap_or(0);
-    let cached = usage
-        .get("cachedContentTokenCount")
-        .and_then(|v| v.as_i64())
-        .unwrap_or(0);
-
-    if cached > 0 {
-        input = (input - cached).max(0);
-    }
-
-    (input, output, cached)
 }

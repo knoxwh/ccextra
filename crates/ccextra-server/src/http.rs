@@ -1,14 +1,15 @@
 // HTTP 服务入口:axum /v1/messages
 //
 // 完整管线:
-// 1. 解析入站 anthropic body
-// 2. normalize_anthropic_full(若启用)
-// 3. 路由决策 model → provider → protocol
-// 4. payload 参数覆盖
-// 5. 协议转换(三条 body-to-body)
-// 6. normalize_target_post(仅转换路径)
-// 7. 上游请求
-// 8. 响应转发(直通字节 / 流式 SSE 状态机)
+// 1. 解析入站 anthropic body + 入口认证
+// 2. 路由决策 model → provider → protocol
+// 3. 归一化第一遍(claude 全量 / 其余协议精简子集)
+// 4. 协议转换(claude 直通 + 四条 body-to-body)
+// 5. normalize_target_post(仅 openai 转换路径)+ drift 观测
+// 6. payload 参数覆盖
+// 7. prompt_cache_key 注入(仅 openai)+ 诊断落盘
+// 8. 上游请求(多 base_url 按序回退)
+// 9. 响应转发(直通字节 / 流式 SSE 状态机)
 
 use axum::{
     body::{to_bytes, Body},
@@ -41,6 +42,8 @@ use futures::StreamExt;
 use globset::Glob;
 use serde_json::{json, Value};
 use std::collections::HashMap;
+use std::future::Future;
+use std::pin::Pin;
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::sync::{Arc, Mutex as StdMutex, OnceLock};
 use tokio::sync::RwLock;
@@ -48,6 +51,10 @@ use tokio::sync::RwLock;
 use crate::sse::parser::{SseEvent, SseParser};
 use crate::sse::SseStreamPin;
 use crate::upstream::UpstreamClient;
+
+/// 配置重载闭包类型
+pub type ReloadFn =
+    Arc<dyn Fn() -> Pin<Box<dyn Future<Output = anyhow::Result<ReloadData>> + Send>> + Send + Sync>;
 
 /// /reload 可替换的运行时配置。整块写锁替换,单个字段不单独加锁。
 /// 注意 `logging.level` 不生效:EnvFilter 仅启动装载一次(见 cli/main.rs)。
@@ -78,7 +85,7 @@ pub struct AppState {
     pub payload_rules: Arc<RwLock<Vec<PayloadRule>>>,
     pub runtime: Arc<RwLock<RuntimeConfig>>,
     /// 重读配置文件的闭包(由 cli 构造,捕获 config 路径)
-    pub reload: Arc<dyn Fn() -> anyhow::Result<ReloadData> + Send + Sync>,
+    pub reload: ReloadFn,
     /// drift 观测状态(会话 → 上次结构哈希;按 openai/anthropic handler 分桶)
     pub drift: DriftState,
 }
@@ -263,7 +270,9 @@ async fn health_check() -> &'static str {
 /// 三把独立写锁分别获取,非全局原子 —— 期间并发请求可能见到部分更新
 /// (如新 providers 配旧 normalize)。热重载低频,取舍见 docs/design.md §8。
 async fn handle_reload(State(state): State<AppState>) -> Result<&'static str, AppError> {
-    let data = (state.reload)().map_err(|e| AppError::new(anyhow::anyhow!("重读配置失败: {e}")))?;
+    let data = (state.reload)()
+        .await
+        .map_err(|e| AppError::new(anyhow::anyhow!("重读配置失败: {e}")))?;
     validate_providers(&data.providers)
         .map_err(|e| AppError::new(anyhow::anyhow!("配置校验失败: {e}")))?;
     *state.providers.write().await = data.providers;
@@ -524,9 +533,29 @@ async fn handle_messages(
         }
         Protocol::Gemini => {
             use ccextra_core::convert::convert_to_gemini;
-            let (gemini_body, short_to_original, _original_to_claude_id) =
+            let (gemini_body, short_to_original) =
                 convert_to_gemini(&body_json, &route.upstream_model);
             body_json = gemini_body;
+            if !short_to_original.is_empty() {
+                tool_names = Some(Arc::new(short_to_original));
+            }
+        }
+        Protocol::Antigravity => {
+            // Antigravity 使用包裹后的 Gemini 格式
+            use ccextra_core::convert::convert_to_antigravity;
+
+            // 从 provider metadata 中提取 project_id
+            let project_id = {
+                let provider = find_provider(&providers, &route.provider);
+                provider
+                    .and_then(|p| p.metadata.as_ref())
+                    .and_then(|m| m.get("project_id"))
+                    .map(|s| s.as_str())
+            };
+
+            let (antigravity_body, short_to_original) =
+                convert_to_antigravity(&body_json, &route.upstream_model, project_id);
+            body_json = antigravity_body;
             if !short_to_original.is_empty() {
                 tool_names = Some(Arc::new(short_to_original));
             }
@@ -547,11 +576,11 @@ async fn handle_messages(
     // 7. 上游请求
     // 从配置中 clone 出上游所需字段后立即释放两把读锁,避免整个上游请求
     // (慢上游/长连接建立)期间持锁,防止 /reload 写锁被无限期阻塞。
-    let (upstream_base_url, upstream_key, upstream_proxy, provider_prompt_cache_key) = {
+    let (upstream_base_urls, upstream_key, upstream_proxy, provider_prompt_cache_key) = {
         let provider = find_provider(&providers, &route.provider)
             .ok_or_else(|| AppError::new(anyhow::anyhow!("provider 未找到: {}", route.provider)))?;
         (
-            provider.base_urls()[0].clone(),
+            provider.base_urls().to_vec(),
             provider.key.clone(),
             provider.proxy_url.clone(),
             provider.prompt_cache_key,
@@ -562,7 +591,10 @@ async fn handle_messages(
 
     // prompt_cache_key 注入(provider 级开关;仅 openai 协议;key=session_id,对齐 codex 0.147)
     if provider_prompt_cache_key
-        && !matches!(route.protocol, Protocol::Claude)
+        && matches!(
+            route.protocol,
+            Protocol::OpenAiChat | Protocol::OpenAiResponses
+        )
         && inject_prompt_cache_key(&mut body_json, cc_session.as_deref())
     {
         tracing::debug!("prompt_cache_key 已注入");
@@ -614,10 +646,13 @@ async fn handle_messages(
         (None, None)
     };
 
-    let mut upstream = Some(
-        upstream_client
+    // 多 base_url 回退(对齐 CPA antigravity executor:网络错误、429 切下一个 URL)
+    let mut upstream = None;
+    let mut last_err = None;
+    for (idx, base_url) in upstream_base_urls.iter().enumerate() {
+        match upstream_client
             .request(
-                &upstream_base_url,
+                base_url,
                 &upstream_key,
                 route.protocol,
                 upstream_proxy.as_deref(),
@@ -627,8 +662,31 @@ async fn handle_messages(
                 thread_id.as_deref(),
                 &extra_headers,
             )
-            .await?,
-    );
+            .await
+        {
+            Ok(resp) => {
+                // 429 且还有下一个 URL:直接切换(CPA 另有按 body 决策分类,此处从简)
+                if resp.status.as_u16() == 429 && idx + 1 < upstream_base_urls.len() {
+                    tracing::debug!("上游 429,回退到下一个 base_url: {}", base_url);
+                    drop(resp);
+                    continue;
+                }
+                upstream = Some(resp);
+                break;
+            }
+            Err(e) => {
+                last_err = Some(e);
+                if idx + 1 < upstream_base_urls.len() {
+                    tracing::debug!("上游请求错误,回退到下一个 base_url: {}", base_url);
+                    continue;
+                }
+            }
+        }
+    }
+    let mut upstream = match upstream {
+        Some(u) => Some(u),
+        None => return Err(last_err.expect("上游请求应已尝试").into()),
+    };
     let mut status = upstream.as_ref().expect("上游响应应存在").status;
     let mut preloaded_stream = None;
 
@@ -680,7 +738,7 @@ async fn handle_messages(
                 upstream = Some(
                     upstream_client
                         .request(
-                            &upstream_base_url,
+                            &upstream_base_urls[0],
                             &upstream_key,
                             route.protocol,
                             upstream_proxy.as_deref(),
@@ -797,6 +855,21 @@ async fn handle_messages(
                     use ccextra_core::convert::convert_gemini_response;
                     Some(convert_gemini_response(
                         &v,
+                        tool_names.as_deref().unwrap_or(&HashMap::new()),
+                    ))
+                }
+                Protocol::Antigravity => {
+                    // Antigravity 响应为 {"response": {...gemini...}} 信封,先解包;
+                    // 对齐 CPA:usageMetadata 可能在信封根,补回内层
+                    use ccextra_core::convert::convert_gemini_response;
+                    let mut inner = v.get("response").cloned().unwrap_or_else(|| v.clone());
+                    if inner.get("usageMetadata").is_none() {
+                        if let Some(u) = v.get("usageMetadata") {
+                            inner["usageMetadata"] = u.clone();
+                        }
+                    }
+                    Some(convert_gemini_response(
+                        &inner,
                         tool_names.as_deref().unwrap_or(&HashMap::new()),
                     ))
                 }
@@ -1884,23 +1957,24 @@ models:
     }
 
     /// 构造带指定 secret 的 reload 闭包(providers 保持空,validate 必过)
-    fn reload_returning_secret(
-        secret: Option<String>,
-    ) -> Arc<dyn Fn() -> anyhow::Result<ReloadData> + Send + Sync> {
+    fn reload_returning_secret(secret: Option<String>) -> ReloadFn {
         Arc::new(move || {
-            Ok(ReloadData {
-                providers: vec![],
-                payload_rules: vec![],
-                normalize: NormalizeConfig {
-                    enabled: false,
-                    drift_detector: false,
-                },
-                logging: LoggingConfig {
-                    level: "info".into(),
-                    request_body: false,
-                },
-                secret: secret.clone(),
-                proxy_url: None,
+            let secret = secret.clone();
+            Box::pin(async move {
+                Ok(ReloadData {
+                    providers: vec![],
+                    payload_rules: vec![],
+                    normalize: NormalizeConfig {
+                        enabled: false,
+                        drift_detector: false,
+                    },
+                    logging: LoggingConfig {
+                        level: "info".into(),
+                        request_body: false,
+                    },
+                    secret,
+                    proxy_url: None,
+                })
             })
         })
     }
@@ -1992,19 +2066,21 @@ models:
     async fn test_reload_applies_normalize_and_proxy() {
         let mut state = mock_state();
         state.reload = Arc::new(|| {
-            Ok(ReloadData {
-                providers: vec![],
-                payload_rules: vec![],
-                normalize: NormalizeConfig {
-                    enabled: true,
-                    drift_detector: true,
-                },
-                logging: LoggingConfig {
-                    level: "debug".into(),
-                    request_body: true,
-                },
-                secret: None,
-                proxy_url: Some("socks5://127.0.0.1:1080".into()),
+            Box::pin(async {
+                Ok(ReloadData {
+                    providers: vec![],
+                    payload_rules: vec![],
+                    normalize: NormalizeConfig {
+                        enabled: true,
+                        drift_detector: true,
+                    },
+                    logging: LoggingConfig {
+                        level: "debug".into(),
+                        request_body: true,
+                    },
+                    secret: None,
+                    proxy_url: Some("socks5://127.0.0.1:1080".into()),
+                })
             })
         });
         let runtime = state.runtime.clone();

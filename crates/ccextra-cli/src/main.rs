@@ -1,5 +1,6 @@
 use anyhow::Result;
 use ccextra_core::cache_stabilization::drift_detector::DriftState;
+use ccextra_core::route::ProviderConfig;
 use ccextra_server::antigravity::{
     constants::{CALLBACK_PORT, REFRESH_SKEW_SECS},
     list, resolve_auth_dir, run_login, LoginOptions,
@@ -103,25 +104,55 @@ async fn main() -> Result<()> {
 
     tracing::info!("配置加载成功: {} providers", config.providers.len());
 
+    // 动态加载 Antigravity providers
+    let auth_dir = pin_auth_dir(&cli.config, config.auth_dir.as_deref());
+    let antigravity_providers = ccextra_server::antigravity::load_antigravity_providers(
+        &auth_dir,
+        config.server.proxy_url.as_deref(),
+    )
+    .await;
+    if !antigravity_providers.is_empty() {
+        tracing::info!(
+            "动态加载 {} 个 Antigravity providers",
+            antigravity_providers.len()
+        );
+    }
+
+    // 合并配置文件 providers 和 Antigravity providers
+    let all_providers = merge_providers(config.providers, antigravity_providers);
+
     // 启动时验证配置
-    ccextra_core::route::validate_providers(&config.providers)?;
+    ccextra_core::route::validate_providers(&all_providers)?;
     tracing::info!("配置验证通过");
 
     // 构建应用状态
     let config_path = cli.config.clone();
-    let reload = Arc::new(move || -> anyhow::Result<ReloadData> {
-        let cfg = Config::load(&config_path)?;
-        Ok(ReloadData {
-            providers: cfg.providers,
-            payload_rules: cfg.payload.unwrap_or_default(),
-            normalize: cfg.normalize,
-            logging: cfg.logging,
-            secret: cfg.secret_key,
-            proxy_url: cfg.server.proxy_url,
+    let reload = Arc::new(move || -> std::pin::Pin<Box<dyn std::future::Future<Output = anyhow::Result<ReloadData>> + Send>> {
+        let config_path = config_path.clone();
+        Box::pin(async move {
+            let cfg = Config::load(&config_path)?;
+
+            // 重载时重新解析 auth_dir(配置里改了要生效),再加载 Antigravity providers
+            let auth_dir = pin_auth_dir(&config_path, cfg.auth_dir.as_deref());
+            let antigravity_providers = ccextra_server::antigravity::load_antigravity_providers(
+                &auth_dir,
+                cfg.server.proxy_url.as_deref(),
+            )
+            .await;
+            let providers = merge_providers(cfg.providers, antigravity_providers);
+
+            Ok(ReloadData {
+                providers,
+                payload_rules: cfg.payload.unwrap_or_default(),
+                normalize: cfg.normalize,
+                logging: cfg.logging,
+                secret: cfg.secret_key,
+                proxy_url: cfg.server.proxy_url,
+            })
         })
     });
     let state = AppState {
-        providers: Arc::new(RwLock::new(config.providers)),
+        providers: Arc::new(RwLock::new(all_providers)),
         payload_rules: Arc::new(RwLock::new(config.payload.unwrap_or_default())),
         runtime: Arc::new(RwLock::new(RuntimeConfig {
             normalize: config.normalize,
@@ -167,6 +198,36 @@ fn pin_auth_dir(config_path: &str, raw: Option<&str>) -> PathBuf {
         Some(dir) => dir.join(path),
         None => path,
     }
+}
+
+/// 合并配置文件与动态注入的 providers(多 Antigravity 账号暴露同一批模型,
+/// alias 冲突会触发启动校验失败;先到者胜出,重复 alias 丢弃并告警)
+fn merge_providers(
+    mut base: Vec<ProviderConfig>,
+    injected: Vec<ProviderConfig>,
+) -> Vec<ProviderConfig> {
+    let mut seen: std::collections::HashSet<String> = base
+        .iter()
+        .flat_map(|p| p.models.iter().map(|m| m.alias.clone()))
+        .collect();
+    for mut p in injected {
+        p.models.retain(|m| {
+            if seen.contains(&m.alias) {
+                tracing::warn!(
+                    "alias 冲突,丢弃 {} 的模型 {}(alias {})",
+                    p.name,
+                    m.name,
+                    m.alias
+                );
+                false
+            } else {
+                seen.insert(m.alias.clone());
+                true
+            }
+        });
+        base.push(p);
+    }
+    base
 }
 
 async fn cmd_login(

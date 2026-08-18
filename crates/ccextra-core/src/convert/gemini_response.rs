@@ -4,12 +4,15 @@ use serde_json::{json, Value};
 use std::collections::HashMap;
 use std::sync::atomic::{AtomicU64, Ordering};
 
+use super::tool_id::claude_tool_id_for;
+
 /// 全局工具使用 ID 计数器
 static TOOL_USE_ID_COUNTER: AtomicU64 = AtomicU64::new(0);
 
 /// 响应类型状态
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
 pub enum ResponseType {
+    #[default]
     None = 0,
     Content = 1,
     Thinking = 2,
@@ -17,7 +20,7 @@ pub enum ResponseType {
 }
 
 /// Gemini 流式响应状态机
-#[derive(Debug)]
+#[derive(Debug, Default)]
 pub struct GeminiStreamState {
     /// 当前响应类型
     pub response_type: ResponseType,
@@ -27,17 +30,8 @@ pub struct GeminiStreamState {
     pub has_content: bool,
     /// 是否见过工具调用
     pub saw_tool_call: bool,
-}
-
-impl Default for GeminiStreamState {
-    fn default() -> Self {
-        Self {
-            response_type: ResponseType::None,
-            response_index: 0,
-            has_content: false,
-            saw_tool_call: false,
-        }
-    }
+    /// 最终事件是否已发(对齐 CPA HasFinalEvents,防重复 finalize)
+    pub final_events_sent: bool,
 }
 
 /// 转换 Gemini 流式事件为 Anthropic SSE 格式
@@ -92,7 +86,10 @@ pub fn convert_gemini_stream_chunk(
 
             // 处理文本内容
             if let Some(text) = text_result.and_then(|t| t.as_str()) {
-                let is_thought = part.get("thought").and_then(|t| t.as_bool()).unwrap_or(false)
+                let is_thought = part
+                    .get("thought")
+                    .and_then(|t| t.as_bool())
+                    .unwrap_or(false)
                     || has_thought_signature;
 
                 if is_thought {
@@ -258,11 +255,10 @@ pub fn convert_gemini_stream_chunk(
                     .map(|s| s.as_str())
                     .unwrap_or(upstream_tool_name);
 
-                // 生成唯一工具使用 ID
-                let tool_use_id = format!(
-                    "toolu_{}_{}",
+                // 生成唯一工具使用 ID(对齐 CPA:{name}-{counter},可被请求侧反解)
+                let tool_use_id = claude_tool_id_for(
                     upstream_tool_name,
-                    TOOL_USE_ID_COUNTER.fetch_add(1, Ordering::SeqCst)
+                    TOOL_USE_ID_COUNTER.fetch_add(1, Ordering::SeqCst),
                 );
 
                 // 开始新工具使用块
@@ -301,10 +297,7 @@ pub fn convert_gemini_stream_chunk(
 /// 处理 Gemini 响应的完成和使用统计
 ///
 /// 当检测到 finishReason 时调用，生成 content_block_stop 和 message_delta 事件
-pub fn finalize_gemini_stream(
-    chunk: &Value,
-    state: &mut GeminiStreamState,
-) -> Vec<Value> {
+pub fn finalize_gemini_stream(chunk: &Value, state: &mut GeminiStreamState) -> Vec<Value> {
     let mut events = Vec::new();
 
     // 检查是否有 finishReason
@@ -316,8 +309,10 @@ pub fn finalize_gemini_stream(
 
     let has_usage = chunk.get("usageMetadata").is_some();
 
-    // 只有在有 finishReason 且有内容输出时才发送最终事件
-    if has_finish_reason && has_usage && state.has_content {
+    // 只有在有 finishReason 且有内容输出时才发送最终事件;且只发一次
+    // (对齐 CPA HasFinalEvents:上游可能在多个非终帧重复带 usage/finishReason)
+    if has_finish_reason && has_usage && state.has_content && !state.final_events_sent {
+        state.final_events_sent = true;
         // 关闭当前内容块
         if state.response_type != ResponseType::None {
             events.push(json!({
@@ -330,16 +325,13 @@ pub fn finalize_gemini_stream(
         // 确定 stop_reason
         let stop_reason = if state.saw_tool_call {
             "tool_use"
-        } else if let Some(finish) = chunk
+        } else if let Some("MAX_TOKENS") = chunk
             .get("candidates")
             .and_then(|c| c.get(0))
             .and_then(|c| c.get("finishReason"))
             .and_then(|f| f.as_str())
         {
-            match finish {
-                "MAX_TOKENS" => "max_tokens",
-                _ => "end_turn",
-            }
+            "max_tokens"
         } else {
             "end_turn"
         };
@@ -377,7 +369,7 @@ pub fn finalize_gemini_stream(
     events
 }
 
-/// 转换 Gemini 非流式响应为 Anthropic 格式
+/// 转换 Gemini 非流式响应为 Anthropic 格式(对齐 CPA gemini_claude_response.go)
 pub fn convert_gemini_response(
     response: &Value,
     short_to_original: &HashMap<String, String>,
@@ -389,102 +381,124 @@ pub fn convert_gemini_response(
         "content": [],
         "model": "",
         "stop_reason": null,
+        "stop_sequence": null,
         "usage": {
             "input_tokens": 0,
             "output_tokens": 0
         }
     });
 
-    // 提取 responseId
     if let Some(response_id) = response.get("responseId").and_then(|r| r.as_str()) {
         anthropic["id"] = json!(response_id);
     }
-
-    // 提取 model
     if let Some(model) = response.get("modelVersion").and_then(|m| m.as_str()) {
         anthropic["model"] = json!(model);
     }
 
-    // 转换内容
-    if let Some(candidates) = response.get("candidates").and_then(|c| c.as_array()) {
-        if let Some(candidate) = candidates.first() {
-            if let Some(content) = candidate.get("content") {
-                if let Some(parts) = content.get("parts").and_then(|p| p.as_array()) {
-                    let mut content_blocks = Vec::new();
-
-                    for part in parts {
-                        // 文本块
-                        if let Some(text) = part.get("text").and_then(|t| t.as_str()) {
-                            // Thinking 块
-                            if part
-                                .get("thought")
-                                .and_then(|t| t.as_bool())
-                                .unwrap_or(false)
-                            {
-                                content_blocks.push(json!({
-                                    "type": "thinking",
-                                    "thinking": text
-                                }));
-                            } else {
-                                content_blocks.push(json!({
-                                    "type": "text",
-                                    "text": text
-                                }));
+    let mut saw_tool_call = false;
+    if let Some(candidate) = response
+        .get("candidates")
+        .and_then(|c| c.as_array())
+        .and_then(|c| c.first())
+    {
+        if let Some(parts) = candidate
+            .pointer("/content/parts")
+            .and_then(|p| p.as_array())
+        {
+            let mut content_blocks = Vec::new();
+            for part in parts {
+                // 文本/思考块:空文本跳过(对齐 CPA builders)
+                if let Some(text) = part.get("text").and_then(|t| t.as_str()) {
+                    if text.is_empty() {
+                        continue;
+                    }
+                    let is_thought = part
+                        .get("thought")
+                        .and_then(|t| t.as_bool())
+                        .unwrap_or(false);
+                    if is_thought {
+                        let mut block = json!({"type": "thinking", "thinking": text});
+                        if let Some(sig) = part
+                            .get("thoughtSignature")
+                            .or_else(|| part.get("thought_signature"))
+                            .and_then(|s| s.as_str())
+                        {
+                            if !sig.is_empty() {
+                                block["signature"] = json!(sig);
                             }
                         }
-
-                        // 工具调用
-                        if let Some(function_call) = part.get("functionCall") {
-                            let name = function_call
-                                .get("name")
-                                .and_then(|n| n.as_str())
-                                .unwrap_or("");
-                            let tool_id = function_call
-                                .get("id")
-                                .and_then(|i| i.as_str())
-                                .unwrap_or("");
-                            let default_args = json!({});
-                            let args = function_call.get("args").unwrap_or(&default_args);
-
-                            // 还原原始工具名
-                            let original_name = short_to_original
-                                .get(name)
-                                .map(|s| s.as_str())
-                                .unwrap_or(name);
-
-                            content_blocks.push(json!({
-                                "type": "tool_use",
-                                "id": tool_id,
-                                "name": original_name,
-                                "input": args
-                            }));
-                        }
+                        content_blocks.push(block);
+                    } else {
+                        content_blocks.push(json!({"type": "text", "text": text}));
                     }
-
-                    anthropic["content"] = json!(content_blocks);
                 }
 
-                // finishReason 映射
-                if let Some(finish_reason) = candidate.get("finishReason").and_then(|f| f.as_str())
-                {
-                    let stop_reason = match finish_reason {
-                        "STOP" => "end_turn",
-                        "MAX_TOKENS" => "max_tokens",
-                        _ => "end_turn",
+                // 工具调用:id 自生成(对齐 CPA,不透传上游 id),name 还原原名
+                if let Some(function_call) = part.get("functionCall") {
+                    saw_tool_call = true;
+                    let name = function_call
+                        .get("name")
+                        .and_then(|n| n.as_str())
+                        .unwrap_or("");
+                    let original_name = short_to_original
+                        .get(name)
+                        .map(|s| s.as_str())
+                        .unwrap_or(name);
+                    // args 仅接受对象,否则兜底 {}(对齐 CPA gjson.Valid && IsObject)
+                    let args = match function_call.get("args") {
+                        Some(a) if a.is_object() => a.clone(),
+                        _ => json!({}),
                     };
-                    anthropic["stop_reason"] = json!(stop_reason);
+                    let tool_id = claude_tool_id_for(
+                        name,
+                        TOOL_USE_ID_COUNTER.fetch_add(1, Ordering::SeqCst),
+                    );
+                    content_blocks.push(json!({
+                        "type": "tool_use",
+                        "id": tool_id,
+                        "name": original_name,
+                        "input": args
+                    }));
                 }
             }
+            anthropic["content"] = json!(content_blocks);
+        }
+
+        // finishReason 映射:有工具调用一律 tool_use(对齐 CPA hasToolCall 优先)
+        if let Some(finish_reason) = candidate.get("finishReason").and_then(|f| f.as_str()) {
+            let stop_reason = if saw_tool_call {
+                "tool_use"
+            } else {
+                match finish_reason {
+                    "MAX_TOKENS" => "max_tokens",
+                    _ => "end_turn",
+                }
+            };
+            anthropic["stop_reason"] = json!(stop_reason);
         }
     }
 
-    // 使用统计
-    if let Some(usage) = response.get("usageMetadata") {
-        if let Some(prompt_tokens) = usage.get("promptTokenCount") {
-            anthropic["usage"]["input_tokens"] = prompt_tokens.clone();
+    // 使用统计:output = candidates + thoughts(对齐 CPA)
+    match response.get("usageMetadata") {
+        Some(usage) => {
+            let prompt_tokens = usage
+                .get("promptTokenCount")
+                .and_then(|t| t.as_i64())
+                .unwrap_or(0);
+            let candidates_tokens = usage
+                .get("candidatesTokenCount")
+                .and_then(|t| t.as_i64())
+                .unwrap_or(0);
+            let thoughts_tokens = usage
+                .get("thoughtsTokenCount")
+                .and_then(|t| t.as_i64())
+                .unwrap_or(0);
+            anthropic["usage"]["input_tokens"] = json!(prompt_tokens);
+            anthropic["usage"]["output_tokens"] = json!(candidates_tokens + thoughts_tokens);
         }
-        if let Some(candidates_tokens) = usage.get("candidatesTokenCount") {
-            anthropic["usage"]["output_tokens"] = candidates_tokens.clone();
+        // 对齐 CPA:无 usageMetadata 且全零时删除 usage 键
+        None => {
+            anthropic.as_object_mut().map(|m| m.remove("usage"));
         }
     }
 
@@ -565,8 +579,76 @@ mod tests {
         assert_eq!(content.len(), 1);
         assert_eq!(content[0]["type"], "tool_use");
         assert_eq!(content[0]["name"], "Read"); // 还原了原名
-        assert_eq!(content[0]["id"], "call_123");
+                                                // 对齐 CPA:id 自生成 {name}-{counter},不透传上游 id
+        let id = content[0]["id"].as_str().unwrap();
+        assert!(id.starts_with("Rd-"), "id={}", id);
         assert_eq!(content[0]["input"]["path"], "/file.txt");
+        // 有工具调用时 stop_reason 一律 tool_use(即使 finishReason=STOP)
+        assert_eq!(anthropic["stop_reason"], "tool_use");
+    }
+
+    #[test]
+    fn test_convert_gemini_response_thoughts_tokens() {
+        let gemini = json!({
+            "candidates": [{
+                "content": {"parts": [{"text": "hi"}], "role": "model"},
+                "finishReason": "STOP"
+            }],
+            "usageMetadata": {
+                "promptTokenCount": 10,
+                "candidatesTokenCount": 20,
+                "thoughtsTokenCount": 30
+            }
+        });
+        let anthropic = convert_gemini_response(&gemini, &HashMap::new());
+        // output = candidates + thoughts(对齐 CPA)
+        assert_eq!(anthropic["usage"]["output_tokens"], 50);
+    }
+
+    #[test]
+    fn test_convert_gemini_response_no_usage_metadata() {
+        let gemini = json!({
+            "candidates": [{
+                "content": {"parts": [{"text": "hi"}], "role": "model"},
+                "finishReason": "STOP"
+            }]
+        });
+        let anthropic = convert_gemini_response(&gemini, &HashMap::new());
+        // 对齐 CPA:无 usageMetadata 时删除 usage
+        assert!(anthropic.get("usage").is_none());
+        assert!(anthropic.get("stop_sequence").is_some());
+    }
+
+    #[test]
+    fn test_convert_gemini_response_args_non_object_fallback() {
+        let gemini = json!({
+            "candidates": [{
+                "content": {
+                    "parts": [{"functionCall": {"name": "Read", "args": "oops"}}],
+                    "role": "model"
+                },
+                "finishReason": "STOP"
+            }]
+        });
+        let anthropic = convert_gemini_response(&gemini, &HashMap::new());
+        assert_eq!(anthropic["content"][0]["input"], json!({}));
+    }
+
+    #[test]
+    fn test_finalize_gemini_stream_only_once() {
+        let chunk = json!({
+            "candidates": [{"finishReason": "STOP"}],
+            "usageMetadata": {"promptTokenCount": 1, "candidatesTokenCount": 2}
+        });
+        let mut state = GeminiStreamState {
+            has_content: true,
+            ..Default::default()
+        };
+        let first = finalize_gemini_stream(&chunk, &mut state);
+        assert!(!first.is_empty());
+        // 第二帧重复 finishReason+usage 不再发最终事件(对齐 HasFinalEvents)
+        let second = finalize_gemini_stream(&chunk, &mut state);
+        assert!(second.is_empty());
     }
 
     #[test]

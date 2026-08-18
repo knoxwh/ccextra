@@ -9,9 +9,10 @@ use reqwest::Client;
 use serde::Deserialize;
 
 /// 空=继承环境代理;`direct`/`none`=直连;否则走该 URL
+/// 统一 30s 超时(对齐 CPA fetch 路径),防 Google 端点不可达时启动/reload 挂死
 pub fn http_client(proxy_url: Option<&str>) -> Result<Client> {
     let trimmed = proxy_url.map(str::trim).unwrap_or("");
-    let mut builder = Client::builder();
+    let mut builder = Client::builder().timeout(std::time::Duration::from_secs(30));
     if trimmed.is_empty() {
         return builder.build().context("build antigravity http client");
     }

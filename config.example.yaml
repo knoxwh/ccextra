@@ -47,21 +47,25 @@ providers:
     base_url: https://xxx
     key: sk-xxx
     # 注入派生 prompt_cache_key(provider 级开关,默认 false)
-    # UUIDv5 按 会话+模型+agent 派生,确定性桶;仅 openai_chat/openai_responses 生效
+    # key = 会话 ID 裸值(对齐 codex 0.147),确定性桶;仅 openai_chat/openai_responses 生效
     prompt_cache_key: true
     models:
       - name: gpt-5.6-terra
         alias: gpt-5.6-terra
 
-  # Cloud Code Assist(OAuth)。key 不用;base_url 空则 daily 再 prod。
-  # 凭证: scripts/antigravity/login.sh → .cache/antigravity
-  - name: antigravity
-    protocol: gemini
-    base_url: ""
-    key: ""
-    models:
-      - name: gemini-3.7-flash-high
-        alias: gemini-3.7-flash-high
+  # Cloud Code Assist(OAuth)。无需手配:启动时自动扫描上方 auth_dir,
+  # 为每份有效凭证注入一个 antigravity provider(模型列表自动拉取)。
+  # 凭证获取: ./ccextra antigravity-login → 写入 .cache/antigravity
+  # 也可显式声明(多 base_url 按序回退:网络/读错、429 切下一个):
+  # - name: antigravity
+  #   protocol: antigravity
+  #   base_url:
+  #     - "https://daily-cloudcode-pa.googleapis.com"
+  #     - "https://cloudcode-pa.googleapis.com"
+  #   key: ""
+  #   models:
+  #     - name: gemini-3.7-flash-high
+  #       alias: gemini-3.7-flash-high
 
 # Payload 参数覆盖(按模型名模式匹配)
 payload:
