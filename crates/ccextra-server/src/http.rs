@@ -640,10 +640,20 @@ async fn handle_messages(
     // responses 协议:session-id/thread-id 头(对齐 Codex 官方客户端)
     // - session-id:会话级 UUID(整会话稳定,与 prompt_cache_key 解耦)
     // - thread-id:线程级 UUID(对齐上游请求关联/日志追踪)
-    let (session_id, thread_id) = if matches!(route.protocol, Protocol::OpenAiResponses) {
-        (cc_session.as_deref(), extract_claude_code_thread(&headers))
+    // grok 模型(chat/responses):session_id 另供 x-grok-conv-id 路由
+    // 亲和(xAI 缓存按服务器存储,见 upstream.rs grok_conv_id_header)
+    let is_grok = route.upstream_model.to_ascii_lowercase().contains("grok");
+    let session_id = if matches!(route.protocol, Protocol::OpenAiResponses)
+        || (is_grok && matches!(route.protocol, Protocol::OpenAiChat))
+    {
+        cc_session.as_deref()
     } else {
-        (None, None)
+        None
+    };
+    let thread_id = if matches!(route.protocol, Protocol::OpenAiResponses) {
+        extract_claude_code_thread(&headers)
+    } else {
+        None
     };
 
     // 多 base_url 回退(对齐 CPA antigravity executor:网络错误、429 切下一个 URL)

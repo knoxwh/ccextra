@@ -54,7 +54,7 @@ Claude Code → ccextra:8222
 7. 剥离 prompt_cache_retention（仅 openai 路径）
 8. prompt_cache_key 注入（provider 级开关）+ 诊断落盘（可选）
 9. claude 直通：anthropic-beta 重建 + 身份头透传
-10. 上游请求（reqwest + 按协议 UA + 代理）
+10. 上游请求（reqwest + 按协议 UA + 代理；grok* 模型加 x-grok-conv-id 会话路由头）
 11. 响应转发（流式 SSE 状态机 / 非流: claude 字节直通, openai 走 non_stream, gemini/antigravity 走 convert_gemini_response 转回 anthropic, 转失败原样回上游字节；上游错误转 anthropic 形状）
     ↓
 上游 Provider

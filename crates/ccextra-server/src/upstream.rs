@@ -61,6 +61,30 @@ fn is_gpt_model(upstream_model: &str) -> bool {
     upstream_model.to_ascii_lowercase().contains("gpt")
 }
 
+/// 模型名是否按 *grok* 匹配(大小写不敏感,含前缀/中缀/后缀)
+fn is_grok_model(upstream_model: &str) -> bool {
+    upstream_model.to_ascii_lowercase().contains("grok")
+}
+
+/// grok 模型(chat/responses)的会话路由头(对齐 xAI 文档):
+/// x-grok-conv-id 把同一会话 ID 的请求路由到同一服务器,缓存按服务器
+/// 存储,命中率最大化。值为会话 ID 裸值,由 http.rs 传入,无会话不发。
+fn grok_conv_id_header(
+    protocol: Protocol,
+    upstream_model: &str,
+    session_id: Option<&str>,
+) -> Option<(&'static str, String)> {
+    if !matches!(protocol, Protocol::OpenAiChat | Protocol::OpenAiResponses) {
+        return None;
+    }
+    if !is_grok_model(upstream_model) {
+        return None;
+    }
+    session_id
+        .filter(|s| !s.trim().is_empty())
+        .map(|s| ("x-grok-conv-id", s.to_string()))
+}
+
 /// 按协议+模型取 User-Agent(对齐上游期望的客户端标识)
 ///
 /// 仅 responses + *gpt* 用 Codex UA;其余(含 responses 上的 grok 等)
@@ -139,7 +163,8 @@ impl UpstreamClient {
     /// - `is_stream`:chat 链路流式时补 `Accept: text/event-stream` /
     ///   `Cache-Control: no-cache`
     /// - `session_id`:responses 链路发 `Session_id` 头(对齐 cacheHelper,
-    ///   值为 prompt_cache_key,上游按它做缓存亲和)
+    ///   值为 prompt_cache_key,上游按它做缓存亲和);grok 模型(chat/responses)
+    ///   发 `x-grok-conv-id` 会话路由头(xAI 服务器缓存亲和)
     /// - `extra_headers`:claude 直通的透传/重建头(对齐 applyClaudeHeaders
     ///   的中转场景:anthropic-beta 按 body 条件重建 + caller beta 追加,
     ///   anthropic-version / x-app / stainless 系列透传)
@@ -195,6 +220,10 @@ impl UpstreamClient {
             if is_gpt_model(upstream_model) {
                 req = req.header("Originator", "codex_cli_rs");
             }
+        }
+        // grok 模型:会话路由头(见 grok_conv_id_header)
+        if let Some((name, value)) = grok_conv_id_header(protocol, upstream_model, session_id) {
+            req = req.header(name, value);
         }
         for (name, value) in extra_headers {
             req = req.header(name.as_str(), value.as_str());
@@ -268,6 +297,30 @@ mod tests {
         assert!(is_gpt_model("openai/GPT-5"));
         assert!(!is_gpt_model("grok-4.6"));
         assert!(!is_gpt_model("claude-opus-5"));
+    }
+
+    #[test]
+    fn test_grok_conv_id_header() {
+        // chat + grok:带会话头
+        assert_eq!(
+            grok_conv_id_header(Protocol::OpenAiChat, "grok-4.6", Some("sess-1")),
+            Some(("x-grok-conv-id", "sess-1".to_string()))
+        );
+        // responses + grok:带
+        assert_eq!(
+            grok_conv_id_header(Protocol::OpenAiResponses, "grok-4.6", Some("sess-1")),
+            Some(("x-grok-conv-id", "sess-1".to_string()))
+        );
+        // 大小写不敏感
+        assert!(grok_conv_id_header(Protocol::OpenAiChat, "GROK-4.6", Some("s")).is_some());
+        // gpt/claude 模型不带
+        assert!(grok_conv_id_header(Protocol::OpenAiChat, "gpt-5.6", Some("s")).is_none());
+        assert!(grok_conv_id_header(Protocol::OpenAiChat, "claude-opus-5", Some("s")).is_none());
+        // gemini 协议不带
+        assert!(grok_conv_id_header(Protocol::Gemini, "grok-4.6", Some("s")).is_none());
+        // 无会话 / 空会话不带(随机生成无稳定键,缓存亲和零收益)
+        assert!(grok_conv_id_header(Protocol::OpenAiChat, "grok-4.6", None).is_none());
+        assert!(grok_conv_id_header(Protocol::OpenAiChat, "grok-4.6", Some("  ")).is_none());
     }
 
     #[test]
