@@ -54,7 +54,7 @@ Claude Code → ccextra:8222
 7. Strip prompt_cache_retention (OpenAI paths only)
 8. Inject prompt_cache_key (per-provider switch) + optional diagnostic dump
 9. Claude passthrough: rebuild anthropic-beta + forward identity headers
-10. Upstream request (reqwest + protocol-specific UA + proxy; grok* models get x-grok-conv-id session routing header)
+10. Upstream request (reqwest + protocol-specific UA + proxy)
 11. Relay response (streaming SSE state machine / non-stream: Claude byte-passthrough, OpenAI via non_stream, gemini/antigravity via convert_gemini_response back to Anthropic; convert failure returns upstream bytes as-is; upstream errors mapped to Anthropic shape)
     ↓
 Upstream provider
