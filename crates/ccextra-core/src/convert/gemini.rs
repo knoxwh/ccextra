@@ -3,7 +3,7 @@
 use serde_json::Value;
 use std::collections::{HashMap, HashSet};
 
-use super::gemini_schema::{clean_json_schema_for_antigravity, clean_json_schema_for_gemini};
+use super::gemini_schema::{clean_json_schema_for_gemini, clean_nested_schema_for_antigravity};
 use super::is_attribution_text;
 use super::message_convert::convert_messages;
 use super::tool_sanitize::{sanitize_function_name, sanitized_function_name_map};
@@ -262,7 +262,7 @@ pub fn convert_tool_definitions(
         if let Some(input_schema) = tool.get("input_schema") {
             gemini_tool["parametersJsonSchema"] = match flavor {
                 SchemaFlavor::Gemini => clean_json_schema_for_gemini(input_schema),
-                SchemaFlavor::Antigravity => clean_json_schema_for_antigravity(input_schema),
+                SchemaFlavor::Antigravity => clean_nested_schema_for_antigravity(input_schema),
             };
         }
 

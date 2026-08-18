@@ -269,4 +269,25 @@ mod tests {
         let schema = &out["request"]["tools"][0]["functionDeclarations"][0]["parametersJsonSchema"];
         assert_eq!(schema["required"], json!(["reason"]));
     }
+
+    #[test]
+    fn test_antigravity_optional_only_properties_gets_underscore_placeholder() {
+        // 对齐 CPA cleanNestedSchema:全可选 properties 套一层后补 `_`
+        let body = json!({
+            "model": "m", "max_tokens": 100,
+            "tools": [{
+                "name": "Flag",
+                "input_schema": {
+                    "type": "object",
+                    "properties": {"flag": {"type": "string"}}
+                }
+            }],
+            "messages": [{"role": "user", "content": "hi"}]
+        });
+        let (out, _) = convert_to_antigravity(&body, "claude-sonnet-4-6", None);
+        let schema = &out["request"]["tools"][0]["functionDeclarations"][0]["parametersJsonSchema"];
+        assert_eq!(schema["required"], json!(["_"]));
+        assert_eq!(schema["properties"]["_"]["type"], "boolean");
+        assert_eq!(schema["properties"]["flag"]["type"], "string");
+    }
 }

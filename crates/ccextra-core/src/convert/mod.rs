@@ -25,9 +25,13 @@ pub use antigravity::convert_to_antigravity;
 pub use fix_json::fix_json_quotes;
 pub use gemini::convert_to_gemini;
 pub use gemini_response::{
-    convert_gemini_response, convert_gemini_stream_chunk, finalize_gemini_stream, GeminiStreamState,
+    convert_gemini_response, convert_gemini_stream_chunk, finalize_gemini_stream,
+    force_finalize_gemini_stream, GeminiStreamState,
 };
-pub use gemini_schema::{clean_json_schema_for_antigravity, clean_json_schema_for_gemini};
+pub use gemini_schema::{
+    clean_json_schema_for_antigravity, clean_json_schema_for_gemini,
+    clean_nested_schema_for_antigravity,
+};
 pub use passthrough::convert_passthrough;
 pub use shorten::build_reverse_map;
 pub use shorten::build_short_name_map;

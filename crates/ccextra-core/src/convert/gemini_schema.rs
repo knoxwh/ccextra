@@ -50,6 +50,17 @@ pub fn clean_json_schema_for_antigravity(schema: &Value) -> Value {
     )
 }
 
+/// 对齐 CPA cleanNestedSchema:套一层 `"schema"` 再清洗再 unwrap。
+/// cleaner 顶层跳过 `_` 占位;套一层后工具 schema 根非顶层,全可选 properties 补 `_`。
+pub fn clean_nested_schema_for_antigravity(schema: &Value) -> Value {
+    let wrapped = json!({"schema": schema});
+    let cleaned = clean_json_schema_for_antigravity(&wrapped);
+    match cleaned.get("schema") {
+        Some(inner) => inner.clone(),
+        None => clean_json_schema_for_antigravity(schema),
+    }
+}
+
 /// 主编排(对齐 cleanJSONSchema 四阶段)
 fn clean_json_schema(schema: &Value, opts: CleanOptions) -> Value {
     let mut s = schema.clone();
@@ -926,13 +937,14 @@ fn add_empty_schema_placeholder(schema: &mut Value) {
             return;
         }
 
+        // 对齐 CPA propsVal.IsObject():properties 非对象(含 null)不加 `_`
         if !has_required && !is_top_level {
-            let props_map = map.get_mut("properties").and_then(|p| p.as_object_mut());
-            if let Some(props_map) = props_map {
-                props_map
-                    .entry("_".to_string())
-                    .or_insert_with(|| json!({"type": "boolean"}));
-            }
+            let Some(props_map) = map.get_mut("properties").and_then(|p| p.as_object_mut()) else {
+                return;
+            };
+            props_map
+                .entry("_".to_string())
+                .or_insert_with(|| json!({"type": "boolean"}));
             map.insert("required".into(), json!(["_"]));
         }
     }
@@ -1059,6 +1071,22 @@ mod tests {
         let out = clean_json_schema_for_gemini(&schema);
         assert!(out["properties"].get("reason").is_none());
         assert!(out.get("required").is_none());
+    }
+
+    #[test]
+    fn test_antigravity_nested_tool_schema_adds_underscore() {
+        // 顶层清洗跳过 `_`;套一层后工具 schema 根补占位(对齐 cleanNestedSchema)
+        let schema = json!({
+            "type": "object",
+            "properties": {"flag": {"type": "string"}}
+        });
+        let top = clean_json_schema_for_antigravity(&schema);
+        assert!(top.get("required").is_none());
+        assert!(top["properties"].get("_").is_none());
+        let nested = clean_nested_schema_for_antigravity(&schema);
+        assert_eq!(nested["required"], json!(["_"]));
+        assert_eq!(nested["properties"]["_"]["type"], "boolean");
+        assert_eq!(nested["properties"]["flag"]["type"], "string");
     }
 
     #[test]

@@ -32,6 +32,16 @@ pub struct GeminiStreamState {
     pub saw_tool_call: bool,
     /// 最终事件是否已发(对齐 CPA HasFinalEvents,防重复 finalize)
     pub final_events_sent: bool,
+    /// 是否见过 usageMetadata(对齐 CPA HasUsageMetadata)
+    has_usage: bool,
+    /// 是否见过 finishReason(对齐 CPA HasFinishReason)
+    has_finish: bool,
+    /// 流式 input = prompt - cached(对齐 CPA Params.PromptTokenCount)
+    prompt_tokens: i64,
+    output_tokens: i64,
+    cache_read: i64,
+    /// 缓存的 finishReason,供 [DONE] force 使用
+    finish_reason: String,
 }
 
 /// 转换 Gemini 流式事件为 Anthropic SSE 格式
@@ -294,78 +304,102 @@ pub fn convert_gemini_stream_chunk(
     events
 }
 
-/// 处理 Gemini 响应的完成和使用统计
-///
-/// 当检测到 finishReason 时调用，生成 content_block_stop 和 message_delta 事件
-pub fn finalize_gemini_stream(chunk: &Value, state: &mut GeminiStreamState) -> Vec<Value> {
-    let mut events = Vec::new();
+fn i64_field(v: &Value, key: &str) -> i64 {
+    v.get(key).and_then(|t| t.as_i64()).unwrap_or(0)
+}
 
-    // 检查是否有 finishReason
-    let has_finish_reason = chunk
+/// usage JSON:cached>0 才写 cache_read_input_tokens(对齐 CPA)
+fn usage_object(input: i64, output: i64, cache_read: i64) -> Value {
+    let mut usage = json!({"input_tokens": input, "output_tokens": output});
+    if cache_read > 0 {
+        usage["cache_read_input_tokens"] = json!(cache_read);
+    }
+    usage
+}
+
+fn cache_chunk_metadata(chunk: &Value, state: &mut GeminiStreamState) {
+    if let Some(fr) = chunk
         .get("candidates")
         .and_then(|c| c.get(0))
         .and_then(|c| c.get("finishReason"))
-        .is_some();
-
-    let has_usage = chunk.get("usageMetadata").is_some();
-
-    // 只有在有 finishReason 且有内容输出时才发送最终事件;且只发一次
-    // (对齐 CPA HasFinalEvents:上游可能在多个非终帧重复带 usage/finishReason)
-    if has_finish_reason && has_usage && state.has_content && !state.final_events_sent {
-        state.final_events_sent = true;
-        // 关闭当前内容块
-        if state.response_type != ResponseType::None {
-            events.push(json!({
-                "type": "content_block_stop",
-                "index": state.response_index
-            }));
-            state.response_type = ResponseType::None;
-        }
-
-        // 确定 stop_reason
-        let stop_reason = if state.saw_tool_call {
-            "tool_use"
-        } else if let Some("MAX_TOKENS") = chunk
-            .get("candidates")
-            .and_then(|c| c.get(0))
-            .and_then(|c| c.get("finishReason"))
-            .and_then(|f| f.as_str())
-        {
-            "max_tokens"
-        } else {
-            "end_turn"
-        };
-
-        // 计算 token 使用
-        let usage = chunk.get("usageMetadata");
-        let prompt_tokens = usage
-            .and_then(|u| u.get("promptTokenCount"))
-            .and_then(|t| t.as_i64())
-            .unwrap_or(0);
-        let candidates_tokens = usage
-            .and_then(|u| u.get("candidatesTokenCount"))
-            .and_then(|t| t.as_i64())
-            .unwrap_or(0);
-        let thoughts_tokens = usage
-            .and_then(|u| u.get("thoughtsTokenCount"))
-            .and_then(|t| t.as_i64())
-            .unwrap_or(0);
-
-        let total_output_tokens = candidates_tokens + thoughts_tokens;
-
-        events.push(json!({
-            "type": "message_delta",
-            "delta": {
-                "stop_reason": stop_reason,
-                "stop_sequence": null
-            },
-            "usage": {
-                "input_tokens": prompt_tokens,
-                "output_tokens": total_output_tokens
-            }
-        }));
+    {
+        state.has_finish = true;
+        state.finish_reason = fr.as_str().unwrap_or("").to_string();
     }
+    if let Some(usage) = chunk.get("usageMetadata") {
+        // 流式:input = prompt - cached(对齐 CPA Params.PromptTokenCount)
+        let cached = i64_field(usage, "cachedContentTokenCount");
+        state.has_usage = true;
+        state.prompt_tokens = i64_field(usage, "promptTokenCount") - cached;
+        state.output_tokens =
+            i64_field(usage, "candidatesTokenCount") + i64_field(usage, "thoughtsTokenCount");
+        state.cache_read = cached;
+    }
+}
 
+fn stop_reason_of(state: &GeminiStreamState) -> &'static str {
+    if state.saw_tool_call {
+        "tool_use"
+    } else if state.finish_reason == "MAX_TOKENS" {
+        "max_tokens"
+    } else {
+        "end_turn"
+    }
+}
+
+/// 关块 + message_delta(对齐 CPA appendFinalEvents)
+fn append_final_events(state: &mut GeminiStreamState, events: &mut Vec<Value>) {
+    if state.final_events_sent || !state.has_content {
+        return;
+    }
+    state.final_events_sent = true;
+    if state.response_type != ResponseType::None {
+        events.push(json!({
+            "type": "content_block_stop",
+            "index": state.response_index
+        }));
+        state.response_type = ResponseType::None;
+    }
+    events.push(json!({
+        "type": "message_delta",
+        "delta": {
+            "stop_reason": stop_reason_of(state),
+            "stop_sequence": null
+        },
+        "usage": usage_object(state.prompt_tokens, state.output_tokens, state.cache_read)
+    }));
+}
+
+/// 处理 Gemini 响应的完成和使用统计
+///
+/// 非 force:finishReason + usage + 有内容才发,且只发一次
+/// (对齐 CPA HasFinalEvents:上游可能在多个非终帧重复带 usage/finishReason)
+pub fn finalize_gemini_stream(chunk: &Value, state: &mut GeminiStreamState) -> Vec<Value> {
+    cache_chunk_metadata(chunk, state);
+    let mut events = Vec::new();
+    if state.has_finish && state.has_usage && state.has_content && !state.final_events_sent {
+        append_final_events(state, &mut events);
+    }
+    events
+}
+
+/// [DONE]/EOF force 收尾(对齐 CPA appendFinalEvents(force=true)):
+/// 无内容先补空 text 块;然后关块 + message_delta(缺 usage 用已缓存值,默认 0)
+pub fn force_finalize_gemini_stream(state: &mut GeminiStreamState) -> Vec<Value> {
+    if state.final_events_sent {
+        return Vec::new();
+    }
+    let mut events = Vec::new();
+    if !state.has_content {
+        events.push(json!({
+            "type": "content_block_start",
+            "index": state.response_index,
+            "content_block": {"type": "text", "text": ""}
+        }));
+        state.response_type = ResponseType::Content;
+        state.has_content = true;
+    }
+    append_final_events(state, &mut events);
     events
 }
 
@@ -478,23 +512,15 @@ pub fn convert_gemini_response(
         }
     }
 
-    // 使用统计:output = candidates + thoughts(对齐 CPA)
+    // 使用统计:非流 input 不扣 cached;cached>0 写 cache_read(对齐 CPA 非流)
     match response.get("usageMetadata") {
         Some(usage) => {
-            let prompt_tokens = usage
-                .get("promptTokenCount")
-                .and_then(|t| t.as_i64())
-                .unwrap_or(0);
-            let candidates_tokens = usage
-                .get("candidatesTokenCount")
-                .and_then(|t| t.as_i64())
-                .unwrap_or(0);
-            let thoughts_tokens = usage
-                .get("thoughtsTokenCount")
-                .and_then(|t| t.as_i64())
-                .unwrap_or(0);
-            anthropic["usage"]["input_tokens"] = json!(prompt_tokens);
-            anthropic["usage"]["output_tokens"] = json!(candidates_tokens + thoughts_tokens);
+            let cached = i64_field(usage, "cachedContentTokenCount");
+            anthropic["usage"] = usage_object(
+                i64_field(usage, "promptTokenCount"),
+                i64_field(usage, "candidatesTokenCount") + i64_field(usage, "thoughtsTokenCount"),
+                cached,
+            );
         }
         // 对齐 CPA:无 usageMetadata 且全零时删除 usage 键
         None => {
@@ -674,5 +700,127 @@ mod tests {
         assert_eq!(events[1]["type"], "content_block_delta");
         assert_eq!(events[1]["delta"]["type"], "text_delta");
         assert_eq!(events[1]["delta"]["text"], "Hello");
+    }
+
+    #[test]
+    fn test_convert_gemini_response_emits_cache_read() {
+        // 对齐 CPA 非流:input 不扣 cached;cached>0 写 cache_read
+        let gemini = json!({
+            "candidates": [{
+                "content": {"parts": [{"text": "hi"}], "role": "model"},
+                "finishReason": "STOP"
+            }],
+            "usageMetadata": {
+                "promptTokenCount": 100,
+                "candidatesTokenCount": 20,
+                "cachedContentTokenCount": 40
+            }
+        });
+        let anthropic = convert_gemini_response(&gemini, &HashMap::new());
+        assert_eq!(anthropic["usage"]["input_tokens"], 100);
+        assert_eq!(anthropic["usage"]["output_tokens"], 20);
+        assert_eq!(anthropic["usage"]["cache_read_input_tokens"], 40);
+    }
+
+    #[test]
+    fn test_convert_gemini_response_zero_cached_omits_cache_read() {
+        let gemini = json!({
+            "candidates": [{
+                "content": {"parts": [{"text": "hi"}], "role": "model"},
+                "finishReason": "STOP"
+            }],
+            "usageMetadata": {
+                "promptTokenCount": 10,
+                "candidatesTokenCount": 5,
+                "cachedContentTokenCount": 0
+            }
+        });
+        let anthropic = convert_gemini_response(&gemini, &HashMap::new());
+        assert_eq!(anthropic["usage"]["input_tokens"], 10);
+        assert!(anthropic["usage"].get("cache_read_input_tokens").is_none());
+    }
+
+    #[test]
+    fn test_finalize_gemini_stream_subtracts_cached() {
+        let chunk = json!({
+            "candidates": [{"finishReason": "STOP"}],
+            "usageMetadata": {
+                "promptTokenCount": 100,
+                "candidatesTokenCount": 8,
+                "thoughtsTokenCount": 2,
+                "cachedContentTokenCount": 40
+            }
+        });
+        let mut state = GeminiStreamState {
+            has_content: true,
+            ..Default::default()
+        };
+        let events = finalize_gemini_stream(&chunk, &mut state);
+        let delta = events
+            .iter()
+            .find(|e| e["type"] == "message_delta")
+            .unwrap();
+        assert_eq!(delta["usage"]["input_tokens"], 60);
+        assert_eq!(delta["usage"]["output_tokens"], 10);
+        assert_eq!(delta["usage"]["cache_read_input_tokens"], 40);
+    }
+
+    #[test]
+    fn test_force_finalize_on_done_without_usage() {
+        // [DONE] force:有内容无 finish/usage 仍发 message_delta(usage 全 0)
+        let mut state = GeminiStreamState {
+            has_content: true,
+            response_type: ResponseType::Content,
+            ..Default::default()
+        };
+        let events = force_finalize_gemini_stream(&mut state);
+        assert!(state.final_events_sent);
+        assert_eq!(events[0]["type"], "content_block_stop");
+        let delta = events
+            .iter()
+            .find(|e| e["type"] == "message_delta")
+            .unwrap();
+        assert_eq!(delta["delta"]["stop_reason"], "end_turn");
+        assert_eq!(delta["usage"]["input_tokens"], 0);
+        assert_eq!(delta["usage"]["output_tokens"], 0);
+        assert!(delta["usage"].get("cache_read_input_tokens").is_none());
+        assert!(force_finalize_gemini_stream(&mut state).is_empty());
+    }
+
+    #[test]
+    fn test_force_finalize_synthesizes_empty_text_when_no_content() {
+        let mut state = GeminiStreamState::default();
+        let events = force_finalize_gemini_stream(&mut state);
+        assert!(state.has_content);
+        assert_eq!(events[0]["type"], "content_block_start");
+        assert_eq!(events[0]["content_block"]["type"], "text");
+        assert_eq!(events[0]["content_block"]["text"], "");
+        assert_eq!(events[1]["type"], "content_block_stop");
+        assert_eq!(events[2]["type"], "message_delta");
+    }
+
+    #[test]
+    fn test_force_finalize_uses_cached_usage() {
+        // usage 在非终帧出现,force 时用缓存值
+        let usage_chunk = json!({
+            "usageMetadata": {
+                "promptTokenCount": 50,
+                "candidatesTokenCount": 3,
+                "cachedContentTokenCount": 10
+            }
+        });
+        let mut state = GeminiStreamState {
+            has_content: true,
+            ..Default::default()
+        };
+        assert!(finalize_gemini_stream(&usage_chunk, &mut state).is_empty());
+        let events = force_finalize_gemini_stream(&mut state);
+        let delta = events
+            .iter()
+            .find(|e| e["type"] == "message_delta")
+            .unwrap();
+        assert_eq!(delta["usage"]["input_tokens"], 40);
+        assert_eq!(delta["usage"]["output_tokens"], 3);
+        assert_eq!(delta["usage"]["cache_read_input_tokens"], 10);
     }
 }

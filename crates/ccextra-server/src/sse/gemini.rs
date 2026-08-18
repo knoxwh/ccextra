@@ -5,7 +5,8 @@ use super::parser::SseParser;
 use super::SseStreamPin;
 use bytes::{BufMut, Bytes, BytesMut};
 use ccextra_core::convert::{
-    convert_gemini_stream_chunk, finalize_gemini_stream, GeminiStreamState,
+    convert_gemini_stream_chunk, finalize_gemini_stream, force_finalize_gemini_stream,
+    GeminiStreamState,
 };
 use futures::{Stream, StreamExt};
 use std::collections::HashMap;
@@ -31,6 +32,7 @@ where
         let mut parser = SseParser::new();
         let mut state = GeminiStreamState::default();
         let mut message_started = false;
+        let mut finished = false;
 
         let input_tokens = estimated_input_tokens.unwrap_or(1);
 
@@ -41,6 +43,9 @@ where
                     let events = parser.push(&chunk_bytes);
 
                     for event in events {
+                        if finished {
+                            continue;
+                        }
                         if event.event.as_deref() == Some("error") {
                             // 上游错误事件直接转发
                             let mut buf = BytesMut::new();
@@ -52,11 +57,18 @@ where
                         }
 
                         if event.data == "[DONE]" {
-                            // 只在有内容时发送 message_stop
-                            if state.has_content {
-                                let stop_event = emit::sse("message_stop", &serde_json::json!({"type": "message_stop"}));
-                                yield Ok(stop_event);
+                            // 对齐 CPA:[DONE] force finalize;无内容补空 text;再 message_stop
+                            if message_started {
+                                for ev in force_finalize_gemini_stream(&mut state) {
+                                    let event_type = ev["type"].as_str().unwrap_or("");
+                                    yield Ok(emit::sse(event_type, &ev));
+                                }
+                                if state.has_content {
+                                    let stop_event = emit::sse("message_stop", &serde_json::json!({"type": "message_stop"}));
+                                    yield Ok(stop_event);
+                                }
                             }
+                            finished = true;
                             continue;
                         }
 
@@ -136,10 +148,16 @@ where
             }
         }
 
-        // 流结束: 只在有内容时发送 message_stop
-        if message_started && state.has_content {
-            let stop_event = emit::sse("message_stop", &serde_json::json!({"type": "message_stop"}));
-            yield Ok(stop_event);
+        // 流结束无 [DONE]:与 [DONE] 同 force,防双 message_stop
+        if message_started && !finished {
+            for ev in force_finalize_gemini_stream(&mut state) {
+                let event_type = ev["type"].as_str().unwrap_or("");
+                yield Ok(emit::sse(event_type, &ev));
+            }
+            if state.has_content {
+                let stop_event = emit::sse("message_stop", &serde_json::json!({"type": "message_stop"}));
+                yield Ok(stop_event);
+            }
         }
     })
 }
