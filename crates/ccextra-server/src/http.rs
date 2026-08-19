@@ -26,7 +26,8 @@ use ccextra_core::cache_stabilization::drift_detector::{
     DriftState,
 };
 use ccextra_core::convert::{
-    convert_passthrough, convert_to_openai_chat, convert_to_openai_responses, ConvertError,
+    convert_passthrough, convert_to_openai_chat, convert_to_openai_responses,
+    is_thinking_signature_invalid, trim_encrypted_reasoning_items, ConvertError,
 };
 use ccextra_core::count_tokens::count_claude_input_tokens;
 use ccextra_core::normalize::{
@@ -474,10 +475,12 @@ async fn handle_messages(
     }
 
     // 4. 协议转换(含目标侧归一化)
+    // stream 缺省对齐 Anthropic API 语义(false 非流):Claude Code 非流重试
+    // 不带 stream 字段,按 true 会把上游 SSE 流回给期望 JSON 的客户端。
     let is_stream = body_json
         .get("stream")
         .and_then(|v| v.as_bool())
-        .unwrap_or(true);
+        .unwrap_or(false);
     // Claude Code 会话 ID 须在转换前提取(转换后 metadata 被丢弃),供 prompt_cache_key 用
     let cc_session = extract_claude_code_session(&headers, &body_json);
 
@@ -649,6 +652,14 @@ async fn handle_messages(
     } else {
         (None, None)
     };
+    tracing::debug!(
+        session_id = ?session_id,
+        thread_id = ?thread_id,
+        cc_session = ?cc_session,
+        is_grok = is_grok,
+        protocol = ?route.protocol,
+        "会话 ID 派发"
+    );
 
     // 多 base_url 回退(对齐 CPA antigravity executor:网络错误、429 切下一个 URL)
     let mut upstream = None;
@@ -770,28 +781,71 @@ async fn handle_messages(
 
     // 上游错误:转 anthropic error 形状
     // (OpenAI 的 {"error":{...}} 直接透传客户端不认,对齐 WriteErrorResponse)
+    // Responses 400 + invalid_encrypted_content / thinking signature invalid /
+    // grok "Could not decrypt":剥离 reasoning.encrypted_content 再请求一次。
     if !status.is_success() {
-        let upstream = upstream.take().expect("上游响应应存在");
-        if let Some(meta) = upstream_meta_base(
-            log_request_body,
-            upstream.body.headers(),
-            ts,
-            request_seq,
-            &sess,
-            &proto,
-            &model,
-            &route.upstream_model,
-            status,
-            &body_json,
-        ) {
-            write_upstream_meta(&meta);
+        let failed = upstream.take().expect("上游响应应存在");
+        let failed_headers = failed.body.headers().clone();
+        let err_bytes = failed.body.bytes().await?;
+        let mut final_status = status;
+        let mut final_bytes = err_bytes;
+        let mut final_headers = failed_headers;
+        let mut retried_ok = false;
+
+        if status.as_u16() == 400
+            && matches!(route.protocol, Protocol::OpenAiResponses)
+            && is_thinking_signature_invalid(&final_bytes)
+            && trim_encrypted_reasoning_items(&mut body_json)
+        {
+            tracing::warn!(
+                protocol = ?route.protocol,
+                "invalid_encrypted_content,剥离 reasoning 后重试一次"
+            );
+            let retry = upstream_client
+                .request(
+                    &upstream_base_urls[0],
+                    &upstream_key,
+                    route.protocol,
+                    upstream_proxy.as_deref(),
+                    &body_json,
+                    is_stream,
+                    session_id,
+                    thread_id.as_deref(),
+                    &extra_headers,
+                )
+                .await?;
+            final_status = retry.status;
+            if retry.status.is_success() {
+                status = retry.status;
+                upstream = Some(retry);
+                retried_ok = true;
+            } else {
+                final_headers = retry.body.headers().clone();
+                final_bytes = retry.body.bytes().await?;
+            }
         }
-        let body_bytes = upstream.body.bytes().await?;
-        return Response::builder()
-            .status(status)
-            .header(header::CONTENT_TYPE, "application/json")
-            .body(Body::from(to_anthropic_error(&body_bytes)))
-            .map_err(|e| AppError::new(anyhow::anyhow!("构造错误响应失败: {e}")));
+
+        if !retried_ok {
+            if let Some(meta) = upstream_meta_base(
+                log_request_body,
+                &final_headers,
+                ts,
+                request_seq,
+                &sess,
+                &proto,
+                &model,
+                &route.upstream_model,
+                final_status,
+                &body_json,
+            ) {
+                write_upstream_meta(&meta);
+            }
+            return Response::builder()
+                .status(final_status)
+                .header(header::CONTENT_TYPE, "application/json")
+                .body(Body::from(to_anthropic_error(&final_bytes)))
+                .map_err(|e| AppError::new(anyhow::anyhow!("构造错误响应失败: {e}")));
+        }
     }
 
     // 7. 响应转换
@@ -1600,6 +1654,131 @@ models:
 
         assert_eq!(attempts.load(Ordering::SeqCst), 2);
         assert!(String::from_utf8_lossy(&response_body).contains("retry ok"));
+    }
+
+    /// Responses 400 invalid_encrypted_content:剥离 encrypted_content 后重试一次。
+    #[tokio::test]
+    async fn test_openai_responses_retries_after_invalid_encrypted_content() {
+        let attempts = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+        let handler_attempts = Arc::clone(&attempts);
+        let saw_encrypted = Arc::new(std::sync::atomic::AtomicBool::new(false));
+        let saw_trimmed = Arc::new(std::sync::atomic::AtomicBool::new(false));
+        let handler_encrypted = Arc::clone(&saw_encrypted);
+        let handler_trimmed = Arc::clone(&saw_trimmed);
+        let upstream = Router::new().route(
+            "/responses",
+            post(move |body: axum::body::Bytes| {
+                let attempts = Arc::clone(&handler_attempts);
+                let saw_encrypted = Arc::clone(&handler_encrypted);
+                let saw_trimmed = Arc::clone(&handler_trimmed);
+                async move {
+                    let n = attempts.fetch_add(1, Ordering::SeqCst);
+                    let parsed: Value = serde_json::from_slice(&body).unwrap_or(json!({}));
+                    let has_enc = parsed
+                        .get("input")
+                        .and_then(|v| v.as_array())
+                        .map(|items| {
+                            items.iter().any(|item| {
+                                item.get("type").and_then(|t| t.as_str()) == Some("reasoning")
+                                    && item.get("encrypted_content").is_some()
+                            })
+                        })
+                        .unwrap_or(false);
+                    if n == 0 {
+                        saw_encrypted.store(has_enc, Ordering::SeqCst);
+                        (
+                            StatusCode::BAD_REQUEST,
+                            [(header::CONTENT_TYPE, "application/json")],
+                            json!({
+                                "error": {
+                                    "type": "invalid_request_error",
+                                    "code": "invalid_encrypted_content",
+                                    "message": "invalid_encrypted_content"
+                                }
+                            })
+                            .to_string(),
+                        )
+                    } else {
+                        saw_trimmed.store(!has_enc, Ordering::SeqCst);
+                        (
+                            StatusCode::OK,
+                            [(header::CONTENT_TYPE, "application/json")],
+                            json!({
+                                "type": "response.completed",
+                                "response": {
+                                    "id": "resp_trim",
+                                    "model": "gpt-5",
+                                    "output": [{
+                                        "type": "message",
+                                        "content": [{"type": "output_text", "text": "trimmed ok"}]
+                                    }],
+                                    "usage": {"input_tokens": 1, "output_tokens": 1}
+                                }
+                            })
+                            .to_string(),
+                        )
+                    }
+                }
+            }),
+        );
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let upstream_addr = listener.local_addr().unwrap();
+        let server = tokio::spawn(async move {
+            axum::serve(listener, upstream).await.unwrap();
+        });
+
+        let state = mock_state();
+        let provider_yaml = format!(
+            r#"
+name: test-responses-trim
+protocol: openai_responses
+base_url: "http://{}"
+key: sk-test
+proxy_url: "direct"
+models:
+  - name: gpt-5
+    alias: test-responses-trim
+"#,
+            upstream_addr
+        );
+        let provider: ProviderConfig = serde_yaml::from_str(&provider_yaml).unwrap();
+        state.providers.write().await.push(provider);
+        let app = app(state);
+        let request = Request::builder()
+            .uri("/v1/messages")
+            .method("POST")
+            .header("content-type", "application/json")
+            .body(Body::from(
+                serde_json::to_vec(&json!({
+                    "model": "test-responses-trim",
+                    "max_tokens": 64,
+                    "stream": false,
+                    "messages": [
+                        {"role": "assistant", "content": [
+                            {"type": "thinking", "thinking": "t", "signature": "gAAAA-replay"}
+                        ]},
+                        {"role": "user", "content": "hi"}
+                    ]
+                }))
+                .unwrap(),
+            ))
+            .unwrap();
+        let response = app.oneshot(request).await.unwrap();
+        let status = response.status();
+        let response_body = to_bytes(response.into_body(), 1024 * 1024).await.unwrap();
+        server.abort();
+
+        assert_eq!(attempts.load(Ordering::SeqCst), 2);
+        assert!(
+            saw_encrypted.load(Ordering::SeqCst),
+            "首次应带 encrypted_content"
+        );
+        assert!(
+            saw_trimmed.load(Ordering::SeqCst),
+            "重试应已剥离 encrypted_content"
+        );
+        assert_eq!(status, StatusCode::OK);
+        assert!(String::from_utf8_lossy(&response_body).contains("trimmed ok"));
     }
 
     #[tokio::test]

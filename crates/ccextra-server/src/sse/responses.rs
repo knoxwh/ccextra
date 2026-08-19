@@ -27,6 +27,13 @@ use super::SseStreamPin;
 const FALLBACK_MODEL: &str = "claude-opus-4-1-20250805";
 /// 同一 reasoning item 多个 summary part 的分隔符(对齐 codexThinkingSummaryPartSeparator)
 const SUMMARY_PART_SEPARATOR: &str = "\n\n";
+/// Responses reasoning item 携带 Claude redacted_thinking 载荷的前缀
+/// (对齐 ClaudeResponsesRedactedThinkingPrefix)
+///
+/// Responses 无 redacted reasoning 类型，Anthropic 要求 redacted_thinking 必须原样回放，
+/// 故 redacted_thinking.data 骑在 encrypted_content 后带此前缀，回程侧还原。
+/// 该前缀对任何提供商都不是合法签名，外部上游会丢弃而非回放无效值。
+const CLAUDE_RESPONSES_REDACTED_THINKING_PREFIX: &str = "claude-redacted-thinking:";
 
 /// 单个 function_call 流式块(对齐 codexFunctionCallStream)
 ///
@@ -83,6 +90,8 @@ struct ResponsesRelay {
     /// 待收尾的 encrypted_content(signature_delta 用)
     thinking_signature: String,
     thinking_summary_seen: bool,
+    /// 当前 reasoning item 是否为 redacted_thinking(根据 encrypted_content 前缀判定)
+    thinking_is_redacted: bool,
 
     /// function_call 流式状态(对齐 ConvertCodexResponseToClaudeParams)
     function_calls: HashMap<String, usize>,
@@ -119,6 +128,7 @@ impl ResponsesRelay {
             thinking_index: -1,
             thinking_signature: String::new(),
             thinking_summary_seen: false,
+            thinking_is_redacted: false,
             function_calls: HashMap::new(),
             function_call_queue: Vec::new(),
             active_function_call: None,
@@ -194,7 +204,12 @@ impl ResponsesRelay {
                 if self.thinking_open {
                     out.extend(self.thinking_delta(SUMMARY_PART_SEPARATOR));
                 } else {
-                    out.extend(self.start_thinking());
+                    // 根据 thinking_is_redacted 标志打开对应类型的块
+                    if self.thinking_is_redacted {
+                        out.extend(self.start_redacted_thinking());
+                    } else {
+                        out.extend(self.start_thinking());
+                    }
                 }
                 self.thinking_summary_seen = true;
                 out
@@ -223,7 +238,12 @@ impl ResponsesRelay {
                     if self.thinking_open {
                         out.extend(self.thinking_delta(SUMMARY_PART_SEPARATOR));
                     } else {
-                        out.extend(self.start_thinking());
+                        // 根据 thinking_is_redacted 标志打开对应类型的块
+                        if self.thinking_is_redacted {
+                            out.extend(self.start_redacted_thinking());
+                        } else {
+                            out.extend(self.start_thinking());
+                        }
                     }
                     self.thinking_summary_seen = true;
                     return out;
@@ -270,6 +290,10 @@ impl ResponsesRelay {
                             .and_then(|v| v.as_str())
                             .unwrap_or("")
                             .to_string();
+                        // 检测是否 redacted_thinking(根据 encrypted_content 前缀)
+                        self.thinking_is_redacted = self
+                            .thinking_signature
+                            .starts_with(CLAUDE_RESPONSES_REDACTED_THINKING_PREFIX);
                         out
                     }
                     "function_call" | "custom_tool_call" => {
@@ -407,6 +431,25 @@ impl ResponsesRelay {
                 if let Some(sig) = item.get("encrypted_content").and_then(|v| v.as_str()) {
                     if !sig.is_empty() {
                         self.thinking_signature = sig.to_string();
+                        // 检测是否 redacted_thinking(根据 encrypted_content 前缀)
+                        let is_redacted = self
+                            .thinking_signature
+                            .starts_with(CLAUDE_RESPONSES_REDACTED_THINKING_PREFIX);
+
+                        // 如果块已打开且类型不匹配，关闭旧块并用正确类型重开
+                        // (防御性处理：summary delta 先于 output_item 到达的边缘情况)
+                        if self.thinking_open && is_redacted != self.thinking_is_redacted {
+                            out.push(emit::content_block_stop(self.thinking_index));
+                            self.thinking_open = false;
+                            self.thinking_index += 1;
+                            if is_redacted {
+                                out.extend(self.start_redacted_thinking());
+                            } else {
+                                out.extend(self.start_thinking());
+                            }
+                        }
+
+                        self.thinking_is_redacted = is_redacted;
                     }
                 }
                 if self.thinking_summary_seen {
@@ -416,6 +459,7 @@ impl ResponsesRelay {
                 }
                 self.thinking_signature.clear();
                 self.thinking_summary_seen = false;
+                self.thinking_is_redacted = false;
                 out
             }
             "function_call" | "custom_tool_call" => {
@@ -540,18 +584,38 @@ impl ResponsesRelay {
     fn plaintext_reasoning_delta(&mut self, root: &Value) -> Vec<Bytes> {
         let delta = root.get("delta").and_then(|v| v.as_str()).unwrap_or("");
         let mut out = self.stop_text();
-        out.extend(self.start_thinking());
+        // 根据 thinking_is_redacted 标志打开对应类型的块
+        if self.thinking_is_redacted {
+            out.extend(self.start_redacted_thinking());
+        } else {
+            out.extend(self.start_thinking());
+        }
         out.extend(self.thinking_delta(delta));
+        self.thinking_summary_seen = true;
         out
     }
 
     /// 关闭 thinking 块:有 signature 先发 signature_delta(加密内容回放闭环)
+    /// 若 signature 为 redacted_thinking 载荷(带前缀),发 redacted_thinking 块而非 thinking
     fn finalize_thinking(&mut self) -> Vec<Bytes> {
         if !self.thinking_open {
             return Vec::new();
         }
         let mut out = Vec::new();
-        if !self.thinking_signature.is_empty() {
+        // 检测 redacted_thinking 载荷(对齐 responsesRedactedThinkingData)
+        if let Some(data) = self
+            .thinking_signature
+            .strip_prefix(CLAUDE_RESPONSES_REDACTED_THINKING_PREFIX)
+        {
+            if !data.is_empty() {
+                // 发送 redacted_thinking 的 data 字段
+                out.push(emit::content_block_delta_redacted_thinking_data(
+                    self.thinking_index,
+                    data,
+                ));
+            }
+        } else if !self.thinking_signature.is_empty() {
+            // 普通 thinking 签名
             out.push(emit::content_block_delta_signature(
                 self.thinking_index,
                 &self.thinking_signature,
@@ -563,13 +627,35 @@ impl ResponsesRelay {
     }
 
     /// 无 summary 只有 encrypted_content 的 reasoning item:开块即收尾
+    /// 检测 redacted_thinking 载荷,开 redacted_thinking 块而非 thinking 块
     fn finalize_signature_only_thinking(&mut self) -> Vec<Bytes> {
         if self.thinking_signature.is_empty() {
             return Vec::new();
         }
-        let mut out = self.start_thinking();
+        // 检测是否 redacted_thinking
+        let is_redacted = self
+            .thinking_signature
+            .starts_with(CLAUDE_RESPONSES_REDACTED_THINKING_PREFIX);
+        let mut out = if is_redacted {
+            self.start_redacted_thinking()
+        } else {
+            self.start_thinking()
+        };
         out.extend(self.finalize_thinking());
         out
+    }
+
+    /// 开 redacted_thinking 块(对齐 content_block_start redacted_thinking)
+    fn start_redacted_thinking(&mut self) -> Vec<Bytes> {
+        if self.thinking_open {
+            return Vec::new();
+        }
+        self.thinking_index = self.next_block_index;
+        self.next_block_index += 1;
+        self.thinking_open = true;
+        vec![emit::content_block_start_redacted_thinking(
+            self.thinking_index,
+        )]
     }
 
     // ---- function_call 流式状态机 ----
@@ -1885,5 +1971,110 @@ mod tests {
         assert!(s.contains("web_search_tool_result"));
         assert!(s.contains("rust async"));
         assert!(s.contains("https://example.com"));
+    }
+
+    #[test]
+    fn test_redacted_thinking_restores_from_encrypted_content() {
+        // encrypted_content 带前缀 "claude-redacted-thinking:" 应还原为 redacted_thinking 块
+        let mut r = ResponsesRelay::new(None);
+        r.process(&created());
+        r.process(&ev(
+            r#"{"type":"response.output_item.added","item":{"type":"reasoning"}}"#,
+        ));
+        let out = r.process(&ev(
+            r#"{"type":"response.output_item.done","item":{"type":"reasoning","encrypted_content":"claude-redacted-thinking:opaque_data_xyz"}}"#,
+        ));
+        let bufs = out.concat();
+        let s = String::from_utf8_lossy(&bufs);
+        // 应发 redacted_thinking 块，不是 thinking 块
+        assert!(
+            s.contains("\"type\":\"redacted_thinking\""),
+            "应发 redacted_thinking 块,实际: {s}"
+        );
+        assert!(
+            s.contains("redacted_thinking_data"),
+            "应发 redacted_thinking_data delta,实际: {s}"
+        );
+        assert!(s.contains("opaque_data_xyz"), "应包含 data 载荷,实际: {s}");
+        assert!(
+            !s.contains("signature_delta"),
+            "redacted_thinking 不应发 signature_delta,实际: {s}"
+        );
+        assert!(s.contains("content_block_stop"));
+    }
+
+    #[test]
+    fn test_redacted_thinking_with_summary_seen() {
+        // 带 summary 的 redacted_thinking: summary 可见 + 最后发 data
+        let mut r = ResponsesRelay::new(None);
+        r.process(&created());
+        r.process(&ev(
+            r#"{"type":"response.reasoning_summary_text.delta","delta":"thinking process"}"#,
+        ));
+        let out = r.process(&ev(
+            r#"{"type":"response.output_item.done","item":{"type":"reasoning","encrypted_content":"claude-redacted-thinking:data123"}}"#,
+        ));
+        let bufs = out.concat();
+        let s = String::from_utf8_lossy(&bufs);
+        assert!(
+            s.contains("\"type\":\"redacted_thinking\""),
+            "应为 redacted_thinking 块"
+        );
+        assert!(s.contains("redacted_thinking_data"));
+        assert!(s.contains("data123"));
+    }
+
+    #[test]
+    fn test_normal_thinking_signature_not_affected() {
+        // 无前缀的普通 signature 应继续正常处理（不误判为 redacted_thinking）
+        let mut r = ResponsesRelay::new(None);
+        r.process(&created());
+        let out1 = r.process(&ev(
+            r#"{"type":"response.reasoning_summary_text.delta","delta":"思考中"}"#,
+        ));
+        let buf1 = out1.concat();
+        let s1 = String::from_utf8_lossy(&buf1);
+
+        let out2 = r.process(&ev(
+            r#"{"type":"response.output_item.done","item":{"type":"reasoning","encrypted_content":"gAAAAABmNormal_Signature"}}"#,
+        ));
+        let buf2 = out2.concat();
+        let s2 = String::from_utf8_lossy(&buf2);
+
+        let combined = format!("{}{}", s1, s2);
+        assert!(
+            combined.contains("\"type\":\"thinking\""),
+            "普通签名应发 thinking 块,实际: {}",
+            combined
+        );
+        assert!(
+            combined.contains("signature_delta"),
+            "应发 signature_delta,实际: {}",
+            combined
+        );
+        assert!(combined.contains("gAAAAABmNormal_Signature"));
+        assert!(
+            !combined.contains("redacted_thinking"),
+            "不应误判为 redacted_thinking"
+        );
+    }
+
+    #[test]
+    fn test_redacted_thinking_signature_only() {
+        // 无 summary 只有 encrypted_content 的 redacted_thinking
+        let mut r = ResponsesRelay::new(None);
+        r.process(&created());
+        r.process(&ev(
+            r#"{"type":"response.output_item.added","item":{"type":"reasoning","encrypted_content":"claude-redacted-thinking:sig_only"}}"#,
+        ));
+        let out = r.process(&ev(
+            r#"{"type":"response.output_item.done","item":{"type":"reasoning","encrypted_content":"claude-redacted-thinking:sig_only"}}"#,
+        ));
+        let bufs = out.concat();
+        let s = String::from_utf8_lossy(&bufs);
+        assert!(s.contains("\"type\":\"redacted_thinking\""));
+        assert!(s.contains("redacted_thinking_data"));
+        assert!(s.contains("sig_only"));
+        assert!(s.contains("content_block_stop"));
     }
 }

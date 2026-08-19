@@ -51,7 +51,7 @@ pub fn convert_to_openai_chat(body: &mut Value, upstream_model: &str) -> Result<
     }
     openai.insert(
         "stream".into(),
-        body.get("stream").unwrap_or(&json!(true)).clone(),
+        body.get("stream").unwrap_or(&json!(false)).clone(),
     );
 
     // thinking → reasoning_effort(忠实 thinking 映射;顶层 output_config 优先)
@@ -88,10 +88,9 @@ pub fn convert_to_openai_chat(body: &mut Value, upstream_model: &str) -> Result<
         }
     }
 
-    // Messages 逐条转换(先合并连续同角色消息,对齐上游 ClaudeMessageAccumulator)
+    // Messages 逐条转换
     if let Some(message_arr) = body.get("messages").and_then(|v| v.as_array()) {
-        let merged = super::merge_consecutive_messages(message_arr);
-        for msg in &merged {
+        for msg in message_arr {
             let role = msg
                 .get("role")
                 .and_then(|v| v.as_str())
@@ -99,13 +98,10 @@ pub fn convert_to_openai_chat(body: &mut Value, upstream_model: &str) -> Result<
             let content = msg.get("content").cloned().unwrap_or(json!(""));
 
             // messages 内 role=system:提取文本包 <system-reminder> 转 user
-            // (对齐 ClaudeMessageSystemReminderText)
             if role == "system" {
                 if let Some(reminder) = system_reminder_text(&content) {
-                    messages.push(json!({
-                        "role": "user",
-                        "content": [{"type": "text", "text": reminder}]
-                    }));
+                    let converted = convert_message("user", &json!(reminder))?;
+                    messages.extend(converted);
                 }
                 continue;
             }
@@ -188,7 +184,11 @@ pub fn convert_to_openai_chat(body: &mut Value, upstream_model: &str) -> Result<
     // 强制上游在流尾发 usage chunk。kimi/moonshot 等上游未开启时全程无
     // usage,响应 usage 全 0,客户端 ccstatusline 无 context 显示。
     // 仅流式注入:非流请求带 stream_options 部分上游可能拒绝。
-    if body.get("stream").and_then(|v| v.as_bool()).unwrap_or(true) {
+    if body
+        .get("stream")
+        .and_then(|v| v.as_bool())
+        .unwrap_or(false)
+    {
         openai.insert("stream_options".into(), json!({"include_usage": true}));
     }
 
@@ -540,9 +540,8 @@ mod tests {
     }
 
     #[test]
-    fn test_consecutive_assistant_turns_merged() {
-        // Claude Code 把一轮 assistant 拆成 thinking + (text+tool_use) 两条消息,
-        // 转换后应合并为一条 assistant(对齐上游 ClaudeMessageAccumulator)。
+    fn test_consecutive_assistant_turns_not_merged() {
+        // Claude→OpenAI 不 merge(对齐 CPA,只有反向需要 merge)
         let mut body = json!({
             "model": "test",
             "messages": [
@@ -556,12 +555,13 @@ mod tests {
         });
         convert_to_openai_chat(&mut body, "gpt").unwrap();
         let msgs = body["messages"].as_array().unwrap();
-        assert_eq!(msgs.len(), 2);
+        assert_eq!(msgs.len(), 3);
         assert_eq!(msgs[0]["role"], "assistant");
         assert_eq!(msgs[0]["reasoning_content"], "t1");
-        assert_eq!(msgs[0]["content"][0]["text"], "answer");
-        assert_eq!(msgs[0]["tool_calls"][0]["id"], "c1");
-        assert_eq!(msgs[1]["role"], "user");
+        assert_eq!(msgs[1]["role"], "assistant");
+        assert_eq!(msgs[1]["content"][0]["text"], "answer");
+        assert_eq!(msgs[1]["tool_calls"][0]["id"], "c1");
+        assert_eq!(msgs[2]["role"], "user");
     }
 
     #[test]
@@ -963,7 +963,7 @@ mod tests {
 
     #[test]
     fn test_message_system_reminder_to_user() {
-        // messages 内 role=system:提取文本包 <system-reminder> 转 user(一致)
+        // messages 内 role=system:提取文本包 <system-reminder> 转 user(对齐 CPA)
         let mut body = json!({
             "model": "test",
             "messages": [
@@ -976,7 +976,11 @@ mod tests {
         convert_to_openai_chat(&mut body, "gpt").unwrap();
         let msgs = body["messages"].as_array().unwrap();
         assert_eq!(msgs.len(), 2);
+        assert_eq!(msgs[0]["role"], "user");
+        assert_eq!(msgs[0]["content"], json!([{"type": "text", "text": "hi"}]));
         assert_eq!(msgs[1]["role"], "user");
+        // system reminder 也走 convert_message 归一化为数组
+        assert_eq!(msgs[1]["content"][0]["type"], "text");
         assert!(msgs[1]["content"][0]["text"]
             .as_str()
             .unwrap()
@@ -1067,13 +1071,16 @@ mod tests {
             "非流不应注入 stream_options"
         );
 
-        // stream 缺省 = true → 注入
+        // stream 缺省 = false(对齐 Anthropic API 语义)→ 不注入
         let mut body2 = json!({
             "model": "test",
             "messages": [{"role": "user", "content": "hi"}]
         });
         convert_to_openai_chat(&mut body2, "gpt").unwrap();
-        assert_eq!(body2["stream_options"]["include_usage"], true);
+        assert!(
+            body2.get("stream_options").is_none(),
+            "stream 缺省应按非流处理"
+        );
     }
 
     #[test]

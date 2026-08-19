@@ -109,6 +109,18 @@ pub fn content_block_start_thinking(index: i64) -> Bytes {
     )
 }
 
+/// content_block_start 事件(redacted_thinking 块)
+pub fn content_block_start_redacted_thinking(index: i64) -> Bytes {
+    sse(
+        "content_block_start",
+        &json!({
+            "type": "content_block_start",
+            "index": index,
+            "content_block": {"type": "redacted_thinking", "data": ""}
+        }),
+    )
+}
+
 /// content_block_start 事件(tool_use 块)
 pub fn content_block_start_tool_use(index: i64, id: &str, name: &str) -> Bytes {
     sse(
@@ -184,6 +196,18 @@ pub fn content_block_delta_signature(index: i64, signature: &str) -> Bytes {
             "type": "content_block_delta",
             "index": index,
             "delta": {"type": "signature_delta", "signature": signature}
+        }),
+    )
+}
+
+/// content_block_delta 事件(redacted_thinking data,responses 协议专用)
+pub fn content_block_delta_redacted_thinking_data(index: i64, data: &str) -> Bytes {
+    sse(
+        "content_block_delta",
+        &json!({
+            "type": "content_block_delta",
+            "index": index,
+            "delta": {"type": "redacted_thinking_data", "data": data}
         }),
     )
 }

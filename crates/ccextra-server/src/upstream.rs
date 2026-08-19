@@ -56,14 +56,41 @@ fn endpoint_path(protocol: Protocol, is_stream: bool) -> String {
     }
 }
 
+/// Grok CLI 身份头常量(对齐 grok-build xai-grok-sampler client.rs)
+const GROK_TOKEN_AUTH: &str = "xai-grok-cli";
+const GROK_CLIENT_VERSION: &str = "1.0.5";
+const GROK_CLIENT_IDENTIFIER: &str = "grok-shell";
+
+/// Grok CLI User-Agent(对齐 grok-build 默认分支:
+/// grok-shell/{version} ({os}; {arch}),platform 运行时取真实值)
+static GROK_CLI_UA: std::sync::OnceLock<String> = std::sync::OnceLock::new();
+fn grok_cli_ua() -> &'static str {
+    GROK_CLI_UA
+        .get_or_init(|| {
+            format!(
+                "grok-shell/{} ({}; {})",
+                GROK_CLIENT_VERSION,
+                std::env::consts::OS,
+                std::env::consts::ARCH
+            )
+        })
+        .as_str()
+}
+
 /// 模型名是否按 *gpt* 匹配(大小写不敏感,含前缀/中缀/后缀)
 fn is_gpt_model(upstream_model: &str) -> bool {
     upstream_model.to_ascii_lowercase().contains("gpt")
 }
 
+/// 模型名是否按 *grok* 匹配(大小写不敏感)
+fn is_grok_model(upstream_model: &str) -> bool {
+    upstream_model.to_ascii_lowercase().contains("grok")
+}
+
 /// 按协议+模型取 User-Agent(对齐上游期望的客户端标识)
 ///
-/// 仅 responses + *gpt* 用 Codex UA;其余(含 responses 上的 grok 等)
+/// 仅 responses + *gpt* 用 Codex UA;responses + *grok* 用 Grok CLI UA
+/// (对齐 grokbuild-proxy DefaultUserAgent);其余(含 responses 上的其他模型)
 /// 用 claude-cli。部分上游按 UA 分流缓存/特性,reqwest 默认 UA
 /// 会被识别为非官方客户端。
 fn user_agent(protocol: Protocol, upstream_model: &str) -> &'static str {
@@ -74,6 +101,7 @@ fn user_agent(protocol: Protocol, upstream_model: &str) -> &'static str {
         // Antigravity 上游按 UA 识别客户端,非 antigravity UA 直接 404
         Protocol::Antigravity => crate::antigravity::constants::REQUEST_UA,
         Protocol::OpenAiResponses if is_gpt_model(upstream_model) => CODEX_TUI,
+        Protocol::OpenAiResponses if is_grok_model(upstream_model) => grok_cli_ua(),
         _ => CLAUDE_CLI,
     }
 }
@@ -198,13 +226,32 @@ impl UpstreamClient {
             }
         }
 
-        // grok 模型会话路由:x-grok-conv-id 把同一会话路由到同一服务器(缓存亲和)
+        // grok 模型会话路由 + CLI 身份头(对齐 grokbuild-proxy headers.go)
+        // - x-grok-conv-id:同一会话路由到同一服务器(缓存亲和)
+        // - X-XAI-Token-Auth / x-grok-client-version / x-grok-client-identifier /
+        //   x-grok-model-override:Grok Build CLI 身份,网关按此识别合法客户端
+        // 仅 responses 协议补完整身份头(chat 协议的 c-grok 保持原行为)
         if matches!(protocol, Protocol::OpenAiChat | Protocol::OpenAiResponses)
-            && upstream_model.to_ascii_lowercase().contains("grok")
+            && is_grok_model(upstream_model)
         {
+            tracing::debug!(
+                session_id = ?session_id,
+                upstream_model = upstream_model,
+                protocol = ?protocol,
+                "upstream.rs grok 头注入"
+            );
             if let Some(sid) = session_id {
                 if !sid.trim().is_empty() {
                     req = req.header("x-grok-conv-id", sid);
+                    tracing::debug!(sid = sid, "发送 x-grok-conv-id");
+                }
+            }
+            if matches!(protocol, Protocol::OpenAiResponses) {
+                req = req.header("X-XAI-Token-Auth", GROK_TOKEN_AUTH);
+                req = req.header("x-grok-client-version", GROK_CLIENT_VERSION);
+                req = req.header("x-grok-client-identifier", GROK_CLIENT_IDENTIFIER);
+                if !upstream_model.is_empty() {
+                    req = req.header("x-grok-model-override", upstream_model);
                 }
             }
         }
@@ -273,14 +320,22 @@ mod tests {
         );
         assert_eq!(
             user_agent(Protocol::OpenAiResponses, "grok-4.6"),
-            CLAUDE_CLI
+            grok_cli_ua()
         );
+        // UA 格式: grok-shell/{version} ({os}; {arch}),platform 运行时取真实值
+        let ua = grok_cli_ua();
+        assert!(ua.starts_with("grok-shell/1.0.5 ("));
+        assert!(ua.contains(std::env::consts::OS));
+        assert!(ua.contains(std::env::consts::ARCH));
         assert_eq!(user_agent(Protocol::Claude, "claude-opus-5"), CLAUDE_CLI);
         assert!(is_gpt_model("gpt-5.6-terra"));
         assert!(is_gpt_model("ck-gpt-5.6"));
         assert!(is_gpt_model("openai/GPT-5"));
         assert!(!is_gpt_model("grok-4.6"));
         assert!(!is_gpt_model("claude-opus-5"));
+        assert!(is_grok_model("grok-4.6"));
+        assert!(is_grok_model("Grok-4.6"));
+        assert!(!is_grok_model("gpt-5.6"));
     }
 
     #[test]

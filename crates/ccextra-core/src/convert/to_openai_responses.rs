@@ -49,37 +49,117 @@ fn is_gpt_upstream(upstream_model: &str) -> bool {
     upstream_model.to_ascii_lowercase().starts_with("gpt")
 }
 
-/// signature 是否 GPT 兼容(对齐 CompatibleSignatureForProvider(GPT, sig) 的轻量版)
-///
-/// 参考实现 用完整 Fernet 容器校验;这里按 OpenAI reasoning 签名的确定前缀
-/// ("gAAAA" 或 base64 首字符 'g')判定,足以区分 Claude/Gemini 签名(以 'C'/'E'/'R'
-/// 开头)与 GPT 签名。Grok 特例按模型名放行(对齐 codexClaudeTargetAcceptsGrokSignature)。
-fn signature_compatible_gpt(signature: &str, upstream_model: &str) -> bool {
+/// 轻量签名提供方(对齐 CPA DetectSignatureProvider 的首字节预过滤,
+/// 不做 Fernet/CAIS/protobuf 完整校验)。Grok 无信封,Detect 永不返回 grok。
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum SignatureProvider {
+    Unknown,
+    Claude,
+    Gemini,
+    Gpt,
+}
+
+/// 按首字节区分 GPT/Claude/Gemini(对齐 CPA selfDescribingSignatureFirstChars = "CERg")。
+/// 'g' ← GPT Fernet 0x80;'C'/'R' ← Claude CAIS/双层;'E' ← Gemini/Claude 单层(轻量归 Gemini)。
+fn detect_signature_provider(raw: &str) -> SignatureProvider {
+    let sig = raw.trim();
+    if sig.is_empty() {
+        return SignatureProvider::Unknown;
+    }
+    match sig.as_bytes()[0] {
+        b'g' => SignatureProvider::Gpt,
+        b'C' | b'R' => SignatureProvider::Claude,
+        b'E' => SignatureProvider::Gemini,
+        _ => SignatureProvider::Unknown,
+    }
+}
+
+/// 目标不匹配则不可回放(对齐 DecideSignatureCompatibility)。
+/// GPT 目标只留 GPT 信封;grok 目标丢 CERg 外来信封,opaque 放行。
+fn signature_compatible_for_target(signature: &str, upstream_model: &str) -> bool {
     let sig = signature.trim();
     if sig.is_empty() {
         return false;
     }
-    let first = sig.as_bytes()[0];
-    // GPT Fernet reasoning 首字节 0x80 → base64 首字符 'g'(一致 selfDescribingSignatureFirstChars 判定)
-    let looks_gpt = first == b'g' || sig.starts_with("gAAAA");
-    if looks_gpt {
-        return true;
+    let detected = detect_signature_provider(sig);
+    if upstream_model.to_ascii_lowercase().contains("grok") {
+        return detected == SignatureProvider::Unknown;
     }
-    // Grok encrypted_content 无信封,参考实现 对 grok 目标单独放行
-    upstream_model.to_ascii_lowercase().contains("grok")
+    detected == SignatureProvider::Gpt
 }
 
-/// Claude thinking signature → 可回放给 GPT 上游的 reasoning.encrypted_content
+/// thinking signature → 可回放给目标上游的 reasoning.encrypted_content
 fn gpt_compatible_signature(signature: Option<&str>, upstream_model: &str) -> Option<String> {
     let sig = signature.unwrap_or("").trim();
     if sig.is_empty() {
         return None;
     }
-    if signature_compatible_gpt(sig, upstream_model) {
+    if signature_compatible_for_target(sig, upstream_model) {
         Some(sig.to_string())
     } else {
         None
     }
+}
+
+/// 上游 400 `invalid_encrypted_content` / thinking signature invalid 时,
+/// 剥离 Responses `input[]` reasoning 项的 `encrypted_content` 再重试。
+/// 对齐 CPA sanitizeOpenAIResponsesReasoningEncryptedContent 的剥离动作
+/// (重试路径全剥,不做形状校验)。剥后无 content/summary 的空项整项丢掉。
+/// `store` 非 true 时顺带丢掉孤儿 `id`(防 store=false 的 lookup 400)。
+pub fn trim_encrypted_reasoning_items(body: &mut Value) -> bool {
+    let store_true = body.get("store").and_then(|v| v.as_bool()) == Some(true);
+    let Some(input) = body.get_mut("input").and_then(|v| v.as_array_mut()) else {
+        return false;
+    };
+    let mut changed = false;
+    let mut kept: Vec<Value> = Vec::with_capacity(input.len());
+    for mut item in input.drain(..) {
+        if item.get("type").and_then(|v| v.as_str()) != Some("reasoning") {
+            kept.push(item);
+            continue;
+        }
+        if item.get("encrypted_content").is_some() {
+            if let Some(obj) = item.as_object_mut() {
+                obj.remove("encrypted_content");
+                if !store_true {
+                    obj.remove("id");
+                }
+            }
+            changed = true;
+        }
+        if reasoning_item_empty(&item) {
+            changed = true;
+            continue;
+        }
+        kept.push(item);
+    }
+    *input = kept;
+    changed
+}
+
+/// 上游错误 body 是否 thinking 签名无效。
+/// Codex: `invalid_encrypted_content` / `invalid signature in thinking block`
+/// (CPA thinking_signature_invalid)。xAI/grok: `Could not decrypt`。
+pub fn is_thinking_signature_invalid(body: &[u8]) -> bool {
+    let lower = String::from_utf8_lossy(body).to_ascii_lowercase();
+    lower.contains("invalid_encrypted_content")
+        || lower.contains("invalid signature in thinking block")
+        || lower.contains("could not decrypt")
+}
+
+fn reasoning_item_empty(item: &Value) -> bool {
+    let content_empty = match item.get("content") {
+        None | Some(Value::Null) => true,
+        Some(Value::String(s)) => s.is_empty(),
+        Some(Value::Array(a)) => a.is_empty(),
+        Some(_) => false,
+    };
+    let summary_empty = match item.get("summary") {
+        None | Some(Value::Null) => true,
+        Some(Value::Array(a)) => a.is_empty(),
+        Some(_) => false,
+    };
+    content_empty && summary_empty && item.get("encrypted_content").is_none()
 }
 
 /// tool_result content → responses output 数组或字符串(对齐 tool_result 分支)
@@ -329,12 +409,20 @@ pub fn convert_to_openai_responses(
     // --- messages → input[] ---
     // custom 工具调用的 call_id 集合(tool_result 需转 custom_tool_call_output)
     let mut custom_call_ids: HashSet<String> = HashSet::new();
-    // 先合并连续同角色消息,对齐上游 ClaudeMessageAccumulator
-    let merged_messages = body
-        .get("messages")
-        .and_then(|v| v.as_array())
-        .map(|msgs| super::merge_consecutive_messages(msgs));
-    if let Some(messages) = merged_messages.as_deref() {
+    // system role 的 reminder 消息预转 user(对齐 ClaudeMessageSystemReminderText)
+    let messages_array = body.get("messages").and_then(|v| v.as_array()).map(|msgs| {
+        let mut msgs: Vec<Value> = msgs.clone();
+        for m in &mut msgs {
+            if m.get("role").and_then(|v| v.as_str()) == Some("system") {
+                if let Some(text) = claude_system_reminder_text(m.get("content")) {
+                    m["role"] = json!("user");
+                    m["content"] = json!(text);
+                }
+            }
+        }
+        msgs
+    });
+    if let Some(messages) = messages_array.as_deref() {
         for msg in messages {
             let role = msg.get("role").and_then(|v| v.as_str()).unwrap_or("user");
 
@@ -344,7 +432,7 @@ pub fn convert_to_openai_responses(
                     openai["input"].as_array_mut().unwrap().push(json!({
                         "type": "message",
                         "role": "user",
-                        "content": [{"type": "input_text", "text": text}]
+                        "content": text
                     }));
                 }
                 continue;
@@ -403,10 +491,9 @@ pub fn convert_to_openai_responses(
                         }
                     }
                     "thinking" => {
-                        // 对齐 CLIProxyAPI 32dfdaeb 策略(同 chat 路径):无签名 thinking
-                        // 回放为明文 reasoning —— 响应侧仅当块带 encrypted_content 时
-                        // 才签名(sse/responses.rs),无加密的链内历史必然无签名;
-                        // 有签名仍须 GPT 兼容,不兼容丢弃(防跨提供方脏签名)
+                        // 无签名 thinking 回放为明文 reasoning。有签名须目标兼容:
+                        // GPT 只留 'g' 信封;grok 丢 CERg 外来信封、opaque 放行
+                        // (对齐 CPA DetectSignatureProvider 轻量首字节 + grok target-only)。
                         if role == "assistant" {
                             let sig = part.get("signature").and_then(|v| v.as_str());
                             if matches!(sig, Some(s) if !s.trim().is_empty()) {
@@ -414,7 +501,6 @@ pub fn convert_to_openai_responses(
                                     flush_message(&mut content_items, &mut out_items);
                                     out_items.push(json!({
                                         "type": "reasoning",
-                                        "summary": [],
                                         "content": null,
                                         "encrypted_content": good
                                     }));
@@ -424,12 +510,17 @@ pub fn convert_to_openai_responses(
                                     flush_message(&mut content_items, &mut out_items);
                                     out_items.push(json!({
                                         "type": "reasoning",
-                                        "summary": [],
                                         "content": t
                                     }));
                                 }
                             }
                         }
+                    }
+                    "redacted_thinking" => {
+                        // redacted_thinking 块不回放(对齐 grok-build parse-only 丢弃,
+                        // xai-grok-sampler/src/stream/messages.rs:288)。CPA 虽打包成
+                        // "claude-redacted-thinking:" 前缀,但有签名兼容性检查层剥离不兼容的;
+                        // ccextra 无该层,且 grok-build 官方参考实现也不回放,故跳过。
                     }
                     "image" => {
                         if let Some(url) = image_to_data_url(part) {
@@ -619,7 +710,12 @@ pub fn convert_to_openai_responses(
     // 保留入站 reasoning.effort,钳制到模型支持级别(对齐 codex compact.rs:704 保留 turn_context.reasoning_effort)
     let effort = crate::thinking::resolve_effort_from_body(body).unwrap_or("medium");
     let effort = crate::thinking::clamp_effort(effort, upstream_model);
-    openai["reasoning"] = json!({"effort": effort});
+    // grok 模型对齐 grok-build:reasoning.summary=concise(其余模型不设)
+    openai["reasoning"] = if upstream_model.to_ascii_lowercase().contains("grok") {
+        json!({"effort": effort, "summary": "concise"})
+    } else {
+        json!({"effort": effort})
+    };
 
     // --- service_tier:speed=fast → priority(对齐 normalizeCodexServiceTier) ---
     if body.get("speed").and_then(|v| v.as_str()) == Some("fast") {
@@ -628,7 +724,7 @@ pub fn convert_to_openai_responses(
 
     // --- codex 固定参数(一致) ---
     // stream 保留入站值(对齐 to_openai_chat)
-    openai["stream"] = body.get("stream").unwrap_or(&json!(true)).clone();
+    openai["stream"] = body.get("stream").unwrap_or(&json!(false)).clone();
     openai["store"] = json!(false);
     openai["include"] = json!(["reasoning.encrypted_content"]);
 
@@ -1066,7 +1162,7 @@ mod tests {
     #[test]
     fn test_consecutive_assistant_turns_merged() {
         // 连续 assistant 消息(thinking + text/tool)合并为一条输入序列,
-        // 保序:message(output_text) → function_call。
+        // 保序:reasoning → message(output_text) → function_call。
         let mut body = json!({
             "model": "test",
             "messages": [
@@ -1080,8 +1176,6 @@ mod tests {
         convert_to_openai_responses(&mut body, "test-model").unwrap();
         let input = body["input"].as_array().unwrap();
         assert_eq!(input.len(), 3);
-        // 无签名 thinking 回放为明文 reasoning item(对齐 chat 路径),保序在
-        // message 之前 —— 同链路历史由本转换器产生,必无签名
         assert_eq!(input[0]["type"], "reasoning");
         assert_eq!(input[0]["content"], "t1");
         assert_eq!(input[1]["type"], "message");
@@ -1114,7 +1208,8 @@ mod tests {
     }
 
     #[test]
-    fn test_thinking_grok_model_passes_any_signature() {
+    fn test_thinking_grok_model_drops_foreign_envelope() {
+        // grok 目标:Claude/GPT/Gemini 信封剥离,opaque 才回放
         let mut body = json!({
             "model": "test",
             "messages": [
@@ -1124,8 +1219,113 @@ mod tests {
             ]
         });
         convert_to_openai_responses(&mut body, "grok-3").unwrap();
+        assert!(body["input"].as_array().unwrap().is_empty());
+    }
+
+    #[test]
+    fn test_thinking_grok_model_drops_gpt_envelope() {
+        let mut body = json!({
+            "model": "test",
+            "messages": [
+                {"role": "assistant", "content": [
+                    {"type": "thinking", "thinking": "t", "signature": "gAAAA-from-gpt"}
+                ]}
+            ]
+        });
+        convert_to_openai_responses(&mut body, "grok-3").unwrap();
+        assert!(body["input"].as_array().unwrap().is_empty());
+    }
+
+    #[test]
+    fn test_thinking_grok_model_replays_opaque() {
+        let mut body = json!({
+            "model": "test",
+            "messages": [
+                {"role": "assistant", "content": [
+                    {"type": "thinking", "thinking": "t", "signature": "xAI-opaque-blob"}
+                ]}
+            ]
+        });
+        convert_to_openai_responses(&mut body, "grok-3").unwrap();
         assert_eq!(body["input"][0]["type"], "reasoning");
-        assert_eq!(body["input"][0]["encrypted_content"], "C4x2 opaque");
+        assert_eq!(body["input"][0]["encrypted_content"], "xAI-opaque-blob");
+    }
+
+    #[test]
+    fn test_detect_signature_provider_first_byte() {
+        assert_eq!(
+            detect_signature_provider("gAAAA..."),
+            SignatureProvider::Gpt
+        );
+        assert_eq!(
+            detect_signature_provider("Cais..."),
+            SignatureProvider::Claude
+        );
+        assert_eq!(
+            detect_signature_provider("Rlayer..."),
+            SignatureProvider::Claude
+        );
+        assert_eq!(
+            detect_signature_provider("Egemini..."),
+            SignatureProvider::Gemini
+        );
+        assert_eq!(
+            detect_signature_provider("opaque-blob"),
+            SignatureProvider::Unknown
+        );
+        assert_eq!(detect_signature_provider(""), SignatureProvider::Unknown);
+        assert_eq!(detect_signature_provider("  "), SignatureProvider::Unknown);
+    }
+
+    #[test]
+    fn test_trim_encrypted_reasoning_items() {
+        let mut body = json!({
+            "store": false,
+            "input": [
+                {"type": "reasoning", "id": "rs_1", "encrypted_content": "gAAAA-bad", "content": null},
+                {"type": "message", "role": "user", "content": [{"type": "input_text", "text": "hi"}]},
+                {"type": "reasoning", "encrypted_content": "gAAAA-keep-text", "content": "think"}
+            ]
+        });
+        assert!(trim_encrypted_reasoning_items(&mut body));
+        let input = body["input"].as_array().unwrap();
+        assert_eq!(input.len(), 2);
+        assert_eq!(input[0]["type"], "message");
+        assert_eq!(input[1]["type"], "reasoning");
+        assert_eq!(input[1]["content"], "think");
+        assert!(input[1].get("encrypted_content").is_none());
+        assert!(!trim_encrypted_reasoning_items(&mut body));
+    }
+
+    #[test]
+    fn test_is_thinking_signature_invalid() {
+        assert!(is_thinking_signature_invalid(
+            br#"{"error":{"code":"invalid_encrypted_content","message":"bad"}}"#
+        ));
+        assert!(is_thinking_signature_invalid(
+            br#"{"error":{"message":"Invalid signature in thinking block"}}"#
+        ));
+        assert!(is_thinking_signature_invalid(
+            br#"{"error":{"message":"Could not decrypt"}}"#
+        ));
+        assert!(!is_thinking_signature_invalid(
+            br#"{"error":{"message":"context_length_exceeded"}}"#
+        ));
+    }
+
+    #[test]
+    fn test_redacted_thinking_grok_model_skipped() {
+        // grok 不回放 redacted_thinking(对齐 grok-build parse-only 丢弃)
+        let mut body = json!({
+            "model": "test",
+            "messages": [
+                {"role": "assistant", "content": [
+                    {"type": "redacted_thinking", "data": "opaque_payload_xyz"}
+                ]}
+            ]
+        });
+        convert_to_openai_responses(&mut body, "grok-3").unwrap();
+        assert!(body["input"].as_array().unwrap().is_empty());
     }
 
     #[test]
@@ -1207,8 +1407,8 @@ mod tests {
     fn test_codex_fixed_fields() {
         let mut body = json!({"model": "test", "messages": []});
         convert_to_openai_responses(&mut body, "test-model").unwrap();
-        // 无 stream 字段默认流式(与历史行为一致)
-        assert_eq!(body["stream"], true);
+        // 无 stream 字段默认非流(对齐 Anthropic API 语义)
+        assert_eq!(body["stream"], false);
         assert_eq!(body["store"], false);
         assert_eq!(body["include"][0], "reasoning.encrypted_content");
         assert_eq!(body["parallel_tool_calls"], true);
@@ -1418,5 +1618,53 @@ mod tests {
         assert_eq!(body["input"][0]["type"], "message");
         assert_eq!(body["input"][0]["content"][0]["text"], "let me check");
         assert_eq!(body["input"][1]["type"], "function_call");
+    }
+
+    #[test]
+    fn test_redacted_thinking_non_grok_skipped() {
+        // 非 grok 同样不回放 redacted_thinking(对齐 grok-build parse-only 丢弃)
+        let mut body = json!({
+            "model": "test",
+            "messages": [
+                {"role": "assistant", "content": [
+                    {"type": "redacted_thinking", "data": "opaque_payload_xyz"}
+                ]}
+            ]
+        });
+        convert_to_openai_responses(&mut body, "gpt-5").unwrap();
+        assert!(body["input"].as_array().unwrap().is_empty());
+    }
+
+    #[test]
+    fn test_redacted_thinking_empty_data_skipped() {
+        // redacted_thinking 块跳过后,后续 text 块仍正常处理为 message
+        let mut body = json!({
+            "model": "test",
+            "messages": [
+                {"role": "assistant", "content": [
+                    {"type": "redacted_thinking", "data": ""},
+                    {"type": "text", "text": "result"}
+                ]}
+            ]
+        });
+        convert_to_openai_responses(&mut body, "gpt-5").unwrap();
+        assert_eq!(body["input"].as_array().unwrap().len(), 1);
+        assert_eq!(body["input"][0]["type"], "message");
+        assert_eq!(body["input"][0]["content"][0]["text"], "result");
+    }
+
+    #[test]
+    fn test_redacted_thinking_user_role_ignored() {
+        // user 角色的 redacted_thinking 块应被忽略（只处理 assistant）
+        let mut body = json!({
+            "model": "test",
+            "messages": [
+                {"role": "user", "content": [
+                    {"type": "redacted_thinking", "data": "should_ignore"}
+                ]}
+            ]
+        });
+        convert_to_openai_responses(&mut body, "gpt-5").unwrap();
+        assert_eq!(body["input"].as_array().unwrap().len(), 0);
     }
 }

@@ -24,10 +24,18 @@ pub fn responses_to_anthropic(
     tool_names: Option<&HashMap<String, String>>,
 ) -> Option<Value> {
     let ty = body.get("type").and_then(|v| v.as_str()).unwrap_or("");
-    if ty != "response.completed" && ty != "response.incomplete" {
+    // SSE 完成信封 {"type":...,"response":{...}} 或官方 REST 顶层 Response
+    // (object==response);错误 body 无 response,维持 None 不误转
+    let is_wrapper = ty == "response.completed" || ty == "response.incomplete";
+    let is_rest = body.get("object").and_then(|v| v.as_str()) == Some("response");
+    if !is_wrapper && !is_rest {
         return None;
     }
-    let response = body.get("response")?;
+    let response = if is_wrapper {
+        body.get("response")
+    } else {
+        Some(body)
+    }?;
 
     let mut content: Vec<Value> = Vec::new();
     let mut has_tool_use = false;
@@ -368,6 +376,27 @@ fn push_text(out: &mut String, s: &str) {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn test_responses_nonstream_rest_top_level() {
+        // 官方 REST 非流响应:顶层 object=response(无包裹信封)
+        let body = json!({
+            "id": "resp_9",
+            "object": "response",
+            "status": "completed",
+            "model": "gpt-5.6-terra",
+            "output": [{
+                "type": "message",
+                "content": [{"type": "output_text", "text": "rest hi"}]
+            }],
+            "usage": {"input_tokens": 50, "output_tokens": 3}
+        });
+        let out = responses_to_anthropic(&body, None).unwrap();
+        assert_eq!(out["type"], "message");
+        assert_eq!(out["content"][0]["text"], "rest hi");
+        assert_eq!(out["stop_reason"], "end_turn");
+        assert_eq!(out["usage"]["output_tokens"], 3);
+    }
 
     #[test]
     fn test_responses_nonstream_text() {
