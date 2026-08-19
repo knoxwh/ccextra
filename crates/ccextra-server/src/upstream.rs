@@ -83,7 +83,7 @@ fn is_gpt_model(upstream_model: &str) -> bool {
 }
 
 /// 模型名是否按 *grok* 匹配(大小写不敏感)
-fn is_grok_model(upstream_model: &str) -> bool {
+pub(crate) fn is_grok_model(upstream_model: &str) -> bool {
     upstream_model.to_ascii_lowercase().contains("grok")
 }
 

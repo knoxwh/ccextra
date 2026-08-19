@@ -15,6 +15,7 @@ pub mod gemini_response;
 pub mod gemini_schema;
 pub mod message_convert;
 pub mod passthrough;
+pub mod reasoning_replay;
 pub mod shorten;
 pub mod to_openai_chat;
 pub mod to_openai_responses;
@@ -33,6 +34,7 @@ pub use gemini_schema::{
     clean_nested_schema_for_antigravity,
 };
 pub use passthrough::convert_passthrough;
+pub use reasoning_replay::{extract_replay_items, filter_replay_items, insert_replay_items};
 pub use shorten::build_reverse_map;
 pub use shorten::build_short_name_map;
 pub use to_openai_chat::convert_to_openai_chat;

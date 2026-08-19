@@ -162,6 +162,10 @@ async fn main() -> Result<()> {
         })),
         reload,
         drift: DriftState::new(1000),
+        replay_cache: ccextra_server::sse::replay_cache::ReplayCache::new(
+            std::time::Duration::from_secs(3600),
+            1024,
+        ),
     };
 
     // 启动 HTTP 服务

@@ -11,6 +11,7 @@ pub mod emit;
 pub mod gemini;
 pub mod non_stream;
 pub mod parser;
+pub mod replay_cache;
 pub mod responses;
 
 use bytes::Bytes;

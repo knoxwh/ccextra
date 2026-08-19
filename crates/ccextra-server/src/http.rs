@@ -50,8 +50,9 @@ use std::sync::{Arc, Mutex as StdMutex, OnceLock};
 use tokio::sync::RwLock;
 
 use crate::sse::parser::{SseEvent, SseParser};
+use crate::sse::replay_cache::StreamReplayExtractor;
 use crate::sse::SseStreamPin;
-use crate::upstream::UpstreamClient;
+use crate::upstream::{is_grok_model, UpstreamClient};
 
 /// 配置重载闭包类型
 pub type ReloadFn =
@@ -89,6 +90,9 @@ pub struct AppState {
     pub reload: ReloadFn,
     /// drift 观测状态(会话 → 上次结构哈希;按 openai/anthropic handler 分桶)
     pub drift: DriftState,
+    /// reasoning replay 缓存(会话 → 上一轮 replay 项;responses+grok 用,
+    /// 对齐 CPA xai reasoning replay;server 层持有,core 无 IO)
+    pub replay_cache: crate::sse::replay_cache::ReplayCache,
 }
 
 #[derive(Clone, Debug, serde::Deserialize)]
@@ -523,6 +527,19 @@ async fn handle_messages(
             if !rev.is_empty() {
                 tool_names = Some(Arc::new(rev));
             }
+            // reasoning replay 注入(对齐 CPA applyXAIReasoningReplayCacheRequired,
+            // 仅 grok 模型:responses 的 reasoning 是服务器端状态,store=false 时
+            // 上游不保留,须回放上一轮 encrypted_content,否则模型丢失决策记忆
+            // 重复发相同工具调用)。缓存 key = "{model}:{session}"(对齐
+            // xaiReasoningReplayCacheKey 的 model+session 连续性边界)。
+            if is_grok_model(&route.upstream_model) {
+                if let Some(sess) = cc_session.as_deref() {
+                    let key = format!("{}:{}", route.upstream_model, sess);
+                    if state.replay_cache.apply_to_body(&key, &mut body_json) {
+                        tracing::debug!(session = %sess, "reasoning replay 已注入");
+                    }
+                }
+            }
             if normalize_enabled {
                 normalize_target_post(&mut body_json, TargetShape::OpenAiResponses);
                 observe_drift_for(
@@ -652,6 +669,18 @@ async fn handle_messages(
     } else {
         (None, None)
     };
+    // reasoning replay 提取条件(responses+grok+有会话身份;与注入点同源,
+    // key 同为 "{model}:{session}")
+    let replay_scope = if is_grok && matches!(route.protocol, Protocol::OpenAiResponses) {
+        session_id.map(|s| {
+            (
+                state.replay_cache.clone(),
+                format!("{}:{}", route.upstream_model, s),
+            )
+        })
+    } else {
+        None
+    };
     tracing::debug!(
         session_id = ?session_id,
         thread_id = ?thread_id,
@@ -738,6 +767,7 @@ async fn handle_messages(
                 tool_names.clone(),
                 meta_base,
                 initial_meta_written,
+                replay_scope.clone(),
             );
             let first = out.next().await;
             let retry = match &first {
@@ -801,6 +831,12 @@ async fn handle_messages(
                 protocol = ?route.protocol,
                 "invalid_encrypted_content,剥离 reasoning 后重试一次"
             );
+            // 缓存的 replay 项含同一无效 encrypted_content,一并清掉
+            // (对齐 clearCodexReasoningReplayOnInvalidSignature:
+            // 签名被上游拒绝后不得下轮再注入)
+            if let Some((cache, key)) = replay_scope.as_ref() {
+                cache.invalidate(key);
+            }
             let retry = upstream_client
                 .request(
                     &upstream_base_urls[0],
@@ -875,6 +911,7 @@ async fn handle_messages(
                 tool_names,
                 meta_base,
                 initial_meta_written,
+                replay_scope,
             )
         };
         Ok(Response::builder()
@@ -902,6 +939,17 @@ async fn handle_messages(
             write_upstream_meta(&meta);
         }
         let body_bytes = upstream.body.bytes().await?;
+        // 非流 responses+grok:REST 顶层 Response(object=response)同样提取
+        // replay 项(对齐 CPA 对 completed data 的缓存路径)
+        if let Some((cache, key)) = replay_scope.as_ref() {
+            if let Ok(v) = serde_json::from_slice::<Value>(&body_bytes) {
+                if v.get("object").and_then(|o| o.as_str()) == Some("response") {
+                    // 包一层 completed 形状复用提取逻辑
+                    let wrapped = json!({"response": v});
+                    cache.store_from_completed(key, &wrapped);
+                }
+            }
+        }
         let converted = match serde_json::from_slice::<Value>(&body_bytes) {
             Ok(v) => match route.protocol {
                 Protocol::Claude => None,
@@ -1198,6 +1246,8 @@ fn upstream_meta_base(
 }
 
 /// 包裹转换流并维护可选响应诊断。首帧门控会先轮询该流，故诊断也必须在此处接入。
+/// `replay_scope`:Some(session_key) 时从流中提取 response.completed 缓存
+/// reasoning replay 项(对齐 CPA cacheXAIReasoningReplayFromCompleted)。
 fn relay_stream_with_meta<S>(
     protocol: Protocol,
     stream: S,
@@ -1205,12 +1255,19 @@ fn relay_stream_with_meta<S>(
     tool_names: Option<Arc<HashMap<String, String>>>,
     meta_base: Option<Value>,
     initial_meta_written: bool,
+    replay_scope: Option<(crate::sse::replay_cache::ReplayCache, String)>,
 ) -> SseStreamPin
 where
     S: futures::Stream<Item = Result<Bytes, reqwest::Error>> + Send + 'static,
 {
     let Some(meta) = meta_base else {
-        return crate::sse::relay(protocol, stream, estimated_input_tokens, tool_names);
+        return relay_with_replay_tap(
+            protocol,
+            stream,
+            estimated_input_tokens,
+            tool_names,
+            replay_scope,
+        );
     };
     let shared = Arc::new(StdMutex::new(meta));
     let written = Arc::new(AtomicBool::new(initial_meta_written));
@@ -1219,6 +1276,9 @@ where
         let scan = Arc::clone(&scanner);
         let shared_for_scan = Arc::clone(&shared);
         let written_for_scan = Arc::clone(&written);
+        let replay_for_scan = replay_scope
+            .clone()
+            .map(|(cache, key)| StdMutex::new(StreamReplayExtractor::new(cache, key)));
         let tapped = stream.inspect(move |result| {
             if let Ok(bytes) = result {
                 if let Some(id) = scan.lock().unwrap().push(bytes) {
@@ -1226,6 +1286,9 @@ where
                     meta["response_id"] = json!(id);
                     let ok = write_upstream_meta(&meta);
                     written_for_scan.store(ok, Ordering::Release);
+                }
+                if let Some(extractor) = replay_for_scan.as_ref() {
+                    extractor.lock().unwrap().push(bytes);
                 }
             }
         });
@@ -1243,13 +1306,44 @@ where
             }
         })
     } else {
-        let relayed = crate::sse::relay(protocol, stream, estimated_input_tokens, tool_names);
+        let relayed = relay_with_replay_tap(
+            protocol,
+            stream,
+            estimated_input_tokens,
+            tool_names,
+            replay_scope,
+        );
         sse_meta_finalizer(relayed, move || {
             if !written.load(Ordering::Acquire) {
                 let ok = write_upstream_meta(&shared.lock().unwrap());
                 written.store(ok, Ordering::Release);
             }
         })
+    }
+}
+
+/// 无诊断 meta 时的直通 relay:仅当带 replay scope 时加提取 tap。
+fn relay_with_replay_tap<S>(
+    protocol: Protocol,
+    stream: S,
+    estimated_input_tokens: Option<usize>,
+    tool_names: Option<Arc<HashMap<String, String>>>,
+    replay_scope: Option<(crate::sse::replay_cache::ReplayCache, String)>,
+) -> SseStreamPin
+where
+    S: futures::Stream<Item = Result<Bytes, reqwest::Error>> + Send + 'static,
+{
+    match replay_scope {
+        Some((cache, key)) => {
+            let mut extractor = StreamReplayExtractor::new(cache, key);
+            let tapped = stream.inspect(move |result| {
+                if let Ok(bytes) = result {
+                    extractor.push(bytes);
+                }
+            });
+            crate::sse::relay(protocol, tapped, estimated_input_tokens, tool_names)
+        }
+        None => crate::sse::relay(protocol, stream, estimated_input_tokens, tool_names),
     }
 }
 
@@ -1581,6 +1675,10 @@ data: {"type":"response.created","response":{"id":"resp_eof"}}"#
             })),
             reload: reload_returning_secret(None),
             drift: DriftState::new(1000),
+            replay_cache: crate::sse::replay_cache::ReplayCache::new(
+                std::time::Duration::from_secs(3600),
+                1024,
+            ),
         }
     }
 

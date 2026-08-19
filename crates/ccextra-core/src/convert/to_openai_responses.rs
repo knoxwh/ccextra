@@ -706,6 +706,10 @@ pub fn convert_to_openai_responses(
         .unwrap_or(false);
     openai["parallel_tool_calls"] = json!(!disable_parallel);
 
+    // --- 采样参数不透传(对齐 CPA preserveXAIResponsesOutputControls:
+    // claude 入站走 default 分支不 preserve。CC 的 max_tokens 常为 64000,
+    // 透传 max_output_tokens 超 grok 上限会 400 触发客户端重试死循环) ---
+
     // --- reasoning.effort(对齐 thinking 分支,默认 medium) ---
     // 保留入站 reasoning.effort,钳制到模型支持级别(对齐 codex compact.rs:704 保留 turn_context.reasoning_effort)
     let effort = crate::thinking::resolve_effort_from_body(body).unwrap_or("medium");
@@ -727,6 +731,26 @@ pub fn convert_to_openai_responses(
     openai["stream"] = body.get("stream").unwrap_or(&json!(false)).clone();
     openai["store"] = json!(false);
     openai["include"] = json!(["reasoning.encrypted_content"]);
+
+    // --- stop 删除(对齐 CPA sanitizeXAIResponsesBody:responses 不支持 stop) ---
+    if let Some(obj) = openai.as_object_mut() {
+        obj.remove("stop");
+    }
+
+    // --- 无存活工具时三删(对齐 CPA normalizeXAIToolChoiceForTools) ---
+    // tools 缺失或空数组时,tools/tool_choice/parallel_tool_calls 全部不发,
+    // 否则 xAI 对无 tools 的 tool_choice 报 400
+    let has_tools = openai
+        .get("tools")
+        .and_then(|v| v.as_array())
+        .is_some_and(|a| !a.is_empty());
+    if !has_tools {
+        if let Some(obj) = openai.as_object_mut() {
+            obj.remove("tools");
+            obj.remove("tool_choice");
+            obj.remove("parallel_tool_calls");
+        }
+    }
 
     // 反向映射 short→original,响应侧还原工具名
     let reverse = super::shorten::build_reverse_map(&tool_name_map);
@@ -1411,7 +1435,8 @@ mod tests {
         assert_eq!(body["stream"], false);
         assert_eq!(body["store"], false);
         assert_eq!(body["include"][0], "reasoning.encrypted_content");
-        assert_eq!(body["parallel_tool_calls"], true);
+        // 无工具时三删,parallel_tool_calls 不发(对齐 CPA)
+        assert!(body.get("parallel_tool_calls").is_none());
     }
 
     #[test]
@@ -1419,15 +1444,114 @@ mod tests {
         let mut body = json!({
             "model": "test",
             "messages": [],
-            "tool_choice": {"type": "auto", "disable_parallel_tool_use": true}
+            "tool_choice": {"type": "auto", "disable_parallel_tool_use": true},
+            "tools": [{"name": "f", "input_schema": {"type": "object"}}]
         });
         convert_to_openai_responses(&mut body, "test-model").unwrap();
         assert_eq!(body["parallel_tool_calls"], false);
     }
 
     #[test]
+    fn test_no_tools_drops_tool_fields() {
+        // 无工具时三删(对齐 CPA normalizeXAIToolChoiceForTools)
+        let mut body = json!({"model": "test", "messages": []});
+        convert_to_openai_responses(&mut body, "test-model").unwrap();
+        assert!(body.get("tools").is_none());
+        assert!(body.get("tool_choice").is_none());
+        assert!(body.get("parallel_tool_calls").is_none());
+
+        // 空 tools 数组同样三删
+        let mut body2 = json!({"model": "test", "messages": [], "tools": []});
+        convert_to_openai_responses(&mut body2, "test-model").unwrap();
+        assert!(body2.get("tools").is_none());
+        assert!(body2.get("tool_choice").is_none());
+        assert!(body2.get("parallel_tool_calls").is_none());
+
+        // 有工具时保留三者
+        let mut body3 = json!({
+            "model": "test",
+            "messages": [],
+            "tools": [{"name": "search", "input_schema": {"type": "object"}}]
+        });
+        convert_to_openai_responses(&mut body3, "test-model").unwrap();
+        assert!(body3.get("tools").is_some());
+        assert_eq!(body3["tool_choice"], "auto");
+        assert_eq!(body3["parallel_tool_calls"], true);
+    }
+
+    #[test]
+    fn test_sampling_params_not_passed_through() {
+        // 采样参数不透传(对齐 CPA:claude 入站不 preserve;
+        // CC max_tokens=64000 透传超 grok 上限会 400 死循环)
+        let mut body = json!({
+            "model": "test",
+            "messages": [],
+            "max_tokens": 64000,
+            "temperature": 0.7,
+            "top_p": 0.9,
+            "top_k": 40
+        });
+        convert_to_openai_responses(&mut body, "test-model").unwrap();
+        assert!(body.get("max_output_tokens").is_none());
+        assert!(body.get("temperature").is_none());
+        assert!(body.get("top_p").is_none());
+        assert!(body.get("top_k").is_none());
+    }
+
+    #[test]
+    fn test_strict_only_when_simplified() {
+        // strict 恒设 false(对齐 CPA ConvertClaudeRequestToCodex:
+        // strict != false 即强制 false,claude 入站路径无 xAI 后处理层)
+        let mut body = json!({
+            "model": "test",
+            "messages": [],
+            "tools": [{
+                "name": "search",
+                "input_schema": {
+                    "type": "object",
+                    "properties": {"q": {"type": "string"}}
+                }
+            }]
+        });
+        convert_to_openai_responses(&mut body, "test-model").unwrap();
+        assert_eq!(body["tools"][0]["strict"], false);
+
+        // root union 非 object-only 被简化:同样 strict=false
+        let mut body2 = json!({
+            "model": "test",
+            "messages": [],
+            "tools": [{
+                "name": "search",
+                "input_schema": {
+                    "type": "object",
+                    "anyOf": [{"type": "string"}, {"type": "object"}]
+                }
+            }]
+        });
+        convert_to_openai_responses(&mut body2, "test-model").unwrap();
+        assert_eq!(body2["tools"][0]["strict"], false);
+    }
+
+    #[test]
+    fn test_stop_removed() {
+        // responses 不支持 stop,转换后删除(对齐 CPA sanitizeXAIResponsesBody)
+        let mut body = json!({
+            "model": "test",
+            "messages": [],
+            "stop_sequences": ["\n\n"]
+        });
+        convert_to_openai_responses(&mut body, "test-model").unwrap();
+        assert!(body.get("stop").is_none());
+    }
+
+    #[test]
     fn test_tool_choice_mappings() {
-        let mut body = json!({"model": "test", "messages": [], "tool_choice": {"type": "any"}});
+        let mut body = json!({
+            "model": "test",
+            "messages": [],
+            "tool_choice": {"type": "any"},
+            "tools": [{"name": "f", "input_schema": {"type": "object"}}]
+        });
         convert_to_openai_responses(&mut body, "test-model").unwrap();
         assert_eq!(body["tool_choice"], "required");
 
