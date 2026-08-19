@@ -5,10 +5,12 @@
 // - convert/: 三条 body-to-body 转换
 // - route/: model → provider 路由决策
 // - session/: 会话身份派生
+// - doom_loop: Grok doom loop 检测纯逻辑
 
 pub mod cache_stabilization;
 pub mod convert;
 pub mod count_tokens;
+pub mod doom_loop;
 pub mod normalize;
 pub mod prompt_cache;
 pub mod route;
@@ -16,6 +18,7 @@ pub mod secret;
 pub mod session;
 pub mod thinking;
 
+pub use doom_loop::{is_confident, parse_trigger, DoomLoopSignal, DoomLoopSignalKind};
 pub use route::{Protocol, RouteDecision};
 
 /// 判断 antigravity 模型是否使用 reasoning replay(对齐 CPA

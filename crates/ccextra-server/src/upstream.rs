@@ -226,10 +226,11 @@ impl UpstreamClient {
             }
         }
 
-        // grok 模型会话路由 + CLI 身份头(对齐 grokbuild-proxy headers.go)
+        // grok 模型会话路由 + CLI 身份头 + doom loop 检测(对齐 grokbuild-proxy headers.go + grok-build client.rs)
         // - x-grok-conv-id:同一会话路由到同一服务器(缓存亲和)
         // - X-XAI-Token-Auth / x-grok-client-version / x-grok-client-identifier /
         //   x-grok-model-override:Grok Build CLI 身份,网关按此识别合法客户端
+        // - x-grok-doom-loop-check:1024,启用死循环检测(硬编码对齐 grok-build 默认窗口)
         // 仅 responses 协议补完整身份头(chat 协议的 c-grok 保持原行为)
         if matches!(protocol, Protocol::OpenAiChat | Protocol::OpenAiResponses)
             && is_grok_model(upstream_model)
@@ -253,6 +254,8 @@ impl UpstreamClient {
                 if !upstream_model.is_empty() {
                     req = req.header("x-grok-model-override", upstream_model);
                 }
+                // doom loop 检测头(对齐 grok-build client.rs L1420:policy.window_tokens)
+                req = req.header("x-grok-doom-loop-check", "1024");
             }
         }
 

@@ -22,6 +22,7 @@ use super::emit;
 use super::parser::SseEvent;
 use super::parser::SseParser;
 use super::SseStreamPin;
+use ccextra_core::doom_loop::{is_confident, parse_trigger};
 
 /// message_start 的 model 兜底(同默认值)
 const FALLBACK_MODEL: &str = "claude-opus-4-1-20250805";
@@ -111,6 +112,8 @@ struct ResponsesRelay {
     tool_names: Option<Arc<HashMap<String, String>>>,
     /// 入站 body 本地估算输入 token(http.rs 计算;上游流未回真实 usage 时占位)
     estimated_input: Option<usize>,
+    /// doom loop 检测:已见触发器 raw label 去重(服务端重发累计集)
+    doom_loop_seen: HashSet<String>,
 }
 
 impl ResponsesRelay {
@@ -140,6 +143,7 @@ impl ResponsesRelay {
             last_web_search_tool_use_id: String::new(),
             tool_names: None,
             estimated_input,
+            doom_loop_seen: HashSet::new(),
         }
     }
 
@@ -182,6 +186,9 @@ impl ResponsesRelay {
                 self.finished = true;
                 vec![stream_error_frame(&root)]
             }
+            // Grok doom loop 检测事件(对齐 grok-build DoomLoopSignalCollector):
+            // 吞掉不转发(非标准事件),置信信号立即中断流,CC 自动重试即重采样
+            "response.doom_loop_check" => self.process_doom_loop_check(&root),
             // OpenAI Responses 终态错误事件:error 嵌在 response.error,提升为顶层复用映射
             "response.failed" => {
                 self.finished = true;
@@ -380,6 +387,10 @@ impl ResponsesRelay {
             "response.completed" | "response.incomplete" => {
                 let response = root.get("response");
                 self.update_identity(response);
+                // 终态响应对象上的 doom_loop_check 字段(对齐 grok-build 双路报告)
+                if let Some(out) = self.check_terminal_doom_loop(response) {
+                    return out;
+                }
                 let mut out = self.finalize_thinking();
                 out.extend(self.stop_text());
                 out.extend(self.append_function_calls_from_terminal(response));
@@ -391,6 +402,62 @@ impl ResponsesRelay {
             }
             _ => Vec::new(),
         }
+    }
+
+    /// doom loop 事件处理:解析触发器,置信即中断流(best-effort 永不报错)
+    ///
+    /// 对齐 grok-build DoomLoopSignalCollector.absorb + is_confident:
+    /// - 触发器按 raw label 去重(服务端重发累计集)
+    /// - 置信(thinking channel tail_repetition ≤ 64)→ 发 anthropic error 中断,
+    ///   CC 自动重试 = 免费获得重采样
+    /// - 非置信只记 warn 日志,流照常转发
+    fn process_doom_loop_check(&mut self, root: &Value) -> Vec<Bytes> {
+        let triggers = root
+            .pointer("/doom_loop_check/triggers")
+            .and_then(|v| v.as_array())
+            .map(|arr| {
+                arr.iter()
+                    .filter_map(|t| t.as_str().map(String::from))
+                    .collect::<Vec<_>>()
+            })
+            .unwrap_or_default();
+        self.absorb_doom_loop_triggers(&triggers)
+    }
+
+    /// 终态响应对象上的 doom_loop_check 字段(双路报告第二处)
+    fn check_terminal_doom_loop(&mut self, response: Option<&Value>) -> Option<Vec<Bytes>> {
+        let triggers = response?
+            .pointer("/doom_loop_check/triggers")
+            .and_then(|v| v.as_array())
+            .map(|arr| {
+                arr.iter()
+                    .filter_map(|t| t.as_str().map(String::from))
+                    .collect::<Vec<_>>()
+            })?;
+        let out = self.absorb_doom_loop_triggers(&triggers);
+        if out.is_empty() {
+            None
+        } else {
+            Some(out)
+        }
+    }
+
+    /// 吸收触发器集:去重、解析、置信判定;置信返回中断帧
+    fn absorb_doom_loop_triggers(&mut self, triggers: &[String]) -> Vec<Bytes> {
+        for raw in triggers {
+            if self.doom_loop_seen.contains(raw) {
+                continue;
+            }
+            self.doom_loop_seen.insert(raw.clone());
+            let signal = parse_trigger(raw);
+            if is_confident(&signal) {
+                tracing::warn!(trigger = raw, "doom loop 置信信号,中断流触发 CC 重采样");
+                // 复用流中断 error 路径:CC 收到 error 事件自动重试
+                return self.stream_error(&format!("doom loop detected: {raw}"));
+            }
+            tracing::warn!(trigger = raw, "doom loop 非置信信号,warn-only");
+        }
+        Vec::new()
     }
 
     /// output_item.done 分派(message 文本兜底 / reasoning 收尾)
@@ -1676,6 +1743,98 @@ mod tests {
         // finish 兜底也不得再产 message_delta/stop
         let fin = r.finish();
         assert!(fin.is_empty(), "error 后 finish 应为空,实际: {fin:?}");
+    }
+
+    #[test]
+    fn test_doom_loop_confident_signal_aborts_stream() {
+        // 置信信号(thinking channel tail_repetition ≤ 64):吞掉事件 + 发 error 中断
+        let mut r = ResponsesRelay::new(None);
+        r.process(&created());
+        let out = r.process(&ev(
+            r#"{"type":"response.doom_loop_check","doom_loop_check":{"triggers":["tail_repetition:32@thinking"]}}"#,
+        ));
+        let s = s(&out);
+        assert!(
+            s.starts_with("event: error"),
+            "置信信号应发 error 中断,实际: {s}"
+        );
+        assert!(
+            s.contains("doom loop detected"),
+            "error 应含 doom loop 信息,实际: {s}"
+        );
+        // 中断后后续事件一律忽略
+        let after = r.process(&ev(
+            r#"{"type":"response.completed","response":{"id":"r1","output":[]}}"#,
+        ));
+        assert!(after.is_empty(), "中断后不得继续处理,实际: {after:?}");
+        assert!(
+            r.finish().is_empty(),
+            "中断后 finish 应为空,实际: {:?}",
+            r.finish()
+        );
+    }
+
+    #[test]
+    fn test_doom_loop_non_confident_signal_passes_through() {
+        // 非置信信号(response channel):吞掉事件,流照常
+        let mut r = ResponsesRelay::new(None);
+        r.process(&created());
+        let out = r.process(&ev(
+            r#"{"type":"response.doom_loop_check","doom_loop_check":{"triggers":["tail_repetition:32@response"]}}"#,
+        ));
+        assert!(out.is_empty(), "非置信信号不应产出任何帧,实际: {out:?}");
+        // 流继续正常处理
+        let text = r.process(&ev(r#"{"type":"response.output_text.delta","delta":"ok"}"#));
+        assert!(s(&text).contains("text_delta"));
+    }
+
+    #[test]
+    fn test_doom_loop_terminal_field_confident() {
+        // 终态响应对象上的 doom_loop_check 字段:置信时中断而非正常收尾
+        let mut r = ResponsesRelay::new(None);
+        r.process(&created());
+        let out = r.process(&ev(
+            r#"{"type":"response.completed","response":{"id":"r1","output":[],"doom_loop_check":{"triggers":["tail_repetition:16@thinking"]}}}"#,
+        ));
+        let s = s(&out);
+        assert!(
+            s.starts_with("event: error"),
+            "终态置信信号应发 error,实际: {s}"
+        );
+        assert!(!s.contains("message_stop"), "不得正常收尾,实际: {s}");
+    }
+
+    #[test]
+    fn test_doom_loop_dedup_repeated_triggers() {
+        // 服务端重发累计集:同 label 去重,不重复判定
+        let mut r = ResponsesRelay::new(None);
+        r.process(&created());
+        // 第一次:非置信
+        r.process(&ev(
+            r#"{"type":"response.doom_loop_check","doom_loop_check":{"triggers":["tail_repetition:32@response"]}}"#,
+        ));
+        // 第二次重发同 label:仍非置信,流照常
+        let out = r.process(&ev(
+            r#"{"type":"response.doom_loop_check","doom_loop_check":{"triggers":["tail_repetition:32@response"]}}"#,
+        ));
+        assert!(out.is_empty(), "重复 label 应去重,实际: {out:?}");
+    }
+
+    #[test]
+    fn test_doom_loop_malformed_payload_never_fails() {
+        // malformed payload:best-effort,不弄挂流
+        let mut r = ResponsesRelay::new(None);
+        r.process(&created());
+        let out = r.process(&ev(
+            r#"{"type":"response.doom_loop_check","doom_loop_check":{"triggers":[123,null]}}"#,
+        ));
+        assert!(
+            out.is_empty(),
+            "malformed 不应产出帧也不应报错,实际: {out:?}"
+        );
+        // 流继续正常
+        let text = r.process(&ev(r#"{"type":"response.output_text.delta","delta":"ok"}"#));
+        assert!(s(&text).contains("text_delta"));
     }
 
     #[test]

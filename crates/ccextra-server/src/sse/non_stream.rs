@@ -15,6 +15,7 @@ use super::responses::{
     codex_stop_reason, map_stop_reason, sanitize_tool_id, stop_sequence, web_search_result_content,
 };
 use ccextra_core::convert::fix_json_quotes;
+use ccextra_core::doom_loop::{is_confident, parse_trigger};
 
 /// OpenAI responses 非流式 body → Anthropic messages body
 ///
@@ -36,6 +37,12 @@ pub fn responses_to_anthropic(
     } else {
         Some(body)
     }?;
+
+    // doom loop 检测:终态响应对象上的 doom_loop_check 字段(对齐 grok-build
+    // 双路报告),置信信号返回错误而非正常响应(CC 自动重试即重采样)
+    if let Some(err) = terminal_doom_loop_error(response) {
+        return Some(err);
+    }
 
     let mut content: Vec<Value> = Vec::new();
     let mut has_tool_use = false;
@@ -165,6 +172,34 @@ pub fn responses_to_anthropic(
         output_tokens,
         cached,
     )
+}
+
+/// 终态响应对象上的 doom_loop_check 置信检查(对齐 grok-build is_confident)
+///
+/// 置信(thinking channel tail_repetition ≤ 64)返回 anthropic error body,
+/// CC 收到自动重试即重采样;非置信返回 None 走正常转换。
+fn terminal_doom_loop_error(response: &Value) -> Option<Value> {
+    let triggers = response
+        .pointer("/doom_loop_check/triggers")
+        .and_then(|v| v.as_array())?;
+    for raw in triggers.iter().filter_map(|t| t.as_str()) {
+        let signal = parse_trigger(raw);
+        if is_confident(&signal) {
+            tracing::warn!(
+                trigger = raw,
+                "doom loop 置信信号(非流),返回错误触发 CC 重采样"
+            );
+            return Some(json!({
+                "type": "error",
+                "error": {
+                    "type": "api_error",
+                    "message": format!("doom loop detected: {raw}")
+                }
+            }));
+        }
+        tracing::warn!(trigger = raw, "doom loop 非置信信号(非流),warn-only");
+    }
+    None
 }
 
 /// OpenAI chat 非流式 body → Anthropic messages body
@@ -468,6 +503,47 @@ mod tests {
         assert_eq!(out["content"][0]["type"], "thinking");
         assert_eq!(out["content"][0]["thinking"], "think step\nstep two");
         assert_eq!(out["content"][0]["signature"], "sig123");
+    }
+
+    #[test]
+    fn test_responses_nonstream_doom_loop_confident() {
+        // 终态置信信号:返回 anthropic error 而非正常响应
+        let body = json!({
+            "type": "response.completed",
+            "response": {
+                "id": "r1",
+                "model": "grok-4.6",
+                "output": [],
+                "doom_loop_check": {"triggers": ["tail_repetition:32@thinking"]}
+            }
+        });
+        let out = responses_to_anthropic(&body, None).unwrap();
+        assert_eq!(out["type"], "error");
+        assert_eq!(out["error"]["type"], "api_error");
+        assert!(out["error"]["message"]
+            .as_str()
+            .unwrap()
+            .contains("doom loop"));
+    }
+
+    #[test]
+    fn test_responses_nonstream_doom_loop_non_confident() {
+        // 非置信信号(response channel):正常转换
+        let body = json!({
+            "type": "response.completed",
+            "response": {
+                "id": "r1",
+                "model": "grok-4.6",
+                "output": [{
+                    "type": "message",
+                    "content": [{"type": "output_text", "text": "hi"}]
+                }],
+                "doom_loop_check": {"triggers": ["tail_repetition:32@response"]}
+            }
+        });
+        let out = responses_to_anthropic(&body, None).unwrap();
+        assert_eq!(out["type"], "message");
+        assert_eq!(out["content"][0]["text"], "hi");
     }
 
     #[test]
