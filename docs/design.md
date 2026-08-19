@@ -93,8 +93,9 @@ openai chat:     relay_openai_chat_to_anthropic
                  (单 active block + reasoning 去重 + tool_calls index 映射 +
                   reasoning-only 空回合 thinking 转 text 兜底)
 openai responses: relay_responses_to_anthropic
-                 (reasoning 回放闭环: summary→thinking_delta +
-                  encrypted_content→signature_delta)
+                 (reasoning replay 闭环: output_item.done 收集 +
+                  completed 补空 output + 缓存 replay 项 + 下轮注入;
+                  summary→thinking_delta + encrypted_content→signature_delta)
 gemini/antigravity: relay_gemini_to_anthropic (sse/gemini.rs,两协议共用;
                  antigravity 先解 {"response": {...}} 信封)
                  (无 event: 分派; data: 行; part.text 当增量;
@@ -117,6 +118,8 @@ Claude Code → ccextra:8222
 2. 路由决策 model → provider → protocol
 3. 转换前归一化 (claude 全量 / 其余协议精简子集；gemini/antigravity 跳过 drift)
 4. 协议转换 (五条 body-to-body；antigravity 在 core 内完成信封)
+   - responses: 转换后注入 reasoning replay (对齐 CPA applyCodexReasoningReplayCacheRequired,
+     仅判断来源协议 FormatClaude 不限模型;ccextra 入站恒为 anthropic 故全部启用)
 5. normalize_target_post (仅 openai) + drift 观测 (gemini/antigravity 跳过)
 6. Payload 参数覆盖 (通配匹配，可限定协议；claude 直通须显式 protocol)
 7. 剥离 prompt_cache_retention (非 claude 路径)
@@ -197,4 +200,4 @@ executor 规则（对齐 CPA `antigravity_executor_request.go`）：claude 模�
 
 ## 11. 设计对齐目标
 
-转换逻辑、认证、prompt cache key、thinking 映射、reasoning 回放对齐成熟协议网关实现;九模块归一化对齐字节稳定化 sidecar 的缓存稳定化管线。gemini/antigravity 路径对齐 CLIProxyAPI 的翻译器与 executor(schema 清洗、VALIDATED、maxOutputTokens 封顶、信封与 UA)。
+转换逻辑、认证、prompt cache key、thinking 映射、reasoning replay 对齐成熟协议网关实现;九模块归一化对齐字节稳定化 sidecar 的缓存稳定化管线。gemini/antigravity 路径对齐 CLIProxyAPI 的翻译器与 executor(schema 清洗、VALIDATED、maxOutputTokens 封顶、信封与 UA)。reasoning replay 对齐 CPA 的 xAI/codex reasoning replay 实现(applyXAIReasoningReplayCacheRequired / applyCodexReasoningReplayCacheRequired + cacheXAIReasoningReplayFromCompleted / cacheCodexReasoningReplayFromCompleted):responses 协议 reasoning 是服务器端状态(store=false),上游不保留须回放 encrypted_content,否则模型丢失决策记忆重复发工具调用。CPA 启用条件为来源协议 FormatClaude(不判断模型),ccextra 入站恒为 anthropic 故 responses 全部启用。实现包含:流式 output_item.done 收集、completed 补空 output、归一化提取(reasoning/message/function_call/custom_tool_call 最小形状+锚点检测)、过滤(去重+对齐+匹配 output)、注入(call_id 双候选+插入位置计算)、TTL 1h 滑动续期、400 invalid signature 清缓存、缓存 key "{model}:{session}"。

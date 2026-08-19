@@ -52,7 +52,7 @@ use tokio::sync::RwLock;
 use crate::sse::parser::{SseEvent, SseParser};
 use crate::sse::replay_cache::StreamReplayExtractor;
 use crate::sse::SseStreamPin;
-use crate::upstream::{is_grok_model, UpstreamClient};
+use crate::upstream::UpstreamClient;
 
 /// 配置重载闭包类型
 pub type ReloadFn =
@@ -527,17 +527,22 @@ async fn handle_messages(
             if !rev.is_empty() {
                 tool_names = Some(Arc::new(rev));
             }
-            // reasoning replay 注入(对齐 CPA applyXAIReasoningReplayCacheRequired,
-            // 仅 grok 模型:responses 的 reasoning 是服务器端状态,store=false 时
-            // 上游不保留,须回放上一轮 encrypted_content,否则模型丢失决策记忆
-            // 重复发相同工具调用)。缓存 key = "{model}:{session}"(对齐
-            // xaiReasoningReplayCacheKey 的 model+session 连续性边界)。
-            if is_grok_model(&route.upstream_model) {
-                if let Some(sess) = cc_session.as_deref() {
-                    let key = format!("{}:{}", route.upstream_model, sess);
-                    if state.replay_cache.apply_to_body(&key, &mut body_json) {
-                        tracing::debug!(session = %sess, "reasoning replay 已注入");
-                    }
+            // reasoning replay 注入(对齐 CPA applyCodexReasoningReplayCacheRequired:
+            // responses 协议的 reasoning 是服务器端状态,store=false 时上游不保留,
+            // 须回放上一轮 encrypted_content,否则模型丢失决策记忆重复发相同工具
+            // 调用。CPA codexReasoningReplayEnabledForSource 只判断来源协议
+            // FormatClaude,不限模型;ccextra 入站协议恒为 anthropic,故 responses
+            // 协议全部启用)。缓存 key = "{model}:{session}"(对齐
+            // xaiReasoningReplayCacheKey / codexReasoningReplayScope 的
+            // model+session 连续性边界)。
+            if let Some(sess) = cc_session.as_deref() {
+                let key = format!("{}:{}", route.upstream_model, sess);
+                if state.replay_cache.apply_to_body(&key, &mut body_json) {
+                    tracing::debug!(
+                        session = %sess,
+                        model = %route.upstream_model,
+                        "reasoning replay 已注入"
+                    );
                 }
             }
             if normalize_enabled {
@@ -669,9 +674,10 @@ async fn handle_messages(
     } else {
         (None, None)
     };
-    // reasoning replay 提取条件(responses+grok+有会话身份;与注入点同源,
-    // key 同为 "{model}:{session}")
-    let replay_scope = if is_grok && matches!(route.protocol, Protocol::OpenAiResponses) {
+    // reasoning replay 提取条件(responses 协议 + 有会话身份;与注入点同源,
+    // key 同为 "{model}:{session}",对齐 CPA codexReasoningReplayEnabledForSource
+    // 只判断来源协议不限模型)
+    let replay_scope = if matches!(route.protocol, Protocol::OpenAiResponses) {
         session_id.map(|s| {
             (
                 state.replay_cache.clone(),
