@@ -156,7 +156,7 @@ openai chat 的 `delta.tool_calls[N]` 需映射到 anthropic 的 `content[M]`,�
 anthropic 的 prompt caching marker,可标记在 system block / message / tool 定义 / content part 上,形如 `{type: "ephemeral"}`。
 
 **thinking**  
-anthropic 的推理块,含 `type: "thinking"` 的 content,可带 `budget_tokens` / `signature` 字段。chat 转换把过门的正文写入 `reasoning_content`(见「reasoning 回放闭环」);responses 把兼容签名写入 `encrypted_content`。gemini:`enabled` + `budget_tokens` 写 `thinkingBudget`;`adaptive`/`auto` 有显式 `output_config.effort` 写 `thinkingLevel`,否则 gemini 按注册表 thinking.max 发 `thinkingBudget`、antigravity 兜底 `thinkingLevel=high`。gemini 直连丢全部 thinking 块;antigravity 保留带签名块(见「Gemini 签名与运输」)。
+anthropic 的推理块,含 `type: "thinking"` 的 content,可带 `budget_tokens` / `signature` 字段。chat 转换把过门的正文写入 `reasoning_content`(见「reasoning 回放闭环」);responses 把兼容签名写入 `encrypted_content`。gemini:`enabled` + `budget_tokens` 写 `thinkingBudget`;`adaptive`/`auto` 显式 `output_config.effort="max"` 或缺失时走预算表发 `thinkingBudget`(查不到或 antigravity 兜底 `thinkingLevel=high`)，其余合法值(`low`/`medium`/`high`)写 `thinkingLevel`(非法值兜底 `high`)。gemini 直连丢全部 thinking 块;antigravity 保留带签名块(见「Gemini 签名与运输」)。
 
 **system**  
 anthropic 顶层字段,可以是 `string` 或 `block 数组`(含 text / tool_use / cache_control)两种形态。
