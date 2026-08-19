@@ -123,33 +123,41 @@ pub fn convert_to_gemini_with(
                     .and_then(|e| e.as_str())
                     .map(|e| e.trim().to_lowercase())
                     .filter(|e| !e.is_empty());
-                match effort {
-                    Some(e) => {
+
+                // effort="max" 或缺失时走预算表 → thinkingBudget,兜底 high
+                let use_budget_path = effort.as_deref() == Some("max") || effort.is_none();
+
+                if use_budget_path {
+                    // 对齐 CPA:thinking.max 预算表仅 Gemini 直连翻译器使用,
+                    // Antigravity 翻译器缺省 thinkingLevel=high
+                    let max_budget = if flavor == SchemaFlavor::Gemini {
+                        gemini_thinking_max_budget(upstream_model)
+                    } else {
+                        None
+                    };
+                    if let Some(max_budget) = max_budget {
                         generation_config.insert(
                             "thinkingConfig".into(),
-                            serde_json::json!({"thinkingLevel": e}),
+                            serde_json::json!({"thinkingBudget": max_budget}),
+                        );
+                    } else {
+                        generation_config.insert(
+                            "thinkingConfig".into(),
+                            serde_json::json!({"thinkingLevel": "high"}),
                         );
                     }
-                    None => {
-                        // 对齐 CPA:thinking.max 预算表仅 Gemini 直连翻译器使用,
-                        // Antigravity 翻译器缺省 thinkingLevel=high
-                        let max_budget = if flavor == SchemaFlavor::Gemini {
-                            gemini_thinking_max_budget(upstream_model)
-                        } else {
-                            None
-                        };
-                        if let Some(max_budget) = max_budget {
-                            generation_config.insert(
-                                "thinkingConfig".into(),
-                                serde_json::json!({"thinkingBudget": max_budget}),
-                            );
-                        } else {
-                            generation_config.insert(
-                                "thinkingConfig".into(),
-                                serde_json::json!({"thinkingLevel": "high"}),
-                            );
-                        }
-                    }
+                } else if let Some(e) = effort {
+                    // 非 max 的 effort 值校验白名单(Gemini 接受 low/medium/high)
+                    let valid_levels = ["low", "medium", "high"];
+                    let level = if valid_levels.contains(&e.as_str()) {
+                        e
+                    } else {
+                        "high".to_string() // 不合法值兜底
+                    };
+                    generation_config.insert(
+                        "thinkingConfig".into(),
+                        serde_json::json!({"thinkingLevel": level}),
+                    );
                 }
             }
             _ => {}
@@ -367,6 +375,42 @@ mod tests {
         assert_eq!(
             gemini["generationConfig"]["thinkingConfig"]["thinkingLevel"],
             "low"
+        );
+    }
+
+    #[test]
+    fn test_convert_to_gemini_thinking_effort_max() {
+        // effort="max" 应走预算表 → thinkingBudget,不发 thinkingLevel="max"
+        let anthropic = json!({
+            "model": "m", "max_tokens": 1000,
+            "thinking": {"type": "adaptive"},
+            "output_config": {"effort": "max"},
+            "messages": [{"role": "user", "content": "hi"}]
+        });
+        let (gemini, _) = convert_to_gemini(&anthropic, "gemini-3.7");
+        // 3.x 模型预算表返回 32768
+        assert_eq!(
+            gemini["generationConfig"]["thinkingConfig"]["thinkingBudget"],
+            32768
+        );
+        assert!(gemini["generationConfig"]["thinkingConfig"]
+            .get("thinkingLevel")
+            .is_none());
+    }
+
+    #[test]
+    fn test_convert_to_gemini_thinking_effort_invalid() {
+        // 不合法 effort 值兜底 "high"
+        let anthropic = json!({
+            "model": "m", "max_tokens": 1000,
+            "thinking": {"type": "adaptive"},
+            "output_config": {"effort": "ultra"},
+            "messages": [{"role": "user", "content": "hi"}]
+        });
+        let (gemini, _) = convert_to_gemini(&anthropic, "gemini-2.5-pro");
+        assert_eq!(
+            gemini["generationConfig"]["thinkingConfig"]["thinkingLevel"],
+            "high"
         );
     }
 
