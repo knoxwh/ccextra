@@ -584,6 +584,25 @@ async fn handle_messages(
             if !short_to_original.is_empty() {
                 tool_names = Some(Arc::new(short_to_original));
             }
+
+            // reasoning replay 注入(对齐 CPA prepareAntigravityGeminiReasoningReplayPayload:
+            // antigravity gemini/flash/agent 模型启用 replay,claude 模型不启用;入站协议
+            // 恒为 anthropic,符合 CPA 对 sourceFormat 的判断。信封里的 request 字段才是
+            // Gemini 格式,注入目标是信封内层的 request.contents)。
+            if ccextra_core::antigravity_uses_reasoning_replay(&route.upstream_model) {
+                if let Some(sess) = cc_session.as_deref() {
+                    let key = format!("{}:{}", route.upstream_model, sess);
+                    if let Some(request) = body_json.get_mut("request") {
+                        if state.replay_cache.apply_to_body(&key, request) {
+                            tracing::debug!(
+                                session = %sess,
+                                model = %route.upstream_model,
+                                "antigravity reasoning replay 已注入"
+                            );
+                        }
+                    }
+                }
+            }
         }
     }
 
@@ -674,11 +693,22 @@ async fn handle_messages(
     } else {
         (None, None)
     };
-    // reasoning replay 提取条件(responses 协议 + 有会话身份;与注入点同源,
-    // key 同为 "{model}:{session}",对齐 CPA codexReasoningReplayEnabledForSource
-    // 只判断来源协议不限模型)
+    // reasoning replay 提取条件:
+    // - responses 协议 + 有会话身份;key 为 "{model}:{session}",对齐 CPA
+    //   codexReasoningReplayEnabledForSource 只判断来源协议不限模型
+    // - antigravity 协议 + gemini/flash/agent 模型 + 有会话身份;对齐 CPA
+    //   antigravityUsesReasoningReplayCache 的模型过滤(claude 不启用)
     let replay_scope = if matches!(route.protocol, Protocol::OpenAiResponses) {
         session_id.map(|s| {
+            (
+                state.replay_cache.clone(),
+                format!("{}:{}", route.upstream_model, s),
+            )
+        })
+    } else if matches!(route.protocol, Protocol::Antigravity)
+        && ccextra_core::antigravity_uses_reasoning_replay(&route.upstream_model)
+    {
+        cc_session.as_deref().map(|s| {
             (
                 state.replay_cache.clone(),
                 format!("{}:{}", route.upstream_model, s),
@@ -945,14 +975,28 @@ async fn handle_messages(
             write_upstream_meta(&meta);
         }
         let body_bytes = upstream.body.bytes().await?;
-        // 非流 responses+grok:REST 顶层 Response(object=response)同样提取
-        // replay 项(对齐 CPA 对 completed data 的缓存路径)
+        // 非流 reasoning replay 提取:
+        // - responses:REST 顶层 Response(object=response)同样提取 replay 项
+        // - antigravity:{"response": {...}} 信封内层提取(对齐 CPA
+        //   cacheAntigravityReasoningReplayFromResponse 从响应 body 提取)
         if let Some((cache, key)) = replay_scope.as_ref() {
             if let Ok(v) = serde_json::from_slice::<Value>(&body_bytes) {
-                if v.get("object").and_then(|o| o.as_str()) == Some("response") {
-                    // 包一层 completed 形状复用提取逻辑
-                    let wrapped = json!({"response": v});
-                    cache.store_from_completed(key, &wrapped);
+                match route.protocol {
+                    Protocol::OpenAiResponses => {
+                        if v.get("object").and_then(|o| o.as_str()) == Some("response") {
+                            // 包一层 completed 形状复用提取逻辑
+                            let wrapped = json!({"response": v});
+                            cache.store_from_completed(key, &wrapped);
+                        }
+                    }
+                    Protocol::Antigravity => {
+                        // 信封内层 response 字段可能包含 candidates 和 reasoning 签名
+                        if let Some(inner) = v.get("response") {
+                            let wrapped = json!({"response": inner});
+                            cache.store_from_completed(key, &wrapped);
+                        }
+                    }
+                    _ => {}
                 }
             }
         }
@@ -1329,6 +1373,7 @@ where
 }
 
 /// 无诊断 meta 时的直通 relay:仅当带 replay scope 时加提取 tap。
+/// responses 协议与 antigravity 协议都需从流中提取 replay 项。
 fn relay_with_replay_tap<S>(
     protocol: Protocol,
     stream: S,
