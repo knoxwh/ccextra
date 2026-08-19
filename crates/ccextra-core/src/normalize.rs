@@ -113,14 +113,19 @@ pub fn normalize_anthropic_full(body: &mut Value) -> NormalizeCounts {
 
 /// 入站 anthropic 转换前归一化:精简子集(openai 转换链路转换前调用)。
 ///
-/// 跑:schema 键排序 → smoosh → content_strip → tool_input → sort → rstrip。
+/// 跑:tool_def 排序 + schema 键排序 → smoosh → content_strip → tool_input → sort → rstrip。
+/// tool_def 排序提升 gemini/antigravity 隐式前缀缓存命中率(对齐 full 管线)。
 /// schema 键必须在 tool_input 之前排:转换把 `tool_use.input` 冻成
-/// `arguments` 字符串,post 无法再改。`tools[]` 数组排序仍留 post
-/// (openai 形状)。跳过 volatile strip、auto cache_control、volatile
-/// detect warn——cache_control 转换时丢弃;volatile / drift 留转换后。
+/// `arguments` 字符串,post 无法再改。跳过 volatile strip、auto cache_control、
+/// volatile detect warn——cache_control 转换时丢弃;volatile / drift 留转换后。
 pub fn normalize_anthropic_pretransform(body: &mut Value) -> NormalizeCounts {
-    // schema 键递归排序(不排 tools[]:那是 openai 形状的 post 职责)
+    let mut tool_sorted = false;
+
+    // tool_def 排序 + schema 键递归排序
     if let Some(tools) = body.get_mut("tools").and_then(|t| t.as_array_mut()) {
+        if !any_tool_has_cache_control(tools) {
+            tool_sorted = sort_tools_deterministically(tools);
+        }
         for tool in tools.iter_mut() {
             if let Some(schema) = tool.get_mut("input_schema") {
                 sort_schema_keys_recursive(schema);
@@ -129,6 +134,7 @@ pub fn normalize_anthropic_pretransform(body: &mut Value) -> NormalizeCounts {
     }
 
     NormalizeCounts {
+        tool_sorted,
         // 1. smoosh 拆分
         smoosh_count: split_smooshed_reminders(body, DriftApiKind::Anthropic),
         // 2. bookkeeping 剥离
@@ -267,16 +273,23 @@ mod tests {
     fn test_pretransform_skips_cache_control_injection() {
         // 没有 cache_control 注入(转换前不注入:转换后 cache 语义丢弃)
         let mut body = json!({
-            "tools": [{"name": "b", "input_schema": {"type": "object"}}],
+            "tools": [
+                {"name": "b", "input_schema": {"type": "object"}},
+                {"name": "a", "input_schema": {"type": "object"}}
+            ],
             "messages": [{"role": "user", "content": "hi"}]
         });
 
         let counts = normalize_anthropic_pretransform(&mut body);
 
         assert_eq!(counts.cache_control_placed, 0);
-        assert!(!counts.tool_sorted, "tool-def sort must be skipped");
-        // tools 顺序未被改动
-        assert_eq!(body["tools"][0]["name"], "b");
+        // pretransform 现在排序 tool_def(提升 gemini/antigravity 缓存命中)
+        assert!(
+            counts.tool_sorted,
+            "tool-def should be sorted for prefix stability"
+        );
+        assert_eq!(body["tools"][0]["name"], "a");
+        assert_eq!(body["tools"][1]["name"], "b");
     }
 
     #[test]
