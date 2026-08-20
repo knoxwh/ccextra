@@ -131,6 +131,42 @@ pub fn extract_replay_items(completed: &Value) -> Option<Vec<Value>> {
                 }
                 obj
             }
+            Some("function_call_output") => {
+                let call_id = item
+                    .get("call_id")
+                    .and_then(|v| v.as_str())
+                    .map(|c| c.trim());
+                let output = item.get("output");
+                let (Some(call_id), Some(output)) = (call_id, output) else {
+                    continue;
+                };
+                if call_id.is_empty() {
+                    continue;
+                }
+                json!({
+                    "type": "function_call_output",
+                    "call_id": call_id,
+                    "output": output,
+                })
+            }
+            Some("custom_tool_call_output") => {
+                let call_id = item
+                    .get("call_id")
+                    .and_then(|v| v.as_str())
+                    .map(|c| c.trim());
+                let output = item.get("output");
+                let (Some(call_id), Some(output)) = (call_id, output) else {
+                    continue;
+                };
+                if call_id.is_empty() {
+                    continue;
+                }
+                json!({
+                    "type": "custom_tool_call_output",
+                    "call_id": call_id,
+                    "output": output,
+                })
+            }
             _ => continue,
         };
         items.push(normalized);
@@ -333,6 +369,9 @@ pub fn filter_replay_items(body: &Value, items: Vec<Value>) -> Vec<Value> {
                 for key in keys {
                     existing_calls.insert(key);
                 }
+            }
+            "function_call_output" | "custom_tool_call_output" => {
+                // 保留 output（它们跟随对应的 function_call）
             }
             _ => continue,
         }
@@ -679,5 +718,62 @@ mod tests {
             &mut no_input,
             vec![json!({"type": "reasoning", "encrypted_content": "g"})]
         ));
+    }
+
+    #[test]
+    fn test_extract_includes_function_call_output() {
+        let completed = json!({
+            "response": {
+                "output": [
+                    {"type": "function_call", "call_id": "call_1", "name": "tool_a", "arguments": "{}"},
+                    {"type": "function_call_output", "call_id": "call_1", "output": [{"type": "input_text", "text": "result"}]},
+                    {"type": "reasoning", "encrypted_content": "gAAAA-valid", "content": "think"},
+                ]
+            }
+        });
+        let items = extract_replay_items(&completed).unwrap();
+        assert_eq!(items.len(), 3);
+        assert_eq!(items[0]["type"], "function_call");
+        assert_eq!(items[1]["type"], "function_call_output");
+        assert_eq!(items[1]["call_id"], "call_1");
+        assert_eq!(items[2]["type"], "reasoning");
+    }
+
+    #[test]
+    fn test_extract_includes_custom_tool_call_output() {
+        let completed = json!({
+            "response": {
+                "output": [
+                    {"type": "custom_tool_call", "call_id": "call_1", "name": "tool", "input": {"query": "test"}},
+                    {"type": "custom_tool_call_output", "call_id": "call_1", "output": {"result": "ok"}},
+                ]
+            }
+        });
+        let items = extract_replay_items(&completed).unwrap();
+        assert_eq!(items.len(), 2);
+        assert_eq!(items[0]["type"], "custom_tool_call");
+        assert_eq!(items[1]["type"], "custom_tool_call_output");
+        assert_eq!(items[1]["call_id"], "call_1");
+    }
+
+    #[test]
+    fn test_filter_preserves_output_with_call() {
+        let body = json!({
+            "input": [
+                {"type": "function_call", "call_id": "call_1", "name": "tool_a", "arguments": "{}"},
+                {"type": "function_call_output", "call_id": "call_1", "output": "ok"},
+                {"type": "function_call_output", "call_id": "call_2", "output": "pending"}
+            ]
+        });
+        let cached = vec![
+            json!({"type": "function_call", "call_id": "call_2", "name": "tool_b", "arguments": "{}"}),
+            json!({"type": "function_call_output", "call_id": "call_2", "output": "pending"}),
+        ];
+        let filtered = filter_replay_items(&body, cached);
+        assert_eq!(filtered.len(), 2, "应保留 call + output");
+        assert_eq!(filtered[0]["type"], "function_call");
+        assert_eq!(filtered[0]["call_id"], "call_2");
+        assert_eq!(filtered[1]["type"], "function_call_output");
+        assert_eq!(filtered[1]["call_id"], "call_2");
     }
 }
