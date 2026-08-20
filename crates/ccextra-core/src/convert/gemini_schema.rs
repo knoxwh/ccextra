@@ -772,6 +772,7 @@ fn remove_unsupported_keywords(schema: &mut Value, opts: CleanOptions) {
         "enumTitles",
         "prefill",
         "deprecated",
+        "encrypted",
     ]);
     if opts.antigravity_semantics {
         keywords.push("not");
@@ -970,12 +971,14 @@ mod tests {
     fn test_gemini_removes_metadata_and_unsupported() {
         let schema = json!({
             "title": "T", "$schema": "http://x", "additionalProperties": false,
+            "encrypted": "secret-marker",
             "properties": {"p": {"type": "string", "format": "date", "nullable": true}}
         });
         let out = clean_json_schema_for_gemini(&schema);
         assert!(out.get("title").is_none());
         assert!(out.get("$schema").is_none());
         assert!(out.get("additionalProperties").is_none());
+        assert!(out.get("encrypted").is_none());
         assert!(out["description"]
             .as_str()
             .unwrap()

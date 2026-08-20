@@ -86,6 +86,26 @@ pub fn convert_to_gemini_with(
         ));
     }
 
+    // 对齐 CPA EnsureGeminiLeadingUserContent:切片历史/工具续跑时首 turn 可能为
+    // model,Gemini 侧要求 contents 以 user 开头,前置空 user turn。
+    // Antigravity claude 目标跳过(adapter 拒空 text part)。
+    let is_claude_target = upstream_model.to_lowercase().contains("claude");
+    if !(flavor == SchemaFlavor::Antigravity && is_claude_target) {
+        if let Some(contents) = gemini.get_mut("contents").and_then(|c| c.as_array_mut()) {
+            if contents
+                .first()
+                .and_then(|c| c.get("role"))
+                .and_then(|r| r.as_str())
+                == Some("model")
+            {
+                contents.insert(
+                    0,
+                    serde_json::json!({"role": "user", "parts": [{"text": ""}]}),
+                );
+            }
+        }
+    }
+
     // 生成配置
     let mut generation_config = serde_json::Map::new();
     if let Some(max_tokens) = body.get("max_tokens") {
@@ -299,6 +319,46 @@ mod tests {
         assert_eq!(gemini["contents"].as_array().unwrap().len(), 1);
         assert_eq!(gemini["generationConfig"]["maxOutputTokens"], 4096);
         assert!(short_map.is_empty());
+    }
+
+    #[test]
+    fn test_convert_to_gemini_prepends_empty_user_turn_for_model_first() {
+        let anthropic = json!({
+            "model": "m", "max_tokens": 100,
+            "messages": [
+                {"role": "assistant", "content": [{"type": "text", "text": "resume"}]},
+                {"role": "user", "content": "continue"}
+            ]
+        });
+        let (gemini, _) = convert_to_gemini(&anthropic, "gemini-2.0");
+        let contents = gemini["contents"].as_array().unwrap();
+        assert_eq!(contents.len(), 3);
+        assert_eq!(contents[0]["role"], "user");
+        assert_eq!(contents[0]["parts"][0]["text"], "");
+        assert_eq!(contents[1]["role"], "model");
+    }
+
+    #[test]
+    fn test_convert_to_gemini_user_first_untouched() {
+        let anthropic = json!({
+            "model": "m", "max_tokens": 100,
+            "messages": [{"role": "user", "content": "hi"}]
+        });
+        let (gemini, _) = convert_to_gemini(&anthropic, "gemini-2.0");
+        assert_eq!(gemini["contents"].as_array().unwrap().len(), 1);
+    }
+
+    #[test]
+    fn test_convert_to_antigravity_claude_skips_empty_user_turn() {
+        let anthropic = json!({
+            "model": "m", "max_tokens": 100,
+            "messages": [{"role": "assistant", "content": [{"type": "text", "text": "resume"}]}]
+        });
+        let (gemini, _) =
+            convert_to_gemini_with(&anthropic, "claude-opus-5", SchemaFlavor::Antigravity);
+        let contents = gemini["contents"].as_array().unwrap();
+        assert_eq!(contents.len(), 1);
+        assert_eq!(contents[0]["role"], "model");
     }
 
     #[test]

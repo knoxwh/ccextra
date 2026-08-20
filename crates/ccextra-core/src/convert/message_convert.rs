@@ -13,12 +13,12 @@ const THOUGHT_SIGNATURE_SENTINEL: &str = "skip_thought_signature_validator";
 /// 转换 Anthropic messages 为 Gemini contents
 ///
 /// original_to_short: 原始工具名 → 上游清洗短名(本轮 tools 声明)
-/// preserve_signed_thinking: 保留带非空 signature 的 thinking 块
-/// (对齐 CPA antigravity 翻译器;Gemini 直连非 compat 路径全丢)
+/// antigravity: Antigravity 语义(保留带非空 signature 的 thinking 块,
+/// 工具图嵌进 functionResponse.parts);Gemini 直连保持兄弟 inline_data
 pub fn convert_messages(
     messages: &[Value],
     original_to_short: &HashMap<String, String>,
-    preserve_signed_thinking: bool,
+    antigravity: bool,
 ) -> Vec<Value> {
     let mut contents = Vec::new();
 
@@ -27,21 +27,15 @@ pub fn convert_messages(
 
         match role {
             "user" => {
-                let parts = convert_content_to_parts(
-                    &msg["content"],
-                    original_to_short,
-                    preserve_signed_thinking,
-                );
+                let parts =
+                    convert_content_to_parts(&msg["content"], original_to_short, antigravity);
                 if !parts.is_empty() {
                     contents.push(json!({ "role": "user", "parts": parts }));
                 }
             }
             "assistant" => {
-                let parts = convert_content_to_parts(
-                    &msg["content"],
-                    original_to_short,
-                    preserve_signed_thinking,
-                );
+                let parts =
+                    convert_content_to_parts(&msg["content"], original_to_short, antigravity);
                 if !parts.is_empty() {
                     contents.push(json!({ "role": "model", "parts": parts }));
                 }
@@ -109,7 +103,7 @@ fn system_reminder_text(content: &Value) -> Option<String> {
 fn convert_content_to_parts(
     content: &Value,
     original_to_short: &HashMap<String, String>,
-    preserve_signed_thinking: bool,
+    antigravity: bool,
 ) -> Vec<Value> {
     let mut parts = Vec::new();
 
@@ -121,12 +115,7 @@ fn convert_content_to_parts(
         }
         Value::Array(blocks) => {
             for block in blocks {
-                append_block_parts(
-                    &mut parts,
-                    block,
-                    original_to_short,
-                    preserve_signed_thinking,
-                );
+                append_block_parts(&mut parts, block, original_to_short, antigravity);
             }
         }
         _ => {}
@@ -140,7 +129,7 @@ fn append_block_parts(
     parts: &mut Vec<Value>,
     block: &Value,
     original_to_short: &HashMap<String, String>,
-    preserve_signed_thinking: bool,
+    antigravity: bool,
 ) {
     let Some(block_type) = block.get("type").and_then(|t| t.as_str()) else {
         return;
@@ -158,7 +147,7 @@ fn append_block_parts(
         // thinking 块默认丢弃(Gemini 非 compat 路径);Antigravity 保留带签名块
         // (对齐 CPA antigravity 翻译器,空签名块跳过不转文本)
         "thinking" => {
-            if !preserve_signed_thinking {
+            if !antigravity {
                 return;
             }
             let text = block.get("thinking").and_then(|t| t.as_str()).unwrap_or("");
@@ -219,16 +208,43 @@ fn append_block_parts(
                 .unwrap_or_else(|| sanitize_function_name(&func_name));
 
             let (result, images) = convert_tool_result_content(block.get("content"));
-            parts.push(json!({
-                "functionResponse": {
-                    "name": func_name,
-                    "response": { "result": result }
-                }
-            }));
-            for (mime_type, data) in images {
+            // 对齐 CPA fixCLIToolResponse 归一化:Antigravity 把工具图嵌进
+            // functionResponse.parts(inlineData 驼峰 + 显式 mimeType,缺省
+            // image/png——Cloud Code Assist 忽略无 mimeType 的 inlineData),
+            // Gemini 直连保持 sibling inline_data
+            if antigravity && !images.is_empty() {
+                let image_parts: Vec<Value> = images
+                    .into_iter()
+                    .map(|(mime_type, data)| {
+                        let mime_type = if mime_type.is_empty() {
+                            "image/png".to_string()
+                        } else {
+                            mime_type
+                        };
+                        json!({
+                            "inlineData": { "mimeType": mime_type, "data": data }
+                        })
+                    })
+                    .collect();
                 parts.push(json!({
-                    "inline_data": { "mime_type": mime_type, "data": data }
+                    "functionResponse": {
+                        "name": func_name,
+                        "response": { "result": result },
+                        "parts": image_parts
+                    }
                 }));
+            } else {
+                parts.push(json!({
+                    "functionResponse": {
+                        "name": func_name,
+                        "response": { "result": result }
+                    }
+                }));
+                for (mime_type, data) in images {
+                    parts.push(json!({
+                        "inline_data": { "mime_type": mime_type, "data": data }
+                    }));
+                }
             }
         }
         "image" => {
@@ -454,6 +470,28 @@ mod tests {
         );
         assert_eq!(parts[1]["inline_data"]["mime_type"], "image/png");
         assert_eq!(parts[1]["inline_data"]["data"], "AAAA");
+    }
+
+    #[test]
+    fn test_convert_messages_antigravity_nests_tool_images() {
+        let messages = vec![json!({
+            "role": "user",
+            "content": [{
+                "type": "tool_result",
+                "tool_use_id": "Read-1",
+                "content": [
+                    {"type": "text", "text": "see image"},
+                    {"type": "image", "source": {"type": "base64", "media_type": "image/png", "data": "AAAA"}}
+                ]
+            }]
+        })];
+        let contents = convert_messages(&messages, &HashMap::new(), true);
+        let parts = contents[0]["parts"].as_array().unwrap();
+        assert_eq!(parts.len(), 1);
+        let fr = &parts[0]["functionResponse"];
+        assert_eq!(fr["parts"].as_array().unwrap().len(), 1);
+        assert_eq!(fr["parts"][0]["inlineData"]["mimeType"], "image/png");
+        assert_eq!(fr["parts"][0]["inlineData"]["data"], "AAAA");
     }
 
     #[test]
