@@ -46,7 +46,10 @@ OpenAI `/v1/responses` 协议(Codex CLI 默认)。请求体用顶层 `instructio
 发往上游的真实模型名,与入站 alias 可能不同。
 
 **按协议 UA 分流**  
-上游请求按协议+模型分流 User-Agent / Originator:仅 responses + `*gpt*`(大小写不敏感)用 `codex-tui/0.147.0 ...` 且带 `Originator: codex_cli_rs`;antigravity 用固定 `antigravity/hub/...`(非 antigravity UA 上游直接 404);claude / chat / 非 gpt 的 responses / gemini 用 `claude-cli/2.1.234`,不带 Originator。antigravity 信封里另有 `userAgent=antigravity`,与 HTTP 头不是同一字段。部分上游按 UA 识别客户端并分流缓存/特性,reqwest 默认 UA 会被判为非官方客户端。
+上游请求按协议+模型分流 User-Agent / Originator:仅 responses + `*gpt*`(大小写不敏感)用 `codex-tui/0.147.0 ...` 且带 `Originator: codex_cli_rs`;chat 或 responses + `*grok*` 用 `grok-shell/{ver} ({os}; {arch})`(对齐 grok-build 默认 UA);antigravity 用固定 `antigravity/hub/...`(非 antigravity UA 上游直接 404);其余(claude / 非 grok 的 chat / 非 gpt 非 grok 的 responses / gemini)用 `claude-cli/2.1.234`,不带 Originator。antigravity 信封里另有 `userAgent=antigravity`,与 HTTP 头不是同一字段。部分上游按 UA 识别客户端并分流缓存/特性,reqwest 默认 UA 会被判为非官方客户端。
+
+**grok CLI 身份头**  
+chat/responses + grok 发 `X-XAI-Token-Auth=xai-grok-cli`、`x-grok-client-version`、`x-grok-client-identifier=grok-shell`、`x-grok-model-override`,以及有会话时的 `x-grok-conv-id`。`x-grok-doom-loop-check` 仅 responses。不发 `req-id` / `session-id` / `agent-id` / `turn-idx`(无官方会话计数源;conv-id 已承担粘性)。
 
 **claude 直通头重建**  
 claude 路径的 `anthropic-beta` 头按 body 条件重建(基础集 `claude-code-20250219` + thinking 无 display → `redact-thinking` / tools → `advanced-tool-use` / `effort-2025-11-24` / speed=fast → `fast-mode`),再追加 caller 自带 beta(去重)。`anthropic-version`/`x-app`/`x-stainless-*` 等身份头仅透传(有就转发,没有不补)。与直通头重建中转场景一致。
@@ -122,7 +125,7 @@ responses 路径下,上游模型名以 `gpt` 开头(不区分大小写)时,拼�
 注:早期版本的 `messages[0].content` SHA-256 兜底已删除——`messages[0]` 会被每请求注入的 system-reminder 与上下文压缩改变,不是稳定身份。
 
 **prompt_cache_key**  
-OpenAI chat/responses 的缓存桶标识。对齐 codex CLI 0.147 `prompt_cache_key()`:key = session_id 裸值(取代旧版 `UUIDv5(NameSpaceOID, "cli-proxy-api:codex:claude-code" \0 模型 \0 "claude:<会话>:agent:<agent>")` 派生)。provider 级开关(配置 `prompt_cache_key`,默认 false),仅 openai_chat / openai_responses 生效。无 Claude Code 会话 ID 或 body 已有 key 时不注入。gemini/antigravity 路径不注入。
+OpenAI chat/responses 的缓存桶标识。对齐 codex CLI 0.147 `prompt_cache_key()`:key = session_id 裸值(取代旧版 `UUIDv5(NameSpaceOID, "cli-proxy-api:codex:claude-code" \0 模型 \0 "claude:<会话>:agent:<agent>")` 派生)。provider 级开关(配置 `prompt_cache_key`,默认 false),仅 openai_chat / openai_responses 生效。chat + grok 跳过注入(官方 CLI 不把该字段映射上线,粘性走头 `x-grok-conv-id`);responses + grok 开关开时仍注入(对齐 grok-build `forwards_prompt_cache_key` 仅 Responses)。grok 判定看 payload 后出站 model。openai 转换丢未知顶层字段,管线转换后写回入站非空 key。payload / 入站已有非空 key 不覆盖、不硬剥。无 Claude Code 会话 ID 或 body 已有 key 时不注入。gemini/antigravity 路径不注入。
 
 ## 响应流式
 

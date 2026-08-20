@@ -128,7 +128,7 @@ Claude Code → ccextra:8222
 5. normalize_target_post (仅 openai) + drift 观测 (gemini/antigravity 跳过)
 6. Payload 参数覆盖 (通配匹配，可限定协议；claude 直通须显式 protocol)
 7. 剥离 prompt_cache_retention (非 claude 路径)
-8. prompt_cache_key 注入 (provider 级开关,仅 openai 协议)
+8. prompt_cache_key 注入 (provider 级开关,仅 openai;chat+grok 跳过,见 §12;grok 判定用 payload 后出站 model)
 9. 诊断落盘 (可选) + claude 直通: anthropic-beta 重建 + 身份头透传
 10. 统一走 UpstreamClient.request (按协议取 URL/UA;多 base_url 按序回退)
 11. 响应转发 (流式 SSE 五臂, gemini/antigravity 共用状态机 / 非流: claude 字节直通, 其余转回 anthropic; 上游错误转 anthropic 形状)
@@ -211,3 +211,50 @@ reasoning replay 对齐 CPA 的 xAI/codex/antigravity reasoning replay 实现:
 - responses 协议对齐 applyCodexReasoningReplayCacheRequired / cacheCodexReasoningReplayFromCompleted:来源协议 FormatClaude 不限模型(ccextra 入站恒为 anthropic 故全部启用);reasoning 是服务器端状态(store=false),上游不保留须回放 encrypted_content,否则模型丢失决策记忆重复发工具调用
 - antigravity 协议对齐 prepareAntigravityGeminiReasoningReplayPayload / cacheAntigravityReasoningReplayFromResponse:gemini/flash/agent 模型启用(对齐 antigravityUsesReasoningReplayCache),claude 模型不启用;注入目标为信封内层 request.contents
 - 实现包含:流式 output_item.done 收集、completed 补空 output、归一化提取(reasoning/message/function_call/custom_tool_call 最小形状+锚点检测)、过滤(去重+对齐+匹配 output)、注入(call_id 双候选+插入位置计算)、TTL 1h 滑动续期、400 invalid signature 清缓存、缓存 key "{model}:{session}"
+
+## 12. Grok 客户端对齐
+
+对照 grok-build `xai-grok-sampler`（`GrokRequestHeaders`、`chat_completion_stream`、`create_response_stream`）、`ApiBackend::forwards_prompt_cache_key()`（仅 Responses）以及 xAI 指南：chat 粘性靠头 `x-grok-conv-id`，responses 靠 body `prompt_cache_key`。
+
+手术对齐，不完整克隆 grok-build 每请求头。config 的 `prompt_cache_key` 开关不注释、不改 schema。
+
+### 12.1 触发与范围
+
+`is_grok_model`（模型名含 `grok`，大小写不敏感）且协议为 `openai_chat` 或 `openai_responses`。判定用 payload 后出站 `body["model"]`（空则回退 `route.upstream_model`），与 `UpstreamClient.request` 读的出站 model 一致。非 grok（codex / gpt / claude / gemini / antigravity）零改动。
+
+### 12.2 出站矩阵
+
+| | chat+grok | responses+grok |
+|---|---|---|
+| UA | `grok-shell/1.0.5 ({os}; {arch})` | 同左（已有） |
+| `x-grok-conv-id` | `extract_claude_code_session` 原样；空则省略 | 同左 |
+| `X-XAI-Token-Auth` / `x-grok-client-version` / `x-grok-client-identifier` / `x-grok-model-override` | 补 | 已有 |
+| `x-grok-doom-loop-check=1024` | 不发 | 已有（流/非流都发） |
+| body `prompt_cache_key` | 开关开也不注入 | 开关开仍注入 |
+| `x-grok-req-id` / `x-grok-session-id` / `x-grok-agent-id` / `x-grok-turn-idx` | 不发 | 不发 |
+| Codex `session-id` / `thread-id` | 不发 | 已有，不动 |
+
+**conv-id 值源。** 官方主路径 `conv_id = session_info.id`（`new_session_inner`：`_meta.sessionId` 合法 UUID 原样，否则 `Uuid::now_v7()`，整会话复用）。ccextra 永远没有 grok-shell ACP session。值 = `extract_claude_code_session` 原样（头 `x-claude-code-session-id`，否则 `metadata.user_id` `_session_<uuid>` / JSON `session_id`）。不 UUIDv5、不假 v7。空/缺省略头（官方 sampler 空串也发；手术取舍）。不双写 `x-grok-session-id`（官方主路径两字段同值，都是 `session_info.id`；粘性只放 conv-id）。
+
+### 12.3 实现落点
+
+- `upstream.rs` `user_agent`：`OpenAiChat` + grok 走 `grok_cli_ua()`。gpt 走 chat 仍 `claude-cli`。Originator 仍只 responses+gpt。
+- `upstream.rs` 抽纯函数供单测：`grok_cli_headers(protocol, upstream_model, session_id: Option<&str>) -> Vec<(name, value)>`。非 grok 或非 chat/responses 返回空。grok：身份四头（Token-Auth=`xai-grok-cli` / version=`1.0.5` / identifier=`grok-shell` / 模型非空才 `x-grok-model-override`）；`session_id` 非空才 `x-grok-conv-id`（trim 后空视同无）；doom-loop=`1024` 仅 responses（流/非流都发，维持现状）。`request()` 调该函数再 `header`。
+- `http.rs` 注入闸门：`provider_prompt_cache_key && openai && !(chat && grok)`，grok 看 payload 后出站 model。`inject_prompt_cache_key` 函数体不改。payload / 入站已有非空 key 不覆盖、不硬剥。session 派发（chat+grok 已传 `cc_session`）跟同一出站 model。
+- openai 转换器重建 body，丢未知顶层字段。`http.rs` 转换前保存入站非空 `prompt_cache_key`，转换后、payload 前原样写回（payload 仍可覆盖）。不改 `to_openai_chat` / `to_openai_responses` / `session.rs` / provider schema。
+
+### 12.4 非目标
+
+不造 `req-id` / `agent-id` / `turn-idx`（无对等会话计数，空头或随机 id 可能打散亲和）。不把 Claude session 塞进 `x-grok-session-id`。不把 Claude session 派生为 grok UUID。空 session 不发空串 conv-id。不硬剥 chat body 已有 `prompt_cache_key`。不改 doom-loop 窗口（硬编码 1024），不改成仅流式。
+
+### 12.5 测试
+
+- 扩 `test_user_agent_per_protocol`：chat+grok = grok-shell；chat+gpt 仍 claude-cli。
+- `grok_cli_headers`：chat+grok 有身份四头、无 doom-loop；responses+grok 另带 doom-loop；chat+gpt 空。有 session：`x-grok-conv-id` 原样。空 / `None` / 空白：无 conv-id，身份头仍在。
+- 注入闸门四格：chat+grok 假；responses+grok 真；chat+非 grok 真；开关关一律假。另：chat+grok 开关开且 body 已有非空 key → 保留、不剥。
+- HTTP mock chat+grok：UA `grok-shell/1.0.5 (... )`；头含 `X-XAI-Token-Auth=xai-grok-cli`、`x-grok-client-version=1.0.5`、`x-grok-client-identifier=grok-shell`、`x-grok-model-override`；有 session 时 `x-grok-conv-id`；无 `x-grok-doom-loop-check` / `req-id` / `session-id` / `agent-id` / `turn-idx`。开关开 body 无 `prompt_cache_key`。responses+grok 开关开 body 有 key。
+- HTTP mock payload 把 gpt 改 grok：chat 不注入、有 conv-id、UA/头跟 grok。入站 anthropic `prompt_cache_key` 到出站 body 原样保留（chat+grok 不剥；responses 不改写成 session）。
+
+### 12.6 风险
+
+chat UA 从 `claude-cli` 换成 `grok-shell`，网关按 UA 分流时旧前缀 miss 一轮，即对齐目的。Token-Auth 对 grok 一律带（官方仅 cli chat proxy URL 注入；ccextra responses 已一律带，chat 跟同一策略）。doom-loop 官方挂 `create_response_stream`；ccextra responses+grok 非流也发，维持现状。responses 双键：开关开时 `prompt_cache_key` 与 conv-id 都是 Claude session，官方「body key 覆盖 conv-id 路由」无意义；payload 已有**不同** key 时可能分流，12.4 已锁不硬剥。第三方兼容上游若拒未知头，与现 responses+grok 同一暴露面。
