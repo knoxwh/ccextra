@@ -49,6 +49,7 @@ tracing-subscriber = { version = "0.3", features = ["env-filter", "json", "time"
 # Crypto (for session key derivation)
 sha2 = "0.10"
 hex = "0.4"
+base64 = "0.22"
 
 # Secret key hashing (明文自动转 bcrypt)
 bcrypt = "0.15"

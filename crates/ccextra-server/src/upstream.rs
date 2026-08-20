@@ -56,7 +56,9 @@ fn endpoint_path(protocol: Protocol, is_stream: bool) -> String {
     }
 }
 
-/// Grok CLI 身份头常量(对齐 grok-build xai-grok-sampler client.rs)
+/// Grok CLI 身份头常量
+/// Token-Auth 对齐 grok-build GrokAuthCredentials (`xai-grok-cli`);
+/// version/identifier 对齐 grok-shell,不在 sampler GrokRequestHeaders 里
 const GROK_TOKEN_AUTH: &str = "xai-grok-cli";
 const GROK_CLIENT_VERSION: &str = "1.0.5";
 const GROK_CLIENT_IDENTIFIER: &str = "grok-shell";
@@ -87,12 +89,46 @@ pub(crate) fn is_grok_model(upstream_model: &str) -> bool {
     upstream_model.to_ascii_lowercase().contains("grok")
 }
 
+/// grok chat/responses 出站头(手术对齐 grok-build)
+/// Token-Auth/version/identifier 来自 GrokAuthCredentials + grok-shell;
+/// conv-id/model-override 来自 GrokRequestHeaders(不发 req-id/session-id/agent-id/turn-idx)
+/// 非 grok 或非 chat/responses 返回空,conv-id 仅 session trim 非空才带,doom-loop 仅 responses
+fn grok_cli_headers(
+    protocol: Protocol,
+    upstream_model: &str,
+    session_id: Option<&str>,
+) -> Vec<(&'static str, String)> {
+    if !matches!(protocol, Protocol::OpenAiChat | Protocol::OpenAiResponses)
+        || !is_grok_model(upstream_model)
+    {
+        return Vec::new();
+    }
+    let mut headers = vec![
+        ("X-XAI-Token-Auth", GROK_TOKEN_AUTH.to_string()),
+        ("x-grok-client-version", GROK_CLIENT_VERSION.to_string()),
+        (
+            "x-grok-client-identifier",
+            GROK_CLIENT_IDENTIFIER.to_string(),
+        ),
+        ("x-grok-model-override", upstream_model.to_string()),
+    ];
+    if let Some(sid) = session_id {
+        if !sid.trim().is_empty() {
+            // 原样发出;trim 只判断空,不改值
+            headers.push(("x-grok-conv-id", sid.to_string()));
+        }
+    }
+    if matches!(protocol, Protocol::OpenAiResponses) {
+        headers.push(("x-grok-doom-loop-check", "1024".to_string()));
+    }
+    headers
+}
+
 /// 按协议+模型取 User-Agent(对齐上游期望的客户端标识)
 ///
-/// 仅 responses + *gpt* 用 Codex UA;responses + *grok* 用 Grok CLI UA
-/// (对齐 grokbuild-proxy DefaultUserAgent);其余(含 responses 上的其他模型)
-/// 用 claude-cli。部分上游按 UA 分流缓存/特性,reqwest 默认 UA
-/// 会被识别为非官方客户端。
+/// 仅 responses + *gpt* 用 Codex UA;chat 或 responses + *grok* 用 Grok CLI UA
+/// (对齐 grok-shell `{name}/{ver} ({os}; {arch})`);其余用 claude-cli
+/// 部分上游按 UA 分流缓存/特性,reqwest 默认 UA 会被识别为非官方客户端。
 fn user_agent(protocol: Protocol, upstream_model: &str) -> &'static str {
     const CLAUDE_CLI: &str = "claude-cli/2.1.234";
     const CODEX_TUI: &str =
@@ -101,7 +137,9 @@ fn user_agent(protocol: Protocol, upstream_model: &str) -> &'static str {
         // Antigravity 上游按 UA 识别客户端,非 antigravity UA 直接 404
         Protocol::Antigravity => crate::antigravity::constants::REQUEST_UA,
         Protocol::OpenAiResponses if is_gpt_model(upstream_model) => CODEX_TUI,
-        Protocol::OpenAiResponses if is_grok_model(upstream_model) => grok_cli_ua(),
+        Protocol::OpenAiChat | Protocol::OpenAiResponses if is_grok_model(upstream_model) => {
+            grok_cli_ua()
+        }
         _ => CLAUDE_CLI,
     }
 }
@@ -226,37 +264,18 @@ impl UpstreamClient {
             }
         }
 
-        // grok 模型会话路由 + CLI 身份头 + doom loop 检测(对齐 grokbuild-proxy headers.go + grok-build client.rs)
-        // - x-grok-conv-id:同一会话路由到同一服务器(缓存亲和)
-        // - X-XAI-Token-Auth / x-grok-client-version / x-grok-client-identifier /
-        //   x-grok-model-override:Grok Build CLI 身份,网关按此识别合法客户端
-        // - x-grok-doom-loop-check:1024,启用死循环检测(硬编码对齐 grok-build 默认窗口)
-        // 仅 responses 协议补完整身份头(chat 协议的 c-grok 保持原行为)
-        if matches!(protocol, Protocol::OpenAiChat | Protocol::OpenAiResponses)
-            && is_grok_model(upstream_model)
-        {
+        // grok 模型:CLI 身份头 + conv-id +(仅 responses) doom-loop
+        let grok_headers = grok_cli_headers(protocol, upstream_model, session_id);
+        if !grok_headers.is_empty() {
             tracing::debug!(
                 session_id = ?session_id,
                 upstream_model = upstream_model,
                 protocol = ?protocol,
                 "upstream.rs grok 头注入"
             );
-            if let Some(sid) = session_id {
-                if !sid.trim().is_empty() {
-                    req = req.header("x-grok-conv-id", sid);
-                    tracing::debug!(sid = sid, "发送 x-grok-conv-id");
-                }
-            }
-            if matches!(protocol, Protocol::OpenAiResponses) {
-                req = req.header("X-XAI-Token-Auth", GROK_TOKEN_AUTH);
-                req = req.header("x-grok-client-version", GROK_CLIENT_VERSION);
-                req = req.header("x-grok-client-identifier", GROK_CLIENT_IDENTIFIER);
-                if !upstream_model.is_empty() {
-                    req = req.header("x-grok-model-override", upstream_model);
-                }
-                // doom loop 检测头(对齐 grok-build client.rs L1420:policy.window_tokens)
-                req = req.header("x-grok-doom-loop-check", "1024");
-            }
+        }
+        for (name, value) in grok_headers {
+            req = req.header(name, value);
         }
 
         for (name, value) in extra_headers {
@@ -325,6 +344,10 @@ mod tests {
             user_agent(Protocol::OpenAiResponses, "grok-4.6"),
             grok_cli_ua()
         );
+        assert_eq!(user_agent(Protocol::OpenAiChat, "grok-4.6"), grok_cli_ua());
+        assert_eq!(user_agent(Protocol::OpenAiChat, "Grok-4.6"), grok_cli_ua());
+        // chat+gpt 仍 claude-cli(回归,已有 gpt-5.6-terra 断言;再锁大小写)
+        assert_eq!(user_agent(Protocol::OpenAiChat, "GPT-4"), CLAUDE_CLI);
         // UA 格式: grok-shell/{version} ({os}; {arch}),platform 运行时取真实值
         let ua = grok_cli_ua();
         assert!(ua.starts_with("grok-shell/1.0.5 ("));
@@ -339,6 +362,101 @@ mod tests {
         assert!(is_grok_model("grok-4.6"));
         assert!(is_grok_model("Grok-4.6"));
         assert!(!is_grok_model("gpt-5.6"));
+    }
+
+    fn grok_header_map(
+        protocol: Protocol,
+        model: &str,
+        session: Option<&str>,
+    ) -> std::collections::HashMap<String, String> {
+        grok_cli_headers(protocol, model, session)
+            .into_iter()
+            .map(|(k, v)| (k.to_string(), v))
+            .collect()
+    }
+
+    fn assert_identity(h: &std::collections::HashMap<String, String>, model: &str) {
+        assert_eq!(
+            h.get("X-XAI-Token-Auth").map(String::as_str),
+            Some("xai-grok-cli")
+        );
+        assert_eq!(
+            h.get("x-grok-client-version").map(String::as_str),
+            Some("1.0.5")
+        );
+        assert_eq!(
+            h.get("x-grok-client-identifier").map(String::as_str),
+            Some("grok-shell")
+        );
+        assert_eq!(
+            h.get("x-grok-model-override").map(String::as_str),
+            Some(model)
+        );
+        assert!(!h.contains_key("x-grok-req-id"));
+        assert!(!h.contains_key("x-grok-session-id"));
+        assert!(!h.contains_key("x-grok-agent-id"));
+        assert!(!h.contains_key("x-grok-turn-idx"));
+    }
+
+    #[test]
+    fn test_grok_cli_headers_chat_has_identity_no_doom_loop() {
+        let h = grok_header_map(Protocol::OpenAiChat, "grok-4.6", Some("sess-abc"));
+        assert_identity(&h, "grok-4.6");
+        assert_eq!(
+            h.get("x-grok-conv-id").map(String::as_str),
+            Some("sess-abc")
+        );
+        assert!(!h.contains_key("x-grok-doom-loop-check"));
+    }
+
+    #[test]
+    fn test_grok_cli_headers_responses_has_doom_loop() {
+        let h = grok_header_map(Protocol::OpenAiResponses, "grok-4.6", Some("sess-abc"));
+        assert_identity(&h, "grok-4.6");
+        assert_eq!(
+            h.get("x-grok-conv-id").map(String::as_str),
+            Some("sess-abc")
+        );
+        assert_eq!(
+            h.get("x-grok-doom-loop-check").map(String::as_str),
+            Some("1024")
+        );
+    }
+
+    #[test]
+    fn test_grok_cli_headers_chat_gpt_empty() {
+        assert!(grok_cli_headers(Protocol::OpenAiChat, "gpt-4", Some("sess")).is_empty());
+        assert!(
+            grok_cli_headers(Protocol::OpenAiResponses, "gpt-5.6-terra", Some("sess")).is_empty()
+        );
+        assert!(grok_cli_headers(Protocol::Claude, "grok-4.6", Some("sess")).is_empty());
+        assert!(grok_cli_headers(Protocol::Gemini, "grok-4.6", Some("sess")).is_empty());
+    }
+
+    #[test]
+    fn test_grok_cli_headers_empty_session_omits_conv_id() {
+        for session in [None, Some(""), Some("   ")] {
+            let h = grok_header_map(Protocol::OpenAiChat, "grok-4.6", session);
+            assert_identity(&h, "grok-4.6");
+            assert!(!h.contains_key("x-grok-conv-id"));
+            assert!(h.contains_key("X-XAI-Token-Auth"));
+        }
+    }
+
+    #[test]
+    fn test_grok_cli_headers_conv_id_is_raw_not_uuid() {
+        let raw = "user_session_not-a-uuid";
+        let h = grok_header_map(Protocol::OpenAiChat, "Grok-4.6", Some(raw));
+        assert_eq!(h.get("x-grok-conv-id").map(String::as_str), Some(raw));
+        let padded = "  sess-abc  ";
+        let h = grok_header_map(Protocol::OpenAiChat, "grok-4.6", Some(padded));
+        assert_eq!(h.get("x-grok-conv-id").map(String::as_str), Some(padded));
+    }
+
+    #[test]
+    fn test_grok_cli_headers_empty_model_skips_override() {
+        // 空模型名不含 grok,整组头都不发(override 无从谈起)
+        assert!(grok_cli_headers(Protocol::OpenAiChat, "", Some("sess")).is_empty());
     }
 
     #[test]

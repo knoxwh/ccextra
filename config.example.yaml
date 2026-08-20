@@ -48,6 +48,8 @@ providers:
     key: sk-xxx
     # 注入派生 prompt_cache_key(provider 级开关,默认 false)
     # key = 会话 ID 裸值(对齐 codex 0.147),确定性桶;仅 openai_chat/openai_responses 生效
+    # grok chat 不注入(粘性走 x-grok-conv-id);已有非空 key 不剥(转换后写回)。grok responses 开关开仍注入
+    # grok 判定看 payload 后出站 model
     prompt_cache_key: true
     models:
       - name: gpt-5.6-terra

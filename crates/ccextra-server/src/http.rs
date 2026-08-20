@@ -27,7 +27,8 @@ use ccextra_core::cache_stabilization::drift_detector::{
 };
 use ccextra_core::convert::{
     convert_passthrough, convert_to_openai_chat, convert_to_openai_responses,
-    is_thinking_signature_invalid, trim_encrypted_reasoning_items, ConvertError,
+    is_thinking_signature_invalid, sanitize_gpt_reasoning_items, trim_encrypted_reasoning_items,
+    ConvertError,
 };
 use ccextra_core::count_tokens::count_claude_input_tokens;
 use ccextra_core::normalize::{
@@ -52,7 +53,7 @@ use tokio::sync::RwLock;
 use crate::sse::parser::{SseEvent, SseParser};
 use crate::sse::replay_cache::StreamReplayExtractor;
 use crate::sse::SseStreamPin;
-use crate::upstream::UpstreamClient;
+use crate::upstream::{is_grok_model, UpstreamClient};
 
 /// 配置重载闭包类型
 pub type ReloadFn =
@@ -301,6 +302,36 @@ fn find_provider<'a>(providers: &'a [ProviderConfig], name: &str) -> Option<&'a 
     providers.iter().find(|p| p.name == name)
 }
 
+/// 解析 payload 后最终模型。仅 OpenAI 的无效覆盖回退路由模型并同步写回 body,
+/// 确保 Grok 判定与 UpstreamClient 读取的 model 一致；其余协议保留 payload 原语义。
+fn resolve_outbound_model(body: &mut Value, fallback: &str, protocol: Protocol) -> String {
+    match body
+        .get("model")
+        .and_then(|v| v.as_str())
+        .filter(|s| !s.trim().is_empty())
+    {
+        Some(model) => model.to_string(),
+        None => {
+            if matches!(protocol, Protocol::OpenAiChat | Protocol::OpenAiResponses) {
+                body["model"] = Value::String(fallback.to_string());
+            }
+            fallback.to_string()
+        }
+    }
+}
+
+/// prompt_cache_key 注入闸门:provider 开关 + openai 协议,chat+grok 跳过。
+/// 官方 CLI 不把该字段映射上 chat 线,粘性走 x-grok-conv-id。
+fn should_inject_prompt_cache_key(
+    provider_prompt_cache_key: bool,
+    protocol: Protocol,
+    upstream_model: &str,
+) -> bool {
+    provider_prompt_cache_key
+        && matches!(protocol, Protocol::OpenAiChat | Protocol::OpenAiResponses)
+        && !(matches!(protocol, Protocol::OpenAiChat) && is_grok_model(upstream_model))
+}
+
 /// 应用 payload 参数覆盖(支持 "*glm*" 通配;协议限定,缺省 = 所有协议)
 /// claude 直通默认不注入:必须显式声明 `protocol: claude` 才生效,
 /// 避免无协议规则误覆盖直通 body。
@@ -493,6 +524,12 @@ async fn handle_messages(
         .unwrap_or(false);
     // Claude Code 会话 ID 须在转换前提取(转换后 metadata 被丢弃),供 prompt_cache_key 用
     let cc_session = extract_claude_code_session(&headers, &body_json);
+    // openai 转换器重建 body,丢未知顶层字段;入站非空 prompt_cache_key 转换后原样写回
+    let inbound_prompt_cache_key = body_json
+        .get("prompt_cache_key")
+        .and_then(|v| v.as_str())
+        .filter(|s| !s.trim().is_empty())
+        .map(str::to_string);
 
     // 入站 Claude body 本地估算输入 token(对齐 ClaudeInputTokenState)。
     // 多数上游流中不带 usage(chat 只在最后 chunk 带,responses 只在流尾),
@@ -612,8 +649,42 @@ async fn handle_messages(
         }
     }
 
+    // openai 转换丢顶层未知字段;payload 前写回,payload 仍可覆盖
+    if matches!(
+        route.protocol,
+        Protocol::OpenAiChat | Protocol::OpenAiResponses
+    ) {
+        if let Some(key) = inbound_prompt_cache_key {
+            body_json["prompt_cache_key"] = Value::String(key);
+        }
+    }
+
     // 5. payload 参数覆盖(转换后注入;claude 直通需显式 protocol 才生效)
     apply_payload_overrides(&mut body_json, &model, route.protocol, &payload_rules);
+
+    // grok 判定与缓存闸门跟出站 model:payload 可把 gpt-* 改成 grok-*
+    // OpenAI payload 若把 model 置空/改成非字符串,回写路由模型,保证 body 与头部判定一致。
+    let outbound_model =
+        resolve_outbound_model(&mut body_json, &route.upstream_model, route.protocol);
+
+    // GPT/Codex 在最终 model 与 payload 落定后校验 reasoning 回放信封。
+    if matches!(route.protocol, Protocol::OpenAiResponses)
+        && outbound_model.to_ascii_lowercase().starts_with("gpt")
+    {
+        if let Some(obj) = body_json.as_object_mut() {
+            for key in [
+                "previous_response_id",
+                "generate",
+                "safety_identifier",
+                "stream_options",
+            ] {
+                obj.remove(key);
+            }
+        }
+        if sanitize_gpt_reasoning_items(&mut body_json) {
+            tracing::debug!("已清理无效 GPT reasoning encrypted_content");
+        }
+    }
 
     // 6. 对齐 StripPromptCacheRetention:openai 上游拒绝 prompt_cache_retention
     // (HTTP 400 "Unsupported parameter: prompt_cache_retention"),claude 直通保留
@@ -639,12 +710,8 @@ async fn handle_messages(
     drop(payload_rules);
     drop(providers);
 
-    // prompt_cache_key 注入(provider 级开关;仅 openai 协议;key=session_id,对齐 codex 0.147)
-    if provider_prompt_cache_key
-        && matches!(
-            route.protocol,
-            Protocol::OpenAiChat | Protocol::OpenAiResponses
-        )
+    // prompt_cache_key 注入(provider 级开关;仅 openai;chat+grok 跳过,对齐 grok-build)
+    if should_inject_prompt_cache_key(provider_prompt_cache_key, route.protocol, &outbound_model)
         && inject_prompt_cache_key(&mut body_json, cc_session.as_deref())
     {
         tracing::debug!("prompt_cache_key 已注入");
@@ -691,7 +758,7 @@ async fn handle_messages(
     // - session-id:会话级 UUID(整会话稳定,与 prompt_cache_key 解耦)
     // - thread-id:线程级 UUID(对齐上游请求关联/日志追踪)
     // grok 模型(chat/responses):session_id 用于 x-grok-conv-id 会话路由
-    let is_grok = route.upstream_model.to_ascii_lowercase().contains("grok");
+    let is_grok = is_grok_model(&outbound_model);
     let (session_id, thread_id) = if matches!(route.protocol, Protocol::OpenAiResponses) {
         (cc_session.as_deref(), extract_claude_code_thread(&headers))
     } else if is_grok && matches!(route.protocol, Protocol::OpenAiChat) {
@@ -1635,6 +1702,101 @@ data: {"type":"response.created","response":{"id":"resp_eof"}}"#
     }
 
     #[test]
+    fn test_should_inject_prompt_cache_key_matrix() {
+        // chat+grok 假
+        assert!(!should_inject_prompt_cache_key(
+            true,
+            Protocol::OpenAiChat,
+            "grok-4.6"
+        ));
+        assert!(!should_inject_prompt_cache_key(
+            true,
+            Protocol::OpenAiChat,
+            "Grok-4.6"
+        ));
+        // responses+grok 真
+        assert!(should_inject_prompt_cache_key(
+            true,
+            Protocol::OpenAiResponses,
+            "grok-4.6"
+        ));
+        // chat+非 grok 真
+        assert!(should_inject_prompt_cache_key(
+            true,
+            Protocol::OpenAiChat,
+            "gpt-4"
+        ));
+        // 开关关一律假
+        assert!(!should_inject_prompt_cache_key(
+            false,
+            Protocol::OpenAiChat,
+            "gpt-4"
+        ));
+        assert!(!should_inject_prompt_cache_key(
+            false,
+            Protocol::OpenAiResponses,
+            "grok-4.6"
+        ));
+        // 非 openai 假
+        assert!(!should_inject_prompt_cache_key(
+            true,
+            Protocol::Claude,
+            "grok-4.6"
+        ));
+    }
+
+    #[test]
+    fn test_chat_grok_gate_preserves_existing_prompt_cache_key() {
+        // 闸门跳过,不调用 inject;已有非空 key 不剥
+        let mut body = json!({"model": "grok-4.6", "prompt_cache_key": "user-key"});
+        if should_inject_prompt_cache_key(true, Protocol::OpenAiChat, "grok-4.6") {
+            inject_prompt_cache_key(&mut body, Some("sess-abc"));
+        }
+        assert_eq!(body["prompt_cache_key"], "user-key");
+    }
+
+    #[test]
+    fn test_openai_outbound_model_invalid_payload_falls_back_in_body() {
+        for protocol in [Protocol::OpenAiChat, Protocol::OpenAiResponses] {
+            for invalid in [
+                Value::String(String::new()),
+                Value::String("  ".to_string()),
+                Value::Null,
+                Value::Bool(true),
+            ] {
+                let mut body = json!({"model": invalid});
+                assert_eq!(
+                    resolve_outbound_model(&mut body, "grok-4.6", protocol),
+                    "grok-4.6"
+                );
+                assert_eq!(body["model"], "grok-4.6");
+            }
+        }
+    }
+
+    #[test]
+    fn test_non_openai_invalid_payload_model_keeps_body() {
+        for protocol in [Protocol::Claude, Protocol::Gemini, Protocol::Antigravity] {
+            let mut body = json!({"model": null});
+            assert_eq!(
+                resolve_outbound_model(&mut body, "claude-opus-5", protocol),
+                "claude-opus-5"
+            );
+            assert!(body["model"].is_null());
+        }
+    }
+
+    #[test]
+    fn test_outbound_model_keeps_nonempty_payload_override() {
+        let mut body = json!({"model": "grok-4.6"});
+        assert_eq!(
+            resolve_outbound_model(&mut body, "gpt-4", Protocol::OpenAiChat),
+            "grok-4.6"
+        );
+        assert_eq!(body["model"], "grok-4.6");
+    }
+
+    #[test]
     fn test_claude_relay_beta_rebuild_with_thinking_and_tools() {
         // thinking(无 display)→ redact-thinking;tools → advanced-tool-use
         let headers = headers_with(&[("anthropic-beta", "interleaved-thinking-2025-05-14")]);
@@ -1811,9 +1973,9 @@ models:
         assert!(String::from_utf8_lossy(&response_body).contains("retry ok"));
     }
 
-    /// Responses 400 invalid_encrypted_content:剥离 encrypted_content 后重试一次。
+    /// GPT Responses 在请求前剥离格式无效的 encrypted_content，避免触发 400 重试。
     #[tokio::test]
-    async fn test_openai_responses_retries_after_invalid_encrypted_content() {
+    async fn test_openai_responses_sanitizes_invalid_encrypted_content_before_request() {
         let attempts = Arc::new(std::sync::atomic::AtomicUsize::new(0));
         let handler_attempts = Arc::clone(&attempts);
         let saw_encrypted = Arc::new(std::sync::atomic::AtomicBool::new(false));
@@ -1827,7 +1989,7 @@ models:
                 let saw_encrypted = Arc::clone(&handler_encrypted);
                 let saw_trimmed = Arc::clone(&handler_trimmed);
                 async move {
-                    let n = attempts.fetch_add(1, Ordering::SeqCst);
+                    attempts.fetch_add(1, Ordering::SeqCst);
                     let parsed: Value = serde_json::from_slice(&body).unwrap_or(json!({}));
                     let has_enc = parsed
                         .get("input")
@@ -1839,8 +2001,8 @@ models:
                             })
                         })
                         .unwrap_or(false);
-                    if n == 0 {
-                        saw_encrypted.store(has_enc, Ordering::SeqCst);
+                    if has_enc {
+                        saw_encrypted.store(true, Ordering::SeqCst);
                         (
                             StatusCode::BAD_REQUEST,
                             [(header::CONTENT_TYPE, "application/json")],
@@ -1854,7 +2016,7 @@ models:
                             .to_string(),
                         )
                     } else {
-                        saw_trimmed.store(!has_enc, Ordering::SeqCst);
+                        saw_trimmed.store(true, Ordering::SeqCst);
                         (
                             StatusCode::OK,
                             [(header::CONTENT_TYPE, "application/json")],
@@ -1923,17 +2085,185 @@ models:
         let response_body = to_bytes(response.into_body(), 1024 * 1024).await.unwrap();
         server.abort();
 
-        assert_eq!(attempts.load(Ordering::SeqCst), 2);
+        assert_eq!(attempts.load(Ordering::SeqCst), 1);
         assert!(
-            saw_encrypted.load(Ordering::SeqCst),
-            "首次应带 encrypted_content"
+            !saw_encrypted.load(Ordering::SeqCst),
+            "首次请求不应带 encrypted_content"
         );
         assert!(
             saw_trimmed.load(Ordering::SeqCst),
-            "重试应已剥离 encrypted_content"
+            "请求应在发送前剥离无效 encrypted_content"
         );
         assert_eq!(status, StatusCode::OK);
         assert!(String::from_utf8_lossy(&response_body).contains("trimmed ok"));
+    }
+
+    #[tokio::test]
+    async fn test_openai_responses_retries_valid_encrypted_content_after_upstream_rejection() {
+        const VALID: &str = "gAAAAAAAAAAAAQIDBAUGBwgJCgsMDQ4PEBESExQVFhcYGRobHB0eHyAhIiMkJSYnKCkqKywtLi8wMTIzNDU2Nzg5Ojs8PT4_QA";
+        let attempts = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+        let saw_encrypted = Arc::new(std::sync::atomic::AtomicBool::new(false));
+        let saw_trimmed = Arc::new(std::sync::atomic::AtomicBool::new(false));
+        let handler_attempts = Arc::clone(&attempts);
+        let handler_encrypted = Arc::clone(&saw_encrypted);
+        let handler_trimmed = Arc::clone(&saw_trimmed);
+        let upstream = Router::new().route(
+            "/responses",
+            post(move |body: axum::body::Bytes| {
+                let attempts = Arc::clone(&handler_attempts);
+                let saw_encrypted = Arc::clone(&handler_encrypted);
+                let saw_trimmed = Arc::clone(&handler_trimmed);
+                async move {
+                    let parsed: Value = serde_json::from_slice(&body).unwrap();
+                    let has_encrypted = parsed["input"].as_array().unwrap().iter().any(|item| {
+                        item["type"] == "reasoning" && item.get("encrypted_content").is_some()
+                    });
+                    if attempts.fetch_add(1, Ordering::SeqCst) == 0 {
+                        saw_encrypted.store(has_encrypted, Ordering::SeqCst);
+                        (
+                            StatusCode::BAD_REQUEST,
+                            [(header::CONTENT_TYPE, "application/json")],
+                            r#"{"error":{"code":"invalid_encrypted_content"}}"#,
+                        )
+                    } else {
+                        saw_trimmed.store(!has_encrypted, Ordering::SeqCst);
+                        (
+                            StatusCode::OK,
+                            [(header::CONTENT_TYPE, "application/json")],
+                            r#"{"type":"response.completed","response":{"id":"resp_retry","model":"gpt-5","output":[],"usage":{"input_tokens":1,"output_tokens":1}}}"#,
+                        )
+                    }
+                }
+            }),
+        );
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let upstream_addr = listener.local_addr().unwrap();
+        let server = tokio::spawn(async move { axum::serve(listener, upstream).await.unwrap() });
+
+        let state = mock_state();
+        let provider: ProviderConfig = serde_yaml::from_str(&format!(
+            "name: test-responses-retry\nprotocol: openai_responses\nbase_url: http://{}\nkey: sk-test\nproxy_url: direct\nmodels:\n  - name: gpt-5\n    alias: test-responses-retry\n",
+            upstream_addr
+        ))
+        .unwrap();
+        state.providers.write().await.push(provider);
+        let app = app(state);
+        let request = Request::builder()
+            .uri("/v1/messages")
+            .method("POST")
+            .header("content-type", "application/json")
+            .body(Body::from(
+                serde_json::to_vec(&json!({
+                    "model": "test-responses-retry", "max_tokens": 64, "stream": false,
+                    "messages": [
+                        {"role": "assistant", "content": [{"type": "thinking", "thinking": "t", "signature": VALID}]},
+                        {"role": "user", "content": "hi"}
+                    ]
+                }))
+                .unwrap(),
+            ))
+            .unwrap();
+        let response = app.oneshot(request).await.unwrap();
+        server.abort();
+
+        assert_eq!(response.status(), StatusCode::OK);
+        assert_eq!(attempts.load(Ordering::SeqCst), 2);
+        assert!(saw_encrypted.load(Ordering::SeqCst));
+        assert!(saw_trimmed.load(Ordering::SeqCst));
+    }
+
+    #[tokio::test]
+    async fn test_gpt_responses_strips_execute_only_payload_fields() {
+        let captured: Arc<StdMutex<Option<Value>>> = Arc::new(StdMutex::new(None));
+        let handler_captured = Arc::clone(&captured);
+        let upstream = Router::new().route(
+            "/responses",
+            post(move |body: axum::body::Bytes| {
+                let captured = Arc::clone(&handler_captured);
+                async move {
+                    *captured.lock().unwrap() = Some(serde_json::from_slice(&body).unwrap());
+                    (
+                        [(header::CONTENT_TYPE, "application/json")],
+                        json!({
+                            "type": "response.completed",
+                            "response": {
+                                "id": "resp_final",
+                                "model": "gpt-5",
+                                "output": [],
+                                "usage": {"input_tokens": 1, "output_tokens": 1}
+                            }
+                        })
+                        .to_string(),
+                    )
+                }
+            }),
+        );
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let upstream_addr = listener.local_addr().unwrap();
+        let server = tokio::spawn(async move {
+            axum::serve(listener, upstream).await.unwrap();
+        });
+
+        let state = mock_state();
+        let provider: ProviderConfig = serde_yaml::from_str(&format!(
+            r#"
+name: test-responses-final
+protocol: openai_responses
+base_url: "http://{}"
+key: sk-test
+proxy_url: "direct"
+models:
+  - name: gpt-5
+    alias: test-responses-final
+"#,
+            upstream_addr
+        ))
+        .unwrap();
+        state.providers.write().await.push(provider);
+        state.payload_rules.write().await.push(PayloadRule {
+            models: vec!["test-responses-final".into()],
+            protocol: Some(Protocol::OpenAiResponses),
+            params: json!({
+                "previous_response_id": "resp_previous",
+                "generate": true,
+                "safety_identifier": "safe-id",
+                "stream_options": {"include_usage": true},
+                "prompt_cache_retention": "24h",
+                "temperature": 0.1
+            })
+            .as_object()
+            .unwrap()
+            .clone(),
+        });
+        let app = app(state);
+        let request = Request::builder()
+            .uri("/v1/messages")
+            .method("POST")
+            .header("content-type", "application/json")
+            .body(Body::from(
+                serde_json::to_vec(&json!({
+                    "model": "test-responses-final",
+                    "max_tokens": 64,
+                    "messages": [{"role": "user", "content": "hi"}]
+                }))
+                .unwrap(),
+            ))
+            .unwrap();
+        let response = app.oneshot(request).await.unwrap();
+        server.abort();
+
+        assert_eq!(response.status(), StatusCode::OK);
+        let body = captured.lock().unwrap().clone().unwrap();
+        for key in [
+            "previous_response_id",
+            "generate",
+            "safety_identifier",
+            "stream_options",
+            "prompt_cache_retention",
+        ] {
+            assert!(body.get(key).is_none(), "{key} 不应发往 GPT Responses");
+        }
+        assert_eq!(body["temperature"], 0.1);
     }
 
     #[tokio::test]
@@ -2576,5 +2906,498 @@ models:
             serde_json::from_slice(&to_anthropic_error(b"<html>502 bad gateway</html>")).unwrap();
         assert_eq!(out["error"]["type"], "api_error");
         assert_eq!(out["error"]["message"], "<html>502 bad gateway</html>");
+    }
+
+    #[derive(Clone, Default)]
+    struct CapturedUpstream {
+        headers: Arc<StdMutex<Option<HeaderMap>>>,
+        body: Arc<StdMutex<Option<Value>>>,
+    }
+
+    impl CapturedUpstream {
+        fn record(&self, headers: HeaderMap, body: Bytes) {
+            *self.headers.lock().unwrap() = Some(headers);
+            *self.body.lock().unwrap() = serde_json::from_slice(&body).ok();
+        }
+        fn header(&self, name: &str) -> Option<String> {
+            self.headers.lock().unwrap().as_ref().and_then(|h| {
+                h.get(name)
+                    .and_then(|v| v.to_str().ok())
+                    .map(str::to_string)
+            })
+        }
+        fn has_header(&self, name: &str) -> bool {
+            self.headers
+                .lock()
+                .unwrap()
+                .as_ref()
+                .map(|h| h.contains_key(name))
+                .unwrap_or(false)
+        }
+        fn body(&self) -> Value {
+            self.body.lock().unwrap().clone().unwrap_or(json!({}))
+        }
+    }
+
+    #[tokio::test]
+    async fn test_chat_grok_headers_and_skips_prompt_cache_key() {
+        let captured = CapturedUpstream::default();
+        let handler_cap = captured.clone();
+        let upstream = Router::new().route(
+            "/chat/completions",
+            post(move |headers: HeaderMap, body: Bytes| {
+                let captured = handler_cap.clone();
+                async move {
+                    captured.record(headers, body);
+                    (
+                        StatusCode::OK,
+                        [(header::CONTENT_TYPE, "application/json")],
+                        json!({
+                            "id": "chatcmpl_grok",
+                            "model": "grok-4.6",
+                            "choices": [{
+                                "index": 0,
+                                "message": {"role": "assistant", "content": "ok"},
+                                "finish_reason": "stop"
+                            }],
+                            "usage": {"prompt_tokens": 1, "completion_tokens": 1}
+                        })
+                        .to_string(),
+                    )
+                }
+            }),
+        );
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let upstream_addr = listener.local_addr().unwrap();
+        let server = tokio::spawn(async move {
+            axum::serve(listener, upstream).await.unwrap();
+        });
+
+        let state = mock_state();
+        let provider_yaml = format!(
+            r#"
+name: test-grok-chat
+protocol: openai_chat
+base_url: "http://{}"
+key: sk-test
+proxy_url: "direct"
+prompt_cache_key: true
+models:
+  - name: grok-4.6
+    alias: test-grok-chat
+"#,
+            upstream_addr
+        );
+        let provider: ProviderConfig = serde_yaml::from_str(&provider_yaml).unwrap();
+        state.providers.write().await.push(provider);
+        let app = app(state);
+        let request = Request::builder()
+            .uri("/v1/messages")
+            .method("POST")
+            .header("content-type", "application/json")
+            .header("x-claude-code-session-id", "sess-abc-123")
+            .body(Body::from(
+                serde_json::to_vec(&json!({
+                    "model": "test-grok-chat",
+                    "max_tokens": 64,
+                    "stream": false,
+                    "messages": [{"role": "user", "content": "hi"}]
+                }))
+                .unwrap(),
+            ))
+            .unwrap();
+        let response = app.oneshot(request).await.unwrap();
+        let status = response.status();
+        server.abort();
+
+        assert_eq!(status, StatusCode::OK);
+        let ua = captured.header("user-agent").unwrap_or_default();
+        assert!(
+            ua.starts_with("grok-shell/1.0.5 ("),
+            "UA 应为 grok-shell,实际 {ua}"
+        );
+        assert_eq!(
+            captured.header("x-xai-token-auth").as_deref(),
+            Some("xai-grok-cli")
+        );
+        assert_eq!(
+            captured.header("x-grok-client-version").as_deref(),
+            Some("1.0.5")
+        );
+        assert_eq!(
+            captured.header("x-grok-client-identifier").as_deref(),
+            Some("grok-shell")
+        );
+        assert_eq!(
+            captured.header("x-grok-model-override").as_deref(),
+            Some("grok-4.6")
+        );
+        assert_eq!(
+            captured.header("x-grok-conv-id").as_deref(),
+            Some("sess-abc-123")
+        );
+        assert!(!captured.has_header("x-grok-doom-loop-check"));
+        assert!(!captured.has_header("x-grok-req-id"));
+        assert!(!captured.has_header("x-grok-session-id"));
+        assert!(!captured.has_header("x-grok-agent-id"));
+        assert!(!captured.has_header("x-grok-turn-idx"));
+        assert!(!captured.has_header("session-id"));
+        assert!(!captured.has_header("thread-id"));
+        assert!(
+            captured.body().get("prompt_cache_key").is_none(),
+            "chat+grok 开关开也不注入"
+        );
+    }
+
+    #[tokio::test]
+    async fn test_responses_grok_still_injects_prompt_cache_key() {
+        let captured = CapturedUpstream::default();
+        let handler_cap = captured.clone();
+        let upstream = Router::new().route(
+            "/responses",
+            post(move |headers: HeaderMap, body: Bytes| {
+                let captured = handler_cap.clone();
+                async move {
+                    captured.record(headers, body);
+                    (
+                        StatusCode::OK,
+                        [(header::CONTENT_TYPE, "application/json")],
+                        json!({
+                            "type": "response.completed",
+                            "response": {
+                                "id": "resp_grok",
+                                "model": "grok-4.6",
+                                "output": [{
+                                    "type": "message",
+                                    "content": [{"type": "output_text", "text": "ok"}]
+                                }],
+                                "usage": {"input_tokens": 1, "output_tokens": 1}
+                            }
+                        })
+                        .to_string(),
+                    )
+                }
+            }),
+        );
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let upstream_addr = listener.local_addr().unwrap();
+        let server = tokio::spawn(async move {
+            axum::serve(listener, upstream).await.unwrap();
+        });
+
+        let state = mock_state();
+        let provider_yaml = format!(
+            r#"
+name: test-grok-responses
+protocol: openai_responses
+base_url: "http://{}"
+key: sk-test
+proxy_url: "direct"
+prompt_cache_key: true
+models:
+  - name: grok-4.6
+    alias: test-grok-responses
+"#,
+            upstream_addr
+        );
+        let provider: ProviderConfig = serde_yaml::from_str(&provider_yaml).unwrap();
+        state.providers.write().await.push(provider);
+        let app = app(state);
+        let request = Request::builder()
+            .uri("/v1/messages")
+            .method("POST")
+            .header("content-type", "application/json")
+            .header("x-claude-code-session-id", "sess-abc-123")
+            .body(Body::from(
+                serde_json::to_vec(&json!({
+                    "model": "test-grok-responses",
+                    "max_tokens": 64,
+                    "stream": false,
+                    "messages": [{"role": "user", "content": "hi"}]
+                }))
+                .unwrap(),
+            ))
+            .unwrap();
+        let response = app.oneshot(request).await.unwrap();
+        let status = response.status();
+        server.abort();
+
+        assert_eq!(status, StatusCode::OK);
+        let ua = captured.header("user-agent").unwrap_or_default();
+        assert!(ua.starts_with("grok-shell/1.0.5 ("));
+        assert_eq!(
+            captured.header("x-xai-token-auth").as_deref(),
+            Some("xai-grok-cli")
+        );
+        assert_eq!(
+            captured.header("x-grok-doom-loop-check").as_deref(),
+            Some("1024")
+        );
+        assert_eq!(
+            captured.header("x-grok-conv-id").as_deref(),
+            Some("sess-abc-123")
+        );
+        assert!(!captured.has_header("x-grok-req-id"));
+        assert!(!captured.has_header("x-grok-session-id"));
+        assert!(!captured.has_header("x-grok-agent-id"));
+        assert!(!captured.has_header("x-grok-turn-idx"));
+        assert_eq!(captured.body()["prompt_cache_key"], "sess-abc-123");
+    }
+
+    #[tokio::test]
+    async fn test_chat_payload_override_gpt_to_grok_uses_outbound_model() {
+        let captured = CapturedUpstream::default();
+        let handler_cap = captured.clone();
+        let upstream = Router::new().route(
+            "/chat/completions",
+            post(move |headers: HeaderMap, body: Bytes| {
+                let captured = handler_cap.clone();
+                async move {
+                    captured.record(headers, body);
+                    (
+                        StatusCode::OK,
+                        [(header::CONTENT_TYPE, "application/json")],
+                        json!({
+                            "id": "chatcmpl_override",
+                            "model": "grok-4.6",
+                            "choices": [{
+                                "index": 0,
+                                "message": {"role": "assistant", "content": "ok"},
+                                "finish_reason": "stop"
+                            }],
+                            "usage": {"prompt_tokens": 1, "completion_tokens": 1}
+                        })
+                        .to_string(),
+                    )
+                }
+            }),
+        );
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let upstream_addr = listener.local_addr().unwrap();
+        let server = tokio::spawn(async move {
+            axum::serve(listener, upstream).await.unwrap();
+        });
+
+        let state = mock_state();
+        let provider_yaml = format!(
+            r#"
+name: test-gpt-to-grok
+protocol: openai_chat
+base_url: "http://{}"
+key: sk-test
+proxy_url: "direct"
+prompt_cache_key: true
+models:
+  - name: gpt-4
+    alias: test-gpt-to-grok
+"#,
+            upstream_addr
+        );
+        let provider: ProviderConfig = serde_yaml::from_str(&provider_yaml).unwrap();
+        state.providers.write().await.push(provider);
+        let mut params = serde_json::Map::new();
+        params.insert("model".into(), json!("grok-4.6"));
+        state.payload_rules.write().await.push(PayloadRule {
+            models: vec!["test-gpt-to-grok".into()],
+            protocol: Some(Protocol::OpenAiChat),
+            params,
+        });
+        let app = app(state);
+        let request = Request::builder()
+            .uri("/v1/messages")
+            .method("POST")
+            .header("content-type", "application/json")
+            .header("x-claude-code-session-id", "sess-abc-123")
+            .body(Body::from(
+                serde_json::to_vec(&json!({
+                    "model": "test-gpt-to-grok",
+                    "max_tokens": 64,
+                    "stream": false,
+                    "messages": [{"role": "user", "content": "hi"}]
+                }))
+                .unwrap(),
+            ))
+            .unwrap();
+        let response = app.oneshot(request).await.unwrap();
+        let status = response.status();
+        server.abort();
+
+        assert_eq!(status, StatusCode::OK);
+        assert_eq!(captured.body()["model"], "grok-4.6");
+        let ua = captured.header("user-agent").unwrap_or_default();
+        assert!(
+            ua.starts_with("grok-shell/1.0.5 ("),
+            "UA 应为 grok-shell,实际 {ua}"
+        );
+        assert_eq!(
+            captured.header("x-grok-model-override").as_deref(),
+            Some("grok-4.6")
+        );
+        assert_eq!(
+            captured.header("x-grok-conv-id").as_deref(),
+            Some("sess-abc-123")
+        );
+        assert!(
+            captured.body().get("prompt_cache_key").is_none(),
+            "payload 改 grok 后 chat 不注入"
+        );
+    }
+
+    #[tokio::test]
+    async fn test_chat_grok_preserves_inbound_prompt_cache_key() {
+        let captured = CapturedUpstream::default();
+        let handler_cap = captured.clone();
+        let upstream = Router::new().route(
+            "/chat/completions",
+            post(move |headers: HeaderMap, body: Bytes| {
+                let captured = handler_cap.clone();
+                async move {
+                    captured.record(headers, body);
+                    (
+                        StatusCode::OK,
+                        [(header::CONTENT_TYPE, "application/json")],
+                        json!({
+                            "id": "chatcmpl_key",
+                            "model": "grok-4.6",
+                            "choices": [{
+                                "index": 0,
+                                "message": {"role": "assistant", "content": "ok"},
+                                "finish_reason": "stop"
+                            }],
+                            "usage": {"prompt_tokens": 1, "completion_tokens": 1}
+                        })
+                        .to_string(),
+                    )
+                }
+            }),
+        );
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let upstream_addr = listener.local_addr().unwrap();
+        let server = tokio::spawn(async move {
+            axum::serve(listener, upstream).await.unwrap();
+        });
+
+        let state = mock_state();
+        let provider_yaml = format!(
+            r#"
+name: test-grok-chat-key
+protocol: openai_chat
+base_url: "http://{}"
+key: sk-test
+proxy_url: "direct"
+prompt_cache_key: true
+models:
+  - name: grok-4.6
+    alias: test-grok-chat-key
+"#,
+            upstream_addr
+        );
+        let provider: ProviderConfig = serde_yaml::from_str(&provider_yaml).unwrap();
+        state.providers.write().await.push(provider);
+        let app = app(state);
+        let request = Request::builder()
+            .uri("/v1/messages")
+            .method("POST")
+            .header("content-type", "application/json")
+            .header("x-claude-code-session-id", "sess-abc-123")
+            .body(Body::from(
+                serde_json::to_vec(&json!({
+                    "model": "test-grok-chat-key",
+                    "max_tokens": 64,
+                    "stream": false,
+                    "prompt_cache_key": "user-key",
+                    "messages": [{"role": "user", "content": "hi"}]
+                }))
+                .unwrap(),
+            ))
+            .unwrap();
+        let response = app.oneshot(request).await.unwrap();
+        let status = response.status();
+        server.abort();
+
+        assert_eq!(status, StatusCode::OK);
+        assert_eq!(captured.body()["prompt_cache_key"], "user-key");
+    }
+
+    #[tokio::test]
+    async fn test_responses_preserves_inbound_prompt_cache_key() {
+        let captured = CapturedUpstream::default();
+        let handler_cap = captured.clone();
+        let upstream = Router::new().route(
+            "/responses",
+            post(move |headers: HeaderMap, body: Bytes| {
+                let captured = handler_cap.clone();
+                async move {
+                    captured.record(headers, body);
+                    (
+                        StatusCode::OK,
+                        [(header::CONTENT_TYPE, "application/json")],
+                        json!({
+                            "type": "response.completed",
+                            "response": {
+                                "id": "resp_key",
+                                "model": "grok-4.6",
+                                "output": [{
+                                    "type": "message",
+                                    "content": [{"type": "output_text", "text": "ok"}]
+                                }],
+                                "usage": {"input_tokens": 1, "output_tokens": 1}
+                            }
+                        })
+                        .to_string(),
+                    )
+                }
+            }),
+        );
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let upstream_addr = listener.local_addr().unwrap();
+        let server = tokio::spawn(async move {
+            axum::serve(listener, upstream).await.unwrap();
+        });
+
+        let state = mock_state();
+        let provider_yaml = format!(
+            r#"
+name: test-grok-responses-key
+protocol: openai_responses
+base_url: "http://{}"
+key: sk-test
+proxy_url: "direct"
+prompt_cache_key: true
+models:
+  - name: grok-4.6
+    alias: test-grok-responses-key
+"#,
+            upstream_addr
+        );
+        let provider: ProviderConfig = serde_yaml::from_str(&provider_yaml).unwrap();
+        state.providers.write().await.push(provider);
+        let app = app(state);
+        let request = Request::builder()
+            .uri("/v1/messages")
+            .method("POST")
+            .header("content-type", "application/json")
+            .header("x-claude-code-session-id", "sess-abc-123")
+            .body(Body::from(
+                serde_json::to_vec(&json!({
+                    "model": "test-grok-responses-key",
+                    "max_tokens": 64,
+                    "stream": false,
+                    "prompt_cache_key": "user-key",
+                    "messages": [{"role": "user", "content": "hi"}]
+                }))
+                .unwrap(),
+            ))
+            .unwrap();
+        let response = app.oneshot(request).await.unwrap();
+        let status = response.status();
+        server.abort();
+
+        assert_eq!(status, StatusCode::OK);
+        assert_eq!(
+            captured.body()["prompt_cache_key"],
+            "user-key",
+            "入站 key 不改写成 session"
+        );
     }
 }
