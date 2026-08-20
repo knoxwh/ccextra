@@ -35,7 +35,7 @@ You are the model operating inside Claude Code's agent loop, not a standalone Co
 
 ## Operating environment
 Treat the supplied system instructions, CLAUDE.md, user instructions, declared tools, permission decisions, and tool results as your complete operating environment. User and project instructions take precedence over this block.
-Your capabilities are exactly the tools declared in the current request: the built-in Claude Code tools (Read, Edit, Write, Bash, Glob, Grep) plus any additional declared tools. Use only declared tools and follow their schemas. Do not assume any additional tool or capability is available. Do not claim an action succeeded until its tool result confirms it.
+Your capabilities are exactly the tools declared in the current request: the built-in Claude Code tools (Read, Edit, Write, Bash, LSP, Agent, WebFetch, WebSearch, TaskCreate/Update/List, and others) plus any additional declared tools. Use only declared tools and follow their schemas. Do not assume any additional tool or capability is available. Do not claim an action succeeded until its tool result confirms it.
 For a brand-new task with no prior context, be ambitious; when working in an existing codebase, do exactly what the user asks with surgical precision and keep changes minimal and consistent with the codebase style.
 
 ## Working style
@@ -105,6 +105,17 @@ fn gpt_compatible_signature(signature: Option<&str>, upstream_model: &str) -> Op
     }
 }
 
+/// 移除 reasoning 项的孤儿 id(encrypted_content 已无且 store 非 true 时)
+fn remove_reasoning_id_if_orphan(item: &mut Value, store_true: bool) -> bool {
+    if !store_true && item.get("encrypted_content").is_none() && item.get("id").is_some() {
+        if let Some(obj) = item.as_object_mut() {
+            obj.remove("id");
+            return true;
+        }
+    }
+    false
+}
+
 /// GPT/Codex 请求发送前仅剥离格式无效的 encrypted_content。
 /// `store` 非 true 时顺带丢掉无法回放的 reasoning id；空 reasoning 项整项丢弃。
 pub fn sanitize_gpt_reasoning_items(body: &mut Value) -> bool {
@@ -130,10 +141,7 @@ pub fn sanitize_gpt_reasoning_items(body: &mut Value) -> bool {
             }
             changed = true;
         }
-        if !store_true && item.get("encrypted_content").is_none() && item.get("id").is_some() {
-            if let Some(obj) = item.as_object_mut() {
-                obj.remove("id");
-            }
+        if remove_reasoning_id_if_orphan(&mut item, store_true) {
             changed = true;
         }
         if reasoning_item_empty(&item) {
@@ -194,10 +202,10 @@ pub fn trim_encrypted_reasoning_items(body: &mut Value) -> bool {
         if item.get("encrypted_content").is_some() {
             if let Some(obj) = item.as_object_mut() {
                 obj.remove("encrypted_content");
-                if !store_true {
-                    obj.remove("id");
-                }
             }
+            changed = true;
+        }
+        if remove_reasoning_id_if_orphan(&mut item, store_true) {
             changed = true;
         }
         if reasoning_item_empty(&item) {
@@ -972,7 +980,7 @@ mod tests {
         assert!(GPT_ADAPTER_BLOCK.contains("Your capabilities are exactly the tools declared"));
         assert!(GPT_ADAPTER_BLOCK
             .contains("Do not assume any additional tool or capability is available."));
-        assert!(GPT_ADAPTER_BLOCK.contains("Read, Edit, Write, Bash, Glob, Grep"));
+        assert!(GPT_ADAPTER_BLOCK.contains("Read, Edit, Write, Bash, LSP, Agent"));
         assert!(GPT_ADAPTER_BLOCK
             .contains("Do not claim an action succeeded until its tool result confirms it."));
         assert!(GPT_ADAPTER_BLOCK.contains("Never revert existing changes you did not make."));
@@ -1325,6 +1333,8 @@ mod tests {
         assert_eq!(input[0]["role"], "developer");
         assert_eq!(input[1]["type"], "message");
         assert_eq!(input[1]["content"][0]["text"], "answer");
+        // 无签名 thinking 被丢弃(无 reasoning 项)
+        assert!(!input.iter().any(|i| i["type"] == "reasoning"));
     }
 
     #[test]
