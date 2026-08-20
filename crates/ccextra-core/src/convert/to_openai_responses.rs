@@ -15,6 +15,8 @@
 
 use std::collections::{HashMap, HashSet};
 
+use base64::engine::general_purpose::{URL_SAFE, URL_SAFE_NO_PAD};
+use base64::Engine;
 use serde_json::{json, Value};
 
 use super::shorten::{build_short_name_map, shorten_name_if_needed};
@@ -101,6 +103,75 @@ fn gpt_compatible_signature(signature: Option<&str>, upstream_model: &str) -> Op
     }
 }
 
+/// GPT/Codex 请求发送前仅剥离格式无效的 encrypted_content。
+/// `store` 非 true 时顺带丢掉无法回放的 reasoning id；空 reasoning 项整项丢弃。
+pub fn sanitize_gpt_reasoning_items(body: &mut Value) -> bool {
+    let store_true = body.get("store").and_then(|v| v.as_bool()) == Some(true);
+    let Some(input) = body.get_mut("input").and_then(|v| v.as_array_mut()) else {
+        return false;
+    };
+    let mut changed = false;
+    let mut kept = Vec::with_capacity(input.len());
+    for mut item in input.drain(..) {
+        if item.get("type").and_then(|v| v.as_str()) != Some("reasoning") {
+            kept.push(item);
+            continue;
+        }
+        let invalid = match item.get("encrypted_content") {
+            Some(Value::String(content)) => !is_valid_gpt_reasoning_signature(content),
+            Some(_) => true,
+            None => false,
+        };
+        if invalid {
+            if let Some(obj) = item.as_object_mut() {
+                obj.remove("encrypted_content");
+            }
+            changed = true;
+        }
+        if !store_true && item.get("encrypted_content").is_none() && item.get("id").is_some() {
+            if let Some(obj) = item.as_object_mut() {
+                obj.remove("id");
+            }
+            changed = true;
+        }
+        if reasoning_item_empty(&item) {
+            changed = true;
+            continue;
+        }
+        kept.push(item);
+    }
+    *input = kept;
+    changed
+}
+
+/// 仅校验 GPT Fernet 信封外层形状，不验证可解密性。
+/// Fernet token 结构: version(1) + timestamp(8) + IV(16) + ciphertext(>=16,16 字节对齐) + HMAC(32)
+fn is_valid_gpt_reasoning_signature(signature: &str) -> bool {
+    // 最小长度 = 1 + 8 + 16 + 16 + 32 = 73 字节(含最短 ciphertext)
+    const MIN_DECODED_LEN: usize = 1 + 8 + 16 + 16 + 32;
+    const MAX_LEN: usize = 32 * 1024 * 1024;
+    if signature != signature.trim()
+        || signature.len() > MAX_LEN
+        || !signature.starts_with("gAAAA")
+        || !signature
+            .bytes()
+            .all(|byte| byte.is_ascii_alphanumeric() || matches!(byte, b'-' | b'_' | b'='))
+    {
+        return false;
+    }
+    let decoded = URL_SAFE_NO_PAD
+        .decode(signature)
+        .or_else(|_| URL_SAFE.decode(signature));
+    let Ok(decoded) = decoded else {
+        return false;
+    };
+    if decoded.len() < MIN_DECODED_LEN || decoded[0] != 0x80 {
+        return false;
+    }
+    let ciphertext_len = decoded.len() - 1 - 8 - 16 - 32;
+    ciphertext_len > 0 && ciphertext_len % 16 == 0
+}
+
 /// 上游 400 `invalid_encrypted_content` / thinking signature invalid 时,
 /// 剥离 Responses `input[]` reasoning 项的 `encrypted_content` 再重试。
 /// 对齐 CPA sanitizeOpenAIResponsesReasoningEncryptedContent 的剥离动作
@@ -156,6 +227,7 @@ fn reasoning_item_empty(item: &Value) -> bool {
     };
     let summary_empty = match item.get("summary") {
         None | Some(Value::Null) => true,
+        Some(Value::String(s)) => s.is_empty(),
         Some(Value::Array(a)) => a.is_empty(),
         Some(_) => false,
     };
@@ -354,24 +426,35 @@ pub fn convert_to_openai_responses(
     body: &mut Value,
     upstream_model: &str,
 ) -> Result<HashMap<String, String>> {
-    // --- system → instructions(对齐 codex base_instructions) ---
-    let mut instructions = String::new();
-    if let Some(system) = body.get("system") {
-        instructions = system_to_instructions_text(system);
-    }
-    // GPT 上游追加适配块到 instructions 末尾
-    if is_gpt_upstream(upstream_model) {
-        if !instructions.is_empty() {
-            instructions.push_str("\n\n");
-        }
-        instructions.push_str(GPT_ADAPTER_BLOCK);
-    }
+    // --- system → instructions / developer message ---
+    let system = body
+        .get("system")
+        .map(system_to_instructions_text)
+        .unwrap_or_default();
+    let gpt_upstream = is_gpt_upstream(upstream_model);
+    let instructions = if gpt_upstream {
+        String::new()
+    } else {
+        system.clone()
+    };
 
     let mut openai = json!({
         "model": upstream_model,
         "instructions": instructions,
         "input": [],
     });
+    if gpt_upstream {
+        let mut developer = system;
+        if !developer.is_empty() {
+            developer.push_str("\n\n");
+        }
+        developer.push_str(GPT_ADAPTER_BLOCK);
+        openai["input"].as_array_mut().unwrap().push(json!({
+            "type": "message",
+            "role": "developer",
+            "content": [{"type": "input_text", "text": developer}]
+        }));
+    }
 
     // --- 工具名缩短映射(对齐 buildReverseMapFromClaudeOriginalToShort) ---
     let mut tool_name_map: HashMap<String, String> = HashMap::new();
@@ -491,27 +574,32 @@ pub fn convert_to_openai_responses(
                         }
                     }
                     "thinking" => {
-                        // 无签名 thinking 回放为明文 reasoning。有签名须目标兼容:
-                        // GPT 只留 'g' 信封;grok 丢 CERg 外来信封、opaque 放行
-                        // (对齐 CPA DetectSignatureProvider 轻量首字节 + grok target-only)。
+                        // GPT/Codex 仅回放可识别的加密信封；无签名明文不进入请求。
+                        // 其余 Responses 上游保留既有明文 reasoning 回放。
                         if role == "assistant" {
                             let sig = part.get("signature").and_then(|v| v.as_str());
                             if matches!(sig, Some(s) if !s.trim().is_empty()) {
                                 if let Some(good) = gpt_compatible_signature(sig, upstream_model) {
                                     flush_message(&mut content_items, &mut out_items);
-                                    out_items.push(json!({
+                                    let mut reasoning = json!({
                                         "type": "reasoning",
                                         "content": null,
                                         "encrypted_content": good
-                                    }));
+                                    });
+                                    if gpt_upstream {
+                                        reasoning["summary"] = json!([]);
+                                    }
+                                    out_items.push(reasoning);
                                 }
-                            } else if let Some(t) = part.get("thinking").and_then(|v| v.as_str()) {
-                                if !t.trim().is_empty() {
-                                    flush_message(&mut content_items, &mut out_items);
-                                    out_items.push(json!({
-                                        "type": "reasoning",
-                                        "content": t
-                                    }));
+                            } else if !gpt_upstream {
+                                if let Some(t) = part.get("thinking").and_then(|v| v.as_str()) {
+                                    if !t.trim().is_empty() {
+                                        flush_message(&mut content_items, &mut out_items);
+                                        out_items.push(json!({
+                                            "type": "reasoning",
+                                            "content": t
+                                        }));
+                                    }
                                 }
                             }
                         }
@@ -721,8 +809,11 @@ pub fn convert_to_openai_responses(
         json!({"effort": effort})
     };
 
-    // --- service_tier:speed=fast → priority(对齐 normalizeCodexServiceTier) ---
-    if body.get("speed").and_then(|v| v.as_str()) == Some("fast") {
+    // --- service_tier:speed/service_tier fast → priority(对齐 normalizeCodexServiceTier) ---
+    let service_tier = body.get("service_tier").and_then(|v| v.as_str());
+    if body.get("speed").and_then(|v| v.as_str()) == Some("fast")
+        || (gpt_upstream && matches!(service_tier, Some("fast" | "priority")))
+    {
         openai["service_tier"] = json!("priority");
     }
 
@@ -820,34 +911,36 @@ mod tests {
     }
 
     #[test]
-    fn test_gpt_adapter_block_appended_to_instructions() {
-        // gpt 上游：GPT_ADAPTER_BLOCK 追加到 instructions 末尾
+    fn test_gpt_system_and_adapter_go_to_developer_message() {
+        // Codex 线将 system 与 Claude Code 适配块作为 developer 输入，instructions 留空。
         let mut body = json!({
             "model": "test",
             "system": "You are helpful",
             "messages": []
         });
         convert_to_openai_responses(&mut body, "gpt-5.6-terra").unwrap();
-        let instructions = body["instructions"].as_str().unwrap();
-        // 精确验证结构：system + \n\n + adapter
-        let expected = format!("You are helpful\n\n{}", GPT_ADAPTER_BLOCK);
-        assert_eq!(instructions, expected);
-        // input 应该为空（没有 messages）
-        assert_eq!(body["input"].as_array().unwrap().len(), 0);
+        assert_eq!(body["instructions"], "");
+        assert_eq!(body["input"][0]["type"], "message");
+        assert_eq!(body["input"][0]["role"], "developer");
+        assert_eq!(
+            body["input"][0]["content"][0]["text"],
+            format!("You are helpful\n\n{}", GPT_ADAPTER_BLOCK)
+        );
     }
 
     #[test]
-    fn test_gpt_adapter_creates_instructions_when_no_system() {
-        // 空 system：instructions 只包含 GPT_ADAPTER_BLOCK
+    fn test_gpt_adapter_creates_developer_message_without_system() {
         let mut body = json!({
             "model": "test",
             "messages": [{"role": "user", "content": "hi"}]
         });
         convert_to_openai_responses(&mut body, "gpt-5.6-sol").unwrap();
-        assert_eq!(body["instructions"], GPT_ADAPTER_BLOCK);
+        assert_eq!(body["instructions"], "");
         let input = body["input"].as_array().unwrap();
-        assert_eq!(input[0]["role"], "user");
-        assert_eq!(input[0]["content"][0]["text"], "hi");
+        assert_eq!(input[0]["role"], "developer");
+        assert_eq!(input[0]["content"][0]["text"], GPT_ADAPTER_BLOCK);
+        assert_eq!(input[1]["role"], "user");
+        assert_eq!(input[1]["content"][0]["text"], "hi");
     }
 
     #[test]
@@ -893,13 +986,14 @@ mod tests {
 
         convert_to_openai_responses(&mut body, "gpt-5.6-terra").unwrap();
 
-        // adapter 现在在 instructions 里
-        let instructions = body["instructions"].as_str().unwrap();
-        assert!(instructions
-            .contains("inside Claude Code's agent loop, not a standalone Codex session."));
-        assert!(instructions.contains("built-in Claude Code tools (Read, Edit, Write, Bash"));
-        assert!(!instructions.contains("Never use apply_patch"));
-        assert!(!instructions.contains("Edit files only with the tools Claude Code provides"));
+        // adapter 现在在 developer message 里
+        let developer = &body["input"][0];
+        assert_eq!(developer["role"], "developer");
+        let text = developer["content"][0]["text"].as_str().unwrap();
+        assert!(text.contains("inside Claude Code's agent loop, not a standalone Codex session."));
+        assert!(text.contains("built-in Claude Code tools (Read, Edit, Write, Bash"));
+        assert!(!text.contains("Never use apply_patch"));
+        assert!(!text.contains("Edit files only with the tools Claude Code provides"));
         assert_eq!(body["tools"][0]["type"], "custom");
         assert_eq!(body["tools"][0]["name"], "apply_patch");
         assert_eq!(body["tool_choice"]["type"], "custom");
@@ -1209,8 +1303,28 @@ mod tests {
     }
 
     #[test]
+    fn test_gpt_unsigned_thinking_is_dropped() {
+        let mut body = json!({
+            "model": "test",
+            "messages": [
+                {"role": "assistant", "content": [
+                    {"type": "thinking", "thinking": "private trace"},
+                    {"type": "text", "text": "answer"}
+                ]}
+            ]
+        });
+        convert_to_openai_responses(&mut body, "gpt-5.6-terra").unwrap();
+        let input = body["input"].as_array().unwrap();
+        assert_eq!(input.len(), 2);
+        assert_eq!(input[0]["role"], "developer");
+        assert_eq!(input[1]["type"], "message");
+        assert_eq!(input[1]["content"][0]["text"], "answer");
+    }
+
+    #[test]
     fn test_thinking_signature_gpt_compat_kept_else_dropped() {
-        // gAAAA 前缀 → reasoning 透传;'C' 开头(Claude 签名)→ 丢弃
+        // 仅验证转换层首字节过滤:gAAAA 前缀 → reasoning;'C' 开头 → 丢弃。
+        // gAAAA-claude-looking 不是完整 Fernet，HTTP 请求前 sanitizer 会剥除。
         let mut body = json!({
             "model": "test",
             "messages": [
@@ -1221,14 +1335,16 @@ mod tests {
                 ]}
             ]
         });
-        convert_to_openai_responses(&mut body, "test-model").unwrap();
-        assert_eq!(body["input"][0]["type"], "reasoning");
+        convert_to_openai_responses(&mut body, "gpt-5.6-terra").unwrap();
+        assert_eq!(body["input"][0]["role"], "developer");
+        assert_eq!(body["input"][1]["type"], "reasoning");
         assert_eq!(
-            body["input"][0]["encrypted_content"],
+            body["input"][1]["encrypted_content"],
             "gAAAA-claude-looking"
         );
-        assert_eq!(body["input"][1]["type"], "message");
-        assert_eq!(body["input"][1]["content"][0]["text"], "answer");
+        assert_eq!(body["input"][1]["summary"], json!([]));
+        assert_eq!(body["input"][2]["type"], "message");
+        assert_eq!(body["input"][2]["content"][0]["text"], "answer");
     }
 
     #[test]
@@ -1322,6 +1438,54 @@ mod tests {
     }
 
     #[test]
+    fn test_sanitize_gpt_reasoning_items() {
+        const VALID: &str = "gAAAAAAAAAAAAQIDBAUGBwgJCgsMDQ4PEBESExQVFhcYGRobHB0eHyAhIiMkJSYnKCkqKywtLi8wMTIzNDU2Nzg5Ojs8PT4_QA";
+        let mut body = json!({
+            "store": false,
+            "input": [
+                {"type": "reasoning", "id": "rs_bad", "encrypted_content": "gAAAA-replay", "content": null, "summary": []},
+                {"type": "reasoning", "id": "rs_text", "encrypted_content": " ", "content": "keep"},
+                {"type": "reasoning", "id": "rs_summary", "encrypted_content": null, "summary": ["keep"]},
+                {"type": "reasoning", "id": "rs_valid", "encrypted_content": VALID, "content": null, "summary": []},
+                {"type": "reasoning", "id": "rs_orphan", "content": null, "summary": []},
+                {"type": "message", "role": "user", "content": [{"type": "input_text", "text": "hi"}]}
+            ]
+        });
+
+        assert!(sanitize_gpt_reasoning_items(&mut body));
+        let input = body["input"].as_array().unwrap();
+        assert_eq!(input.len(), 4);
+        assert_eq!(input[0]["content"], "keep");
+        assert!(input[0].get("encrypted_content").is_none());
+        assert!(input[0].get("id").is_none());
+        assert_eq!(input[1]["summary"], json!(["keep"]));
+        assert!(input[1].get("encrypted_content").is_none());
+        assert!(input[1].get("id").is_none());
+        assert_eq!(input[2]["encrypted_content"], VALID);
+        assert_eq!(input[2]["id"], "rs_valid");
+        assert_eq!(input[3]["type"], "message");
+        assert!(!sanitize_gpt_reasoning_items(&mut body));
+    }
+
+    #[test]
+    fn test_sanitize_gpt_reasoning_keeps_id_with_store_true() {
+        let mut body = json!({
+            "store": true,
+            "input": [{
+                "type": "reasoning",
+                "id": "rs_stored",
+                "encrypted_content": null,
+                "content": "keep"
+            }]
+        });
+
+        assert!(sanitize_gpt_reasoning_items(&mut body));
+        assert_eq!(body["input"][0]["id"], "rs_stored");
+        assert!(body["input"][0].get("encrypted_content").is_none());
+        assert_eq!(body["input"][0]["content"], "keep");
+    }
+
+    #[test]
     fn test_is_thinking_signature_invalid() {
         assert!(is_thinking_signature_invalid(
             br#"{"error":{"code":"invalid_encrypted_content","message":"bad"}}"#
@@ -1399,6 +1563,13 @@ mod tests {
     fn test_service_tier_from_speed() {
         let mut body = json!({"model": "test", "messages": [], "speed": "fast"});
         convert_to_openai_responses(&mut body, "test-model").unwrap();
+        assert_eq!(body["service_tier"], "priority");
+    }
+
+    #[test]
+    fn test_service_tier_fast_is_priority() {
+        let mut body = json!({"model": "test", "messages": [], "service_tier": "fast"});
+        convert_to_openai_responses(&mut body, "gpt-5.6-terra").unwrap();
         assert_eq!(body["service_tier"], "priority");
     }
 
@@ -1756,7 +1927,9 @@ mod tests {
             ]
         });
         convert_to_openai_responses(&mut body, "gpt-5").unwrap();
-        assert!(body["input"].as_array().unwrap().is_empty());
+        let input = body["input"].as_array().unwrap();
+        assert_eq!(input.len(), 1);
+        assert_eq!(input[0]["role"], "developer");
     }
 
     #[test]
@@ -1772,9 +1945,10 @@ mod tests {
             ]
         });
         convert_to_openai_responses(&mut body, "gpt-5").unwrap();
-        assert_eq!(body["input"].as_array().unwrap().len(), 1);
-        assert_eq!(body["input"][0]["type"], "message");
-        assert_eq!(body["input"][0]["content"][0]["text"], "result");
+        assert_eq!(body["input"].as_array().unwrap().len(), 2);
+        assert_eq!(body["input"][0]["role"], "developer");
+        assert_eq!(body["input"][1]["type"], "message");
+        assert_eq!(body["input"][1]["content"][0]["text"], "result");
     }
 
     #[test]
@@ -1789,6 +1963,8 @@ mod tests {
             ]
         });
         convert_to_openai_responses(&mut body, "gpt-5").unwrap();
-        assert_eq!(body["input"].as_array().unwrap().len(), 0);
+        let input = body["input"].as_array().unwrap();
+        assert_eq!(input.len(), 1);
+        assert_eq!(input[0]["role"], "developer");
     }
 }

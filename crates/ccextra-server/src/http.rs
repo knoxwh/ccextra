@@ -27,7 +27,8 @@ use ccextra_core::cache_stabilization::drift_detector::{
 };
 use ccextra_core::convert::{
     convert_passthrough, convert_to_openai_chat, convert_to_openai_responses,
-    is_thinking_signature_invalid, trim_encrypted_reasoning_items, ConvertError,
+    is_thinking_signature_invalid, sanitize_gpt_reasoning_items, trim_encrypted_reasoning_items,
+    ConvertError,
 };
 use ccextra_core::count_tokens::count_claude_input_tokens;
 use ccextra_core::normalize::{
@@ -665,6 +666,25 @@ async fn handle_messages(
     // OpenAI payload 若把 model 置空/改成非字符串,回写路由模型,保证 body 与头部判定一致。
     let outbound_model =
         resolve_outbound_model(&mut body_json, &route.upstream_model, route.protocol);
+
+    // GPT/Codex 在最终 model 与 payload 落定后校验 reasoning 回放信封。
+    if matches!(route.protocol, Protocol::OpenAiResponses)
+        && outbound_model.to_ascii_lowercase().starts_with("gpt")
+    {
+        if let Some(obj) = body_json.as_object_mut() {
+            for key in [
+                "previous_response_id",
+                "generate",
+                "safety_identifier",
+                "stream_options",
+            ] {
+                obj.remove(key);
+            }
+        }
+        if sanitize_gpt_reasoning_items(&mut body_json) {
+            tracing::debug!("已清理无效 GPT reasoning encrypted_content");
+        }
+    }
 
     // 6. 对齐 StripPromptCacheRetention:openai 上游拒绝 prompt_cache_retention
     // (HTTP 400 "Unsupported parameter: prompt_cache_retention"),claude 直通保留
@@ -1953,9 +1973,9 @@ models:
         assert!(String::from_utf8_lossy(&response_body).contains("retry ok"));
     }
 
-    /// Responses 400 invalid_encrypted_content:剥离 encrypted_content 后重试一次。
+    /// GPT Responses 在请求前剥离格式无效的 encrypted_content，避免触发 400 重试。
     #[tokio::test]
-    async fn test_openai_responses_retries_after_invalid_encrypted_content() {
+    async fn test_openai_responses_sanitizes_invalid_encrypted_content_before_request() {
         let attempts = Arc::new(std::sync::atomic::AtomicUsize::new(0));
         let handler_attempts = Arc::clone(&attempts);
         let saw_encrypted = Arc::new(std::sync::atomic::AtomicBool::new(false));
@@ -1969,7 +1989,7 @@ models:
                 let saw_encrypted = Arc::clone(&handler_encrypted);
                 let saw_trimmed = Arc::clone(&handler_trimmed);
                 async move {
-                    let n = attempts.fetch_add(1, Ordering::SeqCst);
+                    attempts.fetch_add(1, Ordering::SeqCst);
                     let parsed: Value = serde_json::from_slice(&body).unwrap_or(json!({}));
                     let has_enc = parsed
                         .get("input")
@@ -1981,8 +2001,8 @@ models:
                             })
                         })
                         .unwrap_or(false);
-                    if n == 0 {
-                        saw_encrypted.store(has_enc, Ordering::SeqCst);
+                    if has_enc {
+                        saw_encrypted.store(true, Ordering::SeqCst);
                         (
                             StatusCode::BAD_REQUEST,
                             [(header::CONTENT_TYPE, "application/json")],
@@ -1996,7 +2016,7 @@ models:
                             .to_string(),
                         )
                     } else {
-                        saw_trimmed.store(!has_enc, Ordering::SeqCst);
+                        saw_trimmed.store(true, Ordering::SeqCst);
                         (
                             StatusCode::OK,
                             [(header::CONTENT_TYPE, "application/json")],
@@ -2065,17 +2085,185 @@ models:
         let response_body = to_bytes(response.into_body(), 1024 * 1024).await.unwrap();
         server.abort();
 
-        assert_eq!(attempts.load(Ordering::SeqCst), 2);
+        assert_eq!(attempts.load(Ordering::SeqCst), 1);
         assert!(
-            saw_encrypted.load(Ordering::SeqCst),
-            "首次应带 encrypted_content"
+            !saw_encrypted.load(Ordering::SeqCst),
+            "首次请求不应带 encrypted_content"
         );
         assert!(
             saw_trimmed.load(Ordering::SeqCst),
-            "重试应已剥离 encrypted_content"
+            "请求应在发送前剥离无效 encrypted_content"
         );
         assert_eq!(status, StatusCode::OK);
         assert!(String::from_utf8_lossy(&response_body).contains("trimmed ok"));
+    }
+
+    #[tokio::test]
+    async fn test_openai_responses_retries_valid_encrypted_content_after_upstream_rejection() {
+        const VALID: &str = "gAAAAAAAAAAAAQIDBAUGBwgJCgsMDQ4PEBESExQVFhcYGRobHB0eHyAhIiMkJSYnKCkqKywtLi8wMTIzNDU2Nzg5Ojs8PT4_QA";
+        let attempts = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+        let saw_encrypted = Arc::new(std::sync::atomic::AtomicBool::new(false));
+        let saw_trimmed = Arc::new(std::sync::atomic::AtomicBool::new(false));
+        let handler_attempts = Arc::clone(&attempts);
+        let handler_encrypted = Arc::clone(&saw_encrypted);
+        let handler_trimmed = Arc::clone(&saw_trimmed);
+        let upstream = Router::new().route(
+            "/responses",
+            post(move |body: axum::body::Bytes| {
+                let attempts = Arc::clone(&handler_attempts);
+                let saw_encrypted = Arc::clone(&handler_encrypted);
+                let saw_trimmed = Arc::clone(&handler_trimmed);
+                async move {
+                    let parsed: Value = serde_json::from_slice(&body).unwrap();
+                    let has_encrypted = parsed["input"].as_array().unwrap().iter().any(|item| {
+                        item["type"] == "reasoning" && item.get("encrypted_content").is_some()
+                    });
+                    if attempts.fetch_add(1, Ordering::SeqCst) == 0 {
+                        saw_encrypted.store(has_encrypted, Ordering::SeqCst);
+                        (
+                            StatusCode::BAD_REQUEST,
+                            [(header::CONTENT_TYPE, "application/json")],
+                            r#"{"error":{"code":"invalid_encrypted_content"}}"#,
+                        )
+                    } else {
+                        saw_trimmed.store(!has_encrypted, Ordering::SeqCst);
+                        (
+                            StatusCode::OK,
+                            [(header::CONTENT_TYPE, "application/json")],
+                            r#"{"type":"response.completed","response":{"id":"resp_retry","model":"gpt-5","output":[],"usage":{"input_tokens":1,"output_tokens":1}}}"#,
+                        )
+                    }
+                }
+            }),
+        );
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let upstream_addr = listener.local_addr().unwrap();
+        let server = tokio::spawn(async move { axum::serve(listener, upstream).await.unwrap() });
+
+        let state = mock_state();
+        let provider: ProviderConfig = serde_yaml::from_str(&format!(
+            "name: test-responses-retry\nprotocol: openai_responses\nbase_url: http://{}\nkey: sk-test\nproxy_url: direct\nmodels:\n  - name: gpt-5\n    alias: test-responses-retry\n",
+            upstream_addr
+        ))
+        .unwrap();
+        state.providers.write().await.push(provider);
+        let app = app(state);
+        let request = Request::builder()
+            .uri("/v1/messages")
+            .method("POST")
+            .header("content-type", "application/json")
+            .body(Body::from(
+                serde_json::to_vec(&json!({
+                    "model": "test-responses-retry", "max_tokens": 64, "stream": false,
+                    "messages": [
+                        {"role": "assistant", "content": [{"type": "thinking", "thinking": "t", "signature": VALID}]},
+                        {"role": "user", "content": "hi"}
+                    ]
+                }))
+                .unwrap(),
+            ))
+            .unwrap();
+        let response = app.oneshot(request).await.unwrap();
+        server.abort();
+
+        assert_eq!(response.status(), StatusCode::OK);
+        assert_eq!(attempts.load(Ordering::SeqCst), 2);
+        assert!(saw_encrypted.load(Ordering::SeqCst));
+        assert!(saw_trimmed.load(Ordering::SeqCst));
+    }
+
+    #[tokio::test]
+    async fn test_gpt_responses_strips_execute_only_payload_fields() {
+        let captured: Arc<StdMutex<Option<Value>>> = Arc::new(StdMutex::new(None));
+        let handler_captured = Arc::clone(&captured);
+        let upstream = Router::new().route(
+            "/responses",
+            post(move |body: axum::body::Bytes| {
+                let captured = Arc::clone(&handler_captured);
+                async move {
+                    *captured.lock().unwrap() = Some(serde_json::from_slice(&body).unwrap());
+                    (
+                        [(header::CONTENT_TYPE, "application/json")],
+                        json!({
+                            "type": "response.completed",
+                            "response": {
+                                "id": "resp_final",
+                                "model": "gpt-5",
+                                "output": [],
+                                "usage": {"input_tokens": 1, "output_tokens": 1}
+                            }
+                        })
+                        .to_string(),
+                    )
+                }
+            }),
+        );
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let upstream_addr = listener.local_addr().unwrap();
+        let server = tokio::spawn(async move {
+            axum::serve(listener, upstream).await.unwrap();
+        });
+
+        let state = mock_state();
+        let provider: ProviderConfig = serde_yaml::from_str(&format!(
+            r#"
+name: test-responses-final
+protocol: openai_responses
+base_url: "http://{}"
+key: sk-test
+proxy_url: "direct"
+models:
+  - name: gpt-5
+    alias: test-responses-final
+"#,
+            upstream_addr
+        ))
+        .unwrap();
+        state.providers.write().await.push(provider);
+        state.payload_rules.write().await.push(PayloadRule {
+            models: vec!["test-responses-final".into()],
+            protocol: Some(Protocol::OpenAiResponses),
+            params: json!({
+                "previous_response_id": "resp_previous",
+                "generate": true,
+                "safety_identifier": "safe-id",
+                "stream_options": {"include_usage": true},
+                "prompt_cache_retention": "24h",
+                "temperature": 0.1
+            })
+            .as_object()
+            .unwrap()
+            .clone(),
+        });
+        let app = app(state);
+        let request = Request::builder()
+            .uri("/v1/messages")
+            .method("POST")
+            .header("content-type", "application/json")
+            .body(Body::from(
+                serde_json::to_vec(&json!({
+                    "model": "test-responses-final",
+                    "max_tokens": 64,
+                    "messages": [{"role": "user", "content": "hi"}]
+                }))
+                .unwrap(),
+            ))
+            .unwrap();
+        let response = app.oneshot(request).await.unwrap();
+        server.abort();
+
+        assert_eq!(response.status(), StatusCode::OK);
+        let body = captured.lock().unwrap().clone().unwrap();
+        for key in [
+            "previous_response_id",
+            "generate",
+            "safety_identifier",
+            "stream_options",
+            "prompt_cache_retention",
+        ] {
+            assert!(body.get(key).is_none(), "{key} 不应发往 GPT Responses");
+        }
+        assert_eq!(body["temperature"], 0.1);
     }
 
     #[tokio::test]
