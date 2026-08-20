@@ -48,9 +48,57 @@ Be concise. Default final answers under 10 lines; small changes 2-5 sentences; m
 Don't expose extended reasoning — show conclusions, not the thought process.
 Stop when the task is done: report result plus one logical next step, then yield.";
 
+/// Grok 上游追加的行为适配块(字节固定,缓存前缀稳定)。
+///
+/// 直接对齐官方 grok-build prompt.md 核心约束,仅替换环境声明为 Claude Code。
+/// 保留官方 prompt 的工作策略(L4-11)、工具调用(L14-16)、沟通风格(L34-48)精髓。
+/// 英文固定文本,不配置化;冲突时用户指令(CLAUDE.md)优先,本块只补缺省。
+const GROK_ADAPTER_BLOCK: &str = "\
+You are operating inside Claude Code's agent loop. Your main goal is to complete the user's request. The supplied system instructions, CLAUDE.md, declared tools, and tool results are your complete operating environment. Your capabilities are exactly the tools declared in the current request: the built-in Claude Code tools (Read, Edit, Write, Bash, LSP, Agent, WebFetch, WebSearch, TaskCreate/Update/List, and others) plus any additional declared tools.
+
+Always respond in Simplified Chinese (简体中文). Use Simplified Chinese for all explanations, communications, and user-facing messages. Technical terms, code identifiers, file paths, command names, and error strings should remain in their original form.
+
+## Work policy
+Keep every explicit requirement of the request in view until it is completed, superseded by the user, or genuinely blocked. If something is blocked, say so plainly rather than quietly dropping it.
+Match your response to the user's intent. Implement clear action requests; answer questions, reviews, explanations, and planning requests without making unsolicited project edits.
+For clear, reversible local work, do it in the current turn instead of asking permission conversationally or ending with an offer to do it later.
+Claim that something is done, fixed, tested, or addressed only when tool output supports the claim. Otherwise state what you did not verify and why.
+Keep changes scoped to what was asked. Match the surrounding code's comment and tooling conventions: comments should be short, factual, and only explain non-obvious constraints; never narrate your reasoning or implementation steps, and never leave placeholders for unrelated work using comments.
+
+## Tool calling
+Use specialized tools instead of bash commands when possible, as this provides a better user experience. For file operations, prefer dedicated file tools (Read for reading files instead of cat/head/tail, Edit for editing and creating files instead of sed/awk). Reserve bash tools exclusively for actual system commands and terminal operations that require shell execution.
+NEVER use bash echo or other command-line tools to communicate thoughts, explanations, or instructions to the user. Output all communication directly in your response text instead.
+
+## Communication
+Communicate directly and concisely, in complete sentences. Concise means being selective about what you include, not clipping the prose: no telegraphic fragments, no shorthand the user hasn't used.
+
+Write every user-facing message for a reader who has NOT seen your tool calls, internal notes, or workspace documents:
+- Restate what you did and what you found in plain language. Do not assume the user remembers earlier messages or knows the state of the work.
+- Define project-specific terms, abbreviations, and codenames on first use. Never carry vocabulary from internal docs, rules, or skills into your replies unless the user used it first.
+- State facts literally. Do not invent metaphors, idioms, or catchy labels to describe technical work.
+
+Lead with the answer:
+- Answer the user's actual question first — especially \"why\" questions — then give supporting detail.
+- Open with what is true or what to do. Do not open answers or sections with negations (\"It's not X\") or \"Do not...\" framing; make the point affirmatively, then contrast only if it adds information.
+- If the question is answerable from context, answer it. Do not respond with a clarifying question back, and do not dump raw data when the user wants the relevant subset.
+
+Keep intermediate progress updates short and infrequent. The final message must stand alone: what was done, what the outcome is, and the answer to what the user asked.
+
+NEVER coin acronyms, shorthand, or technical-sounding labels of your own. ALWAYS use terminology already established in the conversation or provided context; otherwise describe the concept in plain language.";
+
 /// 判定上游是否为 GPT 模型(仅按模型名前缀,对齐约定:responses 协议 + gpt*)
 fn is_gpt_upstream(upstream_model: &str) -> bool {
     upstream_model.to_ascii_lowercase().starts_with("gpt")
+}
+
+/// 判定上游是否为 Grok 模型(按模型名包含 grok)
+fn is_grok_upstream(upstream_model: &str) -> bool {
+    upstream_model.to_ascii_lowercase().contains("grok")
+}
+
+/// 判定上游是否需要注入 developer message + adapter block(GPT 或 Grok)
+fn needs_adapter_block(upstream_model: &str) -> bool {
+    is_gpt_upstream(upstream_model) || is_grok_upstream(upstream_model)
 }
 
 /// 轻量签名提供方(对齐 CPA DetectSignatureProvider 的首字节预过滤,
@@ -442,7 +490,8 @@ pub fn convert_to_openai_responses(
         .map(system_to_instructions_text)
         .unwrap_or_default();
     let gpt_upstream = is_gpt_upstream(upstream_model);
-    let instructions = if gpt_upstream {
+    let needs_adapter = needs_adapter_block(upstream_model);
+    let instructions = if needs_adapter {
         String::new()
     } else {
         system.clone()
@@ -453,12 +502,18 @@ pub fn convert_to_openai_responses(
         "instructions": instructions,
         "input": [],
     });
-    if gpt_upstream {
+    if needs_adapter {
         let mut developer = system;
         if !developer.is_empty() {
             developer.push_str("\n\n");
         }
-        developer.push_str(GPT_ADAPTER_BLOCK);
+        // GPT 使用 GPT_ADAPTER_BLOCK, Grok 使用 GROK_ADAPTER_BLOCK
+        let adapter_block = if gpt_upstream {
+            GPT_ADAPTER_BLOCK
+        } else {
+            GROK_ADAPTER_BLOCK
+        };
+        developer.push_str(adapter_block);
         openai["input"].as_array_mut().unwrap().push(json!({
             "type": "message",
             "role": "developer",
@@ -959,7 +1014,7 @@ mod tests {
 
     #[test]
     fn test_non_gpt_no_adapter_block() {
-        // 非 gpt 上游不注入 adapter block
+        // 非 gpt/grok 上游不注入 adapter block
         let mut body = json!({
             "model": "test",
             "system": "You are helpful",
@@ -968,6 +1023,52 @@ mod tests {
         convert_to_openai_responses(&mut body, "claude-opus-5").unwrap();
         assert_eq!(body["instructions"], "You are helpful");
         assert_eq!(body["input"].as_array().unwrap().len(), 0);
+    }
+
+    #[test]
+    fn test_grok_system_and_adapter_go_to_developer_message() {
+        // Grok 线将 system 与 GROK_ADAPTER_BLOCK 作为 developer 输入，instructions 留空。
+        let mut body = json!({
+            "model": "test",
+            "system": "You are helpful",
+            "messages": []
+        });
+        convert_to_openai_responses(&mut body, "grok-4.6").unwrap();
+        assert_eq!(body["instructions"], "");
+        assert_eq!(body["input"][0]["type"], "message");
+        assert_eq!(body["input"][0]["role"], "developer");
+        assert_eq!(
+            body["input"][0]["content"][0]["text"],
+            format!("You are helpful\n\n{}", GROK_ADAPTER_BLOCK)
+        );
+    }
+
+    #[test]
+    fn test_grok_adapter_creates_developer_message_without_system() {
+        let mut body = json!({
+            "model": "test",
+            "messages": [{"role": "user", "content": "hi"}]
+        });
+        convert_to_openai_responses(&mut body, "grok-3").unwrap();
+        assert_eq!(body["instructions"], "");
+        let input = body["input"].as_array().unwrap();
+        assert_eq!(input[0]["role"], "developer");
+        assert_eq!(input[0]["content"][0]["text"], GROK_ADAPTER_BLOCK);
+        assert_eq!(input[1]["role"], "user");
+        assert_eq!(input[1]["content"][0]["text"], "hi");
+    }
+
+    #[test]
+    fn test_grok_adapter_block_contains_key_constraints() {
+        // 验证 GROK_ADAPTER_BLOCK 包含官方 prompt.md 的核心约束
+        assert!(GROK_ADAPTER_BLOCK.contains("inside Claude Code's agent loop"));
+        assert!(GROK_ADAPTER_BLOCK.contains("Your capabilities are exactly the tools declared"));
+        assert!(GROK_ADAPTER_BLOCK.contains("only when tool output supports the claim"));
+        assert!(GROK_ADAPTER_BLOCK.contains("Use specialized tools instead of bash commands"));
+        assert!(GROK_ADAPTER_BLOCK.contains("Communicate directly and concisely"));
+        assert!(GROK_ADAPTER_BLOCK.contains("in complete sentences"));
+        assert!(GROK_ADAPTER_BLOCK.contains("NEVER coin acronyms"));
+        assert!(GROK_ADAPTER_BLOCK.contains("Always respond in Simplified Chinese"));
     }
 
     #[test]
@@ -1375,7 +1476,10 @@ mod tests {
             ]
         });
         convert_to_openai_responses(&mut body, "grok-3").unwrap();
-        assert!(body["input"].as_array().unwrap().is_empty());
+        let input = body["input"].as_array().unwrap();
+        // grok 注入 developer message，外来信封被丢弃后只剩 developer
+        assert_eq!(input.len(), 1);
+        assert_eq!(input[0]["role"], "developer");
     }
 
     #[test]
@@ -1389,7 +1493,10 @@ mod tests {
             ]
         });
         convert_to_openai_responses(&mut body, "grok-3").unwrap();
-        assert!(body["input"].as_array().unwrap().is_empty());
+        let input = body["input"].as_array().unwrap();
+        // grok 注入 developer message，GPT 信封被丢弃后只剩 developer
+        assert_eq!(input.len(), 1);
+        assert_eq!(input[0]["role"], "developer");
     }
 
     #[test]
@@ -1403,8 +1510,12 @@ mod tests {
             ]
         });
         convert_to_openai_responses(&mut body, "grok-3").unwrap();
-        assert_eq!(body["input"][0]["type"], "reasoning");
-        assert_eq!(body["input"][0]["encrypted_content"], "xAI-opaque-blob");
+        let input = body["input"].as_array().unwrap();
+        // grok 注入 developer message，opaque 签名回放为 reasoning
+        assert_eq!(input.len(), 2);
+        assert_eq!(input[0]["role"], "developer");
+        assert_eq!(input[1]["type"], "reasoning");
+        assert_eq!(input[1]["encrypted_content"], "xAI-opaque-blob");
     }
 
     #[test]
@@ -1421,12 +1532,13 @@ mod tests {
         });
         convert_to_openai_responses(&mut body, "grok-4.6").unwrap();
         let input = body["input"].as_array().unwrap();
-        // grok 非 gpt_upstream,无 developer prompt,只有 message
-        assert_eq!(input.len(), 1);
-        assert_eq!(input[0]["type"], "message");
-        assert_eq!(input[0]["role"], "assistant");
-        assert_eq!(input[0]["content"][0]["text"], "answer");
-        // 无 reasoning 项(无签名 thinking 被丢弃)
+        // grok 现在注入 developer message，input[0] 是 developer，input[1] 是 message
+        assert_eq!(input.len(), 2);
+        assert_eq!(input[0]["role"], "developer");
+        assert_eq!(input[1]["type"], "message");
+        assert_eq!(input[1]["role"], "assistant");
+        assert_eq!(input[1]["content"][0]["text"], "answer");
+        // 无签名 thinking 被丢弃(无 reasoning 项)
         assert!(!input.iter().any(|i| i["type"] == "reasoning"));
     }
 
@@ -1552,7 +1664,10 @@ mod tests {
             ]
         });
         convert_to_openai_responses(&mut body, "grok-3").unwrap();
-        assert!(body["input"].as_array().unwrap().is_empty());
+        let input = body["input"].as_array().unwrap();
+        // grok 注入 developer message，redacted_thinking 被丢弃后只剩 developer
+        assert_eq!(input.len(), 1);
+        assert_eq!(input[0]["role"], "developer");
     }
 
     #[test]
