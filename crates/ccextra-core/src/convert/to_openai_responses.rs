@@ -2,9 +2,11 @@
 //
 // 主要映射(逐条一致):
 // - system → instructions 字段(合并 text blocks,过滤计费归属块,对齐 codex base_instructions)
-// - messages → input[]:text→input_text/output_text、thinking(带 GPT 兼容签名)→reasoning、
+// - messages → input[]:text→input_text/output_text、thinking(带签名)→reasoning、
 //   image→input_image、tool_use→function_call、tool_result→function_call_output
 //   (遇 thinking/tool_use/tool_result 先 flush 文本 message,对齐 flushMessage 顺序)
+// - thinking 处理:GPT/Grok 仅回放带签名的 encrypted reasoning,无签名明文丢弃
+//   (对齐 reasoning replay 缓存只认 encrypted_content;其余 responses 上游保留明文)
 // - tools → codex tools(原名超 64 缩短 + 唯一 _N 后缀;web_search_* → type:"web_search")、
 //   input_schema→parameters(strict=false,剥 cache_control/defer_loading/$schema)
 // - thinking.budget_tokens → reasoning.effort(直映射,不钳制)
@@ -574,7 +576,9 @@ pub fn convert_to_openai_responses(
                         }
                     }
                     "thinking" => {
-                        // GPT/Codex 仅回放可识别的加密信封；无签名明文不进入请求。
+                        // GPT/Codex/Grok 仅回放可识别的加密信封；无签名明文不进入请求
+                        // (对齐 reasoning replay 缓存只认 encrypted_content,明文 reasoning
+                        // 无法回放会导致 grok 多轮丢失决策记忆陷入工具调用死循环)。
                         // 其余 Responses 上游保留既有明文 reasoning 回放。
                         if role == "assistant" {
                             let sig = part.get("signature").and_then(|v| v.as_str());
@@ -591,7 +595,9 @@ pub fn convert_to_openai_responses(
                                     }
                                     out_items.push(reasoning);
                                 }
-                            } else if !gpt_upstream {
+                            } else if !gpt_upstream
+                                && !upstream_model.to_ascii_lowercase().contains("grok")
+                            {
                                 if let Some(t) = part.get("thinking").and_then(|v| v.as_str()) {
                                     if !t.trim().is_empty() {
                                         flush_message(&mut content_items, &mut out_items);
@@ -1389,6 +1395,29 @@ mod tests {
         convert_to_openai_responses(&mut body, "grok-3").unwrap();
         assert_eq!(body["input"][0]["type"], "reasoning");
         assert_eq!(body["input"][0]["encrypted_content"], "xAI-opaque-blob");
+    }
+
+    #[test]
+    fn test_grok_unsigned_thinking_is_dropped() {
+        // grok 对齐 GPT:无签名 thinking 丢弃(明文 reasoning 无法缓存会导致死循环)
+        let mut body = json!({
+            "model": "test",
+            "messages": [
+                {"role": "assistant", "content": [
+                    {"type": "thinking", "thinking": "private trace"},
+                    {"type": "text", "text": "answer"}
+                ]}
+            ]
+        });
+        convert_to_openai_responses(&mut body, "grok-4.6").unwrap();
+        let input = body["input"].as_array().unwrap();
+        // grok 非 gpt_upstream,无 developer prompt,只有 message
+        assert_eq!(input.len(), 1);
+        assert_eq!(input[0]["type"], "message");
+        assert_eq!(input[0]["role"], "assistant");
+        assert_eq!(input[0]["content"][0]["text"], "answer");
+        // 无 reasoning 项(无签名 thinking 被丢弃)
+        assert!(!input.iter().any(|i| i["type"] == "reasoning"));
     }
 
     #[test]
