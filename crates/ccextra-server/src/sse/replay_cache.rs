@@ -1,10 +1,11 @@
 // reasoning replay 缓存(server 层状态,对齐 CPA internal/cache 的
-// XAI reasoning replay 存取;core 无 IO,状态由本层持有)
+// codex 累积 replay 存取;core 无 IO,状态由本层持有)
 //
-// key = "{model}:{session key}"(对齐 xaiReasoningReplayCacheKey 的
+// key = "{model}:{session key}"(对齐 codexReasoningReplayCacheKey 的
 // model+session 连续性边界;session 与 x-grok-conv-id 同源 cc_session)。
-// value = 上一轮 response.completed 提取的 replay 项。带 TTL 与容量上限,
-// 防泄漏。SSE 解析器不落本层:每条流各自持有(对齐 CPA 每请求局部收集),
+// value = 累积的 replay turns(每轮 [marker, ...items],256 turn/16MB
+// 上限丢最老,marker id 幂等去重)。带 TTL 与容量上限,防泄漏。
+// SSE 解析器不落本层:每条流各自持有(对齐 CPA 每请求局部收集),
 // 同会话并发流互不串扰,流结束随闭包释放。
 
 use ccextra_core::convert::{append_replay_turn, build_replay_turn, insert_replay_turns};
@@ -131,8 +132,8 @@ impl ReplayCache {
     /// 每轮构造 [marker, ...items] 追加(对齐 CPA
     /// AppendCodexReasoningReplayItemsBestEffort + appendCodexReasoningReplayTurn):
     /// marker id 含 request 指纹,同轮重放幂等去重;超 256 turn/16MB 丢最老。
-    /// 无可回放项时删除累积(对齐 XAIReasoningReplayNoReplayableState:
-    /// 成功轮次无可缓存 reasoning 时不得残留 encrypted state)。
+    /// 无可回放项时不动缓存(对齐 CPA cacheCodexReasoningReplayFromCompleted
+    /// 直接 return;累积语义下纯文本轮清空会丢全部历史 reasoning)。
     ///
     /// request_fingerprint 传空串:真值需请求侧 input 前缀指纹,本函数无 body
     /// 上下文(StreamReplayExtractor 亦无)。取舍:锚定退化为 call_ids/
@@ -142,30 +143,26 @@ impl ReplayCache {
         if session_key.trim().is_empty() {
             return;
         }
+        let Some(turn) = build_replay_turn(completed, "") else {
+            return;
+        };
         let mut map = self.inner.lock().unwrap();
-        match build_replay_turn(completed, "") {
-            Some(turn) => {
-                if map.len() >= self.capacity && !map.contains_key(session_key) {
-                    map.clear();
-                }
-                let existing = map
-                    .get(session_key)
-                    .filter(|e| e.stored_at.elapsed() <= self.ttl)
-                    .map(|e| e.items.clone())
-                    .unwrap_or_default();
-                let merged = append_replay_turn(&existing, &turn);
-                map.insert(
-                    session_key.to_string(),
-                    Entry {
-                        items: merged,
-                        stored_at: Instant::now(),
-                    },
-                );
-            }
-            None => {
-                map.remove(session_key);
-            }
+        if map.len() >= self.capacity && !map.contains_key(session_key) {
+            map.clear();
         }
+        let existing = map
+            .get(session_key)
+            .filter(|e| e.stored_at.elapsed() <= self.ttl)
+            .map(|e| e.items.clone())
+            .unwrap_or_default();
+        let merged = append_replay_turn(&existing, &turn);
+        map.insert(
+            session_key.to_string(),
+            Entry {
+                items: merged,
+                stored_at: Instant::now(),
+            },
+        );
     }
 
     /// 删除该会话缓存(上游拒绝 replay 项时调用,对齐
@@ -232,17 +229,24 @@ mod tests {
     }
 
     #[test]
-    fn test_no_replayable_output_clears_old() {
+    fn test_no_replayable_output_keeps_cache() {
         let cache = ReplayCache::new(Duration::from_secs(60), 128);
         cache.store_from_completed("sess-1", &completed());
+        // 纯文本轮(无可回放项)→ 不动缓存(对齐 CPA 直接 return;
+        // 累积语义下清空会丢全部历史 reasoning)
         cache.store_from_completed(
             "sess-1",
             &json!({"type": "response.completed", "response": {"output": [
                 {"type": "web_search_call"}
             ]}}),
         );
-        let mut body = json!({"input": []});
-        assert!(!cache.apply_to_body("sess-1", &mut body));
+        let mut body = json!({"input": [
+            {"type": "message", "role": "user", "content": "q"},
+            {"type": "function_call_output", "call_id": "call_1", "output": "ok"}
+        ]});
+        assert!(cache.apply_to_body("sess-1", &mut body));
+        let input = body["input"].as_array().unwrap();
+        assert!(input.iter().any(|i| i["type"] == "reasoning"));
     }
 
     #[test]

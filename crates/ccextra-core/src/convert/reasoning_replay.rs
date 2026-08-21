@@ -1,14 +1,15 @@
 // reasoning replay:responses 上游的服务器端 reasoning 状态回放
-// (对齐 CLIProxyAPI internal/runtime/executor/xai_reasoning_replay.go +
-// codex_executor_reasoning.go 的注入/过滤辅助)
+// (对齐 CLIProxyAPI internal/runtime/executor/codex_executor_reasoning.go
+// 的 codex 累积路径 + internal/cache/codex_reasoning_replay_cache.go)
 //
 // 背景:responses 协议 reasoning 是服务器端状态,store=false 时上游不保留。
 // Claude Code 回传的 thinking 块经 anthropic→responses 转换虽会回放
 // encrypted_content,但流式往返中签名/形状可能丢失(实测 grok 会话
 // 33 个 function_call 仅 2 条 reasoning),模型每轮丢失决策记忆,重复
-// 发相同工具调用陷入死循环。CPA 的解法:每轮从 response.completed 缓存
-// 原始 reasoning/message/function_call 项,下轮注入 input[](按 call_id
-// 对齐位置)。缓存状态由 server 层持有,本模块只做纯函数。
+// 发相同工具调用陷入死循环。CPA codex 路径的解法:每轮从 response.completed
+// 构造 turn(marker + raw items)累积进缓存,下轮按 turn 分段锚定注入
+// input[](call_id/assistant 指纹定位)。缓存状态由 server 层持有,
+// 本模块只做纯函数。
 
 use serde_json::{json, Value};
 
@@ -224,7 +225,7 @@ fn input_has_encrypted_content(input_items: &[Value], encrypted: &str) -> bool {
 /// - replay 含 call_id:首个未匹配 replay 的 function_call_output 前
 ///   (call_id 取全部 comparable 候选,对齐 CPA 的 replayCallIDs 收集)
 /// - 否则:最后一条 assistant message 处(插其前)
-/// - 都没有:input 末尾
+/// - 都没有:首个非 developer/system 项前;再没有则 input 末尾
 fn replay_insert_index(input_items: &[Value], replay_items: &[Value]) -> usize {
     let mut replay_call_ids: std::collections::HashSet<String> = std::collections::HashSet::new();
     for item in replay_items {
@@ -273,6 +274,20 @@ fn replay_insert_index(input_items: &[Value], replay_items: &[Value]) -> usize {
             .map(|r| r.trim().to_ascii_lowercase())
             .unwrap_or_default();
         if role == "assistant" && (item_type.is_empty() || item_type == "message") {
+            return index;
+        }
+    }
+    // 首个可插项前(对齐 shouldInsertCodexReasoningReplayBefore:
+    // role 空或 type 非 message 的项前可插;developer/system 消息前不插)
+    for (index, item) in input_items.iter().enumerate() {
+        let item_type = item.get("type").and_then(|v| v.as_str()).unwrap_or("");
+        let role = item
+            .get("role")
+            .and_then(|v| v.as_str())
+            .map(|r| r.trim().to_ascii_lowercase())
+            .unwrap_or_default();
+        let is_message = role.is_empty() || item_type.is_empty() || item_type == "message";
+        if !(is_message && (role == "developer" || role == "system")) {
             return index;
         }
     }
@@ -806,7 +821,12 @@ pub fn insert_replay_turns(body: &mut Value, replay_items: Vec<Value>) -> bool {
             }
             let index = replay_insert_index(&input_items, &filtered);
             let aligned = align_replay_call_ids(&input_items, filtered);
-            insertions.entry(index).or_default().extend(aligned);
+            // 前插(对齐 CPA insertions[index] = append(items, insertions[index]...)):
+            // turn 从新到旧处理,同锚点时旧 turn 排在前
+            let entry = insertions.entry(index).or_default();
+            let mut merged = aligned;
+            merged.append(entry);
+            *entry = merged;
             inserted = true;
             continue;
         }
@@ -824,7 +844,11 @@ pub fn insert_replay_turns(body: &mut Value, replay_items: Vec<Value>) -> bool {
             continue;
         }
         let aligned = align_replay_call_ids(&input_items, filtered);
-        insertions.entry(anchor).or_default().extend(aligned);
+        // 前插,同上
+        let entry = insertions.entry(anchor).or_default();
+        let mut merged = aligned;
+        merged.append(entry);
+        *entry = merged;
         inserted = true;
     }
     if !inserted {
