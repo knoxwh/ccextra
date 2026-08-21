@@ -616,8 +616,8 @@ pub const MAX_REPLAY_BYTES: usize = 16 << 20;
 /// 从 response.completed 构造一个 turn:[marker, ...items]
 /// (对齐 cacheCodexReasoningReplayFromCompleted)。
 ///
-/// marker id = sha256(request_fingerprint + assistant_fingerprint + call_ids
-/// + items 原始字节),同轮重放 id 相同,append 时按 id 去重。
+/// marker id = sha256(request_fingerprint、assistant_fingerprint、call_ids
+/// 与 items 原始字节拼接),同轮重放 id 相同,append 时按 id 去重。
 /// items 不归一化(CPA codex 路径存 raw);zzswitch 等 relay 非标准回显的
 /// function_call_output 一并缓存(配对完整,c40235f 场景)。
 /// 无 reasoning/function_call/custom_tool_call 项返回 None。
