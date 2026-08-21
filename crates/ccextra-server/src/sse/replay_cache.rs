@@ -58,10 +58,12 @@ impl StreamReplayExtractor {
                 .as_deref()
                 .or_else(|| value.get("type").and_then(|v| v.as_str()));
             match event_type {
-                Some("reasoning_text.delta") => {
+                // 上游真实事件名带 response. 前缀(见 sse/responses.rs 的
+                // event_type 判别,data.type 同为全名)
+                Some("response.reasoning_text.delta") => {
                     self.collect_reasoning_delta(&value);
                 }
-                Some("output_item.done") => {
+                Some("response.output_item.done") => {
                     self.collect_output_item_done(&value);
                 }
                 Some("response.completed") => {
@@ -426,8 +428,8 @@ mod tests {
         let mut extractor = StreamReplayExtractor::new(cache.clone(), key.clone());
 
         // 喂 output_item.done 事件
-        let done1 = b"event: output_item.done\ndata: {\"output_index\":0,\"item\":{\"type\":\"reasoning\",\"encrypted_content\":\"dGVzdA\"}}\n\n";
-        let done2 = b"event: output_item.done\ndata: {\"item\":{\"type\":\"function_call\",\"call_id\":\"c1\",\"name\":\"f\",\"arguments\":\"{}\"}}\n\n";
+        let done1 = b"event: response.output_item.done\ndata: {\"output_index\":0,\"item\":{\"type\":\"reasoning\",\"encrypted_content\":\"dGVzdA\"}}\n\n";
+        let done2 = b"event: response.output_item.done\ndata: {\"item\":{\"type\":\"function_call\",\"call_id\":\"c1\",\"name\":\"f\",\"arguments\":\"{}\"}}\n\n";
         extractor.push(done1);
         extractor.push(done2);
 
@@ -452,7 +454,7 @@ mod tests {
         let key = "sess-keep".to_string();
         let mut extractor = StreamReplayExtractor::new(cache.clone(), key.clone());
 
-        extractor.push(b"event: output_item.done\ndata: {\"item\":{\"type\":\"reasoning\",\"encrypted_content\":\"orphan\"}}\n\n");
+        extractor.push(b"event: response.output_item.done\ndata: {\"item\":{\"type\":\"reasoning\",\"encrypted_content\":\"orphan\"}}\n\n");
 
         // completed 已有 output
         let completed_with = b"event: response.completed\ndata: {\"type\":\"response.completed\",\"response\":{\"output\":[{\"type\":\"reasoning\",\"encrypted_content\":\"original\"}]}}\n\n";
@@ -473,15 +475,15 @@ mod tests {
 
         // 流式 reasoning 文本累积(对齐 grok-build L273 reasoning_acc.push_str)
         extractor.push(
-            b"event: reasoning_text.delta\ndata: {\"output_index\":0,\"delta\":\"thinking \"}\n\n",
+            b"event: response.reasoning_text.delta\ndata: {\"output_index\":0,\"delta\":\"thinking \"}\n\n",
         );
         extractor.push(
-            b"event: reasoning_text.delta\ndata: {\"output_index\":0,\"delta\":\"hard\"}\n\n",
+            b"event: response.reasoning_text.delta\ndata: {\"output_index\":0,\"delta\":\"hard\"}\n\n",
         );
 
         // output_item.done 无 content/summary → 兜底补 summary(对齐 inject_streaming_reasoning_fallback)
-        extractor.push(b"event: output_item.done\ndata: {\"output_index\":0,\"item\":{\"type\":\"reasoning\",\"encrypted_content\":\"gAAA\"}}\n\n");
-        extractor.push(b"event: output_item.done\ndata: {\"item\":{\"type\":\"function_call\",\"call_id\":\"c1\",\"name\":\"f\",\"arguments\":\"{}\"}}\n\n");
+        extractor.push(b"event: response.output_item.done\ndata: {\"output_index\":0,\"item\":{\"type\":\"reasoning\",\"encrypted_content\":\"gAAA\"}}\n\n");
+        extractor.push(b"event: response.output_item.done\ndata: {\"item\":{\"type\":\"function_call\",\"call_id\":\"c1\",\"name\":\"f\",\"arguments\":\"{}\"}}\n\n");
 
         // completed 无 output → patch 补上
         let completed_empty = b"event: response.completed\ndata: {\"type\":\"response.completed\",\"response\":{\"id\":\"r3\"}}\n\n";
@@ -507,10 +509,11 @@ mod tests {
         let mut extractor = StreamReplayExtractor::new(cache.clone(), key.clone());
 
         // 无 output_index 的 delta → fallback 槽
-        extractor.push(b"event: reasoning_text.delta\ndata: {\"delta\":\"fallback text\"}\n\n");
+        extractor
+            .push(b"event: response.reasoning_text.delta\ndata: {\"delta\":\"fallback text\"}\n\n");
 
         // output_item.done 无 output_index 且无 content/summary → 用 fallback 槽兜底
-        extractor.push(b"event: output_item.done\ndata: {\"item\":{\"type\":\"reasoning\",\"encrypted_content\":\"xAI\"}}\n\n");
+        extractor.push(b"event: response.output_item.done\ndata: {\"item\":{\"type\":\"reasoning\",\"encrypted_content\":\"xAI\"}}\n\n");
 
         let completed_empty = b"event: response.completed\ndata: {\"type\":\"response.completed\",\"response\":{\"id\":\"r4\"}}\n\n";
         extractor.push(completed_empty);
@@ -528,7 +531,7 @@ mod tests {
         let key = "sess-synth".to_string();
         let mut extractor = StreamReplayExtractor::new(cache.clone(), key.clone());
 
-        extractor.push(b"event: reasoning_text.delta\ndata: {\"delta\":\"think\"}\n\n");
+        extractor.push(b"event: response.reasoning_text.delta\ndata: {\"delta\":\"think\"}\n\n");
         // completed 自带 output 且无 reasoning 项 → 合成 reasoning 前插
         // (对齐官方 L1518-1525 无 Reasoning 时 insert 合成项)
         extractor.push(b"event: response.completed\ndata: {\"type\":\"response.completed\",\"response\":{\"output\":[{\"type\":\"function_call\",\"call_id\":\"c2\",\"name\":\"f\",\"arguments\":\"{}\"}]}}\n\n");
@@ -551,10 +554,12 @@ mod tests {
 
         // 两条 delta 单一累积;两个 reasoning 无文本 → 只塞第一个(对齐官方
         // items.iter().position(Reasoning) 取第一个)
-        extractor
-            .push(b"event: reasoning_text.delta\ndata: {\"output_index\":0,\"delta\":\"a\"}\n\n");
-        extractor
-            .push(b"event: reasoning_text.delta\ndata: {\"output_index\":1,\"delta\":\"b\"}\n\n");
+        extractor.push(
+            b"event: response.reasoning_text.delta\ndata: {\"output_index\":0,\"delta\":\"a\"}\n\n",
+        );
+        extractor.push(
+            b"event: response.reasoning_text.delta\ndata: {\"output_index\":1,\"delta\":\"b\"}\n\n",
+        );
         extractor.push(b"event: response.completed\ndata: {\"type\":\"response.completed\",\"response\":{\"output\":[{\"type\":\"reasoning\",\"encrypted_content\":\"e1\"},{\"type\":\"reasoning\",\"encrypted_content\":\"e2\"}]}}\n\n");
 
         let mut body = json!({"input": []});
@@ -573,10 +578,10 @@ mod tests {
         let mut extractor = StreamReplayExtractor::new(cache.clone(), key.clone());
 
         // 累积流式文本
-        extractor.push(b"event: reasoning_text.delta\ndata: {\"output_index\":0,\"delta\":\"orphan delta\"}\n\n");
+        extractor.push(b"event: response.reasoning_text.delta\ndata: {\"output_index\":0,\"delta\":\"orphan delta\"}\n\n");
 
         // output_item.done 已带 summary → 不用流式文本覆盖(对齐 grok-build L1503 any_with_text return)
-        extractor.push(b"event: output_item.done\ndata: {\"output_index\":0,\"item\":{\"type\":\"reasoning\",\"encrypted_content\":\"gAAA\",\"summary\":[{\"type\":\"summary_text\",\"text\":\"original summary\"}]}}\n\n");
+        extractor.push(b"event: response.output_item.done\ndata: {\"output_index\":0,\"item\":{\"type\":\"reasoning\",\"encrypted_content\":\"gAAA\",\"summary\":[{\"type\":\"summary_text\",\"text\":\"original summary\"}]}}\n\n");
 
         let completed_empty = b"event: response.completed\ndata: {\"type\":\"response.completed\",\"response\":{\"id\":\"r5\"}}\n\n";
         extractor.push(completed_empty);
