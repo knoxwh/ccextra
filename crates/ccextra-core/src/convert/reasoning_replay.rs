@@ -322,17 +322,22 @@ fn output_call_ids(input_items: &[Value]) -> std::collections::HashMap<String, S
 }
 
 /// replay 工具调用项 call_id 对齐到 input 已有 output 的形态
-/// (对齐 codexAlignReasoningReplayToolCallIDs)
+/// (对齐 codexAlignReasoningReplayToolCallIDs);reasoning 项注入前剥掉
+/// status 字段(对齐 grok-build conversation/responses.rs L219-221:
+/// status output-only,输入侧拒绝)。
 fn align_replay_call_ids(input_items: &[Value], replay_items: Vec<Value>) -> Vec<Value> {
     let outputs = output_call_ids(input_items);
-    if outputs.is_empty() {
-        return replay_items;
-    }
     replay_items
         .into_iter()
         .map(|mut item| {
             let item_type = item.get("type").and_then(|v| v.as_str()).unwrap_or("");
-            if !matches!(item_type, "function_call" | "custom_tool_call") {
+            if item_type == "reasoning" {
+                if let Some(obj) = item.as_object_mut() {
+                    obj.remove("status");
+                }
+                return item;
+            }
+            if outputs.is_empty() || !matches!(item_type, "function_call" | "custom_tool_call") {
                 return item;
             }
             let call_id = item
@@ -718,11 +723,49 @@ fn turn_anchor_index(
     None
 }
 
+/// reasoning 项是否携带可回放的明文(summary 非空文本或 content 非空)。
+/// 对齐 grok-build conversation/responses.rs:Reasoning 项带
+/// summary/content 时原样回放进 input,仅 encrypted-only 无文本项视为空。
+fn reasoning_has_text(item: &Value) -> bool {
+    if let Some(arr) = item.get("summary").and_then(|v| v.as_array()) {
+        if arr.iter().any(|sp| {
+            sp.get("text")
+                .and_then(|v| v.as_str())
+                .map(|s| !s.is_empty())
+                .unwrap_or(false)
+        }) {
+            return true;
+        }
+    }
+    if let Some(s) = item.get("content").and_then(|v| v.as_str()) {
+        return !s.is_empty();
+    }
+    if let Some(arr) = item.get("content").and_then(|v| v.as_array()) {
+        return arr.iter().any(|c| {
+            c.get("text")
+                .and_then(|v| v.as_str())
+                .map(|s| !s.is_empty())
+                .unwrap_or(false)
+        });
+    }
+    false
+}
+
 /// turn 内 items 过滤(对齐 filterCodexReasoningReplayTurnItems):
 /// reasoning 按 encrypted_content 去重;call 按键去重且须有匹配 output;
 /// message/output 直接丢(codex 路径不回放 output——output 由客户端提供,
 /// call 的配对门保证只注入 input 已有 output 的 call)。
-fn filter_turn_items(input_items: &[Value], items: Vec<Value>) -> Vec<Value> {
+///
+/// keep_plain_reasoning=true 时,无 encrypted_content 但带明文
+/// (summary/content)的 reasoning 保留(对齐 grok-build 官方行为,见
+/// conversation/responses.rs 的 ConversationItem::Reasoning 分支:整个
+/// ReasoningItem 原样注入 input,只清 status)。否则无
+/// encrypted_content 的 reasoning 丢弃,维持既有策略。
+fn filter_turn_items(
+    input_items: &[Value],
+    items: Vec<Value>,
+    keep_plain_reasoning: bool,
+) -> Vec<Value> {
     let mut existing_reasoning: std::collections::HashSet<String> = Default::default();
     let mut existing_calls: std::collections::HashSet<String> = Default::default();
     let mut existing_outputs: std::collections::HashSet<String> = Default::default();
@@ -758,9 +801,18 @@ fn filter_turn_items(input_items: &[Value], items: Vec<Value>) -> Vec<Value> {
                     .and_then(|v| v.as_str())
                     .map(|s| s.trim())
                     .unwrap_or("");
-                if enc.is_empty() || existing_reasoning.contains(enc) {
+                if enc.is_empty() {
+                    // 无加密信封:grok 明文回放开关放行带文本的项,
+                    // 否则丢弃(对齐 to_openai_responses.rs L594 决策)
+                    if keep_plain_reasoning && reasoning_has_text(&item) {
+                        filtered.push(item);
+                    }
                     continue;
                 }
+                if existing_reasoning.contains(enc) {
+                    continue;
+                }
+                filtered.push(item);
             }
             "function_call" | "custom_tool_call" => {
                 let keys = tool_call_keys(&item);
@@ -782,10 +834,10 @@ fn filter_turn_items(input_items: &[Value], items: Vec<Value>) -> Vec<Value> {
                 for key in keys {
                     existing_calls.insert(key);
                 }
+                filtered.push(item);
             }
             _ => continue,
         }
-        filtered.push(item);
     }
     filtered
 }
@@ -793,7 +845,14 @@ fn filter_turn_items(input_items: &[Value], items: Vec<Value>) -> Vec<Value> {
 /// 累积 replay 注入(对齐 insertCodexReasoningReplayTurns):
 /// 按 turn 从新到旧处理,各 turn 锚定后过滤、call_id 对齐、插入。
 /// unmarked turn(旧格式)走现有单块路径。任一 turn 注入成功即 true。
-pub fn insert_replay_turns(body: &mut Value, replay_items: Vec<Value>) -> bool {
+///
+/// keep_plain_reasoning=true 时保留无 encrypted_content 但带摘要文本的
+/// reasoning(上游为 grok 时启用,对齐 grok-build 官方行为)。
+pub fn insert_replay_turns(
+    body: &mut Value,
+    replay_items: Vec<Value>,
+    keep_plain_reasoning: bool,
+) -> bool {
     let Some(input_items) = body.get("input").and_then(|v| v.as_array().cloned()) else {
         return false;
     };
@@ -839,7 +898,7 @@ pub fn insert_replay_turns(body: &mut Value, replay_items: Vec<Value>) -> bool {
         if turn.request_fingerprint.is_empty() {
             fallback_end = anchor.saturating_sub(1);
         }
-        let filtered = filter_turn_items(&input_items, turn.items.clone());
+        let filtered = filter_turn_items(&input_items, turn.items.clone(), keep_plain_reasoning);
         if filtered.is_empty() {
             continue;
         }
@@ -913,6 +972,82 @@ mod tests {
     }
 
     #[test]
+    fn test_filter_plain_reasoning_kept_for_grok_only() {
+        let body = json!({"input": [
+            {"type": "message", "role": "user", "content": "q"}
+        ]});
+        let items = vec![
+            // 无 encrypted_content 但带 summary 文本(官方 grok 明文推理)
+            json!({"type": "reasoning", "summary": [{"type": "summary_text", "text": "think"}]}),
+            // 无文本的明文 reasoning,任何时候都丢
+            json!({"type": "reasoning"}),
+            // 加密信封不受开关影响
+            json!({"type": "reasoning", "encrypted_content": "gAAA"}),
+        ];
+        // 非 grok:明文一律丢(仅剩加密项)
+        let filtered = filter_turn_items(body["input"].as_array().unwrap(), items.clone(), false);
+        assert_eq!(filtered.len(), 1);
+        assert_eq!(filtered[0]["encrypted_content"], "gAAA");
+        // grok:带文本的明文保留
+        let filtered = filter_turn_items(body["input"].as_array().unwrap(), items.clone(), true);
+        assert_eq!(filtered.len(), 2);
+        assert!(filtered
+            .iter()
+            .any(|i| i["type"] == "reasoning" && i["summary"][0]["text"] == "think"));
+        assert!(filtered.iter().any(|i| i["encrypted_content"] == "gAAA"));
+    }
+
+    #[test]
+    fn test_insert_replay_turns_keeps_plain_reasoning_for_grok() {
+        let completed = json!({"response": {"output": [
+            {"type": "reasoning", "summary": [{"type": "summary_text", "text": "think"}]}
+        ]}});
+        let turn = build_replay_turn(&completed, "").unwrap();
+        let mut body = json!({"input": [
+            {"type": "message", "role": "user", "content": "q"},
+            {"type": "message", "role": "assistant", "content": [
+                {"type": "output_text", "text": "hi"}
+            ]}
+        ]});
+        // 非 grok:明文 reasoning 丢弃,无可回放项 → 不注入
+        let mut plain = body.clone();
+        assert!(!insert_replay_turns(&mut plain, turn.clone(), false));
+        assert!(plain["input"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .all(|i| i["type"] != "reasoning"));
+        // grok:明文 reasoning 保留并注入
+        assert!(insert_replay_turns(&mut body, turn, true));
+        assert!(body["input"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .any(|i| i["type"] == "reasoning" && i["summary"][0]["text"] == "think"));
+    }
+
+    #[test]
+    fn test_insert_replay_strips_reasoning_status() {
+        let completed = json!({"response": {"output": [
+            {"type": "reasoning", "encrypted_content": "gAAA", "status": "in_progress"}
+        ]}});
+        let turn = build_replay_turn(&completed, "").unwrap();
+        let mut body = json!({"input": [
+            {"type": "message", "role": "user", "content": "q"}
+        ]});
+        assert!(insert_replay_turns(&mut body, turn, false));
+        let reasoning = body["input"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .find(|i| i["type"] == "reasoning")
+            .unwrap();
+        // 对齐官方 L219-221:status output-only,注入前剥掉
+        assert!(reasoning.get("status").is_none());
+        assert_eq!(reasoning["encrypted_content"], "gAAA");
+    }
+
+    #[test]
     fn test_filter_ambiguous_assistant_history_blocks_all() {
         let body = json!({"input": [
             {"type": "message", "role": "user", "content": "q"},
@@ -956,7 +1091,7 @@ mod tests {
             json!({"type": "reasoning", "encrypted_content": "gAAA"}),
             json!({"type": "function_call", "call_id": "call_1", "name": "f", "arguments": "{}"}),
         ];
-        assert!(insert_replay_turns(&mut body, items));
+        assert!(insert_replay_turns(&mut body, items, false));
         let input = body["input"].as_array().unwrap();
         // 插在首个 output 前(index 1),reasoning 与 function_call 都在其前
         assert_eq!(input.len(), 5);
@@ -973,7 +1108,7 @@ mod tests {
             {"type": "message", "role": "user", "content": "next"}
         ]});
         let items = vec![json!({"type": "reasoning", "encrypted_content": "gAAA"})];
-        assert!(insert_replay_turns(&mut body, items));
+        assert!(insert_replay_turns(&mut body, items, false));
         let input = body["input"].as_array().unwrap();
         // 插在最后一条 assistant 处(其前)
         assert_eq!(input.len(), 4);
@@ -993,7 +1128,7 @@ mod tests {
             "name": "f",
             "arguments": "{}"
         })];
-        assert!(insert_replay_turns(&mut body, items));
+        assert!(insert_replay_turns(&mut body, items, false));
         let input = body["input"].as_array().unwrap();
         // call.1 sanitize 后为 call_1,与 output 匹配,对齐为 output 的形态
         assert_eq!(input[0]["call_id"], "call_1");
@@ -1003,11 +1138,12 @@ mod tests {
     #[test]
     fn test_insert_empty_or_bad_input() {
         let mut body = json!({"input": []});
-        assert!(!insert_replay_turns(&mut body, vec![]));
+        assert!(!insert_replay_turns(&mut body, vec![], false));
         let mut no_input = json!({});
         assert!(!insert_replay_turns(
             &mut no_input,
-            vec![json!({"type": "reasoning", "encrypted_content": "g"})]
+            vec![json!({"type": "reasoning", "encrypted_content": "g"})],
+            false
         ));
     }
 
@@ -1210,7 +1346,7 @@ mod tests {
             json!({"type": "reasoning", "encrypted_content": "g2"}),
             json!({"type": "function_call", "call_id": "c2", "name": "f", "arguments": "{}"}),
         ];
-        assert!(insert_replay_turns(&mut body, replay));
+        assert!(insert_replay_turns(&mut body, replay, false));
         let input = body["input"].as_array().unwrap();
         // t2 锚定 c2(在 input),t1 的 c1 不在 input → 锚定失败被丢
         // (call 无匹配 output,filter 剔除;reasoning 无锚也不注入)
@@ -1246,7 +1382,7 @@ mod tests {
             json!({"type": "reasoning", "encrypted_content": "g1"}),
             json!({"type": "function_call", "call_id": "c1", "name": "f", "arguments": "{}"}),
         ];
-        assert!(insert_replay_turns(&mut body, replay));
+        assert!(insert_replay_turns(&mut body, replay, false));
         let input = body["input"].as_array().unwrap();
         // 插在首个 output 前
         assert_eq!(input[1]["type"], "reasoning");
@@ -1257,6 +1393,6 @@ mod tests {
     #[test]
     fn test_insert_replay_turns_empty() {
         let mut body = json!({"input": []});
-        assert!(!insert_replay_turns(&mut body, vec![]));
+        assert!(!insert_replay_turns(&mut body, vec![], false));
     }
 }

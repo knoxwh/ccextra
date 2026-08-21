@@ -580,7 +580,13 @@ async fn handle_messages(
             // model+session 连续性边界)。
             if let Some(sess) = cc_session.as_deref() {
                 let key = format!("{}:{}", route.upstream_model, sess);
-                if state.replay_cache.apply_to_body(&key, &mut body_json) {
+                // grok 上游无加密信封时保留明文 reasoning 回放
+                // (对齐 grok-build 官方行为,其余上游维持仅加密回放)
+                if state.replay_cache.apply_to_body(
+                    &key,
+                    &mut body_json,
+                    is_grok_model(&route.upstream_model),
+                ) {
                     tracing::debug!(
                         session = %sess,
                         model = %route.upstream_model,
@@ -636,7 +642,7 @@ async fn handle_messages(
                 if let Some(sess) = cc_session.as_deref() {
                     let key = format!("{}:{}", route.upstream_model, sess);
                     if let Some(request) = body_json.get_mut("request") {
-                        if state.replay_cache.apply_to_body(&key, request) {
+                        if state.replay_cache.apply_to_body(&key, request, false) {
                             tracing::debug!(
                                 session = %sess,
                                 model = %route.upstream_model,

@@ -27,11 +27,9 @@ pub struct StreamReplayExtractor {
     items_by_index: HashMap<i64, Value>,
     /// 无 output_index 的 done 项(对齐 outputItemsFallback)
     items_fallback: Vec<Value>,
-    /// 流式 reasoning 文本累积器(对齐 grok-build reasoning_acc,
-    /// 按 output_index 分槽;completed 无 content/summary 时兜底补 summary)
-    reasoning_deltas: HashMap<i64, String>,
-    /// 无 output_index 的 reasoning 文本兜底槽
-    reasoning_delta_fallback: String,
+    /// 流式 reasoning 文本累积器(对齐 grok-build stream/responses.rs
+    /// L273 reasoning_acc.push_str:不分 output_index 单一累积)
+    reasoning_acc: String,
 }
 
 impl StreamReplayExtractor {
@@ -42,8 +40,7 @@ impl StreamReplayExtractor {
             parser: SseParser::new(),
             items_by_index: HashMap::new(),
             items_fallback: Vec::new(),
-            reasoning_deltas: HashMap::new(),
-            reasoning_delta_fallback: String::new(),
+            reasoning_acc: String::new(),
         }
     }
 
@@ -76,66 +73,23 @@ impl StreamReplayExtractor {
         }
     }
 
-    /// 收集 reasoning_text.delta(对齐 grok-build L273 reasoning_acc.push_str)
+    /// 收集 reasoning_text.delta(对齐 grok-build L273 reasoning_acc.push_str,
+    /// 官方不分 output_index 单一累积)
     fn collect_reasoning_delta(&mut self, event_data: &Value) {
         let Some(delta) = event_data.get("delta").and_then(|v| v.as_str()) else {
             return;
         };
-        if delta.is_empty() {
-            return;
-        }
-        if let Some(idx) = event_data.get("output_index").and_then(|v| v.as_i64()) {
-            self.reasoning_deltas
-                .entry(idx)
-                .or_default()
-                .push_str(delta);
-        } else {
-            self.reasoning_delta_fallback.push_str(delta);
-        }
+        self.reasoning_acc.push_str(delta);
     }
 
-    /// 收集 output_item.done 的 item 字段(对齐 xaiCollectOutputItemDone)
+    /// 收集 output_item.done 的 item 字段(对齐 xaiCollectOutputItemDone,
+    /// 原样存 item,不做 per-item 兜底——reasoning 缺失文本统一由
+    /// completed 时的 merge_streamed_reasoning_summaries 处理,对齐
+    /// grok-build 只在最终 response 上 inject_streaming_reasoning_fallback)
     fn collect_output_item_done(&mut self, event_data: &Value) {
-        let Some(mut item) = event_data.get("item").cloned() else {
+        let Some(item) = event_data.get("item").cloned() else {
             return;
         };
-        // reasoning item 无 content/summary 时,用累积的流式文本兜底补 summary
-        // (对齐 grok-build inject_streaming_reasoning_fallback L1493-1526)
-        if item.get("type").and_then(|v| v.as_str()) == Some("reasoning") {
-            let has_text = item
-                .get("summary")
-                .and_then(|v| v.as_array())
-                .map(|arr| {
-                    arr.iter().any(|sp| {
-                        sp.get("text")
-                            .and_then(|t| t.as_str())
-                            .map(|s| !s.is_empty())
-                            .unwrap_or(false)
-                    })
-                })
-                .unwrap_or(false)
-                || item
-                    .get("content")
-                    .and_then(|v| v.as_str())
-                    .map(|s| !s.is_empty())
-                    .unwrap_or(false);
-            if !has_text {
-                let idx = event_data.get("output_index").and_then(|v| v.as_i64());
-                let text = if let Some(idx) = idx {
-                    self.reasoning_deltas.get(&idx).map(|s| s.as_str())
-                } else {
-                    Some(self.reasoning_delta_fallback.as_str())
-                };
-                if let Some(text) = text.filter(|t| !t.is_empty()) {
-                    if let Some(obj) = item.as_object_mut() {
-                        obj.insert(
-                            "summary".to_string(),
-                            serde_json::json!([{"type": "summary_text", "text": text}]),
-                        );
-                    }
-                }
-            }
-        }
         if let Some(idx) = event_data.get("output_index").and_then(|v| v.as_i64()) {
             self.items_by_index.insert(idx, item);
         } else {
@@ -143,32 +97,117 @@ impl StreamReplayExtractor {
         }
     }
 
-    /// completed 若无 output,用收集的 items 补上(对齐 xaiPatchCompletedOutput)
+    /// completed 若无 output,用收集的 items 补上(对齐 xaiPatchCompletedOutput);
+    /// 之后统一注入流式 reasoning 兜底(对齐 grok-build 流式路径在最终
+    /// response 上调用 inject_streaming_reasoning_fallback L549-550)
     fn patch_completed_output(&self, mut completed: Value) -> Value {
         let has_output = completed
             .pointer("/response/output")
             .and_then(|v| v.as_array())
             .map(|arr| !arr.is_empty())
             .unwrap_or(false);
-        if has_output || (self.items_by_index.is_empty() && self.items_fallback.is_empty()) {
-            return completed;
-        }
-        let mut indexes: Vec<i64> = self.items_by_index.keys().copied().collect();
-        indexes.sort_unstable();
-        let mut output = Vec::with_capacity(indexes.len() + self.items_fallback.len());
-        for idx in indexes {
-            if let Some(item) = self.items_by_index.get(&idx) {
-                output.push(item.clone());
+        if !has_output && !(self.items_by_index.is_empty() && self.items_fallback.is_empty()) {
+            let mut indexes: Vec<i64> = self.items_by_index.keys().copied().collect();
+            indexes.sort_unstable();
+            let mut output = Vec::with_capacity(indexes.len() + self.items_fallback.len());
+            for idx in indexes {
+                if let Some(item) = self.items_by_index.get(&idx) {
+                    output.push(item.clone());
+                }
+            }
+            output.extend(self.items_fallback.iter().cloned());
+            if let Some(obj) = completed.as_object_mut() {
+                if let Some(response) = obj.get_mut("response").and_then(|v| v.as_object_mut()) {
+                    response.insert("output".to_string(), Value::Array(output));
+                }
             }
         }
-        output.extend(self.items_fallback.iter().cloned());
-        if let Some(obj) = completed.as_object_mut() {
-            if let Some(response) = obj.get_mut("response").and_then(|v| v.as_object_mut()) {
-                response.insert("output".to_string(), Value::Array(output));
-            }
-        }
+        self.merge_streamed_reasoning_summaries(&mut completed);
         completed
     }
+
+    /// 流式 reasoning 兜底注入(对齐 grok-build
+    /// inject_streaming_reasoning_fallback L1493-1526):
+    /// - 无累积文本 → 不动
+    /// - output 任一 reasoning 已带 summary 文本 → 不动
+    /// - 有 reasoning 无文本 → 把累积文本 push 进第一个的 summary(不覆盖)
+    /// - 无 reasoning → 在尾 assistant 前插入合成 reasoning 项
+    fn merge_streamed_reasoning_summaries(&self, completed: &mut Value) {
+        if self.reasoning_acc.is_empty() {
+            return;
+        }
+        let Some(output) = completed
+            .pointer_mut("/response/output")
+            .and_then(|v| v.as_array_mut())
+        else {
+            return;
+        };
+        let any_with_text = output.iter().any(|item| {
+            item.get("type").and_then(|v| v.as_str()) == Some("reasoning")
+                && reasoning_item_has_text(item)
+        });
+        if any_with_text {
+            return;
+        }
+        if let Some(item) = output
+            .iter_mut()
+            .find(|i| i.get("type").and_then(|v| v.as_str()) == Some("reasoning"))
+        {
+            let text = self.reasoning_acc.clone();
+            if let Some(obj) = item.as_object_mut() {
+                if let Some(arr) = obj
+                    .get("summary")
+                    .and_then(|v| v.as_array())
+                    .map(|a| a.to_vec())
+                {
+                    let mut pushable = arr;
+                    pushable.push(serde_json::json!({"type": "summary_text", "text": text}));
+                    obj.insert("summary".to_string(), Value::Array(pushable));
+                } else {
+                    obj.insert(
+                        "summary".to_string(),
+                        serde_json::json!([{"type": "summary_text", "text": text}]),
+                    );
+                }
+            }
+            return;
+        }
+        // 无 reasoning:在尾 assistant 组首项前插入合成项(对齐官方
+        // rposition(Assistant);转入 output 形状,assistant 组由 message/
+        // function_call 折叠而成,首项即组起点)
+        let pos = output
+            .iter()
+            .position(|i| {
+                matches!(
+                    i.get("type").and_then(|v| v.as_str()).unwrap_or(""),
+                    "message" | "function_call" | "custom_tool_call"
+                )
+            })
+            .unwrap_or(output.len());
+        output.insert(
+            pos,
+            serde_json::json!({"type": "reasoning", "summary": [
+                {"type": "summary_text", "text": self.reasoning_acc}
+            ]}),
+        );
+    }
+}
+
+/// reasoning item 是否已带 summary 文本(对齐官方
+/// inject_streaming_reasoning_fallback 的 any_with_text,只查 summary;
+/// encrypted 项 summary 为空数组视为无文本)
+fn reasoning_item_has_text(item: &Value) -> bool {
+    item.get("summary")
+        .and_then(|v| v.as_array())
+        .map(|arr| {
+            arr.iter().any(|sp| {
+                sp.get("text")
+                    .and_then(|t| t.as_str())
+                    .map(|s| !s.is_empty())
+                    .unwrap_or(false)
+            })
+        })
+        .unwrap_or(false)
 }
 
 /// 缓存条目
@@ -245,7 +284,14 @@ impl ReplayCache {
     /// 取上一轮 replay 项并注入 body.input(过滤 + 对齐 + 插入全在 core)。
     /// 无缓存/过滤后为空返回 false。命中时刷新时间戳(对齐 CPA 读时
     /// 滑动续期:GetXAIReasoningReplayItemsRequired 更新 entry.Timestamp)。
-    pub fn apply_to_body(&self, session_key: &str, body: &mut Value) -> bool {
+    /// keep_plain_reasoning=true 时保留无 encrypted_content 但带摘要文本
+    /// 的 reasoning(grok 上游启用,对齐 grok-build 官方行为)。
+    pub fn apply_to_body(
+        &self,
+        session_key: &str,
+        body: &mut Value,
+        keep_plain_reasoning: bool,
+    ) -> bool {
         let trimmed = session_key.trim();
         if trimmed.is_empty() {
             return false;
@@ -265,7 +311,7 @@ impl ReplayCache {
                 None => return false,
             }
         };
-        insert_replay_turns(body, items)
+        insert_replay_turns(body, items, keep_plain_reasoning)
     }
 }
 
@@ -289,7 +335,7 @@ mod tests {
             {"type": "message", "role": "user", "content": "q"},
             {"type": "function_call_output", "call_id": "call_1", "output": "ok"}
         ]});
-        assert!(cache.apply_to_body("sess-1", &mut body));
+        assert!(cache.apply_to_body("sess-1", &mut body, false));
         let input = body["input"].as_array().unwrap();
         assert_eq!(input.len(), 4);
         assert_eq!(input[1]["type"], "reasoning");
@@ -311,7 +357,7 @@ mod tests {
             {"type": "message", "role": "user", "content": "q"},
             {"type": "function_call_output", "call_id": "call_1", "output": "ok"}
         ]});
-        assert!(cache.apply_to_body("sess-1", &mut body));
+        assert!(cache.apply_to_body("sess-1", &mut body, false));
         let input = body["input"].as_array().unwrap();
         assert!(input.iter().any(|i| i["type"] == "reasoning"));
     }
@@ -322,7 +368,7 @@ mod tests {
         cache.store_from_completed("sess-1", &completed());
         std::thread::sleep(Duration::from_millis(2));
         let mut body = json!({"input": []});
-        assert!(!cache.apply_to_body("sess-1", &mut body));
+        assert!(!cache.apply_to_body("sess-1", &mut body, false));
     }
 
     #[test]
@@ -344,7 +390,7 @@ mod tests {
             {"type": "function_call_output", "call_id": "c1", "output": "ok1"},
             {"type": "function_call_output", "call_id": "c2", "output": "ok2"}
         ]});
-        assert!(cache.apply_to_body("sess-1", &mut body));
+        assert!(cache.apply_to_body("sess-1", &mut body, false));
         let input = body["input"].as_array().unwrap();
         assert!(input.iter().any(|i| i["encrypted_content"] == "g1"));
         assert!(input.iter().any(|i| i["encrypted_content"] == "g2"));
@@ -362,7 +408,7 @@ mod tests {
         let mut body = json!({"input": [
             {"type": "message", "role": "user", "content": "q"}
         ]});
-        if cache.apply_to_body("sess-1", &mut body) {
+        if cache.apply_to_body("sess-1", &mut body, false) {
             let count = body["input"]
                 .as_array()
                 .unwrap()
@@ -394,7 +440,7 @@ mod tests {
             {"type": "message", "role": "user", "content": "q"},
             {"type": "function_call_output", "call_id": "c1", "output": "ok"}
         ]});
-        assert!(cache.apply_to_body(&key, &mut body));
+        assert!(cache.apply_to_body(&key, &mut body, false));
         let input = body["input"].as_array().unwrap();
         assert!(input.iter().any(|i| i["type"] == "reasoning"));
         assert!(input.iter().any(|i| i["type"] == "function_call"));
@@ -413,7 +459,7 @@ mod tests {
         extractor.push(completed_with);
 
         let mut body = json!({"input": []});
-        assert!(cache.apply_to_body(&key, &mut body));
+        assert!(cache.apply_to_body(&key, &mut body, false));
         let input = body["input"].as_array().unwrap();
         // 应该用 original 不是 orphan
         assert_eq!(input[0]["encrypted_content"], "original");
@@ -446,7 +492,7 @@ mod tests {
             {"type": "message", "role": "user", "content": "q"},
             {"type": "function_call_output", "call_id": "c1", "output": "ok"}
         ]});
-        assert!(cache.apply_to_body(&key, &mut body));
+        assert!(cache.apply_to_body(&key, &mut body, false));
         let input = body["input"].as_array().unwrap();
         let reasoning = input.iter().find(|i| i["type"] == "reasoning").unwrap();
         assert_eq!(reasoning["encrypted_content"], "gAAA");
@@ -470,10 +516,54 @@ mod tests {
         extractor.push(completed_empty);
 
         let mut body = json!({"input": []});
-        assert!(cache.apply_to_body(&key, &mut body));
+        assert!(cache.apply_to_body(&key, &mut body, false));
         let input = body["input"].as_array().unwrap();
         let reasoning = input.iter().find(|i| i["type"] == "reasoning").unwrap();
         assert_eq!(reasoning["summary"][0]["text"], "fallback text");
+    }
+
+    #[test]
+    fn test_fallback_inserts_synthetic_reasoning_before_assistant() {
+        let cache = ReplayCache::new(Duration::from_secs(60), 128);
+        let key = "sess-synth".to_string();
+        let mut extractor = StreamReplayExtractor::new(cache.clone(), key.clone());
+
+        extractor.push(b"event: reasoning_text.delta\ndata: {\"delta\":\"think\"}\n\n");
+        // completed 自带 output 且无 reasoning 项 → 合成 reasoning 前插
+        // (对齐官方 L1518-1525 无 Reasoning 时 insert 合成项)
+        extractor.push(b"event: response.completed\ndata: {\"type\":\"response.completed\",\"response\":{\"output\":[{\"type\":\"function_call\",\"call_id\":\"c2\",\"name\":\"f\",\"arguments\":\"{}\"}]}}\n\n");
+
+        let mut body = json!({"input": [
+            {"type": "function_call_output", "call_id": "c2", "output": "ok"}
+        ]});
+        assert!(cache.apply_to_body(&key, &mut body, true));
+        let input = body["input"].as_array().unwrap();
+        let reasoning = input.iter().find(|i| i["type"] == "reasoning").unwrap();
+        assert_eq!(reasoning["summary"][0]["text"], "think");
+        assert!(input.iter().any(|i| i["type"] == "function_call"));
+    }
+
+    #[test]
+    fn test_fallback_fills_first_reasoning_only() {
+        let cache = ReplayCache::new(Duration::from_secs(60), 128);
+        let key = "sess-first".to_string();
+        let mut extractor = StreamReplayExtractor::new(cache.clone(), key.clone());
+
+        // 两条 delta 单一累积;两个 reasoning 无文本 → 只塞第一个(对齐官方
+        // items.iter().position(Reasoning) 取第一个)
+        extractor
+            .push(b"event: reasoning_text.delta\ndata: {\"output_index\":0,\"delta\":\"a\"}\n\n");
+        extractor
+            .push(b"event: reasoning_text.delta\ndata: {\"output_index\":1,\"delta\":\"b\"}\n\n");
+        extractor.push(b"event: response.completed\ndata: {\"type\":\"response.completed\",\"response\":{\"output\":[{\"type\":\"reasoning\",\"encrypted_content\":\"e1\"},{\"type\":\"reasoning\",\"encrypted_content\":\"e2\"}]}}\n\n");
+
+        let mut body = json!({"input": []});
+        assert!(cache.apply_to_body(&key, &mut body, false));
+        let input = body["input"].as_array().unwrap();
+        let reasonings: Vec<_> = input.iter().filter(|i| i["type"] == "reasoning").collect();
+        assert_eq!(reasonings.len(), 2);
+        assert_eq!(reasonings[0]["summary"][0]["text"], "ab");
+        assert!(reasonings[1].get("summary").is_none());
     }
 
     #[test]
@@ -492,7 +582,7 @@ mod tests {
         extractor.push(completed_empty);
 
         let mut body = json!({"input": []});
-        assert!(cache.apply_to_body(&key, &mut body));
+        assert!(cache.apply_to_body(&key, &mut body, false));
         let input = body["input"].as_array().unwrap();
         let reasoning = input.iter().find(|i| i["type"] == "reasoning").unwrap();
         // 应保留 original summary 不是 orphan delta
