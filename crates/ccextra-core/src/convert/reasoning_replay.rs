@@ -749,6 +749,320 @@ fn trim_replay_items(mut items: Vec<Value>) -> Vec<Value> {
     }
 }
 
+/// 一个 replay turn:marker 元数据 + 该轮 items
+struct ReplayTurn {
+    marked: bool,
+    assistant_fingerprint: String,
+    request_fingerprint: String,
+    call_ids: Vec<String>,
+    items: Vec<Value>,
+}
+
+/// 按 marker 分段(对齐 splitCodexReasoningReplayTurns):
+/// marker 开新段;无 marker 前导的头部 items 归入一个 unmarked 段。
+fn split_replay_turns(items: &[Value]) -> Vec<ReplayTurn> {
+    let mut turns: Vec<ReplayTurn> = Vec::new();
+    let mut current = ReplayTurn {
+        marked: false,
+        assistant_fingerprint: String::new(),
+        request_fingerprint: String::new(),
+        call_ids: Vec::new(),
+        items: Vec::new(),
+    };
+    for item in items {
+        if item.get("type").and_then(|v| v.as_str()) == Some(REPLAY_TURN_TYPE) {
+            if !current.items.is_empty() {
+                turns.push(current);
+            }
+            current = ReplayTurn {
+                marked: true,
+                assistant_fingerprint: item
+                    .get("assistant_fingerprint")
+                    .and_then(|v| v.as_str())
+                    .unwrap_or("")
+                    .trim()
+                    .to_string(),
+                request_fingerprint: item
+                    .get("request_fingerprint")
+                    .and_then(|v| v.as_str())
+                    .unwrap_or("")
+                    .trim()
+                    .to_string(),
+                call_ids: item
+                    .get("call_ids")
+                    .and_then(|v| v.as_array())
+                    .map(|arr| {
+                        arr.iter()
+                            .filter_map(|v| v.as_str())
+                            .map(|s| s.trim().to_string())
+                            .filter(|s| !s.is_empty())
+                            .collect()
+                    })
+                    .unwrap_or_default(),
+                items: Vec::new(),
+            };
+            continue;
+        }
+        current.items.push(item.clone());
+    }
+    if !current.items.is_empty() {
+        turns.push(current);
+    }
+    turns
+}
+
+/// 增量前缀指纹(对齐 codexReplayPrefixFingerprints):
+/// 逐项推进 hasher,clone 中间状态取各前缀指纹,应答任意 end 查询。
+struct PrefixFingerprints {
+    hasher: sha2::Sha256, // 持续推进
+    sums: Vec<String>,    // sums[end] = items[0:end] 指纹
+    len: usize,
+}
+
+impl PrefixFingerprints {
+    fn new(len: usize) -> Self {
+        use sha2::{Digest, Sha256};
+        Self {
+            hasher: Sha256::new(),
+            sums: vec![hex::encode(Sha256::new().finalize())],
+            len,
+        }
+    }
+
+    fn push(&mut self, item: &Value) {
+        use sha2::Digest;
+        self.hasher.update(b"\0item\0");
+        self.hasher.update(serde_json::to_vec(item).unwrap_or_default());
+        // clone 当前状态再 finalize,得到该前缀指纹
+        let fp = hex::encode(self.hasher.clone().finalize());
+        self.sums.push(fp);
+    }
+
+    fn at(&self, end: usize) -> String {
+        if end > self.len {
+            return String::new();
+        }
+        self.sums[end].clone()
+    }
+}
+
+/// turn 锚点定位(对齐 codexReasoningReplayTurnAnchorIndex):
+/// 1. call_ids 非空:从 searchEnd 向前找首个 call_id 匹配的 call/output 项
+/// 2. 否则 assistant_fingerprint 非空:向前找指纹匹配的 assistant message
+/// 3. 两者都空:退回现有 replay_insert_index
+///
+/// request_fingerprint 非空时要求锚点处前缀指纹匹配(防错位)。
+/// 已用锚点(used)跳过。找不到返回 None。
+fn turn_anchor_index(
+    input_items: &[Value],
+    turn: &ReplayTurn,
+    fallback_end: usize,
+    used: &mut std::collections::HashSet<usize>,
+    fingerprints: &PrefixFingerprints,
+) -> Option<usize> {
+    let mut search_end = fallback_end.min(input_items.len().saturating_sub(1));
+    if !turn.request_fingerprint.is_empty() {
+        search_end = input_items.len().saturating_sub(1);
+    }
+    let matches_prefix = |index: usize| {
+        turn.request_fingerprint.is_empty()
+            || fingerprints.at(index) == turn.request_fingerprint
+    };
+    if !turn.call_ids.is_empty() {
+        let mut wanted: std::collections::HashSet<String> = Default::default();
+        for call_id in &turn.call_ids {
+            wanted.extend(comparable_call_ids(call_id));
+        }
+        for index in (0..=search_end).rev() {
+            if used.contains(&index) || !matches_prefix(index) {
+                continue;
+            }
+            let item_type = input_items[index]
+                .get("type")
+                .and_then(|v| v.as_str())
+                .unwrap_or("");
+            if !matches!(
+                item_type,
+                "function_call"
+                    | "custom_tool_call"
+                    | "function_call_output"
+                    | "custom_tool_call_output"
+            ) {
+                continue;
+            }
+            let call_id = input_items[index]
+                .get("call_id")
+                .and_then(|v| v.as_str())
+                .unwrap_or("");
+            if comparable_call_ids(call_id).iter().any(|c| wanted.contains(c)) {
+                return Some(index);
+            }
+        }
+    }
+    if !turn.assistant_fingerprint.is_empty() {
+        for index in (0..=search_end).rev() {
+            if used.contains(&index) || !matches_prefix(index) {
+                continue;
+            }
+            if assistant_message_fingerprint(&input_items[index]) == turn.assistant_fingerprint {
+                return Some(index);
+            }
+        }
+    }
+    if turn.call_ids.is_empty() && turn.assistant_fingerprint.is_empty() {
+        return Some(replay_insert_index(input_items, &turn.items));
+    }
+    None
+}
+
+/// turn 内 items 过滤(对齐 filterCodexReasoningReplayTurnItems):
+/// reasoning 按 encrypted_content 去重;call 按键去重且须有匹配 output;
+/// message/output 直接丢(codex 路径不回放 output——output 由客户端提供,
+/// call 的配对门保证只注入 input 已有 output 的 call)。
+fn filter_turn_items(input_items: &[Value], items: Vec<Value>) -> Vec<Value> {
+    let mut existing_reasoning: std::collections::HashSet<String> = Default::default();
+    let mut existing_calls: std::collections::HashSet<String> = Default::default();
+    let mut existing_outputs: std::collections::HashSet<String> = Default::default();
+    for item in input_items {
+        match item.get("type").and_then(|v| v.as_str()).unwrap_or("") {
+            "reasoning" => {
+                if let Some(enc) = item
+                    .get("encrypted_content")
+                    .and_then(|v| v.as_str())
+                    .map(|s| s.trim())
+                    .filter(|s| !s.is_empty())
+                {
+                    existing_reasoning.insert(enc.to_string());
+                }
+            }
+            "function_call_output" | "custom_tool_call_output" => {
+                if let Some(call_id) = item.get("call_id").and_then(|v| v.as_str()) {
+                    existing_outputs.extend(comparable_call_ids(call_id));
+                }
+            }
+            _ => {}
+        }
+        for key in tool_call_keys(item) {
+            existing_calls.insert(key);
+        }
+    }
+    let mut filtered = Vec::with_capacity(items.len());
+    for item in items {
+        match item.get("type").and_then(|v| v.as_str()).unwrap_or("") {
+            "reasoning" => {
+                let enc = item
+                    .get("encrypted_content")
+                    .and_then(|v| v.as_str())
+                    .map(|s| s.trim())
+                    .unwrap_or("");
+                if existing_reasoning.contains(enc) {
+                    continue;
+                }
+            }
+            "function_call" | "custom_tool_call" => {
+                let keys = tool_call_keys(&item);
+                if keys.is_empty() || keys.iter().any(|k| existing_calls.contains(k)) {
+                    continue;
+                }
+                let has_output = item
+                    .get("call_id")
+                    .and_then(|v| v.as_str())
+                    .map(|c| {
+                        comparable_call_ids(c).iter().any(|id| existing_outputs.contains(id))
+                    })
+                    .unwrap_or(false);
+                if !has_output {
+                    continue;
+                }
+                for key in keys {
+                    existing_calls.insert(key);
+                }
+            }
+            _ => continue,
+        }
+        filtered.push(item);
+    }
+    filtered
+}
+
+/// 累积 replay 注入(对齐 insertCodexReasoningReplayTurns):
+/// 按 turn 从新到旧处理,各 turn 锚定后过滤、call_id 对齐、插入。
+/// unmarked turn(旧格式)走现有单块路径。任一 turn 注入成功即 true。
+pub fn insert_replay_turns(body: &mut Value, replay_items: Vec<Value>) -> bool {
+    let Some(input_items) = body.get("input").and_then(|v| v.as_array().cloned()) else {
+        return false;
+    };
+    if replay_items.is_empty() {
+        return false;
+    }
+    let input_len = input_items.len();
+    let turns = split_replay_turns(&replay_items);
+    let mut insertions: std::collections::HashMap<usize, Vec<Value>> = Default::default();
+    let mut used: std::collections::HashSet<usize> = Default::default();
+    let mut fingerprints = PrefixFingerprints::new(input_len);
+    for item in &input_items {
+        fingerprints.push(item);
+    }
+    let mut fallback_end = input_len.saturating_sub(1);
+    let mut inserted = false;
+    for turn in turns.iter().rev() {
+        if turn.items.is_empty() {
+            continue;
+        }
+        if !turn.marked {
+            let filtered = filter_replay_items(body, turn.items.clone());
+            if filtered.is_empty() {
+                continue;
+            }
+            let index = replay_insert_index(&input_items, &filtered);
+            let aligned = align_replay_call_ids(&input_items, filtered);
+            insertions.entry(index).or_default().extend(aligned);
+            inserted = true;
+            continue;
+        }
+        let Some(anchor) = turn_anchor_index(
+            &input_items,
+            turn,
+            fallback_end,
+            &mut used,
+            &fingerprints,
+        ) else {
+            continue;
+        };
+        used.insert(anchor);
+        if turn.request_fingerprint.is_empty() {
+            fallback_end = anchor.saturating_sub(1);
+        }
+        let filtered = filter_turn_items(&input_items, turn.items.clone());
+        if filtered.is_empty() {
+            continue;
+        }
+        let aligned = align_replay_call_ids(&input_items, filtered);
+        insertions.entry(anchor).or_default().extend(aligned);
+        inserted = true;
+    }
+    if !inserted {
+        return false;
+    }
+    let mut merged: Vec<Value> = Vec::with_capacity(input_len + replay_items.len());
+    for (index, item) in input_items.into_iter().enumerate() {
+        if let Some(extra) = insertions.remove(&index) {
+            merged.extend(extra);
+        }
+        merged.push(item);
+    }
+    // 末尾插入键 = input_len(对齐 CPA insertions[len(inputItems)])
+    if let Some(tail) = insertions.remove(&input_len) {
+        merged.extend(tail);
+    }
+    if let Some(obj) = body.as_object_mut() {
+        obj.insert("input".to_string(), Value::Array(merged));
+        true
+    } else {
+        false
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -1074,6 +1388,103 @@ mod tests {
         // t0 已被丢,t_new 在
         assert!(!merged.iter().any(|i| i["id"] == "t0"));
         assert!(merged.iter().any(|i| i["id"] == "t_new"));
+    }
+
+    #[test]
+    fn test_split_replay_turns() {
+        let items = vec![
+            json!({"type": REPLAY_TURN_TYPE, "id": "t1", "call_ids": ["c1"]}),
+            json!({"type": "reasoning", "encrypted_content": "g1"}),
+            json!({"type": REPLAY_TURN_TYPE, "id": "t2"}),
+            json!({"type": "reasoning", "encrypted_content": "g2"}),
+            json!({"type": "reasoning", "encrypted_content": "g3"}), // 尾部归入 t2 段
+        ];
+        let turns = split_replay_turns(&items);
+        // CPA 语义:尾部无 marker 的 items 归入最后一个 marker 段,非新段
+        assert_eq!(turns.len(), 2);
+        assert!(turns[0].marked);
+        assert_eq!(turns[0].call_ids, vec!["c1"]);
+        assert_eq!(turns[0].items.len(), 1);
+        assert!(turns[1].marked);
+        assert_eq!(turns[1].items.len(), 2);
+        // 头部无 marker 前导 = unmarked 段(旧格式兜底)
+        let legacy = vec![
+            json!({"type": "reasoning", "encrypted_content": "g0"}),
+            json!({"type": REPLAY_TURN_TYPE, "id": "t1"}),
+            json!({"type": "reasoning", "encrypted_content": "g1"}),
+        ];
+        let turns = split_replay_turns(&legacy);
+        assert_eq!(turns.len(), 2);
+        assert!(!turns[0].marked);
+        assert!(turns[1].marked);
+    }
+
+    #[test]
+    fn test_insert_replay_turns_two_rounds_anchored() {
+        // 两轮缓存,input 已含第二轮的 call/output;第一轮的 call/output
+        // 已被 CC compact 掉(不在 input)。各轮 reasoning 锚定到对应位置。
+        let mut body = json!({"input": [
+            {"type": "message", "role": "user", "content": "q1"},
+            {"type": "message", "role": "user", "content": "q2"},
+            {"type": "function_call", "call_id": "c2", "name": "f", "arguments": "{}"},
+            {"type": "function_call_output", "call_id": "c2", "output": "ok2"}
+        ]});
+        let replay = vec![
+            json!({"type": REPLAY_TURN_TYPE, "id": "t1", "call_ids": ["c1"]}),
+            json!({"type": "reasoning", "encrypted_content": "g1"}),
+            json!({"type": "function_call", "call_id": "c1", "name": "f", "arguments": "{}"}),
+            json!({"type": REPLAY_TURN_TYPE, "id": "t2", "call_ids": ["c2"]}),
+            json!({"type": "reasoning", "encrypted_content": "g2"}),
+            json!({"type": "function_call", "call_id": "c2", "name": "f", "arguments": "{}"}),
+        ];
+        assert!(insert_replay_turns(&mut body, replay));
+        let input = body["input"].as_array().unwrap();
+        // t2 锚定 c2(在 input),t1 的 c1 不在 input → 锚定失败被丢
+        // (call 无匹配 output,filter 剔除;reasoning 无锚也不注入)
+        // CPA 语义:从尾往前扫先命中 output 项,插入在锚点项前
+        // = g2 插在 c2 的 call 与 output 之间
+        let idx_g2 = input.iter().position(|i| i["encrypted_content"] == "g2");
+        let idx_c2 = input
+            .iter()
+            .position(|i| i["call_id"] == "c2" && i["type"] == "function_call");
+        let idx_o2 = input
+            .iter()
+            .position(|i| i["call_id"] == "c2" && i["type"] == "function_call_output");
+        assert!(idx_g2.is_some());
+        assert!(idx_c2.unwrap() < idx_g2.unwrap());
+        assert!(idx_g2.unwrap() < idx_o2.unwrap());
+        assert!(!input.iter().any(|i| i["encrypted_content"] == "g1"));
+        // c2 的 call 已在 input,不重复注入
+        let c2_calls = input
+            .iter()
+            .filter(|i| i["type"] == "function_call" && i["call_id"] == "c2")
+            .count();
+        assert_eq!(c2_calls, 1);
+    }
+
+    #[test]
+    fn test_insert_replay_turns_unmarked_fallback() {
+        // 旧格式(无 marker):整块走现有 filter+insert 语义
+        let mut body = json!({"input": [
+            {"type": "message", "role": "user", "content": "q"},
+            {"type": "function_call_output", "call_id": "c1", "output": "ok"}
+        ]});
+        let replay = vec![
+            json!({"type": "reasoning", "encrypted_content": "g1"}),
+            json!({"type": "function_call", "call_id": "c1", "name": "f", "arguments": "{}"}),
+        ];
+        assert!(insert_replay_turns(&mut body, replay));
+        let input = body["input"].as_array().unwrap();
+        // 插在首个 output 前
+        assert_eq!(input[1]["type"], "reasoning");
+        assert_eq!(input[2]["type"], "function_call");
+        assert_eq!(input[3]["type"], "function_call_output");
+    }
+
+    #[test]
+    fn test_insert_replay_turns_empty() {
+        let mut body = json!({"input": []});
+        assert!(!insert_replay_turns(&mut body, vec![]));
     }
 
     #[test]

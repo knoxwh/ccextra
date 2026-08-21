@@ -34,7 +34,10 @@ pub use gemini_schema::{
     clean_nested_schema_for_antigravity,
 };
 pub use passthrough::convert_passthrough;
-pub use reasoning_replay::{extract_replay_items, filter_replay_items, insert_replay_items};
+pub use reasoning_replay::{
+    append_replay_turn, build_replay_turn, extract_replay_items, filter_replay_items,
+    insert_replay_items, insert_replay_turns, REPLAY_TURN_TYPE,
+};
 pub use shorten::build_reverse_map;
 pub use shorten::build_short_name_map;
 pub use to_openai_chat::convert_to_openai_chat;
