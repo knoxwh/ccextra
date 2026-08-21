@@ -204,9 +204,6 @@ fn filter_replay_items(body: &Value, items: Vec<Value>) -> Vec<Value> {
                     existing_calls.insert(key);
                 }
             }
-            "function_call_output" | "custom_tool_call_output" => {
-                // 保留 output（它们跟随对应的 function_call）
-            }
             _ => continue,
         }
         filtered.push(item);
@@ -420,8 +417,8 @@ pub const MAX_REPLAY_BYTES: usize = 16 << 20;
 ///
 /// marker id = sha256(request_fingerprint、assistant_fingerprint、call_ids
 /// 与 items 原始字节拼接),同轮重放 id 相同,append 时按 id 去重。
-/// items 不归一化(CPA codex 路径存 raw);zzswitch 等 relay 非标准回显的
-/// function_call_output 一并缓存(配对完整,c40235f 场景)。
+/// items 不归一化(CPA codex 路径存 raw,只认 reasoning/function_call/
+/// custom_tool_call/message,不缓存 output——output 由客户端 input 提供)。
 /// 无 reasoning/function_call/custom_tool_call 项返回 None。
 pub fn build_replay_turn(completed: &Value, request_fingerprint: &str) -> Option<Vec<Value>> {
     use sha2::{Digest, Sha256};
@@ -440,18 +437,6 @@ pub fn build_replay_turn(completed: &Value, request_fingerprint: &str) -> Option
                     .filter(|c| !c.is_empty())
                 {
                     call_ids.push(call_id.to_string());
-                }
-            }
-            "function_call_output" | "custom_tool_call_output" => {
-                // zzswitch 等 relay 非标准回显 output;缓存它保证 call/output
-                // 配对完整(c40235f 场景)。标准 API completed 无此项,分支不触发。
-                let call_id = item
-                    .get("call_id")
-                    .and_then(|v| v.as_str())
-                    .map(|c| c.trim())
-                    .filter(|c| !c.is_empty());
-                if call_id.is_some() && item.get("output").is_some() {
-                    items.push(item.clone());
                 }
             }
             "message" => {
@@ -1107,24 +1092,6 @@ mod tests {
     }
 
     #[test]
-    fn test_build_replay_turn_includes_output_echo() {
-        // zzswitch 等 relay 非标准回显 output(c40235f 场景):一并缓存
-        let with_output = json!({"response": {"output": [
-            {"type": "function_call", "call_id": "c1", "name": "f", "arguments": "{}"},
-            {"type": "function_call_output", "call_id": "c1", "output": "ok"}
-        ]}});
-        let t = build_replay_turn(&with_output, "").unwrap();
-        assert_eq!(t.len(), 3); // marker + call + output
-        assert_eq!(t[2]["type"], "function_call_output");
-        // 空 call_id / 缺 output 的回显项丢弃
-        let bad = json!({"response": {"output": [
-            {"type": "function_call_output", "call_id": "", "output": "ok"},
-            {"type": "function_call_output", "call_id": "c9"}
-        ]}});
-        assert!(build_replay_turn(&bad, "").is_none());
-    }
-
-    #[test]
     fn test_append_replay_turn_accumulates() {
         let turn1 = vec![
             json!({"type": REPLAY_TURN_TYPE, "id": "t1"}),
@@ -1267,26 +1234,5 @@ mod tests {
     fn test_insert_replay_turns_empty() {
         let mut body = json!({"input": []});
         assert!(!insert_replay_turns(&mut body, vec![]));
-    }
-
-    #[test]
-    fn test_filter_preserves_output_with_call() {
-        let body = json!({
-            "input": [
-                {"type": "function_call", "call_id": "call_1", "name": "tool_a", "arguments": "{}"},
-                {"type": "function_call_output", "call_id": "call_1", "output": "ok"},
-                {"type": "function_call_output", "call_id": "call_2", "output": "pending"}
-            ]
-        });
-        let cached = vec![
-            json!({"type": "function_call", "call_id": "call_2", "name": "tool_b", "arguments": "{}"}),
-            json!({"type": "function_call_output", "call_id": "call_2", "output": "pending"}),
-        ];
-        let filtered = filter_replay_items(&body, cached);
-        assert_eq!(filtered.len(), 2, "应保留 call + output");
-        assert_eq!(filtered[0]["type"], "function_call");
-        assert_eq!(filtered[0]["call_id"], "call_2");
-        assert_eq!(filtered[1]["type"], "function_call_output");
-        assert_eq!(filtered[1]["call_id"], "call_2");
     }
 }
