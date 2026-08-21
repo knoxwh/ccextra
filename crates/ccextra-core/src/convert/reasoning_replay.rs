@@ -693,6 +693,62 @@ pub fn build_replay_turn(completed: &Value, request_fingerprint: &str) -> Option
     Some(turn)
 }
 
+/// 累积 append 一个 turn(对齐 CPA appendCodexReasoningReplayTurn):
+/// - existing 首项非 marker(旧单块格式)→ 丢弃重建,只保留新 turn
+/// - turn id 已存在 → 幂等返回(不重复追加)
+/// - 否则拼接后 trim(超限丢最老)
+pub fn append_replay_turn(existing: &[Value], turn: &[Value]) -> Vec<Value> {
+    let is_marker =
+        |v: &Value| v.get("type").and_then(|t| t.as_str()) == Some(REPLAY_TURN_TYPE);
+    let mut items: Vec<Value> = if !existing.is_empty() && !is_marker(&existing[0]) {
+        Vec::new()
+    } else {
+        existing.to_vec()
+    };
+    let turn_id = turn
+        .first()
+        .filter(|m| is_marker(m))
+        .and_then(|m| m.get("id"))
+        .and_then(|v| v.as_str())
+        .unwrap_or("")
+        .to_string();
+    if !turn_id.is_empty() {
+        let dup = items
+            .iter()
+            .any(|v| is_marker(v) && v.get("id").and_then(|i| i.as_str()) == Some(turn_id.as_str()));
+        if dup {
+            return trim_replay_items(items);
+        }
+    }
+    items.extend(turn.iter().cloned());
+    trim_replay_items(items)
+}
+
+/// trim 到上限内(对齐 CPA trimCodexReasoningReplayItems):
+/// 超 MAX_REPLAY_TURNS 个 turn 或 MAX_REPLAY_BYTES 总字节 → 循环丢最老 turn;
+/// 单 turn 超限(turn_starts 只剩 1 仍超)→ 返回空。
+fn trim_replay_items(mut items: Vec<Value>) -> Vec<Value> {
+    let is_marker =
+        |v: &Value| v.get("type").and_then(|t| t.as_str()) == Some(REPLAY_TURN_TYPE);
+    loop {
+        let mut turn_starts = vec![0usize];
+        let mut total_bytes: usize = 0;
+        for (index, item) in items.iter().enumerate() {
+            total_bytes += serde_json::to_vec(item).map(|v| v.len()).unwrap_or(0);
+            if index > 0 && is_marker(item) {
+                turn_starts.push(index);
+            }
+        }
+        if turn_starts.len() <= MAX_REPLAY_TURNS && total_bytes <= MAX_REPLAY_BYTES {
+            return items;
+        }
+        if turn_starts.len() <= 1 {
+            return Vec::new();
+        }
+        items.drain(..turn_starts[1]);
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -973,6 +1029,51 @@ mod tests {
             {"type": "function_call_output", "call_id": "c9"}
         ]}});
         assert!(build_replay_turn(&bad, "").is_none());
+    }
+
+    #[test]
+    fn test_append_replay_turn_accumulates() {
+        let turn1 = vec![
+            json!({"type": REPLAY_TURN_TYPE, "id": "t1"}),
+            json!({"type": "reasoning", "encrypted_content": "g1"}),
+        ];
+        let turn2 = vec![
+            json!({"type": REPLAY_TURN_TYPE, "id": "t2"}),
+            json!({"type": "reasoning", "encrypted_content": "g2"}),
+        ];
+        let merged = append_replay_turn(&turn1, &turn2);
+        assert_eq!(merged.len(), 4);
+        assert_eq!(merged[0]["id"], "t1");
+        assert_eq!(merged[2]["id"], "t2");
+        // 幂等:同 id turn 重复 append 不增长
+        let again = append_replay_turn(&merged, &turn2);
+        assert_eq!(again.len(), 4);
+        // 旧格式 existing(首项非 marker)→ 视为过期,整体替换
+        let legacy = vec![json!({"type": "reasoning", "encrypted_content": "old"})];
+        let replaced = append_replay_turn(&legacy, &turn1);
+        assert_eq!(replaced.len(), 2);
+        assert_eq!(replaced[0]["id"], "t1");
+    }
+
+    #[test]
+    fn test_append_trims_oldest_beyond_limit() {
+        // 构造 MAX_REPLAY_TURNS 个 turn,append 新 turn 后超限,丢最老
+        let mut existing: Vec<Value> = Vec::new();
+        for i in 0..MAX_REPLAY_TURNS {
+            existing.push(json!({"type": REPLAY_TURN_TYPE, "id": format!("t{}", i)}));
+            existing.push(json!({"type": "reasoning", "encrypted_content": format!("g{}", i)}));
+        }
+        let new_turn = vec![
+            json!({"type": REPLAY_TURN_TYPE, "id": "t_new"}),
+            json!({"type": "reasoning", "encrypted_content": "g_new"}),
+        ];
+        let merged = append_replay_turn(&existing, &new_turn);
+        // 256 turn 上限:丢最老一个(t0),剩 256 个 marker
+        let markers = merged.iter().filter(|i| i["type"] == REPLAY_TURN_TYPE).count();
+        assert_eq!(markers, MAX_REPLAY_TURNS);
+        // t0 已被丢,t_new 在
+        assert!(!merged.iter().any(|i| i["id"] == "t0"));
+        assert!(merged.iter().any(|i| i["id"] == "t_new"));
     }
 
     #[test]
