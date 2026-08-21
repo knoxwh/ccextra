@@ -27,6 +27,11 @@ pub struct StreamReplayExtractor {
     items_by_index: HashMap<i64, Value>,
     /// 无 output_index 的 done 项(对齐 outputItemsFallback)
     items_fallback: Vec<Value>,
+    /// 流式 reasoning 文本累积器(对齐 grok-build reasoning_acc,
+    /// 按 output_index 分槽;completed 无 content/summary 时兜底补 summary)
+    reasoning_deltas: HashMap<i64, String>,
+    /// 无 output_index 的 reasoning 文本兜底槽
+    reasoning_delta_fallback: String,
 }
 
 impl StreamReplayExtractor {
@@ -37,10 +42,14 @@ impl StreamReplayExtractor {
             parser: SseParser::new(),
             items_by_index: HashMap::new(),
             items_fallback: Vec::new(),
+            reasoning_deltas: HashMap::new(),
+            reasoning_delta_fallback: String::new(),
         }
     }
 
-    /// 喂入上游 chunk,收集 output_item.done,遇 completed 补空 output 后缓存
+    /// 喂入上游 chunk,收集 output_item.done + reasoning_text.delta,
+    /// 遇 completed 补空 output 后缓存(对齐 grok-build stream_responses
+    /// L273 reasoning_acc 累积 + L549-550 inject_streaming_reasoning_fallback)
     pub fn push(&mut self, bytes: &[u8]) {
         for event in self.parser.push(bytes) {
             let value: Value = match serde_json::from_str(&event.data) {
@@ -52,6 +61,9 @@ impl StreamReplayExtractor {
                 .as_deref()
                 .or_else(|| value.get("type").and_then(|v| v.as_str()));
             match event_type {
+                Some("reasoning_text.delta") => {
+                    self.collect_reasoning_delta(&value);
+                }
                 Some("output_item.done") => {
                     self.collect_output_item_done(&value);
                 }
@@ -64,15 +76,70 @@ impl StreamReplayExtractor {
         }
     }
 
-    /// 收集 output_item.done 的 item 字段(对齐 xaiCollectOutputItemDone)
-    fn collect_output_item_done(&mut self, event_data: &Value) {
-        let Some(item) = event_data.get("item") else {
+    /// 收集 reasoning_text.delta(对齐 grok-build L273 reasoning_acc.push_str)
+    fn collect_reasoning_delta(&mut self, event_data: &Value) {
+        let Some(delta) = event_data.get("delta").and_then(|v| v.as_str()) else {
             return;
         };
+        if delta.is_empty() {
+            return;
+        }
         if let Some(idx) = event_data.get("output_index").and_then(|v| v.as_i64()) {
-            self.items_by_index.insert(idx, item.clone());
+            self.reasoning_deltas
+                .entry(idx)
+                .or_default()
+                .push_str(delta);
         } else {
-            self.items_fallback.push(item.clone());
+            self.reasoning_delta_fallback.push_str(delta);
+        }
+    }
+
+    /// 收集 output_item.done 的 item 字段(对齐 xaiCollectOutputItemDone)
+    fn collect_output_item_done(&mut self, event_data: &Value) {
+        let Some(mut item) = event_data.get("item").cloned() else {
+            return;
+        };
+        // reasoning item 无 content/summary 时,用累积的流式文本兜底补 summary
+        // (对齐 grok-build inject_streaming_reasoning_fallback L1493-1526)
+        if item.get("type").and_then(|v| v.as_str()) == Some("reasoning") {
+            let has_text = item
+                .get("summary")
+                .and_then(|v| v.as_array())
+                .map(|arr| {
+                    arr.iter().any(|sp| {
+                        sp.get("text")
+                            .and_then(|t| t.as_str())
+                            .map(|s| !s.is_empty())
+                            .unwrap_or(false)
+                    })
+                })
+                .unwrap_or(false)
+                || item
+                    .get("content")
+                    .and_then(|v| v.as_str())
+                    .map(|s| !s.is_empty())
+                    .unwrap_or(false);
+            if !has_text {
+                let idx = event_data.get("output_index").and_then(|v| v.as_i64());
+                let text = if let Some(idx) = idx {
+                    self.reasoning_deltas.get(&idx).map(|s| s.as_str())
+                } else {
+                    Some(self.reasoning_delta_fallback.as_str())
+                };
+                if let Some(text) = text.filter(|t| !t.is_empty()) {
+                    if let Some(obj) = item.as_object_mut() {
+                        obj.insert(
+                            "summary".to_string(),
+                            serde_json::json!([{"type": "summary_text", "text": text}]),
+                        );
+                    }
+                }
+            }
+        }
+        if let Some(idx) = event_data.get("output_index").and_then(|v| v.as_i64()) {
+            self.items_by_index.insert(idx, item);
+        } else {
+            self.items_fallback.push(item);
         }
     }
 
@@ -350,5 +417,85 @@ mod tests {
         let input = body["input"].as_array().unwrap();
         // 应该用 original 不是 orphan
         assert_eq!(input[0]["encrypted_content"], "original");
+    }
+
+    #[test]
+    fn test_inject_streaming_reasoning_fallback_with_deltas() {
+        let cache = ReplayCache::new(Duration::from_secs(60), 128);
+        let key = "sess-deltas".to_string();
+        let mut extractor = StreamReplayExtractor::new(cache.clone(), key.clone());
+
+        // 流式 reasoning 文本累积(对齐 grok-build L273 reasoning_acc.push_str)
+        extractor.push(
+            b"event: reasoning_text.delta\ndata: {\"output_index\":0,\"delta\":\"thinking \"}\n\n",
+        );
+        extractor.push(
+            b"event: reasoning_text.delta\ndata: {\"output_index\":0,\"delta\":\"hard\"}\n\n",
+        );
+
+        // output_item.done 无 content/summary → 兜底补 summary(对齐 inject_streaming_reasoning_fallback)
+        extractor.push(b"event: output_item.done\ndata: {\"output_index\":0,\"item\":{\"type\":\"reasoning\",\"encrypted_content\":\"gAAA\"}}\n\n");
+        extractor.push(b"event: output_item.done\ndata: {\"item\":{\"type\":\"function_call\",\"call_id\":\"c1\",\"name\":\"f\",\"arguments\":\"{}\"}}\n\n");
+
+        // completed 无 output → patch 补上
+        let completed_empty = b"event: response.completed\ndata: {\"type\":\"response.completed\",\"response\":{\"id\":\"r3\"}}\n\n";
+        extractor.push(completed_empty);
+
+        // 验证注入的 reasoning item 带 summary(流式文本兜底)
+        let mut body = json!({"input": [
+            {"type": "message", "role": "user", "content": "q"},
+            {"type": "function_call_output", "call_id": "c1", "output": "ok"}
+        ]});
+        assert!(cache.apply_to_body(&key, &mut body));
+        let input = body["input"].as_array().unwrap();
+        let reasoning = input.iter().find(|i| i["type"] == "reasoning").unwrap();
+        assert_eq!(reasoning["encrypted_content"], "gAAA");
+        let summary = reasoning["summary"].as_array().unwrap();
+        assert_eq!(summary[0]["text"], "thinking hard");
+    }
+
+    #[test]
+    fn test_reasoning_delta_fallback_no_output_index() {
+        let cache = ReplayCache::new(Duration::from_secs(60), 128);
+        let key = "sess-fallback".to_string();
+        let mut extractor = StreamReplayExtractor::new(cache.clone(), key.clone());
+
+        // 无 output_index 的 delta → fallback 槽
+        extractor.push(b"event: reasoning_text.delta\ndata: {\"delta\":\"fallback text\"}\n\n");
+
+        // output_item.done 无 output_index 且无 content/summary → 用 fallback 槽兜底
+        extractor.push(b"event: output_item.done\ndata: {\"item\":{\"type\":\"reasoning\",\"encrypted_content\":\"xAI\"}}\n\n");
+
+        let completed_empty = b"event: response.completed\ndata: {\"type\":\"response.completed\",\"response\":{\"id\":\"r4\"}}\n\n";
+        extractor.push(completed_empty);
+
+        let mut body = json!({"input": []});
+        assert!(cache.apply_to_body(&key, &mut body));
+        let input = body["input"].as_array().unwrap();
+        let reasoning = input.iter().find(|i| i["type"] == "reasoning").unwrap();
+        assert_eq!(reasoning["summary"][0]["text"], "fallback text");
+    }
+
+    #[test]
+    fn test_reasoning_with_existing_summary_not_overwritten() {
+        let cache = ReplayCache::new(Duration::from_secs(60), 128);
+        let key = "sess-keep-summary".to_string();
+        let mut extractor = StreamReplayExtractor::new(cache.clone(), key.clone());
+
+        // 累积流式文本
+        extractor.push(b"event: reasoning_text.delta\ndata: {\"output_index\":0,\"delta\":\"orphan delta\"}\n\n");
+
+        // output_item.done 已带 summary → 不用流式文本覆盖(对齐 grok-build L1503 any_with_text return)
+        extractor.push(b"event: output_item.done\ndata: {\"output_index\":0,\"item\":{\"type\":\"reasoning\",\"encrypted_content\":\"gAAA\",\"summary\":[{\"type\":\"summary_text\",\"text\":\"original summary\"}]}}\n\n");
+
+        let completed_empty = b"event: response.completed\ndata: {\"type\":\"response.completed\",\"response\":{\"id\":\"r5\"}}\n\n";
+        extractor.push(completed_empty);
+
+        let mut body = json!({"input": []});
+        assert!(cache.apply_to_body(&key, &mut body));
+        let input = body["input"].as_array().unwrap();
+        let reasoning = input.iter().find(|i| i["type"] == "reasoning").unwrap();
+        // 应保留 original summary 不是 orphan delta
+        assert_eq!(reasoning["summary"][0]["text"], "original summary");
     }
 }

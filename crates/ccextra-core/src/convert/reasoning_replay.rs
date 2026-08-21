@@ -758,7 +758,7 @@ fn filter_turn_items(input_items: &[Value], items: Vec<Value>) -> Vec<Value> {
                     .and_then(|v| v.as_str())
                     .map(|s| s.trim())
                     .unwrap_or("");
-                if existing_reasoning.contains(enc) {
+                if enc.is_empty() || existing_reasoning.contains(enc) {
                     continue;
                 }
             }
