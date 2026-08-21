@@ -7,7 +7,7 @@
 // 防泄漏。SSE 解析器不落本层:每条流各自持有(对齐 CPA 每请求局部收集),
 // 同会话并发流互不串扰,流结束随闭包释放。
 
-use ccextra_core::convert::{extract_replay_items, filter_replay_items, insert_replay_items};
+use ccextra_core::convert::{append_replay_turn, build_replay_turn, insert_replay_turns};
 use serde_json::Value;
 use std::collections::HashMap;
 use std::sync::{Arc, Mutex};
@@ -127,23 +127,37 @@ impl ReplayCache {
         }
     }
 
-    /// 从 response.completed 事件 data 缓存 replay 项。
-    /// 无可回放项时删除旧缓存(对齐 XAIReasoningReplayNoReplayableState:
-    /// 成功轮次无可缓存 reasoning 时不得残留上一轮的 encrypted state)。
+    /// 从 response.completed 事件 data 累积缓存 replay 项。
+    /// 每轮构造 [marker, ...items] 追加(对齐 CPA
+    /// AppendCodexReasoningReplayItemsBestEffort + appendCodexReasoningReplayTurn):
+    /// marker id 含 request 指纹,同轮重放幂等去重;超 256 turn/16MB 丢最老。
+    /// 无可回放项时删除累积(对齐 XAIReasoningReplayNoReplayableState:
+    /// 成功轮次无可缓存 reasoning 时不得残留 encrypted state)。
+    ///
+    /// request_fingerprint 传空串:真值需请求侧 input 前缀指纹,本函数无 body
+    /// 上下文(StreamReplayExtractor 亦无)。取舍:锚定退化为 call_ids/
+    /// assistant_fingerprint 双通道,已覆盖主场景;防错位增强留待需要时给
+    /// StreamReplayExtractor::new 加参数从 http.rs 传入。
     pub fn store_from_completed(&self, session_key: &str, completed: &Value) {
         if session_key.trim().is_empty() {
             return;
         }
         let mut map = self.inner.lock().unwrap();
-        match extract_replay_items(completed) {
-            Some(items) => {
+        match build_replay_turn(completed, "") {
+            Some(turn) => {
                 if map.len() >= self.capacity && !map.contains_key(session_key) {
                     map.clear();
                 }
+                let existing = map
+                    .get(session_key)
+                    .filter(|e| e.stored_at.elapsed() <= self.ttl)
+                    .map(|e| e.items.clone())
+                    .unwrap_or_default();
+                let merged = append_replay_turn(&existing, &turn);
                 map.insert(
                     session_key.to_string(),
                     Entry {
-                        items,
+                        items: merged,
                         stored_at: Instant::now(),
                     },
                 );
@@ -187,11 +201,7 @@ impl ReplayCache {
                 None => return false,
             }
         };
-        let filtered = filter_replay_items(body, items);
-        if filtered.is_empty() {
-            return false;
-        }
-        insert_replay_items(body, filtered)
+        insert_replay_turns(body, items)
     }
 }
 
@@ -242,6 +252,54 @@ mod tests {
         std::thread::sleep(Duration::from_millis(2));
         let mut body = json!({"input": []});
         assert!(!cache.apply_to_body("sess-1", &mut body));
+    }
+
+    #[test]
+    fn test_cumulative_store_two_rounds() {
+        let cache = ReplayCache::new(Duration::from_secs(60), 128);
+        let round1 = json!({"type": "response.completed", "response": {"output": [
+            {"type": "reasoning", "encrypted_content": "g1"},
+            {"type": "function_call", "call_id": "c1", "name": "f", "arguments": "{}"}
+        ]}});
+        let round2 = json!({"type": "response.completed", "response": {"output": [
+            {"type": "reasoning", "encrypted_content": "g2"},
+            {"type": "function_call", "call_id": "c2", "name": "f", "arguments": "{}"}
+        ]}});
+        cache.store_from_completed("sess-1", &round1);
+        cache.store_from_completed("sess-1", &round2);
+        // 两轮 reasoning 都注入(input 含 c1/c2 的 output)
+        let mut body = json!({"input": [
+            {"type": "message", "role": "user", "content": "q"},
+            {"type": "function_call_output", "call_id": "c1", "output": "ok1"},
+            {"type": "function_call_output", "call_id": "c2", "output": "ok2"}
+        ]});
+        assert!(cache.apply_to_body("sess-1", &mut body));
+        let input = body["input"].as_array().unwrap();
+        assert!(input.iter().any(|i| i["encrypted_content"] == "g1"));
+        assert!(input.iter().any(|i| i["encrypted_content"] == "g2"));
+    }
+
+    #[test]
+    fn test_store_idempotent_same_completed() {
+        let cache = ReplayCache::new(Duration::from_secs(60), 128);
+        let round1 = json!({"type": "response.completed", "response": {"output": [
+            {"type": "reasoning", "encrypted_content": "g1"}
+        ]}});
+        cache.store_from_completed("sess-1", &round1);
+        cache.store_from_completed("sess-1", &round1); // 同轮重复(重试场景)
+                                                       // marker id 相同,不重复累积
+        let mut body = json!({"input": [
+            {"type": "message", "role": "user", "content": "q"}
+        ]});
+        if cache.apply_to_body("sess-1", &mut body) {
+            let count = body["input"]
+                .as_array()
+                .unwrap()
+                .iter()
+                .filter(|i| i["encrypted_content"] == "g1")
+                .count();
+            assert_eq!(count, 1);
+        }
     }
 
     #[test]
