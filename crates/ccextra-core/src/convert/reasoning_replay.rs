@@ -12,172 +12,6 @@
 
 use serde_json::{json, Value};
 
-/// 从 response.completed 的 `response.output` 提取可回放项并归一化
-/// (对齐 cacheXAIReasoningReplayFromCompleted + normalizeXAIReasoningReplayItems):
-/// - reasoning:须有非空 encrypted_content,归一化为最小形状
-///   {type, summary:[], content:null, encrypted_content}
-/// - message:仅 assistant 且 content 数组含 output_text/refusal,
-///   归一化为最小形状;非 assistant(user message)丢弃
-/// - function_call:call_id/name/arguments 均有效,归一化最小形状
-/// - custom_tool_call:call_id/name/input 有效,归一化最小形状
-///
-/// 无 reasoning/function_call/custom_tool_call 锚点(如只剩 message)返回
-/// None——调用方应删除旧缓存,防止上一轮的 encrypted state 注入后续轮次。
-pub fn extract_replay_items(completed: &Value) -> Option<Vec<Value>> {
-    let output = completed.pointer("/response/output")?.as_array()?;
-    let mut items: Vec<Value> = Vec::with_capacity(output.len());
-    let mut has_anchor = false;
-    for item in output {
-        let normalized = match item.get("type").and_then(|v| v.as_str()) {
-            Some("reasoning") => {
-                let Some(enc) = item.get("encrypted_content").and_then(|v| v.as_str()) else {
-                    continue;
-                };
-                if enc.trim().is_empty() || enc.trim() != enc {
-                    continue;
-                }
-                has_anchor = true;
-                json!({
-                    "type": "reasoning",
-                    "summary": [],
-                    "content": null,
-                    "encrypted_content": enc,
-                })
-            }
-            Some("message") => {
-                if item
-                    .get("role")
-                    .and_then(|v| v.as_str())
-                    .map(|r| r.trim().eq_ignore_ascii_case("assistant"))
-                    != Some(true)
-                {
-                    continue;
-                }
-                let Some(parts) = item.get("content").and_then(|v| v.as_array()) else {
-                    continue;
-                };
-                let mut content: Vec<Value> = Vec::with_capacity(parts.len());
-                for part in parts {
-                    match part.get("type").and_then(|v| v.as_str()) {
-                        Some("output_text") => {
-                            if let Some(text) = part.get("text").and_then(|v| v.as_str()) {
-                                content.push(json!({"type": "output_text", "text": text}));
-                            }
-                        }
-                        Some("refusal") => {
-                            if let Some(r) = part.get("refusal").and_then(|v| v.as_str()) {
-                                content.push(json!({"type": "refusal", "refusal": r}));
-                            }
-                        }
-                        _ => continue,
-                    }
-                }
-                if content.is_empty() {
-                    continue;
-                }
-                json!({"type": "message", "role": "assistant", "content": content})
-            }
-            Some("function_call") => {
-                let call_id = item
-                    .get("call_id")
-                    .and_then(|v| v.as_str())
-                    .map(|c| c.trim());
-                let name = item.get("name").and_then(|v| v.as_str()).map(|c| c.trim());
-                let arguments = item.get("arguments").and_then(|v| v.as_str());
-                let (Some(call_id), Some(name), Some(arguments)) = (call_id, name, arguments)
-                else {
-                    continue;
-                };
-                if call_id.is_empty() || name.is_empty() {
-                    continue;
-                }
-                has_anchor = true;
-                json!({
-                    "type": "function_call",
-                    "call_id": call_id,
-                    "name": name,
-                    "arguments": arguments,
-                })
-            }
-            Some("custom_tool_call") => {
-                let call_id = item
-                    .get("call_id")
-                    .and_then(|v| v.as_str())
-                    .map(|c| c.trim());
-                let name = item.get("name").and_then(|v| v.as_str()).map(|c| c.trim());
-                let input = item.get("input");
-                let (Some(call_id), Some(name), Some(input)) = (call_id, name, input) else {
-                    continue;
-                };
-                if call_id.is_empty() || name.is_empty() {
-                    continue;
-                }
-                has_anchor = true;
-                let mut obj = json!({
-                    "type": "custom_tool_call",
-                    "status": "completed",
-                    "call_id": call_id,
-                    "name": name,
-                    "input": input,
-                });
-                if let Some(status) = item
-                    .get("status")
-                    .and_then(|v| v.as_str())
-                    .map(|s| s.trim())
-                {
-                    if !status.is_empty() {
-                        obj["status"] = json!(status);
-                    }
-                }
-                obj
-            }
-            Some("function_call_output") => {
-                let call_id = item
-                    .get("call_id")
-                    .and_then(|v| v.as_str())
-                    .map(|c| c.trim());
-                let output = item.get("output");
-                let (Some(call_id), Some(output)) = (call_id, output) else {
-                    continue;
-                };
-                if call_id.is_empty() {
-                    continue;
-                }
-                json!({
-                    "type": "function_call_output",
-                    "call_id": call_id,
-                    "output": output,
-                })
-            }
-            Some("custom_tool_call_output") => {
-                let call_id = item
-                    .get("call_id")
-                    .and_then(|v| v.as_str())
-                    .map(|c| c.trim());
-                let output = item.get("output");
-                let (Some(call_id), Some(output)) = (call_id, output) else {
-                    continue;
-                };
-                if call_id.is_empty() {
-                    continue;
-                }
-                json!({
-                    "type": "custom_tool_call_output",
-                    "call_id": call_id,
-                    "output": output,
-                })
-            }
-            _ => continue,
-        };
-        items.push(normalized);
-    }
-    if items.is_empty() || !has_anchor {
-        None
-    } else {
-        Some(items)
-    }
-}
-
 /// call_id 匹配候选(对齐 codexReplayComparableCallIDs):
 /// 原始 id + sanitize/缩短后的 claude 可见 id。CC 回传 tool_result 时
 /// call_id 可能经 sanitize 与上游原始 id 不同,双候选兜底匹配。
@@ -289,7 +123,7 @@ fn message_parts(content: &Value) -> Option<Vec<(String, String)>> {
 /// - message:input 已含相同 assistant 内容 → 跳过
 /// - function_call/custom_tool_call:键为空或已存在 → 跳过;
 ///   无匹配 output(说明 CC 未回传该轮结果)→ 跳过
-pub fn filter_replay_items(body: &Value, items: Vec<Value>) -> Vec<Value> {
+fn filter_replay_items(body: &Value, items: Vec<Value>) -> Vec<Value> {
     let Some(input_items) = body.get("input").and_then(|v| v.as_array()) else {
         return Vec::new();
     };
@@ -448,39 +282,6 @@ fn replay_insert_index(input_items: &[Value], replay_items: &[Value]) -> usize {
     input_items.len()
 }
 
-/// 把 replay 项注入 body.input(对齐 insertCodexReasoningReplayItems)。
-/// 注入前按 input 已有 output 的 call_id 对齐 replay 项的 call_id
-/// (codexAlignReasoningReplayToolCallIDs:CC 回传的 output call_id 可能
-/// 是 sanitize 形态,回放 function_call 须用同一形态才能配对)。
-/// input 非数组或 replay 为空返回 false。
-pub fn insert_replay_items(body: &mut Value, replay_items: Vec<Value>) -> bool {
-    if replay_items.is_empty() {
-        return false;
-    }
-    let Some(input_items) = body.get("input").and_then(|v| v.as_array()).cloned() else {
-        return false;
-    };
-    let insert_index = replay_insert_index(&input_items, &replay_items);
-    let replay_items = align_replay_call_ids(&input_items, replay_items);
-
-    let mut merged: Vec<Value> = Vec::with_capacity(input_items.len() + replay_items.len());
-    for (i, item) in input_items.into_iter().enumerate() {
-        if i == insert_index {
-            merged.extend(replay_items.iter().cloned());
-        }
-        merged.push(item);
-    }
-    if insert_index >= merged.len() {
-        merged.extend(replay_items);
-    }
-    if let Some(obj) = body.as_object_mut() {
-        obj.insert("input".to_string(), Value::Array(merged));
-        true
-    } else {
-        false
-    }
-}
-
 /// output call_id 映射(对齐 codexReplayOutputCallIDs):
 /// 每个 output 的所有匹配候选 → 原始 call_id
 fn output_call_ids(input_items: &[Value]) -> std::collections::HashMap<String, String> {
@@ -574,7 +375,8 @@ fn assistant_message_fingerprint(item: &Value) -> String {
                     }
                     "refusal" => {
                         builder.push_str("\u{0}refusal\u{0}");
-                        builder.push_str(part.get("refusal").and_then(|v| v.as_str()).unwrap_or(""));
+                        builder
+                            .push_str(part.get("refusal").and_then(|v| v.as_str()).unwrap_or(""));
                     }
                     _ => return String::new(),
                 }
@@ -698,8 +500,7 @@ pub fn build_replay_turn(completed: &Value, request_fingerprint: &str) -> Option
 /// - turn id 已存在 → 幂等返回(不重复追加)
 /// - 否则拼接后 trim(超限丢最老)
 pub fn append_replay_turn(existing: &[Value], turn: &[Value]) -> Vec<Value> {
-    let is_marker =
-        |v: &Value| v.get("type").and_then(|t| t.as_str()) == Some(REPLAY_TURN_TYPE);
+    let is_marker = |v: &Value| v.get("type").and_then(|t| t.as_str()) == Some(REPLAY_TURN_TYPE);
     let mut items: Vec<Value> = if !existing.is_empty() && !is_marker(&existing[0]) {
         Vec::new()
     } else {
@@ -713,9 +514,9 @@ pub fn append_replay_turn(existing: &[Value], turn: &[Value]) -> Vec<Value> {
         .unwrap_or("")
         .to_string();
     if !turn_id.is_empty() {
-        let dup = items
-            .iter()
-            .any(|v| is_marker(v) && v.get("id").and_then(|i| i.as_str()) == Some(turn_id.as_str()));
+        let dup = items.iter().any(|v| {
+            is_marker(v) && v.get("id").and_then(|i| i.as_str()) == Some(turn_id.as_str())
+        });
         if dup {
             return trim_replay_items(items);
         }
@@ -728,8 +529,7 @@ pub fn append_replay_turn(existing: &[Value], turn: &[Value]) -> Vec<Value> {
 /// 超 MAX_REPLAY_TURNS 个 turn 或 MAX_REPLAY_BYTES 总字节 → 循环丢最老 turn;
 /// 单 turn 超限(turn_starts 只剩 1 仍超)→ 返回空。
 fn trim_replay_items(mut items: Vec<Value>) -> Vec<Value> {
-    let is_marker =
-        |v: &Value| v.get("type").and_then(|t| t.as_str()) == Some(REPLAY_TURN_TYPE);
+    let is_marker = |v: &Value| v.get("type").and_then(|t| t.as_str()) == Some(REPLAY_TURN_TYPE);
     loop {
         let mut turn_starts = vec![0usize];
         let mut total_bytes: usize = 0;
@@ -832,7 +632,8 @@ impl PrefixFingerprints {
     fn push(&mut self, item: &Value) {
         use sha2::Digest;
         self.hasher.update(b"\0item\0");
-        self.hasher.update(serde_json::to_vec(item).unwrap_or_default());
+        self.hasher
+            .update(serde_json::to_vec(item).unwrap_or_default());
         // clone 当前状态再 finalize,得到该前缀指纹
         let fp = hex::encode(self.hasher.clone().finalize());
         self.sums.push(fp);
@@ -865,8 +666,7 @@ fn turn_anchor_index(
         search_end = input_items.len().saturating_sub(1);
     }
     let matches_prefix = |index: usize| {
-        turn.request_fingerprint.is_empty()
-            || fingerprints.at(index) == turn.request_fingerprint
+        turn.request_fingerprint.is_empty() || fingerprints.at(index) == turn.request_fingerprint
     };
     if !turn.call_ids.is_empty() {
         let mut wanted: std::collections::HashSet<String> = Default::default();
@@ -894,7 +694,10 @@ fn turn_anchor_index(
                 .get("call_id")
                 .and_then(|v| v.as_str())
                 .unwrap_or("");
-            if comparable_call_ids(call_id).iter().any(|c| wanted.contains(c)) {
+            if comparable_call_ids(call_id)
+                .iter()
+                .any(|c| wanted.contains(c))
+            {
                 return Some(index);
             }
         }
@@ -968,7 +771,9 @@ fn filter_turn_items(input_items: &[Value], items: Vec<Value>) -> Vec<Value> {
                     .get("call_id")
                     .and_then(|v| v.as_str())
                     .map(|c| {
-                        comparable_call_ids(c).iter().any(|id| existing_outputs.contains(id))
+                        comparable_call_ids(c)
+                            .iter()
+                            .any(|id| existing_outputs.contains(id))
                     })
                     .unwrap_or(false);
                 if !has_output {
@@ -1020,13 +825,9 @@ pub fn insert_replay_turns(body: &mut Value, replay_items: Vec<Value>) -> bool {
             inserted = true;
             continue;
         }
-        let Some(anchor) = turn_anchor_index(
-            &input_items,
-            turn,
-            fallback_end,
-            &mut used,
-            &fingerprints,
-        ) else {
+        let Some(anchor) =
+            turn_anchor_index(&input_items, turn, fallback_end, &mut used, &fingerprints)
+        else {
             continue;
         };
         used.insert(anchor);
@@ -1067,41 +868,6 @@ pub fn insert_replay_turns(body: &mut Value, replay_items: Vec<Value>) -> bool {
 mod tests {
     use super::*;
     use serde_json::json;
-
-    fn completed(output: Value) -> Value {
-        json!({"type": "response.completed", "response": {"id": "r1", "output": output}})
-    }
-
-    #[test]
-    fn test_extract_replay_items_four_types() {
-        let v = completed(json!([
-            {"type": "reasoning", "encrypted_content": "gAAA"},
-            {"type": "message", "role": "assistant", "content": [
-                {"type": "output_text", "text": "hi"}
-            ]},
-            {"type": "function_call", "call_id": "c1", "name": "f", "arguments": "{}"},
-            {"type": "custom_tool_call", "call_id": "c2", "name": "g", "input": "x"},
-            {"type": "web_search_call"},
-            {"type": "message", "role": "user", "content": "q"}
-        ]));
-        let items = extract_replay_items(&v).unwrap();
-        // user message 丢弃(对齐 normalizeXAIReasoningReplayMessageItem 只认 assistant)
-        assert_eq!(items.len(), 4);
-        assert_eq!(items[0]["type"], "reasoning");
-        assert_eq!(items[1]["role"], "assistant");
-        assert_eq!(items[3]["type"], "custom_tool_call");
-        // 归一化最小形状
-        assert_eq!(items[0]["summary"], json!([]));
-        assert_eq!(items[0]["content"], Value::Null);
-    }
-
-    #[test]
-    fn test_extract_none_when_no_replayable() {
-        let v = completed(json!([{"type": "web_search_call"}]));
-        assert!(extract_replay_items(&v).is_none());
-        // output 非数组
-        assert!(extract_replay_items(&json!({"response": {"output": null}})).is_none());
-    }
 
     #[test]
     fn test_filter_drops_existing_call_and_requires_output() {
@@ -1181,7 +947,7 @@ mod tests {
             json!({"type": "reasoning", "encrypted_content": "gAAA"}),
             json!({"type": "function_call", "call_id": "call_1", "name": "f", "arguments": "{}"}),
         ];
-        assert!(insert_replay_items(&mut body, items));
+        assert!(insert_replay_turns(&mut body, items));
         let input = body["input"].as_array().unwrap();
         // 插在首个 output 前(index 1),reasoning 与 function_call 都在其前
         assert_eq!(input.len(), 5);
@@ -1198,7 +964,7 @@ mod tests {
             {"type": "message", "role": "user", "content": "next"}
         ]});
         let items = vec![json!({"type": "reasoning", "encrypted_content": "gAAA"})];
-        assert!(insert_replay_items(&mut body, items));
+        assert!(insert_replay_turns(&mut body, items));
         let input = body["input"].as_array().unwrap();
         // 插在最后一条 assistant 处(其前)
         assert_eq!(input.len(), 4);
@@ -1218,7 +984,7 @@ mod tests {
             "name": "f",
             "arguments": "{}"
         })];
-        assert!(insert_replay_items(&mut body, items));
+        assert!(insert_replay_turns(&mut body, items));
         let input = body["input"].as_array().unwrap();
         // call.1 sanitize 后为 call_1,与 output 匹配,对齐为 output 的形态
         assert_eq!(input[0]["call_id"], "call_1");
@@ -1228,9 +994,9 @@ mod tests {
     #[test]
     fn test_insert_empty_or_bad_input() {
         let mut body = json!({"input": []});
-        assert!(!insert_replay_items(&mut body, vec![]));
+        assert!(!insert_replay_turns(&mut body, vec![]));
         let mut no_input = json!({});
-        assert!(!insert_replay_items(
+        assert!(!insert_replay_turns(
             &mut no_input,
             vec![json!({"type": "reasoning", "encrypted_content": "g"})]
         ));
@@ -1255,11 +1021,21 @@ mod tests {
         ]});
         assert!(!assistant_message_fingerprint(&m4).is_empty());
         // user message / 非 message / 空 content → 空串
-        assert_eq!(assistant_message_fingerprint(&json!({"role": "user", "content": "hello"})), "");
-        assert_eq!(assistant_message_fingerprint(&json!({"type": "function_call", "call_id": "c"})), "");
-        assert_eq!(assistant_message_fingerprint(&json!({"role": "assistant", "content": []})), "");
+        assert_eq!(
+            assistant_message_fingerprint(&json!({"role": "user", "content": "hello"})),
+            ""
+        );
+        assert_eq!(
+            assistant_message_fingerprint(&json!({"type": "function_call", "call_id": "c"})),
+            ""
+        );
+        assert_eq!(
+            assistant_message_fingerprint(&json!({"role": "assistant", "content": []})),
+            ""
+        );
         // 数组含未知 part 类型 → 空串(歧义保守)
-        let m5 = json!({"role": "assistant", "content": [{"type": "input_image", "image_url": "x"}]});
+        let m5 =
+            json!({"role": "assistant", "content": [{"type": "input_image", "image_url": "x"}]});
         assert_eq!(assistant_message_fingerprint(&m5), "");
     }
 
@@ -1300,7 +1076,10 @@ mod tests {
         // call_ids 收集
         assert_eq!(turn[0]["call_ids"], json!(["c1"]));
         // assistant_fingerprint 非空
-        assert!(!turn[0]["assistant_fingerprint"].as_str().unwrap().is_empty());
+        assert!(!turn[0]["assistant_fingerprint"]
+            .as_str()
+            .unwrap()
+            .is_empty());
         // request_fingerprint 透传
         assert_eq!(turn[0]["request_fingerprint"], "reqfp");
         // items 原样保留(不归一化,对齐 CPA cacheCodexReasoningReplayFromCompleted)
@@ -1383,7 +1162,10 @@ mod tests {
         ];
         let merged = append_replay_turn(&existing, &new_turn);
         // 256 turn 上限:丢最老一个(t0),剩 256 个 marker
-        let markers = merged.iter().filter(|i| i["type"] == REPLAY_TURN_TYPE).count();
+        let markers = merged
+            .iter()
+            .filter(|i| i["type"] == REPLAY_TURN_TYPE)
+            .count();
         assert_eq!(markers, MAX_REPLAY_TURNS);
         // t0 已被丢,t_new 在
         assert!(!merged.iter().any(|i| i["id"] == "t0"));
@@ -1485,42 +1267,6 @@ mod tests {
     fn test_insert_replay_turns_empty() {
         let mut body = json!({"input": []});
         assert!(!insert_replay_turns(&mut body, vec![]));
-    }
-
-    #[test]
-    fn test_extract_includes_function_call_output() {
-        let completed = json!({
-            "response": {
-                "output": [
-                    {"type": "function_call", "call_id": "call_1", "name": "tool_a", "arguments": "{}"},
-                    {"type": "function_call_output", "call_id": "call_1", "output": [{"type": "input_text", "text": "result"}]},
-                    {"type": "reasoning", "encrypted_content": "gAAAA-valid", "content": "think"},
-                ]
-            }
-        });
-        let items = extract_replay_items(&completed).unwrap();
-        assert_eq!(items.len(), 3);
-        assert_eq!(items[0]["type"], "function_call");
-        assert_eq!(items[1]["type"], "function_call_output");
-        assert_eq!(items[1]["call_id"], "call_1");
-        assert_eq!(items[2]["type"], "reasoning");
-    }
-
-    #[test]
-    fn test_extract_includes_custom_tool_call_output() {
-        let completed = json!({
-            "response": {
-                "output": [
-                    {"type": "custom_tool_call", "call_id": "call_1", "name": "tool", "input": {"query": "test"}},
-                    {"type": "custom_tool_call_output", "call_id": "call_1", "output": {"result": "ok"}},
-                ]
-            }
-        });
-        let items = extract_replay_items(&completed).unwrap();
-        assert_eq!(items.len(), 2);
-        assert_eq!(items[0]["type"], "custom_tool_call");
-        assert_eq!(items[1]["type"], "custom_tool_call_output");
-        assert_eq!(items[1]["call_id"], "call_1");
     }
 
     #[test]
