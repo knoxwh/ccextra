@@ -547,6 +547,65 @@ fn align_replay_call_ids(input_items: &[Value], replay_items: Vec<Value>) -> Vec
         .collect()
 }
 
+/// assistant message 内容指纹(对齐 codexReplayAssistantMessageFingerprint):
+/// 字符串 content 直接取;数组只认 input_text/output_text/refusal,
+/// 其他 part 类型返回空串(歧义保守)。sha256 hex,空内容空串。
+// TODO(task2): build_replay_turn 消费后移除 allow
+#[allow(dead_code)]
+fn assistant_message_fingerprint(item: &Value) -> String {
+    use sha2::{Digest, Sha256};
+    let item_type = item.get("type").and_then(|v| v.as_str()).unwrap_or("");
+    if !item_type.is_empty() && item_type != "message" {
+        return String::new();
+    }
+    let is_assistant = item
+        .get("role")
+        .and_then(|v| v.as_str())
+        .is_some_and(|r| r.trim().eq_ignore_ascii_case("assistant"));
+    if !is_assistant {
+        return String::new();
+    }
+    let mut builder = String::new();
+    match item.get("content") {
+        Some(Value::String(s)) => builder.push_str(s),
+        Some(Value::Array(parts)) => {
+            for part in parts {
+                match part.get("type").and_then(|v| v.as_str()).unwrap_or("") {
+                    "input_text" | "output_text" => {
+                        builder.push_str(part.get("text").and_then(|v| v.as_str()).unwrap_or(""));
+                    }
+                    "refusal" => {
+                        builder.push_str("\u{0}refusal\u{0}");
+                        builder.push_str(part.get("refusal").and_then(|v| v.as_str()).unwrap_or(""));
+                    }
+                    _ => return String::new(),
+                }
+            }
+        }
+        _ => return String::new(),
+    }
+    if builder.is_empty() {
+        return String::new();
+    }
+    hex::encode(Sha256::digest(builder.as_bytes()))
+}
+
+/// input 前 end 项的指纹(对齐 codexReplayInputPrefixFingerprint):
+/// 逐项吸收 `\0item\0` + 原始 JSON 字节,sha256 hex。
+/// end 越界返回空串。
+pub fn input_prefix_fingerprint(input_items: &[Value], end: usize) -> String {
+    use sha2::{Digest, Sha256};
+    if end > input_items.len() {
+        return String::new();
+    }
+    let mut hasher = Sha256::new();
+    for item in &input_items[..end] {
+        hasher.update(b"\0item\0");
+        hasher.update(serde_json::to_vec(item).unwrap_or_default());
+    }
+    hex::encode(hasher.finalize())
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -718,6 +777,52 @@ mod tests {
             &mut no_input,
             vec![json!({"type": "reasoning", "encrypted_content": "g"})]
         ));
+    }
+
+    #[test]
+    fn test_assistant_message_fingerprint() {
+        // assistant message,字符串 content
+        let m1 = json!({"type": "message", "role": "assistant", "content": "hello"});
+        let f1 = assistant_message_fingerprint(&m1);
+        assert!(!f1.is_empty());
+        // 相同内容相同指纹
+        let m2 = json!({"role": "assistant", "content": "hello"});
+        assert_eq!(f1, assistant_message_fingerprint(&m2));
+        // 不同内容不同指纹
+        let m3 = json!({"role": "assistant", "content": "world"});
+        assert_ne!(f1, assistant_message_fingerprint(&m3));
+        // 数组 content:input_text/output_text 取 text,refusal 特殊标记
+        let m4 = json!({"role": "assistant", "content": [
+            {"type": "output_text", "text": "a"},
+            {"type": "refusal", "refusal": "no"}
+        ]});
+        assert!(!assistant_message_fingerprint(&m4).is_empty());
+        // user message / 非 message / 空 content → 空串
+        assert_eq!(assistant_message_fingerprint(&json!({"role": "user", "content": "hello"})), "");
+        assert_eq!(assistant_message_fingerprint(&json!({"type": "function_call", "call_id": "c"})), "");
+        assert_eq!(assistant_message_fingerprint(&json!({"role": "assistant", "content": []})), "");
+        // 数组含未知 part 类型 → 空串(歧义保守)
+        let m5 = json!({"role": "assistant", "content": [{"type": "input_image", "image_url": "x"}]});
+        assert_eq!(assistant_message_fingerprint(&m5), "");
+    }
+
+    #[test]
+    fn test_input_prefix_fingerprint() {
+        let items = vec![
+            json!({"type": "message", "role": "user", "content": "q"}),
+            json!({"type": "function_call", "call_id": "c1", "name": "f", "arguments": "{}"}),
+        ];
+        let f0 = input_prefix_fingerprint(&items, 0);
+        let f1 = input_prefix_fingerprint(&items, 1);
+        let f2 = input_prefix_fingerprint(&items, 2);
+        assert!(!f0.is_empty() && !f1.is_empty() && !f2.is_empty());
+        assert_ne!(f0, f1);
+        assert_ne!(f1, f2);
+        // 前缀性质:不同长度不同指纹;越界返回空串
+        assert_eq!(input_prefix_fingerprint(&items, 3), "");
+        assert_eq!(input_prefix_fingerprint(&items, usize::MAX), "");
+        // 空数组 end=0 有值(空哈希)
+        assert!(!input_prefix_fingerprint(&[], 0).is_empty());
     }
 
     #[test]
