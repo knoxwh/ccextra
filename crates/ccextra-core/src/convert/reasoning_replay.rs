@@ -550,8 +550,6 @@ fn align_replay_call_ids(input_items: &[Value], replay_items: Vec<Value>) -> Vec
 /// assistant message 内容指纹(对齐 codexReplayAssistantMessageFingerprint):
 /// 字符串 content 直接取;数组只认 input_text/output_text/refusal,
 /// 其他 part 类型返回空串(歧义保守)。sha256 hex,空内容空串。
-// TODO(task2): build_replay_turn 消费后移除 allow
-#[allow(dead_code)]
 fn assistant_message_fingerprint(item: &Value) -> String {
     use sha2::{Digest, Sha256};
     let item_type = item.get("type").and_then(|v| v.as_str()).unwrap_or("");
@@ -604,6 +602,95 @@ pub fn input_prefix_fingerprint(input_items: &[Value], end: usize) -> String {
         hasher.update(serde_json::to_vec(item).unwrap_or_default());
     }
     hex::encode(hasher.finalize())
+}
+
+/// turn 边界 marker 类型(对齐 CPA CodexReasoningReplayTurnType,改名避免
+/// 与 CPA 字面量混淆;注入前 filter 会剔除,永不上游)
+pub const REPLAY_TURN_TYPE: &str = "ccextra_replay_turn";
+
+/// 累积缓存的每轮 turn 上限(对齐 CodexReasoningReplayCacheMaxTurnsPerEntry)
+pub const MAX_REPLAY_TURNS: usize = 256;
+/// 累积缓存单条目字节上限(对齐 CodexReasoningReplayCacheMaxBytesPerEntry)
+pub const MAX_REPLAY_BYTES: usize = 16 << 20;
+
+/// 从 response.completed 构造一个 turn:[marker, ...items]
+/// (对齐 cacheCodexReasoningReplayFromCompleted)。
+///
+/// marker id = sha256(request_fingerprint + assistant_fingerprint + call_ids
+/// + items 原始字节),同轮重放 id 相同,append 时按 id 去重。
+/// items 不归一化(CPA codex 路径存 raw);zzswitch 等 relay 非标准回显的
+/// function_call_output 一并缓存(配对完整,c40235f 场景)。
+/// 无 reasoning/function_call/custom_tool_call 项返回 None。
+pub fn build_replay_turn(completed: &Value, request_fingerprint: &str) -> Option<Vec<Value>> {
+    use sha2::{Digest, Sha256};
+    let output = completed.pointer("/response/output")?.as_array()?;
+    let mut items: Vec<Value> = Vec::with_capacity(output.len());
+    let mut call_ids: Vec<String> = Vec::new();
+    let mut assistant_fingerprint = String::new();
+    for item in output {
+        match item.get("type").and_then(|v| v.as_str()).unwrap_or("") {
+            "reasoning" | "function_call" | "custom_tool_call" => {
+                items.push(item.clone());
+                if let Some(call_id) = item
+                    .get("call_id")
+                    .and_then(|v| v.as_str())
+                    .map(|c| c.trim())
+                    .filter(|c| !c.is_empty())
+                {
+                    call_ids.push(call_id.to_string());
+                }
+            }
+            "function_call_output" | "custom_tool_call_output" => {
+                // zzswitch 等 relay 非标准回显 output;缓存它保证 call/output
+                // 配对完整(c40235f 场景)。标准 API completed 无此项,分支不触发。
+                let call_id = item
+                    .get("call_id")
+                    .and_then(|v| v.as_str())
+                    .map(|c| c.trim())
+                    .filter(|c| !c.is_empty());
+                if call_id.is_some() && item.get("output").is_some() {
+                    items.push(item.clone());
+                }
+            }
+            "message" => {
+                let fp = assistant_message_fingerprint(item);
+                if !fp.is_empty() {
+                    assistant_fingerprint = fp;
+                }
+            }
+            _ => continue,
+        }
+    }
+    if items.is_empty() {
+        return None;
+    }
+    let mut hasher = Sha256::new();
+    hasher.update(request_fingerprint.as_bytes());
+    hasher.update(format!("\u{0}assistant\u{0}{}", assistant_fingerprint).as_bytes());
+    for call_id in &call_ids {
+        hasher.update(format!("\u{0}call\u{0}{}", call_id).as_bytes());
+    }
+    for item in &items {
+        hasher.update(b"\0item\0");
+        hasher.update(serde_json::to_vec(item).unwrap_or_default());
+    }
+    let mut marker = json!({
+        "type": REPLAY_TURN_TYPE,
+        "id": hex::encode(hasher.finalize()),
+    });
+    if !assistant_fingerprint.is_empty() {
+        marker["assistant_fingerprint"] = json!(assistant_fingerprint);
+    }
+    if !request_fingerprint.is_empty() {
+        marker["request_fingerprint"] = json!(request_fingerprint);
+    }
+    if !call_ids.is_empty() {
+        marker["call_ids"] = json!(call_ids);
+    }
+    let mut turn = Vec::with_capacity(items.len() + 1);
+    turn.push(marker);
+    turn.extend(items);
+    Some(turn)
 }
 
 #[cfg(test)]
@@ -823,6 +910,69 @@ mod tests {
         assert_eq!(input_prefix_fingerprint(&items, usize::MAX), "");
         // 空数组 end=0 有值(空哈希)
         assert!(!input_prefix_fingerprint(&[], 0).is_empty());
+    }
+
+    #[test]
+    fn test_build_replay_turn_basic() {
+        let completed = json!({"response": {"output": [
+            {"type": "reasoning", "encrypted_content": "gAAA"},
+            {"type": "function_call", "call_id": "c1", "name": "f", "arguments": "{}"},
+            {"type": "message", "role": "assistant", "content": [
+                {"type": "output_text", "text": "hi"}
+            ]},
+            {"type": "web_search_call"}
+        ]}});
+        let turn = build_replay_turn(&completed, "reqfp").unwrap();
+        // marker + 2 个可回放项(message 只提指纹不入 items,web_search_call 丢弃)
+        assert_eq!(turn.len(), 3);
+        assert_eq!(turn[0]["type"], REPLAY_TURN_TYPE);
+        assert!(!turn[0]["id"].as_str().unwrap().is_empty());
+        // call_ids 收集
+        assert_eq!(turn[0]["call_ids"], json!(["c1"]));
+        // assistant_fingerprint 非空
+        assert!(!turn[0]["assistant_fingerprint"].as_str().unwrap().is_empty());
+        // request_fingerprint 透传
+        assert_eq!(turn[0]["request_fingerprint"], "reqfp");
+        // items 原样保留(不归一化,对齐 CPA cacheCodexReasoningReplayFromCompleted)
+        assert_eq!(turn[1]["encrypted_content"], "gAAA");
+        assert_eq!(turn[2]["call_id"], "c1");
+    }
+
+    #[test]
+    fn test_build_replay_turn_dedup_and_empty() {
+        // 同一 completed + 同 request_fingerprint → marker id 相同(幂等去重键)
+        let completed = json!({"response": {"output": [
+            {"type": "reasoning", "encrypted_content": "gAAA"}
+        ]}});
+        let t1 = build_replay_turn(&completed, "fp").unwrap();
+        let t2 = build_replay_turn(&completed, "fp").unwrap();
+        assert_eq!(t1[0]["id"], t2[0]["id"]);
+        // 不同 request_fingerprint → 不同 id
+        let t3 = build_replay_turn(&completed, "fp2").unwrap();
+        assert_ne!(t1[0]["id"], t3[0]["id"]);
+        // 无可回放项 → None
+        let empty = json!({"response": {"output": [{"type": "web_search_call"}]}});
+        assert!(build_replay_turn(&empty, "fp").is_none());
+        // output 缺失 → None
+        assert!(build_replay_turn(&json!({"response": {}}), "fp").is_none());
+    }
+
+    #[test]
+    fn test_build_replay_turn_includes_output_echo() {
+        // zzswitch 等 relay 非标准回显 output(c40235f 场景):一并缓存
+        let with_output = json!({"response": {"output": [
+            {"type": "function_call", "call_id": "c1", "name": "f", "arguments": "{}"},
+            {"type": "function_call_output", "call_id": "c1", "output": "ok"}
+        ]}});
+        let t = build_replay_turn(&with_output, "").unwrap();
+        assert_eq!(t.len(), 3); // marker + call + output
+        assert_eq!(t[2]["type"], "function_call_output");
+        // 空 call_id / 缺 output 的回显项丢弃
+        let bad = json!({"response": {"output": [
+            {"type": "function_call_output", "call_id": "", "output": "ok"},
+            {"type": "function_call_output", "call_id": "c9"}
+        ]}});
+        assert!(build_replay_turn(&bad, "").is_none());
     }
 
     #[test]
