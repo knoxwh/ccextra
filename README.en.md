@@ -123,7 +123,8 @@ providers:
 ### Run
 
 ```bash
-./target/release/ccextra --config config.yaml
+./build.sh                                # Build and place binary at root ./ccextra
+./ccextra --config config.yaml            # Run in foreground
 ```
 
 Or use the scripts:
@@ -133,6 +134,26 @@ Or use the scripts:
 ./stop.sh     # stop
 ./restart.sh  # restart
 ./build.sh    # build (restarts if already running)
+```
+
+### OAuth Subscription Login (Antigravity / xAI Grok)
+
+No need to configure API keys manually in `config.yaml`. Log in via CLI and ccextra will automatically discover credentials and inject providers on startup:
+
+```bash
+# 1. Antigravity (Google Cloud Code Assist) login
+./ccextra antigravity-login
+# View saved credentials status
+./ccextra antigravity-status
+# Query quota and model status
+./scripts/check_antigravity_quota.sh
+
+# 2. xAI Grok Device Authorization login
+./ccextra xai-login
+# View saved credentials status
+./ccextra xai-status
+# Verify xAI connectivity and models
+./scripts/check_grok_quota.sh
 ```
 
 ### Point Claude Code at it

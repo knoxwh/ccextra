@@ -123,7 +123,8 @@ providers:
 ### 启动
 
 ```bash
-./target/release/ccextra --config config.yaml
+./build.sh                                # 构建并放置于根目录 ./ccextra
+./ccextra --config config.yaml            # 前台启动
 ```
 
 或使用脚本：
@@ -133,6 +134,26 @@ providers:
 ./stop.sh     # 停止
 ./restart.sh  # 重启
 ./build.sh    # 构建（自动重启）
+```
+
+### OAuth 订阅登录 (Antigravity / xAI Grok)
+
+无需在 `config.yaml` 中配置 API Key，通过 CLI 完成登录后，ccextra 启动时会自动发现凭证并注入 Provider：
+
+```bash
+# 1. Antigravity (Google Cloud Code Assist) 登录
+./ccextra antigravity-login
+# 查看已保存的凭证状态
+./ccextra antigravity-status
+# 查询可用配额与模型状态
+./scripts/check_antigravity_quota.sh
+
+# 2. xAI Grok 设备码授权登录
+./ccextra xai-login
+# 查看已保存的凭证状态
+./ccextra xai-status
+# 验证 xAI 连通性与模型
+./scripts/check_grok_quota.sh
 ```
 
 ### 接入 Claude Code
