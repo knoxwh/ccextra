@@ -3,11 +3,16 @@ use ccextra_core::cache_stabilization::drift_detector::DriftState;
 use ccextra_core::route::ProviderConfig;
 use ccextra_server::antigravity::{
     constants::{CALLBACK_PORT, REFRESH_SKEW_SECS},
-    list, resolve_auth_dir, run_login, LoginOptions,
+    list as list_antigravity, resolve_auth_dir as resolve_antigravity_auth_dir,
+    run_login as run_antigravity_login, LoginOptions as AntigravityLoginOptions,
 };
 use ccextra_server::http::{AppState, ReloadData, RuntimeConfig};
 use ccextra_server::serve;
 use ccextra_server::upstream::UpstreamClient;
+use ccextra_server::xai::{
+    constants::REFRESH_SKEW_SECS as XAI_REFRESH_SKEW_SECS, list as list_xai,
+    resolve_auth_dir as resolve_xai_auth_dir, run_login as run_xai_login, XAILoginOptions,
+};
 use clap::{Parser, Subcommand};
 use std::path::PathBuf;
 use std::sync::Arc;
@@ -55,6 +60,23 @@ enum Commands {
         #[arg(long)]
         auth_dir: Option<String>,
     },
+    /// xAI Grok 设备码授权登录并写入凭证
+    #[command(name = "xai-login")]
+    XaiLogin {
+        /// 凭证目录,默认配置文件旁 .cache/xai
+        #[arg(long)]
+        auth_dir: Option<String>,
+        /// 不自动打开浏览器,只打印 URL
+        #[arg(long)]
+        no_browser: bool,
+    },
+    /// 列出已保存的 xAI Grok 凭证(不打印 token)
+    #[command(name = "xai-status")]
+    XaiStatus {
+        /// 凭证目录,默认配置文件旁 .cache/xai
+        #[arg(long)]
+        auth_dir: Option<String>,
+    },
 }
 
 #[tokio::main]
@@ -66,10 +88,19 @@ async fn main() -> Result<()> {
             no_browser,
             callback_port,
         }) => {
-            return cmd_login(&cli.config, auth_dir, no_browser, callback_port).await;
+            return cmd_antigravity_login(&cli.config, auth_dir, no_browser, callback_port).await;
         }
         Some(Commands::AntigravityStatus { auth_dir }) => {
-            return cmd_status(&cli.config, auth_dir);
+            return cmd_antigravity_status(&cli.config, auth_dir);
+        }
+        Some(Commands::XaiLogin {
+            auth_dir,
+            no_browser,
+        }) => {
+            return cmd_xai_login(&cli.config, auth_dir, no_browser).await;
+        }
+        Some(Commands::XaiStatus { auth_dir }) => {
+            return cmd_xai_status(&cli.config, auth_dir);
         }
         None => {}
     }
@@ -105,9 +136,13 @@ async fn main() -> Result<()> {
     tracing::info!("配置加载成功: {} providers", config.providers.len());
 
     // 动态加载 Antigravity providers
-    let auth_dir = pin_auth_dir(&cli.config, config.auth_dir.as_deref());
+    let antigravity_auth_dir = pin_auth_dir(
+        &cli.config,
+        config.auth_dir.as_deref(),
+        resolve_antigravity_auth_dir,
+    );
     let antigravity_providers = ccextra_server::antigravity::load_antigravity_providers(
-        &auth_dir,
+        &antigravity_auth_dir,
         config.server.proxy_url.as_deref(),
     )
     .await;
@@ -118,8 +153,22 @@ async fn main() -> Result<()> {
         );
     }
 
-    // 合并配置文件 providers 和 Antigravity providers
-    let all_providers = merge_providers(config.providers, antigravity_providers);
+    // 动态加载 xAI providers
+    let xai_auth_dir = pin_auth_dir(
+        &cli.config,
+        config.xai_auth_dir.as_deref(),
+        resolve_xai_auth_dir,
+    );
+    let xai_providers =
+        ccextra_server::xai::load_xai_providers(&xai_auth_dir, config.server.proxy_url.as_deref())
+            .await;
+    if !xai_providers.is_empty() {
+        tracing::info!("动态加载 {} 个 xAI providers", xai_providers.len());
+    }
+
+    // 合并配置文件 providers、Antigravity providers 和 xAI providers
+    let mut all_providers = merge_providers(config.providers, antigravity_providers);
+    all_providers = merge_providers(all_providers, xai_providers);
 
     // 启动时验证配置
     ccextra_core::route::validate_providers(&all_providers)?;
@@ -132,14 +181,23 @@ async fn main() -> Result<()> {
         Box::pin(async move {
             let cfg = Config::load(&config_path)?;
 
-            // 重载时重新解析 auth_dir(配置里改了要生效),再加载 Antigravity providers
-            let auth_dir = pin_auth_dir(&config_path, cfg.auth_dir.as_deref());
+            // 重载时重新解析 auth_dir 并加载动态 providers
+            let antigravity_auth_dir = pin_auth_dir(&config_path, cfg.auth_dir.as_deref(), resolve_antigravity_auth_dir);
             let antigravity_providers = ccextra_server::antigravity::load_antigravity_providers(
-                &auth_dir,
+                &antigravity_auth_dir,
                 cfg.server.proxy_url.as_deref(),
             )
             .await;
-            let providers = merge_providers(cfg.providers, antigravity_providers);
+
+            let xai_auth_dir = pin_auth_dir(&config_path, cfg.xai_auth_dir.as_deref(), resolve_xai_auth_dir);
+            let xai_providers = ccextra_server::xai::load_xai_providers(
+                &xai_auth_dir,
+                cfg.server.proxy_url.as_deref(),
+            )
+            .await;
+
+            let mut providers = merge_providers(cfg.providers, antigravity_providers);
+            providers = merge_providers(providers, xai_providers);
 
             Ok(ReloadData {
                 providers,
@@ -181,18 +239,30 @@ fn load_optional_config(path: &str) -> Option<Config> {
     Config::load(path).ok()
 }
 
-fn auth_dir_from(config_path: &str, override_dir: Option<String>) -> PathBuf {
+fn antigravity_auth_dir_from(config_path: &str, override_dir: Option<String>) -> PathBuf {
     let raw = if let Some(dir) = override_dir {
         Some(dir)
     } else {
         load_optional_config(config_path).and_then(|cfg| cfg.auth_dir)
     };
-    pin_auth_dir(config_path, raw.as_deref())
+    pin_auth_dir(config_path, raw.as_deref(), resolve_antigravity_auth_dir)
+}
+
+fn xai_auth_dir_from(config_path: &str, override_dir: Option<String>) -> PathBuf {
+    let raw = if let Some(dir) = override_dir {
+        Some(dir)
+    } else {
+        load_optional_config(config_path).and_then(|cfg| cfg.xai_auth_dir)
+    };
+    pin_auth_dir(config_path, raw.as_deref(), resolve_xai_auth_dir)
 }
 
 /// 相对路径钉在配置文件所在目录,不跟进程 cwd 走
-fn pin_auth_dir(config_path: &str, raw: Option<&str>) -> PathBuf {
-    let path = resolve_auth_dir(raw);
+fn pin_auth_dir<F>(config_path: &str, raw: Option<&str>, resolver: F) -> PathBuf
+where
+    F: FnOnce(Option<&str>) -> PathBuf,
+{
+    let path = resolver(raw);
     if path.is_absolute() {
         return path;
     }
@@ -204,7 +274,7 @@ fn pin_auth_dir(config_path: &str, raw: Option<&str>) -> PathBuf {
     }
 }
 
-/// 合并配置文件与动态注入的 providers(多 Antigravity 账号暴露同一批模型,
+/// 合并配置文件与动态注入的 providers(多账号暴露同一批模型,
 /// alias 冲突会触发启动校验失败;先到者胜出,重复 alias 丢弃并告警)
 fn merge_providers(
     mut base: Vec<ProviderConfig>,
@@ -234,29 +304,28 @@ fn merge_providers(
     base
 }
 
-async fn cmd_login(
+async fn cmd_antigravity_login(
     config_path: &str,
     auth_dir: Option<String>,
     no_browser: bool,
     callback_port: Option<u16>,
 ) -> Result<()> {
     let cfg = load_optional_config(config_path);
-    // 登录换码/userinfo/project 走 server.proxy_url
     let proxy_url = cfg.as_ref().and_then(|c| c.server.proxy_url.clone());
-    let opts = LoginOptions {
-        auth_dir: auth_dir_from(config_path, auth_dir),
+    let opts = AntigravityLoginOptions {
+        auth_dir: antigravity_auth_dir_from(config_path, auth_dir),
         no_browser,
         callback_port: callback_port.unwrap_or(CALLBACK_PORT),
         proxy_url,
     };
-    run_login(opts).await?;
+    run_antigravity_login(opts).await?;
     Ok(())
 }
 
-fn cmd_status(config_path: &str, auth_dir: Option<String>) -> Result<()> {
-    let dir = auth_dir_from(config_path, auth_dir);
+fn cmd_antigravity_status(config_path: &str, auth_dir: Option<String>) -> Result<()> {
+    let dir = antigravity_auth_dir_from(config_path, auth_dir);
     let now = SystemTime::now();
-    let entries = list(&dir)?;
+    let entries = list_antigravity(&dir)?;
     if entries.is_empty() {
         println!("无 Antigravity 凭证: {}", dir.display());
         return Ok(());
@@ -293,22 +362,87 @@ fn cmd_status(config_path: &str, auth_dir: Option<String>) -> Result<()> {
     Ok(())
 }
 
+async fn cmd_xai_login(
+    config_path: &str,
+    auth_dir: Option<String>,
+    no_browser: bool,
+) -> Result<()> {
+    let cfg = load_optional_config(config_path);
+    let proxy_url = cfg.as_ref().and_then(|c| c.server.proxy_url.clone());
+    let opts = XAILoginOptions {
+        auth_dir: xai_auth_dir_from(config_path, auth_dir),
+        no_browser,
+        proxy_url,
+    };
+    run_xai_login(opts).await?;
+    Ok(())
+}
+
+fn cmd_xai_status(config_path: &str, auth_dir: Option<String>) -> Result<()> {
+    let dir = xai_auth_dir_from(config_path, auth_dir);
+    let now = SystemTime::now();
+    let entries = list_xai(&dir)?;
+    if entries.is_empty() {
+        println!("无 xAI 凭证: {}", dir.display());
+        return Ok(());
+    }
+    println!("auth_dir: {}", dir.display());
+    for (path, cred) in entries {
+        let status = if cred.disabled {
+            "disabled"
+        } else if cred.is_fresh(now, XAI_REFRESH_SKEW_SECS) {
+            "fresh"
+        } else {
+            "stale"
+        };
+        let email = if cred.email.is_empty() {
+            "-"
+        } else {
+            cred.email.as_str()
+        };
+        let sub = if cred.sub.is_empty() {
+            "-"
+        } else {
+            cred.sub.as_str()
+        };
+        println!(
+            "{}  email={email}  sub={sub}  {status}  expired={}",
+            path.file_name().unwrap_or_default().to_string_lossy(),
+            if cred.expired.is_empty() {
+                "-"
+            } else {
+                cred.expired.as_str()
+            }
+        );
+    }
+    Ok(())
+}
+
 #[cfg(test)]
 mod tests {
     use super::pin_auth_dir;
+    use ccextra_server::antigravity::resolve_auth_dir as resolve_antigravity_auth_dir;
+    use ccextra_server::xai::resolve_auth_dir as resolve_xai_auth_dir;
     use std::path::PathBuf;
 
     #[test]
     fn pin_default_next_to_config() {
-        let dir = pin_auth_dir("/tmp/proj/config.yaml", None);
+        let dir = pin_auth_dir("/tmp/proj/config.yaml", None, resolve_antigravity_auth_dir);
         assert_eq!(dir, PathBuf::from("/tmp/proj/.cache/antigravity"));
         assert!(!dir.to_string_lossy().contains(".cli-proxy-api"));
+
+        let xai_dir = pin_auth_dir("/tmp/proj/config.yaml", None, resolve_xai_auth_dir);
+        assert_eq!(xai_dir, PathBuf::from("/tmp/proj/.cache/xai"));
     }
 
     #[test]
     fn pin_keeps_absolute_and_tilde() {
         assert_eq!(
-            pin_auth_dir("/tmp/proj/config.yaml", Some("/abs/creds")),
+            pin_auth_dir(
+                "/tmp/proj/config.yaml",
+                Some("/abs/creds"),
+                resolve_antigravity_auth_dir
+            ),
             PathBuf::from("/abs/creds")
         );
         let home = std::env::var_os("HOME")
@@ -316,7 +450,11 @@ mod tests {
             .map(PathBuf::from)
             .unwrap();
         assert_eq!(
-            pin_auth_dir("/tmp/proj/config.yaml", Some("~/.cli-proxy-api")),
+            pin_auth_dir(
+                "/tmp/proj/config.yaml",
+                Some("~/.cli-proxy-api"),
+                resolve_antigravity_auth_dir
+            ),
             home.join(".cli-proxy-api")
         );
     }

@@ -9,7 +9,7 @@
 [![Workspace](https://img.shields.io/badge/workspace-3%20crates-lightgrey)]()
 [![Docs: design](https://img.shields.io/badge/docs-architecture-informational)](docs/design.md)
 
-单个二进制，监听一个端口，同时提供 Claude 原生协议、OpenAI Chat Completions、OpenAI Responses、Google Gemini、Antigravity（Cloud Code Assist OAuth）五种上游接入。把 Claude Code 的请求按模型路由到不同 provider，并通过对请求体的确定性归一化，最大程度命中上游 prompt 缓存。
+单个二进制，监听一个端口，同时提供 Claude 原生协议、OpenAI Chat Completions、OpenAI Responses、Google Gemini、Antigravity（Cloud Code Assist OAuth）、xAI Grok（OAuth）上游接入。把 Claude Code 的请求按模型路由到不同 provider，并通过对请求体的确定性归一化，最大程度命中上游 prompt 缓存。
 
 ```
 Claude Code          (ANTHROPIC_BASE_URL → http://127.0.0.1:8222)
@@ -21,14 +21,15 @@ ccextra :8222  ──  路由 → 归一化 → 协议转换 → 上游请求
      ├── openai_chat       → OpenAI Chat Completions
      ├── openai_responses  → OpenAI Responses
      ├── gemini            → Google Gemini API
-     └── antigravity       → Cloud Code Assist(OAuth 自动注入,无需手配)
+     ├── antigravity       → Cloud Code Assist(OAuth 自动注入,无需手配)
+     └── xai               → xAI Grok(OAuth 自动注入,无需手配)
 ```
 
 ## 特性
 
 | 类别 | 说明 |
 | ---- | ---- |
-| **多协议接入** | 同时支持 Claude 原生 / OpenAI Chat Completions / OpenAI Responses / Google Gemini / Antigravity 五种上游协议 |
+| **多协议接入** | 同时支持 Claude 原生 / OpenAI Chat Completions / OpenAI Responses / Google Gemini / Antigravity / xAI Grok 上游协议 |
 | **模型路由** | 入站模型名按 alias 解析到唯一 provider，冲突启动即报错，不做隐式推导 |
 | **字节级直通** | Claude → Claude 只改 model 字段，其余字节原样保留，保住归一化成果 |
 | **prompt 缓存优化** | 九模块归一化消除序列化漂移，命中上游 prompt cache；drift 检测器跨轮观测盲区 |
@@ -185,7 +186,7 @@ curl http://127.0.0.1:8222/health
 | `server.host` / `server.port` | 监听地址，默认 `127.0.0.1:8222` |
 | `server.proxy_url` | 全局代理兜底，可选；`"direct"` 表示不走代理 |
 | `secret_key` | 入口认证，可选。配置后 `/v1/models` 与 `/v1/messages` 需携带匹配 key，否则 401。支持 `x-api-key` 或 `Authorization: Bearer`。明文自动转 bcrypt 落盘。`/reload` 热替换 secret，并清空 bcrypt 校验缓存 |
-| `providers[].protocol` | 上游协议：`claude` / `openai_chat` / `openai_responses` / `gemini` / `antigravity`。Antigravity 通常无需手配：启动时自动扫描 `auth_dir`（默认 `.cache/antigravity`）的 OAuth 凭证并注入 provider |
+| `providers[].protocol` | 上游协议：`claude` / `openai_chat` / `openai_responses` / `gemini` / `antigravity`。Antigravity 与 xAI Grok 通常无需手配：启动时自动扫描 `auth_dir`（默认 `.cache/antigravity`）与 `xai_auth_dir`（默认 `.cache/xai`）的 OAuth 凭证并注入 provider |
 | `providers[].base_url` / `key` | 上游地址与密钥 |
 | `providers[].models[].alias` | 入站模型名 → 上游真实模型名 |
 | `providers[].prompt_cache_key` | 缓存桶 key = 会话 ID（对齐 codex 0.147），仅 openai 协议生效 |
@@ -227,7 +228,7 @@ ccextra/
 cargo test --workspace
 ```
 
-当前 594 个测试 (12 + 441 + 141)，覆盖缓存归一化、协议转换（Claude/OpenAI/Gemini/Antigravity）、SSE 状态机、HTTP 管线与配置解析等模块。
+当前 709 个测试，覆盖缓存归一化、协议转换（Claude/OpenAI/Gemini/Antigravity/xAI Grok）、SSE 状态机、HTTP 管线与配置解析等模块。
 
 ## 文档
 

@@ -739,6 +739,38 @@ async fn handle_messages(
             }
         }
     }
+
+    // xAI 运行时 token 校验与自动刷新
+    if let Some(provider) = find_provider(&providers, &route.provider) {
+        if let Some(meta) = &provider.metadata {
+            if meta.get("provider_type").map(|s| s.as_str()) == Some("xai") {
+                if let Some(auth_dir_str) = meta.get("auth_dir") {
+                    let auth_dir = std::path::Path::new(auth_dir_str);
+                    let email = meta.get("email").map(|s| s.as_str()).unwrap_or("");
+                    let sub = meta.get("sub").map(|s| s.as_str()).unwrap_or("");
+                    let id = if !email.is_empty() { email } else { sub };
+                    match crate::xai::ensure_credential_fresh(
+                        auth_dir,
+                        id,
+                        upstream_proxy.as_deref(),
+                    )
+                    .await
+                    {
+                        Ok(fresh_cred) => {
+                            upstream_key = fresh_cred.access_token;
+                        }
+                        Err(e) => {
+                            tracing::warn!(
+                                email = %email,
+                                sub = %sub,
+                                "xAI 凭证运行时刷新失败: {e}"
+                            );
+                        }
+                    }
+                }
+            }
+        }
+    }
     drop(payload_rules);
     drop(providers);
 

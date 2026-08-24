@@ -5,5 +5,6 @@ pub mod http;
 pub mod oauth;
 pub mod sse;
 pub mod upstream;
+pub mod xai;
 
 pub use http::serve;

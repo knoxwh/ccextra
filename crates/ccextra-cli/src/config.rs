@@ -20,6 +20,9 @@ pub struct Config {
     /// Antigravity 凭证目录(可选);默认配置文件旁 `.cache/antigravity`
     #[serde(default)]
     pub auth_dir: Option<String>,
+    /// xAI 凭证目录(可选);默认配置文件旁 `.cache/xai`
+    #[serde(default)]
+    pub xai_auth_dir: Option<String>,
 }
 
 #[derive(Debug, Deserialize)]

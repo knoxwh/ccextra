@@ -13,6 +13,9 @@ secret_key: "sk-ccextra-xxx"
 # Antigravity 凭证目录(可选)。默认配置文件旁 .cache/antigravity。
 # auth_dir: ".cache/antigravity"
 
+# xAI Grok 凭证目录(可选)。默认配置文件旁 .cache/xai。
+# xai_auth_dir: ".cache/xai"
+
 # Provider 定义
 providers:
   - name: xxx1
@@ -68,6 +71,10 @@ providers:
   #   models:
   #     - name: gemini-3.7-flash-high
   #       alias: gemini-3.7-flash-high
+
+  # xAI Grok (OAuth)。无需手配:启动时自动扫描上方 xai_auth_dir,
+  # 为每份有效凭证注入一个 xai provider(OpenAI Responses 协议)。
+  # 凭证获取: ./ccextra xai-login → 写入 .cache/xai
 
 # Payload 参数覆盖(按模型名模式匹配)
 payload:
