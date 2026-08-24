@@ -79,6 +79,11 @@ pub async fn load_antigravity_providers(
         // 创建 ProviderConfig
         // Antigravity 使用 cloudcode-pa.googleapis.com 的内部 API,不是公开的 generativelanguage API
         let mut metadata = std::collections::HashMap::new();
+        metadata.insert(
+            "auth_dir".to_string(),
+            auth_dir.to_string_lossy().to_string(),
+        );
+        metadata.insert("email".to_string(), cred.email.clone());
         if !cred.project_id.is_empty() {
             metadata.insert("project_id".to_string(), cred.project_id.clone());
         }

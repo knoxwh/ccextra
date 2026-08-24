@@ -703,7 +703,7 @@ async fn handle_messages(
     // 7. 上游请求
     // 从配置中 clone 出上游所需字段后立即释放两把读锁,避免整个上游请求
     // (慢上游/长连接建立)期间持锁,防止 /reload 写锁被无限期阻塞。
-    let (upstream_base_urls, upstream_key, upstream_proxy, provider_prompt_cache_key) = {
+    let (upstream_base_urls, mut upstream_key, upstream_proxy, provider_prompt_cache_key) = {
         let provider = find_provider(&providers, &route.provider)
             .ok_or_else(|| AppError::new(anyhow::anyhow!("provider 未找到: {}", route.provider)))?;
         (
@@ -713,6 +713,32 @@ async fn handle_messages(
             provider.prompt_cache_key,
         )
     };
+
+    // Antigravity 协议运行时 token 校验与自动刷新（对齐 CLIProxyAPI ensureAccessToken）
+    if matches!(route.protocol, Protocol::Antigravity) {
+        if let Some(provider) = find_provider(&providers, &route.provider) {
+            if let Some(meta) = &provider.metadata {
+                if let (Some(auth_dir_str), Some(email)) = (meta.get("auth_dir"), meta.get("email"))
+                {
+                    let auth_dir = std::path::Path::new(auth_dir_str);
+                    match crate::antigravity::ensure_credential_fresh(
+                        auth_dir,
+                        email,
+                        upstream_proxy.as_deref(),
+                    )
+                    .await
+                    {
+                        Ok(fresh_cred) => {
+                            upstream_key = fresh_cred.access_token;
+                        }
+                        Err(e) => {
+                            tracing::warn!(email = %email, "Antigravity 凭证运行时刷新失败: {e}");
+                        }
+                    }
+                }
+            }
+        }
+    }
     drop(payload_rules);
     drop(providers);
 
