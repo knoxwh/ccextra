@@ -95,7 +95,7 @@ pub async fn onboard_user(client: &Client, access_token: &str, tier_id: &str) ->
         "tier_id": tier_id,
         "metadata": {
             "ide_type": "ANTIGRAVITY",
-            "ide_version": "2.8.1",
+            "ide_version": "2.9.1",
             "ide_name": "antigravity",
         }
     });

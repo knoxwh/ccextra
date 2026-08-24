@@ -4,6 +4,7 @@ use serde_json::{json, Value};
 use std::collections::HashMap;
 
 use super::is_attribution_text;
+use super::to_openai_responses::signature_compatible_for_target;
 use super::tool_id::tool_name_from_claude_tool_use_id;
 use super::tool_sanitize::sanitize_function_name;
 
@@ -15,10 +16,12 @@ const THOUGHT_SIGNATURE_SENTINEL: &str = "skip_thought_signature_validator";
 /// original_to_short: 原始工具名 → 上游清洗短名(本轮 tools 声明)
 /// antigravity: Antigravity 语义(保留带非空 signature 的 thinking 块,
 /// 工具图嵌进 functionResponse.parts);Gemini 直连保持兄弟 inline_data
+/// upstream_model: 目标模型名(用于签名兼容性检查)
 pub fn convert_messages(
     messages: &[Value],
     original_to_short: &HashMap<String, String>,
     antigravity: bool,
+    upstream_model: &str,
 ) -> Vec<Value> {
     let mut contents = Vec::new();
 
@@ -27,15 +30,23 @@ pub fn convert_messages(
 
         match role {
             "user" => {
-                let parts =
-                    convert_content_to_parts(&msg["content"], original_to_short, antigravity);
+                let parts = convert_content_to_parts(
+                    &msg["content"],
+                    original_to_short,
+                    antigravity,
+                    upstream_model,
+                );
                 if !parts.is_empty() {
                     contents.push(json!({ "role": "user", "parts": parts }));
                 }
             }
             "assistant" => {
-                let parts =
-                    convert_content_to_parts(&msg["content"], original_to_short, antigravity);
+                let parts = convert_content_to_parts(
+                    &msg["content"],
+                    original_to_short,
+                    antigravity,
+                    upstream_model,
+                );
                 if !parts.is_empty() {
                     contents.push(json!({ "role": "model", "parts": parts }));
                 }
@@ -104,6 +115,7 @@ fn convert_content_to_parts(
     content: &Value,
     original_to_short: &HashMap<String, String>,
     antigravity: bool,
+    upstream_model: &str,
 ) -> Vec<Value> {
     let mut parts = Vec::new();
 
@@ -115,7 +127,13 @@ fn convert_content_to_parts(
         }
         Value::Array(blocks) => {
             for block in blocks {
-                append_block_parts(&mut parts, block, original_to_short, antigravity);
+                append_block_parts(
+                    &mut parts,
+                    block,
+                    original_to_short,
+                    antigravity,
+                    upstream_model,
+                );
             }
         }
         _ => {}
@@ -130,6 +148,7 @@ fn append_block_parts(
     block: &Value,
     original_to_short: &HashMap<String, String>,
     antigravity: bool,
+    upstream_model: &str,
 ) {
     let Some(block_type) = block.get("type").and_then(|t| t.as_str()) else {
         return;
@@ -144,8 +163,8 @@ fn append_block_parts(
                 }
             }
         }
-        // thinking 块默认丢弃(Gemini 非 compat 路径);Antigravity 保留带签名块
-        // (对齐 CPA antigravity 翻译器,空签名块跳过不转文本)
+        // thinking 块默认丢弃(Gemini 非 compat 路径);Antigravity 保留带兼容签名块
+        // (对齐 CPA antigravity 翻译器:空签名或不兼容签名块丢弃)
         "thinking" => {
             if !antigravity {
                 return;
@@ -155,7 +174,11 @@ fn append_block_parts(
                 .get("signature")
                 .and_then(|s| s.as_str())
                 .unwrap_or("");
-            if text.is_empty() || signature.is_empty() {
+            // 空文本、空签名或签名不兼容目标 → 丢弃
+            if text.is_empty()
+                || signature.is_empty()
+                || !signature_compatible_for_target(signature, upstream_model)
+            {
                 return;
             }
             parts.push(json!({
@@ -332,6 +355,7 @@ fn base64_image_data(block: &Value) -> Option<(String, String)> {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use base64::Engine;
     use serde_json::json;
 
     #[test]
@@ -341,7 +365,7 @@ mod tests {
             json!({"role": "assistant", "content": "Hi there"}),
         ];
         let map = HashMap::new();
-        let contents = convert_messages(&messages, &map, false);
+        let contents = convert_messages(&messages, &map, false, "gemini-2.0");
 
         assert_eq!(contents.len(), 2);
         assert_eq!(contents[0]["role"], "user");
@@ -356,7 +380,7 @@ mod tests {
             "role": "user",
             "content": [{"type": "text", "text": ""}, {"type": "text", "text": "hi"}]
         })];
-        let contents = convert_messages(&messages, &HashMap::new(), false);
+        let contents = convert_messages(&messages, &HashMap::new(), false, "gemini-2.0");
         let parts = contents[0]["parts"].as_array().unwrap();
         assert_eq!(parts.len(), 1);
         assert_eq!(parts[0]["text"], "hi");
@@ -371,7 +395,7 @@ mod tests {
                 {"type": "text", "text": "answer"}
             ]
         })];
-        let contents = convert_messages(&messages, &HashMap::new(), false);
+        let contents = convert_messages(&messages, &HashMap::new(), false, "gemini-2.0");
         let parts = contents[0]["parts"].as_array().unwrap();
         assert_eq!(parts.len(), 1);
         assert_eq!(parts[0]["text"], "answer");
@@ -383,7 +407,7 @@ mod tests {
             json!({"role": "system", "content": [{"type": "text", "text": "permissions note"}]}),
             json!({"role": "system", "content": "x-anthropic-billing-header: abc"}),
         ];
-        let contents = convert_messages(&messages, &HashMap::new(), false);
+        let contents = convert_messages(&messages, &HashMap::new(), false, "gemini-2.0");
         // attribution 文本的 system 消息被整体跳过
         assert_eq!(contents.len(), 1);
         assert_eq!(contents[0]["role"], "user");
@@ -413,7 +437,7 @@ mod tests {
                 "content": [{"type": "tool_result", "tool_use_id": "Read-3", "content": "ok"}]
             }),
         ];
-        let contents = convert_messages(&messages, &map, false);
+        let contents = convert_messages(&messages, &map, false, "gemini-2.0");
         let parts = contents[0]["parts"].as_array().unwrap();
         assert_eq!(parts.len(), 1);
         // 对齐 CPA:name 用声明短名,附加签名哨兵
@@ -435,7 +459,7 @@ mod tests {
                 "content": "File contents here"
             }]
         })];
-        let contents = convert_messages(&messages, &HashMap::new(), false);
+        let contents = convert_messages(&messages, &HashMap::new(), false, "gemini-2.0");
         let parts = contents[0]["parts"].as_array().unwrap();
         assert_eq!(parts.len(), 1);
         assert_eq!(parts[0]["functionResponse"]["name"], "mcp__x__query-docs");
@@ -458,7 +482,7 @@ mod tests {
                 ]
             }]
         })];
-        let contents = convert_messages(&messages, &HashMap::new(), false);
+        let contents = convert_messages(&messages, &HashMap::new(), false, "gemini-2.0");
         let parts = contents[0]["parts"].as_array().unwrap();
         // functionResponse + 拆出的 inline_data 图片
         assert_eq!(parts.len(), 2);
@@ -485,7 +509,7 @@ mod tests {
                 ]
             }]
         })];
-        let contents = convert_messages(&messages, &HashMap::new(), true);
+        let contents = convert_messages(&messages, &HashMap::new(), true, "claude-opus-5");
         let parts = contents[0]["parts"].as_array().unwrap();
         assert_eq!(parts.len(), 1);
         let fr = &parts[0]["functionResponse"];
@@ -503,7 +527,7 @@ mod tests {
                 {"type": "text", "text": "what is this"}
             ]
         })];
-        let contents = convert_messages(&messages, &HashMap::new(), false);
+        let contents = convert_messages(&messages, &HashMap::new(), false, "gemini-2.0");
         let parts = contents[0]["parts"].as_array().unwrap();
         assert_eq!(parts.len(), 2);
         assert_eq!(parts[0]["inline_data"]["mime_type"], "image/jpeg");
@@ -520,9 +544,71 @@ mod tests {
         ];
         let mut map = HashMap::new();
         map.insert("Read".to_string(), "Read".to_string());
-        let contents = convert_messages(&messages, &map, false);
+        let contents = convert_messages(&messages, &map, false, "gemini-2.0");
         // 尾部未应答 functionCall 的 model 回合被剥离
         assert_eq!(contents.len(), 1);
         assert_eq!(contents[0]["role"], "user");
+    }
+
+    #[test]
+    fn test_thinking_signature_compatibility_gemini() {
+        // Gemini 目标丢弃所有 thinking 块(antigravity=false)
+        let messages = vec![json!({
+            "role": "assistant",
+            "content": [
+                {"type": "thinking", "thinking": "t1", "signature": "gAAAA-gpt"},
+                {"type": "text", "text": "answer"}
+            ]
+        })];
+        let contents = convert_messages(&messages, &HashMap::new(), false, "gemini-2.0");
+        let parts = contents[0]["parts"].as_array().unwrap();
+        assert_eq!(parts.len(), 1);
+        assert_eq!(parts[0]["text"], "answer");
+    }
+
+    #[test]
+    fn test_thinking_signature_compatibility_claude() {
+        // Claude 目标保留兼容签名,丢弃 GPT 签名
+        let messages = vec![json!({
+            "role": "assistant",
+            "content": [
+                {"type": "thinking", "thinking": "claude-ok", "signature": "C4x2-valid"},
+                {"type": "thinking", "thinking": "gpt-bad", "signature": "gAAAA-gpt"},
+                {"type": "text", "text": "answer"}
+            ]
+        })];
+        let contents = convert_messages(&messages, &HashMap::new(), true, "claude-opus-5");
+        let parts = contents[0]["parts"].as_array().unwrap();
+        // 只保留 Claude 签名的 thinking 块
+        assert_eq!(parts.len(), 2);
+        assert_eq!(parts[0]["thought"], true);
+        assert_eq!(parts[0]["text"], "claude-ok");
+        assert_eq!(parts[1]["text"], "answer");
+    }
+
+    #[test]
+    fn test_thinking_signature_compatibility_grok() {
+        // Grok 目标需要高熵 opaque blob
+        let mut high_entropy = vec![0u8; 64];
+        for (i, byte) in high_entropy.iter_mut().enumerate() {
+            *byte = (i * 7 % 256) as u8;
+        }
+        let valid_grok = base64::engine::general_purpose::STANDARD_NO_PAD.encode(&high_entropy);
+
+        let messages = vec![json!({
+            "role": "assistant",
+            "content": [
+                {"type": "thinking", "thinking": "grok-ok", "signature": valid_grok},
+                {"type": "thinking", "thinking": "gpt-bad", "signature": "gAAAA-gpt"},
+                {"type": "text", "text": "answer"}
+            ]
+        })];
+        let contents = convert_messages(&messages, &HashMap::new(), true, "grok-beta");
+        let parts = contents[0]["parts"].as_array().unwrap();
+        // 只保留 Grok 兼容签名
+        assert_eq!(parts.len(), 2);
+        assert_eq!(parts[0]["thought"], true);
+        assert_eq!(parts[0]["text"], "grok-ok");
+        assert_eq!(parts[1]["text"], "answer");
     }
 }

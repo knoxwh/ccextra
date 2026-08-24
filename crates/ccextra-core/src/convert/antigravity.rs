@@ -226,7 +226,7 @@ mod tests {
             "messages": [
                 {"role": "user", "content": "hi"},
                 {"role": "assistant", "content": [
-                    {"type": "thinking", "thinking": "t1", "signature": "sig1"},
+                    {"type": "thinking", "thinking": "t1", "signature": "C4x2-valid-claude-sig"},
                     {"type": "thinking", "thinking": "t2"},
                     {"type": "text", "text": "answer"}
                 ]}
@@ -236,7 +236,7 @@ mod tests {
         let parts = out["request"]["contents"][1]["parts"].as_array().unwrap();
         assert_eq!(parts.len(), 2);
         assert_eq!(parts[0]["thought"], true);
-        assert_eq!(parts[0]["thoughtSignature"], "sig1");
+        assert_eq!(parts[0]["thoughtSignature"], "C4x2-valid-claude-sig");
         assert_eq!(parts[1]["text"], "answer");
     }
 

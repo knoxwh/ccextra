@@ -22,6 +22,7 @@ use super::emit;
 use super::parser::SseEvent;
 use super::parser::SseParser;
 use super::SseStreamPin;
+use ccextra_core::convert::is_valid_gpt_reasoning_signature;
 use ccextra_core::doom_loop::{is_confident, parse_trigger};
 
 /// message_start 的 model 兜底(同默认值)
@@ -496,27 +497,34 @@ impl ResponsesRelay {
             "reasoning" => {
                 let mut out = self.stop_text();
                 if let Some(sig) = item.get("encrypted_content").and_then(|v| v.as_str()) {
-                    if !sig.is_empty() {
-                        self.thinking_signature = sig.to_string();
+                    if sig.is_empty() {
+                        // 空签名跳过
+                    } else {
                         // 检测是否 redacted_thinking(根据 encrypted_content 前缀)
-                        let is_redacted = self
-                            .thinking_signature
-                            .starts_with(CLAUDE_RESPONSES_REDACTED_THINKING_PREFIX);
+                        let is_redacted =
+                            sig.starts_with(CLAUDE_RESPONSES_REDACTED_THINKING_PREFIX);
 
-                        // 如果块已打开且类型不匹配，关闭旧块并用正确类型重开
-                        // (防御性处理：summary delta 先于 output_item 到达的边缘情况)
-                        if self.thinking_open && is_redacted != self.thinking_is_redacted {
-                            out.push(emit::content_block_stop(self.thinking_index));
-                            self.thinking_open = false;
-                            self.thinking_index += 1;
-                            if is_redacted {
-                                out.extend(self.start_redacted_thinking());
-                            } else {
-                                out.extend(self.start_thinking());
+                        // redacted_thinking 直接通过,普通签名验证 GPT Fernet 格式(对齐 CPA d5b57a2d)
+                        let valid = is_redacted || is_valid_gpt_reasoning_signature(sig);
+
+                        if valid {
+                            self.thinking_signature = sig.to_string();
+
+                            // 如果块已打开且类型不匹配，关闭旧块并用正确类型重开
+                            // (防御性处理：summary delta 先于 output_item 到达的边缘情况)
+                            if self.thinking_open && is_redacted != self.thinking_is_redacted {
+                                out.push(emit::content_block_stop(self.thinking_index));
+                                self.thinking_open = false;
+                                self.thinking_index += 1;
+                                if is_redacted {
+                                    out.extend(self.start_redacted_thinking());
+                                } else {
+                                    out.extend(self.start_thinking());
+                                }
                             }
-                        }
 
-                        self.thinking_is_redacted = is_redacted;
+                            self.thinking_is_redacted = is_redacted;
+                        }
                     }
                 }
                 if self.thinking_summary_seen {
@@ -1528,12 +1536,12 @@ mod tests {
         assert!(s1.contains("让我想想"));
 
         let out2 = r.process(&ev(
-            r#"{"type":"response.output_item.done","item":{"type":"reasoning","encrypted_content":"ENC123"}}"#,
+            r#"{"type":"response.output_item.done","item":{"type":"reasoning","encrypted_content":"gAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA"}}"#,
         ));
         let bufs2 = out2.concat();
         let s2 = String::from_utf8_lossy(&bufs2);
         assert!(s2.contains("signature_delta"));
-        assert!(s2.contains("ENC123"));
+        assert!(s2.contains("gAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA"));
         assert!(s2.contains("content_block_stop"));
     }
 
@@ -1546,13 +1554,13 @@ mod tests {
             r#"{"type":"response.output_item.added","item":{"type":"reasoning"}}"#,
         ));
         let out = r.process(&ev(
-            r#"{"type":"response.output_item.done","item":{"type":"reasoning","encrypted_content":"ENC9"}}"#,
+            r#"{"type":"response.output_item.done","item":{"type":"reasoning","encrypted_content":"gAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA"}}"#,
         ));
         let bufs = out.concat();
         let s = String::from_utf8_lossy(&bufs);
         assert!(s.contains("\"type\":\"thinking\""));
         assert!(s.contains("signature_delta"));
-        assert!(s.contains("ENC9"));
+        assert!(s.contains("gAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA"));
     }
 
     #[test]
@@ -2195,7 +2203,7 @@ mod tests {
         let s1 = String::from_utf8_lossy(&buf1);
 
         let out2 = r.process(&ev(
-            r#"{"type":"response.output_item.done","item":{"type":"reasoning","encrypted_content":"gAAAAABmNormal_Signature"}}"#,
+            r#"{"type":"response.output_item.done","item":{"type":"reasoning","encrypted_content":"gAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA"}}"#,
         ));
         let buf2 = out2.concat();
         let s2 = String::from_utf8_lossy(&buf2);
@@ -2211,7 +2219,7 @@ mod tests {
             "应发 signature_delta,实际: {}",
             combined
         );
-        assert!(combined.contains("gAAAAABmNormal_Signature"));
+        assert!(combined.contains("gAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA"));
         assert!(
             !combined.contains("redacted_thinking"),
             "不应误判为 redacted_thinking"

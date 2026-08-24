@@ -65,6 +65,9 @@ pub fn clean_nested_schema_for_antigravity(schema: &Value) -> Value {
 fn clean_json_schema(schema: &Value, opts: CleanOptions) -> Value {
     let mut s = schema.clone();
 
+    // Phase 0: 归一化畸形 schema(对齐 CPA normalizeMalformedSchemaObjects)
+    s = normalize_malformed_schema_objects(s);
+
     // Phase 1: 转换与提示
     if opts.antigravity_semantics {
         s = inline_local_refs(&s);
@@ -952,6 +955,336 @@ fn add_empty_schema_placeholder(schema: &mut Value) {
     apply(schema, true);
 }
 
+/// 归一化畸形 schema 节点(对齐 CPA normalizeMalformedSchemaObjects):
+/// 1. 包裹缺 type/properties 的 bare property maps
+/// 2. 剥离 property 的 boolean required,提升到父级 required 数组
+fn normalize_malformed_schema_objects(schema: Value) -> Value {
+    let Value::Object(root_map) = schema else {
+        return schema;
+    };
+
+    // 跳过 API 请求文档(有 tools/contents/messages 等)
+    if is_api_request_document(&root_map) {
+        return Value::Object(root_map);
+    }
+
+    // 单键 {"schema": ...} 时解套、修复、再套回
+    if root_map.len() == 1 {
+        if let Some(Value::Object(inner)) = root_map.get("schema").cloned() {
+            let (repaired, modified) = repair_schema_node(inner);
+            if modified {
+                let mut wrapped = Map::new();
+                wrapped.insert("schema".to_string(), Value::Object(repaired));
+                return Value::Object(wrapped);
+            }
+            return Value::Object(root_map);
+        }
+    }
+
+    let (repaired, _modified) = repair_schema_node(root_map);
+    Value::Object(repaired)
+}
+
+/// 检测是否为 API 请求文档(有 tools/contents/messages 等顶层键)
+fn is_api_request_document(m: &Map<String, Value>) -> bool {
+    if m.contains_key("tools")
+        || m.contains_key("contents")
+        || m.contains_key("messages")
+        || m.contains_key("functionDeclarations")
+        || m.contains_key("function_declarations")
+    {
+        return true;
+    }
+    if let Some(Value::Object(req)) = m.get("request") {
+        if is_api_request_document(req) {
+            return true;
+        }
+    }
+    false
+}
+
+/// 递归修复 schema 节点
+fn repair_schema_node(node: Map<String, Value>) -> (Map<String, Value>, bool) {
+    let mut clone = node.clone();
+    let mut modified = false;
+    let mut skip_step2 = false; // Step 1 处理了 bare properties 后跳过 Step 2
+
+    // 1. 收集 bare properties(非 schema 关键字的 map,且未声明为 primitive/array)
+    if !is_non_object_declared_type(clone.get("type")) {
+        let mut bare_props = Map::new();
+        let keys_to_remove: Vec<_> = clone
+            .iter()
+            .filter_map(|(k, v)| {
+                if v.is_object() && !is_known_schema_keyword_or_extension(k) {
+                    Some(k.clone())
+                } else {
+                    None
+                }
+            })
+            .collect();
+
+        for k in &keys_to_remove {
+            if let Some(v) = clone.remove(k) {
+                bare_props.insert(k.clone(), v);
+            }
+        }
+
+        if !bare_props.is_empty() {
+            let (repaired_props, promoted_reqs, _) = repair_property_map(bare_props);
+            // 合并到 properties
+            let mut props = match clone.remove("properties") {
+                Some(Value::Object(existing)) => existing,
+                _ => Map::new(),
+            };
+            for (k, v) in repaired_props {
+                props.insert(k, v);
+            }
+            clone.insert("properties".to_string(), Value::Object(props));
+            if !clone.contains_key("type") {
+                clone.insert("type".to_string(), Value::String("object".to_string()));
+            }
+
+            // 合并 required
+            if !promoted_reqs.is_empty() {
+                let existing = extract_string_array(clone.get("required"));
+                let merged = merge_string_slices(&existing, &promoted_reqs);
+                clone.insert(
+                    "required".to_string(),
+                    Value::Array(merged.into_iter().map(Value::String).collect()),
+                );
+            }
+            modified = true;
+            skip_step2 = true; // bare properties 已被 repair_property_map 递归修复,跳过 Step 2
+        }
+    }
+
+    // 2. 递归修复 properties(仅当 Step 1 未处理时)
+    if !skip_step2 {
+        if let Some(Value::Object(props_val)) = clone.get("properties").cloned() {
+            let (repaired, promoted, props_mod) = repair_property_map(props_val);
+            clone.insert("properties".to_string(), Value::Object(repaired));
+            if props_mod {
+                modified = true;
+            }
+            if !promoted.is_empty() {
+                let existing = extract_string_array(clone.get("required"));
+                let merged = merge_string_slices(&existing, &promoted);
+                clone.insert(
+                    "required".to_string(),
+                    Value::Array(merged.into_iter().map(Value::String).collect()),
+                );
+                modified = true;
+            }
+        }
+    }
+
+    // 3. 递归进 items/additionalProperties/patternProperties 等容器
+    if let Some(Value::Object(items)) = clone.remove("items") {
+        let (repaired, items_mod) = repair_schema_node(items);
+        clone.insert("items".to_string(), Value::Object(repaired));
+        if items_mod {
+            modified = true;
+        }
+    } else if let Some(Value::Array(items_list)) = clone.remove("items") {
+        let (repaired, list_mod) = repair_schema_list(items_list);
+        clone.insert("items".to_string(), Value::Array(repaired));
+        if list_mod {
+            modified = true;
+        }
+    }
+
+    if let Some(Value::Object(add_props)) = clone.get("additionalProperties").cloned() {
+        let (repaired, add_mod) = repair_schema_node(add_props);
+        clone.insert("additionalProperties".to_string(), Value::Object(repaired));
+        if add_mod {
+            modified = true;
+        }
+    }
+
+    if let Some(Value::Object(pat_props)) = clone.remove("patternProperties") {
+        let (repaired, _, pat_mod) = repair_property_map(pat_props);
+        clone.insert("patternProperties".to_string(), Value::Object(repaired));
+        if pat_mod {
+            modified = true;
+        }
+    }
+
+    for key in &[
+        "if",
+        "then",
+        "else",
+        "not",
+        "contains",
+        "propertyNames",
+        "unevaluatedProperties",
+        "unevaluatedItems",
+        "contentSchema",
+        "additionalItems",
+    ] {
+        if let Some(Value::Object(sub_val)) = clone.remove(*key) {
+            let (repaired, sub_mod) = repair_schema_node(sub_val);
+            clone.insert(key.to_string(), Value::Object(repaired));
+            if sub_mod {
+                modified = true;
+            }
+        }
+    }
+
+    for key in &["anyOf", "oneOf", "allOf", "prefixItems"] {
+        if let Some(Value::Array(list_val)) = clone.remove(*key) {
+            let (repaired, list_mod) = repair_schema_list(list_val);
+            clone.insert(key.to_string(), Value::Array(repaired));
+            if list_mod {
+                modified = true;
+            }
+        }
+    }
+
+    for key in &["$defs", "definitions", "dependentSchemas"] {
+        if let Some(Value::Object(defs_val)) = clone.remove(*key) {
+            let mut repaired_defs = Map::new();
+            let mut defs_modified = false;
+            for (dk, dv) in defs_val {
+                if let Value::Object(def_map) = dv {
+                    let (repaired_def, def_mod) = repair_schema_node(def_map);
+                    repaired_defs.insert(dk, Value::Object(repaired_def));
+                    if def_mod {
+                        defs_modified = true;
+                        modified = true;
+                    }
+                } else {
+                    repaired_defs.insert(dk, dv);
+                }
+            }
+            clone.insert(key.to_string(), Value::Object(repaired_defs));
+            if defs_modified {
+                modified = true;
+            }
+        }
+    }
+
+    (clone, modified)
+}
+
+/// 修复 property map,提升 boolean required
+fn repair_property_map(props: Map<String, Value>) -> (Map<String, Value>, Vec<String>, bool) {
+    let mut out = Map::new();
+    let mut promoted_reqs = Vec::new();
+    let mut modified = false;
+
+    for (k, v) in props {
+        let Value::Object(mut child_map) = v else {
+            out.insert(k, v);
+            continue;
+        };
+
+        // 先提取 boolean required(递归前)
+        if let Some(Value::Bool(req_bool)) = child_map.remove("required") {
+            modified = true;
+            if req_bool {
+                promoted_reqs.push(k.clone());
+            }
+        }
+
+        // 再递归修复子节点(处理嵌套 bare properties)
+        let (repaired_child, child_mod) = repair_schema_node(child_map);
+        if child_mod {
+            modified = true;
+        }
+
+        out.insert(k, Value::Object(repaired_child));
+    }
+
+    promoted_reqs.sort();
+    (out, promoted_reqs, modified)
+}
+
+fn repair_schema_list(list: Vec<Value>) -> (Vec<Value>, bool) {
+    let mut repaired = Vec::new();
+    let mut list_modified = false;
+    for item in list {
+        if let Value::Object(item_map) = item {
+            let (repaired_item, item_mod) = repair_schema_node(item_map);
+            repaired.push(Value::Object(repaired_item));
+            if item_mod {
+                list_modified = true;
+            }
+        } else {
+            repaired.push(item);
+        }
+    }
+    (repaired, list_modified)
+}
+
+fn is_known_schema_keyword_or_extension(key: &str) -> bool {
+    if key.starts_with("x-") {
+        return true;
+    }
+    matches!(
+        key,
+        "properties"
+            | "patternProperties"
+            | "additionalProperties"
+            | "items"
+            | "prefixItems"
+            | "$defs"
+            | "definitions"
+            | "dependentSchemas"
+            | "dependentRequired"
+            | "dependencies"
+            | "if"
+            | "then"
+            | "else"
+            | "not"
+            | "contains"
+            | "propertyNames"
+            | "unevaluatedProperties"
+            | "unevaluatedItems"
+            | "contentSchema"
+            | "additionalItems"
+            | "default"
+            | "const"
+            | "example"
+            | "examples"
+            | "discriminator"
+            | "xml"
+            | "externalDocs"
+            | "enumDescriptions"
+            | "enumTitles"
+    )
+}
+
+fn is_non_object_declared_type(t: Option<&Value>) -> bool {
+    match t {
+        Some(Value::String(s)) => !s.is_empty() && s != "object",
+        Some(Value::Array(arr)) => {
+            !arr.is_empty() && !arr.iter().any(|item| item.as_str() == Some("object"))
+        }
+        _ => false,
+    }
+}
+
+fn extract_string_array(val: Option<&Value>) -> Vec<String> {
+    match val {
+        Some(Value::Array(arr)) => arr
+            .iter()
+            .filter_map(|v| v.as_str().map(String::from))
+            .collect(),
+        _ => Vec::new(),
+    }
+}
+
+fn merge_string_slices(existing: &[String], promoted: &[String]) -> Vec<String> {
+    let mut seen = std::collections::HashSet::new();
+    let mut res = Vec::new();
+    for s in existing.iter().chain(promoted.iter()) {
+        if !s.is_empty() && seen.insert(s.clone()) {
+            res.push(s.clone());
+        }
+    }
+    res
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -1058,7 +1391,13 @@ mod tests {
     fn test_antigravity_passes_null_properties_through() {
         // 对齐 CPA gjson Exists():显式 null 视为存在,不加占位,原样放行
         let schema = json!({"type": "object", "properties": null});
+        let phase0 = normalize_malformed_schema_objects(schema.clone());
+        eprintln!(
+            "phase0 = {}",
+            serde_json::to_string_pretty(&phase0).unwrap()
+        );
         let out = clean_json_schema_for_antigravity(&schema);
+        eprintln!("out = {}", serde_json::to_string_pretty(&out).unwrap());
         assert!(out["properties"].is_null());
         assert!(out.get("required").is_none());
     }
@@ -1108,5 +1447,96 @@ mod tests {
         // 非 false 的 additionalProperties 无提示,仅删键
         assert!(out.get("additionalProperties").is_none());
         assert!(out.get("description").is_none());
+    }
+
+    #[test]
+    fn test_normalize_bare_properties_wraps_as_object() {
+        // MCP 工具常见畸形:顶层直接写 property maps,缺 type/properties 包裹
+        let malformed = json!({
+            "name": {"type": "string"},
+            "age": {"type": "number"}
+        });
+        let out = clean_json_schema_for_gemini(&malformed);
+        assert_eq!(out["type"], "object");
+        assert_eq!(out["properties"]["name"]["type"], "string");
+        assert_eq!(out["properties"]["age"]["type"], "number");
+    }
+
+    #[test]
+    fn test_normalize_promotes_boolean_required() {
+        // property 的 boolean required 应提升到父级 required 数组
+        let malformed = json!({
+            "type": "object",
+            "properties": {
+                "name": {"type": "string", "required": true},
+                "age": {"type": "number", "required": false},
+                "email": {"type": "string"}
+            }
+        });
+        let out = clean_json_schema_for_gemini(&malformed);
+        assert_eq!(out["required"], json!(["name"]));
+        assert!(out["properties"]["name"].get("required").is_none());
+        assert!(out["properties"]["age"].get("required").is_none());
+    }
+
+    #[test]
+    fn test_normalize_skips_api_request_document() {
+        // 跳过 API 请求文档(有 tools/contents/messages)
+        let request = json!({
+            "tools": [],
+            "name": {"type": "string"}
+        });
+        let out = clean_json_schema_for_gemini(&request);
+        // 未修复,name 仍在顶层
+        assert!(out.get("name").is_some());
+        assert!(out.get("properties").is_none());
+    }
+
+    #[test]
+    fn test_normalize_nested_bare_with_boolean_required() {
+        // 最小复现:嵌套 bare property 的 boolean required 提升
+        let malformed = json!({
+            "address": {
+                "city": {"type": "string", "required": true}
+            }
+        });
+        let out = clean_json_schema_for_gemini(&malformed);
+        assert_eq!(out["type"], "object");
+        assert_eq!(out["properties"]["address"]["type"], "object");
+        assert_eq!(
+            out["properties"]["address"]["properties"]["city"]["type"],
+            "string"
+        );
+        assert_eq!(out["properties"]["address"]["required"], json!(["city"]));
+    }
+
+    #[test]
+    fn test_normalize_recursively_repairs_nested() {
+        // 递归修复嵌套 properties
+        let malformed = json!({
+            "type": "object",
+            "properties": {
+                "user": {
+                    "name": {"type": "string", "required": true},
+                    "address": {
+                        "city": {"type": "string", "required": true}
+                    }
+                }
+            }
+        });
+        let out = clean_json_schema_for_gemini(&malformed);
+        // user 是标准 properties,其内部 bare properties 被修复
+        assert_eq!(out["properties"]["user"]["type"], "object");
+        assert_eq!(out["properties"]["user"]["required"], json!(["name"]));
+        assert_eq!(
+            out["properties"]["user"]["properties"]["name"]["type"],
+            "string"
+        );
+
+        // address 也是 bare property,被包裹成 object
+        let address = &out["properties"]["user"]["properties"]["address"];
+        assert_eq!(address["type"], "object");
+        assert_eq!(address["properties"]["city"]["type"], "string");
+        assert_eq!(address["required"], json!(["city"]));
     }
 }

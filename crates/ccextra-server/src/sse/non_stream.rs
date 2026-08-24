@@ -14,8 +14,11 @@ use super::chat::map_finish_reason;
 use super::responses::{
     codex_stop_reason, map_stop_reason, sanitize_tool_id, stop_sequence, web_search_result_content,
 };
-use ccextra_core::convert::fix_json_quotes;
+use ccextra_core::convert::{fix_json_quotes, is_valid_gpt_reasoning_signature};
 use ccextra_core::doom_loop::{is_confident, parse_trigger};
+
+/// redacted_thinking 前缀(对齐 responses.rs)
+const CLAUDE_RESPONSES_REDACTED_THINKING_PREFIX: &str = "claude-redacted-thinking:";
 
 /// OpenAI responses 非流式 body → Anthropic messages body
 ///
@@ -66,10 +69,31 @@ pub fn responses_to_anthropic(
                         .and_then(|v| v.as_str())
                         .unwrap_or("")
                         .to_string();
-                    if !text.is_empty() || !signature.is_empty() {
-                        let mut block = json!({"type": "thinking", "thinking": text});
-                        if !signature.is_empty() {
-                            block["signature"] = json!(signature);
+                    // redacted_thinking 直接通过,普通签名验证 GPT Fernet 格式(对齐 CPA d5b57a2d)
+                    let is_redacted =
+                        signature.starts_with(CLAUDE_RESPONSES_REDACTED_THINKING_PREFIX);
+                    let valid_signature = if !signature.is_empty()
+                        && (is_redacted || is_valid_gpt_reasoning_signature(&signature))
+                    {
+                        signature
+                    } else {
+                        String::new()
+                    };
+                    if !text.is_empty() || !valid_signature.is_empty() {
+                        let block_type = if is_redacted {
+                            "redacted_thinking"
+                        } else {
+                            "thinking"
+                        };
+                        let mut block = json!({"type": block_type, block_type: text});
+                        if !valid_signature.is_empty() {
+                            let sig_field = if is_redacted {
+                                "redacted_thinking_data"
+                            } else {
+                                "signature"
+                            };
+                            block[sig_field] = json!(valid_signature
+                                .trim_start_matches(CLAUDE_RESPONSES_REDACTED_THINKING_PREFIX));
                         }
                         content.push(block);
                     }
@@ -493,7 +517,7 @@ mod tests {
                     "type": "reasoning",
                     "summary": [{"type": "summary_text", "text": "think step"},
                                 {"type": "summary_text", "text": " step two"}],
-                    "encrypted_content": "sig123"
+                    "encrypted_content": "gAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA"
                 }],
                 "stop_reason": "end_turn",
                 "usage": {"input_tokens": 10, "output_tokens": 5}
@@ -502,7 +526,7 @@ mod tests {
         let out = responses_to_anthropic(&body, None).unwrap();
         assert_eq!(out["content"][0]["type"], "thinking");
         assert_eq!(out["content"][0]["thinking"], "think step\nstep two");
-        assert_eq!(out["content"][0]["signature"], "sig123");
+        assert_eq!(out["content"][0]["signature"], "gAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA");
     }
 
     #[test]

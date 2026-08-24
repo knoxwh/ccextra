@@ -78,11 +78,12 @@ pub fn convert_to_gemini_with(
 
     // 消息
     if let Some(messages_arr) = body.get("messages").and_then(|m| m.as_array()) {
-        // 对齐 CPA:Antigravity 保留带签名 thinking 块,Gemini 直连全丢
+        // 对齐 CPA:Antigravity 保留带兼容签名 thinking 块,Gemini 直连全丢
         gemini["contents"] = serde_json::json!(convert_messages(
             messages_arr,
             &original_to_short,
-            flavor == SchemaFlavor::Antigravity
+            flavor == SchemaFlavor::Antigravity,
+            upstream_model
         ));
     }
 
