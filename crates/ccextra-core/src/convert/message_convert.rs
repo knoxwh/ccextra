@@ -293,12 +293,15 @@ fn append_block_parts(
 }
 
 /// tool_result content 归一化(对齐 CPA ConvertClaudeToolResultContent):
-/// - 字符串 → 原样
-/// - 单个非图块 → 该块 raw JSON
-/// - 多个非图块 → raw JSON 数组
+/// - 字符串 → 原样保持字符串
+/// - 单个非图块 → 序列化为 JSON 字符串
+/// - 多个非图块 → 序列化数组为 JSON 字符串
 /// - base64 图片块 → 拆出为 inline_data parts
-/// - 对象 → raw JSON
+/// - 对象 → 序列化为 JSON 字符串
 /// - 缺失/空 → 空串
+///
+/// 对齐 CPA 9d0a60bf:functionResponse.response.result 必须保持字符串,
+/// 避免解析后的对象/数组触发上游 400 错误
 fn convert_tool_result_content(content: Option<&Value>) -> (Value, Vec<(String, String)>) {
     let Some(content) = content else {
         return (json!(""), Vec::new());
@@ -318,8 +321,8 @@ fn convert_tool_result_content(content: Option<&Value>) -> (Value, Vec<(String, 
             }
             let result = match non_image.len() {
                 0 => json!(""),
-                1 => non_image[0].clone(),
-                _ => json!(non_image),
+                1 => json!(serde_json::to_string(non_image[0]).unwrap_or_default()),
+                _ => json!(serde_json::to_string(&non_image).unwrap_or_default()),
             };
             (result, images)
         }
@@ -327,9 +330,15 @@ fn convert_tool_result_content(content: Option<&Value>) -> (Value, Vec<(String, 
             if let Some(img) = base64_image_data(content) {
                 return (json!(""), vec![img]);
             }
-            (content.clone(), Vec::new())
+            (
+                json!(serde_json::to_string(content).unwrap_or_default()),
+                Vec::new(),
+            )
         }
-        other => (other.clone(), Vec::new()),
+        other => (
+            json!(serde_json::to_string(other).unwrap_or_default()),
+            Vec::new(),
+        ),
     }
 }
 
@@ -487,10 +496,10 @@ mod tests {
         // functionResponse + 拆出的 inline_data 图片
         assert_eq!(parts.len(), 2);
         assert_eq!(parts[0]["functionResponse"]["name"], "Read");
-        // 对齐 CPA:单个非图块 → 该块 raw JSON(非数组)
+        // 对齐 CPA 9d0a60bf:单个非图块 → 序列化为 JSON 字符串
         assert_eq!(
             parts[0]["functionResponse"]["response"]["result"],
-            json!({"type": "text", "text": "see image"})
+            r#"{"type":"text","text":"see image"}"#
         );
         assert_eq!(parts[1]["inline_data"]["mime_type"], "image/png");
         assert_eq!(parts[1]["inline_data"]["data"], "AAAA");
@@ -610,5 +619,48 @@ mod tests {
         assert_eq!(parts[0]["thought"], true);
         assert_eq!(parts[0]["text"], "grok-ok");
         assert_eq!(parts[1]["text"], "answer");
+    }
+
+    #[test]
+    fn test_tool_result_preserves_json_as_string() {
+        // 对齐 CPA 9d0a60bf:tool result 对象/数组必须序列化为字符串
+        let messages = vec![json!({
+            "role": "user",
+            "content": [{
+                "type": "tool_result",
+                "tool_use_id": "read_file-1",
+                "content": {"key": "value", "items": [1, 2, 3]}
+            }]
+        })];
+        let contents = convert_messages(&messages, &HashMap::new(), false, "gemini-2.0");
+        let result = &contents[0]["parts"][0]["functionResponse"]["response"]["result"];
+        let result_str = result.as_str().unwrap();
+        // 验证是字符串且包含预期内容(serde_json 键序不固定)
+        assert!(result_str.starts_with('{'));
+        assert!(result_str.contains(r#""key":"value""#));
+        assert!(result_str.contains(r#""items":[1,2,3]"#));
+    }
+
+    #[test]
+    fn test_tool_result_array_content_stringified() {
+        // 对齐 CPA 9d0a60bf:多个非图块序列化为 JSON 字符串
+        let messages = vec![json!({
+            "role": "user",
+            "content": [{
+                "type": "tool_result",
+                "tool_use_id": "lookup-1",
+                "content": [
+                    {"type": "text", "text": "first"},
+                    {"type": "text", "text": "second"}
+                ]
+            }]
+        })];
+        let contents = convert_messages(&messages, &HashMap::new(), false, "gemini-2.0");
+        let result = &contents[0]["parts"][0]["functionResponse"]["response"]["result"];
+        let result_str = result.as_str().unwrap();
+        // 数组序列化为字符串
+        assert!(result_str.starts_with('['));
+        assert!(result_str.contains(r#""text":"first""#));
+        assert!(result_str.contains(r#""text":"second""#));
     }
 }
