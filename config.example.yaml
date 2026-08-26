@@ -6,6 +6,13 @@ server:
   # 可选；全局代理兜底，"direct" 表示不走代理
   proxy_url: "http://127.0.0.1:7897"
 
+# User-Agent 自定义(可选)。以下为默认值。
+user_agents:
+  claude_cli: "claude-cli/2.1.246"
+  codex_tui: "codex-tui/0.149.1 (Mac OS 26.6.2; arm64) ghostty/1.3.1 (codex-tui; 0.149.1)"
+  grok_version: "1.0.5"
+  antigravity: "antigravity/hub/2.10.0 darwin/arm64"
+
 # 入口 secret key(可选)。配置后 /v1/models 与 /v1/messages 需 x-api-key 匹配。
 # Claude Code 用 ANTHROPIC_AUTH_TOKEN 或环境变量注入该 key。
 secret_key: "sk-ccextra-xxx"
