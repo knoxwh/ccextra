@@ -60,24 +60,7 @@ fn endpoint_path(protocol: Protocol, is_stream: bool) -> String {
 /// Token-Auth 对齐 grok-build GrokAuthCredentials (`xai-grok-cli`);
 /// version/identifier 对齐 grok-shell,不在 sampler GrokRequestHeaders 里
 const GROK_TOKEN_AUTH: &str = "xai-grok-cli";
-const GROK_CLIENT_VERSION: &str = "1.0.5";
 const GROK_CLIENT_IDENTIFIER: &str = "grok-shell";
-
-/// Grok CLI User-Agent(对齐 grok-build 默认分支:
-/// grok-shell/{version} ({os}; {arch}),platform 运行时取真实值)
-static GROK_CLI_UA: std::sync::OnceLock<String> = std::sync::OnceLock::new();
-fn grok_cli_ua() -> &'static str {
-    GROK_CLI_UA
-        .get_or_init(|| {
-            format!(
-                "grok-shell/{} ({}; {})",
-                GROK_CLIENT_VERSION,
-                std::env::consts::OS,
-                std::env::consts::ARCH
-            )
-        })
-        .as_str()
-}
 
 /// 模型名是否按 *gpt* 匹配(大小写不敏感,含前缀/中缀/后缀)
 fn is_gpt_model(upstream_model: &str) -> bool {
@@ -97,6 +80,7 @@ fn grok_cli_headers(
     protocol: Protocol,
     upstream_model: &str,
     session_id: Option<&str>,
+    grok_version: &str,
 ) -> Vec<(&'static str, String)> {
     if !matches!(protocol, Protocol::OpenAiChat | Protocol::OpenAiResponses)
         || !is_grok_model(upstream_model)
@@ -105,7 +89,7 @@ fn grok_cli_headers(
     }
     let mut headers = vec![
         ("X-XAI-Token-Auth", GROK_TOKEN_AUTH.to_string()),
-        ("x-grok-client-version", GROK_CLIENT_VERSION.to_string()),
+        ("x-grok-client-version", grok_version.to_string()),
         (
             "x-grok-client-identifier",
             GROK_CLIENT_IDENTIFIER.to_string(),
@@ -129,18 +113,26 @@ fn grok_cli_headers(
 /// 仅 responses + *gpt* 用 Codex UA;chat 或 responses + *grok* 用 Grok CLI UA
 /// (对齐 grok-shell `{name}/{ver} ({os}; {arch})`);其余用 claude-cli
 /// 部分上游按 UA 分流缓存/特性,reqwest 默认 UA 会被识别为非官方客户端。
-fn user_agent(protocol: Protocol, upstream_model: &str) -> &'static str {
-    const CLAUDE_CLI: &str = "claude-cli/2.1.234";
-    const CODEX_TUI: &str =
-        "codex-tui/0.147.0 (Mac OS 26.6.2; arm64) ghostty/1.3.1 (codex-tui; 0.147.0)";
+fn user_agent(
+    protocol: Protocol,
+    upstream_model: &str,
+    user_agents: &crate::http::UserAgentSet,
+) -> String {
     match protocol {
         // Antigravity 上游按 UA 识别客户端,非 antigravity UA 直接 404
-        Protocol::Antigravity => crate::antigravity::constants::REQUEST_UA,
-        Protocol::OpenAiResponses if is_gpt_model(upstream_model) => CODEX_TUI,
-        Protocol::OpenAiChat | Protocol::OpenAiResponses if is_grok_model(upstream_model) => {
-            grok_cli_ua()
+        Protocol::Antigravity => user_agents.antigravity.to_string(),
+        Protocol::OpenAiResponses if is_gpt_model(upstream_model) => {
+            user_agents.codex_tui.to_string()
         }
-        _ => CLAUDE_CLI,
+        Protocol::OpenAiChat | Protocol::OpenAiResponses if is_grok_model(upstream_model) => {
+            format!(
+                "grok-shell/{} ({}; {})",
+                user_agents.grok_version,
+                std::env::consts::OS,
+                std::env::consts::ARCH
+            )
+        }
+        _ => user_agents.claude_cli.to_string(),
     }
 }
 
@@ -222,6 +214,7 @@ impl UpstreamClient {
         session_id: Option<&str>,
         thread_id: Option<&str>,
         extra_headers: &[(String, String)],
+        user_agents: &crate::http::UserAgentSet,
     ) -> anyhow::Result<UpstreamResponse> {
         let proxy_key = self.resolve_proxy(provider_proxy);
         let client = self.client_for(&proxy_key);
@@ -241,7 +234,7 @@ impl UpstreamClient {
         // generativelanguage 不收 Bearer);其余 Bearer
         let mut req = client.post(&url).header(
             reqwest::header::USER_AGENT,
-            user_agent(protocol, upstream_model),
+            user_agent(protocol, upstream_model, user_agents),
         );
         if matches!(protocol, Protocol::Gemini) {
             req = req.header("x-goog-api-key", api_key);
@@ -265,7 +258,12 @@ impl UpstreamClient {
         }
 
         // grok 模型:CLI 身份头 + conv-id +(仅 responses) doom-loop
-        let grok_headers = grok_cli_headers(protocol, upstream_model, session_id);
+        let grok_headers = grok_cli_headers(
+            protocol,
+            upstream_model,
+            session_id,
+            &user_agents.grok_version,
+        );
         if !grok_headers.is_empty() {
             tracing::debug!(
                 session_id = ?session_id,
@@ -321,39 +319,48 @@ mod tests {
 
     #[test]
     fn test_user_agent_per_protocol() {
-        const CLAUDE_CLI: &str = "claude-cli/2.1.234";
+        use std::sync::Arc;
+        let uas = crate::http::UserAgentSet {
+            claude_cli: Arc::new("claude-cli/2.1.246".to_string()),
+            codex_tui: Arc::new(
+                "codex-tui/0.149.1 (Mac OS 26.6.2; arm64) ghostty/1.3.1 (codex-tui; 0.149.1)"
+                    .to_string(),
+            ),
+            grok_version: Arc::new("1.0.5".to_string()),
+            antigravity: Arc::new("antigravity/hub/2.10.0 darwin/arm64".to_string()),
+        };
+        const CLAUDE_CLI: &str = "claude-cli/2.1.246";
         const CODEX_TUI: &str =
-            "codex-tui/0.147.0 (Mac OS 26.6.2; arm64) ghostty/1.3.1 (codex-tui; 0.147.0)";
+            "codex-tui/0.149.1 (Mac OS 26.6.2; arm64) ghostty/1.3.1 (codex-tui; 0.149.1)";
         assert_eq!(
-            user_agent(Protocol::OpenAiChat, "gpt-5.6-terra"),
+            user_agent(Protocol::OpenAiChat, "gpt-5.6-terra", &uas),
             CLAUDE_CLI
         );
         assert_eq!(
-            user_agent(Protocol::OpenAiResponses, "gpt-5.6-terra"),
+            user_agent(Protocol::OpenAiResponses, "gpt-5.6-terra", &uas),
             CODEX_TUI
         );
         assert_eq!(
-            user_agent(Protocol::OpenAiResponses, "GPT-5.6-sol"),
+            user_agent(Protocol::OpenAiResponses, "GPT-5.6-sol", &uas),
             CODEX_TUI
         );
         assert_eq!(
-            user_agent(Protocol::OpenAiResponses, "openai/gpt-5.6"),
+            user_agent(Protocol::OpenAiResponses, "openai/gpt-5.6", &uas),
             CODEX_TUI
         );
-        assert_eq!(
-            user_agent(Protocol::OpenAiResponses, "grok-4.6"),
-            grok_cli_ua()
-        );
-        assert_eq!(user_agent(Protocol::OpenAiChat, "grok-4.6"), grok_cli_ua());
-        assert_eq!(user_agent(Protocol::OpenAiChat, "Grok-4.6"), grok_cli_ua());
+        let grok_ua = user_agent(Protocol::OpenAiResponses, "grok-4.6", &uas);
+        assert!(grok_ua.starts_with("grok-shell/1.0.5 ("));
+        assert_eq!(user_agent(Protocol::OpenAiChat, "grok-4.6", &uas), grok_ua);
+        assert_eq!(user_agent(Protocol::OpenAiChat, "Grok-4.6", &uas), grok_ua);
         // chat+gpt 仍 claude-cli(回归,已有 gpt-5.6-terra 断言;再锁大小写)
-        assert_eq!(user_agent(Protocol::OpenAiChat, "GPT-4"), CLAUDE_CLI);
+        assert_eq!(user_agent(Protocol::OpenAiChat, "GPT-4", &uas), CLAUDE_CLI);
         // UA 格式: grok-shell/{version} ({os}; {arch}),platform 运行时取真实值
-        let ua = grok_cli_ua();
-        assert!(ua.starts_with("grok-shell/1.0.5 ("));
-        assert!(ua.contains(std::env::consts::OS));
-        assert!(ua.contains(std::env::consts::ARCH));
-        assert_eq!(user_agent(Protocol::Claude, "claude-opus-5"), CLAUDE_CLI);
+        assert!(grok_ua.contains(std::env::consts::OS));
+        assert!(grok_ua.contains(std::env::consts::ARCH));
+        assert_eq!(
+            user_agent(Protocol::Claude, "claude-opus-5", &uas),
+            CLAUDE_CLI
+        );
         assert!(is_gpt_model("gpt-5.6-terra"));
         assert!(is_gpt_model("ck-gpt-5.6"));
         assert!(is_gpt_model("openai/GPT-5"));
@@ -369,7 +376,7 @@ mod tests {
         model: &str,
         session: Option<&str>,
     ) -> std::collections::HashMap<String, String> {
-        grok_cli_headers(protocol, model, session)
+        grok_cli_headers(protocol, model, session, "1.0.5")
             .into_iter()
             .map(|(k, v)| (k.to_string(), v))
             .collect()
@@ -425,12 +432,16 @@ mod tests {
 
     #[test]
     fn test_grok_cli_headers_chat_gpt_empty() {
-        assert!(grok_cli_headers(Protocol::OpenAiChat, "gpt-4", Some("sess")).is_empty());
-        assert!(
-            grok_cli_headers(Protocol::OpenAiResponses, "gpt-5.6-terra", Some("sess")).is_empty()
-        );
-        assert!(grok_cli_headers(Protocol::Claude, "grok-4.6", Some("sess")).is_empty());
-        assert!(grok_cli_headers(Protocol::Gemini, "grok-4.6", Some("sess")).is_empty());
+        assert!(grok_cli_headers(Protocol::OpenAiChat, "gpt-4", Some("sess"), "1.0.5").is_empty());
+        assert!(grok_cli_headers(
+            Protocol::OpenAiResponses,
+            "gpt-5.6-terra",
+            Some("sess"),
+            "1.0.5"
+        )
+        .is_empty());
+        assert!(grok_cli_headers(Protocol::Claude, "grok-4.6", Some("sess"), "1.0.5").is_empty());
+        assert!(grok_cli_headers(Protocol::Gemini, "grok-4.6", Some("sess"), "1.0.5").is_empty());
     }
 
     #[test]
@@ -456,7 +467,7 @@ mod tests {
     #[test]
     fn test_grok_cli_headers_empty_model_skips_override() {
         // 空模型名不含 grok,整组头都不发(override 无从谈起)
-        assert!(grok_cli_headers(Protocol::OpenAiChat, "", Some("sess")).is_empty());
+        assert!(grok_cli_headers(Protocol::OpenAiChat, "", Some("sess"), "1.0.5").is_empty());
     }
 
     #[test]

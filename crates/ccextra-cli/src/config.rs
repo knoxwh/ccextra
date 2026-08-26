@@ -23,6 +23,21 @@ pub struct Config {
     /// xAI 凭证目录(可选);默认配置文件旁 `.cache/xai`
     #[serde(default)]
     pub xai_auth_dir: Option<String>,
+    /// User-Agent 覆盖(可选);缺失时用默认值
+    #[serde(default)]
+    pub user_agents: Option<UserAgents>,
+}
+
+#[derive(Debug, Deserialize, Clone)]
+pub struct UserAgents {
+    /// Claude CLI UA,默认 "claude-cli/2.1.246"
+    pub claude_cli: Option<String>,
+    /// Codex TUI UA,默认 "codex-tui/0.149.1 (Mac OS 26.6.2; arm64) ghostty/1.3.1 (codex-tui; 0.149.1)"
+    pub codex_tui: Option<String>,
+    /// Grok CLI 版本号,默认 "1.0.5"(完整 UA 运行时拼接 os/arch)
+    pub grok_version: Option<String>,
+    /// Antigravity hub UA,默认 "antigravity/hub/2.10.0 darwin/arm64"
+    pub antigravity: Option<String>,
 }
 
 #[derive(Debug, Deserialize)]

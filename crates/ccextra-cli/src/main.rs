@@ -6,7 +6,7 @@ use ccextra_server::antigravity::{
     list as list_antigravity, resolve_auth_dir as resolve_antigravity_auth_dir,
     run_login as run_antigravity_login, LoginOptions as AntigravityLoginOptions,
 };
-use ccextra_server::http::{AppState, ReloadData, RuntimeConfig};
+use ccextra_server::http::{AppState, ReloadData, RuntimeConfig, UserAgentSet};
 use ccextra_server::serve;
 use ccextra_server::upstream::UpstreamClient;
 use ccextra_server::xai::{
@@ -199,6 +199,8 @@ async fn main() -> Result<()> {
             let mut providers = merge_providers(cfg.providers, antigravity_providers);
             providers = merge_providers(providers, xai_providers);
 
+            let user_agents = build_user_agents(cfg.user_agents.as_ref());
+
             Ok(ReloadData {
                 providers,
                 payload_rules: cfg.payload.unwrap_or_default(),
@@ -206,9 +208,13 @@ async fn main() -> Result<()> {
                 logging: cfg.logging,
                 secret: cfg.secret_key,
                 proxy_url: cfg.server.proxy_url,
+                user_agents,
             })
         })
     });
+
+    let user_agents = build_user_agents(config.user_agents.as_ref());
+
     let state = AppState {
         providers: Arc::new(RwLock::new(all_providers)),
         payload_rules: Arc::new(RwLock::new(config.payload.unwrap_or_default())),
@@ -217,6 +223,7 @@ async fn main() -> Result<()> {
             logging: config.logging,
             secret: config.secret_key,
             upstream: UpstreamClient::new(config.server.proxy_url),
+            user_agents,
         })),
         reload,
         drift: DriftState::new(1000),
@@ -416,6 +423,38 @@ fn cmd_xai_status(config_path: &str, auth_dir: Option<String>) -> Result<()> {
         );
     }
     Ok(())
+}
+
+/// 构建 UserAgentSet(从配置或使用默认值)
+fn build_user_agents(config: Option<&config::UserAgents>) -> UserAgentSet {
+    const DEFAULT_CLAUDE_CLI: &str = "claude-cli/2.1.246";
+    const DEFAULT_CODEX_TUI: &str =
+        "codex-tui/0.149.1 (Mac OS 26.6.2; arm64) ghostty/1.3.1 (codex-tui; 0.149.1)";
+    const DEFAULT_GROK_VERSION: &str = "1.0.5";
+    const DEFAULT_ANTIGRAVITY: &str = "antigravity/hub/2.10.0 darwin/arm64";
+
+    UserAgentSet {
+        claude_cli: Arc::new(
+            config
+                .and_then(|c| c.claude_cli.clone())
+                .unwrap_or_else(|| DEFAULT_CLAUDE_CLI.to_string()),
+        ),
+        codex_tui: Arc::new(
+            config
+                .and_then(|c| c.codex_tui.clone())
+                .unwrap_or_else(|| DEFAULT_CODEX_TUI.to_string()),
+        ),
+        grok_version: Arc::new(
+            config
+                .and_then(|c| c.grok_version.clone())
+                .unwrap_or_else(|| DEFAULT_GROK_VERSION.to_string()),
+        ),
+        antigravity: Arc::new(
+            config
+                .and_then(|c| c.antigravity.clone())
+                .unwrap_or_else(|| DEFAULT_ANTIGRAVITY.to_string()),
+        ),
+    }
 }
 
 #[cfg(test)]

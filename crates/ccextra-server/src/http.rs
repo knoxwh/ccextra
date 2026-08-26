@@ -69,6 +69,17 @@ pub struct RuntimeConfig {
     /// 上游 HTTP 客户端(封装全局代理)。每次 /reload 无条件重建,
     /// 连接池随之丢弃 —— 低频操作,取舍见 docs/design.md §8。
     pub upstream: UpstreamClient,
+    /// User-Agent 字符串(启动或 /reload 时加载)
+    pub user_agents: UserAgentSet,
+}
+
+/// User-Agent 配置集(启动时从 config 加载,Arc 包装避免请求时 clone)
+#[derive(Clone)]
+pub struct UserAgentSet {
+    pub claude_cli: Arc<String>,
+    pub codex_tui: Arc<String>,
+    pub grok_version: Arc<String>,
+    pub antigravity: Arc<String>,
 }
 
 /// 热重载结果:闭包重读配置文件,返回新配置
@@ -80,6 +91,7 @@ pub struct ReloadData {
     pub secret: Option<String>,
     /// 全局代理 URL;"direct"/"" 或 None = 直连
     pub proxy_url: Option<String>,
+    pub user_agents: UserAgentSet,
 }
 
 #[derive(Clone)]
@@ -288,6 +300,7 @@ async fn handle_reload(State(state): State<AppState>) -> Result<&'static str, Ap
         logging: data.logging,
         secret: data.secret,
         upstream: UpstreamClient::new(data.proxy_url),
+        user_agents: data.user_agents,
     };
     // secret 可能变更,旧 bcrypt 校验结果一律作废(不比较新旧值)
     if let Ok(mut cache) = auth_cache().lock() {
@@ -459,7 +472,14 @@ async fn handle_messages(
     body: Body,
 ) -> Result<Response, AppError> {
     // 一次性 clone 运行时快照值后立即释放读锁,避免跨 await 持锁阻塞 /reload
-    let (secret, log_request_body, normalize_enabled, normalize_drift_detector, upstream_client) = {
+    let (
+        secret,
+        log_request_body,
+        normalize_enabled,
+        normalize_drift_detector,
+        upstream_client,
+        user_agents,
+    ) = {
         let rt = state.runtime.read().await;
         (
             rt.secret.clone(),
@@ -467,6 +487,7 @@ async fn handle_messages(
             rt.normalize.enabled,
             rt.normalize.drift_detector,
             rt.upstream.clone(),
+            rt.user_agents.clone(),
         )
     };
     check_secret(&headers, &secret)?;
@@ -878,6 +899,7 @@ async fn handle_messages(
                 session_id,
                 thread_id.as_deref(),
                 &extra_headers,
+                &user_agents,
             )
             .await
         {
@@ -965,6 +987,7 @@ async fn handle_messages(
                             session_id,
                             thread_id.as_deref(),
                             &extra_headers,
+                            &user_agents,
                         )
                         .await?,
                 );
@@ -1021,6 +1044,7 @@ async fn handle_messages(
                     session_id,
                     thread_id.as_deref(),
                     &extra_headers,
+                    &user_agents,
                 )
                 .await?;
             final_status = retry.status;
@@ -1649,6 +1673,22 @@ mod tests {
     use serde_json::json;
     use tower::util::ServiceExt;
 
+    // 测试用默认 User-Agent 值
+    const TEST_CLAUDE_CLI: &str = "claude-cli/2.1.246";
+    const TEST_CODEX_TUI: &str =
+        "codex-tui/0.149.1 (Mac OS 26.6.2; arm64) ghostty/1.3.1 (codex-tui; 0.149.1)";
+    const TEST_GROK_VERSION: &str = "1.0.5";
+    const TEST_ANTIGRAVITY: &str = "antigravity/hub/2.10.0 darwin/arm64";
+
+    fn test_user_agents() -> UserAgentSet {
+        UserAgentSet {
+            claude_cli: Arc::new(TEST_CLAUDE_CLI.to_string()),
+            codex_tui: Arc::new(TEST_CODEX_TUI.to_string()),
+            grok_version: Arc::new(TEST_GROK_VERSION.to_string()),
+            antigravity: Arc::new(TEST_ANTIGRAVITY.to_string()),
+        }
+    }
+
     #[test]
     fn upstream_log_stem_includes_request_sequence() {
         let first = upstream_log_stem("sessabcd", 123, 7, "openairesponses");
@@ -1960,6 +2000,7 @@ data: {"type":"response.created","response":{"id":"resp_eof"}}"#
                 },
                 secret: None,
                 upstream: UpstreamClient::new(None),
+                user_agents: test_user_agents(),
             })),
             reload: reload_returning_secret(None),
             drift: DriftState::new(1000),
@@ -2711,6 +2752,7 @@ models:
                     },
                     secret,
                     proxy_url: None,
+                    user_agents: test_user_agents(),
                 })
             })
         })
@@ -2817,6 +2859,7 @@ models:
                     },
                     secret: None,
                     proxy_url: Some("socks5://127.0.0.1:1080".into()),
+                    user_agents: test_user_agents(),
                 })
             })
         });

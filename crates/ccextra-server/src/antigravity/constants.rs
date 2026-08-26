@@ -23,8 +23,8 @@ pub const API_VERSION: &str = "v1internal";
 
 /// 写死 hub 回退版本,不拉 updater manifest
 /// Cloud Code 拒绝 <2.9.0 客户端访问新模型,此版本必须 ≥2.9.0
-pub const REQUEST_UA: &str = "antigravity/hub/2.9.1 darwin/arm64";
-pub const ONBOARD_UA: &str = "antigravity/hub/2.9.1 darwin/arm64 google-api-nodejs-client/10.3.0";
+pub const REQUEST_UA: &str = "antigravity/hub/2.10.0 darwin/arm64";
+pub const ONBOARD_UA: &str = "antigravity/hub/2.10.0 darwin/arm64 google-api-nodejs-client/10.3.0";
 pub const GOOG_API_CLIENT: &str = "gl-node/22.21.1";
 pub const TOKEN_REFRESH_UA: &str = "Go-http-client/2.0";
 
