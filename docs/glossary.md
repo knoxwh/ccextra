@@ -46,10 +46,10 @@ OpenAI `/v1/responses` 协议(Codex CLI 默认)。请求体用顶层 `instructio
 发往上游的真实模型名,与入站 alias 可能不同。
 
 **按协议 UA 分流**  
-上游请求按协议+模型分流 User-Agent / Originator:仅 responses + `*gpt*`(大小写不敏感)用 `codex-tui/0.147.0 ...` 且带 `Originator: codex_cli_rs`;chat 或 responses + `*grok*` 用 `grok-shell/{ver} ({os}; {arch})`(对齐 grok-build 默认 UA);antigravity 用固定 `antigravity/hub/...`(非 antigravity UA 上游直接 404);其余(claude / 非 grok 的 chat / 非 gpt 非 grok 的 responses / gemini)用 `claude-cli/2.1.234`,不带 Originator。antigravity 信封里另有 `userAgent=antigravity`,与 HTTP 头不是同一字段。部分上游按 UA 识别客户端并分流缓存/特性,reqwest 默认 UA 会被判为非官方客户端。
+上游请求按协议+模型分流 User-Agent / Originator。可选顶层 `user_agents` 覆盖 `claude_cli` / `codex_tui` / `grok_version` / `antigravity`；字段缺失用内置默认值，`/reload` 生效。仅 responses + `*gpt*`(大小写不敏感)用 `codex_tui`（默认 `codex-tui/0.149.1 ...`）且带 `Originator: codex_cli_rs`;chat 或 responses + `*grok*` 用 `grok-shell/{grok_version} ({os}; {arch})`(默认 `1.0.5`，对齐 grok-build 默认 UA);antigravity 用 `antigravity`（默认 `antigravity/hub/2.10.0 darwin/arm64`，非 antigravity UA 上游直接 404）;其余(claude / 非 grok 的 chat / 非 gpt 非 grok 的 responses / gemini)用 `claude_cli`（默认 `claude-cli/2.1.246`）,不带 Originator。antigravity 信封里另有 `userAgent=antigravity`,与 HTTP 头不是同一字段。部分上游按 UA 识别客户端并分流缓存/特性,reqwest 默认 UA 会被判为非官方客户端。
 
 **grok CLI 身份头**  
-chat/responses + grok 发 `X-XAI-Token-Auth=xai-grok-cli`、`x-grok-client-version`、`x-grok-client-identifier=grok-shell`、`x-grok-model-override`,以及有会话时的 `x-grok-conv-id`。`x-grok-doom-loop-check` 仅 responses。不发 `req-id` / `session-id` / `agent-id` / `turn-idx`(无官方会话计数源;conv-id 已承担粘性)。
+chat/responses + grok 发 `X-XAI-Token-Auth=xai-grok-cli`、`x-grok-client-version`（取 `user_agents.grok_version`）、`x-grok-client-identifier=grok-shell`、`x-grok-model-override`,以及有会话时的 `x-grok-conv-id`。`x-grok-doom-loop-check` 仅 responses。不发 `req-id` / `session-id` / `agent-id` / `turn-idx`(无官方会话计数源;conv-id 已承担粘性)。
 
 **claude 直通头重建**  
 claude 路径的 `anthropic-beta` 头按 body 条件重建(基础集 `claude-code-20250219` + thinking 无 display → `redact-thinking` / tools → `advanced-tool-use` / `effort-2025-11-24` / speed=fast → `fast-mode`),再追加 caller 自带 beta(去重)。`anthropic-version`/`x-app`/`x-stainless-*` 等身份头仅透传(有就转发,没有不补)。与直通头重建中转场景一致。
@@ -98,7 +98,7 @@ responses 路径下,上游模型名以 `gpt` 开头(不区分大小写)时,拼�
 - gemini/antigravity 路径:同跑 `pretransform` 五模块子集(输入仍是 anthropic 形状),不写 `cachedContent`,不注入 `prompt_cache_key`,跳过 post 归一化与 drift
 
 **post-transform 归一化 / target_post**  
-转换后对目标协议 body 跑的二次归一化:tool_def normalize → sort stabilize → reminder rstrip → volatile strip(对齐 openai 转换后管线)。claude 直通与 gemini 路径跳过此步。
+转换后对目标协议 body 跑的二次归一化:tool_def normalize → sort stabilize → reminder rstrip → volatile strip(对齐 openai 转换后管线)。openai chat 随后观测 drift；responses 在 payload 后按最终 upstream_model 截断 `function_call_output` / `custom_tool_call_output` 的输出（仅 `normalize.enabled`：grok 40KB + 2KB 预览，非 grok 10KB），再观测最终 body。claude 直通与 gemini 路径跳过此步。
 
 **九模块**  
 九个归一化单元:  
@@ -176,7 +176,7 @@ Claude Code 注入的缓存保留时长参数。openai 上游拒绝(HTTP 400 `Un
 Claude Code 每请求注入 system 的计费+prompt 指纹块,前缀 `x-anthropic-billing-header:`。内容逐请求变化,转换到 openai / gemini 侧必须剥离。
 
 **tool_result 内容转换**  
-claude `tool_result` 的 content 转 openai 工具消息:字符串原样;纯文本数组 `\n\n` 连接为字符串(tool role 兼容性最好);含 image 的数组保留 parts 数组(text/image_url)。gemini 路径:`tool_result` → `functionResponse`,id 用入站 `tool_use_id`,name 从本轮 `tool_use` 表查;**内容进 `response.result` 强制 JSON 字符串化(对齐 CPA 9d0a60bf),防止解析后对象/数组触发上游 400**;结果里的 base64 图进 `functionResponse.parts.inlineData`。不接 URL 图。
+claude `tool_result` 的 content 转 openai 工具消息:字符串原样;纯文本数组 `\n\n` 连接为字符串(tool role 兼容性最好);含 image 的数组保留 parts 数组(text/image_url)。responses 在 `normalize.enabled` 时，payload 后按最终 upstream_model 截断 `function_call_output` / `custom_tool_call_output` 的 output：grok 40KB + 2KB 预览，非 grok 10KB。gemini 路径:`tool_result` → `functionResponse`,id 用入站 `tool_use_id`,name 从本轮 `tool_use` 表查;**内容进 `response.result` 强制 JSON 字符串化(对齐 CPA 9d0a60bf),防止解析后对象/数组触发上游 400**;结果里的 base64 图进 `functionResponse.parts.inlineData`。不接 URL 图。
 
 ## Gemini 签名与运输
 

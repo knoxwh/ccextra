@@ -33,8 +33,8 @@ ccextra :8222  ──  route → normalize → convert → upstream
 | **Model routing** | Inbound model name resolves via alias to exactly one provider. Conflicts fail at startup; no implicit fallback |
 | **Byte-level passthrough** | Claude → Claude changes only the `model` field. Remaining bytes stay intact so normalization is not undone |
 | **Prompt-cache optimization** | Nine-module normalization kills serialization drift so upstream prompt cache can hit. A drift detector watches blind spots across turns |
-| **Streaming state machines** | Hand-written SSE parser plus three independent relay paths. A dropped stream emits a structured error event instead of a bare hang-up |
-| **Hot reload** | `POST /reload` updates providers / payload / normalize / `logging.request_body` / secret / global proxy without restart, and clears the bcrypt verify cache. `logging.level` applies at startup only |
+| **Streaming state machines** | Hand-written SSE parser plus five independent relay paths (Claude / OpenAI Chat / Responses / Gemini / Antigravity). A dropped stream emits a structured error event instead of a bare hang-up |
+| **Hot reload** | `POST /reload` updates providers / payload / normalize / `user_agents` / `logging.request_body` / secret / global proxy without restart, and clears the bcrypt verify cache. `logging.level` applies at startup only |
 | **Proxy** | Global default plus per-provider override. SOCKS supported |
 | **Payload overrides** | Wildcard match on model name (e.g. `*glm*`) to override request params. Can be scoped to a protocol |
 | **Ingress auth** | Optional `secret_key`. Plaintext is hashed to bcrypt and written back. Verify results are cached |
@@ -50,13 +50,14 @@ Claude Code → ccextra:8222
 2. Route: model → provider → protocol
 3. Pre-transform normalize (full set for Claude / slim subset for others; gemini/antigravity skip drift)
 4. Protocol convert (four body-to-body paths + Claude passthrough; content shape normalized)
-5. Post-transform normalize (convert paths only) + drift observe
+5. Post-transform normalize (OpenAI conversion paths only; Chat observes drift afterward)
 6. Payload overrides (wildcard match, optional protocol scope)
-7. Strip prompt_cache_retention (OpenAI paths only)
-8. Inject prompt_cache_key (per-provider switch) + optional diagnostic dump
-9. Claude passthrough: rebuild anthropic-beta + forward identity headers
-10. Upstream request (reqwest + protocol-specific UA + proxy)
-11. Relay response (streaming SSE state machine / non-stream: Claude byte-passthrough, OpenAI via non_stream, gemini/antigravity via convert_gemini_response back to Anthropic; convert failure returns upstream bytes as-is; upstream errors mapped to Anthropic shape)
+7. Responses tool-result truncation (only when normalization is enabled; final upstream model: Grok 40KB plus 2KB preview, non-Grok 10KB) + drift observe
+8. Strip prompt_cache_retention (OpenAI paths only)
+9. Inject prompt_cache_key (per-provider switch) + optional diagnostic dump
+10. Claude passthrough: rebuild anthropic-beta + forward identity headers
+11. Upstream request (reqwest + protocol-specific UA + proxy)
+12. Relay response (streaming SSE state machine / non-stream: Claude byte-passthrough, OpenAI via non_stream, gemini/antigravity via convert_gemini_response back to Anthropic; convert failure returns upstream bytes as-is; upstream errors mapped to Anthropic shape)
     ↓
 Upstream provider
 ```
@@ -212,6 +213,7 @@ Full knobs live in [`config.example.yaml`](config.example.yaml). Highlights:
 | `providers[].models[].alias` | Inbound model name → real upstream model name |
 | `providers[].prompt_cache_key` | Cache-bucket key = session ID (aligned with Codex 0.147). OpenAI protocols only |
 | `payload` | Wildcard match on model name (`*glm*`) to override request params. Can be scoped with `protocol` |
+| `user_agents` | Override outbound User-Agents (`claude_cli` / `codex_tui` / `grok_version` / `antigravity`); optional, missing fields use built-in defaults, and `/reload` applies changes |
 | `normalize.enabled` | Master switch for normalization. `drift_detector` turns on cross-turn drift observation |
 | `logging.request_body` | Dump each upstream body under `logs/` for cache-drift debugging |
 
@@ -249,7 +251,7 @@ ccextra/
 cargo test --workspace
 ```
 
-Currently 709 tests, covering cache normalization, protocol conversion (Claude/OpenAI/Gemini/Antigravity/xAI Grok), SSE state machines, the HTTP pipeline, and config parsing.
+Currently 749 tests, covering cache normalization, protocol conversion (Claude/OpenAI/Gemini/Antigravity/xAI Grok), SSE state machines, the HTTP pipeline, and config parsing.
 
 ## Docs
 

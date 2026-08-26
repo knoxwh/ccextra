@@ -64,12 +64,18 @@ body["model"] = Value::String(upstream_model.to_string());
 normalize_target_post (4 模块，仅 openai 转换路径；gemini/antigravity 跳过)
   - tool_def normalize / sort stabilize / reminder rstrip / volatile strip
     ↓
-drift 观测 (claude / openai 链路；gemini/antigravity 跳过)
+drift 观测 (claude / openai chat 在各自归一化后；gemini/antigravity 跳过)
+    ↓
+Payload 参数覆盖
+    ↓
+responses tool_result 截断（仅 `normalize.enabled`；按 payload 后最终 upstream_model：grok 40KB + 2KB 预览，非 grok 10KB）
+    ↓
+responses drift 观测（最终截断 body）
     ↓
 上游请求
 ```
 
-**理由**：`cache_control` 注入需 anthropic 结构且对 openai 上游无意义；转换引入新漂移需二次清理；drift 观测统一在转换后进行。gemini/antigravity 不做前缀稳定，空臂占位，避免九模块误改 Gemini 请求体。
+**理由**：`cache_control` 注入需 anthropic 结构且对 openai 上游无意义；转换引入新漂移需二次清理；claude / openai chat 在各自归一化后观测，responses 则在 payload 后截断 tool_result 再观测最终 body。gemini/antigravity 不做前缀稳定，空臂占位，避免九模块误改 Gemini 请求体。
 
 ## 4. 关键修正（对标参考实现已知坑）
 
@@ -131,13 +137,14 @@ Claude Code → ccextra:8222
    - antigravity: 转换后对 gemini/flash/agent 模型注入 reasoning replay,注入目标为
      信封内层 request.contents(对齐 CPA prepareAntigravityGeminiReasoningReplayPayload;
      claude 模型不启用 replay,对齐 antigravityUsesReasoningReplayCache)
-5. normalize_target_post (仅 openai) + drift 观测 (gemini/antigravity 跳过)
+5. normalize_target_post (仅 openai；claude / openai chat 分别在自身归一化后观测 drift)
 6. Payload 参数覆盖 (通配匹配，可限定协议；claude 直通须显式 protocol)
-7. 剥离 prompt_cache_retention (非 claude 路径)
-8. prompt_cache_key 注入 (provider 级开关,仅 openai;chat+grok 跳过,见 §12;grok 判定用 payload 后出站 model)
-9. 诊断落盘 (可选) + claude 直通: anthropic-beta 重建 + 身份头透传
-10. 统一走 UpstreamClient.request (按协议取 URL/UA;多 base_url 按序回退)
-11. 响应转发 (流式 SSE 五臂, gemini/antigravity 共用状态机 / 非流: claude 字节直通, 其余转回 anthropic; 上游错误转 anthropic 形状)
+7. responses tool_result 截断（仅 `normalize.enabled`；按 payload 后最终 upstream_model 分流：grok 40KB + 2KB 预览，非 grok 10KB）+ drift 观测
+8. 剥离 prompt_cache_retention (非 claude 路径)
+9. prompt_cache_key 注入 (provider 级开关,仅 openai;chat+grok 跳过,见 §12;grok 判定用 payload 后出站 model)
+10. 诊断落盘 (可选) + claude 直通: anthropic-beta 重建 + 身份头透传
+11. 统一走 UpstreamClient.request (按协议取 URL/UA;多 base_url 按序回退)
+12. 响应转发 (流式 SSE 五臂, gemini/antigravity 共用状态机 / 非流: claude 字节直通, 其余转回 anthropic; 上游错误转 anthropic 形状)
     ↓
 上游 Provider
 ```
@@ -153,7 +160,7 @@ Claude Code → ccextra:8222
 
 `AppState.runtime` 用 `Arc<RwLock<RuntimeConfig>>` 封装 `normalize`/`logging`/`secret`/`upstream`，`/reload` 整块写锁替换；`providers`、`payload_rules` 各自独立 `RwLock`。三把锁分别获取，**非全局原子** —— 窗口内并发请求可能见部分更新（新 providers 配旧 normalize）。热重载低频，可接受。
 
-`handle_messages` 取运行时快照后立即释放读锁（`secret`/`logging`/`normalize` 字段 clone、`UpstreamClient` clone），再 `drop(providers)`/`drop(payload_rules)`，避免跨上游 `await` 持锁阻塞 `/reload`。
+`handle_messages` 取运行时快照后立即释放读锁（`secret`/`logging`/`normalize`/`user_agents` 字段 clone、`UpstreamClient` clone），再 `drop(providers)`/`drop(payload_rules)`，避免跨上游 `await` 持锁阻塞 `/reload`。
 
 `/reload` 无条件重建 `UpstreamClient`（不比较新旧 `proxy_url`），丢弃内部 `reqwest::Client` 连接池缓存。低频操作，取舍可接受；若 proxy_url 未变可复用旧 client 优化。
 
@@ -203,7 +210,7 @@ executor 规则（对齐 CPA `antigravity_executor_request.go`）：claude 模�
 ### 10.5 凭证与发送
 
 - **Gemini 直连**：`key` = API Key，经 `x-goog-api-key` 头发送（对齐 CPA gemini executor），`{base}/v1beta/models/{model}:generateContent | :streamGenerateContent`
-- **Antigravity**：启动时 `antigravity/provider.rs` 扫描 `auth_dir`（默认 `.cache/antigravity`），为每份有效凭证注入一个 provider（过期自动刷新回写，模型列表拉取，project_id 进 metadata）。base_url 为 `[daily, prod]` 回退；URL `/v1internal:generateContent | :streamGenerateContent?alt=sse`；UA 固定 `antigravity/hub/...`（非 antigravity UA 上游直接 404）。登录走 CLI 子命令 `ccextra antigravity-login`
+- **Antigravity**：启动时 `antigravity/provider.rs` 扫描 `auth_dir`（默认 `.cache/antigravity`），为每份有效凭证注入一个 provider（过期自动刷新回写，模型列表拉取，project_id 进 metadata）。base_url 为 `[daily, prod]` 回退；URL `/v1internal:generateContent | :streamGenerateContent?alt=sse`；UA 默认 `antigravity/hub/2.10.0 darwin/arm64`，可由 `user_agents.antigravity` 覆盖（非 antigravity UA 上游直接 404）。登录走 CLI 子命令 `ccextra antigravity-login`
 
 ### 10.6 响应转换
 
@@ -232,7 +239,7 @@ reasoning replay 对齐 CPA 的 xAI/codex/antigravity reasoning replay 实现:
 
 | | chat+grok | responses+grok |
 |---|---|---|
-| UA | `grok-shell/1.0.5 ({os}; {arch})` | 同左（已有） |
+| UA | `grok-shell/{grok_version} ({os}; {arch})`（默认 `1.0.5`） | 同左（已有） |
 | `x-grok-conv-id` | `extract_claude_code_session` 原样；空则省略 | 同左 |
 | `X-XAI-Token-Auth` / `x-grok-client-version` / `x-grok-client-identifier` / `x-grok-model-override` | 补 | 已有 |
 | `x-grok-doom-loop-check=1024` | 不发 | 已有（流/非流都发） |
@@ -244,8 +251,8 @@ reasoning replay 对齐 CPA 的 xAI/codex/antigravity reasoning replay 实现:
 
 ### 12.3 实现落点
 
-- `upstream.rs` `user_agent`：`OpenAiChat` + grok 走 `grok_cli_ua()`。gpt 走 chat 仍 `claude-cli`。Originator 仍只 responses+gpt。
-- `upstream.rs` 抽纯函数供单测：`grok_cli_headers(protocol, upstream_model, session_id: Option<&str>) -> Vec<(name, value)>`。非 grok 或非 chat/responses 返回空。grok：身份四头（Token-Auth=`xai-grok-cli` / version=`1.0.5` / identifier=`grok-shell` / 模型非空才 `x-grok-model-override`）；`session_id` 非空才 `x-grok-conv-id`（trim 后空视同无）；doom-loop=`1024` 仅 responses（流/非流都发，维持现状）。`request()` 调该函数再 `header`。
+- `upstream.rs` `user_agent(protocol, upstream_model, user_agents)`：从 `UserAgentSet` 按协议与模型分流；`OpenAiChat` + grok 运行时拼接 `grok-shell/{grok_version}`，gpt 走 chat 用 `claude_cli`。Originator 仍只 responses+gpt。
+- `upstream.rs` `grok_cli_headers`：接收 `grok_version`；非 grok 或非 chat/responses 返回空。grok：身份四头（Token-Auth=`xai-grok-cli` / version 取 `grok_version` / identifier=`grok-shell` / 模型非空才 `x-grok-model-override`）；`session_id` 非空才 `x-grok-conv-id`（trim 后空视同无）；doom-loop=`1024` 仅 responses（流/非流都发，维持现状）。`request()` 调该函数再 `header`。
 - `http.rs` 注入闸门：`provider_prompt_cache_key && openai && !(chat && grok)`，grok 看 payload 后出站 model。`inject_prompt_cache_key` 函数体不改。payload / 入站已有非空 key 不覆盖、不硬剥。session 派发（chat+grok 已传 `cc_session`）跟同一出站 model。
 - openai 转换器重建 body，丢未知顶层字段。`http.rs` 转换前保存入站非空 `prompt_cache_key`，转换后、payload 前原样写回（payload 仍可覆盖）。不改 `to_openai_chat` / `to_openai_responses` / `session.rs` / provider schema。
 

@@ -33,8 +33,8 @@ ccextra :8222  ──  路由 → 归一化 → 协议转换 → 上游请求
 | **模型路由** | 入站模型名按 alias 解析到唯一 provider，冲突启动即报错，不做隐式推导 |
 | **字节级直通** | Claude → Claude 只改 model 字段，其余字节原样保留，保住归一化成果 |
 | **prompt 缓存优化** | 九模块归一化消除序列化漂移，命中上游 prompt cache；drift 检测器跨轮观测盲区 |
-| **流式状态机** | 手写 SSE 解析器 + 三条独立转发路径，断流发结构化 error 兜底，不裸断流 |
-| **热重载** | `POST /reload` 无需重启更新 providers / payload / normalize / `logging.request_body` / secret / 全局代理，并清空 bcrypt 校验缓存；`logging.level` 仅启动生效 |
+| **流式状态机** | 手写 SSE 解析器 + 五条独立转发路径（claude / openai chat / responses / gemini / antigravity），断流发结构化 error 兜底，不裸断流 |
+| **热重载** | `POST /reload` 无需重启更新 providers / payload / normalize / `user_agents` / `logging.request_body` / secret / 全局代理，并清空 bcrypt 校验缓存；`logging.level` 仅启动生效 |
 | **代理支持** | 全局 + 每 provider 覆盖，支持 SOCKS |
 | **参数覆盖** | 按模型名通配符匹配（如 `*glm*`）覆盖请求参数，可限定协议生效 |
 | **入口认证** | 可选 `secret_key`，明文自动转 bcrypt 落盘，校验结果缓存 |
@@ -50,13 +50,14 @@ Claude Code → ccextra:8222
 2. 路由决策 model → provider → protocol
 3. 转换前归一化（claude 全量 / 其余协议精简子集；gemini/antigravity 跳过 drift）
 4. 协议转换（四条 body-to-body + claude 直通，content 形态归一化）
-5. post-transform 归一化（仅转换路径）+ drift 观测
+5. post-transform 归一化（仅 openai 转换路径；chat 随后观测 drift）
 6. payload 参数覆盖（通配匹配，可限定协议）
-7. 剥离 prompt_cache_retention（仅 openai 路径）
-8. prompt_cache_key 注入（provider 级开关）+ 诊断落盘（可选）
-9. claude 直通：anthropic-beta 重建 + 身份头透传
-10. 上游请求（reqwest + 按协议 UA + 代理）
-11. 响应转发（流式 SSE 状态机 / 非流: claude 字节直通, openai 走 non_stream, gemini/antigravity 走 convert_gemini_response 转回 anthropic, 转失败原样回上游字节；上游错误转 anthropic 形状）
+7. Responses 工具结果截断（仅归一化启用时；按最终上游模型分流：Grok 40KB + 2KB 预览，非 Grok 10KB）+ drift 观测
+8. 剥离 prompt_cache_retention（仅 openai 路径）
+9. prompt_cache_key 注入（provider 级开关）+ 诊断落盘（可选）
+10. claude 直通：anthropic-beta 重建 + 身份头透传
+11. 上游请求（reqwest + 按协议 UA + 代理）
+12. 响应转发（流式 SSE 状态机 / 非流: claude 字节直通, openai 走 non_stream, gemini/antigravity 走 convert_gemini_response 转回 anthropic, 转失败原样回上游字节；上游错误转 anthropic 形状）
     ↓
 上游 Provider
 ```
@@ -212,6 +213,7 @@ curl http://127.0.0.1:8222/health
 | `providers[].models[].alias` | 入站模型名 → 上游真实模型名 |
 | `providers[].prompt_cache_key` | 缓存桶 key = 会话 ID（对齐 codex 0.147），仅 openai 协议生效 |
 | `payload` | 按模型名通配（`*glm*`）覆盖请求参数，可 `protocol` 限定生效范围 |
+| `user_agents` | 自定义出站 User-Agent（`claude_cli` / `codex_tui` / `grok_version` / `antigravity`）；可选，缺失字段使用内置默认值，`/reload` 生效 |
 | `normalize.enabled` | 归一化总开关；`drift_detector` 开启跨轮漂移观测 |
 | `logging.request_body` | 逐请求落盘上游 body 到 `logs/`，供缓存漂移定位 |
 
@@ -249,7 +251,7 @@ ccextra/
 cargo test --workspace
 ```
 
-当前 709 个测试，覆盖缓存归一化、协议转换（Claude/OpenAI/Gemini/Antigravity/xAI Grok）、SSE 状态机、HTTP 管线与配置解析等模块。
+当前 749 个测试，覆盖缓存归一化、协议转换（Claude/OpenAI/Gemini/Antigravity/xAI Grok）、SSE 状态机、HTTP 管线与配置解析等模块。
 
 ## 文档
 
