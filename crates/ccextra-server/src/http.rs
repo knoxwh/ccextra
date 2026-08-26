@@ -512,15 +512,6 @@ async fn handle_messages(
     let route = resolve_route(&model, &providers)?;
     let payload_rules = state.payload_rules.read().await;
 
-    // tool_result 截断策略按上游客户端分流(仅 Responses 协议生效):
-    // - grok 模型 → grok-build 客户端策略(40KB 预算,2KB 预览 + footer)
-    // - 其余(GPT 等)→ codex 客户端策略(10KB bytes 前缀截断)
-    let truncation_strategy = if is_grok_model(&route.upstream_model) {
-        ccextra_core::normalize::UpstreamTruncation::GrokBuild
-    } else {
-        ccextra_core::normalize::UpstreamTruncation::Codex
-    };
-
     // 3. 归一化第一遍(按协议:claude 直通全量 / openai 转换前精简)
     // 对齐:claude 直通走 /v1/messages(全量),openai 走转换前
     // 精简子集(跳过 tool-def sort / volatile / cache_control / drift——
@@ -584,7 +575,7 @@ async fn handle_messages(
         Protocol::OpenAiChat => {
             convert_to_openai_chat(&mut body_json, &route.upstream_model)?;
             if normalize_enabled {
-                normalize_target_post(&mut body_json, TargetShape::OpenAiChat, None);
+                normalize_target_post(&mut body_json, TargetShape::OpenAiChat);
                 observe_drift_for(
                     &state.drift,
                     &headers,
@@ -625,18 +616,7 @@ async fn handle_messages(
                 }
             }
             if normalize_enabled {
-                normalize_target_post(
-                    &mut body_json,
-                    TargetShape::OpenAiResponses,
-                    Some(truncation_strategy),
-                );
-                observe_drift_for(
-                    &state.drift,
-                    &headers,
-                    &body_json,
-                    DriftApiKind::OpenAiResponses,
-                    normalize_drift_detector,
-                );
+                normalize_target_post(&mut body_json, TargetShape::OpenAiResponses);
             }
         }
         Protocol::Gemini => {
@@ -706,6 +686,33 @@ async fn handle_messages(
     // OpenAI payload 若把 model 置空/改成非字符串,回写路由模型,保证 body 与头部判定一致。
     let outbound_model =
         resolve_outbound_model(&mut body_json, &route.upstream_model, route.protocol);
+
+    // tool_result 截断(仅 Responses 协议):策略按上游客户端分流,用 payload
+    // 覆盖后的 outbound_model 判定——规则可把 gpt-* 改成 grok-*(或反向),
+    // 截断策略须跟实际出站模型:
+    // - grok 模型 → grok-build 客户端策略(40KB 预算,2KB 预览 + footer)
+    // - 其余(GPT 等)→ codex 客户端策略(10KB bytes 中间截断)
+    if normalize_enabled && matches!(route.protocol, Protocol::OpenAiResponses) {
+        let strategy = if is_grok_model(&outbound_model) {
+            ccextra_core::normalize::UpstreamTruncation::GrokBuild
+        } else {
+            ccextra_core::normalize::UpstreamTruncation::Codex
+        };
+        if let Err(e) = ccextra_core::cache_stabilization::truncate_tool_results::truncate(
+            &mut body_json,
+            strategy,
+        ) {
+            tracing::warn!("tool_result truncation failed: {}", e);
+        }
+        // drift 必须看到最终截断后的 Responses body,避免大工具输出参与前缀哈希。
+        observe_drift_for(
+            &state.drift,
+            &headers,
+            &body_json,
+            DriftApiKind::OpenAiResponses,
+            normalize_drift_detector,
+        );
+    }
 
     // GPT/Codex 在最终 model 与 payload 落定后校验 reasoning 回放信封。
     if matches!(route.protocol, Protocol::OpenAiResponses)
@@ -2094,6 +2101,96 @@ models:
 
         assert_eq!(attempts.load(Ordering::SeqCst), 2);
         assert!(String::from_utf8_lossy(&response_body).contains("retry ok"));
+    }
+
+    #[tokio::test]
+    async fn test_responses_uses_override_model_for_tool_result_truncation() {
+        let captured: Arc<StdMutex<Option<Value>>> = Arc::new(StdMutex::new(None));
+        let handler_captured = Arc::clone(&captured);
+        let upstream = Router::new().route(
+            "/responses",
+            post(move |body: axum::body::Bytes| {
+                let captured = Arc::clone(&handler_captured);
+                async move {
+                    *captured.lock().unwrap() = serde_json::from_slice(&body).ok();
+                    (
+                        StatusCode::OK,
+                        [(header::CONTENT_TYPE, "application/json")],
+                        json!({
+                            "object": "response",
+                            "id": "resp-override",
+                            "model": "grok-4.6",
+                            "output": [],
+                            "usage": {"input_tokens": 1, "output_tokens": 1}
+                        })
+                        .to_string(),
+                    )
+                }
+            }),
+        );
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let upstream_addr = listener.local_addr().unwrap();
+        let server = tokio::spawn(async move {
+            axum::serve(listener, upstream).await.unwrap();
+        });
+
+        let state = mock_state();
+        state.runtime.write().await.normalize.enabled = true;
+        *state.payload_rules.write().await = vec![PayloadRule {
+            models: vec!["test-responses-override".into()],
+            protocol: Some(Protocol::OpenAiResponses),
+            params: [("model".into(), json!("grok-4.6"))].into_iter().collect(),
+        }];
+        let provider: ProviderConfig = serde_yaml::from_str(&format!(
+            r#"
+name: test-responses-override
+protocol: openai_responses
+base_url: "http://{upstream_addr}"
+key: sk-test
+proxy_url: "direct"
+models:
+  - name: gpt-5
+    alias: test-responses-override
+"#
+        ))
+        .unwrap();
+        state.providers.write().await.push(provider);
+        let app = app(state);
+        let request = Request::builder()
+            .uri("/v1/messages")
+            .method("POST")
+            .header("content-type", "application/json")
+            .body(Body::from(
+                serde_json::to_vec(&json!({
+                    "model": "test-responses-override",
+                    "max_tokens": 64,
+                    "messages": [
+                        {"role": "assistant", "content": [{"type": "tool_use", "id": "tool_1", "name": "read", "input": {}}]},
+                        {"role": "user", "content": [{"type": "tool_result", "tool_use_id": "tool_1", "content": "x".repeat(20_000)}]}
+                    ]
+                }))
+                .unwrap(),
+            ))
+            .unwrap();
+        let response = app.oneshot(request).await.unwrap();
+        server.abort();
+
+        assert_eq!(response.status(), StatusCode::OK);
+        let body = captured.lock().unwrap().clone().unwrap();
+        assert_eq!(body["model"], "grok-4.6");
+        let output = body["input"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .find(|item| item["type"] == "function_call_output")
+            .unwrap()["output"]
+            .as_str()
+            .unwrap();
+        assert_eq!(
+            output.len(),
+            20_000,
+            "Grok strategy must retain 20KB output"
+        );
     }
 
     /// GPT Responses 在请求前剥离格式无效的 encrypted_content，避免触发 400 重试。

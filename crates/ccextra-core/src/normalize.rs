@@ -23,7 +23,6 @@ use crate::cache_stabilization::tool_def_normalize::{
     normalize_tool_definitions_responses, sort_schema_keys_recursive, sort_tools_deterministically,
 };
 use crate::cache_stabilization::tool_input_normalize::normalize_tool_use_inputs;
-use crate::cache_stabilization::truncate_tool_results;
 use crate::cache_stabilization::volatile_detector::{
     detect_volatile_content, emit_volatile_warnings, strip_volatile_from_prefix,
     ApiKind as VolatileApiKind,
@@ -152,21 +151,20 @@ pub fn normalize_anthropic_pretransform(body: &mut Value) -> NormalizeCounts {
     }
 }
 
-/// 转换后目标 body 二次归一化:tool_def + sort + rstrip + volatile + truncate
+/// 转换后目标 body 二次归一化:tool_def + sort + rstrip + volatile
 ///
 /// 顺序(post-transform):
 /// 1. tool_def 归一化(按 chat / responses 形状区分)
 /// 2. system reminder 列表块排序(CC 注入的 skills/deferred 列表顺序不稳定)
 /// 3. 尾部 reminder 空白归一化(CC 重序列化历史内容时字节漂移 #48734)
 /// 4. volatile 剥离(工具参数里残留的时间戳/UUID)
-/// 5. tool_result 截断(仅 Responses 协议;按上游客户端策略分流)
+///
+/// tool_result 截断不在本管线:策略须按 payload 覆盖后的出站模型判定,
+/// 由 server 层在 apply_payload_overrides 之后单独调用
+/// truncate_tool_results::truncate。
 ///
 /// 排序在 rstrip 前,两条归一化都落在 drift 检测前。
-pub fn normalize_target_post(
-    body: &mut Value,
-    shape: TargetShape,
-    truncation: Option<UpstreamTruncation>,
-) -> NormalizeCounts {
+pub fn normalize_target_post(body: &mut Value, shape: TargetShape) -> NormalizeCounts {
     let mut counts = NormalizeCounts::default();
 
     // 1. tool_def 归一化
@@ -193,13 +191,6 @@ pub fn normalize_target_post(
 
     // 4. volatile 剥离(openai 两种形状共用同一 walker)
     counts.volatile_count = strip_volatile_from_prefix(body, VolatileApiKind::OpenAi);
-
-    // 5. tool_result 截断(仅 Responses 协议;按上游客户端策略分流)
-    if let (TargetShape::OpenAiResponses, Some(strategy)) = (shape, truncation) {
-        if let Err(e) = truncate_tool_results::truncate(body, strategy) {
-            tracing::warn!("tool_result truncation failed: {}", e);
-        }
-    }
 
     counts
 }
@@ -372,7 +363,7 @@ mod tests {
             "messages": [{"role": "user", "content": "hi"}]
         });
 
-        let counts = normalize_target_post(&mut body, TargetShape::OpenAiChat, None);
+        let counts = normalize_target_post(&mut body, TargetShape::OpenAiChat);
 
         assert!(counts.tool_sorted);
     }
@@ -388,7 +379,7 @@ mod tests {
             ]
         });
 
-        let counts = normalize_target_post(&mut body, TargetShape::OpenAiChat, None);
+        let counts = normalize_target_post(&mut body, TargetShape::OpenAiChat);
 
         assert!(counts.sort_count > 0, "skill listing should be sorted");
         let content = body["messages"][0]["content"].as_str().unwrap();
@@ -408,7 +399,7 @@ mod tests {
             ]
         });
 
-        let counts = normalize_target_post(&mut body, TargetShape::OpenAiChat, None);
+        let counts = normalize_target_post(&mut body, TargetShape::OpenAiChat);
 
         assert!(
             counts.rstrip_count > 0,
@@ -431,9 +422,9 @@ mod tests {
             ]
         });
 
-        let c1 = normalize_target_post(&mut body, TargetShape::OpenAiChat, None);
+        let c1 = normalize_target_post(&mut body, TargetShape::OpenAiChat);
         let snapshot = body.clone();
-        let c2 = normalize_target_post(&mut body, TargetShape::OpenAiChat, None);
+        let c2 = normalize_target_post(&mut body, TargetShape::OpenAiChat);
 
         assert!(c1.sort_count > 0, "skill listing should sort");
         assert!(c1.rstrip_count > 0, "trailing whitespace should collapse");
