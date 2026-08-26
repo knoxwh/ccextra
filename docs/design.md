@@ -96,19 +96,25 @@ openai responses: relay_responses_to_anthropic
                  (reasoning replay 闭环: output_item.done 收集 +
                   completed 补空 output + 缓存 replay 项 + 下轮注入;
                   summary→thinking_delta + encrypted_content→signature_delta)
-gemini/antigravity: relay_gemini_to_anthropic (sse/gemini.rs,两协议共用;
-                 antigravity 先解 {"response": {...}} 信封;
-                 antigravity gemini/flash/agent 模型启用 reasoning replay,
-                 claude 模型不启用,对齐 CPA antigravityUsesReasoningReplayCache)
-                 (无 event: 分派; data: 行; part.text 当增量;
-                  finishReason 在 = 终包; 帧复用 emit)
+gemini:            relay_gemini_to_anthropic
+                   (直连 Gemini SSE → Anthropic SSE;
+                    无 event: 分派; data: 行; part.text 当增量;
+                    finishReason + usage + 内容触发 message_delta;
+                    缺失 finishReason 不合成 terminal)
+antigravity:       relay_antigravity_to_anthropic
+                   (共用 Gemini 内容状态机;先解 {"response": {...}} 信封;
+                    gemini/flash/agent 模型启用 reasoning replay,
+                    claude 模型不启用,对齐 CPA antigravityUsesReasoningReplayCache;
+                    finishReason + usage + 内容触发 message_delta;
+                    clean EOF/[DONE] 已有 payload 且所有 candidate 缺失
+                    finishReason 时合成空 text + STOP terminal)
 ```
 
 OpenAI 转换流在尚未输出首个 Anthropic SSE 帧时，若首帧为 `error`，重试上游一次；仅门控首帧，不全量缓冲。第二次仍失败、或已输出首帧后的传输错误/未满足终态 EOF，发 anthropic `error` 事件，不裸断流，也不补造 `message_start`、`message_delta` 或 `message_stop`。
 
 - OpenAI Chat：`[DONE]` 是显式终态；已开始的消息即使没有 `finish_reason` 也正常收尾。未收到 `[DONE]` 的 EOF 仅在已有 `finish_reason` 时正常收尾。
 - OpenAI Responses：`response.completed`、`response.incomplete` 正常收尾；`response.failed`、`error` 或缺少该终态的 EOF 发 `error`。
-- Gemini：无首帧重试。`finishReason` 在即为终包。已发 `message_start` 且全程无 text/thinking/tool 时补空 text，再发 `message_delta` / `message_stop`；从未发过首帧则不发任何帧。出站是 anthropic SSE，不是 Chat 的 `[DONE]`。非流认信封里的 `response.*`。
+- Gemini / Antigravity：无首帧重试。空流、空信封、空 `candidates` 或 read error 发 `error`，不伪造成功终态；非空 usage 可作为 payload。Gemini 直连在 clean EOF/`[DONE]` 有 payload 时只发 `message_stop`，不补缺失 finish terminal；Antigravity 在同样条件下补空 text + `message_delta`，已有任意 candidate 的 finish reason 时不重复合成。出站是 anthropic SSE，不是 Chat 的 `[DONE]`。非流 Antigravity 认信封里的 `response.*`，并恢复 `usageMetadata` / `cpaUsageMetadata`。
 - 状态机收尾后忽略后续上游事件，避免错误帧与正常收尾帧混合。
 
 ## 6. 管线流程
@@ -184,7 +190,7 @@ ccextra 设计为与主力网关并存，独立运行，验证时手动切换，
 
 ### 10.3 消息与 thinking 签名
 
-`message_convert.rs` 负责 messages→contents：role 映射（assistant→model）、空文本跳过、`tool_use`→`functionCall`（附 `skip_thought_signature_validator` 哨兵，对齐 CPA）、`tool_result`→`functionResponse`（名从 tool_use_id 反解）、base64 图→`inline_data`、尾部未应答 functionCall 的 model 回合剥离。
+`message_convert.rs` 负责 messages→contents：role 映射（assistant→model）、空文本跳过、`tool_use`→`functionCall`（附 `skip_thought_signature_validator` 哨兵，对齐 CPA）、`tool_result`→`functionResponse`（名从 tool_use_id 反解，**result 字段强制 JSON 字符串化对齐 CPA 9d0a60bf，防止解析后对象/数组触发上游 400**）、base64 图→`inline_data`、尾部未应答 functionCall 的 model 回合剥离。
 
 thinking 块按协议分流：Gemini 直连全丢（非 compat 路径）；Antigravity 保留带非空 `signature` 的块为 `{thought:true, text, thoughtSignature}`，空签名块跳过。CPA 的签名缓存/carrier/CAIS 校验子系统不移植——签名只做客户端透传。
 

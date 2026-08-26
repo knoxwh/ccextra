@@ -55,8 +55,7 @@ where
             gemini::relay_gemini_to_anthropic(stream, estimated_input_tokens, tool_names)
         }
         Protocol::Antigravity => {
-            // Antigravity 使用与 Gemini 相同的 SSE 格式
-            gemini::relay_gemini_to_anthropic(stream, estimated_input_tokens, tool_names)
+            gemini::relay_antigravity_to_anthropic(stream, estimated_input_tokens, tool_names)
         }
     }
 }

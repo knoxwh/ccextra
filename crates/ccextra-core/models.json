@@ -22,7 +22,7 @@
     },
     {
       "id": "qwen3.8-max",
-      "reasoning_levels": ["low", "high", "max"]
+      "reasoning_levels": ["low", "high", "xhigh"]
     },
     {
       "id": "deepseek-v4-flash",

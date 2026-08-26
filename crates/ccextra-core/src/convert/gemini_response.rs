@@ -44,6 +44,13 @@ pub struct GeminiStreamState {
     finish_reason: String,
 }
 
+impl GeminiStreamState {
+    /// 是否观察到非空 finishReason(供 Antigravity [DONE] 收尾判断)。
+    pub fn has_finish_reason(&self) -> bool {
+        self.has_finish
+    }
+}
+
 /// 转换 Gemini 流式事件为 Anthropic SSE 格式
 ///
 /// 实现状态机处理内容块转换：
@@ -318,13 +325,22 @@ fn usage_object(input: i64, output: i64, cache_read: i64) -> Value {
 }
 
 fn cache_chunk_metadata(chunk: &Value, state: &mut GeminiStreamState) {
-    if let Some(fr) = chunk
-        .get("candidates")
-        .and_then(|c| c.get(0))
-        .and_then(|c| c.get("finishReason"))
-    {
-        state.has_finish = true;
-        state.finish_reason = fr.as_str().unwrap_or("").to_string();
+    if let Some(candidates) = chunk.get("candidates").and_then(|c| c.as_array()) {
+        for (index, candidate) in candidates.iter().enumerate() {
+            let Some(reason) = candidate
+                .get("finishReason")
+                .and_then(|value| value.as_str())
+                .filter(|reason| !reason.is_empty())
+            else {
+                continue;
+            };
+            state.has_finish = true;
+            // CPA 下游 stop_reason 只消费 candidates[0],但 Antigravity
+            // [DONE] 判定需扫描所有 candidate 是否见过终态。
+            if index == 0 && state.finish_reason.is_empty() {
+                state.finish_reason = reason.to_string();
+            }
+        }
     }
     if let Some(usage) = chunk.get("usageMetadata") {
         // 流式:input = prompt - cached(对齐 CPA Params.PromptTokenCount)
@@ -395,6 +411,11 @@ pub fn force_finalize_gemini_stream(state: &mut GeminiStreamState) -> Vec<Value>
             "type": "content_block_start",
             "index": state.response_index,
             "content_block": {"type": "text", "text": ""}
+        }));
+        events.push(json!({
+            "type": "content_block_delta",
+            "index": state.response_index,
+            "delta": {"type": "text_delta", "text": ""}
         }));
         state.response_type = ResponseType::Content;
         state.has_content = true;
@@ -498,22 +519,29 @@ pub fn convert_gemini_response(
             anthropic["content"] = json!(content_blocks);
         }
 
-        // finishReason 映射:有工具调用一律 tool_use(对齐 CPA hasToolCall 优先)
-        if let Some(finish_reason) = candidate.get("finishReason").and_then(|f| f.as_str()) {
-            let stop_reason = if saw_tool_call {
-                "tool_use"
-            } else {
-                match finish_reason {
-                    "MAX_TOKENS" => "max_tokens",
-                    _ => "end_turn",
-                }
-            };
-            anthropic["stop_reason"] = json!(stop_reason);
-        }
+        // finishReason 缺失时按 CPA 非流转换默认补 STOP。
+        let finish_reason = candidate
+            .get("finishReason")
+            .and_then(|f| f.as_str())
+            .filter(|reason| !reason.is_empty())
+            .unwrap_or("STOP");
+        let stop_reason = if saw_tool_call {
+            "tool_use"
+        } else {
+            match finish_reason {
+                "MAX_TOKENS" => "max_tokens",
+                _ => "end_turn",
+            }
+        };
+        anthropic["stop_reason"] = json!(stop_reason);
     }
 
     // 使用统计:非流 input 不扣 cached;cached>0 写 cache_read(对齐 CPA 非流)
-    match response.get("usageMetadata") {
+    // Antigravity 非流可能暂用 cpaUsageMetadata,先兼容两种字段名。
+    match response
+        .get("usageMetadata")
+        .or_else(|| response.get("cpaUsageMetadata"))
+    {
         Some(usage) => {
             let cached = i64_field(usage, "cachedContentTokenCount");
             anthropic["usage"] = usage_object(
@@ -646,6 +674,32 @@ mod tests {
     }
 
     #[test]
+    fn test_convert_gemini_response_accepts_cpa_usage_metadata() {
+        let gemini = json!({
+            "candidates": [{
+                "content": {"parts": [{"text": "hi"}]}
+            }],
+            "cpaUsageMetadata": {
+                "promptTokenCount": 4,
+                "candidatesTokenCount": 2
+            }
+        });
+        let anthropic = convert_gemini_response(&gemini, &HashMap::new());
+        assert_eq!(anthropic["usage"]["input_tokens"], 4);
+        assert_eq!(anthropic["usage"]["output_tokens"], 2);
+    }
+
+    #[test]
+    fn test_convert_gemini_response_defaults_missing_finish_reason() {
+        let gemini = json!({
+            "candidates": [{
+                "content": {"parts": [{"text": "hi"}], "role": "model"}
+            }]
+        });
+        let anthropic = convert_gemini_response(&gemini, &HashMap::new());
+        assert_eq!(anthropic["stop_reason"], "end_turn");
+    }
+    #[test]
     fn test_convert_gemini_response_args_non_object_fallback() {
         let gemini = json!({
             "candidates": [{
@@ -658,6 +712,24 @@ mod tests {
         });
         let anthropic = convert_gemini_response(&gemini, &HashMap::new());
         assert_eq!(anthropic["content"][0]["input"], json!({}));
+    }
+
+    #[test]
+    fn test_finalize_gemini_stream_scans_all_candidates_for_finish_reason() {
+        let chunk = json!({
+            "candidates": [
+                {"content": {"parts": [{"text": "hi"}]}},
+                {"finishReason": "STOP"}
+            ],
+            "usageMetadata": {"promptTokenCount": 1, "candidatesTokenCount": 2}
+        });
+        let mut state = GeminiStreamState {
+            has_content: true,
+            ..Default::default()
+        };
+        let events = finalize_gemini_stream(&chunk, &mut state);
+        assert!(!events.is_empty());
+        assert!(state.has_finish_reason());
     }
 
     #[test]
@@ -795,8 +867,10 @@ mod tests {
         assert_eq!(events[0]["type"], "content_block_start");
         assert_eq!(events[0]["content_block"]["type"], "text");
         assert_eq!(events[0]["content_block"]["text"], "");
-        assert_eq!(events[1]["type"], "content_block_stop");
-        assert_eq!(events[2]["type"], "message_delta");
+        assert_eq!(events[1]["type"], "content_block_delta");
+        assert_eq!(events[1]["delta"]["text"], "");
+        assert_eq!(events[2]["type"], "content_block_stop");
+        assert_eq!(events[3]["type"], "message_delta");
     }
 
     #[test]

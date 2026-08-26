@@ -133,11 +133,13 @@ OpenAI chat/responses 的缓存桶标识。对齐 codex CLI 0.147 `prompt_cache_
 `text/event-stream` 格式,`data:` 行承载 JSON 事件。anthropic 用 `message_start` / `content_block_delta` 等事件;openai chat 用 `data: {choices: [{delta: ...}]}`;responses 用 `output_item` 事件。
 
 **relay 状态机**  
-把上游 SSE 流逐 chunk 解析并转换为目标协议事件序列的状态维护。四条路径独立:  
+把上游 SSE 流逐 chunk 解析并转换为目标协议事件序列的状态维护。五条路径独立:
 - claude 直通 = 字节级转发,不解析  
 - openai chat → anthropic = `relay_openai_chat_to_anthropic` 状态机  
 - responses → anthropic = `relay_responses_to_anthropic` 状态机  
-- gemini → anthropic = `relay_gemini_to_anthropic` 状态机。无 `event:` 分派,每行 `data: {json}`,`part.text` 当增量,不做累积去重
+- gemini → anthropic = `relay_gemini_to_anthropic`;直连 Gemini 只在看到有效 payload 后发 `message_stop`,不合成缺失 `finishReason` 的 terminal 事件
+- antigravity → anthropic = `relay_antigravity_to_anthropic`;先解 `{"response": ...}` 信封。clean EOF 或 `[DONE]` 时,仅当已有有效 payload 且所有 candidate 都缺非空 `finishReason` 才合成 terminal 事件;已观察到 finish reason 时不重复合成。
+两条 Gemini 风格路径均忽略空信封、空 `candidates`、空 usage;空流或 read error 发 anthropic `error`,不发正常终态。`cpaUsageMetadata` 会在转换前恢复为 usage 元数据。
 
 **reasoning 回放闭环**  
 responses 路径:有 `encrypted_content` 时流式 `summary` 转 `thinking_delta`(可见),`output_item.done` 的加密内容以 `signature_delta` 收尾。下一轮有签 thinking 仅当签名 GPT 兼容(`gAAAA` 前缀)或 grok 模型才回放为 `reasoning.encrypted_content`,否则丢弃。无签非空 thinking 回放为明文 `reasoning.content`。替代旧的 redacted_thinking 方案(形状不合规范且请求侧丢弃)。
@@ -145,7 +147,7 @@ responses 路径:有 `encrypted_content` 时流式 `summary` 转 `thinking_delta
 chat 路径不同:Chat Completions 无 `encrypted_content`。对齐 CPA `shouldMapClaudeThinkingToGPTReasoning` 默认——无/空签名回放正文;有签名仅 `gAAAA` 过门后回放正文;Claude/Gemini/未知/grok 密文整块扔。签名本身不进 `reasoning_content`。无 grok 特例,无 CPA compat。
 
 **断流兜底**  
-OpenAI 转换流尚未输出首个 Anthropic SSE 帧时，若首帧为 `error`，重试上游一次；仅门控首帧，不缓冲完整响应。第二次仍失败、或已输出首帧后发生上游传输错误/EOF 未满足协议终态时，状态机只发 anthropic `error`，不伪造 `message_start` 或正常收尾帧。Chat 的 `[DONE]` 是显式终态；未收到 `[DONE]` 的 EOF 需已有 `finish_reason`。Responses 仅 `response.completed` / `response.incomplete` 正常收尾；`response.failed` 与 `error` 为错误终态。终态后忽略后续帧。responses 空轮次/纯思考轮次合成空 text 块(Claude 客户端遇零块消息报 "Content block not found")。gemini 无首帧重试。已发 `message_start` 且全程无 text/thinking/tool 时,补空 `text` 块再发 `message_delta` / `message_stop`;从未发过首帧则不发任何帧。出站是 anthropic SSE,不是 Chat 的 `[DONE]`。
+OpenAI 转换流尚未输出首个 Anthropic SSE 帧时,若首帧为 `error`,重试上游一次;仅门控首帧,不缓冲完整响应。第二次仍失败、或已输出首帧后发生上游传输错误/EOF 未满足协议终态时,状态机只发 anthropic `error`,不伪造 `message_start` 或正常收尾帧。Chat 的 `[DONE]` 是显式终态;未收到 `[DONE]` 的 EOF 需已有 `finish_reason`。Responses 仅 `response.completed` / `response.incomplete` 正常收尾;`response.failed` 与 `error` 为错误终态。终态后忽略后续帧。responses 空轮次/纯思考轮次合成空 text 块(Claude 客户端遇零块消息报 "Content block not found")。Gemini 风格路径无首帧重试:直连 Gemini 在有效 payload 后仅发 `message_stop`,不合成缺失 finish terminal;Antigravity 在 clean EOF/`[DONE]` 且已有 payload、缺少有效 finish 时补空 text terminal 事件,已有 finish 时不重复。空流、空 envelope、空 `candidates`、空 usage、read error 均不报告成功完成。
 
 **诊断落盘**  
 `logging.request_body: true` 时逐请求把最终上游 body 落盘 `logs/upstream_body_<session前8>_<毫秒>.<protocol>.json`,供逐轮 diff 定位缓存漂移。另含入站 `request_body` 调试日志。
@@ -174,7 +176,7 @@ Claude Code 注入的缓存保留时长参数。openai 上游拒绝(HTTP 400 `Un
 Claude Code 每请求注入 system 的计费+prompt 指纹块,前缀 `x-anthropic-billing-header:`。内容逐请求变化,转换到 openai / gemini 侧必须剥离。
 
 **tool_result 内容转换**  
-claude `tool_result` 的 content 转 openai 工具消息:字符串原样;纯文本数组 `\n\n` 连接为字符串(tool role 兼容性最好);含 image 的数组保留 parts 数组(text/image_url)。gemini 路径:`tool_result` → `functionResponse`,id 用入站 `tool_use_id`,name 从本轮 `tool_use` 表查;内容进 `response.result`;结果里的 base64 图进 `functionResponse.parts.inlineData`。不接 URL 图。
+claude `tool_result` 的 content 转 openai 工具消息:字符串原样;纯文本数组 `\n\n` 连接为字符串(tool role 兼容性最好);含 image 的数组保留 parts 数组(text/image_url)。gemini 路径:`tool_result` → `functionResponse`,id 用入站 `tool_use_id`,name 从本轮 `tool_use` 表查;**内容进 `response.result` 强制 JSON 字符串化(对齐 CPA 9d0a60bf),防止解析后对象/数组触发上游 400**;结果里的 base64 图进 `functionResponse.parts.inlineData`。不接 URL 图。
 
 ## Gemini 签名与运输
 

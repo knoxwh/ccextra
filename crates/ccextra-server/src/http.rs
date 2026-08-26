@@ -1153,12 +1153,17 @@ async fn handle_messages(
                 }
                 Protocol::Antigravity => {
                     // Antigravity 响应为 {"response": {...gemini...}} 信封,先解包;
-                    // 对齐 CPA:usageMetadata 可能在信封根,补回内层
+                    // usageMetadata/cpaUsageMetadata 可能位于信封根或内层。
                     use ccextra_core::convert::convert_gemini_response;
                     let mut inner = v.get("response").cloned().unwrap_or_else(|| v.clone());
                     if inner.get("usageMetadata").is_none() {
-                        if let Some(u) = v.get("usageMetadata") {
-                            inner["usageMetadata"] = u.clone();
+                        let usage = inner
+                            .get("cpaUsageMetadata")
+                            .or_else(|| v.get("usageMetadata"))
+                            .or_else(|| v.get("cpaUsageMetadata"))
+                            .cloned();
+                        if let Some(usage) = usage {
+                            inner["usageMetadata"] = usage;
                         }
                     }
                     Some(convert_gemini_response(

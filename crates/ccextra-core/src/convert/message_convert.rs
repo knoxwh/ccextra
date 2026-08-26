@@ -11,6 +11,12 @@ use super::tool_sanitize::sanitize_function_name;
 /// functionCall 附加的思考签名哨兵(对齐 CPA geminiClaudeThoughtSignature)
 const THOUGHT_SIGNATURE_SENTINEL: &str = "skip_thought_signature_validator";
 
+#[derive(Default)]
+struct ToolHistory {
+    tool_name_by_id: HashMap<String, String>,
+    pending_tool_use_ids: Vec<String>,
+}
+
 /// 转换 Anthropic messages 为 Gemini contents
 ///
 /// original_to_short: 原始工具名 → 上游清洗短名(本轮 tools 声明)
@@ -24,17 +30,22 @@ pub fn convert_messages(
     upstream_model: &str,
 ) -> Vec<Value> {
     let mut contents = Vec::new();
+    let mut tool_history = ToolHistory::default();
 
     for msg in messages {
         let role = msg.get("role").and_then(|r| r.as_str()).unwrap_or("");
+        let preceding_tool_use_ids = std::mem::take(&mut tool_history.pending_tool_use_ids);
 
         match role {
             "user" => {
+                let content = align_tool_results(&msg["content"], &preceding_tool_use_ids);
                 let parts = convert_content_to_parts(
-                    &msg["content"],
+                    &content,
                     original_to_short,
                     antigravity,
                     upstream_model,
+                    &mut tool_history,
+                    false,
                 );
                 if !parts.is_empty() {
                     contents.push(json!({ "role": "user", "parts": parts }));
@@ -46,6 +57,8 @@ pub fn convert_messages(
                     original_to_short,
                     antigravity,
                     upstream_model,
+                    &mut tool_history,
+                    true,
                 );
                 if !parts.is_empty() {
                     contents.push(json!({ "role": "model", "parts": parts }));
@@ -77,6 +90,47 @@ pub fn convert_messages(
     }
 
     contents
+}
+
+/// 按 preceding tool_use 顺序排列 tool_result;非结果块保留到结果之后。
+/// 数量或 ID 无法一一匹配时保持原始顺序,避免破坏不完整历史。
+fn align_tool_results(content: &Value, preceding_tool_use_ids: &[String]) -> Value {
+    let Some(blocks) = content.as_array() else {
+        return content.clone();
+    };
+    if preceding_tool_use_ids.is_empty() {
+        return content.clone();
+    }
+
+    let mut tool_results = Vec::new();
+    let mut other_blocks = Vec::new();
+    for block in blocks {
+        if block.get("type").and_then(|t| t.as_str()) == Some("tool_result") {
+            tool_results.push(block);
+        } else {
+            other_blocks.push(block);
+        }
+    }
+    if tool_results.len() != preceding_tool_use_ids.len() {
+        return content.clone();
+    }
+
+    let mut ordered = Vec::with_capacity(blocks.len());
+    let mut used = vec![false; tool_results.len()];
+    for tool_use_id in preceding_tool_use_ids {
+        let Some(index) = tool_results.iter().enumerate().find_map(|(index, result)| {
+            (!used[index]
+                && !tool_use_id.is_empty()
+                && result.get("tool_use_id").and_then(|id| id.as_str()) == Some(tool_use_id))
+            .then_some(index)
+        }) else {
+            return content.clone();
+        };
+        used[index] = true;
+        ordered.push(tool_results[index].clone());
+    }
+    ordered.extend(other_blocks.into_iter().cloned());
+    Value::Array(ordered)
 }
 
 /// 提取 system 消息文本并包成 <system-reminder>...</system-reminder>
@@ -116,6 +170,8 @@ fn convert_content_to_parts(
     original_to_short: &HashMap<String, String>,
     antigravity: bool,
     upstream_model: &str,
+    tool_history: &mut ToolHistory,
+    record_tool_use_ids: bool,
 ) -> Vec<Value> {
     let mut parts = Vec::new();
 
@@ -133,6 +189,8 @@ fn convert_content_to_parts(
                     original_to_short,
                     antigravity,
                     upstream_model,
+                    tool_history,
+                    record_tool_use_ids,
                 );
             }
         }
@@ -149,6 +207,8 @@ fn append_block_parts(
     original_to_short: &HashMap<String, String>,
     antigravity: bool,
     upstream_model: &str,
+    tool_history: &mut ToolHistory,
+    record_tool_use_ids: bool,
 ) {
     let Some(block_type) = block.get("type").and_then(|t| t.as_str()) else {
         return;
@@ -207,28 +267,49 @@ fn append_block_parts(
                 v if v.is_object() => v,
                 _ => json!({}),
             };
+            let tool_use_id = block.get("id").and_then(|i| i.as_str()).unwrap_or("");
+            if !tool_use_id.is_empty() {
+                tool_history
+                    .tool_name_by_id
+                    .insert(tool_use_id.to_string(), short.clone());
+            }
+            if record_tool_use_ids {
+                // 空 ID 也记录,阻止不完整历史被误排序。
+                tool_history
+                    .pending_tool_use_ids
+                    .push(tool_use_id.to_string());
+            }
+            let mut function_call = json!({
+                "name": short,
+                "args": input
+            });
+            if !tool_use_id.is_empty() {
+                function_call["id"] = json!(tool_use_id);
+            }
             parts.push(json!({
                 "thoughtSignature": THOUGHT_SIGNATURE_SENTINEL,
-                "functionCall": {
-                    "name": short,
-                    "args": input
-                }
+                "functionCall": function_call
             }));
         }
         "tool_result" => {
             let Some(tool_use_id) = block.get("tool_use_id").and_then(|i| i.as_str()) else {
                 return;
             };
-            // 从 id 反解工具名(对齐 toolNameFromClaudeToolUseID),保证与
-            // 模型发出的 functionCall.name 一致;反解失败兜底用 id 本身
-            let mut func_name = tool_name_from_claude_tool_use_id(tool_use_id);
-            if func_name.is_empty() {
-                func_name = tool_use_id.to_string();
-            }
-            let func_name = original_to_short
-                .get(func_name.as_str())
+            // 优先使用历史中的 tool_use.name;旧 ID 格式仅作兼容兜底。
+            let func_name = tool_history
+                .tool_name_by_id
+                .get(tool_use_id)
                 .cloned()
-                .unwrap_or_else(|| sanitize_function_name(&func_name));
+                .unwrap_or_else(|| {
+                    let mut derived = tool_name_from_claude_tool_use_id(tool_use_id);
+                    if derived.is_empty() {
+                        derived = tool_use_id.to_string();
+                    }
+                    original_to_short
+                        .get(derived.as_str())
+                        .cloned()
+                        .unwrap_or_else(|| sanitize_function_name(&derived))
+                });
 
             let (result, images) = convert_tool_result_content(block.get("content"));
             // 对齐 CPA fixCLIToolResponse 归一化:Antigravity 把工具图嵌进
@@ -251,6 +332,7 @@ fn append_block_parts(
                     .collect();
                 parts.push(json!({
                     "functionResponse": {
+                        "id": tool_use_id,
                         "name": func_name,
                         "response": { "result": result },
                         "parts": image_parts
@@ -259,6 +341,7 @@ fn append_block_parts(
             } else {
                 parts.push(json!({
                     "functionResponse": {
+                        "id": tool_use_id,
                         "name": func_name,
                         "response": { "result": result }
                     }
@@ -451,11 +534,49 @@ mod tests {
         assert_eq!(parts.len(), 1);
         // 对齐 CPA:name 用声明短名,附加签名哨兵
         assert_eq!(parts[0]["functionCall"]["name"], "Read");
+        assert_eq!(parts[0]["functionCall"]["id"], "Read-3");
         assert_eq!(
             parts[0]["thoughtSignature"],
             "skip_thought_signature_validator"
         );
         assert_eq!(parts[0]["functionCall"]["args"]["path"], "/file.txt");
+    }
+
+    #[test]
+    fn test_convert_messages_aligns_parallel_tool_results() {
+        let mut map = HashMap::new();
+        map.insert("Read".to_string(), "Rd".to_string());
+        let messages = vec![
+            json!({
+                "role": "assistant",
+                "content": [
+                    {"type": "tool_use", "id": "opaque-a", "name": "Read", "input": {"n": 1}},
+                    {"type": "tool_use", "id": "opaque-b", "name": "Read", "input": {"n": 2}}
+                ]
+            }),
+            json!({
+                "role": "user",
+                "content": [
+                    {"type": "text", "text": "results"},
+                    {"type": "tool_result", "tool_use_id": "opaque-b", "content": "b"},
+                    {"type": "text", "text": "continue"},
+                    {"type": "tool_result", "tool_use_id": "opaque-a", "content": "a"}
+                ]
+            }),
+        ];
+        let contents = convert_messages(&messages, &map, false, "gemini-2.0");
+        let calls = contents[0]["parts"].as_array().unwrap();
+        assert_eq!(calls[0]["functionCall"]["id"], "opaque-a");
+        assert_eq!(calls[1]["functionCall"]["id"], "opaque-b");
+        assert_eq!(calls[0]["functionCall"]["name"], "Rd");
+
+        let responses = contents[1]["parts"].as_array().unwrap();
+        assert_eq!(responses.len(), 4);
+        assert_eq!(responses[0]["functionResponse"]["id"], "opaque-a");
+        assert_eq!(responses[1]["functionResponse"]["id"], "opaque-b");
+        assert_eq!(responses[0]["functionResponse"]["name"], "Rd");
+        assert_eq!(responses[2]["text"], "results");
+        assert_eq!(responses[3]["text"], "continue");
     }
 
     #[test]
