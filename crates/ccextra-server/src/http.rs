@@ -512,6 +512,15 @@ async fn handle_messages(
     let route = resolve_route(&model, &providers)?;
     let payload_rules = state.payload_rules.read().await;
 
+    // tool_result 截断策略按上游客户端分流(仅 Responses 协议生效):
+    // - grok 模型 → grok-build 客户端策略(40KB 预算,2KB 预览 + footer)
+    // - 其余(GPT 等)→ codex 客户端策略(10KB bytes 前缀截断)
+    let truncation_strategy = if is_grok_model(&route.upstream_model) {
+        ccextra_core::normalize::UpstreamTruncation::GrokBuild
+    } else {
+        ccextra_core::normalize::UpstreamTruncation::Codex
+    };
+
     // 3. 归一化第一遍(按协议:claude 直通全量 / openai 转换前精简)
     // 对齐:claude 直通走 /v1/messages(全量),openai 走转换前
     // 精简子集(跳过 tool-def sort / volatile / cache_control / drift——
@@ -575,7 +584,7 @@ async fn handle_messages(
         Protocol::OpenAiChat => {
             convert_to_openai_chat(&mut body_json, &route.upstream_model)?;
             if normalize_enabled {
-                normalize_target_post(&mut body_json, TargetShape::OpenAiChat);
+                normalize_target_post(&mut body_json, TargetShape::OpenAiChat, None);
                 observe_drift_for(
                     &state.drift,
                     &headers,
@@ -616,7 +625,11 @@ async fn handle_messages(
                 }
             }
             if normalize_enabled {
-                normalize_target_post(&mut body_json, TargetShape::OpenAiResponses);
+                normalize_target_post(
+                    &mut body_json,
+                    TargetShape::OpenAiResponses,
+                    Some(truncation_strategy),
+                );
                 observe_drift_for(
                     &state.drift,
                     &headers,
