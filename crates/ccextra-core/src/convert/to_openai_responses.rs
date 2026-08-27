@@ -21,6 +21,7 @@ use base64::engine::general_purpose::{URL_SAFE, URL_SAFE_NO_PAD};
 use base64::Engine;
 use serde_json::{json, Value};
 
+use super::gemini_schema::inline_local_refs;
 use super::shorten::{build_short_name_map, shorten_name_if_needed};
 use super::Result;
 
@@ -497,6 +498,22 @@ fn normalize_tool_parameters(schema: &Value) -> Value {
     if schema.is_null() || !schema.is_object() {
         return json!({"type": "object", "properties": {}});
     }
+    // 本地 $ref 内联;内联发生后删除 $defs/definitions 容器
+    // (对齐 CPA normalizeXAITool InlineLocalRefs)
+    let mut inlined_owned;
+    let schema: &Value = {
+        let inlined = inline_local_refs(schema);
+        if &inlined == schema {
+            schema
+        } else {
+            inlined_owned = inlined;
+            if let Some(obj) = inlined_owned.as_object_mut() {
+                obj.remove("$defs");
+                obj.remove("definitions");
+            }
+            &inlined_owned
+        }
+    };
     // xAI 系上游(对齐 CPA normalizeXAIObjectRootUnionBranchTypes +
     // xaiFunctionParametersNeedSimplification):root 为 object 且带 root union 时,
     // 先补缺失 type,仍非 object-only → 整体简化,宁可工具参数不可用也不让请求被拒。
@@ -513,7 +530,8 @@ fn normalize_tool_parameters(schema: &Value) -> Value {
                 continue;
             };
             for branch_schema in arr.iter_mut() {
-                if branch_schema.get("type").is_none() {
+                // 含 $ref 的分支不补 type(对齐 CPA:$ref 分支跳过补 type)
+                if branch_schema.get("type").is_none() && branch_schema.get("$ref").is_none() {
                     branch_schema["type"] = json!("object");
                 }
             }
@@ -1418,6 +1436,56 @@ mod tests {
         assert_eq!(
             body["tools"][0]["parameters"]["properties"]["v"]["type"],
             "string"
+        );
+    }
+
+    #[test]
+    fn test_tool_schema_local_refs_inlined() {
+        // 本地 $ref 内联,内联后删除 $defs(对齐 CPA normalizeXAITool InlineLocalRefs)
+        let mut body = json!({
+            "model": "test",
+            "messages": [],
+            "tools": [
+                {"name": "r", "input_schema": {
+                    "type": "object",
+                    "properties": {"user": {"$ref": "#/$defs/User"}},
+                    "$defs": {"User": {
+                        "type": "object",
+                        "properties": {"name": {"type": "string"}}
+                    }}
+                }}
+            ]
+        });
+        convert_to_openai_responses(&mut body, "test-model").unwrap();
+        let params = &body["tools"][0]["parameters"];
+        assert!(params.get("$defs").is_none());
+        assert_eq!(params["properties"]["user"]["type"], "object");
+        assert_eq!(
+            params["properties"]["user"]["properties"]["name"]["type"],
+            "string"
+        );
+    }
+
+    #[test]
+    fn test_tool_schema_union_unresolved_ref_simplified() {
+        // 无法内联的 $ref 分支不补 type,非 object-only → 整体简化(对齐 CPA)
+        let mut body = json!({
+            "model": "test",
+            "messages": [],
+            "tools": [
+                {"name": "r", "input_schema": {
+                    "type": "object",
+                    "oneOf": [
+                        {"$ref": "#/$defs/Missing"},
+                        {"type": "object", "properties": {"a": {"type": "string"}}}
+                    ]
+                }}
+            ]
+        });
+        convert_to_openai_responses(&mut body, "test-model").unwrap();
+        assert_eq!(
+            body["tools"][0]["parameters"],
+            json!({"type": "object", "properties": {}, "additionalProperties": true})
         );
     }
 

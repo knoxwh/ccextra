@@ -214,7 +214,7 @@ fn append_hint(map: &mut Map<String, Value>, hint: &str) {
 
 /// 对齐 CPA inlineLocalRefs:定义容器被剥离前,内联本地 $ref
 /// 每次展开获得独立副本,兄弟关键字覆盖被引用定义,环引用退化为类型化提示
-fn inline_local_refs(schema: &Value) -> Value {
+pub(crate) fn inline_local_refs(schema: &Value) -> Value {
     fn contains_ref(v: &Value) -> bool {
         match v {
             Value::Object(m) => m.contains_key("$ref") || m.values().any(contains_ref),
@@ -451,6 +451,7 @@ const UNSUPPORTED_CONSTRAINTS: &[&str] = &[
     "minItems",
     "maxItems",
     "uniqueItems",
+    "contains",
     "format",
     "default",
     "examples",
@@ -471,9 +472,7 @@ fn move_constraints_to_description(schema: &mut Value, opts: CleanOptions) {
             let Some(val) = map.get(*key) else {
                 continue;
             };
-            if val.is_object() || val.is_array() {
-                continue;
-            }
+            // object/array 值按原始 JSON 搬入提示(对齐 CPA val.Raw)
             let hint = format!("{}: {}", key, value_display_string(val));
             append_hint(map, &hint);
         }
@@ -592,6 +591,33 @@ fn flatten_any_of_one_of(schema: &mut Value) {
                 continue;
             }
             let arr = arr.clone();
+
+            // 父节点已有 properties(如对象 schema 带 anyOf/oneOf 约束):
+            // 不替换父节点,各分支 properties 并入父节点后删 union 关键字(对齐 CPA)
+            if map.get("properties").is_some_and(|p| p.is_object()) {
+                let mut has_null = false;
+                for item in &arr {
+                    if item.get("type").and_then(|t| t.as_str()) == Some("null") {
+                        has_null = true;
+                    }
+                    let Some(Value::Object(branch_props)) = item.get("properties") else {
+                        continue;
+                    };
+                    let branch_props = branch_props.clone();
+                    let Value::Object(parent_props) = map.get_mut("properties").unwrap() else {
+                        continue;
+                    };
+                    for (k, v) in branch_props {
+                        merge_missing_schema(parent_props, &k, &v);
+                    }
+                }
+                if has_null {
+                    map.insert("nullable".into(), Value::Bool(true));
+                }
+                map.shift_remove(key);
+                continue;
+            }
+
             let parent_desc = map
                 .get("description")
                 .and_then(|d| d.as_str())
@@ -654,8 +680,11 @@ fn select_best(items: &[Value]) -> (usize, Vec<String>) {
             (2, if t.is_empty() { "array" } else { t })
         } else if !t.is_empty() && t != "null" {
             (1, t)
+        } else if t == "null" {
+            (0, "null")
         } else {
-            (0, if t.is_empty() { "null" } else { t })
+            // 无类型分支不计入 types(对齐 CPA:空类型不再默认 "null")
+            (0, "")
         };
         if !t.is_empty() {
             types.push(t.to_string());
@@ -861,10 +890,18 @@ fn remove_placeholder_fields(schema: &mut Value) {
     });
 }
 
-/// 对齐 CPA cleanupRequiredFields:required 仅保留 properties 中存在的键
+/// 对齐 CPA cleanupRequiredFields:required 仅保留 properties 中存在的键;
+/// required 是数组但 properties 缺失/非对象时删除 required
 fn cleanup_required_fields(schema: &mut Value) {
     let mut path = Vec::new();
     walk_objects(schema, &mut path, &mut |_, map| {
+        if !map.get("required").is_some_and(|r| r.is_array()) {
+            return;
+        }
+        if !map.get("properties").is_some_and(|p| p.is_object()) {
+            map.shift_remove("required");
+            return;
+        }
         let (Some(Value::Array(req)), Some(Value::Object(props))) =
             (map.get("required"), map.get("properties"))
         else {
@@ -1538,5 +1575,53 @@ mod tests {
         assert_eq!(address["type"], "object");
         assert_eq!(address["properties"]["city"]["type"], "string");
         assert_eq!(address["required"], json!(["city"]));
+    }
+
+    #[test]
+    fn test_anyof_required_only_branches_keep_parent_properties() {
+        // 对齐 CPA issue 5219 #2:required-only 分支不得覆盖父节点 type/properties
+        let input = json!({
+            "type": "object",
+            "anyOf": [
+                {"required": ["left"]},
+                {"required": ["right"]}
+            ],
+            "properties": {
+                "left": {"type": "integer"},
+                "right": {"type": "integer"}
+            },
+            "additionalProperties": false
+        });
+        let out = clean_json_schema_for_antigravity(&input);
+        assert_eq!(out["type"], "object");
+        assert!(out["properties"]["left"].is_object());
+        assert!(out["properties"]["right"].is_object());
+        assert!(out.get("anyOf").is_none());
+    }
+
+    #[test]
+    fn test_contains_keyword_stripped_with_hint() {
+        // 对齐 CPA issue 5219 #3:contains 剥离并搬入 description 提示
+        let input = json!({
+            "type": "object",
+            "properties": {
+                "tags": {
+                    "type": "array",
+                    "items": {"type": "string"},
+                    "contains": {"enum": ["x"]}
+                }
+            },
+            "required": ["tags"],
+            "additionalProperties": false
+        });
+        for out in [
+            clean_json_schema_for_antigravity(&input),
+            clean_json_schema_for_gemini(&input),
+        ] {
+            let tags = &out["properties"]["tags"];
+            assert!(tags.get("contains").is_none());
+            let desc = tags["description"].as_str().unwrap_or("");
+            assert!(desc.contains("contains"), "desc: {desc}");
+        }
     }
 }

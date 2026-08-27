@@ -343,10 +343,10 @@ fn cache_chunk_metadata(chunk: &Value, state: &mut GeminiStreamState) {
         }
     }
     if let Some(usage) = chunk.get("usageMetadata") {
-        // 流式:input = prompt - cached(对齐 CPA Params.PromptTokenCount)
+        // 流式:input = prompt - cached,负数钳 0(对齐 CPA Params.PromptTokenCount)
         let cached = i64_field(usage, "cachedContentTokenCount");
         state.has_usage = true;
-        state.prompt_tokens = i64_field(usage, "promptTokenCount") - cached;
+        state.prompt_tokens = (i64_field(usage, "promptTokenCount") - cached).max(0);
         state.output_tokens =
             i64_field(usage, "candidatesTokenCount") + i64_field(usage, "thoughtsTokenCount");
         state.cache_read = cached;
@@ -536,7 +536,7 @@ pub fn convert_gemini_response(
         anthropic["stop_reason"] = json!(stop_reason);
     }
 
-    // 使用统计:非流 input 不扣 cached;cached>0 写 cache_read(对齐 CPA 非流)
+    // 使用统计:非流 input = prompt - cached(负数钳 0);cached>0 写 cache_read(对齐 CPA 非流)
     // Antigravity 非流可能暂用 cpaUsageMetadata,先兼容两种字段名。
     match response
         .get("usageMetadata")
@@ -544,8 +544,9 @@ pub fn convert_gemini_response(
     {
         Some(usage) => {
             let cached = i64_field(usage, "cachedContentTokenCount");
+            let input = (i64_field(usage, "promptTokenCount") - cached).max(0);
             anthropic["usage"] = usage_object(
-                i64_field(usage, "promptTokenCount"),
+                input,
                 i64_field(usage, "candidatesTokenCount") + i64_field(usage, "thoughtsTokenCount"),
                 cached,
             );
@@ -776,7 +777,7 @@ mod tests {
 
     #[test]
     fn test_convert_gemini_response_emits_cache_read() {
-        // 对齐 CPA 非流:input 不扣 cached;cached>0 写 cache_read
+        // 对齐 CPA 非流:input = prompt - cached;cached>0 写 cache_read
         let gemini = json!({
             "candidates": [{
                 "content": {"parts": [{"text": "hi"}], "role": "model"},
@@ -789,8 +790,27 @@ mod tests {
             }
         });
         let anthropic = convert_gemini_response(&gemini, &HashMap::new());
-        assert_eq!(anthropic["usage"]["input_tokens"], 100);
+        assert_eq!(anthropic["usage"]["input_tokens"], 60);
         assert_eq!(anthropic["usage"]["output_tokens"], 20);
+        assert_eq!(anthropic["usage"]["cache_read_input_tokens"], 40);
+    }
+
+    #[test]
+    fn test_convert_gemini_response_clamps_negative_input() {
+        // 对齐 CPA:prompt < cached 时 input 钳 0
+        let gemini = json!({
+            "candidates": [{
+                "content": {"parts": [{"text": "hi"}], "role": "model"},
+                "finishReason": "STOP"
+            }],
+            "usageMetadata": {
+                "promptTokenCount": 5,
+                "candidatesTokenCount": 3,
+                "cachedContentTokenCount": 40
+            }
+        });
+        let anthropic = convert_gemini_response(&gemini, &HashMap::new());
+        assert_eq!(anthropic["usage"]["input_tokens"], 0);
         assert_eq!(anthropic["usage"]["cache_read_input_tokens"], 40);
     }
 
