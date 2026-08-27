@@ -33,7 +33,8 @@ ccextra :8222  ──  route → normalize → convert → upstream
 | **Model routing** | Inbound model name resolves via alias to exactly one provider. Conflicts fail at startup; no implicit fallback |
 | **Byte-level passthrough** | Claude → Claude changes only the `model` field. Remaining bytes stay intact so normalization is not undone |
 | **Prompt-cache optimization** | Nine-module normalization kills serialization drift so upstream prompt cache can hit. A drift detector watches blind spots across turns |
-| **Streaming state machines** | Hand-written SSE parser plus five independent relay paths (Claude / OpenAI Chat / Responses / Gemini / Antigravity). A dropped stream emits a structured error event instead of a bare hang-up |
+| **Streaming state machines** | Hand-written SSE parser plus five independent relay paths (Claude / OpenAI Chat / Responses / Gemini / Antigravity). A dropped stream emits a structured error event instead of a bare hang-up; all streaming paths wrap a 10s idle keepalive (`: keepalive`) frame |
+| **Fault retry** | Upstream 429 / 5xx / network errors retry with exponential backoff respecting `Retry-After` (capped by a 10s total budget) |
 | **Hot reload** | `POST /reload` updates providers / payload / normalize / `user_agents` / `logging.request_body` / secret / global proxy without restart, and clears the bcrypt verify cache. `logging.level` applies at startup only |
 | **Proxy** | Global default plus per-provider override. SOCKS supported |
 | **Payload overrides** | Wildcard match on model name (e.g. `*glm*`) to override request params. Can be scoped to a protocol |

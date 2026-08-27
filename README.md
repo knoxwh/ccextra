@@ -33,7 +33,8 @@ ccextra :8222  ──  路由 → 归一化 → 协议转换 → 上游请求
 | **模型路由** | 入站模型名按 alias 解析到唯一 provider，冲突启动即报错，不做隐式推导 |
 | **字节级直通** | Claude → Claude 只改 model 字段，其余字节原样保留，保住归一化成果 |
 | **prompt 缓存优化** | 九模块归一化消除序列化漂移，命中上游 prompt cache；drift 检测器跨轮观测盲区 |
-| **流式状态机** | 手写 SSE 解析器 + 五条独立转发路径（claude / openai chat / responses / gemini / antigravity），断流发结构化 error 兜底，不裸断流 |
+| **流式状态机** | 手写 SSE 解析器 + 五条独立转发路径（claude / openai chat / responses / gemini / antigravity），断流发结构化 error 兜底，流式全路径统一包装 10s 空闲心跳（`: keepalive`）防中间掐断 |
+| **故障重试** | 上游 429 / 5xx / 网络错误支持指数退避重试（尊重 `Retry-After`，10s 总预算封顶） |
 | **热重载** | `POST /reload` 无需重启更新 providers / payload / normalize / `user_agents` / `logging.request_body` / secret / 全局代理，并清空 bcrypt 校验缓存；`logging.level` 仅启动生效 |
 | **代理支持** | 全局 + 每 provider 覆盖，支持 SOCKS |
 | **参数覆盖** | 按模型名通配符匹配（如 `*glm*`）覆盖请求参数，可限定协议生效 |

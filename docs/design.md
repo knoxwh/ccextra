@@ -50,7 +50,7 @@ body["model"] = Value::String(upstream_model.to_string());
   ├─ claude 直通: normalize_anthropic_full (9 模块)
   │    - tool_def sort / smoosh split / bookkeeping strip
   │    - tool_input normalize / sort stabilize / reminder rstrip
-  │    - volatile strip / cache_control inject / drift detect
+  │    - volatile dateline normalize / cache_control inject / drift detect
   ├─ openai 转换路径: normalize_anthropic_pretransform (5 模块子集)
   │    - smoosh split / bookkeeping strip / tool_input normalize
   │    - sort stabilize / reminder rstrip
@@ -59,10 +59,10 @@ body["model"] = Value::String(upstream_model.to_string());
        - 输入仍是 anthropic 形状,子集安全幂等
        - 不写 cachedContent,不注入 prompt_cache_key,跳过 post 归一化与 drift
     ↓
-协议转换 (body-to-body，content 形态归一化)
+协议转换 (body-to-body，content 形态归一化；tool_result 内嵌 image 抽出追加至随后 user 消息)
     ↓
 normalize_target_post (4 模块，仅 openai 转换路径；gemini/antigravity 跳过)
-  - tool_def normalize / sort stabilize / reminder rstrip / volatile strip
+  - tool_def normalize / sort stabilize / reminder rstrip / volatile dateline normalize
     ↓
 drift 观测 (claude / openai chat 在各自归一化后；gemini/antigravity 跳过)
     ↓
@@ -143,8 +143,8 @@ Claude Code → ccextra:8222
 8. 剥离 prompt_cache_retention (非 claude 路径)
 9. prompt_cache_key 注入 (provider 级开关,仅 openai;chat+grok 跳过,见 §12;grok 判定用 payload 后出站 model)
 10. 诊断落盘 (可选) + claude 直通: anthropic-beta 重建 + 身份头透传
-11. 统一走 UpstreamClient.request (按协议取 URL/UA;多 base_url 按序回退)
-12. 响应转发 (流式 SSE 五臂, gemini/antigravity 共用状态机 / 非流: claude 字节直通, 其余转回 anthropic; 上游错误转 anthropic 形状)
+11. 统一走 UpstreamClient.request (按协议取 URL/UA;多 base_url 按序回退;网络错误/429/5xx 走 10s 总预算指数退避重试并尊重 Retry-After)
+12. 响应转发 (流式 SSE 五臂包装 10s 空闲心跳 `: keepalive\n\n`, gemini/antigravity 共用状态机 / 非流: claude 字节直通, 其余转回 anthropic; 上游错误转 anthropic 形状)
     ↓
 上游 Provider
 ```
