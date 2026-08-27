@@ -7,9 +7,11 @@
 //!
 //! - [`volatile_detector`] — PR-E5：扫描入站请求体，查找会破坏
 //!   prompt-cache 命中的模式（ISO 8601 时间戳、UUID v4、
-//!   以 ID 命名的字段）。发出 WARN 日志，并可通过
-//!   [`strip_volatile_from_prefix`] **剥离** cache prefix（system + tools）
-//!   中的易变内容，使 prefix 在多次轮次间保持稳定。
+//!   以 ID 命名的字段）。仅发出 WARN 日志（只读观测）。
+//!   [`normalize_client_dateline`] 把 "Today's date is …" 指纹句还原为
+//!   ASCII 撇号 + 连字符日期（对齐 sub2api anthropicfp，抹除
+//!   4 种撇号 × 2 种分隔符的 3 bit 隐写信号）。原占位符剥离路径已
+//!   下线并移除（替换改变上游可见语义）。
 //! - [`drift_detector`] — PR-E6：对每个会话的 cache 热区
 //!   （system / tools / early messages）计算结构哈希。首次见到时发出
 //!   `cache_drift_first_request`，同一会话的连续请求在任一维度上不一致时
@@ -53,4 +55,4 @@ pub use tool_def_normalize::{
 };
 pub use tool_input_normalize::normalize_tool_use_inputs;
 pub use truncate_tool_results::UpstreamTruncation;
-pub use volatile_detector::strip_volatile_from_prefix;
+pub use volatile_detector::normalize_client_dateline;

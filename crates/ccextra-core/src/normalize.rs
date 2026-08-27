@@ -24,13 +24,17 @@ use crate::cache_stabilization::tool_def_normalize::{
 };
 use crate::cache_stabilization::tool_input_normalize::normalize_tool_use_inputs;
 use crate::cache_stabilization::volatile_detector::{
-    detect_volatile_content, emit_volatile_warnings, strip_volatile_from_prefix,
+    detect_volatile_content, emit_volatile_warnings, normalize_client_dateline,
     ApiKind as VolatileApiKind,
 };
 
 pub use crate::cache_stabilization::truncate_tool_results::UpstreamTruncation;
 
 /// 归一化命中的计数,便于测试与日志
+///
+/// `volatile_count` 现在计 dateline 指纹句改写个数(撇号/分隔符隐写还原,
+/// 对齐 sub2api);占位符式 volatile strip 已下线。检测告警仍跑(full
+/// 管线只读 WARN)。pretransform 不跑 dateline,该字段恒 0。
 #[derive(Debug, Default, Clone, Copy, PartialEq, Eq)]
 pub struct NormalizeCounts {
     pub tool_sorted: bool,
@@ -39,6 +43,7 @@ pub struct NormalizeCounts {
     pub tool_input_count: usize,
     pub sort_count: usize,
     pub rstrip_count: usize,
+    /// dateline 指纹句改写的文本块个数
     pub volatile_count: usize,
     pub cache_control_placed: usize,
 }
@@ -59,7 +64,7 @@ pub enum TargetShape {
 /// 4. tool_use.input 键序归一化
 /// 5. system reminder 列表块排序
 /// 6. 尾部 reminder 空白归一化
-/// 7. 前缀 volatile 剥离(仅全量)
+/// 7. 客户端 dateline 归一化(仅全量;撇号/分隔符隐写还原,对齐 sub2api)
 /// 8. cache_control 自动注入(仅全量)
 /// 9. volatile 检测→告警(只读,不改 body)
 ///
@@ -95,8 +100,8 @@ pub fn normalize_anthropic_full(body: &mut Value) -> NormalizeCounts {
     // 6. 尾部 reminder 空白归一化
     counts.rstrip_count = normalize_reminder_trailing_whitespace(body, DriftApiKind::Anthropic);
 
-    // 7. 前缀 volatile 剥离
-    counts.volatile_count = strip_volatile_from_prefix(body, VolatileApiKind::Anthropic);
+    // 7. 客户端 dateline 归一化(撇号/分隔符隐写还原,对齐 sub2api)
+    counts.volatile_count = normalize_client_dateline(body, VolatileApiKind::Anthropic);
 
     // 8. cache_control 自动注入
     if let AutoPlaceOutcome::Applied { placed_count, .. } = auto_place_anthropic_cache_control(body)
@@ -104,7 +109,7 @@ pub fn normalize_anthropic_full(body: &mut Value) -> NormalizeCounts {
         counts.cache_control_placed = placed_count;
     }
 
-    // 9. volatile 检测→告警(只读)
+    // 9. volatile 检测→告警(只读,不改 body)
     let findings = detect_volatile_content(body, VolatileApiKind::Anthropic);
     if !findings.is_empty() {
         emit_volatile_warnings(&findings, "unknown");
@@ -151,13 +156,13 @@ pub fn normalize_anthropic_pretransform(body: &mut Value) -> NormalizeCounts {
     }
 }
 
-/// 转换后目标 body 二次归一化:tool_def + sort + rstrip + volatile
+/// 转换后目标 body 二次归一化:tool_def + sort + rstrip + dateline 归一化
 ///
 /// 顺序(post-transform):
 /// 1. tool_def 归一化(按 chat / responses 形状区分)
 /// 2. system reminder 列表块排序(CC 注入的 skills/deferred 列表顺序不稳定)
 /// 3. 尾部 reminder 空白归一化(CC 重序列化历史内容时字节漂移 #48734)
-/// 4. volatile 剥离(工具参数里残留的时间戳/UUID)
+/// 4. 客户端 dateline 归一化(撇号/分隔符隐写还原,对齐 sub2api)
 ///
 /// tool_result 截断不在本管线:策略须按 payload 覆盖后的出站模型判定,
 /// 由 server 层在 apply_payload_overrides 之后单独调用
@@ -189,8 +194,8 @@ pub fn normalize_target_post(body: &mut Value, shape: TargetShape) -> NormalizeC
     // 3. 尾部 reminder 空白归一化
     counts.rstrip_count = normalize_reminder_trailing_whitespace(body, kind);
 
-    // 4. volatile 剥离(openai 两种形状共用同一 walker)
-    counts.volatile_count = strip_volatile_from_prefix(body, VolatileApiKind::OpenAi);
+    // 4. 客户端 dateline 归一化(openai 两种形状共用;对齐 sub2api)
+    counts.volatile_count = normalize_client_dateline(body, VolatileApiKind::OpenAi);
 
     counts
 }

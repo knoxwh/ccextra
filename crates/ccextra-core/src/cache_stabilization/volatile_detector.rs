@@ -26,9 +26,10 @@
 //!
 //! **检测**函数（`detect_volatile_content`、`scan_string`）只读——
 //! 它们接收 `&Value` 且从不修改。
-//! **剥离**函数（`strip_volatile_from_prefix`）通过将易变子串替换为
-//! 确定性占位符来修改 cache prefix（system + tools）。user/assistant
-//! 消息从不被触碰。
+//! **改写**函数（[`normalize_client_dateline`]）把 "Today's date is …"
+//! 指纹句还原为 ASCII 撇号 + 连字符日期（对齐 sub2api anthropicfp）。
+//! 占位符式剥离（`strip_volatile_from_prefix`）已下线并移除：
+//! 替换改变上游可见语义，退出。
 //!
 //! # 检测策略
 //!
@@ -43,7 +44,6 @@
 //!   [`ApiKind`] 枚举选择正确的遍历器。Bedrock / Vertex 等会放在
 //!   Phase E 的后续工作中——本 PR 保持接口面紧凑。
 
-use super::json_walker::ToolWalker;
 use serde_json::Value;
 
 /// 易变遍历器的简化二值视图：Anthropic 一次遍历，所有 OpenAI 形态共享另一次。
@@ -166,9 +166,8 @@ fn walk_anthropic(body: &Value, out: &mut Vec<VolatileFinding>) {
         return;
     }
     // 只扫描缓存的 PREFIX 区域：system + tools。
-    // messages[] 故意不扫描，因为 (a) strip_volatile_from_prefix 无法触碰它们，
-    // 那里的警告无从处理；(b) cache prefix 仅由 system + tools 派生，
-    // 因此 messages 内的易变内容不会破坏 prefix。扫描它们只会产生噪音
+    // messages[] 故意不扫描：cache prefix 仅由 system + tools 派生，
+    // messages 内的易变内容不破坏 prefix，扫描只会产生噪音
     // （例如历史 tool_result 时间戳/UUID）。
     // system: string | array of content blocks
     if let Some(system) = body.get("system") {
@@ -201,9 +200,8 @@ fn is_responses_direct_tool(tool: &Value) -> bool {
 
 fn walk_openai(body: &Value, out: &mut Vec<VolatileFinding>) {
     // 只扫描缓存的 PREFIX 区域：instructions（Responses 的 system prompt）
-    // + tools。messages[] / input[] 中的条目故意不扫描——
-    // strip_volatile_from_prefix 无法触碰它们，cache prefix 仅由
-    // instructions + tools 派生，扫描它们只会产生噪音
+    // + tools。messages[] / input[] 中的条目故意不扫描：
+    // cache prefix 仅由 instructions + tools 派生，扫描只会产生噪音
     // （历史 tool_result 时间戳/UUID）。
     if let Some(Value::String(instructions)) = body.get("instructions") {
         scan_string(instructions, "instructions", out);
@@ -580,302 +578,235 @@ fn truncate_sample(s: &str) -> String {
     out
 }
 
-// ─── 易变内容消除 ────────────────────────────────────────────────────
-//
-// 将 **cache prefix**（system + tools）中的易变子串替换为确定性占位符，
-// 使前缀在多次轮次之间保持字节一致，尽管存在每请求的 ID/时间戳。
-//
-// user/assistant 消息故意不触碰——它们位于活跃区（live zone），
-// 那里的每轮变化是预期且无害的。
-
-/// ISO-8601 时间戳的占位符。每次替换长度相同，
-/// 使之后所有内容的字节偏移保持稳定。
-const TIMESTAMP_PLACEHOLDER: &str = "___TIMESTAMP___";
-
-/// 仅日期值（`YYYY-MM-DD` / `YYYY/MM/DD`）的占位符。
-const DATE_PLACEHOLDER: &str = "___DATE___";
-
-/// UUID v4 的占位符。每次替换长度相同。
-const UUID_PLACEHOLDER: &str = "___UUID___";
-
-/// ID 字段值的占位符。
-const ID_PLACEHOLDER: &str = "___ID___";
-
-/// 替换 cache prefix（system + tools）中的易变内容。
+/// 客户端 dateline 归一化（对齐 CLIProxyAPI/sub2api `anthropicfp`）。
 ///
-/// **只修改 prefix**——system prompt 和 tool 定义。
-/// user/assistant 消息保持不动，因为它们每轮变化，且不属于缓存前缀。
+/// 部分类 CC 客户端检测到非官方 base URL 时，会往
+/// `Today's date is YYYY-MM-DD.` 这一句注入隐写信号：4 种撇号码点
+/// （ASCII `'`、`’` U+2019、`ʼ` U+02BC、`ʹ` U+02B9）× 2 种分隔符
+/// （`-`/`/`）。本函数把命中句整段还原为 ASCII 撇号 + 连字符形式；
+/// 其余文本（用户 prose、tool_result、代码块）一字不动。
 ///
-/// 返回所做的替换次数（用于可观测性）。
-pub fn strip_volatile_from_prefix(body: &mut Value, kind: ApiKind) -> usize {
+/// 作用域（对齐真实客户端放置位置）：
+/// - Anthropic：`system`（字符串或 text 块）全量；`messages[].content` 的
+///   text 仅扫 `<system-reminder>` 块内（CC 第 2 轮起 dateline 藏在那里）
+/// - OpenAI：`instructions` 全量；`messages[]` / `input[]` 的
+///   system/developer 同上 reminder scoping；tools 不扫
+///
+/// 已规范的句子原样保留（identity）。返回发生改写的文本块个数
+/// （单块内命中多句计 1）。
+pub fn normalize_client_dateline(body: &mut Value, kind: ApiKind) -> usize {
     match kind {
-        ApiKind::Anthropic => strip_anthropic_volatile(body),
-        ApiKind::OpenAi => strip_openai_volatile(body),
+        ApiKind::Anthropic => normalize_dateline_anthropic(body),
+        ApiKind::OpenAi => normalize_dateline_openai(body),
     }
 }
 
-/// 从 Anthropic 请求体中剥离易变内容。
-/// 覆盖：system prompt + tools[].description + tools[].input_schema。
-fn strip_anthropic_volatile(body: &mut Value) -> usize {
+fn normalize_dateline_anthropic(body: &mut Value) -> usize {
     let mut count = 0;
-
-    // 从 system prompt（字符串或块数组）中剥离易变内容。
-    count += strip_anthropic_system(body);
-
-    // tools[].description + tools[].input_schema
-    if let Some(mut walker) = ToolWalker::new(body) {
-        count += walker.for_each(|tool| {
-            let mut tool_count = 0;
-            if let Some(Value::String(desc)) = tool.get_mut("description") {
-                tool_count += strip_string(desc);
-            }
-            if let Some(schema) = tool.get_mut("input_schema") {
-                tool_count += strip_value_recursive(schema);
-            }
-            tool_count
-        });
-    }
-
-    count
-}
-
-/// 从 OpenAI 请求体中剥离易变内容。
-/// 覆盖：instructions/system messages + tools[].function.* + 直接 tool 形态。
-fn strip_openai_volatile(body: &mut Value) -> usize {
-    let mut count = 0;
-
-    count += strip_openai_prefix_text(body);
-
-    if let Some(mut walker) = ToolWalker::new(body) {
-        count += walker.for_each(strip_openai_tool);
-    }
-
-    count
-}
-
-/// 从单个 OpenAI tool 定义中剥离易变内容。
-/// 同时处理 Chat/Completions 形态（function 包装）和 Responses 直接形态。
-fn strip_openai_tool(tool: &mut Value) -> usize {
-    let mut count = 0;
-
-    if let Some(function) = tool.get_mut("function") {
-        // Chat/Completions 形态：tools[].function.{description, parameters}
-        if let Some(Value::String(desc)) = function.get_mut("description") {
-            count += strip_string(desc);
-        }
-        if let Some(params) = function.get_mut("parameters") {
-            count += strip_value_recursive(params);
-        }
-    } else if is_responses_direct_tool(tool) {
-        // Responses 直接形态：tools[].{description, parameters}
-        if let Some(Value::String(desc)) = tool.get_mut("description") {
-            count += strip_string(desc);
-        }
-        if let Some(params) = tool.get_mut("parameters") {
-            count += strip_value_recursive(params);
-        }
-    }
-
-    count
-}
-
-/// 从 Anthropic `system` 字段（字符串或块数组）中剥离易变内容。
-fn strip_anthropic_system(body: &mut Value) -> usize {
-    let mut count = 0;
-    let Some(system) = body.get_mut("system") else {
-        return 0;
-    };
-    match system {
-        Value::String(s) => {
-            count += strip_string(s);
-        }
-        Value::Array(blocks) => {
-            for block in blocks.iter_mut() {
-                if let Some(Value::String(text)) = block.get_mut("text") {
-                    count += strip_string(text);
+    if let Some(system) = body.get_mut("system") {
+        match system {
+            Value::String(s) => count += normalize_dateline_text(s, false),
+            Value::Array(blocks) => {
+                for block in blocks.iter_mut() {
+                    if let Some(Value::String(text)) = block.get_mut("text") {
+                        count += normalize_dateline_text(text, false);
+                    }
                 }
             }
+            _ => {}
         }
-        _ => {}
     }
-    count
-}
 
-/// 从 OpenAI 前缀中剥离易变内容：`instructions`、
-/// `messages[].role==system` 以及 `input[].role in (system, developer)`。
-fn strip_openai_prefix_text(body: &mut Value) -> usize {
-    let mut count = 0;
-    if let Some(Value::String(instructions)) = body.get_mut("instructions") {
-        count += strip_string(instructions);
-    }
     if let Some(Value::Array(messages)) = body.get_mut("messages") {
-        for message in messages {
-            match message.get("role").and_then(Value::as_str) {
-                Some("system") | Some("developer") => {
-                    count += strip_openai_content(message.get_mut("content"));
-                }
-                _ => {}
-            }
-        }
-    }
-    if let Some(Value::Array(input)) = body.get_mut("input") {
-        for item in input {
-            match item.get("role").and_then(Value::as_str) {
-                Some("system") | Some("developer") => {
-                    count += strip_openai_content(item.get_mut("content"));
-                }
-                _ => {}
+        for message in messages.iter_mut() {
+            if let Some(content) = message.get_mut("content") {
+                count += normalize_dateline_message_content(content);
             }
         }
     }
     count
 }
 
-/// 从 OpenAI content 字段（字符串或 parts 数组）中剥离易变内容。
-fn strip_openai_content(content: Option<&mut Value>) -> usize {
+fn normalize_dateline_openai(body: &mut Value) -> usize {
     let mut count = 0;
+
+    if let Some(Value::String(instructions)) = body.get_mut("instructions") {
+        count += normalize_dateline_text(instructions, false);
+    }
+
+    for key in ["messages", "input"] {
+        if let Some(Value::Array(items)) = body.get_mut(key) {
+            for item in items.iter_mut() {
+                // 角色不过滤，与 sub2api 一致：改写只发生在
+                // <system-reminder> 块内，由 scoping 守门
+                if let Some(content) = item.get_mut("content") {
+                    count += normalize_dateline_message_content(content);
+                }
+            }
+        }
+    }
+    count
+}
+
+/// 单条消息 content：字符串或块数组。text 块按 reminder scoping 处理。
+fn normalize_dateline_message_content(content: &mut Value) -> usize {
     match content {
-        Some(Value::String(s)) => {
-            count += strip_string(s);
-        }
-        Some(Value::Array(parts)) => {
-            for part in parts.iter_mut() {
-                if let Some(Value::String(text)) = part.get_mut("text") {
-                    count += strip_string(text);
-                }
-            }
-        }
-        _ => {}
+        Value::String(s) => normalize_dateline_text(s, true),
+        Value::Array(blocks) => blocks
+            .iter_mut()
+            .filter_map(|block| block.get_mut("text"))
+            .map(normalize_dateline_message_content)
+            .sum(),
+        _ => 0,
     }
-    count
 }
 
-/// 替换字符串值中的易变子串。
-fn strip_string(s: &mut String) -> usize {
-    let mut count = 0;
-    let bytes = s.as_bytes();
-    let len = bytes.len();
-    let mut replacements: Vec<(usize, usize, &str)> = Vec::new();
+const DATELINE_PREFIX_ASCII: &[u8] = b"Today";
+const REMINDER_OPEN: &str = "<system-reminder>";
+const REMINDER_CLOSE: &str = "</system-reminder>";
 
+/// 撇号码点：ASCII + 三种 Unicode 变体（隐写信号）。
+/// 变体为多字节 UTF-8，长度 1/2/3 字节，按字节序从长到短排列避免前缀吞并。
+const DATELINE_APOSTROPHES: &[&str] = &["\u{2019}", "\u{02BC}", "\u{02B9}", "'"];
+
+/// 在 `pos` 处解析 dateline 尾部：撇号 + "s date is YYYY?MM?DD."。
+/// 两分隔符必须一致。命中时返回 (句末偏移, 规范形式)。
+fn parse_dateline_at(seg: &str, bytes: &[u8], pos: usize) -> Option<(usize, String)> {
+    let mut apo_end = pos;
+    let mut matched = false;
+    for candidate in DATELINE_APOSTROPHES {
+        if bytes[pos..].starts_with(candidate.as_bytes()) {
+            matched = true;
+            apo_end = pos + candidate.len();
+            break;
+        }
+    }
+    if !matched {
+        return None;
+    }
+    if !bytes[apo_end..].starts_with(b"s date is ") {
+        return None;
+    }
+    let date_start = apo_end + b"s date is ".len();
+    if date_start + 11 > bytes.len() {
+        return None;
+    }
+    // YYYY S MM S DD . （两分隔符一致）
+    let w = &bytes[date_start..date_start + 11];
+    let digit = |i: usize| w[i].is_ascii_digit();
+    if !(digit(0) && digit(1) && digit(2) && digit(3)) {
+        return None;
+    }
+    let sep = w[4];
+    if sep != b'-' && sep != b'/' {
+        return None;
+    }
+    if !(digit(5) && digit(6)) || w[7] != sep || !(digit(8) && digit(9)) || w[10] != b'.' {
+        return None;
+    }
+    let year = &seg[date_start..date_start + 4];
+    let month = &seg[date_start + 5..date_start + 7];
+    let day = &seg[date_start + 8..date_start + 10];
+    // 规范形式恒用 ASCII 撇号 + 连字符（对齐 sub2api canonicalize）
+    Some((
+        date_start + 11,
+        format!("Today's date is {year}-{month}-{day}."),
+    ))
+}
+
+/// 在 `from` 起的字节偏移之后查找子串，返回绝对字节下标。
+fn find_sub(hay: &[u8], from: usize, needle: &[u8]) -> Option<usize> {
+    if needle.is_empty() || from >= hay.len() {
+        return None;
+    }
+    hay[from..]
+        .windows(needle.len())
+        .position(|w| w == needle)
+        .map(|p| p + from)
+}
+
+/// 在字符串内改写全部指纹 dateline 句。
+///
+/// `reminder_scoped_only` 为 true 时只处理 `<system-reminder>` 块内的子串
+/// （messages 内容用），false 时全量（system/instructions 用）。
+fn normalize_dateline_text(s: &mut String, reminder_scoped_only: bool) -> usize {
+    let hay = s.clone();
+    let mut regions: Vec<(usize, usize)> = Vec::new();
+    if reminder_scoped_only {
+        let bytes = hay.as_bytes();
+        let mut cursor = 0usize;
+        while let Some(rel) = find_sub(bytes, cursor, REMINDER_OPEN.as_bytes()) {
+            let start = rel + REMINDER_OPEN.len();
+            let end_rel = find_sub(bytes, start, REMINDER_CLOSE.as_bytes());
+            let end = end_rel.unwrap_or(hay.len()).min(hay.len());
+            cursor = end.min(hay.len());
+            regions.push((start, end));
+            if end >= hay.len() {
+                break;
+            }
+        }
+    } else {
+        regions.push((0, hay.len()));
+    }
+
+    let mut changed = false;
+    let mut out = String::with_capacity(hay.len());
+    let mut last = 0usize;
+    for (start, end) in regions {
+        out.push_str(&hay[last..start]);
+        let (seg, seg_changed) = rewrite_datelines(&hay[start..end]);
+        out.push_str(&seg);
+        changed |= seg_changed;
+        last = end;
+    }
+    out.push_str(&hay[last..]);
+    if !changed {
+        return 0;
+    }
+    *s = out;
+    1
+}
+
+/// 扫描一段文本，把每个指纹 dateline 句还原为规范形式。
+/// 返回 (新文本, 是否有改写)；已规范的句子原样拼回。
+fn rewrite_datelines(seg: &str) -> (String, bool) {
+    let bytes = seg.as_bytes();
+    let mut pieces: Vec<(usize, usize, String)> = Vec::new();
     let mut i = 0usize;
-    while i < len {
-        if i + 19 <= len && looks_like_iso8601(&bytes[i..i + 19]) {
-            // 找到时间戳的完整范围（时区后缀等）
-            let end = find_timestamp_end(&bytes[i..], 19);
-            replacements.push((i, i + end, TIMESTAMP_PLACEHOLDER));
-            i += end;
-            count += 1;
+    while i < bytes.len() {
+        if !bytes[i..].starts_with(DATELINE_PREFIX_ASCII) {
+            i += 1;
             continue;
         }
-        // 仅日期：YYYY-MM-DD 或 YYYY/MM/DD（10 字节）。
-        if looks_like_date_only(s, i) {
-            replacements.push((i, i + 10, DATE_PLACEHOLDER));
-            i += 10;
-            count += 1;
-            continue;
-        }
-        if i + 36 <= len && looks_like_uuid_v4(&bytes[i..i + 36]) {
-            replacements.push((i, i + 36, UUID_PLACEHOLDER));
-            i += 36;
-            count += 1;
-            continue;
-        }
-        // 检查内联 ID 前缀
-        if let Some(end) = find_inline_id_at(s, i) {
-            replacements.push((i, end, ID_PLACEHOLDER));
-            i = end;
-            count += 1;
+        i += DATELINE_PREFIX_ASCII.len();
+        if let Some((whole_end, canonical)) = parse_dateline_at(seg, bytes, i) {
+            let whole_start = i - DATELINE_PREFIX_ASCII.len();
+            if seg[whole_start..whole_end] != canonical {
+                pieces.push((whole_start, whole_end, canonical));
+            }
+            i = whole_end;
             continue;
         }
         i += 1;
     }
 
-    if replacements.is_empty() {
-        return count;
+    if pieces.is_empty() {
+        return (seg.to_string(), false);
     }
-
-    // 构建替换后的字符串。无法进行原地子串替换，因为占位符与原串长度不同，
-    // 因此重建字符串。
-    let mut result = String::with_capacity(s.len());
-    let mut last_end = 0;
-    for (start, end, placeholder) in replacements {
-        result.push_str(&s[last_end..start]);
-        result.push_str(placeholder);
-        last_end = end;
+    let mut out = String::with_capacity(seg.len());
+    let mut last = 0usize;
+    for (start, end, replacement) in pieces {
+        out.push_str(&seg[last..start]);
+        out.push_str(&replacement);
+        last = end;
     }
-    result.push_str(&s[last_end..]);
-    *s = result;
-    count
-}
-
-/// 将时间戳窗口扩展到超过 19 字节最小值，以包含时区后缀
-/// （`Z`、`+HH:MM`、`+HHMM`、`.sss`）。
-fn find_timestamp_end(rest: &[u8], min_len: usize) -> usize {
-    let mut end = min_len;
-    let len = rest.len();
-
-    // 小数秒：`.sss`（最多 9 位数字）
-    if end < len && rest[end] == b'.' {
-        end += 1;
-        while end < len && rest[end].is_ascii_digit() && end - min_len < 10 {
-            end += 1;
-        }
-    }
-    // `Z` 后缀
-    if end < len && (rest[end] == b'Z' || rest[end] == b'z') {
-        end += 1;
-    }
-    // `+HH:MM` 或 `+HHMM` 或 `-HH:MM` 或 `-HHMM`
-    else if end < len && (rest[end] == b'+' || rest[end] == b'-') {
-        end += 1;
-        // 2 位数字小时
-        if end + 2 <= len && rest[end..end + 2].iter().all(u8::is_ascii_digit) {
-            end += 2;
-            // 可选的冒号 + 分钟
-            if end < len && rest[end] == b':' {
-                end += 1;
-            }
-            if end + 2 <= len && rest[end..end + 2].iter().all(u8::is_ascii_digit) {
-                end += 2;
-            }
-        }
-    }
-    end
-}
-
-/// 递归遍历 Value，替换字符串中的易变子串和 ID 字段值。
-fn strip_value_recursive(v: &mut Value) -> usize {
-    let mut count = 0;
-    match v {
-        Value::String(s) => count += strip_string(s),
-        Value::Array(items) => {
-            for item in items.iter_mut() {
-                count += strip_value_recursive(item);
-            }
-        }
-        Value::Object(map) => {
-            for (k, sub) in map.iter_mut() {
-                if is_id_named_key(k) && !is_value_empty(sub) {
-                    // 将整个值替换为占位符
-                    // ——ID 字段值每请求唯一，无论其格式如何都会破坏前缀。
-                    *sub = Value::String(ID_PLACEHOLDER.to_string());
-                    count += 1;
-                    continue; // 不要递归进入占位符
-                }
-                count += strip_value_recursive(sub);
-            }
-        }
-        _ => {}
-    }
-    count
+    out.push_str(&seg[last..]);
+    (out, true)
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::cache_stabilization::drift_detector::{
-        compute_structural_hash, ApiKind as DriftApiKind,
-    };
     use serde_json::json;
 
     #[test]
@@ -1122,143 +1053,6 @@ mod tests {
     // 策略：system/instructions/developer 消息 AND tools 会被剥离。
     // user/assistant 消息不会被剥离。
 
-    #[test]
-    fn strips_anthropic_system_string() {
-        let mut body = json!({
-            "system": "Today is 2026-06-14. Request req-1234567890abcdef.",
-            "tools": []
-        });
-        let count = strip_volatile_from_prefix(&mut body, ApiKind::Anthropic);
-        assert!(count >= 2);
-        assert_eq!(body["system"], "Today is ___DATE___. Request ___ID___.");
-    }
-
-    #[test]
-    fn strips_anthropic_system_blocks() {
-        let mut body = json!({
-            "system": [{"type":"text","text":"Session 550e8400-e29b-41d4-a716-446655440000"}],
-            "tools": []
-        });
-        let count = strip_volatile_from_prefix(&mut body, ApiKind::Anthropic);
-        assert!(count >= 1);
-        assert_eq!(body["system"][0]["text"], "Session ___UUID___");
-    }
-
-    #[test]
-    fn strip_id_field_from_tool_schema() {
-        let mut body = json!({
-            "system": "You are helpful.",
-            "messages": [],
-            "tools": [{
-                "name": "lookup",
-                "input_schema": {
-                    "type": "object",
-                    "properties": {
-                        "request_id": "req-abc-12345"
-                    }
-                }
-            }],
-        });
-        let count = strip_volatile_from_prefix(&mut body, ApiKind::Anthropic);
-        assert!(count >= 1);
-        let value = body["tools"][0]["input_schema"]["properties"]["request_id"]
-            .as_str()
-            .unwrap();
-        assert_eq!(value, ID_PLACEHOLDER);
-    }
-
-    #[test]
-    fn strip_does_not_touch_user_messages() {
-        let mut body = json!({
-            "system": "Be concise.",
-            "messages": [{
-                "role": "user",
-                "content": "trace=550e8400-e29b-41d4-a716-446655440000"
-            }],
-        });
-        let count = strip_volatile_from_prefix(&mut body, ApiKind::Anthropic);
-        // 只有 system 在前缀中——messages 不会被剥离
-        assert_eq!(count, 0);
-        // user 消息仍保留 UUID
-        let content = body["messages"][0]["content"].as_str().unwrap();
-        assert!(content.contains("550e8400-e29b-41d4-a716-446655440000"));
-    }
-
-    #[test]
-    fn strip_idempotent_on_stable_content() {
-        let mut body = json!({
-            "system": "You are a helpful assistant. Be concise.",
-            "messages": [],
-            "tools": [{
-                "name": "search",
-                "description": "Search the corpus.",
-                "input_schema": {"type": "object"}
-            }],
-        });
-        let count1 = strip_volatile_from_prefix(&mut body, ApiKind::Anthropic);
-        assert_eq!(count1, 0);
-        let before = serde_json::to_vec(&body).unwrap();
-        let count2 = strip_volatile_from_prefix(&mut body, ApiKind::Anthropic);
-        assert_eq!(count2, 0);
-        let after = serde_json::to_vec(&body).unwrap();
-        assert_eq!(
-            before, after,
-            "double-strip on stable content must be byte-equal"
-        );
-    }
-
-    #[test]
-    fn strip_system_timestamp_with_timezone() {
-        let mut body = json!({
-            "system": "Started at 2026-05-04T14:30:00.123Z. End.",
-            "messages": [],
-        });
-        let count = strip_volatile_from_prefix(&mut body, ApiKind::Anthropic);
-        assert!(count >= 1);
-        let system = body.get("system").unwrap().as_str().unwrap();
-        assert!(system.contains(TIMESTAMP_PLACEHOLDER));
-    }
-
-    #[test]
-    fn strip_multiple_volatile_in_system() {
-        let mut body = json!({
-            "system": "ts=2026-05-04T14:30:00Z uuid=550e8400-e29b-41d4-a716-446655440000",
-            "messages": [],
-        });
-        let count = strip_volatile_from_prefix(&mut body, ApiKind::Anthropic);
-        assert!(count >= 2);
-    }
-
-    #[test]
-    fn strips_openai_chat_system_message() {
-        let mut body = json!({
-            "messages": [
-                {"role":"system", "content":"Today is 2026/06/14"},
-                {"role":"user", "content":"keep 2026/06/14 untouched"}
-            ],
-            "tools": []
-        });
-        let count = strip_volatile_from_prefix(&mut body, ApiKind::OpenAi);
-        assert_eq!(body["messages"][0]["content"], "Today is ___DATE___");
-        assert_eq!(body["messages"][1]["content"], "keep 2026/06/14 untouched");
-        assert!(count >= 1);
-    }
-
-    #[test]
-    fn strip_anthropic_system_block_array_timestamp() {
-        let mut body = json!({
-            "system": [
-                {"type": "text", "text": "Started at 2026-05-04T14:30:00Z."},
-                {"type": "text", "text": "Be concise."},
-            ],
-            "messages": [],
-        });
-        let count = strip_volatile_from_prefix(&mut body, ApiKind::Anthropic);
-        assert!(count >= 1);
-        let text = body["system"][0]["text"].as_str().unwrap();
-        assert!(text.contains(TIMESTAMP_PLACEHOLDER));
-    }
-
     // ─── 内联 ID 测试 ────────────────────────────────────────
 
     #[test]
@@ -1321,182 +1115,6 @@ mod tests {
             findings.iter().all(|f| f.kind != VolatileKind::InlineId),
             "req-1a (only 2 suffix chars) must not be flagged; got {findings:?}",
         );
-    }
-
-    #[test]
-    fn strip_inline_id_in_system() {
-        let mut body = json!({
-            "system": "Processing req-abc-12345 now.",
-            "messages": [],
-        });
-        let count = strip_volatile_from_prefix(&mut body, ApiKind::Anthropic);
-        assert!(count >= 1);
-        let system = body.get("system").unwrap().as_str().unwrap();
-        assert!(system.contains(ID_PLACEHOLDER));
-    }
-
-    #[test]
-    fn strip_inline_id_msg_in_system() {
-        let mut body = json!({
-            "system": "Ref msg_98765xyz here.",
-            "messages": [],
-        });
-        let count = strip_volatile_from_prefix(&mut body, ApiKind::Anthropic);
-        assert!(count >= 1);
-    }
-
-    #[test]
-    fn strip_inline_id_does_not_replace_stable_words() {
-        // "req-body" 没有数字——不应被剥离
-        let mut body = json!({
-            "system": "The req-body format is standard.",
-            "messages": [],
-        });
-        let count = strip_volatile_from_prefix(&mut body, ApiKind::Anthropic);
-        assert_eq!(count, 0);
-        let system = body.get("system").unwrap().as_str().unwrap();
-        assert!(system.contains("req-body"));
-    }
-
-    #[test]
-    fn strip_inline_id_in_tool_description() {
-        let mut body = json!({
-            "system": "Be helpful.",
-            "messages": [],
-            "tools": [{
-                "name": "lookup",
-                "description": "Look up request req-abc-12345.",
-                "input_schema": {"type": "object"}
-            }],
-        });
-        let count = strip_volatile_from_prefix(&mut body, ApiKind::Anthropic);
-        assert!(count >= 1);
-        let desc = body["tools"][0]["description"].as_str().unwrap();
-        assert!(desc.contains(ID_PLACEHOLDER));
-        assert!(!desc.contains("req-abc-12345"));
-    }
-
-    #[test]
-    fn strip_openai_system_inline_id() {
-        let mut body = json!({
-            "messages": [
-                {"role": "system", "content": "Reference msg_12345abc here."},
-                {"role": "user", "content": "hello"},
-            ],
-        });
-        let count = strip_volatile_from_prefix(&mut body, ApiKind::OpenAi);
-        assert!(count >= 1);
-        let system_content = body["messages"][0]["content"].as_str().unwrap();
-        assert!(system_content.contains(ID_PLACEHOLDER));
-    }
-
-    #[test]
-    fn strip_openai_responses_direct_tool_parameters_and_description() {
-        let mut body = json!({
-            "instructions": "Be helpful.",
-            "input": [],
-            "tools": [{
-                "type": "computer",
-                "name": "click",
-                "description": "Use at 2026-06-13T10:30:00Z",
-                "parameters": {
-                    "type": "object",
-                    "properties": {
-                        "trace": {"type": "string", "description": "trace msg_abc123"},
-                        "when": {"type": "string", "example": "2026/06/13"}
-                    }
-                }
-            }]
-        });
-        let count = strip_volatile_from_prefix(&mut body, ApiKind::OpenAi);
-        assert!(count >= 1);
-        let tool = &body["tools"][0];
-        assert!(tool["description"]
-            .as_str()
-            .unwrap()
-            .contains(TIMESTAMP_PLACEHOLDER));
-        assert!(tool["parameters"]["properties"]["trace"]["description"]
-            .as_str()
-            .unwrap()
-            .contains(ID_PLACEHOLDER));
-        assert!(tool["parameters"]["properties"]["when"]["example"]
-            .as_str()
-            .unwrap()
-            .contains(DATE_PLACEHOLDER));
-    }
-
-    #[test]
-    fn strip_openai_responses_direct_tool_findings_are_reported() {
-        let body = json!({
-            "input": [],
-            "tools": [{
-                "type": "computer",
-                "name": "click",
-                "description": "Use at 2026-06-13T10:30:00Z",
-                "parameters": {
-                    "type": "object",
-                    "properties": {
-                        "trace": {"type": "string", "description": "trace msg_abc123"},
-                        "when": {"type": "string", "example": "2026/06/13"}
-                    }
-                }
-            }]
-        });
-        let findings = detect_volatile_content(&body, ApiKind::OpenAi);
-        assert!(findings
-            .iter()
-            .any(|f| f.location == "tools[0].description"));
-        assert!(findings
-            .iter()
-            .any(|f| f.location == "tools[0].parameters.properties.trace.description"));
-        assert!(findings
-            .iter()
-            .any(|f| f.location == "tools[0].parameters.properties.when.example"));
-    }
-
-    #[test]
-    fn stripped_direct_tool_volatiles_keep_responses_drift_stable() {
-        let mut body = json!({
-            "model": "gpt-5.4",
-            "instructions": "Be helpful.",
-            "input": [{"role": "user", "content": "hello"}],
-            "tools": [{
-                "type": "computer",
-                "name": "click",
-                "description": "Use at 2026-06-13T10:30:00Z",
-                "parameters": {
-                    "type": "object",
-                    "properties": {
-                        "trace": {"type": "string", "description": "trace msg_abc123"},
-                        "when": {"type": "string", "example": "2026/06/13"}
-                    }
-                }
-            }]
-        });
-        let mut body2 = json!({
-            "model": "gpt-5.4",
-            "instructions": "Be helpful.",
-            "input": [{"role": "user", "content": "hello"}],
-            "tools": [{
-                "type": "computer",
-                "name": "click",
-                "description": "Use at 2026-06-14T11:31:00Z",
-                "parameters": {
-                    "type": "object",
-                    "properties": {
-                        "trace": {"type": "string", "description": "trace msg_def456"},
-                        "when": {"type": "string", "example": "2026/06/14"}
-                    }
-                }
-            }]
-        });
-
-        strip_volatile_from_prefix(&mut body, ApiKind::OpenAi);
-        strip_volatile_from_prefix(&mut body2, ApiKind::OpenAi);
-
-        let h1 = compute_structural_hash(&body, DriftApiKind::OpenAiResponses);
-        let h2 = compute_structural_hash(&body2, DriftApiKind::OpenAiResponses);
-        assert_eq!(h1.tools, h2.tools);
     }
 
     // ─── 仅日期测试 ────────────────────────────────────────
@@ -1593,132 +1211,167 @@ mod tests {
         );
     }
 
+    // ─── 客户端 dateline 归一化测试(对齐 sub2api anthropicfp)───
+
     #[test]
-    fn strip_date_in_system() {
+    fn dateline_ascii_hyphen_is_identity() {
         let mut body = json!({
-            "system": "Today is 2026-06-13. Be concise.",
+            "system": "Today's date is 2026-07-01.",
             "messages": [],
         });
-        let count = strip_volatile_from_prefix(&mut body, ApiKind::Anthropic);
-        assert!(count >= 1);
-        let system = body.get("system").unwrap().as_str().unwrap();
-        assert!(system.contains(DATE_PLACEHOLDER));
+        let snapshot = body.clone();
+        let count = normalize_client_dateline(&mut body, ApiKind::Anthropic);
+        assert_eq!(count, 0, "canonical form must be identity");
+        assert_eq!(body, snapshot);
     }
 
     #[test]
-    fn strip_date_slash_in_system() {
+    fn dateline_ascii_slash_becomes_hyphen() {
         let mut body = json!({
-            "system": "Today's date is 2026/06/13.",
+            "system": "Today's date is 2026/07/01.",
             "messages": [],
         });
-        let count = strip_volatile_from_prefix(&mut body, ApiKind::Anthropic);
-        assert!(count >= 1);
-        let system = body.get("system").unwrap().as_str().unwrap();
-        assert!(system.contains(DATE_PLACEHOLDER));
+        let count = normalize_client_dateline(&mut body, ApiKind::Anthropic);
+        assert_eq!(count, 1);
+        assert_eq!(
+            body.get("system").unwrap().as_str().unwrap(),
+            "Today's date is 2026-07-01."
+        );
     }
 
     #[test]
-    fn strip_timestamp_in_system() {
+    fn dateline_unicode_apostrophes_normalized() {
+        for (name, apo) in [
+            ("u2019", '\u{2019}'),
+            ("u02bc", '\u{02BC}'),
+            ("u02b9", '\u{02B9}'),
+        ] {
+            let mut body = json!({
+                "system": format!("Today{}s date is 2026-07-01.", apo),
+                "messages": [],
+            });
+            let count = normalize_client_dateline(&mut body, ApiKind::Anthropic);
+            assert_eq!(count, 1, "{} variant should be rewritten", name);
+            assert_eq!(
+                body.get("system").unwrap().as_str().unwrap(),
+                "Today's date is 2026-07-01.",
+                "{} should become ASCII apostrophe",
+                name
+            );
+        }
+    }
+
+    #[test]
+    fn dateline_mixed_separators_not_matched() {
+        // 与 sub2api 一致:两分隔符不一致的句子不匹配,原样保留
         let mut body = json!({
-            "system": "At 2026-06-13T10:30:00Z do something.",
+            "system": "Today's date is 2026-07/01.",
             "messages": [],
         });
-        let count = strip_volatile_from_prefix(&mut body, ApiKind::Anthropic);
-        assert!(count >= 1);
-        let system = body.get("system").unwrap().as_str().unwrap();
-        assert!(system.contains(TIMESTAMP_PLACEHOLDER));
+        let snapshot = body.clone();
+        let count = normalize_client_dateline(&mut body, ApiKind::Anthropic);
+        assert_eq!(count, 0);
+        assert_eq!(body, snapshot);
+    }
+
+    #[test]
+    fn dateline_prose_and_loose_dates_untouched() {
+        // 非指纹句式的日期(用户 prose、代码)不得改写
+        let mut body = json!({
+            "system": "Today is foo. His date is 2026-06-30. Log at 2026/06/13.",
+            "messages": [],
+        });
+        let snapshot = body.clone();
+        let count = normalize_client_dateline(&mut body, ApiKind::Anthropic);
+        assert_eq!(count, 0);
+        assert_eq!(body, snapshot);
+    }
+
+    #[test]
+    fn dateline_idempotent() {
+        let mut body = json!({
+            "system": [{"type": "text", "text": "Today\u{2019}s date is 2026/07/01."}],
+            "messages": [],
+        });
+        let count1 = normalize_client_dateline(&mut body, ApiKind::Anthropic);
+        let snapshot = body.clone();
+        let count2 = normalize_client_dateline(&mut body, ApiKind::Anthropic);
+        assert_eq!(count1, 1);
+        assert_eq!(count2, 0);
+        assert_eq!(body, snapshot, "must be idempotent");
+    }
+
+    #[test]
+    fn dateline_messages_only_inside_reminder() {
+        // CC 第 2 轮起 dateline 挪进 <system-reminder>;标签外的 prose 不动
+        let mut body = json!({
+            "messages": [
+                {"role": "user", "content": [
+                    {"type": "text", "text": "free prose Today\u{2019}s date is 2026/07/01. untouched"},
+                    {"type": "text", "text": "<system-reminder>Today\u{2019}s date is 2026/07/01.</system-reminder>"}
+                ]}
+            ],
+        });
+        let count = normalize_client_dateline(&mut body, ApiKind::Anthropic);
+        assert_eq!(count, 1, "only the reminder-scoped sentence");
+        assert!(
+            body["messages"][0]["content"][0]["text"]
+                .as_str()
+                .unwrap()
+                .contains("Today\u{2019}s date is 2026/07/01."),
+            "outside reminder must stay untouched"
+        );
+        assert_eq!(
+            body["messages"][0]["content"][1]["text"],
+            "<system-reminder>Today's date is 2026-07-01.</system-reminder>"
+        );
+    }
+
+    #[test]
+    fn dateline_tools_not_scanned() {
+        // 工具定义不在作用域(sub2api 同)
+        let mut body = json!({
+            "system": "Today's date is 2026/07/01.",
+            "tools": [{
+                "name": "t",
+                "description": "Today's date is 2026/07/01."
+            }],
+        });
+        let count = normalize_client_dateline(&mut body, ApiKind::Anthropic);
+        assert_eq!(count, 1);
+        assert!(
+            body["tools"][0]["description"]
+                .as_str()
+                .unwrap()
+                .contains("2026/07/01"),
+            "tools must not be touched"
+        );
+    }
+
+    #[test]
+    fn dateline_openai_instructions_and_roles() {
+        let mut body = json!({
+            "instructions": "Today's date is 2026/05/01.",
+            "input": [
+                {"role": "developer", "content": [{"type": "text", "text": "<system-reminder>Today\u{2019}s date is 2026/04/30.</system-reminder>"}]},
+                {"role": "user", "content": "Today\u{2019}s date is 2026/03/04. outside"}
+            ],
+        });
+        let count = normalize_client_dateline(&mut body, ApiKind::OpenAi);
+        assert_eq!(count, 2, "instructions + reminder block only");
+        assert_eq!(body["instructions"], "Today's date is 2026-05-01.");
+        assert_eq!(
+            body["input"][0]["content"][0]["text"],
+            "<system-reminder>Today's date is 2026-04-30.</system-reminder>"
+        );
+        assert!(
+            body["input"][1]["content"]
+                .as_str()
+                .unwrap()
+                .contains("2026/03/04"),
+            "user content outside reminder stays"
+        );
     }
 
     // ─── input[] 中的 system/developer 消息会被剥离 ─────────
-
-    #[test]
-    fn strips_responses_input_system_message() {
-        let mut body = json!({
-            "model": "gpt-5.4",
-            "instructions": "",
-            "input": [
-                {"role": "system", "content": "Today's date is 2026/06/13. Be concise."},
-                {"role": "user", "content": "Hello"}
-            ],
-            "tools": [],
-        });
-        let count = strip_volatile_from_prefix(&mut body, ApiKind::OpenAi);
-        assert!(count >= 1);
-        let system_content = body["input"][0]["content"].as_str().unwrap();
-        assert!(system_content.contains(DATE_PLACEHOLDER));
-    }
-
-    #[test]
-    fn strips_responses_input_timestamp() {
-        let mut body = json!({
-            "model": "gpt-5.4",
-            "instructions": "",
-            "input": [
-                {"role": "system", "content": "Session started 2026-06-13T10:30:00Z."},
-                {"role": "user", "content": "Hello"}
-            ],
-            "tools": [],
-        });
-        let count = strip_volatile_from_prefix(&mut body, ApiKind::OpenAi);
-        assert!(count >= 1);
-        let system_content = body["input"][0]["content"].as_str().unwrap();
-        assert!(system_content.contains(TIMESTAMP_PLACEHOLDER));
-    }
-
-    #[test]
-    fn strip_does_not_touch_input_user_messages() {
-        let mut body = json!({
-            "model": "gpt-5.4",
-            "instructions": "",
-            "input": [
-                {"role": "system", "content": "You are helpful."},
-                {"role": "user", "content": "trace=550e8400-e29b-41d4-a716-446655440000"}
-            ],
-            "tools": [],
-        });
-        let count = strip_volatile_from_prefix(&mut body, ApiKind::OpenAi);
-        assert_eq!(
-            count, 0,
-            "stable system + user message should have nothing to strip"
-        );
-        // user 消息 UUID 应保持不动
-        let user_content = body["input"][1]["content"].as_str().unwrap();
-        assert!(user_content.contains("550e8400-e29b-41d4-a716-446655440000"));
-    }
-
-    #[test]
-    fn strips_responses_input_developer_message() {
-        // 转换路径将 Claude system 转换为 OpenAI 的 "developer" 角色
-        // developer 消息会被剥离（前缀易变策略）。
-        let mut body = json!({
-            "model": "gpt-5.4",
-            "instructions": "",
-            "input": [
-                {"role": "developer", "content": "Today's date is 2026/06/13. Be concise."},
-                {"role": "user", "content": "Hello"}
-            ],
-            "tools": [],
-        });
-        let count = strip_volatile_from_prefix(&mut body, ApiKind::OpenAi);
-        assert!(count >= 1);
-        let dev_content = body["input"][0]["content"].as_str().unwrap();
-        assert!(dev_content.contains(DATE_PLACEHOLDER));
-    }
-
-    #[test]
-    fn strips_openai_responses_instructions_and_developer_input() {
-        let mut body = json!({
-            "instructions": "Generated at 2026-06-14T12:34:56Z",
-            "input": [
-                {"role":"developer", "content":"Call msg_abc123"},
-                {"role":"user", "content":"keep msg_abc123 untouched"}
-            ],
-            "tools": []
-        });
-        let count = strip_volatile_from_prefix(&mut body, ApiKind::OpenAi);
-        assert_eq!(body["instructions"], "Generated at ___TIMESTAMP___");
-        assert_eq!(body["input"][0]["content"], "Call ___ID___");
-        assert_eq!(body["input"][1]["content"], "keep msg_abc123 untouched");
-        assert!(count >= 2);
-    }
 }
