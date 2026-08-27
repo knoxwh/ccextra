@@ -369,13 +369,20 @@ fn convert_message(role: &str, content: &Value) -> Result<Vec<Value>> {
     Ok(out)
 }
 
-/// tool_result content → openai tool 消息 content(对齐 convertClaudeToolResultContent)
+/// tool_result content → openai tool 消息 content(对齐 DSH serializeMessages)
 /// - 字符串 → 原样
 /// - 数组含 image → 保留 parts 数组(text/image_url)
-/// - 纯文本数组 → "\n\n" 连接为字符串(tool role 兼容性最好)
+/// - 纯文本数组 → "\n\n" 连接为字符串
+/// - 空输出 → "(no output)"(对齐 DSH flattenText(...) || '(no output)')
 fn convert_tool_result_content(content: &Value) -> Value {
     match content {
-        Value::String(_) => content.clone(),
+        Value::String(s) => {
+            if s.trim().is_empty() {
+                Value::String("(no output)".to_string())
+            } else {
+                content.clone()
+            }
+        }
         Value::Array(parts) => {
             let has_image = parts
                 .iter()
@@ -407,7 +414,7 @@ fn convert_tool_result_content(content: &Value) -> Value {
                     .collect();
                 let joined = texts.join("\n\n");
                 if joined.trim().is_empty() {
-                    content.clone()
+                    Value::String("(no output)".to_string())
                 } else {
                     Value::String(joined)
                 }
@@ -420,11 +427,11 @@ fn convert_tool_result_content(content: &Value) -> Value {
                 }
             }
             match content.get("text").and_then(|v| v.as_str()) {
-                Some(t) => Value::String(t.to_string()),
-                None => content.clone(),
+                Some(t) if !t.trim().is_empty() => Value::String(t.to_string()),
+                _ => Value::String("(no output)".to_string()),
             }
         }
-        _ => content.clone(),
+        _ => Value::String("(no output)".to_string()),
     }
 }
 
@@ -810,6 +817,59 @@ mod tests {
         let content = &body["messages"][1]["content"];
         assert_eq!(content[0]["type"], "text");
         assert_eq!(content[1]["type"], "image_url");
+    }
+
+    #[test]
+    fn test_tool_result_empty_string_fallback() {
+        let mut body = json!({
+            "model": "test",
+            "messages": [
+                {"role": "assistant", "content": [
+                    {"type": "tool_use", "id": "t1", "name": "f", "input": {}}
+                ]},
+                {"role": "user", "content": [
+                    {"type": "tool_result", "tool_use_id": "t1", "content": ""}
+                ]}
+            ]
+        });
+        convert_to_openai_chat(&mut body, "gpt").unwrap();
+        assert_eq!(body["messages"][1]["content"], "(no output)");
+    }
+
+    #[test]
+    fn test_tool_result_empty_array_fallback() {
+        let mut body = json!({
+            "model": "test",
+            "messages": [
+                {"role": "assistant", "content": [
+                    {"type": "tool_use", "id": "t1", "name": "f", "input": {}}
+                ]},
+                {"role": "user", "content": [
+                    {"type": "tool_result", "tool_use_id": "t1", "content": []}
+                ]}
+            ]
+        });
+        convert_to_openai_chat(&mut body, "gpt").unwrap();
+        assert_eq!(body["messages"][1]["content"], "(no output)");
+    }
+
+    #[test]
+    fn test_tool_result_whitespace_only_fallback() {
+        let mut body = json!({
+            "model": "test",
+            "messages": [
+                {"role": "assistant", "content": [
+                    {"type": "tool_use", "id": "t1", "name": "f", "input": {}}
+                ]},
+                {"role": "user", "content": [
+                    {"type": "tool_result", "tool_use_id": "t1", "content": [
+                        {"type": "text", "text": "  \n  "}
+                    ]}
+                ]}
+            ]
+        });
+        convert_to_openai_chat(&mut body, "gpt").unwrap();
+        assert_eq!(body["messages"][1]["content"], "(no output)");
     }
 
     #[test]
