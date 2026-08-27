@@ -21,6 +21,14 @@
       "reasoning_levels": ["low", "medium", "high", "xhigh", "max"]
     },
     {
+      "id": "glm-5.3",
+      "reasoning_levels": ["low", "medium", "high", "xhigh", "max"]
+    },
+    {
+      "id": "glm-5.3-flash",
+      "reasoning_levels": ["low", "high", "max"]
+    },
+    {
       "id": "qwen3.8-max",
       "reasoning_levels": ["low", "high", "xhigh"]
     },
