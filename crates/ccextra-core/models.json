@@ -30,7 +30,11 @@
     },
     {
       "id": "qwen3.8-max",
-      "reasoning_levels": ["low", "high", "xhigh"]
+      "reasoning_levels": ["low", "medium", "xhigh"]
+    },
+    {
+      "id": "qwen3.8-flash",
+      "reasoning_levels": ["low", "medium", "xhigh"]
     },
     {
       "id": "deepseek-v4-flash",
