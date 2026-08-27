@@ -53,7 +53,7 @@ use tokio::sync::RwLock;
 use crate::sse::parser::{SseEvent, SseParser};
 use crate::sse::replay_cache::StreamReplayExtractor;
 use crate::sse::SseStreamPin;
-use crate::upstream::{is_grok_model, UpstreamClient};
+use crate::upstream::{is_grok_model, UpstreamClient, UpstreamResponse};
 
 /// 配置重载闭包类型
 pub type ReloadFn =
@@ -145,6 +145,40 @@ static AUTH_CACHE: OnceLock<StdMutex<HashMap<String, bool>>> = OnceLock::new();
 
 /// 诊断日志请求序号:与毫秒时间戳组合,避免并发请求覆盖同一文件。
 static UPSTREAM_LOG_SEQUENCE: AtomicU64 = AtomicU64::new(0);
+
+// 上游可重试错误的统一退避参数(对齐通用网关重试)
+const RETRY_BASE_DELAY: std::time::Duration = std::time::Duration::from_millis(300);
+const RETRY_MAX_DELAY: std::time::Duration = std::time::Duration::from_secs(3);
+const RETRY_TOTAL_BUDGET: std::time::Duration = std::time::Duration::from_secs(10);
+
+/// Retry-After 头解析:仅支持秒数形式(HTTP-date 忽略,按退避公式兜底)
+fn parse_retry_after(headers: &reqwest::header::HeaderMap) -> Option<std::time::Duration> {
+    let raw = headers.get(reqwest::header::RETRY_AFTER)?.to_str().ok()?;
+    let secs = raw.trim().parse::<u64>().ok()?;
+    Some(std::time::Duration::from_secs(secs))
+}
+
+/// 第 attempt 次失败(0 起)后的等待时长:Retry-After 优先,否则
+/// base * 2^attempt 指数退避封顶 max;总预算耗尽返回 None 不再重试。
+fn compute_retry_delay(
+    attempt: u32,
+    started_at: std::time::Instant,
+    headers: &reqwest::header::HeaderMap,
+) -> Option<std::time::Duration> {
+    let elapsed = started_at.elapsed();
+    if elapsed >= RETRY_TOTAL_BUDGET {
+        return None;
+    }
+    let backoff = RETRY_BASE_DELAY.saturating_mul(1u32 << attempt.min(4));
+    let mut delay = parse_retry_after(headers)
+        .unwrap_or(backoff)
+        .min(RETRY_MAX_DELAY);
+    // 头给出的等待也不得突破总预算(截断而非放弃,末次机会照试)
+    if elapsed + delay > RETRY_TOTAL_BUDGET {
+        delay = RETRY_TOTAL_BUDGET - elapsed;
+    }
+    Some(delay)
+}
 
 fn auth_cache() -> &'static StdMutex<HashMap<String, bool>> {
     AUTH_CACHE.get_or_init(|| StdMutex::new(HashMap::new()))
@@ -905,46 +939,108 @@ async fn handle_messages(
     );
 
     // 多 base_url 回退(对齐 CPA antigravity executor:网络错误、429 切下一个 URL)
-    let mut upstream = None;
+    // 外层统一退避重试:网络错误 / 429 / 5xx 按指数退避(尊重 Retry-After)
+    // 重试整个轮换过程;4xx 客户端错误不重试(对齐通用网关)。总预算
+    // RETRY_TOTAL_BUDGET 封顶,避免客户端长时间悬挂。预算耗尽时把最后一次
+    // 失败响应原样交给下方错误转换路径。
+    let mut upstream: Option<UpstreamResponse> = None;
+    let mut last_fail: Option<UpstreamResponse> = None;
     let mut last_err = None;
-    for (idx, base_url) in upstream_base_urls.iter().enumerate() {
-        match upstream_client
-            .request(
-                base_url,
-                &upstream_key,
-                route.protocol,
-                upstream_proxy.as_deref(),
-                &body_json,
-                is_stream,
-                session_id,
-                thread_id.as_deref(),
-                &extra_headers,
-                &user_agents,
-            )
-            .await
-        {
-            Ok(resp) => {
-                // 429 且还有下一个 URL:直接切换(CPA 另有按 body 决策分类,此处从简)
-                if resp.status.as_u16() == 429 && idx + 1 < upstream_base_urls.len() {
-                    tracing::debug!("上游 429,回退到下一个 base_url: {}", base_url);
-                    drop(resp);
-                    continue;
+    let retry_started_at = std::time::Instant::now();
+    let mut attempt: u32 = 0;
+    loop {
+        // 单轮:按序尝试各 base_url,首个「可接受响应」即用
+        // (429 且还有下一个 URL 时换下一个立即试,不耗退避预算)
+        enum Out {
+            Ok(UpstreamResponse),
+            Fail(UpstreamResponse),
+            Net(anyhow::Error),
+        }
+        let outcome = 'round: {
+            for (idx, base_url) in upstream_base_urls.iter().enumerate() {
+                match upstream_client
+                    .request(
+                        base_url,
+                        &upstream_key,
+                        route.protocol,
+                        upstream_proxy.as_deref(),
+                        &body_json,
+                        is_stream,
+                        session_id,
+                        thread_id.as_deref(),
+                        &extra_headers,
+                        &user_agents,
+                    )
+                    .await
+                {
+                    Ok(resp) => {
+                        if resp.status.as_u16() == 429 && idx + 1 < upstream_base_urls.len() {
+                            tracing::debug!("上游 429,回退到下一个 base_url: {}", base_url);
+                            continue;
+                        }
+                        if resp.status.is_success() {
+                            break 'round Out::Ok(resp);
+                        }
+                        break 'round Out::Fail(resp);
+                    }
+                    Err(e) => {
+                        if idx + 1 < upstream_base_urls.len() {
+                            tracing::debug!("上游请求错误,回退到下一个 base_url: {}", base_url);
+                            continue;
+                        }
+                        break 'round Out::Net(e);
+                    }
                 }
+            }
+            unreachable!("base_urls 非空,循环内必 return/break")
+        };
+        match outcome {
+            Out::Ok(resp) => {
                 upstream = Some(resp);
                 break;
             }
-            Err(e) => {
+            Out::Fail(resp) if resp.status.as_u16() == 429 || resp.status.is_server_error() => {
+                let wait = compute_retry_delay(attempt, retry_started_at, resp.body.headers());
+                attempt += 1;
+                match wait {
+                    Some(d) => {
+                        tracing::warn!(
+                            status = resp.status.as_u16(),
+                            attempt,
+                            delay_ms = d.as_millis() as u64,
+                            "上游可重试失败,退避后重试"
+                        );
+                        tokio::time::sleep(d).await;
+                    }
+                    None => {
+                        last_fail = Some(resp);
+                        break;
+                    }
+                }
+            }
+            Out::Fail(resp) => {
+                // 4xx(400/401/403 等):客户端参数类错误,重试无意义
+                last_fail = Some(resp);
+                break;
+            }
+            Out::Net(e) => {
                 last_err = Some(e);
-                if idx + 1 < upstream_base_urls.len() {
-                    tracing::debug!("上游请求错误,回退到下一个 base_url: {}", base_url);
-                    continue;
+                let wait = compute_retry_delay(attempt, retry_started_at, &HeaderMap::new());
+                attempt += 1;
+                match wait {
+                    Some(d) => tokio::time::sleep(d).await,
+                    None => break,
                 }
             }
         }
     }
     let mut upstream = match upstream {
         Some(u) => Some(u),
-        None => return Err(last_err.expect("上游请求应已尝试").into()),
+        None => match (last_fail, last_err) {
+            (Some(f), _) => Some(f),
+            (None, Some(e)) => return Err(e.into()),
+            (None, None) => None,
+        },
     };
     let mut status = upstream.as_ref().expect("上游响应应存在").status;
     let mut preloaded_stream = None;
@@ -3621,5 +3717,131 @@ models:
             "user-key",
             "入站 key 不改写成 session"
         );
+    }
+
+    #[test]
+    fn test_retry_delay_respects_retry_after_and_budget() {
+        let started = std::time::Instant::now();
+        let mut headers = reqwest::header::HeaderMap::new();
+        headers.insert(reqwest::header::RETRY_AFTER, "5".parse().unwrap());
+        // Retry-After 优先且封顶 3s
+        let d = compute_retry_delay(0, started, &headers).unwrap();
+        assert_eq!(d, std::time::Duration::from_secs(3));
+        // 无头:指数 300ms→600ms
+        let d2 = compute_retry_delay(1, started, &reqwest::header::HeaderMap::new()).unwrap();
+        assert_eq!(d2, std::time::Duration::from_millis(600));
+        // 总预算耗尽 → 不再重试
+        std::thread::sleep(std::time::Duration::from_millis(20));
+        let exhausted_start = started - (RETRY_TOTAL_BUDGET + std::time::Duration::from_secs(1));
+        assert!(compute_retry_delay(0, exhausted_start, &headers).is_none());
+    }
+
+    /// 上游 500:按退避重试后成功;429 带 Retry-After 的路径由同一分支覆盖。
+    #[tokio::test]
+    async fn test_upstream_500_retries_with_backoff_then_succeeds() {
+        let attempts = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+        let handler_attempts = Arc::clone(&attempts);
+        let upstream = Router::new().route(
+            "/chat/completions",
+            post(move || {
+                let attempts = Arc::clone(&handler_attempts);
+                async move {
+                    if attempts.fetch_add(1, Ordering::SeqCst) < 2 {
+                        (
+                            axum::http::StatusCode::INTERNAL_SERVER_ERROR,
+                            [(header::CONTENT_TYPE, "application/json")],
+                            r#"{"error":{"message":"overloaded"}}"#,
+                        )
+                    } else {
+                        (
+                            axum::http::StatusCode::OK,
+                            [(header::CONTENT_TYPE, "application/json")],
+                            r#"{"id":"c1","object":"chat.completion","model":"gpt-4","choices":[{"index":0,"message":{"role":"assistant","content":"retry ok"},"finish_reason":"stop"}],"usage":{"prompt_tokens":1,"completion_tokens":1}}"#,
+                        )
+                    }
+                }
+            }),
+        );
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let upstream_addr = listener.local_addr().unwrap();
+        let server = tokio::spawn(async move { axum::serve(listener, upstream).await.unwrap() });
+
+        let state = mock_state();
+        let provider: ProviderConfig = serde_yaml::from_str(&format!(
+            "name: test-500-retry\nprotocol: openai_chat\nbase_url: http://{}\nkey: sk-test\nproxy_url: direct\nmodels:\n  - name: gpt-4\n    alias: test-500-retry\n",
+            upstream_addr
+        ))
+        .unwrap();
+        state.providers.write().await.push(provider);
+        let app = app(state);
+        let request = Request::builder()
+            .uri("/v1/messages")
+            .method("POST")
+            .header("content-type", "application/json")
+            .body(Body::from(
+                serde_json::to_vec(&json!({
+                    "model": "test-500-retry", "max_tokens": 64, "stream": false,
+                    "messages": [{"role": "user", "content": "hi"}]
+                }))
+                .unwrap(),
+            ))
+            .unwrap();
+        let response = app.oneshot(request).await.unwrap();
+        server.abort();
+
+        assert_eq!(response.status(), StatusCode::OK);
+        assert_eq!(attempts.load(Ordering::SeqCst), 3);
+    }
+
+    /// 上游持续 503 耗尽退避预算:末次错误响应转 anthropic error 返回,
+    /// 不返回 500 内部错误,客户端能拿到上游原始错误信息。
+    #[tokio::test]
+    async fn test_upstream_persistent_503_exhausts_budget_returns_error_shape() {
+        let upstream = Router::new().route(
+            "/chat/completions",
+            post(|| async {
+                (
+                    axum::http::StatusCode::SERVICE_UNAVAILABLE,
+                    [(header::CONTENT_TYPE, "application/json")],
+                    r#"{"error":{"message":"down"}}"#,
+                )
+            }),
+        );
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let upstream_addr = listener.local_addr().unwrap();
+        let server = tokio::spawn(async move { axum::serve(listener, upstream).await.unwrap() });
+
+        let state = mock_state();
+        let provider: ProviderConfig = serde_yaml::from_str(&format!(
+            "name: test-503-exhaust\nprotocol: openai_chat\nbase_url: http://{}\nkey: sk-test\nproxy_url: direct\nmodels:\n  - name: gpt-4\n    alias: test-503-exhaust\n",
+            upstream_addr
+        ))
+        .unwrap();
+        state.providers.write().await.push(provider);
+        let app = app(state);
+        let request = Request::builder()
+            .uri("/v1/messages")
+            .method("POST")
+            .header("content-type", "application/json")
+            .body(Body::from(
+                serde_json::to_vec(&json!({
+                    "model": "test-503-exhaust", "max_tokens": 64, "stream": false,
+                    "messages": [{"role": "user", "content": "hi"}]
+                }))
+                .unwrap(),
+            ))
+            .unwrap();
+        let response = app.oneshot(request).await.unwrap();
+        server.abort();
+
+        assert_eq!(
+            response.status(),
+            axum::http::StatusCode::SERVICE_UNAVAILABLE
+        );
+        let bytes = axum::body::to_bytes(response.into_body(), usize::MAX)
+            .await
+            .unwrap();
+        let v: Value = serde_json::from_slice(&bytes).unwrap();
+        assert_eq!(v["type"], "error", "错误必须转 anthropic error 形状");
     }
 }
