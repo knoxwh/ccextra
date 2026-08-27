@@ -4,7 +4,8 @@
 // - system → instructions 字段(合并 text blocks,过滤计费归属块,对齐 codex base_instructions)
 // - messages → input[]:text→input_text/output_text、thinking(带签名)→reasoning、
 //   image→input_image、tool_use→function_call、tool_result→function_call_output
-//   (遇 thinking/tool_use/tool_result 先 flush 文本 message,对齐 flushMessage 顺序)
+//   (遇 thinking/tool_use/tool_result 先 flush 文本 message,对齐 flushMessage 顺序;
+//    tool_result 内嵌 image 抽出到随后 user message,output 不携带图片)
 // - thinking 处理:GPT/Grok 仅回放带签名的 encrypted reasoning,无签名明文丢弃
 //   (对齐 reasoning replay 缓存只认 encrypted_content;其余 responses 上游保留明文)
 // - tools → codex tools(原名超 64 缩短 + 唯一 _N 后缀;web_search_* → type:"web_search")、
@@ -408,11 +409,14 @@ fn reasoning_item_empty(item: &Value) -> bool {
     content_empty && summary_empty && item.get("encrypted_content").is_none()
 }
 
-/// tool_result content → responses output 数组或字符串(对齐 tool_result 分支)
-fn tool_result_output(content: &Value) -> Value {
+/// tool_result content → responses output 与图片 parts 元组(对齐 convertToolResultOutput)。
+/// function_call_output.output 只接受文本,内嵌 image 抽出为元组第二项,
+/// 由调用方追加成随后的 user message(input_image parts)。
+fn tool_result_output(content: &Value) -> (Value, Vec<Value>) {
     match content {
         Value::Array(items) => {
             let mut out: Vec<Value> = Vec::new();
+            let mut images: Vec<Value> = Vec::new();
             for item in items {
                 match item.get("type").and_then(|v| v.as_str()) {
                     Some("image") => {
@@ -429,7 +433,7 @@ fn tool_result_output(content: &Value) -> Value {
                                     item.pointer("/source/mime_type").and_then(|v| v.as_str())
                                 })
                                 .unwrap_or("application/octet-stream");
-                            out.push(json!({
+                            images.push(json!({
                                 "type": "input_image",
                                 "image_url": format!("data:{media};base64,{data}")
                             }));
@@ -444,13 +448,19 @@ fn tool_result_output(content: &Value) -> Value {
                 }
             }
             if out.is_empty() {
-                Value::String(content.to_string())
+                // 无文本可留:抽取过图片用占位(对齐 sub2api "(empty)"),
+                // 否则维持原样序列化,未识别结构不丢信息
+                if images.is_empty() {
+                    (Value::String(content.to_string()), images)
+                } else {
+                    (Value::String("(no output)".to_string()), images)
+                }
             } else {
-                Value::Array(out)
+                (Value::Array(out), images)
             }
         }
-        Value::String(_) => content.clone(),
-        other => other.clone(),
+        Value::String(_) => (content.clone(), Vec::new()),
+        other => (other.clone(), Vec::new()),
     }
 }
 
@@ -728,6 +738,9 @@ pub fn convert_to_openai_responses(
 
             let mut content_items: Vec<Value> = Vec::new();
             let mut out_items: Vec<Value> = Vec::new();
+            // tool_result 抽出的图片 parts(对齐 sub2api toolResultImageParts,
+            // 追加成该消息末尾的独立 user message)
+            let mut result_image_parts: Vec<Value> = Vec::new();
             let flush_message = |content_items: &mut Vec<Value>, out_items: &mut Vec<Value>| {
                 if !content_items.is_empty() {
                     out_items.push(json!({
@@ -858,7 +871,9 @@ pub fn convert_to_openai_responses(
                             .get("tool_use_id")
                             .and_then(|v| v.as_str())
                             .unwrap_or("");
-                        let output = tool_result_output(part.get("content").unwrap_or(&json!("")));
+                        let (output, images) =
+                            tool_result_output(part.get("content").unwrap_or(&json!("")));
+                        result_image_parts.extend(images);
                         let short_id = shorten_call_id(call_id);
                         if custom_call_ids.contains(&short_id) {
                             out_items.push(json!({
@@ -878,6 +893,14 @@ pub fn convert_to_openai_responses(
                 }
             }
             flush_message(&mut content_items, &mut out_items);
+            // 抽出的 tool_result 图片 → 该消息末尾独立 user message
+            if !result_image_parts.is_empty() {
+                out_items.push(json!({
+                    "type": "message",
+                    "role": "user",
+                    "content": result_image_parts
+                }));
+            }
             openai["input"].as_array_mut().unwrap().extend(out_items);
         }
     }
@@ -2173,9 +2196,34 @@ mod tests {
             }]
         });
         convert_to_openai_responses(&mut body, "test-model").unwrap();
+        // 图片抽出(对齐 sub2api):output 只留文本,图片进随后的 user message
         let output = body["input"][0]["output"].as_array().unwrap();
         assert_eq!(output[0]["type"], "input_text");
-        assert_eq!(output[1]["type"], "input_image");
+        assert_eq!(body["input"][1]["type"], "message");
+        assert_eq!(body["input"][1]["role"], "user");
+        let parts = body["input"][1]["content"].as_array().unwrap();
+        assert_eq!(parts[0]["type"], "input_image");
+    }
+
+    #[test]
+    fn test_tool_result_image_only_uses_placeholder() {
+        // 只有图片的 tool_result:output 用占位,图片进随后的 user message
+        let mut body = json!({
+            "model": "test",
+            "messages": [{
+                "role": "user",
+                "content": [{
+                    "type": "tool_result",
+                    "tool_use_id": "t1",
+                    "content": [
+                        {"type": "image", "source": {"type": "base64", "media_type": "image/png", "data": "aGVsbG8="}}
+                    ]
+                }]
+            }]
+        });
+        convert_to_openai_responses(&mut body, "test-model").unwrap();
+        assert_eq!(body["input"][0]["output"], "(no output)");
+        assert_eq!(body["input"][1]["content"][0]["type"], "input_image");
     }
 
     #[test]
