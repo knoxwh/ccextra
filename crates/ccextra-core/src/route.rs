@@ -31,7 +31,7 @@ pub enum RouteError {
     AliasConflict(String),
 }
 
-#[derive(Debug, Clone, Deserialize)]
+#[derive(Debug, Clone, PartialEq, Deserialize)]
 pub struct ProviderConfig {
     pub name: String,
     pub protocol: Protocol,
@@ -110,7 +110,7 @@ where
     }
 }
 
-#[derive(Debug, Clone, Deserialize, Default)]
+#[derive(Debug, Clone, PartialEq, Deserialize, Default)]
 pub struct ModelConfig {
     pub name: String,  // 上游真实名
     pub alias: String, // 入站别名

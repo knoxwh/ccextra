@@ -135,24 +135,6 @@ async fn main() -> Result<()> {
 
     tracing::info!("配置加载成功: {} providers", config.providers.len());
 
-    // 动态加载 Antigravity providers
-    let antigravity_auth_dir = pin_auth_dir(
-        &cli.config,
-        config.auth_dir.as_deref(),
-        resolve_antigravity_auth_dir,
-    );
-    let antigravity_providers = ccextra_server::antigravity::load_antigravity_providers(
-        &antigravity_auth_dir,
-        config.server.proxy_url.as_deref(),
-    )
-    .await;
-    if !antigravity_providers.is_empty() {
-        tracing::info!(
-            "动态加载 {} 个 Antigravity providers",
-            antigravity_providers.len()
-        );
-    }
-
     // 动态加载 xAI providers
     let xai_auth_dir = pin_auth_dir(
         &cli.config,
@@ -166,8 +148,10 @@ async fn main() -> Result<()> {
         tracing::info!("动态加载 {} 个 xAI providers", xai_providers.len());
     }
 
-    // 合并配置文件 providers、Antigravity providers 和 xAI providers
-    let mut all_providers = merge_providers(config.providers, antigravity_providers);
+    // 合并配置文件 providers 和 xAI providers
+    // Antigravity 模型列表需在线拉取(对齐 CPA 启动模式:已知数据先行、
+    // 后台刷新、失败保旧),不阻塞监听 —— 转入 serve 之后的后台任务注入
+    let mut all_providers = merge_providers(config.providers, Vec::new());
     all_providers = merge_providers(all_providers, xai_providers);
 
     // 启动时验证配置
@@ -214,6 +198,8 @@ async fn main() -> Result<()> {
     });
 
     let user_agents = build_user_agents(config.user_agents.as_ref());
+    // 后台注入任务需要的全局代理(与 UpstreamClient 各持一份)
+    let injection_proxy = config.server.proxy_url.clone();
 
     let state = AppState {
         providers: Arc::new(RwLock::new(all_providers)),
@@ -232,6 +218,19 @@ async fn main() -> Result<()> {
             1024,
         ),
     };
+
+    // Antigravity 后台注入(对齐 CPA 启动模式:listening 不等在线模型列表;
+    // 任务内部立即拉取一次,成功替换 providers,失败保旧等下轮)
+    tokio::spawn(run_antigravity_injection(
+        cli.config.clone(),
+        state.providers.clone(),
+        pin_auth_dir(
+            &cli.config,
+            config.auth_dir.as_deref(),
+            resolve_antigravity_auth_dir,
+        ),
+        injection_proxy,
+    ));
 
     // 启动 HTTP 服务
     let addr = format!("{}:{}", config.server.host, config.server.port);
@@ -278,6 +277,73 @@ where
     match base {
         Some(dir) => dir.join(path),
         None => path,
+    }
+}
+
+/// 读取配置文件构建「静态配置 + xAI」provider 集合(不含 Antigravity)。
+/// 启动与后台周期刷新共用;/reload 仍走完整 ReloadData 闭包
+async fn build_provider_set(config_path: &str) -> anyhow::Result<Vec<ProviderConfig>> {
+    let cfg = Config::load(config_path)?;
+    let mut set = merge_providers(cfg.providers, Vec::new());
+    let dir = pin_auth_dir(
+        config_path,
+        cfg.xai_auth_dir.as_deref(),
+        resolve_xai_auth_dir,
+    );
+    set = merge_providers(
+        set,
+        ccextra_server::xai::load_xai_providers(&dir, cfg.server.proxy_url.as_deref()).await,
+    );
+    Ok(set)
+}
+
+/// Antigravity 注入任务(对齐 CPA StartModelsUpdater:启动即拉取、
+/// 成功注入后每 3 小时刷新一次;失败保持现有数据等下一轮)。
+/// 每轮都从配置文件现读集合再叠加最新模型列表,凭证增删自动生效
+async fn run_antigravity_injection(
+    config_path: String,
+    providers: std::sync::Arc<tokio::sync::RwLock<Vec<ProviderConfig>>>,
+    auth_dir: std::path::PathBuf,
+    proxy_url: Option<String>,
+) {
+    /// 刷新周期(对齐 CPA modelsRefreshInterval = 3h)
+    const REFRESH_INTERVAL: std::time::Duration = std::time::Duration::from_secs(3 * 3600);
+
+    let mut ticker = tokio::time::interval(REFRESH_INTERVAL);
+    // 首次 tick 立即到期,启动后马上拉取一次(CPA tryStartupRefresh 同构)
+    ticker.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
+    let mut ready = false;
+    loop {
+        ticker.tick().await;
+        // 每轮从配置文件现读集合再叠加最新模型列表,凭证增删自动生效
+        let set = match build_provider_set(&config_path).await {
+            Ok(s) => s,
+            Err(e) => {
+                tracing::warn!("构建 provider 集合失败,保持现有数据: {e}");
+                continue;
+            }
+        };
+        let injected = ccextra_server::antigravity::load_antigravity_providers(
+            &auth_dir,
+            proxy_url.as_deref(),
+        )
+        .await;
+        if injected.is_empty() {
+            // 保旧语义(CPA keeping current data):不清空现有路由,等下轮重试
+            tracing::warn!("Antigravity 无可用模型/provider,保持现有数据");
+            continue;
+        }
+        let merged = merge_providers(set, injected);
+        // 对齐 CPA detectChangedProviders:内容无变化不换锁写、不发通知
+        if !ready || *providers.read().await != merged {
+            *providers.write().await = merged;
+            if ready {
+                tracing::info!("Antigravity 周期刷新完成");
+            } else {
+                ready = true;
+                tracing::info!("Antigravity providers 已就绪");
+            }
+        }
     }
 }
 
