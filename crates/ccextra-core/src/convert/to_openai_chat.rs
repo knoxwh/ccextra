@@ -7,7 +7,8 @@
 // - system → messages[0] {role: system}
 // - thinking.budget_tokens → reasoning_effort
 // - content 块逐项转换:thinking→reasoning_content, image→data URL,
-//   tool_use→tool_calls, tool_result→role=tool(tool_result 先发保相邻)
+//   tool_use→tool_calls, tool_result→role=tool(tool_result 先发保相邻,
+//   文本 "\n\n" join 留 tool 消息;内嵌 image 抽出到随后 user 消息 parts)
 // - tools input_schema → parameters
 // - tool_choice 映射
 // - stop_sequences → stop
@@ -274,6 +275,9 @@ fn convert_message(role: &str, content: &Value) -> Result<Vec<Value>> {
     let mut reasoning_parts: Vec<String> = Vec::new();
     let mut tool_calls: Vec<Value> = Vec::new();
     let mut tool_results: Vec<Value> = Vec::new();
+    // tool_result 抽出的图片 parts(对齐 sub2api toolResultImageParts),
+    // 并入该消息末尾的 user 消息 parts 尾部;文本始终留在 tool 消息
+    let mut deferred_images: Vec<Value> = Vec::new();
 
     for part in parts {
         let ptype = part.get("type").and_then(|v| v.as_str()).unwrap_or("");
@@ -327,10 +331,12 @@ fn convert_message(role: &str, content: &Value) -> Result<Vec<Value>> {
                     .and_then(|v| v.as_str())
                     .unwrap_or("");
                 let content_val = part.get("content").cloned().unwrap_or(json!(""));
+                let (out_content, images) = convert_tool_result_content(&content_val);
+                deferred_images.extend(images);
                 tool_results.push(json!({
                     "role": "tool",
                     "tool_call_id": tool_call_id,
-                    "content": convert_tool_result_content(&content_val)
+                    "content": out_content
                 }));
             }
             _ => {}
@@ -361,77 +367,77 @@ fn convert_message(role: &str, content: &Value) -> Result<Vec<Value>> {
             }
             out.push(msg);
         }
-    } else if !content_items.is_empty() {
-        // 非 assistant(通常 user):纯 content
-        out.push(json!({"role": role, "content": content_items}));
+    } else {
+        // 非 assistant(通常 user):纯 content。tool_result 抽出的图片追加到
+        // parts 尾部(对齐 sub2api anthropicUserToChatMessages:先收集原 text/
+        // image blocks,再 append toolResultImageParts;图片存在才用数组形态)
+        let mut items = content_items.clone();
+        items.extend(deferred_images);
+        if !items.is_empty() {
+            out.push(json!({"role": role, "content": items}));
+        }
     }
 
     Ok(out)
 }
 
-/// tool_result content → openai tool 消息 content(对齐 DSH serializeMessages)
-/// - 字符串 → 原样
-/// - 数组含 image → 保留 parts 数组(text/image_url)
-/// - 纯文本数组 → "\n\n" 连接为字符串
-/// - 空输出 → "(no output)"(对齐 DSH flattenText(...) || '(no output)')
-fn convert_tool_result_content(content: &Value) -> Value {
+/// tool_result content → (tool 消息 content, 图片 parts)。
+/// 对齐 sub2api convertToolResultOutput:文本(text 数组 "\n\n" join)始终留在
+/// tool 消息,有图也不例外(sub2api 同样不清文本);内嵌 image 抽出到随后的
+/// user 消息 parts。空内容 → "(no output)" 占位(对齐 DSH flattenText(...) ||
+/// '(no output)' / sub2api "(empty)")。
+fn convert_tool_result_content(content: &Value) -> (Value, Vec<Value>) {
     match content {
         Value::String(s) => {
             if s.trim().is_empty() {
-                Value::String("(no output)".to_string())
+                (Value::String("(no output)".to_string()), Vec::new())
             } else {
-                content.clone()
+                (content.clone(), Vec::new())
             }
         }
         Value::Array(parts) => {
-            let has_image = parts
-                .iter()
-                .any(|p| p.get("type").and_then(|t| t.as_str()) == Some("image"));
-            if has_image {
-                let items: Vec<Value> = parts
-                    .iter()
-                    .filter_map(|p| match p.get("type").and_then(|t| t.as_str()) {
-                        Some("text") => Some(json!({
-                            "type": "text",
-                            "text": p.get("text").and_then(|v| v.as_str()).unwrap_or("")
-                        })),
-                        Some("image") => image_to_url(p)
-                            .map(|url| json!({"type": "image_url", "image_url": {"url": url}})),
-                        _ => None,
-                    })
-                    .collect();
-                Value::Array(items)
-            } else {
-                let texts: Vec<&str> = parts
-                    .iter()
-                    .filter_map(|p| {
-                        if p.is_string() {
-                            p.as_str()
-                        } else {
-                            p.get("text").and_then(|v| v.as_str())
+            let mut texts: Vec<&str> = Vec::new();
+            let mut images: Vec<Value> = Vec::new();
+            for p in parts {
+                match p.get("type").and_then(|t| t.as_str()) {
+                    // 对齐 sub2api b.Text != "":仅精确空串滤除
+                    Some("text") => {
+                        if let Some(t) = p.get("text").and_then(|v| v.as_str()) {
+                            if !t.is_empty() {
+                                texts.push(t);
+                            }
                         }
-                    })
-                    .collect();
-                let joined = texts.join("\n\n");
-                if joined.trim().is_empty() {
-                    Value::String("(no output)".to_string())
-                } else {
-                    Value::String(joined)
+                    }
+                    Some("image") => {
+                        if let Some(url) = image_to_url(p) {
+                            images.push(json!({"type": "image_url", "image_url": {"url": url}}));
+                        }
+                    }
+                    _ => {}
                 }
+            }
+            let joined = texts.join("\n\n");
+            if joined.is_empty() {
+                (Value::String("(no output)".to_string()), images)
+            } else {
+                (Value::String(joined), images)
             }
         }
         Value::Object(_) => {
             if content.get("type").and_then(|t| t.as_str()) == Some("image") {
                 if let Some(url) = image_to_url(content) {
-                    return json!([{"type": "image_url", "image_url": {"url": url}}]);
+                    return (
+                        Value::String("(no output)".to_string()),
+                        vec![json!({"type": "image_url", "image_url": {"url": url}})],
+                    );
                 }
             }
             match content.get("text").and_then(|v| v.as_str()) {
-                Some(t) if !t.trim().is_empty() => Value::String(t.to_string()),
-                _ => Value::String("(no output)".to_string()),
+                Some(t) if !t.trim().is_empty() => (Value::String(t.to_string()), Vec::new()),
+                _ => (Value::String("(no output)".to_string()), Vec::new()),
             }
         }
-        _ => Value::String("(no output)".to_string()),
+        _ => (Value::String("(no output)".to_string()), Vec::new()),
     }
 }
 
@@ -798,7 +804,9 @@ mod tests {
     }
 
     #[test]
-    fn test_tool_result_with_image_keeps_array() {
+    fn test_tool_result_image_extracted_to_user_message() {
+        // 图片抽出(对齐 sub2api):图片并入随后 user 消息 parts 尾部,
+        // 文本留 tool 消息
         let mut body = json!({
             "model": "test",
             "messages": [
@@ -814,9 +822,34 @@ mod tests {
             ]
         });
         convert_to_openai_chat(&mut body, "gpt").unwrap();
-        let content = &body["messages"][1]["content"];
-        assert_eq!(content[0]["type"], "text");
-        assert_eq!(content[1]["type"], "image_url");
+        // 对齐 sub2api:文本始终留 tool 消息,仅图片抽出
+        let tool_msg = &body["messages"][1];
+        assert_eq!(tool_msg["role"], "tool");
+        assert_eq!(tool_msg["content"], "see:");
+        let user_msg = &body["messages"][2];
+        assert_eq!(user_msg["role"], "user");
+        assert_eq!(user_msg["content"][0]["type"], "image_url");
+    }
+
+    #[test]
+    fn test_tool_result_image_only_placeholder() {
+        // 只有图片:tool 消息占位,图片进随后 user 消息
+        let mut body = json!({
+            "model": "test",
+            "messages": [
+                {"role": "assistant", "content": [
+                    {"type": "tool_use", "id": "t1", "name": "f", "input": {}}
+                ]},
+                {"role": "user", "content": [
+                    {"type": "tool_result", "tool_use_id": "t1", "content": [
+                        {"type": "image", "source": {"type": "base64", "media_type": "image/png", "data": "AA"}}
+                    ]}
+                ]}
+            ]
+        });
+        convert_to_openai_chat(&mut body, "gpt").unwrap();
+        assert_eq!(body["messages"][1]["content"], "(no output)");
+        assert_eq!(body["messages"][2]["content"][0]["type"], "image_url");
     }
 
     #[test]
@@ -869,7 +902,8 @@ mod tests {
             ]
         });
         convert_to_openai_chat(&mut body, "gpt").unwrap();
-        assert_eq!(body["messages"][1]["content"], "(no output)");
+        // 对齐 sub2api:文本过滤仅精确空串,纯空白保留原样
+        assert_eq!(body["messages"][1]["content"], "  \n  ");
     }
 
     #[test]
