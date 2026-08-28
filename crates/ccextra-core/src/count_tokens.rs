@@ -32,14 +32,20 @@ pub fn count_claude_input_tokens(payload: &str) -> Result<TokenCount, String> {
         .map_err(|e| format!("count_tokens 请求体 JSON 解析失败: {e}"))?;
 
     let mut segments: Vec<String> = Vec::new();
-    let mut overhead = 0usize; // 结构开销补偿
+    let mut overhead = 0usize; // 结构开销补偿(随词表偏差放大)
+    let mut unscaled_tokens = 0usize; // 已按 Claude 口径的直接计费项(媒体/加密 blob),不放大
 
     collect_system(root.get("system"), &mut segments, &mut overhead);
-    collect_messages(root.get("messages"), &mut segments, &mut overhead);
+    collect_messages(
+        root.get("messages"),
+        &mut segments,
+        &mut overhead,
+        &mut unscaled_tokens,
+    );
     collect_tools(root.get("tools"), &mut segments);
     collect_tool_choice(root.get("tool_choice"), &mut segments);
 
-    if segments.is_empty() && overhead == 0 {
+    if segments.is_empty() && overhead == 0 && unscaled_tokens == 0 {
         return Ok(TokenCount { input_tokens: 0 });
     }
 
@@ -55,8 +61,9 @@ pub fn count_claude_input_tokens(payload: &str) -> Result<TokenCount, String> {
     let joined = segments.join("\n");
     let base_count = enc.count_ordinary(&joined);
 
-    // 补偿:结构开销 + O200kBase vs Claude 词表偏差(乘 1.12)
-    let adjusted = ((base_count + overhead) as f64 * 1.12).ceil() as usize;
+    // 补偿:文本段结构开销随词表偏差放大;直接计费项(媒体/加密 blob)原样累加
+    let adjusted =
+        (((base_count + overhead) as f64 * 1.12).ceil() as usize).saturating_add(unscaled_tokens);
     Ok(TokenCount {
         input_tokens: adjusted,
     })
@@ -83,7 +90,12 @@ fn collect_system(system: Option<&Value>, segments: &mut Vec<String>, overhead: 
 }
 
 /// messages:role + content 递归
-fn collect_messages(messages: Option<&Value>, segments: &mut Vec<String>, overhead: &mut usize) {
+fn collect_messages(
+    messages: Option<&Value>,
+    segments: &mut Vec<String>,
+    overhead: &mut usize,
+    unscaled_tokens: &mut usize,
+) {
     let Some(messages) = messages else { return };
     let Some(arr) = messages.as_array() else {
         return;
@@ -92,19 +104,24 @@ fn collect_messages(messages: Option<&Value>, segments: &mut Vec<String>, overhe
         if let Some(role) = msg.get("role").and_then(|v| v.as_str()) {
             push_trimmed(segments, role);
         }
-        collect_content(msg.get("content"), segments, overhead);
+        collect_content(msg.get("content"), segments, overhead, unscaled_tokens);
         *overhead += 4; // 每条消息 <message><role><content> 开销
     }
 }
 
 /// content:字符串 / 数组 / 对象块
-fn collect_content(content: Option<&Value>, segments: &mut Vec<String>, overhead: &mut usize) {
+fn collect_content(
+    content: Option<&Value>,
+    segments: &mut Vec<String>,
+    overhead: &mut usize,
+    unscaled_tokens: &mut usize,
+) {
     let Some(content) = content else { return };
     match content {
         Value::String(s) => push_trimmed(segments, s),
         Value::Array(items) => {
             for item in items {
-                collect_content(Some(item), segments, overhead);
+                collect_content(Some(item), segments, overhead, unscaled_tokens);
             }
         }
         Value::Object(_) => {
@@ -142,22 +159,19 @@ fn collect_content(content: Option<&Value>, segments: &mut Vec<String>, overhead
                             .and_then(|v| v.as_str())
                             .unwrap_or(""),
                     );
-                    collect_content(content.get("content"), segments, overhead);
+                    collect_content(content.get("content"), segments, overhead, unscaled_tokens);
                     *overhead += 3; // <tool_result> 边界
                 }
                 "image" => {
-                    // 图片按中等分辨率估算 1600 token(Claude 官方 ~1000-2000)
-                    *overhead += 1600;
-                }
-                "input_audio" | "audio" => {
-                    // 音频按 1 分钟估算 ~25000 token(Claude 官方数据)
-                    *overhead += 25000;
-                }
-                "video" => {
-                    // 视频按 1 分钟估算 ~100000 token
-                    *overhead += 100000;
+                    // 图片按中等分辨率估算 1600 token(官方 ~1000-2000,取 (w*h)/750 中位值)
+                    *unscaled_tokens += 1600;
+                    *overhead += 2; // <image> 块边界
                 }
                 "redacted_thinking" => {
+                    // 加密 blob 不可解码,按 base64 密度粗估(~4 字符/token)
+                    if let Some(d) = content.get("data").and_then(|v| v.as_str()) {
+                        *unscaled_tokens += d.len() / 4;
+                    }
                     *overhead += 2;
                 }
                 _ => {
@@ -290,6 +304,42 @@ mod tests {
         .unwrap()
         .input_tokens;
         assert!(with_tools > without);
+    }
+
+    #[test]
+    fn test_count_image_not_scaled_by_vocab_ratio() {
+        // 纯图片 body:1600 按 Claude 口径原样计,不被 1.12 放大
+        let body = json!({
+            "model": "x",
+            "messages": [{"role": "user", "content": [
+                {"type": "image", "source": {"type": "base64", "media_type": "image/png", "data": "..."}}
+            ]}]
+        });
+        let r = count_claude_input_tokens(&body.to_string()).unwrap();
+        // 1600 媒体 + 消息结构开销(~5),不含 1.12 放大
+        assert!(
+            r.input_tokens >= 1600 && r.input_tokens <= 1610,
+            "得到 {}",
+            r.input_tokens
+        );
+    }
+
+    #[test]
+    fn test_count_redacted_thinking_estimates_data_blob() {
+        // redacted_thinking 按 data 字符数 /4 粗估,不按 2 token 计
+        let data = "A".repeat(4000);
+        let body = json!({
+            "model": "x",
+            "messages": [{"role": "assistant", "content": [
+                {"type": "redacted_thinking", "data": data}
+            ]}]
+        });
+        let r = count_claude_input_tokens(&body.to_string()).unwrap();
+        assert!(
+            r.input_tokens >= 1000,
+            "4000 字符 blob 至少估 ~1000,得到 {}",
+            r.input_tokens
+        );
     }
 
     #[test]
