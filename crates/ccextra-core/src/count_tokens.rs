@@ -32,12 +32,14 @@ pub fn count_claude_input_tokens(payload: &str) -> Result<TokenCount, String> {
         .map_err(|e| format!("count_tokens 请求体 JSON 解析失败: {e}"))?;
 
     let mut segments: Vec<String> = Vec::new();
-    collect_system(root.get("system"), &mut segments);
-    collect_messages(root.get("messages"), &mut segments);
+    let mut overhead = 0usize; // 结构开销补偿
+
+    collect_system(root.get("system"), &mut segments, &mut overhead);
+    collect_messages(root.get("messages"), &mut segments, &mut overhead);
     collect_tools(root.get("tools"), &mut segments);
     collect_tool_choice(root.get("tool_choice"), &mut segments);
 
-    if segments.is_empty() {
+    if segments.is_empty() && overhead == 0 {
         return Ok(TokenCount { input_tokens: 0 });
     }
 
@@ -51,30 +53,37 @@ pub fn count_claude_input_tokens(payload: &str) -> Result<TokenCount, String> {
         ENC.get().expect("OnceLock 刚 set 必可读")
     };
     let joined = segments.join("\n");
-    let count = enc.count_ordinary(&joined);
+    let base_count = enc.count_ordinary(&joined);
+
+    // 补偿:结构开销 + O200kBase vs Claude 词表偏差(乘 1.12)
+    let adjusted = ((base_count + overhead) as f64 * 1.12).ceil() as usize;
     Ok(TokenCount {
-        input_tokens: count,
+        input_tokens: adjusted,
     })
 }
 
 /// system:字符串或 block 数组,取 text 字段
-fn collect_system(system: Option<&Value>, segments: &mut Vec<String>) {
+fn collect_system(system: Option<&Value>, segments: &mut Vec<String>, overhead: &mut usize) {
     let Some(system) = system else { return };
     match system {
-        Value::String(s) => push_trimmed(segments, s),
+        Value::String(s) => {
+            push_trimmed(segments, s);
+            *overhead += 3; // <system> 标签开销
+        }
         Value::Array(blocks) => {
             for b in blocks {
                 if let Some(t) = b.get("text").and_then(|v| v.as_str()) {
                     push_trimmed(segments, t);
                 }
             }
+            *overhead += 3 + blocks.len() * 2; // 标签 + 每块边界
         }
         _ => {}
     }
 }
 
 /// messages:role + content 递归
-fn collect_messages(messages: Option<&Value>, segments: &mut Vec<String>) {
+fn collect_messages(messages: Option<&Value>, segments: &mut Vec<String>, overhead: &mut usize) {
     let Some(messages) = messages else { return };
     let Some(arr) = messages.as_array() else {
         return;
@@ -83,18 +92,19 @@ fn collect_messages(messages: Option<&Value>, segments: &mut Vec<String>) {
         if let Some(role) = msg.get("role").and_then(|v| v.as_str()) {
             push_trimmed(segments, role);
         }
-        collect_content(msg.get("content"), segments);
+        collect_content(msg.get("content"), segments, overhead);
+        *overhead += 4; // 每条消息 <message><role><content> 开销
     }
 }
 
 /// content:字符串 / 数组 / 对象块
-fn collect_content(content: Option<&Value>, segments: &mut Vec<String>) {
+fn collect_content(content: Option<&Value>, segments: &mut Vec<String>, overhead: &mut usize) {
     let Some(content) = content else { return };
     match content {
         Value::String(s) => push_trimmed(segments, s),
         Value::Array(items) => {
             for item in items {
-                collect_content(Some(item), segments);
+                collect_content(Some(item), segments, overhead);
             }
         }
         Value::Object(_) => {
@@ -104,11 +114,13 @@ fn collect_content(content: Option<&Value>, segments: &mut Vec<String>) {
                     if let Some(t) = content.get("text").and_then(|v| v.as_str()) {
                         push_trimmed(segments, t);
                     }
+                    *overhead += 2; // <text> 块边界
                 }
                 "thinking" => {
                     if let Some(t) = content.get("thinking").and_then(|v| v.as_str()) {
                         push_trimmed(segments, t);
                     }
+                    *overhead += 2;
                 }
                 "tool_use" | "server_tool_use" | "mcp_tool_use" => {
                     push_trimmed(
@@ -120,6 +132,7 @@ fn collect_content(content: Option<&Value>, segments: &mut Vec<String>) {
                         content.get("name").and_then(|v| v.as_str()).unwrap_or(""),
                     );
                     push_json(segments, content.get("input"));
+                    *overhead += 5; // <tool_use><id><name><input> 开销
                 }
                 "tool_result" | "mcp_tool_result" => {
                     push_trimmed(
@@ -129,14 +142,30 @@ fn collect_content(content: Option<&Value>, segments: &mut Vec<String>) {
                             .and_then(|v| v.as_str())
                             .unwrap_or(""),
                     );
-                    collect_content(content.get("content"), segments);
+                    collect_content(content.get("content"), segments, overhead);
+                    *overhead += 3; // <tool_result> 边界
                 }
-                "image" | "input_audio" | "audio" | "video" | "redacted_thinking" => {}
+                "image" => {
+                    // 图片按中等分辨率估算 1600 token(Claude 官方 ~1000-2000)
+                    *overhead += 1600;
+                }
+                "input_audio" | "audio" => {
+                    // 音频按 1 分钟估算 ~25000 token(Claude 官方数据)
+                    *overhead += 25000;
+                }
+                "video" => {
+                    // 视频按 1 分钟估算 ~100000 token
+                    *overhead += 100000;
+                }
+                "redacted_thinking" => {
+                    *overhead += 2;
+                }
                 _ => {
                     // 未知块类型:兜底取 text
                     if let Some(t) = content.get("text").and_then(|v| v.as_str()) {
                         push_trimmed(segments, t);
                     }
+                    *overhead += 2;
                 }
             }
         }
