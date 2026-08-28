@@ -3,7 +3,7 @@
 use serde_json::{json, Value};
 use std::collections::HashMap;
 
-use super::is_attribution_text;
+use super::is_ignorable_system_text;
 use super::to_openai_responses::signature_compatible_for_target;
 use super::tool_id::tool_name_from_claude_tool_use_id;
 use super::tool_sanitize::sanitize_function_name;
@@ -134,13 +134,13 @@ fn align_tool_results(content: &Value, preceding_tool_use_ids: &[String]) -> Val
 }
 
 /// 提取 system 消息文本并包成 <system-reminder>...</system-reminder>
-/// 空文本与 attribution 文本跳过;无有效内容返回 None
+/// 空文本、attribution 文本与 Claude 身份声明跳过;无有效内容返回 None
 fn system_reminder_text(content: &Value) -> Option<String> {
     let mut parts: Vec<&str> = Vec::new();
     match content {
         Value::String(s) => {
-            if !s.is_empty() && !is_attribution_text(s) {
-                parts.push(s);
+            if !is_ignorable_system_text(s) {
+                parts.push(s.trim());
             }
         }
         Value::Array(arr) => {
@@ -149,8 +149,8 @@ fn system_reminder_text(content: &Value) -> Option<String> {
                     continue;
                 }
                 if let Some(text) = item.get("text").and_then(|t| t.as_str()) {
-                    if !text.is_empty() && !is_attribution_text(text) {
-                        parts.push(text);
+                    if !is_ignorable_system_text(text) {
+                        parts.push(text.trim());
                     }
                 }
             }

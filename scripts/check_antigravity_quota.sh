@@ -6,10 +6,13 @@ BASE_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
 AUTH_DIR="${BASE_DIR}/.cache/antigravity"
 API_ENDPOINT="https://cloudcode-pa.googleapis.com"
 DAILY_API_ENDPOINT="https://daily-cloudcode-pa.googleapis.com"
-USER_AGENT="antigravity/hub/1.23.2 darwin/arm64"
 OAUTH_TOKEN_URL="https://oauth2.googleapis.com/token"
-CLIENT_ID="$(sed -n 's/.*pub const CLIENT_ID: &str = "\([^"]*\)".*/\1/p' "${BASE_DIR}/crates/ccextra-server/src/antigravity/constants.rs" 2>/dev/null || true)"
-CLIENT_SECRET="$(sed -n 's/.*pub const CLIENT_SECRET: &str = "\([^"]*\)".*/\1/p' "${BASE_DIR}/crates/ccextra-server/src/antigravity/constants.rs" 2>/dev/null || true)"
+CONSTANTS_RS="${BASE_DIR}/crates/ccextra-server/src/antigravity/constants.rs"
+CLIENT_ID="$(sed -n 's/.*pub const CLIENT_ID: &str = "\([^"]*\)".*/\1/p' "${CONSTANTS_RS}" 2>/dev/null || true)"
+CLIENT_SECRET="$(sed -n 's/.*pub const CLIENT_SECRET: &str = "\([^"]*\)".*/\1/p' "${CONSTANTS_RS}" 2>/dev/null || true)"
+# Cloud Code 拒 <2.9.0 看新模型;跟服务端 REQUEST_UA 对齐,避免脚本漏 3.7 档
+USER_AGENT="$(sed -n 's/.*pub const REQUEST_UA: &str = "\([^"]*\)".*/\1/p' "${CONSTANTS_RS}" 2>/dev/null || true)"
+USER_AGENT="${USER_AGENT:-antigravity/hub/2.10.0 darwin/arm64}"
 
 usage() {
     echo "用法: $0 [选项]"

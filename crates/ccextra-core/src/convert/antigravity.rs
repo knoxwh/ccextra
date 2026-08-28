@@ -196,6 +196,24 @@ mod tests {
     }
 
     #[test]
+    fn test_filters_claude_identity_in_antigravity() {
+        let body = json!({
+            "model": "m", "max_tokens": 100,
+            "system": [
+                {"type": "text", "text": "You are a Claude agent, built on Anthropic's Claude Agent SDK."},
+                {"type": "text", "text": "Do the task."}
+            ],
+            "messages": [{"role": "user", "content": "hi"}]
+        });
+        let (out, _) = convert_to_antigravity(&body, "gemini-3.7-flash-medium", None);
+        let parts = out["request"]["systemInstruction"]["parts"]
+            .as_array()
+            .unwrap();
+        assert_eq!(parts.len(), 1);
+        assert_eq!(parts[0]["text"], "Do the task.");
+    }
+
+    #[test]
     fn test_claude_model_sets_validated_mode() {
         let (out, _) = convert_to_antigravity(&base_body(), "claude-opus-4-6-thinking", None);
         assert_eq!(

@@ -602,7 +602,7 @@ fn system_to_instructions_text(system: &Value) -> String {
     match system {
         Value::String(s) => {
             let trimmed = s.trim();
-            if !trimmed.is_empty() && !super::is_attribution_text(trimmed) {
+            if !super::is_ignorable_system_text(trimmed) {
                 texts.push(trimmed.to_string());
             }
         }
@@ -611,7 +611,7 @@ fn system_to_instructions_text(system: &Value) -> String {
                 if b.get("type").and_then(|v| v.as_str()) == Some("text") {
                     if let Some(t) = b.get("text").and_then(|v| v.as_str()) {
                         let trimmed = t.trim();
-                        if !trimmed.is_empty() && !super::is_attribution_text(trimmed) {
+                        if !super::is_ignorable_system_text(trimmed) {
                             texts.push(trimmed.to_string());
                         }
                     }
@@ -1107,15 +1107,15 @@ pub fn convert_to_openai_responses(
 /// role=system 消息的 reminder 文本(对齐 ClaudeMessageSystemReminderText)
 fn claude_system_reminder_text(content: Option<&Value>) -> Option<String> {
     let parts: Vec<String> = match content {
-        Some(Value::String(s)) if !s.is_empty() && !super::is_attribution_text(s) => {
-            vec![s.clone()]
+        Some(Value::String(s)) if !super::is_ignorable_system_text(s) => {
+            vec![s.trim().to_string()]
         }
         Some(Value::Array(items)) => items
             .iter()
             .filter(|i| i.get("type").and_then(|v| v.as_str()) == Some("text"))
             .filter_map(|i| i.get("text").and_then(|v| v.as_str()))
-            .filter(|t| !t.is_empty() && !super::is_attribution_text(t))
-            .map(String::from)
+            .filter(|t| !super::is_ignorable_system_text(t))
+            .map(|t| t.trim().to_string())
             .collect(),
         _ => Vec::new(),
     };
@@ -1327,17 +1327,19 @@ mod tests {
     }
 
     #[test]
-    fn test_system_attribution_stripped() {
+    fn test_system_attribution_and_claude_identity_stripped() {
         let mut body = json!({
             "model": "test",
             "system": [
                 {"type": "text", "text": "x-anthropic-billing-header: fp=abc"},
+                {"type": "text", "text": "You are a Claude agent, built on Anthropic's Claude Agent SDK."},
+                {"type": "text", "text": "You are Claude Code, Anthropic's official CLI for Claude."},
                 {"type": "text", "text": "Real"}
             ],
             "messages": []
         });
         convert_to_openai_responses(&mut body, "test-model").unwrap();
-        // attribution 被过滤，只保留 "Real"
+        // attribution 与 Claude 身份句被过滤，只保留 "Real"
         assert_eq!(body["instructions"], "Real");
     }
 

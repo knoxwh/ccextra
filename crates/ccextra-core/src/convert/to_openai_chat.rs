@@ -64,20 +64,20 @@ pub fn convert_to_openai_chat(body: &mut Value, upstream_model: &str) -> Result<
 
     let mut messages: Vec<Value> = Vec::new();
 
-    // System → messages[0](逐块剥离计费归属与空白,输出 text 数组,一致)
+    // System → messages[0](逐块剥离计费归属、Claude 身份声明与空白,输出 text 数组,一致)
     if let Some(system) = body.get("system") {
         let mut items: Vec<Value> = Vec::new();
         match system {
             Value::String(s) => {
-                if !s.trim().is_empty() && !super::is_attribution_text(s) {
-                    items.push(json!({"type": "text", "text": s}));
+                if !super::is_ignorable_system_text(s) {
+                    items.push(json!({"type": "text", "text": s.trim()}));
                 }
             }
             Value::Array(blocks) => {
                 for b in blocks {
                     if let Some(t) = b.get("text").and_then(|v| v.as_str()) {
-                        if !t.trim().is_empty() && !super::is_attribution_text(t) {
-                            items.push(json!({"type": "text", "text": t}));
+                        if !super::is_ignorable_system_text(t) {
+                            items.push(json!({"type": "text", "text": t.trim()}));
                         }
                     }
                 }
@@ -202,10 +202,10 @@ pub fn convert_to_openai_chat(body: &mut Value, upstream_model: &str) -> Result<
 fn system_reminder_text(content: &Value) -> Option<String> {
     let parts: Vec<&str> = match content {
         Value::String(s) => {
-            if s.trim().is_empty() || super::is_attribution_text(s) {
+            if super::is_ignorable_system_text(s) {
                 return None;
             }
-            vec![s.as_str()]
+            vec![s.trim()]
         }
         Value::Array(blocks) => blocks
             .iter()
@@ -214,10 +214,10 @@ fn system_reminder_text(content: &Value) -> Option<String> {
                     return None;
                 }
                 let t = b.get("text").and_then(|v| v.as_str())?;
-                if t.trim().is_empty() || super::is_attribution_text(t) {
+                if super::is_ignorable_system_text(t) {
                     None
                 } else {
-                    Some(t)
+                    Some(t.trim())
                 }
             })
             .collect(),
@@ -726,6 +726,36 @@ mod tests {
         });
         convert_to_openai_chat(&mut body, "gpt").unwrap();
         // system 消息不应存在,messages[0] 直接是 user
+        assert_eq!(body["messages"][0]["role"], "user");
+    }
+
+    #[test]
+    fn test_system_filters_attribution_and_claude_identity() {
+        let mut body = json!({
+            "model": "test",
+            "system": [
+                {"type": "text", "text": "x-anthropic-billing-header: fp=xyz"},
+                {"type": "text", "text": "You are a Claude agent, built on Anthropic's Claude Agent SDK."},
+                {"type": "text", "text": "You are Claude Code, Anthropic's official CLI for Claude."},
+                {"type": "text", "text": "You are helpful"}
+            ],
+            "messages": [{"role": "user", "content": "hi"}]
+        });
+        convert_to_openai_chat(&mut body, "gpt").unwrap();
+        let content = body["messages"][0]["content"].as_array().unwrap();
+        assert_eq!(content.len(), 1);
+        assert_eq!(content[0]["text"], "You are helpful");
+    }
+
+    #[test]
+    fn test_system_omitted_when_all_filtered() {
+        let mut body = json!({
+            "model": "test",
+            "system": "You are Claude Code, Anthropic's official CLI for Claude.",
+            "messages": [{"role": "user", "content": "hi"}]
+        });
+        convert_to_openai_chat(&mut body, "gpt").unwrap();
+        assert_eq!(body["messages"].as_array().unwrap().len(), 1);
         assert_eq!(body["messages"][0]["role"], "user");
     }
 

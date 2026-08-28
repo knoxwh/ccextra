@@ -46,11 +46,10 @@ use serde_json::{json, Value};
 use std::collections::HashMap;
 use std::future::Future;
 use std::pin::Pin;
-use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
+use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::{Arc, Mutex as StdMutex, OnceLock};
 use tokio::sync::RwLock;
 
-use crate::sse::parser::{SseEvent, SseParser};
 use crate::sse::replay_cache::StreamReplayExtractor;
 use crate::sse::SseStreamPin;
 use crate::upstream::{is_grok_model, UpstreamClient, UpstreamResponse};
@@ -856,8 +855,8 @@ async fn handle_messages(
         tracing::debug!("prompt_cache_key 已注入");
     }
 
-    // 诊断:request_body 开启时落盘最终上游 body,供逐轮 diff 定位缓存漂移。
-    // 文件名按会话+时间+序号,body 与响应元信息共用同一标识。
+    // 诊断:request_body 开启时落盘请求信息(headers + body),供逐轮 diff。
+    // 文件名按会话+时间+序号。
     let sess = cc_session
         .as_deref()
         .map(|s| s.chars().take(8).collect::<String>())
@@ -874,15 +873,17 @@ async fn handle_messages(
     };
     let log_stem = upstream_log_stem(&sess, ts, request_seq, &proto);
     if log_request_body {
-        let path = format!("logs/upstream_body_{log_stem}.json");
-        let dumped = serde_json::to_vec_pretty(&body_json)
+        let _ = std::fs::create_dir_all("logs");
+        let dump_obj = json!({
+            "inbound_headers": inbound_headers_json(&headers),
+            "upstream_body": body_json,
+        });
+        let path = format!("logs/upstream_request_{log_stem}.json");
+        let dumped = serde_json::to_vec_pretty(&dump_obj)
             .ok()
-            .and_then(|bytes| {
-                std::fs::create_dir_all("logs").ok()?;
-                std::fs::write(&path, bytes).ok()
-            });
+            .and_then(|bytes| std::fs::write(&path, bytes).ok());
         if dumped.is_none() {
-            tracing::warn!(path = %path, "上游 body 落盘失败");
+            tracing::warn!(path = %path, "上游请求诊断信息落盘失败");
         }
     }
 
@@ -1057,27 +1058,11 @@ async fn handle_messages(
         for attempt in 0..=1 {
             let current = upstream.take().expect("上游响应应存在");
             status = current.status;
-            let meta_base = upstream_meta_base(
-                log_request_body,
-                current.body.headers(),
-                ts,
-                request_seq,
-                &sess,
-                &proto,
-                &model,
-                &route.upstream_model,
-                status,
-                &body_json,
-            );
-            // 基础 meta 先落盘:错误响应、流式提前断开也保留响应头指纹。
-            let initial_meta_written = meta_base.as_ref().map(write_upstream_meta).unwrap_or(true);
-            let mut out = relay_stream_with_meta(
+            let mut out = relay_with_replay_tap(
                 route.protocol,
                 current.body.bytes_stream(),
                 estimated_input_tokens,
                 tool_names.clone(),
-                meta_base,
-                initial_meta_written,
                 replay_scope.clone(),
             );
             let first = out.next().await;
@@ -1127,11 +1112,9 @@ async fn handle_messages(
     // grok "Could not decrypt":剥离 reasoning.encrypted_content 再请求一次。
     if !status.is_success() {
         let failed = upstream.take().expect("上游响应应存在");
-        let failed_headers = failed.body.headers().clone();
         let err_bytes = failed.body.bytes().await?;
         let mut final_status = status;
         let mut final_bytes = err_bytes;
-        let mut final_headers = failed_headers;
         let mut retried_ok = false;
 
         if status.as_u16() == 400
@@ -1169,26 +1152,11 @@ async fn handle_messages(
                 upstream = Some(retry);
                 retried_ok = true;
             } else {
-                final_headers = retry.body.headers().clone();
                 final_bytes = retry.body.bytes().await?;
             }
         }
 
         if !retried_ok {
-            if let Some(meta) = upstream_meta_base(
-                log_request_body,
-                &final_headers,
-                ts,
-                request_seq,
-                &sess,
-                &proto,
-                &model,
-                &route.upstream_model,
-                final_status,
-                &body_json,
-            ) {
-                write_upstream_meta(&meta);
-            }
             return Response::builder()
                 .status(final_status)
                 .header(header::CONTENT_TYPE, "application/json")
@@ -1204,26 +1172,11 @@ async fn handle_messages(
             out
         } else {
             let upstream = upstream.take().expect("上游响应应存在");
-            let meta_base = upstream_meta_base(
-                log_request_body,
-                upstream.body.headers(),
-                ts,
-                request_seq,
-                &sess,
-                &proto,
-                &model,
-                &route.upstream_model,
-                status,
-                &body_json,
-            );
-            let initial_meta_written = meta_base.as_ref().map(write_upstream_meta).unwrap_or(true);
-            relay_stream_with_meta(
+            relay_with_replay_tap(
                 route.protocol,
                 upstream.body.bytes_stream(),
                 estimated_input_tokens,
                 tool_names,
-                meta_base,
-                initial_meta_written,
                 replay_scope,
             )
         };
@@ -1237,20 +1190,6 @@ async fn handle_messages(
         // 非流:上游 JSON 转回 Anthropic messages 形状(Claude Code 的
         // 标题生成 / /compact 回退等非流式请求;claude 直通已是 Anthropic 形状)。
         let upstream = upstream.take().expect("上游响应应存在");
-        if let Some(meta) = upstream_meta_base(
-            log_request_body,
-            upstream.body.headers(),
-            ts,
-            request_seq,
-            &sess,
-            &proto,
-            &model,
-            &route.upstream_model,
-            status,
-            &body_json,
-        ) {
-            write_upstream_meta(&meta);
-        }
         let body_bytes = upstream.body.bytes().await?;
         // 非流 reasoning replay 提取:
         // - responses:REST 顶层 Response(object=response)同样提取 replay 项
@@ -1429,232 +1368,52 @@ fn extract_upstream_error(body: &[u8]) -> (String, String) {
     }
 }
 
-// ── 上游响应元信息诊断(配合 logs/upstream_body_* 定位缓存漂移)────────────
+// ── 上游请求诊断落盘(配合 logs/upstream_request_*)────────
 
 fn upstream_log_stem(session: &str, ts: u64, sequence: u64, protocol: &str) -> String {
     format!("{session}_{ts}_{sequence}.{protocol}")
 }
 
-/// 从上游 Responses SSE 字节流中提取首个 response_id。
-/// 复用 SSE 解析器,避免跨 chunk 或 JSON 空白导致误判。
-struct ResponsesIdScanner {
-    parser: SseParser,
-    done: bool,
+/// 入站请求头是否含密钥,落盘时脱敏。
+fn is_sensitive_header(name: &str) -> bool {
+    let n = name.to_ascii_lowercase();
+    matches!(
+        n.as_str(),
+        "authorization" | "proxy-authorization" | "cookie" | "set-cookie" | "x-api-key"
+    ) || n.contains("api-key")
+        || n.ends_with("-token")
+        || n.ends_with("-secret")
 }
 
-impl ResponsesIdScanner {
-    fn new() -> Self {
-        Self {
-            parser: SseParser::new(),
-            done: false,
-        }
-    }
+fn header_value_text(value: &axum::http::HeaderValue) -> String {
+    String::from_utf8_lossy(value.as_bytes()).into_owned()
+}
 
-    /// 喂入一个 chunk,命中返回 id,否则 None。命中后不再解析。
-    fn push(&mut self, bytes: &[u8]) -> Option<String> {
-        if self.done {
-            return None;
-        }
-        let events = self.parser.push(bytes);
-        self.scan(events)
-    }
-
-    /// 流结束时 flush 没有末尾空行的事件。
-    fn finish(&mut self) -> Option<String> {
-        if self.done {
-            return None;
-        }
-        let events = self.parser.finish();
-        self.scan(events)
-    }
-
-    fn scan(&mut self, events: Vec<SseEvent>) -> Option<String> {
-        for event in events {
-            let Ok(value) = serde_json::from_str::<Value>(&event.data) else {
-                continue;
-            };
-            let created = event.event.as_deref() == Some("response.created")
-                || value.get("type").and_then(Value::as_str) == Some("response.created");
-            if !created {
-                continue;
+/// 入站 HeaderMap → JSON(密钥字段写成 `[redacted]`;同名多值保留为数组)。
+fn inbound_headers_json(headers: &HeaderMap) -> Value {
+    let mut map = serde_json::Map::new();
+    for (name, value) in headers.iter() {
+        let key = name.as_str();
+        let val = if is_sensitive_header(key) {
+            "[redacted]".to_string()
+        } else {
+            header_value_text(value)
+        };
+        match map.get_mut(key) {
+            Some(Value::Array(items)) => items.push(json!(val)),
+            Some(existing) => {
+                let first = existing.take();
+                map.insert(key.to_string(), json!([first, val]));
             }
-            let Some(id) = value
-                .pointer("/response/id")
-                .and_then(Value::as_str)
-                .filter(|id| !id.is_empty())
-            else {
-                continue;
-            };
-            self.done = true;
-            return Some(id.to_string());
-        }
-        None
-    }
-}
-
-/// 包裹 SSE 输出流:结束后执行一次 on_end(补写漏配的响应元信息)。
-fn sse_meta_finalizer<F>(inner: SseStreamPin, on_end: F) -> SseStreamPin
-where
-    F: FnOnce() + Send + 'static,
-{
-    Box::pin(async_stream::stream! {
-        let mut inner = inner;
-        while let Some(item) = inner.next().await {
-            yield item;
-        }
-        on_end();
-    })
-}
-
-fn write_meta_file(path: &std::path::Path, meta: &Value) -> bool {
-    let Ok(bytes) = serde_json::to_vec_pretty(meta) else {
-        return false;
-    };
-    std::fs::write(path, bytes).is_ok()
-}
-
-/// 落盘上游响应元信息(诊断)。文件名与 upstream_body_* 同会话同 ts,一对一定位。
-fn write_upstream_meta(meta: &Value) -> bool {
-    let ts = meta["ts"].as_u64().unwrap_or(0);
-    let request_seq = meta["request_seq"].as_u64().unwrap_or(0);
-    let sess = meta["session"].as_str().unwrap_or("nosess");
-    let proto = meta["protocol"].as_str().unwrap_or("unknown");
-    let stem = upstream_log_stem(sess, ts, request_seq, proto);
-    let path = format!("logs/upstream_meta_{stem}.json");
-    let ok = std::fs::create_dir_all("logs").is_ok()
-        && write_meta_file(std::path::Path::new(&path), meta);
-    if !ok {
-        tracing::warn!(path = %path, "上游响应元信息落盘失败");
-    }
-    ok
-}
-
-/// 构造上游响应诊断元信息。流式首帧重试后以最终响应头覆盖同一文件。
-#[allow(clippy::too_many_arguments)]
-fn upstream_meta_base(
-    enabled: bool,
-    headers: &reqwest::header::HeaderMap,
-    ts: u64,
-    request_seq: u64,
-    session: &str,
-    protocol: &str,
-    model: &str,
-    upstream_model: &str,
-    status: reqwest::StatusCode,
-    body: &Value,
-) -> Option<Value> {
-    if !enabled {
-        return None;
-    }
-    let mut response_headers = serde_json::Map::new();
-    for name in [
-        "cf-ray",
-        "x-request-id",
-        "x-response-id",
-        "server",
-        "alt-svc",
-        "via",
-        "x-served-by",
-        "x-cache-status",
-        "cf-cache-status",
-        "age",
-    ] {
-        if let Some(value) = headers.get(name) {
-            response_headers.insert(name.into(), json!(value.to_str().unwrap_or("")));
+            None => {
+                map.insert(key.to_string(), json!(val));
+            }
         }
     }
-    Some(json!({
-        "ts": ts,
-        "request_seq": request_seq,
-        "session": session,
-        "protocol": protocol,
-        "model": model,
-        "upstream_model": upstream_model,
-        "status": status.as_u16(),
-        "prompt_cache_key": body.get("prompt_cache_key"),
-        "response_id": Value::Null,
-        "headers": response_headers,
-    }))
+    Value::Object(map)
 }
 
-/// 包裹转换流并维护可选响应诊断。首帧门控会先轮询该流，故诊断也必须在此处接入。
-/// `replay_scope`:Some(session_key) 时从流中提取 response.completed 缓存
-/// reasoning replay 项(对齐 CPA cacheXAIReasoningReplayFromCompleted)。
-fn relay_stream_with_meta<S>(
-    protocol: Protocol,
-    stream: S,
-    estimated_input_tokens: Option<usize>,
-    tool_names: Option<Arc<HashMap<String, String>>>,
-    meta_base: Option<Value>,
-    initial_meta_written: bool,
-    replay_scope: Option<(crate::sse::replay_cache::ReplayCache, String)>,
-) -> SseStreamPin
-where
-    S: futures::Stream<Item = Result<Bytes, reqwest::Error>> + Send + 'static,
-{
-    let Some(meta) = meta_base else {
-        return relay_with_replay_tap(
-            protocol,
-            stream,
-            estimated_input_tokens,
-            tool_names,
-            replay_scope,
-        );
-    };
-    let shared = Arc::new(StdMutex::new(meta));
-    let written = Arc::new(AtomicBool::new(initial_meta_written));
-    if matches!(protocol, Protocol::OpenAiResponses) {
-        let scanner = Arc::new(StdMutex::new(ResponsesIdScanner::new()));
-        let scan = Arc::clone(&scanner);
-        let shared_for_scan = Arc::clone(&shared);
-        let written_for_scan = Arc::clone(&written);
-        let replay_for_scan = replay_scope
-            .clone()
-            .map(|(cache, key)| StdMutex::new(StreamReplayExtractor::new(cache, key)));
-        let tapped = stream.inspect(move |result| {
-            if let Ok(bytes) = result {
-                if let Some(id) = scan.lock().unwrap().push(bytes) {
-                    let mut meta = shared_for_scan.lock().unwrap();
-                    meta["response_id"] = json!(id);
-                    let ok = write_upstream_meta(&meta);
-                    written_for_scan.store(ok, Ordering::Release);
-                }
-                if let Some(extractor) = replay_for_scan.as_ref() {
-                    extractor.lock().unwrap().push(bytes);
-                }
-            }
-        });
-        let relayed = crate::sse::relay(protocol, tapped, estimated_input_tokens, tool_names);
-        sse_meta_finalizer(relayed, move || {
-            if let Some(id) = scanner.lock().unwrap().finish() {
-                let mut meta = shared.lock().unwrap();
-                meta["response_id"] = json!(id);
-                let ok = write_upstream_meta(&meta);
-                written.store(ok, Ordering::Release);
-            }
-            if !written.load(Ordering::Acquire) {
-                let ok = write_upstream_meta(&shared.lock().unwrap());
-                written.store(ok, Ordering::Release);
-            }
-        })
-    } else {
-        let relayed = relay_with_replay_tap(
-            protocol,
-            stream,
-            estimated_input_tokens,
-            tool_names,
-            replay_scope,
-        );
-        sse_meta_finalizer(relayed, move || {
-            if !written.load(Ordering::Acquire) {
-                let ok = write_upstream_meta(&shared.lock().unwrap());
-                written.store(ok, Ordering::Release);
-            }
-        })
-    }
-}
-
-/// 无诊断 meta 时的直通 relay:仅当带 replay scope 时加提取 tap。
+/// 仅当带 replay scope 时加提取 tap。
 /// responses 协议与 antigravity 协议都需从流中提取 replay 项。
 fn relay_with_replay_tap<S>(
     protocol: Protocol,
@@ -1814,105 +1573,28 @@ mod tests {
     }
 
     #[test]
-    fn write_meta_file_reports_write_failure() {
-        let path = std::env::temp_dir().join(format!(
-            "ccextra-meta-test-{}-{}",
-            std::process::id(),
-            UPSTREAM_LOG_SEQUENCE.fetch_add(1, Ordering::Relaxed),
-        ));
-        std::fs::create_dir_all(&path).unwrap();
-        let meta = json!({"response_id": "resp_1"});
-        assert!(write_meta_file(&path.join("meta.json"), &meta));
-        assert!(!write_meta_file(&path, &meta));
-        std::fs::remove_dir_all(path).unwrap();
+    fn inbound_headers_json_redacts_secrets_keeps_rest() {
+        let mut headers = HeaderMap::new();
+        headers.insert("x-api-key", "sk-live-secret".parse().unwrap());
+        headers.insert("authorization", "Bearer abc".parse().unwrap());
+        headers.insert("user-agent", "claude-cli/2.1.250".parse().unwrap());
+        headers.insert("x-claude-code-session-id", "sess-1".parse().unwrap());
+        headers.insert("anthropic-beta", "oauth-2025-04-20".parse().unwrap());
+        let dumped = inbound_headers_json(&headers);
+        assert_eq!(dumped["x-api-key"], "[redacted]");
+        assert_eq!(dumped["authorization"], "[redacted]");
+        assert_eq!(dumped["user-agent"], "claude-cli/2.1.250");
+        assert_eq!(dumped["x-claude-code-session-id"], "sess-1");
+        assert_eq!(dumped["anthropic-beta"], "oauth-2025-04-20");
     }
 
     #[test]
-    fn responses_id_scanner_single_chunk() {
-        // 单 chunk 内命中 response.created 的 id。
-        let mut scanner = ResponsesIdScanner::new();
-        let id = scanner.push(
-            br#"event: response.created
-data: {"type":"response.created","response":{"id":"resp_abc123","model":"gpt-5"}}
-
-"#,
-        );
-        assert_eq!(id.as_deref(), Some("resp_abc123"));
-        // 命中后不再解析后续事件。
-        assert_eq!(scanner.push(b"anything"), None);
-    }
-
-    #[test]
-    fn responses_id_scanner_across_chunks() {
-        // 事件在任意 JSON 字符位置切开仍可命中。
-        let mut scanner = ResponsesIdScanner::new();
-        assert_eq!(
-            scanner.push(
-                br#"event: response.created
-data: {"type":"response.crea"#
-            ),
-            None
-        );
-        assert_eq!(scanner.push(br#"ted","response":{"id":"resp_xyz"#), None);
-        assert_eq!(
-            scanner.push(
-                br#"","model":"gpt-5"}}
-
-"#
-            ),
-            Some("resp_xyz".to_string())
-        );
-    }
-
-    #[test]
-    fn responses_id_scanner_accepts_json_whitespace() {
-        let mut scanner = ResponsesIdScanner::new();
-        let id = scanner.push(
-            br#"event: response.created
-data: { "type": "response.created", "response": { "id": "resp_space" } }
-
-"#,
-        );
-        assert_eq!(id.as_deref(), Some("resp_space"));
-    }
-
-    #[test]
-    fn responses_id_scanner_ignores_non_created_ids() {
-        let mut scanner = ResponsesIdScanner::new();
-        let id = scanner.push(
-            br#"event: response.output_item.added
-data: {"type":"response.output_item.added","item":{"id":"item_1"}}
-
-event: response.created
-data: {"type":"response.created","response":{"id":"resp_1"}}
-
-"#,
-        );
-        assert_eq!(id.as_deref(), Some("resp_1"));
-    }
-
-    #[test]
-    fn responses_id_scanner_accepts_data_type_without_event_name() {
-        let mut scanner = ResponsesIdScanner::new();
-        let id = scanner.push(
-            br#"data: {"type":"response.created","response":{"id":"resp_no_event"}}
-
-"#,
-        );
-        assert_eq!(id.as_deref(), Some("resp_no_event"));
-    }
-
-    #[test]
-    fn responses_id_scanner_flushes_eof_without_empty_line() {
-        let mut scanner = ResponsesIdScanner::new();
-        assert_eq!(
-            scanner.push(
-                br#"event: response.created
-data: {"type":"response.created","response":{"id":"resp_eof"}}"#
-            ),
-            None
-        );
-        assert_eq!(scanner.finish().as_deref(), Some("resp_eof"));
+    fn inbound_headers_json_keeps_duplicate_names() {
+        let mut headers = HeaderMap::new();
+        headers.append("x-extra", "one".parse().unwrap());
+        headers.append("x-extra", "two".parse().unwrap());
+        let dumped = inbound_headers_json(&headers);
+        assert_eq!(dumped["x-extra"], json!(["one", "two"]));
     }
 
     fn headers_with(pairs: &[(&str, &str)]) -> HeaderMap {

@@ -4,7 +4,7 @@ use serde_json::Value;
 use std::collections::{HashMap, HashSet};
 
 use super::gemini_schema::{clean_json_schema_for_gemini, clean_nested_schema_for_antigravity};
-use super::is_attribution_text;
+use super::is_ignorable_system_text;
 use super::message_convert::convert_messages;
 use super::tool_sanitize::{sanitize_function_name, sanitized_function_name_map};
 
@@ -48,11 +48,11 @@ pub fn convert_to_gemini_with(
         None => (HashMap::new(), HashMap::new()),
     };
 
-    // system → systemInstruction(过滤 attribution 文本,对齐 CPA)
+    // system → systemInstruction(过滤 attribution 文本与 Claude 身份声明,对齐 CPA)
     let mut system_parts = Vec::new();
     match body.get("system") {
-        Some(Value::String(s)) if !s.is_empty() && !is_attribution_text(s) => {
-            system_parts.push(serde_json::json!({"text": s}));
+        Some(Value::String(s)) if !is_ignorable_system_text(s) => {
+            system_parts.push(serde_json::json!({"text": s.trim()}));
         }
         Some(Value::Array(arr)) => {
             for block in arr {
@@ -60,8 +60,8 @@ pub fn convert_to_gemini_with(
                     continue;
                 }
                 if let Some(text) = block.get("text").and_then(|t| t.as_str()) {
-                    if !text.is_empty() && !is_attribution_text(text) {
-                        system_parts.push(serde_json::json!({"text": text}));
+                    if !is_ignorable_system_text(text) {
+                        system_parts.push(serde_json::json!({"text": text.trim()}));
                     }
                 }
             }
@@ -373,11 +373,13 @@ mod tests {
     }
 
     #[test]
-    fn test_convert_to_gemini_system_filters_attribution() {
+    fn test_convert_to_gemini_system_filters_attribution_and_claude_identity() {
         let anthropic = json!({
             "model": "m", "max_tokens": 100,
             "system": [
                 {"type": "text", "text": "x-anthropic-billing-header: abc"},
+                {"type": "text", "text": "You are a Claude agent, built on Anthropic's Claude Agent SDK."},
+                {"type": "text", "text": "You are Claude Code, Anthropic's official CLI for Claude."},
                 {"type": "text", "text": "You are helpful"}
             ],
             "messages": [{"role": "user", "content": "hi"}]
@@ -387,6 +389,19 @@ mod tests {
         assert_eq!(parts.len(), 1);
         assert_eq!(parts[0]["text"], "You are helpful");
         assert_eq!(gemini["systemInstruction"]["role"], "user");
+    }
+
+    #[test]
+    fn test_convert_to_gemini_system_omitted_when_all_filtered() {
+        let anthropic = json!({
+            "model": "m", "max_tokens": 100,
+            "system": [
+                {"type": "text", "text": "You are Claude Code, Anthropic's official CLI for Claude."}
+            ],
+            "messages": [{"role": "user", "content": "hi"}]
+        });
+        let (gemini, _) = convert_to_gemini(&anthropic, "gemini-2.0");
+        assert!(gemini.get("systemInstruction").is_none());
     }
 
     #[test]

@@ -50,10 +50,28 @@ pub use to_openai_responses::{
 /// 转换到 openai 侧必须剥离,否则上游缓存前缀每次请求全 miss。
 const CLAUDE_CODE_ATTRIBUTION_PREFIX: &str = "x-anthropic-billing-header:";
 
+/// Claude Code subagent / CLI 注入的固定身份声明。非 Claude 上游剥离防拦截/人设冲突。
+pub const CLAUDE_AGENT_SDK_IDENTITY: &str =
+    "You are a Claude agent, built on Anthropic's Claude Agent SDK.";
+pub const CLAUDE_CODE_CLI_IDENTITY: &str =
+    "You are Claude Code, Anthropic's official CLI for Claude.";
+
 /// 是否为 Claude Code 计费归属文本(前导空白后以前缀开头)
 pub fn is_attribution_text(text: &str) -> bool {
     text.trim_start()
         .starts_with(CLAUDE_CODE_ATTRIBUTION_PREFIX)
+}
+
+/// 是否为 Claude 官方固定身份声明句
+pub fn is_claude_identity_text(text: &str) -> bool {
+    let t = text.trim();
+    t == CLAUDE_AGENT_SDK_IDENTITY || t == CLAUDE_CODE_CLI_IDENTITY
+}
+
+/// 是否为非 Claude 上游需忽略的系统提示文本(空白、计费头或 Claude 身份声明)
+pub fn is_ignorable_system_text(text: &str) -> bool {
+    let t = text.trim();
+    t.is_empty() || is_attribution_text(t) || is_claude_identity_text(t)
 }
 
 /// 是否为 Claude 服务端工具(web_search 系列)。此类工具在 chat 转换时

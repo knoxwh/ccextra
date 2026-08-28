@@ -150,7 +150,7 @@ chat 路径不同:Chat Completions 无 `encrypted_content`。对齐 CPA `shouldM
 OpenAI 转换流尚未输出首个 Anthropic SSE 帧时,若首帧为 `error`,重试上游一次;仅门控首帧,不缓冲完整响应。第二次仍失败、或已输出首帧后发生上游传输错误/EOF 未满足协议终态时,状态机只发 anthropic `error`,不伪造 `message_start` 或正常收尾帧。Chat 的 `[DONE]` 是显式终态;未收到 `[DONE]` 的 EOF 需已有 `finish_reason`。Responses 仅 `response.completed` / `response.incomplete` 正常收尾;`response.failed` 与 `error` 为错误终态。终态后忽略后续帧。responses 空轮次/纯思考轮次合成空 text 块(Claude 客户端遇零块消息报 "Content block not found")。Gemini 风格路径无首帧重试:直连 Gemini 在有效 payload 后仅发 `message_stop`,不合成缺失 finish terminal;Antigravity 在 clean EOF/`[DONE]` 且已有 payload、缺少有效 finish 时补空 text terminal 事件,已有 finish 时不重复。空流、空 envelope、空 `candidates`、空 usage、read error 均不报告成功完成。
 
 **诊断落盘**  
-`logging.request_body: true` 时逐请求把最终上游 body 落盘 `logs/upstream_body_<session前8>_<毫秒>.<protocol>.json`,供逐轮 diff 定位缓存漂移。另含入站 `request_body` 调试日志。
+`logging.request_body: true` 时逐请求把最终上游 body 与入站 HTTP 头落盘至单个文件 `logs/upstream_request_<session前8>_<毫秒>_<序号>.<protocol>.json`(密钥头脱敏)。另含入站 `request_body` 调试日志。须进程重启才生效(`/reload` 不够)。
 
 **content_block index 对齐**  
 openai chat 的 `delta.tool_calls[N]` 需映射到 anthropic 的 `content[M]`,首次出现时分配 index 并记录映射。
