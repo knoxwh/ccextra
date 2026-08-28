@@ -178,7 +178,9 @@ impl UpstreamClient {
             // 连接驻留对齐缓存 TTL(5min),防空闲回收重连导致上游节点切换
             .pool_idle_timeout(std::time::Duration::from_secs(300))
             // TCP 层探活,防死连接滞留/中间设备静默断
-            .tcp_keepalive(std::time::Duration::from_secs(60));
+            .tcp_keepalive(std::time::Duration::from_secs(60))
+            // 禁 Nagle:SSE 首帧/心跳/delta 都是小包,不等积压直接发,压 TTFT
+            .tcp_nodelay(true);
         if proxy_key == "direct" {
             builder = builder.no_proxy();
         } else if let Ok(proxy) = reqwest::Proxy::all(proxy_key) {
