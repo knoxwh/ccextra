@@ -145,10 +145,34 @@ static AUTH_CACHE: OnceLock<StdMutex<HashMap<String, bool>>> = OnceLock::new();
 /// 诊断日志请求序号:与毫秒时间戳组合,避免并发请求覆盖同一文件。
 static UPSTREAM_LOG_SEQUENCE: AtomicU64 = AtomicU64::new(0);
 
-// 上游可重试错误的统一退避参数(对齐通用网关重试)
+// 上游可重试错误的统一退避参数(对齐通用网关重试与 grok retry)
 const RETRY_BASE_DELAY: std::time::Duration = std::time::Duration::from_millis(300);
 const RETRY_MAX_DELAY: std::time::Duration = std::time::Duration::from_secs(3);
 const RETRY_TOTAL_BUDGET: std::time::Duration = std::time::Duration::from_secs(10);
+
+/// 52x 错误最大退避时间(对齐 grok MAX_RETRY_BACKOFF,防 Cloudflare 120s 挂死)
+const CF_EDGE_MAX_RETRY_BACKOFF: std::time::Duration = std::time::Duration::from_secs(30);
+
+/// +/-20% jitter 抖动(对齐 grok jitter_backoff),打散并发客户端重试风暴
+fn jitter_backoff(base: std::time::Duration) -> std::time::Duration {
+    use std::hash::{Hash, Hasher};
+    static JITTER_SEQ: AtomicU64 = AtomicU64::new(0);
+
+    let base_ms = base.as_millis() as u64;
+    if base_ms == 0 {
+        return base;
+    }
+    let jitter_range = base_ms / 5;
+    let mut hasher = std::hash::DefaultHasher::new();
+    JITTER_SEQ.fetch_add(1, Ordering::Relaxed).hash(&mut hasher);
+    std::thread::current().id().hash(&mut hasher);
+    let jitter = if jitter_range > 0 {
+        hasher.finish() % (jitter_range * 2 + 1)
+    } else {
+        0
+    };
+    std::time::Duration::from_millis(base_ms.saturating_sub(jitter_range) + jitter)
+}
 
 /// Retry-After 头解析:仅支持秒数形式(HTTP-date 忽略,按退避公式兜底)
 fn parse_retry_after(headers: &reqwest::header::HeaderMap) -> Option<std::time::Duration> {
@@ -157,21 +181,45 @@ fn parse_retry_after(headers: &reqwest::header::HeaderMap) -> Option<std::time::
     Some(std::time::Duration::from_secs(secs))
 }
 
-/// 第 attempt 次失败(0 起)后的等待时长:Retry-After 优先,否则
-/// base * 2^attempt 指数退避封顶 max;总预算耗尽返回 None 不再重试。
+/// 第 attempt 次失败(0 起)后的等待时长:
+/// - 429: 完整尊重 Retry-After(对齐 grok/OpenAI rate limit)
+/// - 52x/5xx 等边缘错误: Retry-After 钳位到 30s 并加 +/-20% jitter 抖动
+/// - 其余/网络错误: base * 2^attempt 指数退避 + jitter
+/// - 总预算耗尽返回 None 不再重试。
 fn compute_retry_delay(
     attempt: u32,
     started_at: std::time::Instant,
     headers: &reqwest::header::HeaderMap,
+    status: Option<reqwest::StatusCode>,
 ) -> Option<std::time::Duration> {
     let elapsed = started_at.elapsed();
     if elapsed >= RETRY_TOTAL_BUDGET {
         return None;
     }
-    let backoff = RETRY_BASE_DELAY.saturating_mul(1u32 << attempt.min(4));
-    let mut delay = parse_retry_after(headers)
-        .unwrap_or(backoff)
-        .min(RETRY_MAX_DELAY);
+
+    let is_429 = status.map(|s| s.as_u16() == 429).unwrap_or(false);
+    let is_cf_52x = status
+        .map(|s| {
+            let c = s.as_u16();
+            (520..=529).contains(&c)
+        })
+        .unwrap_or(false);
+
+    let mut delay = if let Some(retry_after) = parse_retry_after(headers) {
+        if is_429 {
+            // 429 真实限流直接按上游声明等待
+            retry_after.min(RETRY_MAX_DELAY)
+        } else if is_cf_52x {
+            // Cloudflare 52x 往往下发 60-120s，钳位到 30s + 抖动
+            jitter_backoff(retry_after.min(CF_EDGE_MAX_RETRY_BACKOFF)).min(RETRY_MAX_DELAY)
+        } else {
+            jitter_backoff(retry_after.min(RETRY_MAX_DELAY))
+        }
+    } else {
+        let backoff = RETRY_BASE_DELAY.saturating_mul(1u32 << attempt.min(4));
+        jitter_backoff(backoff.min(RETRY_MAX_DELAY))
+    };
+
     // 头给出的等待也不得突破总预算(截断而非放弃,末次机会照试)
     if elapsed + delay > RETRY_TOTAL_BUDGET {
         delay = RETRY_TOTAL_BUDGET - elapsed;
@@ -1001,12 +1049,18 @@ async fn handle_messages(
                 break;
             }
             Out::Fail(resp) if resp.status.as_u16() == 429 || resp.status.is_server_error() => {
-                let wait = compute_retry_delay(attempt, retry_started_at, resp.body.headers());
+                let status = resp.status;
+                let wait = compute_retry_delay(
+                    attempt,
+                    retry_started_at,
+                    resp.body.headers(),
+                    Some(status),
+                );
                 attempt += 1;
                 match wait {
                     Some(d) => {
                         tracing::warn!(
-                            status = resp.status.as_u16(),
+                            status = status.as_u16(),
                             attempt,
                             delay_ms = d.as_millis() as u64,
                             "上游可重试失败,退避后重试"
@@ -1026,7 +1080,7 @@ async fn handle_messages(
             }
             Out::Net(e) => {
                 last_err = Some(e);
-                let wait = compute_retry_delay(attempt, retry_started_at, &HeaderMap::new());
+                let wait = compute_retry_delay(attempt, retry_started_at, &HeaderMap::new(), None);
                 attempt += 1;
                 match wait {
                     Some(d) => tokio::time::sleep(d).await,
@@ -3406,16 +3460,30 @@ models:
         let started = std::time::Instant::now();
         let mut headers = reqwest::header::HeaderMap::new();
         headers.insert(reqwest::header::RETRY_AFTER, "5".parse().unwrap());
-        // Retry-After 优先且封顶 3s
-        let d = compute_retry_delay(0, started, &headers).unwrap();
+        // 429: Retry-After 优先且封顶 3s
+        let d = compute_retry_delay(
+            0,
+            started,
+            &headers,
+            Some(reqwest::StatusCode::TOO_MANY_REQUESTS),
+        )
+        .unwrap();
         assert_eq!(d, std::time::Duration::from_secs(3));
-        // 无头:指数 300ms→600ms
-        let d2 = compute_retry_delay(1, started, &reqwest::header::HeaderMap::new()).unwrap();
-        assert_eq!(d2, std::time::Duration::from_millis(600));
+
+        // CF 522 错误带 Retry-After: 120s，钳位并在 jitter 范围 (24s..=30s，受 RETRY_MAX_DELAY 3s 截断)
+        let cf_status = reqwest::StatusCode::from_u16(522).unwrap();
+        let d_cf = compute_retry_delay(0, started, &headers, Some(cf_status)).unwrap();
+        assert!(d_cf <= std::time::Duration::from_secs(3));
+
+        // 无头: 基础 300ms 经 jitter 在 [240ms, 360ms] 范围
+        let d2 = compute_retry_delay(0, started, &reqwest::header::HeaderMap::new(), None).unwrap();
+        assert!(d2 >= std::time::Duration::from_millis(240));
+        assert!(d2 <= std::time::Duration::from_millis(360));
+
         // 总预算耗尽 → 不再重试
         std::thread::sleep(std::time::Duration::from_millis(20));
         let exhausted_start = started - (RETRY_TOTAL_BUDGET + std::time::Duration::from_secs(1));
-        assert!(compute_retry_delay(0, exhausted_start, &headers).is_none());
+        assert!(compute_retry_delay(0, exhausted_start, &headers, None).is_none());
     }
 
     /// 上游 500:按退避重试后成功;429 带 Retry-After 的路径由同一分支覆盖。
