@@ -597,12 +597,12 @@ fn branch_schema_type_is_object_only(t: &Value) -> bool {
 /// 1. codex 存储 base_instructions 为单字符串,合并时自然规范化空白
 /// 2. Claude Code 系统提示程序生成,不含前导/尾随空白
 /// 3. 即使上游发送空白块,trim 后更利于缓存命中(减少无意义字节差异)
-fn system_to_instructions_text(system: &Value) -> String {
+fn system_to_instructions_text(system: &Value, upstream_model: &str) -> String {
     let mut texts: Vec<String> = Vec::new();
     match system {
         Value::String(s) => {
             let trimmed = s.trim();
-            if !super::is_ignorable_system_text(trimmed) {
+            if !super::is_ignorable_system_text(trimmed, upstream_model) {
                 texts.push(trimmed.to_string());
             }
         }
@@ -611,7 +611,7 @@ fn system_to_instructions_text(system: &Value) -> String {
                 if b.get("type").and_then(|v| v.as_str()) == Some("text") {
                     if let Some(t) = b.get("text").and_then(|v| v.as_str()) {
                         let trimmed = t.trim();
-                        if !super::is_ignorable_system_text(trimmed) {
+                        if !super::is_ignorable_system_text(trimmed, upstream_model) {
                             texts.push(trimmed.to_string());
                         }
                     }
@@ -631,7 +631,7 @@ pub fn convert_to_openai_responses(
     // --- system → instructions / developer message ---
     let system = body
         .get("system")
-        .map(system_to_instructions_text)
+        .map(|system| system_to_instructions_text(system, upstream_model))
         .unwrap_or_default();
     let gpt_upstream = is_gpt_upstream(upstream_model);
     let needs_adapter = needs_adapter_block(upstream_model);
@@ -706,7 +706,7 @@ pub fn convert_to_openai_responses(
         let mut msgs: Vec<Value> = msgs.clone();
         for m in &mut msgs {
             if m.get("role").and_then(|v| v.as_str()) == Some("system") {
-                if let Some(text) = claude_system_reminder_text(m.get("content")) {
+                if let Some(text) = claude_system_reminder_text(m.get("content"), upstream_model) {
                     m["role"] = json!("user");
                     m["content"] = json!(text);
                 }
@@ -720,7 +720,8 @@ pub fn convert_to_openai_responses(
 
             // role=system 消息:reminder 文本 → user message(对齐 ClaudeMessageSystemReminderText)
             if role == "system" {
-                if let Some(text) = claude_system_reminder_text(msg.get("content")) {
+                if let Some(text) = claude_system_reminder_text(msg.get("content"), upstream_model)
+                {
                     openai["input"].as_array_mut().unwrap().push(json!({
                         "type": "message",
                         "role": "user",
@@ -1105,16 +1106,16 @@ pub fn convert_to_openai_responses(
 }
 
 /// role=system 消息的 reminder 文本(对齐 ClaudeMessageSystemReminderText)
-fn claude_system_reminder_text(content: Option<&Value>) -> Option<String> {
+fn claude_system_reminder_text(content: Option<&Value>, upstream_model: &str) -> Option<String> {
     let parts: Vec<String> = match content {
-        Some(Value::String(s)) if !super::is_ignorable_system_text(s) => {
+        Some(Value::String(s)) if !super::is_ignorable_system_text(s, upstream_model) => {
             vec![s.trim().to_string()]
         }
         Some(Value::Array(items)) => items
             .iter()
             .filter(|i| i.get("type").and_then(|v| v.as_str()) == Some("text"))
             .filter_map(|i| i.get("text").and_then(|v| v.as_str()))
-            .filter(|t| !super::is_ignorable_system_text(t))
+            .filter(|t| !super::is_ignorable_system_text(t, upstream_model))
             .map(|t| t.trim().to_string())
             .collect(),
         _ => Vec::new(),
@@ -1341,6 +1342,24 @@ mod tests {
         convert_to_openai_responses(&mut body, "test-model").unwrap();
         // attribution 与 Claude 身份句被过滤，只保留 "Real"
         assert_eq!(body["instructions"], "Real");
+    }
+
+    #[test]
+    fn test_claude_target_keeps_claude_identity() {
+        let mut body = json!({
+            "model": "test",
+            "system": [
+                {"type": "text", "text": "You are Claude Code, Anthropic's official CLI for Claude."}
+            ],
+            "messages": []
+        });
+
+        convert_to_openai_responses(&mut body, "claude-opus-5").unwrap();
+
+        assert_eq!(
+            body["instructions"],
+            "You are Claude Code, Anthropic's official CLI for Claude."
+        );
     }
 
     #[test]

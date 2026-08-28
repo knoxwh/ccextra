@@ -211,7 +211,7 @@ fn compute_retry_delay(
             retry_after.min(RETRY_MAX_DELAY)
         } else if is_cf_52x {
             // Cloudflare 52x 往往下发 60-120s，钳位到 30s + 抖动
-            jitter_backoff(retry_after.min(CF_EDGE_MAX_RETRY_BACKOFF)).min(RETRY_MAX_DELAY)
+            jitter_backoff(retry_after.min(CF_EDGE_MAX_RETRY_BACKOFF))
         } else {
             jitter_backoff(retry_after.min(RETRY_MAX_DELAY))
         }
@@ -3456,6 +3456,23 @@ models:
     }
 
     #[test]
+    fn test_cf_retry_after_keeps_jitter_above_general_cap() {
+        let started = std::time::Instant::now();
+        let mut headers = reqwest::header::HeaderMap::new();
+        headers.insert(reqwest::header::RETRY_AFTER, "5".parse().unwrap());
+        let status = reqwest::StatusCode::from_u16(522).unwrap();
+
+        let delay = compute_retry_delay(0, started, &headers, Some(status)).unwrap();
+
+        assert!(
+            delay > RETRY_MAX_DELAY,
+            "52x Retry-After 不得被通用上限截断"
+        );
+        assert!(delay >= std::time::Duration::from_secs(4));
+        assert!(delay <= std::time::Duration::from_secs(6));
+    }
+
+    #[test]
     fn test_retry_delay_respects_retry_after_and_budget() {
         let started = std::time::Instant::now();
         let mut headers = reqwest::header::HeaderMap::new();
@@ -3469,11 +3486,6 @@ models:
         )
         .unwrap();
         assert_eq!(d, std::time::Duration::from_secs(3));
-
-        // CF 522 错误带 Retry-After: 120s，钳位并在 jitter 范围 (24s..=30s，受 RETRY_MAX_DELAY 3s 截断)
-        let cf_status = reqwest::StatusCode::from_u16(522).unwrap();
-        let d_cf = compute_retry_delay(0, started, &headers, Some(cf_status)).unwrap();
-        assert!(d_cf <= std::time::Duration::from_secs(3));
 
         // 无头: 基础 300ms 经 jitter 在 [240ms, 360ms] 范围
         let d2 = compute_retry_delay(0, started, &reqwest::header::HeaderMap::new(), None).unwrap();

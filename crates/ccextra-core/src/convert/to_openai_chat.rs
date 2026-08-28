@@ -64,19 +64,19 @@ pub fn convert_to_openai_chat(body: &mut Value, upstream_model: &str) -> Result<
 
     let mut messages: Vec<Value> = Vec::new();
 
-    // System → messages[0](逐块剥离计费归属、Claude 身份声明与空白,输出 text 数组,一致)
+    // System → messages[0](逐块剥离计费归属、非 Claude 目标身份声明与空白,输出 text 数组,一致)
     if let Some(system) = body.get("system") {
         let mut items: Vec<Value> = Vec::new();
         match system {
             Value::String(s) => {
-                if !super::is_ignorable_system_text(s) {
+                if !super::is_ignorable_system_text(s, upstream_model) {
                     items.push(json!({"type": "text", "text": s.trim()}));
                 }
             }
             Value::Array(blocks) => {
                 for b in blocks {
                     if let Some(t) = b.get("text").and_then(|v| v.as_str()) {
-                        if !super::is_ignorable_system_text(t) {
+                        if !super::is_ignorable_system_text(t, upstream_model) {
                             items.push(json!({"type": "text", "text": t.trim()}));
                         }
                     }
@@ -100,7 +100,7 @@ pub fn convert_to_openai_chat(body: &mut Value, upstream_model: &str) -> Result<
 
             // messages 内 role=system:提取文本包 <system-reminder> 转 user
             if role == "system" {
-                if let Some(reminder) = system_reminder_text(&content) {
+                if let Some(reminder) = system_reminder_text(&content, upstream_model) {
                     let converted = convert_message("user", &json!(reminder))?;
                     messages.extend(converted);
                 }
@@ -199,10 +199,10 @@ pub fn convert_to_openai_chat(body: &mut Value, upstream_model: &str) -> Result<
 
 /// messages 内 role=system 消息 → 文本提取,包 <system-reminder> 标记
 /// (对齐 common.ClaudeMessageSystemReminderText)。
-fn system_reminder_text(content: &Value) -> Option<String> {
+fn system_reminder_text(content: &Value, upstream_model: &str) -> Option<String> {
     let parts: Vec<&str> = match content {
         Value::String(s) => {
-            if super::is_ignorable_system_text(s) {
+            if super::is_ignorable_system_text(s, upstream_model) {
                 return None;
             }
             vec![s.trim()]
@@ -214,7 +214,7 @@ fn system_reminder_text(content: &Value) -> Option<String> {
                     return None;
                 }
                 let t = b.get("text").and_then(|v| v.as_str())?;
-                if super::is_ignorable_system_text(t) {
+                if super::is_ignorable_system_text(t, upstream_model) {
                     None
                 } else {
                     Some(t.trim())
@@ -715,6 +715,24 @@ mod tests {
         let content = body["messages"][0]["content"].as_array().unwrap();
         assert_eq!(content.len(), 1);
         assert_eq!(content[0]["text"], "Real instructions");
+    }
+
+    #[test]
+    fn test_claude_target_keeps_claude_identity() {
+        let mut body = json!({
+            "model": "test",
+            "system": [
+                {"type": "text", "text": "You are Claude Code, Anthropic's official CLI for Claude."}
+            ],
+            "messages": []
+        });
+
+        convert_to_openai_chat(&mut body, "claude-opus-5").unwrap();
+
+        assert_eq!(
+            body["messages"][0]["content"][0]["text"],
+            "You are Claude Code, Anthropic's official CLI for Claude."
+        );
     }
 
     #[test]

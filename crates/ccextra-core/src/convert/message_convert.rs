@@ -66,7 +66,7 @@ pub fn convert_messages(
             }
             // system 消息 → user 角色的 system-reminder 文本(对齐 ClaudeMessageSystemReminderText)
             "system" => {
-                if let Some(reminder) = system_reminder_text(&msg["content"]) {
+                if let Some(reminder) = system_reminder_text(&msg["content"], upstream_model) {
                     contents.push(json!({
                         "role": "user",
                         "parts": [{ "text": reminder }]
@@ -134,12 +134,12 @@ fn align_tool_results(content: &Value, preceding_tool_use_ids: &[String]) -> Val
 }
 
 /// 提取 system 消息文本并包成 <system-reminder>...</system-reminder>
-/// 空文本、attribution 文本与 Claude 身份声明跳过;无有效内容返回 None
-fn system_reminder_text(content: &Value) -> Option<String> {
+/// 空文本、attribution 文本与非 Claude 目标身份声明跳过;无有效内容返回 None
+fn system_reminder_text(content: &Value, upstream_model: &str) -> Option<String> {
     let mut parts: Vec<&str> = Vec::new();
     match content {
         Value::String(s) => {
-            if !is_ignorable_system_text(s) {
+            if !is_ignorable_system_text(s, upstream_model) {
                 parts.push(s.trim());
             }
         }
@@ -149,7 +149,7 @@ fn system_reminder_text(content: &Value) -> Option<String> {
                     continue;
                 }
                 if let Some(text) = item.get("text").and_then(|t| t.as_str()) {
-                    if !is_ignorable_system_text(text) {
+                    if !is_ignorable_system_text(text, upstream_model) {
                         parts.push(text.trim());
                     }
                 }

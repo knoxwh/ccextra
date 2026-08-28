@@ -68,10 +68,12 @@ pub fn is_claude_identity_text(text: &str) -> bool {
     t == CLAUDE_AGENT_SDK_IDENTITY || t == CLAUDE_CODE_CLI_IDENTITY
 }
 
-/// 是否为非 Claude 上游需忽略的系统提示文本(空白、计费头或 Claude 身份声明)
-pub fn is_ignorable_system_text(text: &str) -> bool {
+/// 是否为目标上游需忽略的系统提示文本(空白、计费头或非 Claude 目标的身份声明)
+pub fn is_ignorable_system_text(text: &str, upstream_model: &str) -> bool {
     let t = text.trim();
-    t.is_empty() || is_attribution_text(t) || is_claude_identity_text(t)
+    t.is_empty()
+        || is_attribution_text(t)
+        || (!upstream_model.to_lowercase().contains("claude") && is_claude_identity_text(t))
 }
 
 /// 是否为 Claude 服务端工具(web_search 系列)。此类工具在 chat 转换时

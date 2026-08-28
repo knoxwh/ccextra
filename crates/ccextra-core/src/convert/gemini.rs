@@ -48,10 +48,10 @@ pub fn convert_to_gemini_with(
         None => (HashMap::new(), HashMap::new()),
     };
 
-    // system → systemInstruction(过滤 attribution 文本与 Claude 身份声明,对齐 CPA)
+    // system → systemInstruction(过滤 attribution 文本与非 Claude 目标身份声明,对齐 CPA)
     let mut system_parts = Vec::new();
     match body.get("system") {
-        Some(Value::String(s)) if !is_ignorable_system_text(s) => {
+        Some(Value::String(s)) if !is_ignorable_system_text(s, upstream_model) => {
             system_parts.push(serde_json::json!({"text": s.trim()}));
         }
         Some(Value::Array(arr)) => {
@@ -60,7 +60,7 @@ pub fn convert_to_gemini_with(
                     continue;
                 }
                 if let Some(text) = block.get("text").and_then(|t| t.as_str()) {
-                    if !is_ignorable_system_text(text) {
+                    if !is_ignorable_system_text(text, upstream_model) {
                         system_parts.push(serde_json::json!({"text": text.trim()}));
                     }
                 }
@@ -389,6 +389,32 @@ mod tests {
         assert_eq!(parts.len(), 1);
         assert_eq!(parts[0]["text"], "You are helpful");
         assert_eq!(gemini["systemInstruction"]["role"], "user");
+    }
+
+    #[test]
+    fn test_convert_to_antigravity_claude_keeps_identity() {
+        let anthropic = json!({
+            "model": "m", "max_tokens": 100,
+            "system": [
+                {"type": "text", "text": "You are a Claude agent, built on Anthropic's Claude Agent SDK."},
+                {"type": "text", "text": "You are Claude Code, Anthropic's official CLI for Claude."},
+                {"type": "text", "text": "You are helpful"}
+            ],
+            "messages": [{"role": "user", "content": "hi"}]
+        });
+        let (gemini, _) =
+            convert_to_gemini_with(&anthropic, "claude-opus-5", SchemaFlavor::Antigravity);
+        let parts = gemini["systemInstruction"]["parts"].as_array().unwrap();
+        assert_eq!(parts.len(), 3);
+        assert_eq!(
+            parts[0]["text"],
+            "You are a Claude agent, built on Anthropic's Claude Agent SDK."
+        );
+        assert_eq!(
+            parts[1]["text"],
+            "You are Claude Code, Anthropic's official CLI for Claude."
+        );
+        assert_eq!(parts[2]["text"], "You are helpful");
     }
 
     #[test]
