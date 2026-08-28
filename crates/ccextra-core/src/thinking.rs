@@ -420,6 +420,15 @@ mod tests {
     }
 
     #[test]
+    fn test_clamp_effort_registry_gemini_flash_sku() {
+        // Antigravity SKU 档位写死在注册表,effort=max 钳到该档
+        assert_eq!(clamp_effort("max", "gemini-3.7-flash-medium"), "medium");
+        assert_eq!(clamp_effort("high", "gemini-3.7-flash-medium"), "medium");
+        assert_eq!(clamp_effort("max", "gemini-3.7-flash-high"), "high");
+        assert_eq!(clamp_effort("medium", "gemini-3.7-flash-high"), "high");
+    }
+
+    #[test]
     fn test_clamp_to_nearest_exact_match() {
         let supported = vec![Level::Low, Level::Medium, Level::High];
         assert_eq!(clamp_to_nearest(Level::Medium, &supported), Level::Medium);

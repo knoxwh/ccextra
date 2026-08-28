@@ -138,25 +138,21 @@ pub fn convert_to_gemini_with(
             }
             Some("adaptive") | Some("auto") => {
                 // 对齐 CPA:effort 显式给则透传 thinkingLevel;否则按目标模型
-                // thinking.max 发 thinkingBudget,查不到再兜底 "high"
+                // thinking.max 发 thinkingBudget,查不到再兜底 "high"。
+                // Antigravity 无预算表,走 thinkingLevel,并按注册表钳到模型档位
+                // (gemini-3.7-flash-medium 只认 medium,effort=max 不得抬成 high)
                 let effort = body
                     .pointer("/output_config/effort")
                     .and_then(|e| e.as_str())
                     .map(|e| e.trim().to_lowercase())
                     .filter(|e| !e.is_empty());
 
-                // effort="max" 或缺失时走预算表 → thinkingBudget,兜底 high
-                let use_budget_path = effort.as_deref() == Some("max") || effort.is_none();
+                // 预算表仅 Gemini 直连:max/缺失 → thinkingBudget
+                let use_budget_path = flavor == SchemaFlavor::Gemini
+                    && (effort.as_deref() == Some("max") || effort.is_none());
 
                 if use_budget_path {
-                    // 对齐 CPA:thinking.max 预算表仅 Gemini 直连翻译器使用,
-                    // Antigravity 翻译器缺省 thinkingLevel=high
-                    let max_budget = if flavor == SchemaFlavor::Gemini {
-                        gemini_thinking_max_budget(upstream_model)
-                    } else {
-                        None
-                    };
-                    if let Some(max_budget) = max_budget {
+                    if let Some(max_budget) = gemini_thinking_max_budget(upstream_model) {
                         generation_config.insert(
                             "thinkingConfig".into(),
                             serde_json::json!({"thinkingBudget": max_budget}),
@@ -167,13 +163,14 @@ pub fn convert_to_gemini_with(
                             serde_json::json!({"thinkingLevel": "high"}),
                         );
                     }
-                } else if let Some(e) = effort {
-                    // 非 max 的 effort 值校验白名单(Gemini 接受 low/medium/high)
-                    let valid_levels = ["low", "medium", "high"];
-                    let level = if valid_levels.contains(&e.as_str()) {
-                        e
-                    } else {
-                        "high".to_string() // 不合法值兜底
+                } else {
+                    let raw = effort.unwrap_or_else(|| "high".to_string());
+                    let clamped = crate::thinking::clamp_effort(&raw, upstream_model);
+                    // Gemini 3 thinkingLevel 白名单;max/xhigh 落到 high
+                    let level = match clamped {
+                        "minimal" | "low" | "medium" | "high" => clamped,
+                        "max" | "xhigh" => "high",
+                        _ => "high",
                     };
                     generation_config.insert(
                         "thinkingConfig".into(),
@@ -472,6 +469,64 @@ mod tests {
         assert_eq!(
             gemini["generationConfig"]["thinkingConfig"]["thinkingLevel"],
             "high"
+        );
+    }
+
+    fn adaptive_max_body() -> Value {
+        json!({
+            "model": "m", "max_tokens": 1000,
+            "thinking": {"type": "adaptive"},
+            "output_config": {"effort": "max"},
+            "messages": [{"role": "user", "content": "hi"}]
+        })
+    }
+
+    #[test]
+    fn test_antigravity_clamps_effort_max_to_medium_sku() {
+        // medium SKU 注册表只认 medium,effort=max 不得抬成 high
+        let (gemini, _) = convert_to_gemini_with(
+            &adaptive_max_body(),
+            "gemini-3.7-flash-medium",
+            SchemaFlavor::Antigravity,
+        );
+        assert_eq!(
+            gemini["generationConfig"]["thinkingConfig"]["thinkingLevel"],
+            "medium"
+        );
+        assert!(gemini["generationConfig"]["thinkingConfig"]
+            .get("thinkingBudget")
+            .is_none());
+    }
+
+    #[test]
+    fn test_antigravity_clamps_effort_max_to_high_sku() {
+        let (gemini, _) = convert_to_gemini_with(
+            &adaptive_max_body(),
+            "gemini-3.7-flash-high",
+            SchemaFlavor::Antigravity,
+        );
+        assert_eq!(
+            gemini["generationConfig"]["thinkingConfig"]["thinkingLevel"],
+            "high"
+        );
+    }
+
+    #[test]
+    fn test_antigravity_default_effort_clamps_to_medium_sku() {
+        // 无 output_config.effort 时 CPA 缺省 high,再按 SKU 钳制
+        let anthropic = json!({
+            "model": "m", "max_tokens": 1000,
+            "thinking": {"type": "adaptive"},
+            "messages": [{"role": "user", "content": "hi"}]
+        });
+        let (gemini, _) = convert_to_gemini_with(
+            &anthropic,
+            "gemini-3.7-flash-medium",
+            SchemaFlavor::Antigravity,
+        );
+        assert_eq!(
+            gemini["generationConfig"]["thinkingConfig"]["thinkingLevel"],
+            "medium"
         );
     }
 
