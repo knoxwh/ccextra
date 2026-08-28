@@ -18,11 +18,11 @@
     },
     {
       "id": "glm-5.2",
-      "reasoning_levels": ["low", "medium", "high", "xhigh", "max"]
+      "reasoning_levels": ["low", "high", "max"]
     },
     {
       "id": "glm-5.3",
-      "reasoning_levels": ["low", "medium", "high", "xhigh", "max"]
+      "reasoning_levels": ["low", "high", "max"]
     },
     {
       "id": "glm-5.3-flash",
@@ -78,7 +78,11 @@
     },
     {
       "id": "gemini-3.7-flash-high",
-      "reasoning_levels": ["minimal", "low", "medium", "high"]
+      "reasoning_levels": ["high"]
+    },
+    {
+      "id": "gemini-3.7-flash-medium",
+      "reasoning_levels": ["medium"]
     }
   ]
 }

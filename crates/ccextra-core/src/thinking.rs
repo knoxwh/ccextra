@@ -383,9 +383,9 @@ mod tests {
 
     #[test]
     fn test_clamp_effort_registry_glm52() {
-        // glm-5.2 支持 low/medium/high/xhigh/max
+        // glm-5.2 支持 low/high/max; xhigh 降到 high
         assert_eq!(clamp_effort("max", "glm-5.2"), "max");
-        assert_eq!(clamp_effort("xhigh", "glm-5.2"), "xhigh");
+        assert_eq!(clamp_effort("xhigh", "glm-5.2"), "high");
     }
 
     #[test]
