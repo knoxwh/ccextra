@@ -12,6 +12,7 @@
 //   input_schema→parameters(strict=false,剥 cache_control/defer_loading/$schema)
 // - thinking.budget_tokens → reasoning.effort(直映射,不钳制)
 // - service_tier: speed=fast → priority
+// - output_config.format(json_schema)→ text.format(name 缺省、strict 默认 true)
 // - store=false;include=["reasoning.encrypted_content"];parallel_tool_calls
 //
 // 返回 short→original 工具名映射,响应侧还原原名(对齐 buildReverseMap...)。
@@ -1048,6 +1049,34 @@ pub fn convert_to_openai_responses(
     openai["store"] = json!(false);
     openai["include"] = json!(["reasoning.encrypted_content"]);
 
+    // --- output_config.format(json_schema)→ text.format ---
+    // (对齐 convertClaudeRequestToCodex:name 缺省 cli_proxy_structured_output,
+    //  strict 仅显式 false 时降级,schema 原样透传)
+    if let Some(format) = body
+        .get("output_config")
+        .and_then(|v| v.get("format"))
+        .filter(|f| {
+            f.is_object()
+                && f.get("type").and_then(|t| t.as_str()) == Some("json_schema")
+                && f.get("schema").is_some_and(|s| s.is_object())
+        })
+    {
+        let name = format
+            .get("name")
+            .and_then(|v| v.as_str())
+            .filter(|s| !s.is_empty())
+            .unwrap_or("cli_proxy_structured_output");
+        let strict = format.get("strict") != Some(&Value::Bool(false));
+        openai["text"] = json!({
+            "format": {
+                "type": "json_schema",
+                "name": name,
+                "strict": strict,
+                "schema": format["schema"].clone(),
+            }
+        });
+    }
+
     // --- stop 删除(对齐 CPA sanitizeXAIResponsesBody:responses 不支持 stop) ---
     if let Some(obj) = openai.as_object_mut() {
         obj.remove("stop");
@@ -1910,6 +1939,67 @@ mod tests {
             "messages": []
         });
         convert_to_openai_responses(&mut body, "test-model").unwrap();
+        assert_eq!(body["reasoning"]["effort"], "high");
+    }
+
+    #[test]
+    fn test_output_config_format_maps_to_text_format() {
+        // output_config.format(json_schema)→ text.format(对齐 convertClaudeRequestToCodex)
+        let mut body = json!({
+            "model": "test",
+            "output_config": {"format": {
+                "type": "json_schema",
+                "schema": {
+                    "type": "object",
+                    "properties": {"answer": {"type": "string"}},
+                    "required": ["answer"],
+                    "additionalProperties": false
+                }
+            }},
+            "messages": []
+        });
+        convert_to_openai_responses(&mut body, "test-model").unwrap();
+        assert_eq!(body["text"]["format"]["type"], "json_schema");
+        // name 缺省 → cli_proxy_structured_output;strict 缺省 → true
+        assert_eq!(
+            body["text"]["format"]["name"],
+            "cli_proxy_structured_output"
+        );
+        assert_eq!(body["text"]["format"]["strict"], true);
+        assert_eq!(
+            body["text"]["format"]["schema"]["properties"]["answer"]["type"],
+            "string"
+        );
+    }
+
+    #[test]
+    fn test_output_config_format_custom_name_and_strict_false() {
+        let mut body = json!({
+            "model": "test",
+            "output_config": {"format": {
+                "type": "json_schema",
+                "name": "custom_schema",
+                "strict": false,
+                "schema": {"type": "object"}
+            }},
+            "messages": []
+        });
+        convert_to_openai_responses(&mut body, "test-model").unwrap();
+        assert_eq!(body["text"]["format"]["name"], "custom_schema");
+        assert_eq!(body["text"]["format"]["strict"], false);
+    }
+
+    #[test]
+    fn test_output_config_without_format_no_text() {
+        // 仅 effort / 缺 format → 不发 text(对齐 CPA effort-only 子例)
+        let mut body = json!({
+            "model": "test",
+            "thinking": {"type": "adaptive"},
+            "output_config": {"effort": "high"},
+            "messages": []
+        });
+        convert_to_openai_responses(&mut body, "test-model").unwrap();
+        assert!(body.get("text").is_none());
         assert_eq!(body["reasoning"]["effort"], "high");
     }
 
