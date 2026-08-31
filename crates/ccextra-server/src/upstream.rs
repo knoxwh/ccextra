@@ -152,7 +152,7 @@ impl UpstreamClient {
     }
 
     /// 解析最终代理:provider 覆盖 > 全局 > 直连
-    fn resolve_proxy<'a>(&'a self, provider_proxy: Option<&'a str>) -> String {
+    pub(crate) fn resolve_proxy<'a>(&'a self, provider_proxy: Option<&'a str>) -> String {
         match provider_proxy {
             Some(p) if !p.is_empty() && p != "direct" => p.to_string(),
             Some(_) => "direct".to_string(), // "direct"/"" → 直连
@@ -170,7 +170,7 @@ impl UpstreamClient {
     }
 
     /// 按最终代理取(或构建)client
-    fn client_for(&self, proxy_key: &str) -> Client {
+    pub(crate) fn client_for(&self, proxy_key: &str) -> Client {
         if let Some(c) = self.clients.lock().unwrap().get(proxy_key) {
             return c.clone();
         }
