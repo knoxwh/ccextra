@@ -25,7 +25,7 @@ serde_json = { version = "1.0", features = ["preserve_order", "arbitrary_precisi
 serde_yaml = "0.9"
 
 # HTTP server
-axum = { version = "0.7", features = ["macros"] }
+axum = { version = "0.8", features = ["macros"] }
 tokio = { version = "1.35", features = ["full"] }
 tower = { version = "0.5", features = ["util"] }
 
@@ -38,7 +38,7 @@ bytes = "1.5"
 
 # Error handling
 anyhow = "1.0"
-thiserror = "1.0"
+thiserror = "2.0"
 
 # Logging
 tracing = "0.1"
