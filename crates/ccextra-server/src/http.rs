@@ -147,8 +147,8 @@ static UPSTREAM_LOG_SEQUENCE: AtomicU64 = AtomicU64::new(0);
 
 // 上游可重试错误的统一退避参数(对齐通用网关重试与 grok retry)
 const RETRY_BASE_DELAY: std::time::Duration = std::time::Duration::from_millis(300);
-const RETRY_MAX_DELAY: std::time::Duration = std::time::Duration::from_secs(3);
-const RETRY_TOTAL_BUDGET: std::time::Duration = std::time::Duration::from_secs(10);
+const RETRY_MAX_DELAY: std::time::Duration = std::time::Duration::from_millis(1500);
+const RETRY_TOTAL_BUDGET: std::time::Duration = std::time::Duration::from_secs(3);
 
 /// 52x 错误最大退避时间(对齐 grok MAX_RETRY_BACKOFF,防 Cloudflare 120s 挂死)
 const CF_EDGE_MAX_RETRY_BACKOFF: std::time::Duration = std::time::Duration::from_secs(30);
@@ -3459,7 +3459,7 @@ models:
     fn test_cf_retry_after_keeps_jitter_above_general_cap() {
         let started = std::time::Instant::now();
         let mut headers = reqwest::header::HeaderMap::new();
-        headers.insert(reqwest::header::RETRY_AFTER, "5".parse().unwrap());
+        headers.insert(reqwest::header::RETRY_AFTER, "2".parse().unwrap());
         let status = reqwest::StatusCode::from_u16(522).unwrap();
 
         let delay = compute_retry_delay(0, started, &headers, Some(status)).unwrap();
@@ -3468,8 +3468,8 @@ models:
             delay > RETRY_MAX_DELAY,
             "52x Retry-After 不得被通用上限截断"
         );
-        assert!(delay >= std::time::Duration::from_secs(4));
-        assert!(delay <= std::time::Duration::from_secs(6));
+        assert!(delay >= std::time::Duration::from_millis(1600));
+        assert!(delay <= std::time::Duration::from_millis(2400));
     }
 
     #[test]
@@ -3477,7 +3477,7 @@ models:
         let started = std::time::Instant::now();
         let mut headers = reqwest::header::HeaderMap::new();
         headers.insert(reqwest::header::RETRY_AFTER, "5".parse().unwrap());
-        // 429: Retry-After 优先且封顶 3s
+        // 429: Retry-After 优先且封顶 1.5s
         let d = compute_retry_delay(
             0,
             started,
@@ -3485,7 +3485,7 @@ models:
             Some(reqwest::StatusCode::TOO_MANY_REQUESTS),
         )
         .unwrap();
-        assert_eq!(d, std::time::Duration::from_secs(3));
+        assert_eq!(d, std::time::Duration::from_millis(1500));
 
         // 无头: 基础 300ms 经 jitter 在 [240ms, 360ms] 范围
         let d2 = compute_retry_delay(0, started, &reqwest::header::HeaderMap::new(), None).unwrap();
