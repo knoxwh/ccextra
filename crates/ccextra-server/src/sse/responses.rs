@@ -1250,7 +1250,9 @@ pub(super) fn map_stop_reason(stop_reason: &str, has_tool_use: bool) -> String {
     }
     match stop_reason {
         "" | "stop" | "completed" => "end_turn".to_string(),
-        "max_tokens" | "max_output_tokens" => "max_tokens".to_string(),
+        "max_tokens" | "max_output_tokens" | "max_prompt_tokens" | "max_time_limit" => {
+            "max_tokens".to_string()
+        }
         // 无工具调用时参考实现把 tool 类原因映射为 end_turn
         "tool_use" | "tool_calls" | "function_call" => "end_turn".to_string(),
         "content_filter" => "refusal".to_string(),
@@ -1849,11 +1851,17 @@ mod tests {
     fn test_stop_reason_mappings() {
         assert_eq!(map_stop_reason("content_filter", false), "refusal");
         assert_eq!(map_stop_reason("max_output_tokens", false), "max_tokens");
+        assert_eq!(map_stop_reason("max_prompt_tokens", false), "max_tokens");
+        assert_eq!(map_stop_reason("max_time_limit", false), "max_tokens");
         assert_eq!(map_stop_reason("", false), "end_turn");
         assert_eq!(map_stop_reason("stop", true), "tool_use");
         assert_eq!(map_stop_reason("pause_turn", false), "pause_turn");
         let r = json!({"status":"incomplete","incomplete_details":{"reason":"max_output_tokens"}});
         assert_eq!(codex_stop_reason(&r), "max_output_tokens");
+        let r = json!({"status":"incomplete","incomplete_details":{"reason":"max_prompt_tokens"}});
+        assert_eq!(codex_stop_reason(&r), "max_prompt_tokens");
+        let r = json!({"status":"incomplete","incomplete_details":{"reason":"max_time_limit"}});
+        assert_eq!(codex_stop_reason(&r), "max_time_limit");
         let r = json!({"stop_reason":"stop","stop_sequence":"END"});
         assert_eq!(codex_stop_reason(&r), "stop_sequence");
     }
