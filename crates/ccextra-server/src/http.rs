@@ -30,7 +30,6 @@ use ccextra_core::convert::{
     is_thinking_signature_invalid, sanitize_gpt_reasoning_items, trim_encrypted_reasoning_items,
     ConvertError,
 };
-use ccextra_core::count_tokens::count_claude_input_tokens;
 use ccextra_core::normalize::{
     normalize_anthropic_full, normalize_anthropic_pretransform, normalize_target_post, TargetShape,
 };
@@ -105,6 +104,8 @@ pub struct AppState {
     /// reasoning replay 缓存(会话 → 上一轮 replay 项;responses+grok 用,
     /// 对齐 CPA xai reasoning replay;server 层持有,core 无 IO)
     pub replay_cache: crate::sse::replay_cache::ReplayCache,
+    /// session_id → 最新 input_tokens(避免非 Claude 上游 count_tokens 估算不准导致 context 跳动)
+    pub last_input_tokens: Arc<std::sync::Mutex<std::collections::HashMap<String, usize>>>,
 }
 
 #[derive(Clone, Debug, serde::Deserialize)]
@@ -376,23 +377,18 @@ async fn handle_count_tokens(
             .map_err(|e| AppError::new(anyhow::anyhow!("构造响应失败: {e}")));
     }
 
-    // 非 Claude 协议:本地估算
-    let payload = String::from_utf8_lossy(&bytes);
-    match count_claude_input_tokens(&payload) {
-        Ok(result) => Response::builder()
-            .status(StatusCode::OK)
-            .header(header::CONTENT_TYPE, "application/json")
-            .body(Body::from(serde_json::to_vec(&result).unwrap()))
-            .map_err(|e| AppError::new(anyhow::anyhow!("构造 count_tokens 响应失败: {e}"))),
-        Err(e) => Response::builder()
-            .status(StatusCode::BAD_REQUEST)
-            .header(header::CONTENT_TYPE, "application/json")
-            .body(Body::from(
-                json!({"type": "error", "error": {"type": "invalid_request_error", "message": e}})
-                    .to_string(),
-            ))
-            .map_err(|e| AppError::new(anyhow::anyhow!("构造 count_tokens 错误响应失败: {e}"))),
-    }
+    // 非 Claude 协议:读缓存(有上轮真实值返回,无缓存返回 0)
+    let session = extract_claude_code_session(&headers, &body_json);
+    let tokens = session
+        .as_deref()
+        .and_then(|s| state.last_input_tokens.lock().ok()?.get(s).copied())
+        .unwrap_or(0);
+
+    Response::builder()
+        .status(StatusCode::OK)
+        .header(header::CONTENT_TYPE, "application/json")
+        .body(Body::from(format!(r#"{{"input_tokens":{}}}"#, tokens)))
+        .map_err(|e| AppError::new(anyhow::anyhow!("构造响应失败: {e}")))
 }
 
 /// GET /v1/models:返回配置定义的模型列表(带 secret 认证)
@@ -684,17 +680,19 @@ async fn handle_messages(
         .filter(|s| !s.trim().is_empty())
         .map(str::to_string);
 
-    // 入站 Claude body 本地估算输入 token(对齐 ClaudeInputTokenState)。
+    // 流式 SSE message_start 占位 input_tokens(对齐 ClaudeInputTokenState)。
     // 多数上游流中不带 usage(chat 只在最后 chunk 带,responses 只在流尾),
-    // message_start 又必须第一帧发,故用此值占位,让 cc context 过程中接近
+    // message_start 又必须第一帧发,故用估算占位,让 cc context 过程中接近
     // 真实而非跳 1;流尾 message_delta 以真实 usage 覆盖。claude 直通不经
     // 状态机、非流式不进 SSE,均传 None。
+    // 注意:非 Claude 协议 count_tokens 已改用缓存,此处从缓存读上轮真实值。
     let estimated_input_tokens = if !is_stream || matches!(route.protocol, Protocol::Claude) {
         None
     } else {
-        count_claude_input_tokens(&serde_json::to_string(&body_json).unwrap_or_default())
-            .ok()
-            .map(|c| c.input_tokens)
+        cc_session
+            .as_deref()
+            .and_then(|s| state.last_input_tokens.lock().ok()?.get(s).copied())
+            .or(Some(0))
     };
 
     // 工具名还原表(short→original),responses 转换侧产出,供流式/非流式响应还原
@@ -1322,40 +1320,73 @@ async fn handle_messages(
             }
         }
         let converted = match serde_json::from_slice::<Value>(&body_bytes) {
-            Ok(v) => match route.protocol {
-                Protocol::Claude => None,
-                Protocol::OpenAiChat => crate::sse::non_stream::openai_chat_to_anthropic(&v),
-                Protocol::OpenAiResponses => {
-                    crate::sse::non_stream::responses_to_anthropic(&v, tool_names.as_deref())
-                }
-                Protocol::Gemini => {
-                    use ccextra_core::convert::convert_gemini_response;
-                    Some(convert_gemini_response(
-                        &v,
-                        tool_names.as_deref().unwrap_or(&HashMap::new()),
-                    ))
-                }
-                Protocol::Antigravity => {
-                    // Antigravity 响应为 {"response": {...gemini...}} 信封,先解包;
-                    // usageMetadata/cpaUsageMetadata 可能位于信封根或内层。
-                    use ccextra_core::convert::convert_gemini_response;
-                    let mut inner = v.get("response").cloned().unwrap_or_else(|| v.clone());
-                    if inner.get("usageMetadata").is_none() {
-                        let usage = inner
-                            .get("cpaUsageMetadata")
-                            .or_else(|| v.get("usageMetadata"))
-                            .or_else(|| v.get("cpaUsageMetadata"))
-                            .cloned();
-                        if let Some(usage) = usage {
-                            inner["usageMetadata"] = usage;
+            Ok(v) => {
+                // 提取真实 usage.input_tokens 写入缓存(非流式路径)
+                if let Some(sid) = session_id {
+                    let input_tokens = match route.protocol {
+                        Protocol::OpenAiChat => {
+                            v.pointer("/usage/prompt_tokens").and_then(|t| t.as_i64())
+                        }
+                        Protocol::OpenAiResponses => {
+                            v.pointer("/usage/input_tokens").and_then(|t| t.as_i64())
+                        }
+                        Protocol::Gemini | Protocol::Antigravity => {
+                            // Antigravity 信封内层
+                            let inner = if route.protocol == Protocol::Antigravity {
+                                v.get("response").unwrap_or(&v)
+                            } else {
+                                &v
+                            };
+                            inner
+                                .pointer("/usageMetadata/promptTokenCount")
+                                .and_then(|t| t.as_i64())
+                        }
+                        Protocol::Claude => None,
+                    };
+                    if let Some(tokens) = input_tokens {
+                        if tokens > 0 {
+                            let _ =
+                                state.last_input_tokens.lock().ok().map(|mut cache| {
+                                    cache.insert(sid.to_string(), tokens as usize)
+                                });
                         }
                     }
-                    Some(convert_gemini_response(
-                        &inner,
-                        tool_names.as_deref().unwrap_or(&HashMap::new()),
-                    ))
                 }
-            },
+                match route.protocol {
+                    Protocol::Claude => None,
+                    Protocol::OpenAiChat => crate::sse::non_stream::openai_chat_to_anthropic(&v),
+                    Protocol::OpenAiResponses => {
+                        crate::sse::non_stream::responses_to_anthropic(&v, tool_names.as_deref())
+                    }
+                    Protocol::Gemini => {
+                        use ccextra_core::convert::convert_gemini_response;
+                        Some(convert_gemini_response(
+                            &v,
+                            tool_names.as_deref().unwrap_or(&HashMap::new()),
+                        ))
+                    }
+                    Protocol::Antigravity => {
+                        // Antigravity 响应为 {"response": {...gemini...}} 信封,先解包;
+                        // usageMetadata/cpaUsageMetadata 可能位于信封根或内层。
+                        use ccextra_core::convert::convert_gemini_response;
+                        let mut inner = v.get("response").cloned().unwrap_or_else(|| v.clone());
+                        if inner.get("usageMetadata").is_none() {
+                            let usage = inner
+                                .get("cpaUsageMetadata")
+                                .or_else(|| v.get("usageMetadata"))
+                                .or_else(|| v.get("cpaUsageMetadata"))
+                                .cloned();
+                            if let Some(usage) = usage {
+                                inner["usageMetadata"] = usage;
+                            }
+                        }
+                        Some(convert_gemini_response(
+                            &inner,
+                            tool_names.as_deref().unwrap_or(&HashMap::new()),
+                        ))
+                    }
+                }
+            }
             Err(_) => None,
         };
         let payload = converted
@@ -1911,6 +1942,7 @@ mod tests {
                 std::time::Duration::from_secs(3600),
                 1024,
             ),
+            last_input_tokens: Arc::new(std::sync::Mutex::new(std::collections::HashMap::new())),
         }
     }
 

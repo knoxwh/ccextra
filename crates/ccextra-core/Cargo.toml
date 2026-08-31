@@ -17,7 +17,6 @@ hex.workspace = true
 base64.workspace = true
 globset.workspace = true
 tracing.workspace = true
-tiktoken-rs.workspace = true
 
 # cache_stabilization 模块依赖
 md-5 = "0.10"
