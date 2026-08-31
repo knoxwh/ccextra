@@ -309,3 +309,5 @@ chat UA 从 `claude-cli` 换成 `grok-shell`，网关按 UA 分流时旧前缀 m
 - HTTP client 配置（连接池、超时、代理、HTTP/2 keep-alive）保持一致
 
 **回滚路径:** `git revert <commit>` 恢复 Cargo.toml 到 0.12 版本
+
+**上线后回归（同日修复）:** antigravity `refresh_token` 的手动 `Host` 头在 0.13（hyper 1.x）下与 `:authority` 并存，Google 前端以 HTTP/2 `PROTOCOL_ERROR` RST 该流，导致 token 刷新与模型列表全挂。已删除该冗余头（端点本身即 oauth2.googleapis.com）。教训：升级验证需覆盖真实 OAuth 网络往返，不能只验编译与本地测试。

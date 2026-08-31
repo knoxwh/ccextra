@@ -125,9 +125,10 @@ pub async fn refresh_token(client: &Client, refresh: &str) -> Result<TokenRespon
     if refresh.is_empty() {
         return Err(anyhow!("antigravity token refresh: missing refresh token"));
     }
+    // 不设手动 Host 头:reqwest 0.13(hyper 1.x)下会与 :authority 并存,
+    // Google 前端以 HTTP/2 PROTOCOL_ERROR RST 该流;端点本身即 oauth2.googleapis.com
     let resp = client
         .post(TOKEN_ENDPOINT)
-        .header("Host", "oauth2.googleapis.com")
         .header("Content-Type", "application/x-www-form-urlencoded")
         .header("User-Agent", TOKEN_REFRESH_UA)
         .form(&[
