@@ -221,4 +221,41 @@ mod tests {
         let after = frames.iter().position(|f| f == "after").unwrap();
         assert!(d4 < after, "顺序不得被心跳打乱: {frames:?}");
     }
+
+    #[test]
+    fn test_extract_usage_chat_top_level() {
+        let chunk = json!({
+            "usage": {
+                "prompt_tokens": 100,
+                "completion_tokens": 50,
+                "prompt_tokens_details": {"cached_tokens": 20}
+            }
+        });
+        let (input, output, cached) = extract_usage_chat(&chunk["usage"]);
+        assert_eq!(input, 80);  // 100 - 20
+        assert_eq!(output, 50);
+        assert_eq!(cached, 20);
+    }
+
+    #[test]
+    fn test_extract_usage_chat_choices_fallback() {
+        // Moonshot 部分版本将 usage 置于 choices[0]
+        let chunk = json!({
+            "choices": [{
+                "delta": {"content": "hi"},
+                "usage": {
+                    "prompt_tokens": 150,
+                    "completion_tokens": 30,
+                    "prompt_tokens_details": {"cached_tokens": 50}
+                }
+            }]
+        });
+        // 注意:当前 extract_usage_chat 接收已提取的 usage 对象,
+        // 双路径逻辑需在 chat.rs 的 process 方法实现
+        // 此测试验证提取器本身处理 choices 内 usage 的能力
+        let (input, output, cached) = extract_usage_chat(&chunk["choices"][0]["usage"]);
+        assert_eq!(input, 100);  // 150 - 50
+        assert_eq!(output, 30);
+        assert_eq!(cached, 50);
+    }
 }
