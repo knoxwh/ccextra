@@ -77,6 +77,25 @@ responses drift 观测（最终截断 body）
 
 **理由**：`cache_control` 注入需 anthropic 结构且对 openai 上游无意义；转换引入新漂移需二次清理；claude / openai chat 在各自归一化后观测，responses 则在 payload 后截断 tool_result 再观测最终 body。gemini/antigravity 不做前缀稳定，空臂占位，避免九模块误改 Gemini 请求体。
 
+### OpenAI Chat 兼容性增强
+
+#### Usage 双路径提取 (Moonshot 适配)
+
+流式响应的 usage 字段提取支持双路径:
+1. 优先读取顶层 `chunk.usage` (OpenAI 标准)
+2. 回退读取 `chunk.choices[0].usage` (Moonshot 变体)
+
+实现位置:`crates/ccextra-server/src/sse/chat.rs:132-140`
+
+#### Assistant Content 条件省略
+
+转换 Anthropic messages 时,assistant 消息的 `content` 字段采用条件写入策略:
+- **省略**:`tool_calls` 存在且无文本块 (避免 Moonshot 等严格上游 400)
+- **数组**:有文本块
+- **空串**:无 `tool_calls` 且无文本 (纯 reasoning 回合兜底)
+
+实现位置:`crates/ccextra-core/src/convert/to_openai_chat.rs:350-369`
+
 ## 4. 关键修正（对标参考实现已知坑）
 
 **坑1：system 位置错误**（responses 路径）

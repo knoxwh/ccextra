@@ -129,10 +129,11 @@ impl ChatRelay {
                 self.model = model.to_string();
             }
         }
-        if let Some(usage) = root.get("usage") {
-            if !usage.is_null() {
-                self.cache_usage(usage);
-            }
+        // usage 双路径提取(对齐 Moonshot):优先顶层 usage,回退 choices[0].usage
+        if let Some(usage) = root.get("usage").filter(|u| !u.is_null()) {
+            self.cache_usage(usage);
+        } else if let Some(usage) = root.pointer("/choices/0/usage").filter(|u| !u.is_null()) {
+            self.cache_usage(usage);
         }
 
         let Some(delta) = root.pointer("/choices/0/delta") else {
@@ -1080,5 +1081,25 @@ mod tests {
         assert_eq!(map_finish_reason("tool_calls"), "tool_use");
         assert_eq!(map_finish_reason("function_call"), "tool_use");
         assert_eq!(map_finish_reason("unknown"), "end_turn");
+    }
+
+    #[test]
+    fn test_chat_relay_usage_from_choices() {
+        use crate::sse::parser::SseEvent;
+
+        let mut relay = ChatRelay::new(None);
+
+        // 模拟 Moonshot 流式响应:usage 在 choices[0]
+        let ev = SseEvent {
+            event: None,
+            data: r#"{"id":"chat-1","model":"moonshot-v1","choices":[{"delta":{"content":"hi"},"usage":{"prompt_tokens":100,"completion_tokens":20}}]}"#.to_string(),
+        };
+
+        relay.process(&ev);
+
+        // 验证 usage 被正确提取
+        assert_eq!(relay.usage_input, 100);
+        assert_eq!(relay.usage_output, 20);
+        assert!(relay.usage_seen);
     }
 }
