@@ -290,3 +290,22 @@ reasoning replay 对齐 CPA 的 xAI/codex/antigravity reasoning replay 实现:
 ### 12.6 风险
 
 chat UA 从 `claude-cli` 换成 `grok-shell`，网关按 UA 分流时旧前缀 miss 一轮，即对齐目的。Token-Auth 对 grok 一律带（官方仅 cli chat proxy URL 注入；ccextra responses 已一律带，chat 跟同一策略）。doom-loop 官方挂 `create_response_stream`；ccextra responses+grok 非流也发，维持现状。responses 双键：开关开时 `prompt_cache_key` 与 conv-id 都是 Claude session，官方「body key 覆盖 conv-id 路由」无意义；payload 已有**不同** key 时可能分流，12.4 已锁不硬剥。第三方兼容上游若拒未知头，与现 responses+grok 同一暴露面。
+
+## 13. 依赖升级记录
+
+### 13.1 reqwest 0.12 → 0.13 (2026-08-31)
+
+**动机:** 性能提升（rustls+aws-lc 比 native-tls 快）+ 新 API（Error::is_dns()）
+
+**破坏性变更处理:**
+- 显式启用 `form` feature（OAuth token 交换依赖 `.form()` 方法，0.13 从默认 features 移除）
+- 默认 TLS 后端从 native-tls 切到 rustls（系统证书信任链由 rustls-platform-verifier 处理）
+- 依赖树变化：移除 openssl/native-tls 相关 crates，新增 aws-lc-rs/rustls-platform-verifier
+
+**验证范围:**
+- 全量测试（762 tests passed）
+- Clippy 无警告，格式检查通过
+- OAuth 流程（antigravity/xai `.form()` 编译通过）
+- HTTP client 配置（连接池、超时、代理、HTTP/2 keep-alive）保持一致
+
+**回滚路径:** `git revert <commit>` 恢复 Cargo.toml 到 0.12 版本
