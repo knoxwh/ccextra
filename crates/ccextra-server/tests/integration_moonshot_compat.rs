@@ -19,9 +19,7 @@ async fn test_moonshot_streaming_usage_extraction() {
         Bytes::from("data: [DONE]\n\n"),
     ];
 
-    let stream = futures::stream::iter(
-        chunks.into_iter().map(|b| Ok::<_, reqwest::Error>(b))
-    );
+    let stream = futures::stream::iter(chunks.into_iter().map(Ok::<_, reqwest::Error>));
     let mut relay_stream = relay_openai_chat_to_anthropic(stream, Some(100));
 
     let mut frames = Vec::new();
@@ -30,9 +28,10 @@ async fn test_moonshot_streaming_usage_extraction() {
     }
 
     // 验证 message_delta 包含正确的 usage
-    let delta_frame = frames.iter().find(|f| {
-        String::from_utf8_lossy(f).contains("message_delta")
-    }).expect("should have message_delta");
+    let delta_frame = frames
+        .iter()
+        .find(|f| String::from_utf8_lossy(f).contains("message_delta"))
+        .expect("should have message_delta");
 
     let s = String::from_utf8_lossy(delta_frame);
     assert!(s.contains("\"input_tokens\":120"));
@@ -59,7 +58,9 @@ async fn test_assistant_tool_calls_no_content_field() {
 
     convert_to_openai_chat(&mut body, "moonshot-v1-8k").unwrap();
 
-    let assistant_msg = body["messages"].as_array().unwrap()
+    let assistant_msg = body["messages"]
+        .as_array()
+        .unwrap()
         .iter()
         .find(|m| m["role"] == "assistant")
         .expect("should have assistant message");

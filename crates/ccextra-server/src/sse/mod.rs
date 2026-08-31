@@ -236,7 +236,7 @@ mod tests {
             }
         });
         let (input, output, cached) = extract_usage_chat(&chunk["usage"]);
-        assert_eq!(input, 80);  // 100 - 20
+        assert_eq!(input, 80); // 100 - 20
         assert_eq!(output, 50);
         assert_eq!(cached, 20);
     }
@@ -258,7 +258,7 @@ mod tests {
         // 双路径逻辑需在 chat.rs 的 process 方法实现
         // 此测试验证提取器本身处理 choices 内 usage 的能力
         let (input, output, cached) = extract_usage_chat(&chunk["choices"][0]["usage"]);
-        assert_eq!(input, 100);  // 150 - 50
+        assert_eq!(input, 100); // 150 - 50
         assert_eq!(output, 30);
         assert_eq!(cached, 50);
     }

@@ -1339,6 +1339,9 @@ mod tests {
         let msg = &msgs[0];
         assert!(msg.get("reasoning_content").is_some());
         assert!(msg.get("tool_calls").is_some());
-        assert!(msg.get("content").is_none(), "仅 reasoning 不阻止 content 省略");
+        assert!(
+            msg.get("content").is_none(),
+            "仅 reasoning 不阻止 content 省略"
+        );
     }
 }
