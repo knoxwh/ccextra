@@ -354,11 +354,18 @@ fn convert_message(role: &str, content: &Value) -> Result<Vec<Value>> {
         let has_tool_calls = !tool_calls.is_empty();
         if has_content || has_reasoning || has_tool_calls {
             let mut msg = json!({"role": "assistant"});
-            if has_content {
+
+            // 对齐 shouldOmitContent:tool_calls 存在且无有效文本时,省略 content 键
+            // (避免 Moonshot 等严格上游 400 Bad Request)
+            if has_tool_calls && !has_content {
+                // 省略 content 键:不写任何 content 字段
+            } else if has_content {
                 msg["content"] = json!(content_items);
             } else {
+                // 无 tool_calls 且无 content:空串兜底(纯 reasoning 回合)
                 msg["content"] = json!("");
             }
+
             if has_reasoning {
                 msg["reasoning_content"] = json!(reasoning_parts.join("\n\n"));
             }
@@ -1268,5 +1275,70 @@ mod tests {
         });
         convert_to_openai_chat(&mut body, "glm-5.1").unwrap();
         assert_eq!(body["reasoning_effort"], "xhigh");
+    }
+
+    #[test]
+    fn test_assistant_tool_calls_no_text_omits_content() {
+        // Moonshot/部分严格上游:assistant 有 tool_calls 且文本空时,
+        // content: "" 会触发 400,必须完全省略 content 键
+        let mut body = json!({
+            "model": "test",
+            "messages": [{
+                "role": "assistant",
+                "content": [
+                    {"type": "tool_use", "id": "t1", "name": "get_weather", "input": {}}
+                ]
+            }]
+        });
+        convert_to_openai_chat(&mut body, "gpt").unwrap();
+        let msgs = body["messages"].as_array().unwrap();
+        assert_eq!(msgs.len(), 1);
+        let msg = &msgs[0];
+        assert_eq!(msg["role"], "assistant");
+        assert!(msg.get("tool_calls").is_some());
+        // 关键断言:content 键不存在(非空串)
+        assert!(msg.get("content").is_none(), "content 键应被省略");
+    }
+
+    #[test]
+    fn test_assistant_tool_calls_with_text_keeps_content() {
+        let mut body = json!({
+            "model": "test",
+            "messages": [{
+                "role": "assistant",
+                "content": [
+                    {"type": "text", "text": "Let me check"},
+                    {"type": "tool_use", "id": "t1", "name": "search", "input": {}}
+                ]
+            }]
+        });
+        convert_to_openai_chat(&mut body, "gpt").unwrap();
+        let msgs = body["messages"].as_array().unwrap();
+        let msg = &msgs[0];
+        assert!(msg.get("content").is_some());
+        let content = msg["content"].as_array().unwrap();
+        assert_eq!(content[0]["type"], "text");
+        assert_eq!(content[0]["text"], "Let me check");
+    }
+
+    #[test]
+    fn test_assistant_reasoning_tool_calls_no_text_omits_content() {
+        // reasoning_content 不算有效文本,不应阻止 content 省略
+        let mut body = json!({
+            "model": "test",
+            "messages": [{
+                "role": "assistant",
+                "content": [
+                    {"type": "thinking", "thinking": "让我思考一下"},
+                    {"type": "tool_use", "id": "t1", "name": "calc", "input": {}}
+                ]
+            }]
+        });
+        convert_to_openai_chat(&mut body, "gpt").unwrap();
+        let msgs = body["messages"].as_array().unwrap();
+        let msg = &msgs[0];
+        assert!(msg.get("reasoning_content").is_some());
+        assert!(msg.get("tool_calls").is_some());
+        assert!(msg.get("content").is_none(), "仅 reasoning 不阻止 content 省略");
     }
 }

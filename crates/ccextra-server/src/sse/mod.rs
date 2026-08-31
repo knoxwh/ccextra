@@ -165,6 +165,7 @@ pub fn extract_usage_responses(usage: &serde_json::Value) -> (i64, i64, i64) {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use serde_json::json;
 
     /// 稳定产出 n 个字节块,块间 pause 间隔(模拟慢上游)
     fn slow_stream(
