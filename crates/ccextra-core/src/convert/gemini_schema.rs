@@ -10,11 +10,13 @@
 
 use serde_json::{json, Map, Value};
 
-/// 清洗选项(对齐 CPA jsonSchemaCleanOptions,仅保留两个入口用到的字段)
+/// 清洗选项(对齐 CPA jsonSchemaCleanOptions,仅保留入口用到的字段)
 #[derive(Clone, Copy, Default)]
 struct CleanOptions {
     /// Claude VALIDATED 模式:空对象 schema 补占位属性
     add_placeholder: bool,
+    /// 工具 array 缺 items 时补 string items(对齐 CPA addMissingArrayItems / b5cde4ba)
+    add_missing_array_items: bool,
     /// Antigravity 语义:内联 $ref、drop 全部 enum、not 转 description、nullable 原生保留
     antigravity_semantics: bool,
     /// Gemini:去 nullable/title 与占位字段
@@ -31,6 +33,7 @@ pub fn clean_json_schema_for_gemini(schema: &Value) -> Value {
     clean_json_schema(
         schema,
         CleanOptions {
+            add_missing_array_items: true,
             remove_gemini_metadata: true,
             force_enum_string_type: true,
             ..Default::default()
@@ -44,6 +47,7 @@ pub fn clean_json_schema_for_antigravity(schema: &Value) -> Value {
         schema,
         CleanOptions {
             add_placeholder: true,
+            add_missing_array_items: true,
             antigravity_semantics: true,
             ..Default::default()
         },
@@ -66,7 +70,7 @@ fn clean_json_schema(schema: &Value, opts: CleanOptions) -> Value {
     let mut s = schema.clone();
 
     // Phase 0: 归一化畸形 schema(对齐 CPA normalizeMalformedSchemaObjects)
-    s = normalize_malformed_schema_objects(s);
+    s = normalize_malformed_schema_objects(s, opts.add_missing_array_items);
 
     // Phase 1: 转换与提示
     if opts.antigravity_semantics {
@@ -995,7 +999,8 @@ fn add_empty_schema_placeholder(schema: &mut Value) {
 /// 归一化畸形 schema 节点(对齐 CPA normalizeMalformedSchemaObjects):
 /// 1. 包裹缺 type/properties 的 bare property maps
 /// 2. 剥离 property 的 boolean required,提升到父级 required 数组
-fn normalize_malformed_schema_objects(schema: Value) -> Value {
+/// 3. 工具 array 缺 items 时补 string items(对齐 CPA addMissingArrayItems)
+fn normalize_malformed_schema_objects(schema: Value, add_missing_array_items: bool) -> Value {
     let Value::Object(root_map) = schema else {
         return schema;
     };
@@ -1008,7 +1013,7 @@ fn normalize_malformed_schema_objects(schema: Value) -> Value {
     // 单键 {"schema": ...} 时解套、修复、再套回
     if root_map.len() == 1 {
         if let Some(Value::Object(inner)) = root_map.get("schema").cloned() {
-            let (repaired, modified) = repair_schema_node(inner);
+            let (repaired, modified) = repair_schema_node(inner, add_missing_array_items);
             if modified {
                 let mut wrapped = Map::new();
                 wrapped.insert("schema".to_string(), Value::Object(repaired));
@@ -1018,7 +1023,7 @@ fn normalize_malformed_schema_objects(schema: Value) -> Value {
         }
     }
 
-    let (repaired, _modified) = repair_schema_node(root_map);
+    let (repaired, _modified) = repair_schema_node(root_map, add_missing_array_items);
     Value::Object(repaired)
 }
 
@@ -1041,7 +1046,10 @@ fn is_api_request_document(m: &Map<String, Value>) -> bool {
 }
 
 /// 递归修复 schema 节点
-fn repair_schema_node(node: Map<String, Value>) -> (Map<String, Value>, bool) {
+fn repair_schema_node(
+    node: Map<String, Value>,
+    add_missing_array_items: bool,
+) -> (Map<String, Value>, bool) {
     let mut clone = node.clone();
     let mut modified = false;
     let mut skip_step2 = false; // Step 1 处理了 bare properties 后跳过 Step 2
@@ -1067,7 +1075,8 @@ fn repair_schema_node(node: Map<String, Value>) -> (Map<String, Value>, bool) {
         }
 
         if !bare_props.is_empty() {
-            let (repaired_props, promoted_reqs, _) = repair_property_map(bare_props);
+            let (repaired_props, promoted_reqs, _) =
+                repair_property_map(bare_props, add_missing_array_items);
             // 合并到 properties
             let mut props = match clone.remove("properties") {
                 Some(Value::Object(existing)) => existing,
@@ -1098,7 +1107,8 @@ fn repair_schema_node(node: Map<String, Value>) -> (Map<String, Value>, bool) {
     // 2. 递归修复 properties(仅当 Step 1 未处理时)
     if !skip_step2 {
         if let Some(Value::Object(props_val)) = clone.get("properties").cloned() {
-            let (repaired, promoted, props_mod) = repair_property_map(props_val);
+            let (repaired, promoted, props_mod) =
+                repair_property_map(props_val, add_missing_array_items);
             clone.insert("properties".to_string(), Value::Object(repaired));
             if props_mod {
                 modified = true;
@@ -1115,15 +1125,24 @@ fn repair_schema_node(node: Map<String, Value>) -> (Map<String, Value>, bool) {
         }
     }
 
+    // Gemini/Antigravity 拒无 items 的工具 array schema(对齐 CPA b5cde4ba)
+    if add_missing_array_items
+        && is_array_declared_type(clone.get("type"))
+        && !clone.contains_key("items")
+    {
+        clone.insert("items".to_string(), json!({"type": "string"}));
+        modified = true;
+    }
+
     // 3. 递归进 items/additionalProperties/patternProperties 等容器
     if let Some(Value::Object(items)) = clone.remove("items") {
-        let (repaired, items_mod) = repair_schema_node(items);
+        let (repaired, items_mod) = repair_schema_node(items, add_missing_array_items);
         clone.insert("items".to_string(), Value::Object(repaired));
         if items_mod {
             modified = true;
         }
     } else if let Some(Value::Array(items_list)) = clone.remove("items") {
-        let (repaired, list_mod) = repair_schema_list(items_list);
+        let (repaired, list_mod) = repair_schema_list(items_list, add_missing_array_items);
         clone.insert("items".to_string(), Value::Array(repaired));
         if list_mod {
             modified = true;
@@ -1131,7 +1150,7 @@ fn repair_schema_node(node: Map<String, Value>) -> (Map<String, Value>, bool) {
     }
 
     if let Some(Value::Object(add_props)) = clone.get("additionalProperties").cloned() {
-        let (repaired, add_mod) = repair_schema_node(add_props);
+        let (repaired, add_mod) = repair_schema_node(add_props, add_missing_array_items);
         clone.insert("additionalProperties".to_string(), Value::Object(repaired));
         if add_mod {
             modified = true;
@@ -1139,7 +1158,7 @@ fn repair_schema_node(node: Map<String, Value>) -> (Map<String, Value>, bool) {
     }
 
     if let Some(Value::Object(pat_props)) = clone.remove("patternProperties") {
-        let (repaired, _, pat_mod) = repair_property_map(pat_props);
+        let (repaired, _, pat_mod) = repair_property_map(pat_props, add_missing_array_items);
         clone.insert("patternProperties".to_string(), Value::Object(repaired));
         if pat_mod {
             modified = true;
@@ -1159,7 +1178,7 @@ fn repair_schema_node(node: Map<String, Value>) -> (Map<String, Value>, bool) {
         "additionalItems",
     ] {
         if let Some(Value::Object(sub_val)) = clone.remove(*key) {
-            let (repaired, sub_mod) = repair_schema_node(sub_val);
+            let (repaired, sub_mod) = repair_schema_node(sub_val, add_missing_array_items);
             clone.insert(key.to_string(), Value::Object(repaired));
             if sub_mod {
                 modified = true;
@@ -1169,7 +1188,7 @@ fn repair_schema_node(node: Map<String, Value>) -> (Map<String, Value>, bool) {
 
     for key in &["anyOf", "oneOf", "allOf", "prefixItems"] {
         if let Some(Value::Array(list_val)) = clone.remove(*key) {
-            let (repaired, list_mod) = repair_schema_list(list_val);
+            let (repaired, list_mod) = repair_schema_list(list_val, add_missing_array_items);
             clone.insert(key.to_string(), Value::Array(repaired));
             if list_mod {
                 modified = true;
@@ -1183,7 +1202,8 @@ fn repair_schema_node(node: Map<String, Value>) -> (Map<String, Value>, bool) {
             let mut defs_modified = false;
             for (dk, dv) in defs_val {
                 if let Value::Object(def_map) = dv {
-                    let (repaired_def, def_mod) = repair_schema_node(def_map);
+                    let (repaired_def, def_mod) =
+                        repair_schema_node(def_map, add_missing_array_items);
                     repaired_defs.insert(dk, Value::Object(repaired_def));
                     if def_mod {
                         defs_modified = true;
@@ -1204,7 +1224,10 @@ fn repair_schema_node(node: Map<String, Value>) -> (Map<String, Value>, bool) {
 }
 
 /// 修复 property map,提升 boolean required
-fn repair_property_map(props: Map<String, Value>) -> (Map<String, Value>, Vec<String>, bool) {
+fn repair_property_map(
+    props: Map<String, Value>,
+    add_missing_array_items: bool,
+) -> (Map<String, Value>, Vec<String>, bool) {
     let mut out = Map::new();
     let mut promoted_reqs = Vec::new();
     let mut modified = false;
@@ -1224,7 +1247,7 @@ fn repair_property_map(props: Map<String, Value>) -> (Map<String, Value>, Vec<St
         }
 
         // 再递归修复子节点(处理嵌套 bare properties)
-        let (repaired_child, child_mod) = repair_schema_node(child_map);
+        let (repaired_child, child_mod) = repair_schema_node(child_map, add_missing_array_items);
         if child_mod {
             modified = true;
         }
@@ -1236,12 +1259,12 @@ fn repair_property_map(props: Map<String, Value>) -> (Map<String, Value>, Vec<St
     (out, promoted_reqs, modified)
 }
 
-fn repair_schema_list(list: Vec<Value>) -> (Vec<Value>, bool) {
+fn repair_schema_list(list: Vec<Value>, add_missing_array_items: bool) -> (Vec<Value>, bool) {
     let mut repaired = Vec::new();
     let mut list_modified = false;
     for item in list {
         if let Value::Object(item_map) = item {
-            let (repaired_item, item_mod) = repair_schema_node(item_map);
+            let (repaired_item, item_mod) = repair_schema_node(item_map, add_missing_array_items);
             repaired.push(Value::Object(repaired_item));
             if item_mod {
                 list_modified = true;
@@ -1297,6 +1320,15 @@ fn is_non_object_declared_type(t: Option<&Value>) -> bool {
         Some(Value::Array(arr)) => {
             !arr.is_empty() && !arr.iter().any(|item| item.as_str() == Some("object"))
         }
+        _ => false,
+    }
+}
+
+/// 对齐 CPA isArrayDeclaredType:type 为 "array" 或 type 列表含 "array"
+fn is_array_declared_type(t: Option<&Value>) -> bool {
+    match t {
+        Some(Value::String(s)) => s == "array",
+        Some(Value::Array(arr)) => arr.iter().any(|item| item.as_str() == Some("array")),
         _ => false,
     }
 }
@@ -1428,7 +1460,7 @@ mod tests {
     fn test_antigravity_passes_null_properties_through() {
         // 对齐 CPA gjson Exists():显式 null 视为存在,不加占位,原样放行
         let schema = json!({"type": "object", "properties": null});
-        let phase0 = normalize_malformed_schema_objects(schema.clone());
+        let phase0 = normalize_malformed_schema_objects(schema.clone(), true);
         eprintln!(
             "phase0 = {}",
             serde_json::to_string_pretty(&phase0).unwrap()
@@ -1622,6 +1654,34 @@ mod tests {
             assert!(tags.get("contains").is_none());
             let desc = tags["description"].as_str().unwrap_or("");
             assert!(desc.contains("contains"), "desc: {desc}");
+        }
+    }
+
+    #[test]
+    fn test_tool_arrays_missing_items_get_string_schema() {
+        // 对齐 CPA b5cde4ba / TestCleanJSONSchema_ToolArraysMissingItems:
+        // Gemini 与 Antigravity 工具 schema 缺 items 的 array 补 string items。
+        let input = json!({
+            "type": "object",
+            "properties": {
+                "params": {"type": "array"},
+                "values": {"type": ["array", "null"], "description": "no items"},
+                "existing": {"type": "array", "items": {"type": "number"}}
+            }
+        });
+        for out in [
+            clean_json_schema_for_antigravity(&input),
+            clean_json_schema_for_gemini(&input),
+        ] {
+            assert_eq!(out["properties"]["params"]["items"]["type"], "string");
+            assert_eq!(out["properties"]["values"]["items"]["type"], "string");
+            assert_eq!(out["properties"]["existing"]["items"]["type"], "number");
+        }
+        for out in [
+            clean_json_schema_for_antigravity(&json!({"type": "array"})),
+            clean_json_schema_for_gemini(&json!({"type": "array"})),
+        ] {
+            assert_eq!(out["items"]["type"], "string");
         }
     }
 }

@@ -337,8 +337,13 @@ impl ChatRelay {
     /// 累积 tool_calls 增量
     fn collect_tool_calls(&mut self, tool_calls: &[Value]) -> Vec<Bytes> {
         let mut frames = Vec::new();
-        for tc in tool_calls {
-            let index = tc.get("index").and_then(|v| v.as_u64()).unwrap_or(0) as usize;
+        for (array_index, tc) in tool_calls.iter().enumerate() {
+            // 缺 index 用数组下标(对齐 CPA be1763e5);字段存在则走 Int(),非法值当 0
+            let index = if tc.get("index").is_none() {
+                array_index
+            } else {
+                tc.get("index").and_then(|v| v.as_u64()).unwrap_or(0) as usize
+            };
             {
                 let call = self.tool_calls.entry(index).or_insert_with(|| ToolCall {
                     id: String::new(),
@@ -763,6 +768,58 @@ mod tests {
             .iter()
             .any(|b| b.starts_with(b"event: content_block_delta")));
         assert!(out3.iter().any(|b| b.starts_with(b"event: message_delta")));
+    }
+
+    #[test]
+    fn test_omitted_tool_call_index_preserves_parallel_calls() {
+        // 对齐 CPA be1763e5:同 chunk 并行 tool_calls 缺 index 时按数组下标累积
+        let mut r = ChatRelay::new(None);
+        let out = r.process(&super::super::parser::SseEvent {
+            event: Some("c".into()),
+            data: r#"{"id":"c1","model":"m","choices":[{"index":0,"delta":{"role":"assistant","tool_calls":[{"id":"call_weather","type":"function","function":{"name":"get_weather","arguments":"{\"city\":\"Paris\"}"}},{"id":"call_time","type":"function","function":{"name":"get_time","arguments":"{\"tz\":\"UTC\"}"}}]},"finish_reason":"tool_calls"}],"usage":{"prompt_tokens":10,"completion_tokens":5}}"#.into(),
+        });
+        let buf = out.concat();
+        let s = String::from_utf8_lossy(&buf);
+        let mut starts = Vec::new();
+        let mut deltas = Vec::new();
+        let mut stops = 0;
+        for block in s.split("event: ") {
+            if block.starts_with("content_block_start") {
+                if let Some(data) = block.split_once("data: ").map(|(_, rest)| rest) {
+                    let json = data.split("\n\n").next().unwrap_or(data).trim();
+                    if let Ok(v) = serde_json::from_str::<Value>(json) {
+                        if v["content_block"]["type"] == "tool_use" {
+                            starts.push(v);
+                        }
+                    }
+                }
+            } else if block.starts_with("content_block_delta") {
+                if let Some(data) = block.split_once("data: ").map(|(_, rest)| rest) {
+                    let json = data.split("\n\n").next().unwrap_or(data).trim();
+                    if let Ok(v) = serde_json::from_str::<Value>(json) {
+                        if v["delta"]["type"] == "input_json_delta" {
+                            deltas.push(v);
+                        }
+                    }
+                }
+            } else if block.starts_with("content_block_stop") {
+                stops += 1;
+            }
+        }
+        assert_eq!(starts.len(), 2, "应有两个 tool_use start,实际: {s}");
+        assert_eq!(starts[0]["content_block"]["id"], "call_weather");
+        assert_eq!(starts[0]["content_block"]["name"], "get_weather");
+        assert_eq!(starts[1]["content_block"]["id"], "call_time");
+        assert_eq!(starts[1]["content_block"]["name"], "get_time");
+        assert_eq!(deltas.len(), 2, "应有两个 input_json_delta,实际: {s}");
+        let first: Value =
+            serde_json::from_str(deltas[0]["delta"]["partial_json"].as_str().unwrap()).unwrap();
+        let second: Value =
+            serde_json::from_str(deltas[1]["delta"]["partial_json"].as_str().unwrap()).unwrap();
+        assert_eq!(first["city"], "Paris");
+        assert_eq!(second["tz"], "UTC");
+        assert_eq!(stops, 2, "应有两个 content_block_stop,实际: {s}");
+        assert!(s.contains("\"stop_reason\":\"tool_use\""), "实际: {s}");
     }
 
     #[test]
