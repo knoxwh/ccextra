@@ -353,8 +353,28 @@ mod tests {
             .cloned()
             .collect();
         assert_eq!(props, vec!["content", "path"]);
-        // tools[] 数组仍不排,留给 post
+        // 单工具场景无需排序(已有序),返回 false
         assert!(!counts_a.tool_sorted);
+    }
+
+    #[test]
+    fn test_pretransform_sorts_multiple_tools() {
+        // 多工具场景验证 pretransform 确实排序 tools 数组
+        let mut body = json!({
+            "tools": [
+                {"name": "z_tool", "input_schema": {"type": "object"}},
+                {"name": "a_tool", "input_schema": {"type": "object"}},
+                {"name": "m_tool", "input_schema": {"type": "object"}}
+            ],
+            "messages": [{"role": "user", "content": "hi"}]
+        });
+
+        let counts = normalize_anthropic_pretransform(&mut body);
+
+        assert!(counts.tool_sorted, "multiple tools should be sorted");
+        assert_eq!(body["tools"][0]["name"], "a_tool");
+        assert_eq!(body["tools"][1]["name"], "m_tool");
+        assert_eq!(body["tools"][2]["name"], "z_tool");
     }
 
     #[test]
