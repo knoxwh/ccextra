@@ -6,8 +6,13 @@
 
 [![Rust](https://img.shields.io/badge/rust-1.75%2B-orange)](https://www.rust-lang.org/)
 [![License: MIT](https://img.shields.io/badge/license-MIT-blue.svg)](LICENSE)
+[![Tests](https://img.shields.io/badge/tests-749%20passing-success)]()
 [![Workspace](https://img.shields.io/badge/workspace-3%20crates-lightgrey)]()
 [![Docs: design](https://img.shields.io/badge/docs-architecture-informational)](docs/design.md)
+
+## 📚 快速导航
+
+[🚀 快速开始](#快速开始) · [⚙️ 配置参考](#配置参考) · [🏗️ 架构设计](docs/design.md) · [📖 术语表](docs/glossary.md) · [🧪 测试](#测试)
 
 单个二进制，监听一个端口，同时提供 Claude 原生协议、OpenAI Chat Completions、OpenAI Responses、Google Gemini、Antigravity（Cloud Code Assist OAuth）、xAI Grok（OAuth）上游接入。把 Claude Code 的请求按模型路由到不同 provider，并通过对请求体的确定性归一化，最大程度命中上游 prompt 缓存。
 
@@ -64,6 +69,26 @@ Claude Code → ccextra:8222
 ```
 
 ## 快速开始
+
+### OAuth 订阅登录 (Antigravity / xAI Grok)
+
+**推荐首先完成 OAuth 登录**，无需在 `config.yaml` 中手动配置 API Key。ccextra 启动时会自动发现凭证并注入 Provider：
+
+```bash
+# 1. Antigravity (Google Cloud Code Assist) 登录
+./ccextra antigravity-login
+# 查看已保存的凭证状态
+./ccextra antigravity-status
+# 查询可用配额与模型状态
+./scripts/check_antigravity_quota.sh
+
+# 2. xAI Grok 设备码授权登录
+./ccextra xai-login
+# 查看已保存的凭证状态
+./ccextra xai-status
+# 验证 xAI 连通性与模型
+./scripts/check_grok_quota.sh
+```
 
 ### 编译
 
@@ -136,26 +161,6 @@ providers:
 ./stop.sh     # 停止
 ./restart.sh  # 重启
 ./build.sh    # 构建（自动重启）
-```
-
-### OAuth 订阅登录 (Antigravity / xAI Grok)
-
-无需在 `config.yaml` 中配置 API Key，通过 CLI 完成登录后，ccextra 启动时会自动发现凭证并注入 Provider：
-
-```bash
-# 1. Antigravity (Google Cloud Code Assist) 登录
-./ccextra antigravity-login
-# 查看已保存的凭证状态
-./ccextra antigravity-status
-# 查询可用配额与模型状态
-./scripts/check_antigravity_quota.sh
-
-# 2. xAI Grok 设备码授权登录
-./ccextra xai-login
-# 查看已保存的凭证状态
-./ccextra xai-status
-# 验证 xAI 连通性与模型
-./scripts/check_grok_quota.sh
 ```
 
 ### 接入 Claude Code
@@ -252,7 +257,7 @@ ccextra/
 cargo test --workspace
 ```
 
-当前 749 个测试，覆盖缓存归一化、协议转换（Claude/OpenAI/Gemini/Antigravity/xAI Grok）、SSE 状态机、HTTP 管线与配置解析等模块。
+当前 749 个测试（546 core + 203 server），覆盖缓存归一化、协议转换（Claude/OpenAI/Gemini/Antigravity/xAI Grok）、SSE 状态机、HTTP 管线与配置解析等模块。
 
 ## 文档
 

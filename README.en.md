@@ -6,8 +6,13 @@
 
 [![Rust](https://img.shields.io/badge/rust-1.75%2B-orange)](https://www.rust-lang.org/)
 [![License: MIT](https://img.shields.io/badge/license-MIT-blue.svg)](LICENSE)
+[![Tests](https://img.shields.io/badge/tests-749%20passing-success)]()
 [![Workspace](https://img.shields.io/badge/workspace-3%20crates-lightgrey)]()
 [![Docs: design](https://img.shields.io/badge/docs-architecture-informational)](docs/design.md)
+
+## 📚 Quick Navigation
+
+[🚀 Quick Start](#quick-start) · [⚙️ Configuration](#configuration-reference) · [🏗️ Architecture](docs/design.md) · [📖 Glossary](docs/glossary.md) · [🧪 Testing](#testing)
 
 One binary, one port. Serves six upstream options at once: native Claude, OpenAI Chat Completions, OpenAI Responses, Google Gemini, Antigravity (Cloud Code Assist over OAuth), and xAI Grok (OAuth). Routes Claude Code requests by model to the matching provider, and deterministically normalizes request bodies so upstream prompt caches hit as often as possible.
 
@@ -64,6 +69,26 @@ Upstream provider
 ```
 
 ## Quick start
+
+### OAuth subscription login (Antigravity / xAI Grok)
+
+**Recommended first step**: Complete OAuth login — no manual API key in `config.yaml` required. ccextra discovers credentials at startup and auto-injects providers:
+
+```bash
+# 1. Antigravity (Google Cloud Code Assist) login
+./ccextra antigravity-login
+# View saved credential status
+./ccextra antigravity-status
+# Query quota and model availability
+./scripts/check_antigravity_quota.sh
+
+# 2. xAI Grok device-code authorization
+./ccextra xai-login
+# View saved credential status
+./ccextra xai-status
+# Verify xAI connectivity and models
+./scripts/check_grok_quota.sh
+```
 
 ### Build
 
@@ -136,26 +161,6 @@ Or use the scripts:
 ./stop.sh     # stop
 ./restart.sh  # restart
 ./build.sh    # build (restarts if already running)
-```
-
-### OAuth Subscription Login (Antigravity / xAI Grok)
-
-No need to configure API keys manually in `config.yaml`. Log in via CLI and ccextra will automatically discover credentials and inject providers on startup:
-
-```bash
-# 1. Antigravity (Google Cloud Code Assist) login
-./ccextra antigravity-login
-# View saved credentials status
-./ccextra antigravity-status
-# Query quota and model status
-./scripts/check_antigravity_quota.sh
-
-# 2. xAI Grok Device Authorization login
-./ccextra xai-login
-# View saved credentials status
-./ccextra xai-status
-# Verify xAI connectivity and models
-./scripts/check_grok_quota.sh
 ```
 
 ### Point Claude Code at it
@@ -252,7 +257,7 @@ ccextra/
 cargo test --workspace
 ```
 
-Currently 749 tests, covering cache normalization, protocol conversion (Claude/OpenAI/Gemini/Antigravity/xAI Grok), SSE state machines, the HTTP pipeline, and config parsing.
+Currently 749 tests (546 core + 203 server), covering cache normalization, protocol conversion (Claude/OpenAI/Gemini/Antigravity/xAI Grok), SSE state machines, the HTTP pipeline, and config parsing.
 
 ## Docs
 
