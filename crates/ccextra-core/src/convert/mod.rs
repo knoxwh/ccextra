@@ -35,8 +35,8 @@ pub use gemini_schema::{
 };
 pub use passthrough::convert_passthrough;
 pub use reasoning_replay::{
-    append_replay_turn, build_replay_turn, input_prefix_fingerprint, insert_replay_turns,
-    REPLAY_TURN_TYPE,
+    append_replay_turn, build_replay_turn, compute_input_prefix_fingerprint,
+    input_prefix_fingerprint, insert_replay_turns, REPLAY_TURN_TYPE,
 };
 pub use shorten::build_reverse_map;
 pub use shorten::build_short_name_map;

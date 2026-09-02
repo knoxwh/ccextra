@@ -22,6 +22,7 @@ use super::parser::SseParser;
 pub struct StreamReplayExtractor {
     cache: ReplayCache,
     session_key: String,
+    request_fingerprint: String,
     parser: SseParser,
     /// 带 output_index 的 done 项(对齐 outputItemsByIndex)
     items_by_index: HashMap<i64, Value>,
@@ -33,10 +34,11 @@ pub struct StreamReplayExtractor {
 }
 
 impl StreamReplayExtractor {
-    pub fn new(cache: ReplayCache, session_key: String) -> Self {
+    pub fn new(cache: ReplayCache, session_key: String, request_fingerprint: String) -> Self {
         Self {
             cache,
             session_key,
+            request_fingerprint,
             parser: SseParser::new(),
             items_by_index: HashMap::new(),
             items_fallback: Vec::new(),
@@ -68,7 +70,11 @@ impl StreamReplayExtractor {
                 }
                 Some("response.completed") => {
                     let patched = self.patch_completed_output(value);
-                    self.cache.store_from_completed(&self.session_key, &patched);
+                    self.cache.store_from_completed(
+                        &self.session_key,
+                        &patched,
+                        &self.request_fingerprint,
+                    );
                 }
                 _ => {}
             }
@@ -243,15 +249,17 @@ impl ReplayCache {
     /// 无可回放项时不动缓存(对齐 CPA cacheCodexReasoningReplayFromCompleted
     /// 直接 return;累积语义下纯文本轮清空会丢全部历史 reasoning)。
     ///
-    /// request_fingerprint 传空串:真值需请求侧 input 前缀指纹,本函数无 body
-    /// 上下文(StreamReplayExtractor 亦无)。取舍:锚定退化为 call_ids/
-    /// assistant_fingerprint 双通道,已覆盖主场景;防错位增强留待需要时给
-    /// StreamReplayExtractor::new 加参数从 http.rs 传入。
-    pub fn store_from_completed(&self, session_key: &str, completed: &Value) {
+    /// request_fingerprint 由请求侧 input 前缀指纹传入,用于 marker 精确锚定。
+    pub fn store_from_completed(
+        &self,
+        session_key: &str,
+        completed: &Value,
+        request_fingerprint: &str,
+    ) {
         if session_key.trim().is_empty() {
             return;
         }
-        let Some(turn) = build_replay_turn(completed, "") else {
+        let Some(turn) = build_replay_turn(completed, request_fingerprint) else {
             return;
         };
         let mut map = self.inner.lock().unwrap();
@@ -332,7 +340,7 @@ mod tests {
     #[test]
     fn test_store_and_apply_roundtrip() {
         let cache = ReplayCache::new(Duration::from_secs(60), 128);
-        cache.store_from_completed("sess-1", &completed());
+        cache.store_from_completed("sess-1", &completed(), "");
         let mut body = json!({"input": [
             {"type": "message", "role": "user", "content": "q"},
             {"type": "function_call_output", "call_id": "call_1", "output": "ok"}
@@ -346,7 +354,7 @@ mod tests {
     #[test]
     fn test_no_replayable_output_keeps_cache() {
         let cache = ReplayCache::new(Duration::from_secs(60), 128);
-        cache.store_from_completed("sess-1", &completed());
+        cache.store_from_completed("sess-1", &completed(), "");
         // 纯文本轮(无可回放项)→ 不动缓存(对齐 CPA 直接 return;
         // 累积语义下清空会丢全部历史 reasoning)
         cache.store_from_completed(
@@ -354,6 +362,7 @@ mod tests {
             &json!({"type": "response.completed", "response": {"output": [
                 {"type": "web_search_call"}
             ]}}),
+            "",
         );
         let mut body = json!({"input": [
             {"type": "message", "role": "user", "content": "q"},
@@ -367,7 +376,7 @@ mod tests {
     #[test]
     fn test_ttl_expiry() {
         let cache = ReplayCache::new(Duration::from_millis(0), 128);
-        cache.store_from_completed("sess-1", &completed());
+        cache.store_from_completed("sess-1", &completed(), "");
         std::thread::sleep(Duration::from_millis(2));
         let mut body = json!({"input": []});
         assert!(!cache.apply_to_body("sess-1", &mut body, false));
@@ -384,8 +393,8 @@ mod tests {
             {"type": "reasoning", "encrypted_content": "g2"},
             {"type": "function_call", "call_id": "c2", "name": "f", "arguments": "{}"}
         ]}});
-        cache.store_from_completed("sess-1", &round1);
-        cache.store_from_completed("sess-1", &round2);
+        cache.store_from_completed("sess-1", &round1, "");
+        cache.store_from_completed("sess-1", &round2, "");
         // 两轮 reasoning 都注入(input 含 c1/c2 的 output)
         let mut body = json!({"input": [
             {"type": "message", "role": "user", "content": "q"},
@@ -404,9 +413,9 @@ mod tests {
         let round1 = json!({"type": "response.completed", "response": {"output": [
             {"type": "reasoning", "encrypted_content": "g1"}
         ]}});
-        cache.store_from_completed("sess-1", &round1);
-        cache.store_from_completed("sess-1", &round1); // 同轮重复(重试场景)
-                                                       // marker id 相同,不重复累积
+        cache.store_from_completed("sess-1", &round1, "");
+        cache.store_from_completed("sess-1", &round1, ""); // 同轮重复(重试场景)
+                                                           // marker id 相同,不重复累积
         let mut body = json!({"input": [
             {"type": "message", "role": "user", "content": "q"}
         ]});
@@ -425,7 +434,7 @@ mod tests {
     fn test_patch_completed_empty_output() {
         let cache = ReplayCache::new(Duration::from_secs(60), 128);
         let key = "sess-patch".to_string();
-        let mut extractor = StreamReplayExtractor::new(cache.clone(), key.clone());
+        let mut extractor = StreamReplayExtractor::new(cache.clone(), key.clone(), String::new());
 
         // 喂 output_item.done 事件
         let done1 = b"event: response.output_item.done\ndata: {\"output_index\":0,\"item\":{\"type\":\"reasoning\",\"encrypted_content\":\"dGVzdA\"}}\n\n";
@@ -452,7 +461,7 @@ mod tests {
     fn test_patch_completed_keeps_existing_output() {
         let cache = ReplayCache::new(Duration::from_secs(60), 128);
         let key = "sess-keep".to_string();
-        let mut extractor = StreamReplayExtractor::new(cache.clone(), key.clone());
+        let mut extractor = StreamReplayExtractor::new(cache.clone(), key.clone(), String::new());
 
         extractor.push(b"event: response.output_item.done\ndata: {\"item\":{\"type\":\"reasoning\",\"encrypted_content\":\"orphan\"}}\n\n");
 
@@ -471,7 +480,7 @@ mod tests {
     fn test_inject_streaming_reasoning_fallback_with_deltas() {
         let cache = ReplayCache::new(Duration::from_secs(60), 128);
         let key = "sess-deltas".to_string();
-        let mut extractor = StreamReplayExtractor::new(cache.clone(), key.clone());
+        let mut extractor = StreamReplayExtractor::new(cache.clone(), key.clone(), String::new());
 
         // 流式 reasoning 文本累积(对齐 grok-build L273 reasoning_acc.push_str)
         extractor.push(
@@ -506,7 +515,7 @@ mod tests {
     fn test_reasoning_delta_fallback_no_output_index() {
         let cache = ReplayCache::new(Duration::from_secs(60), 128);
         let key = "sess-fallback".to_string();
-        let mut extractor = StreamReplayExtractor::new(cache.clone(), key.clone());
+        let mut extractor = StreamReplayExtractor::new(cache.clone(), key.clone(), String::new());
 
         // 无 output_index 的 delta → fallback 槽
         extractor
@@ -529,7 +538,7 @@ mod tests {
     fn test_fallback_inserts_synthetic_reasoning_before_assistant() {
         let cache = ReplayCache::new(Duration::from_secs(60), 128);
         let key = "sess-synth".to_string();
-        let mut extractor = StreamReplayExtractor::new(cache.clone(), key.clone());
+        let mut extractor = StreamReplayExtractor::new(cache.clone(), key.clone(), String::new());
 
         extractor.push(b"event: response.reasoning_text.delta\ndata: {\"delta\":\"think\"}\n\n");
         // completed 自带 output 且无 reasoning 项 → 合成 reasoning 前插
@@ -550,7 +559,7 @@ mod tests {
     fn test_fallback_fills_first_reasoning_only() {
         let cache = ReplayCache::new(Duration::from_secs(60), 128);
         let key = "sess-first".to_string();
-        let mut extractor = StreamReplayExtractor::new(cache.clone(), key.clone());
+        let mut extractor = StreamReplayExtractor::new(cache.clone(), key.clone(), String::new());
 
         // 两条 delta 单一累积;两个 reasoning 无文本 → 只塞第一个(对齐官方
         // items.iter().position(Reasoning) 取第一个)
@@ -575,7 +584,7 @@ mod tests {
     fn test_reasoning_with_existing_summary_not_overwritten() {
         let cache = ReplayCache::new(Duration::from_secs(60), 128);
         let key = "sess-keep-summary".to_string();
-        let mut extractor = StreamReplayExtractor::new(cache.clone(), key.clone());
+        let mut extractor = StreamReplayExtractor::new(cache.clone(), key.clone(), String::new());
 
         // 累积流式文本
         extractor.push(b"event: response.reasoning_text.delta\ndata: {\"output_index\":0,\"delta\":\"orphan delta\"}\n\n");

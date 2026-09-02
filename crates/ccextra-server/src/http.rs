@@ -697,6 +697,7 @@ async fn handle_messages(
 
     // 工具名还原表(short→original),responses 转换侧产出,供流式/非流式响应还原
     let mut tool_names: Option<Arc<HashMap<String, String>>> = None;
+    let mut request_fingerprint = String::new();
 
     match route.protocol {
         Protocol::Claude => {
@@ -744,6 +745,9 @@ async fn handle_messages(
                         "reasoning replay 已注入"
                     );
                 }
+                // 注入后计算 input 前缀指纹(marker 锚定用)
+                request_fingerprint =
+                    ccextra_core::convert::compute_input_prefix_fingerprint(&body_json);
             }
             if normalize_enabled {
                 normalize_target_post(&mut body_json, TargetShape::OpenAiResponses);
@@ -1013,6 +1017,7 @@ async fn handle_messages(
             (
                 state.replay_cache.clone(),
                 format!("{}:{}", route.upstream_model, s),
+                request_fingerprint.clone(),
             )
         })
     } else if matches!(route.protocol, Protocol::Antigravity)
@@ -1022,6 +1027,7 @@ async fn handle_messages(
             (
                 state.replay_cache.clone(),
                 format!("{}:{}", route.upstream_model, s),
+                request_fingerprint.clone(),
             )
         })
     } else {
@@ -1232,7 +1238,7 @@ async fn handle_messages(
             // 缓存的 replay 项含同一无效 encrypted_content,一并清掉
             // (对齐 clearCodexReasoningReplayOnInvalidSignature:
             // 签名被上游拒绝后不得下轮再注入)
-            if let Some((cache, key)) = replay_scope.as_ref() {
+            if let Some((cache, key, _)) = replay_scope.as_ref() {
                 cache.invalidate(key);
             }
             let retry = upstream_client
@@ -1298,21 +1304,21 @@ async fn handle_messages(
         // - responses:REST 顶层 Response(object=response)同样提取 replay 项
         // - antigravity:{"response": {...}} 信封内层提取(对齐 CPA
         //   cacheAntigravityReasoningReplayFromResponse 从响应 body 提取)
-        if let Some((cache, key)) = replay_scope.as_ref() {
+        if let Some((cache, key, fingerprint)) = replay_scope.as_ref() {
             if let Ok(v) = serde_json::from_slice::<Value>(&body_bytes) {
                 match route.protocol {
                     Protocol::OpenAiResponses => {
                         if v.get("object").and_then(|o| o.as_str()) == Some("response") {
                             // 包一层 completed 形状复用提取逻辑
                             let wrapped = json!({"response": v});
-                            cache.store_from_completed(key, &wrapped);
+                            cache.store_from_completed(key, &wrapped, fingerprint);
                         }
                     }
                     Protocol::Antigravity => {
                         // 信封内层 response 字段可能包含 candidates 和 reasoning 签名
                         if let Some(inner) = v.get("response") {
                             let wrapped = json!({"response": inner});
-                            cache.store_from_completed(key, &wrapped);
+                            cache.store_from_completed(key, &wrapped, fingerprint);
                         }
                     }
                     _ => {}
@@ -1556,14 +1562,14 @@ fn relay_with_replay_tap<S>(
     stream: S,
     estimated_input_tokens: Option<usize>,
     tool_names: Option<Arc<HashMap<String, String>>>,
-    replay_scope: Option<(crate::sse::replay_cache::ReplayCache, String)>,
+    replay_scope: Option<(crate::sse::replay_cache::ReplayCache, String, String)>,
 ) -> SseStreamPin
 where
     S: futures::Stream<Item = Result<Bytes, reqwest::Error>> + Send + 'static,
 {
     match replay_scope {
-        Some((cache, key)) => {
-            let mut extractor = StreamReplayExtractor::new(cache, key);
+        Some((cache, key, request_fingerprint)) => {
+            let mut extractor = StreamReplayExtractor::new(cache, key, request_fingerprint);
             let tapped = stream.inspect(move |result| {
                 if let Ok(bytes) = result {
                     extractor.push(bytes);

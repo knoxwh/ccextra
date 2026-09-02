@@ -12,6 +12,23 @@
 // 本模块只做纯函数。
 
 use serde_json::{json, Value};
+use sha2::{Digest, Sha256};
+
+/// 计算 input 数组前缀指纹(对齐 CPA codexReplayInputPrefixFingerprint)。
+/// 用于 marker 锚定,请求侧算好传给响应侧缓存写入。
+pub fn compute_input_prefix_fingerprint(body: &Value) -> String {
+    let input_items = body
+        .get("input")
+        .and_then(|v| v.as_array())
+        .map(|a| a.as_slice())
+        .unwrap_or(&[]);
+    let mut hasher = Sha256::new();
+    for item in input_items {
+        hasher.update(b"\0item\0");
+        hasher.update(serde_json::to_vec(item).unwrap_or_default());
+    }
+    hex::encode(hasher.finalize())
+}
 
 /// call_id 匹配候选(对齐 codexReplayComparableCallIDs):
 /// 原始 id + sanitize/缩短后的 claude 可见 id。CC 回传 tool_result 时
