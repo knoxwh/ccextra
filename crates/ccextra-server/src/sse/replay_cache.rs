@@ -336,8 +336,8 @@ impl ReplayCache {
             map.iter().map(|(k, v)| (k.clone(), v.stored_at)).collect();
         candidates.sort_by_key(|(_, ts)| *ts);
         let evict_count = count.min(candidates.len());
-        for i in 0..evict_count {
-            map.remove(&candidates[i].0);
+        for (key, _) in candidates.iter().take(evict_count) {
+            map.remove(key);
         }
     }
 }
