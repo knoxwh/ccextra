@@ -104,6 +104,7 @@ fn grok_cli_headers(
     }
     if matches!(protocol, Protocol::OpenAiResponses) {
         headers.push(("x-grok-doom-loop-check", "1024".to_string()));
+        headers.push(("x-grok-exact-repetition-check", "64".to_string()));
     }
     headers
 }
@@ -437,6 +438,10 @@ mod tests {
         assert_eq!(
             h.get("x-grok-doom-loop-check").map(String::as_str),
             Some("1024")
+        );
+        assert_eq!(
+            h.get("x-grok-exact-repetition-check").map(String::as_str),
+            Some("64")
         );
     }
 

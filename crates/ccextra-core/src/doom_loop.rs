@@ -7,8 +7,13 @@
 pub enum DoomLoopSignalKind {
     /// tail_repetition:{threshold},阈值越低循环越紧
     TailRepetition(u32),
+    /// exact_repetition:{sequence_tokens}x{repeat_count}@{channel}:连续重复的完全相同 token 序列
+    ExactRepetition {
+        sequence_tokens: u32,
+        repeat_count: u32,
+    },
     /// low_logprob(无阈值)
-    LowLogProb,
+    LowLogprob,
     /// 拆不动的未知类型,保留原始 label
     Unknown(String),
 }
@@ -41,7 +46,7 @@ pub fn parse_trigger(label: &str) -> DoomLoopSignal {
 
     if type_part == "low_logprob" {
         return DoomLoopSignal {
-            kind: DoomLoopSignalKind::LowLogProb,
+            kind: DoomLoopSignalKind::LowLogprob,
             channel,
         };
     }
@@ -56,6 +61,23 @@ pub fn parse_trigger(label: &str) -> DoomLoopSignal {
         }
     }
 
+    // exact_repetition:{sequence_tokens}x{repeat_count}
+    if let Some(dimensions) = type_part.strip_prefix("exact_repetition:") {
+        let kind = dimensions
+            .split_once('x')
+            .and_then(|(sequence, count)| {
+                Some((sequence.parse::<u32>().ok()?, count.parse::<u32>().ok()?))
+            })
+            .map_or_else(
+                || DoomLoopSignalKind::Unknown(label.to_string()),
+                |(sequence_tokens, repeat_count)| DoomLoopSignalKind::ExactRepetition {
+                    sequence_tokens,
+                    repeat_count,
+                },
+            );
+        return DoomLoopSignal { kind, channel };
+    }
+
     DoomLoopSignal {
         kind: DoomLoopSignalKind::Unknown(label.to_string()),
         channel,
@@ -64,14 +86,21 @@ pub fn parse_trigger(label: &str) -> DoomLoopSignal {
 
 /// 置信判定(对齐 grok-build DoomLoopRecoveryPolicy::is_confident)
 ///
-/// 只认 thinking channel 的 tail_repetition 且阈值 ≤ 64。
+/// 只认 thinking channel 的 tail_repetition(阈值 ≤ 64)或 exact_repetition。
 /// 其他一切(response channel、low_logprob、未知、更松阈值)返回 false。
 pub fn is_confident(signal: &DoomLoopSignal) -> bool {
     const MAX_THRESHOLD: u32 = 64;
     const THINKING_CHANNEL: &str = "thinking";
 
-    signal.channel == THINKING_CHANNEL
-        && matches!(signal.kind, DoomLoopSignalKind::TailRepetition(t) if t <= MAX_THRESHOLD)
+    if signal.channel != THINKING_CHANNEL {
+        return false;
+    }
+
+    match &signal.kind {
+        DoomLoopSignalKind::TailRepetition(t) if *t <= MAX_THRESHOLD => true,
+        DoomLoopSignalKind::ExactRepetition { .. } => true,
+        _ => false,
+    }
 }
 
 #[cfg(test)]
@@ -90,9 +119,32 @@ mod tests {
     }
 
     #[test]
+    fn test_parse_trigger_exact_repetition() {
+        let sig = parse_trigger("exact_repetition:42x3@thinking");
+        assert_eq!(
+            sig.kind,
+            DoomLoopSignalKind::ExactRepetition {
+                sequence_tokens: 42,
+                repeat_count: 3,
+            }
+        );
+        assert_eq!(sig.channel, "thinking");
+
+        let sig = parse_trigger("exact_repetition:128x5@response");
+        assert_eq!(
+            sig.kind,
+            DoomLoopSignalKind::ExactRepetition {
+                sequence_tokens: 128,
+                repeat_count: 5,
+            }
+        );
+        assert_eq!(sig.channel, "response");
+    }
+
+    #[test]
     fn test_parse_trigger_low_logprob() {
         let sig = parse_trigger("low_logprob@thinking");
-        assert_eq!(sig.kind, DoomLoopSignalKind::LowLogProb);
+        assert_eq!(sig.kind, DoomLoopSignalKind::LowLogprob);
         assert_eq!(sig.channel, "thinking");
     }
 
@@ -121,6 +173,14 @@ mod tests {
             kind: DoomLoopSignalKind::TailRepetition(1),
             channel: "thinking".to_string(),
         }));
+        // thinking channel + exact_repetition
+        assert!(is_confident(&DoomLoopSignal {
+            kind: DoomLoopSignalKind::ExactRepetition {
+                sequence_tokens: 42,
+                repeat_count: 3,
+            },
+            channel: "thinking".to_string(),
+        }));
     }
 
     #[test]
@@ -135,9 +195,17 @@ mod tests {
             kind: DoomLoopSignalKind::TailRepetition(32),
             channel: "response".to_string(),
         }));
+        // exact_repetition + response channel
+        assert!(!is_confident(&DoomLoopSignal {
+            kind: DoomLoopSignalKind::ExactRepetition {
+                sequence_tokens: 42,
+                repeat_count: 3,
+            },
+            channel: "response".to_string(),
+        }));
         // low_logprob
         assert!(!is_confident(&DoomLoopSignal {
-            kind: DoomLoopSignalKind::LowLogProb,
+            kind: DoomLoopSignalKind::LowLogprob,
             channel: "thinking".to_string(),
         }));
         // unknown
