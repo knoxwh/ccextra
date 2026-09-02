@@ -86,21 +86,15 @@ pub fn parse_trigger(label: &str) -> DoomLoopSignal {
 
 /// 置信判定(对齐 grok-build DoomLoopRecoveryPolicy::is_confident)
 ///
-/// 只认 thinking channel 的 tail_repetition(阈值 ≤ 64)或 exact_repetition。
-/// 其他一切(response channel、low_logprob、未知、更松阈值)返回 false。
+/// 只认 thinking channel 的 tail_repetition(阈值 ≤ 64)。
+/// exact_repetition 仅用于遥测统计(grok-build 中无 abort/recovery 消费点),
+/// 其余一切(response channel、low_logprob、未知、更松阈值)返回 false。
 pub fn is_confident(signal: &DoomLoopSignal) -> bool {
     const MAX_THRESHOLD: u32 = 64;
     const THINKING_CHANNEL: &str = "thinking";
 
-    if signal.channel != THINKING_CHANNEL {
-        return false;
-    }
-
-    match &signal.kind {
-        DoomLoopSignalKind::TailRepetition(t) if *t <= MAX_THRESHOLD => true,
-        DoomLoopSignalKind::ExactRepetition { .. } => true,
-        _ => false,
-    }
+    signal.channel == THINKING_CHANNEL
+        && matches!(signal.kind, DoomLoopSignalKind::TailRepetition(t) if t <= MAX_THRESHOLD)
 }
 
 #[cfg(test)]
@@ -173,14 +167,6 @@ mod tests {
             kind: DoomLoopSignalKind::TailRepetition(1),
             channel: "thinking".to_string(),
         }));
-        // thinking channel + exact_repetition
-        assert!(is_confident(&DoomLoopSignal {
-            kind: DoomLoopSignalKind::ExactRepetition {
-                sequence_tokens: 42,
-                repeat_count: 3,
-            },
-            channel: "thinking".to_string(),
-        }));
     }
 
     #[test]
@@ -195,13 +181,13 @@ mod tests {
             kind: DoomLoopSignalKind::TailRepetition(32),
             channel: "response".to_string(),
         }));
-        // exact_repetition + response channel
+        // exact_repetition 仅遥测,不触发中断(对齐 grok-build is_confident)
         assert!(!is_confident(&DoomLoopSignal {
             kind: DoomLoopSignalKind::ExactRepetition {
                 sequence_tokens: 42,
                 repeat_count: 3,
             },
-            channel: "response".to_string(),
+            channel: "thinking".to_string(),
         }));
         // low_logprob
         assert!(!is_confident(&DoomLoopSignal {
