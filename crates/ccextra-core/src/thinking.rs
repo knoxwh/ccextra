@@ -86,14 +86,14 @@ static MODEL_REGISTRY: Lazy<Vec<ModelCapability>> = Lazy::new(|| {
         .unwrap_or_default()
 });
 
-/// 查找模型支持的 reasoning_levels(精确匹配或别名匹配)
+/// 查找模型支持的 reasoning_levels(精确匹配或别名匹配,测试可注入 registry)
 ///
 /// 匹配逻辑(大小写不敏感):
 /// 1. 精确匹配:`glm-5.1` 匹配 `glm-5.1`
 /// 2. 别名匹配:`glm-5.1-27717e1a8a72-glm51` 也能匹配到独立条目
-fn lookup_model_levels(model: &str) -> Option<Vec<Level>> {
+fn lookup_model_levels_impl(model: &str, registry: &[ModelCapability]) -> Option<Vec<Level>> {
     let model_lower = model.trim().to_ascii_lowercase();
-    MODEL_REGISTRY.iter().find_map(|cap| {
+    registry.iter().find_map(|cap| {
         if cap.id.to_ascii_lowercase() == model_lower {
             Some(
                 cap.reasoning_levels
@@ -158,12 +158,21 @@ pub fn resolve_effort_from_body(body: &serde_json::Value) -> Option<&'static str
 /// - `clamp_effort("max", "glm-5.2")` → "max"(注册表 glm-5.2 支持 max)
 /// - `clamp_effort("max", "gpt-5.6-terra")` → "max"(注册表支持 max)
 pub fn clamp_effort<'a>(effort: &'a str, model: &str) -> &'a str {
+    clamp_effort_with_registry(effort, model, &MODEL_REGISTRY)
+}
+
+/// 内部钳制逻辑(测试可注入 registry)
+fn clamp_effort_with_registry<'a>(
+    effort: &'a str,
+    model: &str,
+    registry: &[ModelCapability],
+) -> &'a str {
     let Some(effort_level) = Level::parse(effort) else {
         return effort; // 非法值直透
     };
 
     // 查注册表(精确匹配)
-    let Some(supported) = lookup_model_levels(model) else {
+    let Some(supported) = lookup_model_levels_impl(model, registry) else {
         return effort; // 查不到,不钳制
     };
     clamp_to_nearest(effort_level, &supported).as_str()
@@ -373,59 +382,145 @@ mod tests {
         assert_eq!(clamp_effort("bogus", "any-model"), "bogus");
     }
 
+    // mock registry 供测试用(不依赖 models.json 实际内容)
+    fn mock_registry() -> Vec<ModelCapability> {
+        vec![
+            ModelCapability {
+                id: "glm-5.1".into(),
+                reasoning_levels: vec![
+                    "low".into(),
+                    "medium".into(),
+                    "high".into(),
+                    "xhigh".into(),
+                ],
+            },
+            ModelCapability {
+                id: "glm-5.2".into(),
+                reasoning_levels: vec!["low".into(), "high".into(), "max".into()],
+            },
+            ModelCapability {
+                id: "gpt-5.6-terra".into(),
+                reasoning_levels: vec![
+                    "low".into(),
+                    "medium".into(),
+                    "high".into(),
+                    "xhigh".into(),
+                ],
+            },
+            ModelCapability {
+                id: "gpt-5.6-sol".into(),
+                reasoning_levels: vec![
+                    "low".into(),
+                    "medium".into(),
+                    "high".into(),
+                    "xhigh".into(),
+                ],
+            },
+            ModelCapability {
+                id: "grok-4.6".into(),
+                reasoning_levels: vec![
+                    "low".into(),
+                    "medium".into(),
+                    "high".into(),
+                    "xhigh".into(),
+                ],
+            },
+            ModelCapability {
+                id: "kimi-k3".into(),
+                reasoning_levels: vec!["low".into(), "high".into(), "max".into()],
+            },
+            ModelCapability {
+                id: "gemini-3.7-flash-medium".into(),
+                reasoning_levels: vec!["medium".into()],
+            },
+            ModelCapability {
+                id: "gemini-3.7-flash-high".into(),
+                reasoning_levels: vec!["high".into()],
+            },
+        ]
+    }
+
     #[test]
     fn test_clamp_effort_registry_glm51() {
-        // glm-5.1 注册表支持 low/medium/high/xhigh
-        assert_eq!(clamp_effort("max", "glm-5.1"), "xhigh");
-        assert_eq!(clamp_effort("xhigh", "glm-5.1"), "xhigh");
-        assert_eq!(clamp_effort("high", "glm-5.1"), "high");
+        let reg = mock_registry();
+        assert_eq!(clamp_effort_with_registry("max", "glm-5.1", &reg), "xhigh");
+        assert_eq!(
+            clamp_effort_with_registry("xhigh", "glm-5.1", &reg),
+            "xhigh"
+        );
+        assert_eq!(clamp_effort_with_registry("high", "glm-5.1", &reg), "high");
     }
 
     #[test]
     fn test_clamp_effort_registry_glm52() {
-        // glm-5.2 支持 low/high/max; xhigh 降到 high
-        assert_eq!(clamp_effort("max", "glm-5.2"), "max");
-        assert_eq!(clamp_effort("xhigh", "glm-5.2"), "high");
+        let reg = mock_registry();
+        assert_eq!(clamp_effort_with_registry("max", "glm-5.2", &reg), "max");
+        assert_eq!(clamp_effort_with_registry("xhigh", "glm-5.2", &reg), "high");
     }
 
     #[test]
     fn test_clamp_effort_registry_gpt56() {
-        // gpt-5.6-terra 支持 low/medium/high/xhigh
-        assert_eq!(clamp_effort("max", "gpt-5.6-terra"), "xhigh");
-        assert_eq!(clamp_effort("max", "gpt-5.6-sol"), "xhigh");
+        let reg = mock_registry();
+        assert_eq!(
+            clamp_effort_with_registry("max", "gpt-5.6-terra", &reg),
+            "xhigh"
+        );
+        assert_eq!(
+            clamp_effort_with_registry("max", "gpt-5.6-sol", &reg),
+            "xhigh"
+        );
     }
 
     #[test]
     fn test_clamp_effort_registry_grok46() {
-        // grok-4.6 支持 low/medium/high/xhigh;max 降到 xhigh
-        assert_eq!(clamp_effort("max", "grok-4.6"), "xhigh");
-        assert_eq!(clamp_effort("xhigh", "grok-4.6"), "xhigh");
-        assert_eq!(clamp_effort("high", "grok-4.6"), "high");
-        assert_eq!(clamp_effort("medium", "grok-4.6"), "medium");
+        let reg = mock_registry();
+        assert_eq!(clamp_effort_with_registry("max", "grok-4.6", &reg), "xhigh");
+        assert_eq!(
+            clamp_effort_with_registry("xhigh", "grok-4.6", &reg),
+            "xhigh"
+        );
+        assert_eq!(clamp_effort_with_registry("high", "grok-4.6", &reg), "high");
+        assert_eq!(
+            clamp_effort_with_registry("medium", "grok-4.6", &reg),
+            "medium"
+        );
     }
 
     #[test]
     fn test_clamp_effort_registry_kimi() {
-        // kimi-k3 支持 low/high/max
-        assert_eq!(clamp_effort("max", "kimi-k3"), "max");
-        assert_eq!(clamp_effort("xhigh", "kimi-k3"), "high"); // xhigh(4)距high(3)/max(5)都是1,tie-break取低
-        assert_eq!(clamp_effort("medium", "kimi-k3"), "low"); // medium(2)距low(1)/high(3)都是1,tie-break取低
-        assert_eq!(clamp_effort("high", "kimi-k3"), "high");
+        let reg = mock_registry();
+        assert_eq!(clamp_effort_with_registry("max", "kimi-k3", &reg), "max");
+        assert_eq!(clamp_effort_with_registry("xhigh", "kimi-k3", &reg), "high");
+        assert_eq!(clamp_effort_with_registry("medium", "kimi-k3", &reg), "low");
+        assert_eq!(clamp_effort_with_registry("high", "kimi-k3", &reg), "high");
     }
 
     #[test]
     fn test_clamp_effort_registry_case_insensitive() {
-        assert_eq!(clamp_effort("max", "GLM-5.1"), "xhigh");
-        assert_eq!(clamp_effort("xhigh", "Kimi-K3"), "high");
+        let reg = mock_registry();
+        assert_eq!(clamp_effort_with_registry("max", "GLM-5.1", &reg), "xhigh");
+        assert_eq!(clamp_effort_with_registry("xhigh", "Kimi-K3", &reg), "high");
     }
 
     #[test]
     fn test_clamp_effort_registry_gemini_flash_sku() {
-        // Antigravity SKU 档位写死在注册表,effort=max 钳到该档
-        assert_eq!(clamp_effort("max", "gemini-3.7-flash-medium"), "medium");
-        assert_eq!(clamp_effort("high", "gemini-3.7-flash-medium"), "medium");
-        assert_eq!(clamp_effort("max", "gemini-3.7-flash-high"), "high");
-        assert_eq!(clamp_effort("medium", "gemini-3.7-flash-high"), "high");
+        let reg = mock_registry();
+        assert_eq!(
+            clamp_effort_with_registry("max", "gemini-3.7-flash-medium", &reg),
+            "medium"
+        );
+        assert_eq!(
+            clamp_effort_with_registry("high", "gemini-3.7-flash-medium", &reg),
+            "medium"
+        );
+        assert_eq!(
+            clamp_effort_with_registry("max", "gemini-3.7-flash-high", &reg),
+            "high"
+        );
+        assert_eq!(
+            clamp_effort_with_registry("medium", "gemini-3.7-flash-high", &reg),
+            "high"
+        );
     }
 
     #[test]
