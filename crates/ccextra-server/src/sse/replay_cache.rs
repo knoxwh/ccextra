@@ -16,6 +16,9 @@ use std::time::{Duration, Instant};
 
 use super::parser::SseParser;
 
+/// 驱逐批次(对齐 CPA CodexReasoningReplayCacheEvictBatchSize)
+const EVICT_BATCH_SIZE: usize = 128;
+
 /// 每流一个的 SSE 提取器:累积解析本流 chunk,收集 output_item.done,
 /// 命中 response.completed 补空 output 后写入缓存(对齐 CPA 流式路径的
 /// 局部收集 + xaiPatchCompletedOutput,流结束随闭包释放)。
@@ -233,7 +236,7 @@ pub struct ReplayCache {
 }
 
 impl ReplayCache {
-    /// capacity 上限(超限清空,对齐 secret 缓存的简单策略)
+    /// capacity 上限(超限 LRU 驱逐最老批次,对齐 CPA evictOldestXAIReasoningReplayEntriesLocked)
     pub fn new(ttl: Duration, capacity: usize) -> Self {
         Self {
             inner: Arc::new(Mutex::new(HashMap::new())),
@@ -264,7 +267,7 @@ impl ReplayCache {
         };
         let mut map = self.inner.lock().unwrap();
         if map.len() >= self.capacity && !map.contains_key(session_key) {
-            map.clear();
+            Self::evict_oldest_locked(&mut map, EVICT_BATCH_SIZE);
         }
         let existing = map
             .get(session_key)
@@ -322,6 +325,20 @@ impl ReplayCache {
             }
         };
         insert_replay_turns(body, items, keep_plain_reasoning)
+    }
+
+    /// LRU 驱逐最老的 count 个条目(对齐 CPA evictOldestCodexReasoningReplayEntries)
+    fn evict_oldest_locked(map: &mut HashMap<String, Entry>, count: usize) {
+        if count == 0 || map.is_empty() {
+            return;
+        }
+        let mut candidates: Vec<(String, Instant)> =
+            map.iter().map(|(k, v)| (k.clone(), v.stored_at)).collect();
+        candidates.sort_by_key(|(_, ts)| *ts);
+        let evict_count = count.min(candidates.len());
+        for i in 0..evict_count {
+            map.remove(&candidates[i].0);
+        }
     }
 }
 
@@ -601,5 +618,42 @@ mod tests {
         let reasoning = input.iter().find(|i| i["type"] == "reasoning").unwrap();
         // 应保留 original summary 不是 orphan delta
         assert_eq!(reasoning["summary"][0]["text"], "original summary");
+    }
+
+    #[test]
+    fn test_evict_oldest_lru_not_clear_all() {
+        // 容量 200,驱逐批次 128(对齐 CPA EVICT_BATCH_SIZE)
+        let cache = ReplayCache::new(Duration::from_secs(60), 200);
+        let completed = |id: &str| {
+            json!({"type": "response.completed", "response": {"output": [
+                {"type": "reasoning", "encrypted_content": id}
+            ]}})
+        };
+        // 填满 200 个 session
+        for i in 0..200 {
+            cache.store_from_completed(&format!("sess-{}", i), &completed(&format!("g{}", i)), "");
+            std::thread::sleep(Duration::from_micros(100));
+        }
+
+        // 存第 201 个新 session,触发驱逐 128 个最老的
+        cache.store_from_completed("sess-200", &completed("g200"), "");
+
+        // sess-0 到 sess-127 被驱逐(最老 128 个)
+        let mut body0 = json!({"input": []});
+        assert!(!cache.apply_to_body("sess-0", &mut body0, false));
+        let mut body64 = json!({"input": []});
+        assert!(!cache.apply_to_body("sess-64", &mut body64, false));
+        let mut body127 = json!({"input": []});
+        assert!(!cache.apply_to_body("sess-127", &mut body127, false));
+
+        // sess-128 到 sess-200 应该还在(73 个)
+        let mut body128 = json!({"input": []});
+        assert!(cache.apply_to_body("sess-128", &mut body128, false));
+        let mut body150 = json!({"input": []});
+        assert!(cache.apply_to_body("sess-150", &mut body150, false));
+        let mut body199 = json!({"input": []});
+        assert!(cache.apply_to_body("sess-199", &mut body199, false));
+        let mut body200 = json!({"input": []});
+        assert!(cache.apply_to_body("sess-200", &mut body200, false));
     }
 }

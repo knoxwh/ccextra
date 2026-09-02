@@ -2,11 +2,11 @@
   "models": [
     {
       "id": "gpt-5.6-terra",
-      "reasoning_levels": ["low", "medium", "high", "xhigh", "max", "ultra"]
+      "reasoning_levels": ["low", "medium", "high", "xhigh"]
     },
     {
       "id": "gpt-5.6-sol",
-      "reasoning_levels": ["low", "medium", "high", "xhigh", "max", "ultra"]
+      "reasoning_levels": ["low", "medium", "high", "xhigh"]
     },
     {
       "id": "glm-5.1",
