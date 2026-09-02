@@ -503,7 +503,7 @@ mod tests {
         let anthropic = json!({
             "model": "m", "max_tokens": 1000,
             "thinking": {"type": "adaptive"},
-            "output_config": {"effort": "ultra"},
+            "output_config": {"effort": "bogus"},
             "messages": [{"role": "user", "content": "hi"}]
         });
         let (gemini, _) = convert_to_gemini(&anthropic, "gemini-2.5-pro");

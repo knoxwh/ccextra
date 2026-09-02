@@ -390,9 +390,9 @@ mod tests {
 
     #[test]
     fn test_clamp_effort_registry_gpt56() {
-        // gpt-5.6-terra 支持 low/medium/high/xhigh/max/ultra
-        assert_eq!(clamp_effort("max", "gpt-5.6-terra"), "max");
-        assert_eq!(clamp_effort("ultra", "gpt-5.6-sol"), "ultra");
+        // gpt-5.6-terra 支持 low/medium/high/xhigh
+        assert_eq!(clamp_effort("max", "gpt-5.6-terra"), "xhigh");
+        assert_eq!(clamp_effort("max", "gpt-5.6-sol"), "xhigh");
     }
 
     #[test]
