@@ -157,9 +157,11 @@ impl ChatRelay {
             }
         }
 
-        // tool_calls
+        // tool_calls (对齐 CPA 6c6473f8:忽略空数组,防止错误停止 reasoning)
         if let Some(tool_calls) = delta.get("tool_calls").and_then(|v| v.as_array()) {
-            frames.extend(self.collect_tool_calls(tool_calls));
+            if !tool_calls.is_empty() {
+                frames.extend(self.collect_tool_calls(tool_calls));
+            }
         }
 
         // finish_reason
