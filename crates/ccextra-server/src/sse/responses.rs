@@ -223,6 +223,16 @@ impl ResponsesRelay {
                 out
             }
             "response.reasoning_summary_text.delta" => self.plaintext_reasoning_delta(&root),
+            "response.reasoning_summary_text.done" => {
+                // 对齐 CPA codex_openai_response.go:126-133:
+                // reasoning_summary_text.done 发 "\n\n" 分隔 summary 与后续内容
+                self.thinking_summary_seen = true;
+                if self.thinking_open {
+                    self.thinking_delta(SUMMARY_PART_SEPARATOR)
+                } else {
+                    Vec::new()
+                }
+            }
             // 不关 thinking 块:等 output_item.done 带最终 encrypted_content
             "response.reasoning_summary_part.done" => {
                 self.thinking_summary_seen = true;
@@ -233,8 +243,13 @@ impl ResponsesRelay {
             // 明文推理流都可走这里,完整推理内容同 summary 进 thinking 块。
             "response.reasoning_text.delta" => self.plaintext_reasoning_delta(&root),
             "response.reasoning_text.done" => {
+                // 对齐 CPA:reasoning_text.done 同样发 "\n\n" 分隔
                 self.thinking_summary_seen = true;
-                Vec::new()
+                if self.thinking_open {
+                    self.thinking_delta(SUMMARY_PART_SEPARATOR)
+                } else {
+                    Vec::new()
+                }
             }
             "response.content_part.added" => {
                 // 明文 reasoning part(part.type = reasoning,对齐 OpenAI Responses
@@ -1577,11 +1592,12 @@ mod tests {
         assert!(so.contains("content_block_start"));
         assert!(so.contains("thinking_delta"));
         assert!(so.contains("明文推理"));
-        // done 不关块;text 到来时正常收尾
+        // done 发分隔符(对齐 CPA "\n\n");text 到来时正常收尾
         let done = r.process(&ev(
             r#"{"type":"response.reasoning_text.done","item":{"type":"reasoning"}}"#,
         ));
-        assert!(s(&done).is_empty());
+        let sd = s(&done);
+        assert!(sd.contains("thinking_delta"), "done 应发分隔 delta");
         let text = r.process(&ev(
             r#"{"type":"response.output_text.delta","delta":"答案"}"#,
         ));

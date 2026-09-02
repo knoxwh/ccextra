@@ -54,14 +54,31 @@ pub fn responses_to_anthropic(
         for item in output {
             match item.get("type").and_then(|v| v.as_str()).unwrap_or("") {
                 "reasoning" => {
-                    // summary > content 取文本;signature 保留
+                    // summary + content 拼接(对齐 CPA codex_openai_response.go:433-458)
                     let mut text = String::new();
-                    if let Some(summary) = item.get("summary") {
-                        collect_response_parts(summary, &mut text);
+                    // summary:仅取首个 summary_text 的 text
+                    if let Some(summary) = item.get("summary").and_then(|v| v.as_array()) {
+                        for part in summary {
+                            if part.get("type").and_then(|t| t.as_str()) == Some("summary_text") {
+                                if let Some(t) = part.get("text").and_then(|v| v.as_str()) {
+                                    if !t.is_empty() {
+                                        text.push_str(t);
+                                    }
+                                }
+                                break; // 首个 summary_text 后 break
+                            }
+                        }
                     }
-                    if text.is_empty() {
-                        if let Some(content_arr) = item.get("content") {
-                            collect_response_parts(content_arr, &mut text);
+                    // content:遍历全部 reasoning_text,直接累加
+                    if let Some(content_arr) = item.get("content").and_then(|v| v.as_array()) {
+                        for part in content_arr {
+                            if part.get("type").and_then(|t| t.as_str()) == Some("reasoning_text") {
+                                if let Some(t) = part.get("text").and_then(|v| v.as_str()) {
+                                    if !t.is_empty() {
+                                        text.push_str(t);
+                                    }
+                                }
+                            }
                         }
                     }
                     let signature = item
@@ -372,23 +389,6 @@ fn build_message(
     Some(out)
 }
 
-/// responses reasoning 的 summary/content 都是数组 forEach 取 text
-fn collect_response_parts(v: &Value, out: &mut String) {
-    match v {
-        Value::Array(items) => {
-            for item in items {
-                if let Some(t) = item.get("text").and_then(|v| v.as_str()) {
-                    push_text(out, t);
-                } else if let Some(s) = item.as_str() {
-                    push_text(out, s);
-                }
-            }
-        }
-        Value::String(s) => push_text(out, s),
-        _ => {}
-    }
-}
-
 /// reasoning_content:字符串 / 对象 {text} / 数组(对齐 collectOpenAIReasoningTexts)
 fn collect_reasoning_value(v: &Value) -> String {
     let mut out = String::new();
@@ -508,6 +508,7 @@ mod tests {
 
     #[test]
     fn test_responses_nonstream_reasoning() {
+        // 对齐 CPA:summary 只取首个 summary_text(后续忽略),content 全部拼接
         let body = json!({
             "type": "response.completed",
             "response": {
@@ -515,8 +516,8 @@ mod tests {
                 "model": "gpt-5",
                 "output": [{
                     "type": "reasoning",
-                    "summary": [{"type": "summary_text", "text": "think step"},
-                                {"type": "summary_text", "text": " step two"}],
+                    "summary": [{"type": "summary_text", "text": "think step"}],
+                    "content": [{"type": "reasoning_text", "text": " step two"}],
                     "encrypted_content": "gAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA"
                 }],
                 "stop_reason": "end_turn",
@@ -525,7 +526,7 @@ mod tests {
         });
         let out = responses_to_anthropic(&body, None).unwrap();
         assert_eq!(out["content"][0]["type"], "thinking");
-        assert_eq!(out["content"][0]["thinking"], "think step\nstep two");
+        assert_eq!(out["content"][0]["thinking"], "think step step two");
         assert_eq!(out["content"][0]["signature"], "gAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA");
     }
 

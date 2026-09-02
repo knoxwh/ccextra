@@ -110,15 +110,8 @@ pub fn convert_to_antigravity(
 fn antigravity_max_completion_tokens(model: &str) -> Option<i64> {
     Some(match model {
         "claude-opus-4-6-thinking" | "claude-sonnet-4-6" => 64000,
-        "gemini-3.6-flash-high"
-        | "gemini-3.7-flash-high"
-        | "gemini-3-flash"
-        | "gemini-3-flash-agent" => 65536,
-        "gemini-pro-agent"
-        | "gemini-3.1-pro-low"
-        | "gemini-3.1-flash-lite"
-        | "gemini-3.5-flash-low"
-        | "gemini-3.5-flash-extra-low" => 65535,
+        "gemini-3.6-flash-high" | "gemini-3.7-flash-high" | "gemini-3-flash" => 65536,
+        "gemini-pro-agent" | "gemini-3.1-pro-low" | "gemini-3.1-flash-lite" => 65535,
         "gpt-oss-120b-medium" => 32768,
         _ => return None,
     })

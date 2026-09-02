@@ -73,7 +73,7 @@ fn parse_models(body: &Value) -> Result<Vec<ModelConfig>> {
 
     let mut models = Vec::new();
 
-    // 跳过的内部/实验性模型
+    // 跳过的内部/实验性模型(对齐 CPA registry 移除的废弃模型)
     let skip_models = [
         "chat_20706",
         "chat_23310",
@@ -81,6 +81,9 @@ fn parse_models(body: &Value) -> Result<Vec<ModelConfig>> {
         "tab_jump_flash_lite_preview",
         "gemini-2.5-flash-thinking",
         "gemini-2.5-pro",
+        "gemini-3-flash-agent",
+        "gemini-3.5-flash-low",
+        "gemini-3.5-flash-extra-low",
     ];
 
     for (model_id, model_data) in models_obj {
@@ -119,4 +122,50 @@ fn parse_models(body: &Value) -> Result<Vec<ModelConfig>> {
     }
 
     Ok(models)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use serde_json::json;
+
+    #[test]
+    fn test_parse_models_filters_defunct_models() {
+        let body = json!({
+            "models": {
+                "gemini-3.7-flash-high": {
+                    "displayName": "Gemini 3.7 Flash High",
+                    "maxTokens": 1000000,
+                    "maxOutputTokens": 65536
+                },
+                "gemini-3-flash-agent": {
+                    "displayName": "Defunct Agent",
+                    "maxTokens": 500000
+                },
+                "gemini-3.5-flash-low": {
+                    "displayName": "Defunct Low",
+                    "maxTokens": 500000
+                },
+                "gemini-3.5-flash-extra-low": {
+                    "displayName": "Defunct Extra Low",
+                    "maxTokens": 500000
+                },
+                "claude-opus-4-6-thinking": {
+                    "displayName": "Claude Opus",
+                    "maxTokens": 200000,
+                    "maxOutputTokens": 64000
+                }
+            }
+        });
+
+        let models = parse_models(&body).unwrap();
+        assert_eq!(models.len(), 2);
+
+        let names: Vec<&str> = models.iter().map(|m| m.name.as_str()).collect();
+        assert!(names.contains(&"gemini-3.7-flash-high"));
+        assert!(names.contains(&"claude-opus-4-6-thinking"));
+        assert!(!names.contains(&"gemini-3-flash-agent"));
+        assert!(!names.contains(&"gemini-3.5-flash-low"));
+        assert!(!names.contains(&"gemini-3.5-flash-extra-low"));
+    }
 }
