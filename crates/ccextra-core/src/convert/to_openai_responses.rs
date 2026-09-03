@@ -230,7 +230,7 @@ fn reasoning_item_empty(item: &Value) -> bool {
 fn tool_result_output(content: &Value) -> (Value, Vec<Value>) {
     match content {
         Value::Array(items) => {
-            let mut out: Vec<Value> = Vec::new();
+            let mut texts: Vec<String> = Vec::new();
             let mut images: Vec<Value> = Vec::new();
             for item in items {
                 match item.get("type").and_then(|v| v.as_str()) {
@@ -256,13 +256,13 @@ fn tool_result_output(content: &Value) -> (Value, Vec<Value>) {
                     }
                     Some("text") => {
                         if let Some(t) = item.get("text").and_then(|v| v.as_str()) {
-                            out.push(json!({"type": "input_text", "text": t}));
+                            texts.push(t.to_string());
                         }
                     }
                     _ => {}
                 }
             }
-            if out.is_empty() {
+            if texts.is_empty() {
                 // 无文本可留:抽取过图片用占位(对齐 sub2api "(empty)"),
                 // 否则维持原样序列化,未识别结构不丢信息
                 if images.is_empty() {
@@ -271,11 +271,11 @@ fn tool_result_output(content: &Value) -> (Value, Vec<Value>) {
                     (Value::String("(no output)".to_string()), images)
                 }
             } else {
-                (Value::Array(out), images)
+                (Value::String(texts.join("\n")), images)
             }
         }
         Value::String(_) => (content.clone(), Vec::new()),
-        other => (other.clone(), Vec::new()),
+        other => (Value::String(other.to_string()), Vec::new()),
     }
 }
 
@@ -2174,13 +2174,32 @@ mod tests {
             }]
         });
         convert_to_openai_responses(&mut body, "test-model").unwrap();
-        // 图片抽出(对齐 sub2api):output 只留文本,图片进随后的 user message
-        let output = body["input"][0]["output"].as_array().unwrap();
-        assert_eq!(output[0]["type"], "input_text");
+        // 图片抽出(对齐 sub2api):output 只留文本字符串,图片进随后的 user message
+        assert_eq!(body["input"][0]["output"], "result");
         assert_eq!(body["input"][1]["type"], "message");
         assert_eq!(body["input"][1]["role"], "user");
         let parts = body["input"][1]["content"].as_array().unwrap();
         assert_eq!(parts[0]["type"], "input_image");
+    }
+
+    #[test]
+    fn test_tool_result_multi_text_array_joined() {
+        let mut body = json!({
+            "model": "test",
+            "messages": [{
+                "role": "user",
+                "content": [{
+                    "type": "tool_result",
+                    "tool_use_id": "t1",
+                    "content": [
+                        {"type": "text", "text": "line1"},
+                        {"type": "text", "text": "line2"}
+                    ]
+                }]
+            }]
+        });
+        convert_to_openai_responses(&mut body, "test-model").unwrap();
+        assert_eq!(body["input"][0]["output"], "line1\nline2");
     }
 
     #[test]
