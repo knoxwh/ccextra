@@ -50,6 +50,7 @@ fn process_gemini_events(
     relay: &mut GeminiRelayState,
     input_tokens: i64,
     tool_map: &HashMap<String, String>,
+    signature_model: Option<&str>,
 ) -> Vec<Bytes> {
     let mut output = Vec::new();
     for event in events {
@@ -131,7 +132,9 @@ fn process_gemini_events(
             relay.message_started = true;
         }
 
-        for event in convert_gemini_stream_chunk(&chunk, &mut relay.stream, tool_map) {
+        for event in
+            convert_gemini_stream_chunk(&chunk, &mut relay.stream, tool_map, signature_model)
+        {
             let event_type = event["type"].as_str().unwrap_or("");
             output.push(emit::sse(event_type, &event));
         }
@@ -146,6 +149,7 @@ fn process_gemini_events(
 /// Gemini SSE 流转 Anthropic SSE。
 ///
 /// 直连 Gemini 不对缺失 finishReason 的流合成终态,仅转发 message_stop。
+/// 签名原样透传(CPA gemini/claude 响应侧不做归一化)。
 pub fn relay_gemini_to_anthropic<S>(
     stream: S,
     estimated_input_tokens: Option<usize>,
@@ -154,21 +158,30 @@ pub fn relay_gemini_to_anthropic<S>(
 where
     S: Stream<Item = Result<Bytes, reqwest::Error>> + Send + 'static,
 {
-    relay_gemini_like_to_anthropic(stream, estimated_input_tokens, tool_names, false)
+    relay_gemini_like_to_anthropic(stream, estimated_input_tokens, tool_names, false, None)
 }
 
 /// Antigravity SSE 流转 Anthropic SSE。
 ///
 /// 缺失 finishReason 时按 CPA 在 clean EOF/[DONE] 合成终态 chunk。
+/// `signature_model` 为上游模型名,出站 thoughtSignature 按 CPA
+/// formatClaudeSignatureValue 归一化(claude 组解回原生 E 形)。
 pub fn relay_antigravity_to_anthropic<S>(
     stream: S,
     estimated_input_tokens: Option<usize>,
     tool_names: Option<Arc<HashMap<String, String>>>,
+    signature_model: Arc<str>,
 ) -> SseStreamPin
 where
     S: Stream<Item = Result<Bytes, reqwest::Error>> + Send + 'static,
 {
-    relay_gemini_like_to_anthropic(stream, estimated_input_tokens, tool_names, true)
+    relay_gemini_like_to_anthropic(
+        stream,
+        estimated_input_tokens,
+        tool_names,
+        true,
+        Some(signature_model),
+    )
 }
 
 fn relay_gemini_like_to_anthropic<S>(
@@ -176,6 +189,7 @@ fn relay_gemini_like_to_anthropic<S>(
     estimated_input_tokens: Option<usize>,
     tool_names: Option<Arc<HashMap<String, String>>>,
     synthesize_missing_finish: bool,
+    signature_model: Option<Arc<str>>,
 ) -> SseStreamPin
 where
     S: Stream<Item = Result<Bytes, reqwest::Error>> + Send + 'static,
@@ -200,6 +214,7 @@ where
                         &mut relay,
                         input_tokens as i64,
                         &tool_map,
+                        signature_model.as_deref(),
                     ) {
                         yield Ok(output);
                     }
@@ -232,6 +247,7 @@ where
                 &mut relay,
                 input_tokens as i64,
                 &tool_map,
+                signature_model.as_deref(),
             ) {
                 yield Ok(output);
             }
@@ -267,7 +283,7 @@ mod tests {
     where
         S: Stream<Item = Result<Bytes, reqwest::Error>> + Send + 'static,
     {
-        relay_antigravity_to_anthropic(stream, None, None)
+        relay_antigravity_to_anthropic(stream, None, None, Arc::from("gemini-2.5-pro"))
             .collect::<Vec<_>>()
             .await
             .into_iter()

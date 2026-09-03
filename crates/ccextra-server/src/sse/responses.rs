@@ -1134,11 +1134,12 @@ impl ResponsesRelay {
         out.extend(self.stop_text());
         out.extend(self.synthesize_empty_text_block());
 
-        // usage(对齐 extractResponsesUsage:cached 从 input 扣除)
-        let (input_tokens, output_tokens, cached) = response
+        // usage(对齐 extractResponsesUsage:cached 从 input 扣除;cache_write
+        // 映射为 cache_creation_input_tokens,对齐 CPA 893abbab)
+        let (input_tokens, output_tokens, cached, cache_write) = response
             .and_then(|r| r.get("usage"))
             .map(super::extract_usage_responses)
-            .unwrap_or((0, 0, 0));
+            .unwrap_or((0, 0, 0, 0));
 
         let stop_seq = response.and_then(stop_sequence);
         let raw_reason = response.map(codex_stop_reason).unwrap_or_default();
@@ -1150,6 +1151,7 @@ impl ResponsesRelay {
             input_tokens,
             output_tokens,
             cached,
+            cache_write,
         ));
         out.push(emit::message_stop());
         out
@@ -1678,6 +1680,39 @@ mod tests {
         let v = frame_data(delta);
         assert_eq!(v["usage"]["input_tokens"], 20);
         assert_eq!(v["usage"]["cache_read_input_tokens"], 80);
+    }
+
+    #[test]
+    fn test_usage_maps_cache_write_tokens() {
+        // 对齐 CPA 893abbab:cache_write_tokens → cache_creation_input_tokens,
+        // 0 时不下发该键
+        let mut r = ResponsesRelay::new(None);
+        r.process(&created());
+        let out = r.process(&ev(
+            r#"{"type":"response.completed","response":{"id":"r1","output":[],
+                "usage":{"input_tokens":100,"output_tokens":5,
+                         "input_tokens_details":{"cached_tokens":80,"cache_write_tokens":150}}}}"#,
+        ));
+        let delta = out
+            .iter()
+            .find(|b| b.starts_with(b"event: message_delta"))
+            .unwrap();
+        let v = frame_data(delta);
+        assert_eq!(v["usage"]["cache_creation_input_tokens"], 150);
+
+        let mut r = ResponsesRelay::new(None);
+        r.process(&created());
+        let out = r.process(&ev(
+            r#"{"type":"response.completed","response":{"id":"r1","output":[],
+                "usage":{"input_tokens":100,"output_tokens":5,
+                         "input_tokens_details":{"cached_tokens":80,"cache_write_tokens":0}}}}"#,
+        ));
+        let delta = out
+            .iter()
+            .find(|b| b.starts_with(b"event: message_delta"))
+            .unwrap();
+        let v = frame_data(delta);
+        assert!(v["usage"].get("cache_creation_input_tokens").is_none());
     }
 
     #[test]

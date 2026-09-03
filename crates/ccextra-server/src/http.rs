@@ -1158,6 +1158,11 @@ async fn handle_messages(
     let mut status = upstream.as_ref().expect("上游响应应存在").status;
     let mut preloaded_stream = None;
 
+    // antigravity 响应侧 thoughtSignature 归一化需上游模型名(对齐 CPA 取请求 model);
+    // plain gemini 原样透传,其余协议不参与。
+    let signature_model: Option<Arc<str>> = matches!(route.protocol, Protocol::Antigravity)
+        .then(|| Arc::from(route.upstream_model.as_str()));
+
     // OpenAI 流在首个 Anthropic SSE 帧前失败时，尚未向客户端输出，可重试一次。
     // 已取得首帧后立即放行，后续流保持实时转发，不缓冲完整响应。
     if is_stream
@@ -1176,6 +1181,7 @@ async fn handle_messages(
                 estimated_input_tokens,
                 tool_names.clone(),
                 replay_scope.clone(),
+                signature_model.clone(),
             );
             let first = out.next().await;
             let retry = match &first {
@@ -1292,6 +1298,7 @@ async fn handle_messages(
                 estimated_input_tokens,
                 tool_names,
                 replay_scope,
+                signature_model.clone(),
             )
         };
         Ok(Response::builder()
@@ -1374,6 +1381,7 @@ async fn handle_messages(
                         Some(convert_gemini_response(
                             &v,
                             tool_names.as_deref().unwrap_or(&HashMap::new()),
+                            None,
                         ))
                     }
                     Protocol::Antigravity => {
@@ -1394,6 +1402,7 @@ async fn handle_messages(
                         Some(convert_gemini_response(
                             &inner,
                             tool_names.as_deref().unwrap_or(&HashMap::new()),
+                            Some(route.upstream_model.as_str()),
                         ))
                     }
                 }
@@ -1568,6 +1577,7 @@ fn relay_with_replay_tap<S>(
     estimated_input_tokens: Option<usize>,
     tool_names: Option<Arc<HashMap<String, String>>>,
     replay_scope: Option<(crate::sse::replay_cache::ReplayCache, String, String)>,
+    signature_model: Option<Arc<str>>,
 ) -> SseStreamPin
 where
     S: futures::Stream<Item = Result<Bytes, reqwest::Error>> + Send + 'static,
@@ -1580,9 +1590,21 @@ where
                     extractor.push(bytes);
                 }
             });
-            crate::sse::relay(protocol, tapped, estimated_input_tokens, tool_names)
+            crate::sse::relay(
+                protocol,
+                tapped,
+                estimated_input_tokens,
+                tool_names,
+                signature_model,
+            )
         }
-        None => crate::sse::relay(protocol, stream, estimated_input_tokens, tool_names),
+        None => crate::sse::relay(
+            protocol,
+            stream,
+            estimated_input_tokens,
+            tool_names,
+            signature_model,
+        ),
     }
 }
 

@@ -1190,17 +1190,13 @@ pub fn decode_signature(signature: &str) -> Option<String> {
 }
 
 /// 出站 signature 字段值(对齐 formatClaudeSignatureValue)。
-/// claude 组解回提供方原生 E 形,其余组原样透传(Gemini 签名是原生回放状态)。
-/// 返回 None 表示不发该字段。
-pub fn format_claude_signature_value(model_name: &str, signature: &str) -> Option<String> {
+/// claude 组解回提供方原生 E 形,解码失败得空串(CPA 照发空值,不省字段);
+/// 其余组原样透传(Gemini 签名是原生回放状态)。
+pub fn format_claude_signature_value(model_name: &str, signature: &str) -> String {
     if model_group(model_name) == "claude" {
-        let decoded = decode_signature(signature)?;
-        if decoded.is_empty() {
-            return None;
-        }
-        return Some(decoded);
+        return decode_signature(signature).unwrap_or_default();
     }
-    Some(signature.to_string())
+    signature.to_string()
 }
 
 /// 测试夹具:构造真实形状的 Claude 签名(对齐 CPA buildClaudeSignaturePayload)。
@@ -1289,5 +1285,171 @@ pub(crate) mod fixtures {
     #[allow(dead_code)]
     pub(crate) fn non_claude_raw_signature() -> String {
         STANDARD.encode([0x34u8; 48])
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::fixtures::{
+        claude_native_default, claude_native_signature, claude_upstream_signature,
+        non_claude_raw_signature,
+    };
+    use super::*;
+
+    #[test]
+    fn test_claude_native_signature_reencoded_for_upstream() {
+        // 对齐 CPA CacheModeAcceptsNativeSignature:E 形入站 → R 形出站
+        let native = claude_native_default();
+        let upstream = claude_upstream_signature(&native);
+        assert_eq!(
+            detect_signature_provider(&native),
+            SignatureProvider::Claude
+        );
+        assert_eq!(
+            resolve_thinking_signature("claude-sonnet-4-6", &native),
+            upstream
+        );
+    }
+
+    #[test]
+    fn test_claude_double_layer_signature_passthrough() {
+        // R 形已是上游形态,原样回放
+        let native = claude_native_default();
+        let upstream = claude_upstream_signature(&native);
+        assert_eq!(
+            resolve_thinking_signature("claude-sonnet-4-6", &upstream),
+            upstream
+        );
+    }
+
+    #[test]
+    fn test_invalid_signature_yields_empty() {
+        // 对齐 CPA CacheModeDropsInvalidSignature:非 Claude 信封一律空串(丢块)
+        let foreign = non_claude_raw_signature();
+        assert_eq!(
+            resolve_thinking_signature("claude-sonnet-4-6", &foreign),
+            ""
+        );
+        assert_eq!(resolve_thinking_signature("claude-sonnet-4-6", ""), "");
+        // 极简载荷(只有 channel_id)仍严格有效,对齐 CPA testMinimalAnthropicSignature
+        let minimal = claude_native_signature(12, None, "", false);
+        assert_eq!(
+            compatible_antigravity_claude_thinking_signature(&minimal),
+            Some(claude_upstream_signature(&minimal))
+        );
+        // E 形但 container 缺 channel block:严格校验拒掉
+        let broken = STANDARD.encode([0x12u8, 0x00]);
+        assert_eq!(
+            compatible_antigravity_claude_thinking_signature(&broken),
+            None
+        );
+    }
+
+    #[test]
+    fn test_format_claude_signature_value() {
+        let native = claude_native_default();
+        let upstream = claude_upstream_signature(&native);
+        // claude 组:R 形解回原生 E 形,无前缀
+        assert_eq!(
+            format_claude_signature_value("claude-sonnet-4-6", &upstream),
+            native
+        );
+        // 解码失败得空串(CPA 照发空值)
+        assert_eq!(
+            format_claude_signature_value("claude-sonnet-4-6", "R!!!"),
+            ""
+        );
+        // 其余组原样透传(Gemini 签名是原生回放状态)
+        assert_eq!(
+            format_claude_signature_value("gemini-2.5-pro", &upstream),
+            upstream
+        );
+    }
+
+    #[test]
+    fn test_model_group_order() {
+        // 对齐 GetModelGroup:gpt → claude → gemini → 模型名本身
+        assert_eq!(model_group("gpt-5.6-terra"), "gpt");
+        assert_eq!(model_group("claude-sonnet-4-6"), "claude");
+        assert_eq!(model_group("gemini-2.5-pro"), "gemini");
+        assert_eq!(model_group("grok-4.6"), "grok-4.6");
+    }
+
+    /// xorshift 填充的高熵字节,标准无填充 base64
+    fn high_entropy_base64(byte_len: usize) -> String {
+        let mut buf = vec![0u8; byte_len];
+        let mut state = 0x2545_F491_4F6C_DD1Du64;
+        for byte in buf.iter_mut() {
+            state ^= state << 13;
+            state ^= state >> 7;
+            state ^= state << 17;
+            *byte = (state & 0xff) as u8;
+        }
+        STANDARD_NO_PAD.encode(&buf)
+    }
+
+    #[test]
+    fn test_kimi_fixed_raw_lengths() {
+        // 对齐 kimiThinkingSignatureLens:只认原始长度 12946 / 4340
+        // 12946 = 4*3236+2 → 9709 字节;4340 = 4*1085 → 3255 字节
+        let non_streaming = high_entropy_base64(9709);
+        let streaming = high_entropy_base64(3255);
+        assert_eq!(non_streaming.len(), KIMI_NON_STREAMING_LEN);
+        assert_eq!(streaming.len(), KIMI_STREAMING_LEN);
+        assert!(is_valid_kimi_thinking_signature(&non_streaming));
+        assert!(is_valid_kimi_thinking_signature(&streaming));
+        // 长度不符 / 带填充 / 低熵一律拒
+        assert!(!is_valid_kimi_thinking_signature(&high_entropy_base64(64)));
+        assert!(!is_valid_kimi_thinking_signature(&format!(
+            "{non_streaming}="
+        )));
+        assert!(!is_valid_kimi_thinking_signature(
+            &STANDARD_NO_PAD.encode(vec![7u8; 9709])
+        ));
+    }
+
+    #[test]
+    fn test_grok_encrypted_content() {
+        // 无信封高熵 blob 通过;kimi 固定长度、外来信封、低熵拒掉
+        let opaque = high_entropy_base64(64);
+        assert!(is_valid_grok_encrypted_content(&opaque));
+        assert!(!is_valid_grok_encrypted_content(&high_entropy_base64(9709)));
+        assert!(!is_valid_grok_encrypted_content(
+            &claude_upstream_signature(&claude_native_default())
+        ));
+        assert!(!is_valid_grok_encrypted_content(
+            &STANDARD_NO_PAD.encode(vec![7u8; 64])
+        ));
+        assert!(!is_valid_grok_encrypted_content(""));
+    }
+
+    #[test]
+    fn test_tool_use_thought_signature_fallback() {
+        // 对齐 resolveToolUseThoughtSignature(allowSyntheticFallback=true):
+        // claude 目标空串(不发 thoughtSignature),其余目标回落 bypass 哨兵
+        assert_eq!(
+            resolve_tool_use_thought_signature("claude-opus-5", None),
+            ""
+        );
+        assert_eq!(
+            resolve_tool_use_thought_signature("gemini-2.5-pro", None),
+            GEMINI_SKIP_THOUGHT_SIGNATURE_VALIDATOR
+        );
+        assert_eq!(
+            resolve_tool_use_thought_signature("gpt-5.6", None),
+            GEMINI_SKIP_THOUGHT_SIGNATURE_VALIDATOR
+        );
+        // gemini 目标:bypass 哨兵原样回放,无法识别的 blob 回落哨兵
+        assert_eq!(
+            resolve_tool_use_thought_signature(
+                "gemini-2.5-pro",
+                Some(GEMINI_SKIP_THOUGHT_SIGNATURE_VALIDATOR)
+            ),
+            GEMINI_SKIP_THOUGHT_SIGNATURE_VALIDATOR
+        );
+        assert_eq!(
+            resolve_tool_use_thought_signature("gemini-2.5-pro", Some(&high_entropy_base64(48))),
+            GEMINI_SKIP_THOUGHT_SIGNATURE_VALIDATOR
+        );
     }
 }

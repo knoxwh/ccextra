@@ -68,6 +68,7 @@ pub fn message_delta(
     input_tokens: i64,
     output_tokens: i64,
     cache_read: i64,
+    cache_write: i64,
 ) -> Bytes {
     let mut event = json!({
         "type": "message_delta",
@@ -76,6 +77,9 @@ pub fn message_delta(
     });
     if cache_read > 0 {
         event["usage"]["cache_read_input_tokens"] = json!(cache_read);
+    }
+    if cache_write > 0 {
+        event["usage"]["cache_creation_input_tokens"] = json!(cache_write);
     }
     sse("message_delta", &event)
 }

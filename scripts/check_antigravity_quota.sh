@@ -6,6 +6,7 @@ BASE_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
 AUTH_DIR="${BASE_DIR}/.cache/antigravity"
 API_ENDPOINT="https://cloudcode-pa.googleapis.com"
 DAILY_API_ENDPOINT="https://daily-cloudcode-pa.googleapis.com"
+SANDBOX_DAILY_API_ENDPOINT="https://daily-cloudcode-pa.sandbox.googleapis.com"
 OAUTH_TOKEN_URL="https://oauth2.googleapis.com/token"
 CONSTANTS_RS="${BASE_DIR}/crates/ccextra-server/src/antigravity/constants.rs"
 CLIENT_ID="$(sed -n 's/.*pub const CLIENT_ID: &str = "\([^"]*\)".*/\1/p' "${CONSTANTS_RS}" 2>/dev/null || true)"
@@ -152,7 +153,7 @@ query_quota() {
     fi
 
     local resp=""
-    for endpoint in "$API_ENDPOINT" "$DAILY_API_ENDPOINT"; do
+    for endpoint in "$DAILY_API_ENDPOINT" "$API_ENDPOINT" "$SANDBOX_DAILY_API_ENDPOINT"; do
         resp="$(curl -sS -X POST "${endpoint}/v1internal:fetchAvailableModels" \
             -H "Authorization: Bearer ${token}" \
             -H "Content-Type: application/json" \

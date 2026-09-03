@@ -98,6 +98,7 @@ pub fn relay<S>(
     stream: S,
     estimated_input_tokens: Option<usize>,
     tool_names: Option<Arc<HashMap<String, String>>>,
+    signature_model: Option<Arc<str>>,
 ) -> SseStreamPin
 where
     S: Stream<Item = Result<Bytes, reqwest::Error>> + Send + 'static,
@@ -114,9 +115,12 @@ where
         Protocol::Gemini => {
             gemini::relay_gemini_to_anthropic(stream, estimated_input_tokens, tool_names)
         }
-        Protocol::Antigravity => {
-            gemini::relay_antigravity_to_anthropic(stream, estimated_input_tokens, tool_names)
-        }
+        Protocol::Antigravity => gemini::relay_antigravity_to_anthropic(
+            stream,
+            estimated_input_tokens,
+            tool_names,
+            signature_model.unwrap_or_default(),
+        ),
     };
     with_idle_keepalive(inner)
 }
@@ -143,10 +147,12 @@ pub fn extract_usage_chat(usage: &serde_json::Value) -> (i64, i64, i64) {
     (input, output, cached)
 }
 
-/// 从 OpenAI Responses usage 提取三元组(input, output, cached),cached 已从 input 扣除。
+/// 从 OpenAI Responses usage 提取四元组(input, output, cached, cache_write),
+/// cached 已从 input 扣除。
 ///
-/// 对齐 extractResponsesUsage:input_tokens - cached (if > 0)。
-pub fn extract_usage_responses(usage: &serde_json::Value) -> (i64, i64, i64) {
+/// 对齐 extractResponsesUsage:input_tokens - cached (if > 0);
+/// cache_write 先取 cache_write_tokens,再兜底 cache_creation_tokens(对齐 CPA 893abbab)。
+pub fn extract_usage_responses(usage: &serde_json::Value) -> (i64, i64, i64, i64) {
     let mut input = usage
         .get("input_tokens")
         .and_then(|v| v.as_i64())
@@ -162,7 +168,16 @@ pub fn extract_usage_responses(usage: &serde_json::Value) -> (i64, i64, i64) {
     if cached > 0 {
         input = (input - cached).max(0);
     }
-    (input, output, cached)
+    let cache_write = usage
+        .pointer("/input_tokens_details/cache_write_tokens")
+        .and_then(|v| v.as_i64())
+        .or_else(|| {
+            usage
+                .pointer("/input_tokens_details/cache_creation_tokens")
+                .and_then(|v| v.as_i64())
+        })
+        .unwrap_or(0);
+    (input, output, cached, cache_write)
 }
 
 #[cfg(test)]

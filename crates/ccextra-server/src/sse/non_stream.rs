@@ -196,11 +196,12 @@ pub fn responses_to_anthropic(
         }
     }
 
-    // usage:cached 从 input 扣(对齐 extractResponsesUsage)
-    let (input_tokens, output_tokens, cached) = response
+    // usage:cached 从 input 扣,cache_write 映射为 cache_creation_input_tokens
+    // (对齐 extractResponsesUsage / CPA 893abbab)
+    let (input_tokens, output_tokens, cached, cache_write) = response
         .get("usage")
         .map(super::extract_usage_responses)
-        .unwrap_or((0, 0, 0));
+        .unwrap_or((0, 0, 0, 0));
 
     let stop_reason = map_stop_reason(&codex_stop_reason(response), has_tool_use);
     let stop_seq = stop_sequence(response);
@@ -212,6 +213,7 @@ pub fn responses_to_anthropic(
         input_tokens,
         output_tokens,
         cached,
+        cache_write,
     )
 }
 
@@ -360,10 +362,12 @@ pub fn openai_chat_to_anthropic(body: &Value) -> Option<Value> {
         input_tokens,
         output_tokens,
         cached,
+        0, // chat 路径不透传 cache_write(对齐 CPA:仅 responses 转换映射)
     )
 }
 
 /// 组装 Anthropic messages 非流式响应(基础形状)
+#[allow(clippy::too_many_arguments)]
 fn build_message(
     source: &Value,
     content: Vec<Value>,
@@ -372,6 +376,7 @@ fn build_message(
     input_tokens: i64,
     output_tokens: i64,
     cached: i64,
+    cache_write: i64,
 ) -> Option<Value> {
     let mut out = json!({
         "id": source.get("id").and_then(|v| v.as_str()).unwrap_or(""),
@@ -385,6 +390,9 @@ fn build_message(
     });
     if cached > 0 {
         out["usage"]["cache_read_input_tokens"] = json!(cached);
+    }
+    if cache_write > 0 {
+        out["usage"]["cache_creation_input_tokens"] = json!(cache_write);
     }
     Some(out)
 }
@@ -480,6 +488,38 @@ mod tests {
         assert_eq!(out["stop_reason"], "end_turn");
         assert_eq!(out["usage"]["input_tokens"], 20);
         assert_eq!(out["usage"]["cache_read_input_tokens"], 80);
+    }
+
+    #[test]
+    fn test_responses_nonstream_cache_write_tokens() {
+        // 对齐 CPA 893abbab:cache_write_tokens → cache_creation_input_tokens,0 时不发
+        let body = json!({
+            "type": "response.completed",
+            "response": {
+                "id": "r2",
+                "model": "gpt-5",
+                "output": [{"type": "message",
+                    "content": [{"type": "output_text", "text": "hi"}]}],
+                "usage": {"input_tokens": 100, "output_tokens": 5,
+                    "input_tokens_details": {"cached_tokens": 80, "cache_write_tokens": 150}}
+            }
+        });
+        let out = responses_to_anthropic(&body, None).unwrap();
+        assert_eq!(out["usage"]["cache_creation_input_tokens"], 150);
+
+        let body = json!({
+            "type": "response.completed",
+            "response": {
+                "id": "r3",
+                "model": "gpt-5",
+                "output": [{"type": "message",
+                    "content": [{"type": "output_text", "text": "hi"}]}],
+                "usage": {"input_tokens": 100, "output_tokens": 5,
+                    "input_tokens_details": {"cached_tokens": 80, "cache_write_tokens": 0}}
+            }
+        });
+        let out = responses_to_anthropic(&body, None).unwrap();
+        assert!(out["usage"].get("cache_creation_input_tokens").is_none());
     }
 
     #[test]

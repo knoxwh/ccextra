@@ -253,6 +253,7 @@ impl ChatRelay {
             self.usage_input,
             self.usage_output,
             self.usage_cached,
+            0, // chat 路径不透传 cache_write(对齐 CPA:仅 responses 转换映射)
         ));
         frames.push(emit::message_stop());
 

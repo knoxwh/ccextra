@@ -4,10 +4,23 @@ use serde_json::{json, Value};
 use std::collections::HashMap;
 use std::sync::atomic::{AtomicU64, Ordering};
 
+use super::signature::{format_claude_signature_value, model_group};
 use super::tool_id::claude_tool_id_for;
 
 /// 全局工具使用 ID 计数器
 static TOOL_USE_ID_COUNTER: AtomicU64 = AtomicU64::new(0);
+
+/// 出站 thoughtSignature 归一化。
+///
+/// `signature_model` 为 Some(上游模型名)时走 antigravity 路径,按 CPA
+/// formatClaudeSignatureValue 处理(claude 组解回原生 E 形,其余组原样);
+/// plain gemini 路径 CPA 不做归一化,传 None 原样透传。
+fn outbound_signature(signature_model: Option<&str>, raw: &str) -> String {
+    match signature_model {
+        Some(model) => format_claude_signature_value(model, raw),
+        None => raw.to_string(),
+    }
+}
 
 /// 响应类型状态
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
@@ -64,6 +77,7 @@ pub fn convert_gemini_stream_chunk(
     chunk: &Value,
     state: &mut GeminiStreamState,
     short_to_original: &HashMap<String, String>,
+    signature_model: Option<&str>,
 ) -> Vec<Value> {
     let mut events = Vec::new();
 
@@ -84,6 +98,7 @@ pub fn convert_gemini_stream_chunk(
                 .and_then(|s| s.as_str())
                 .unwrap_or("");
             let has_thought_signature = !thought_signature.is_empty();
+            let signature_value = outbound_signature(signature_model, thought_signature);
 
             // 只有 thoughtSignature 的情况
             if has_thought_signature && text_result.is_none() && function_call_result.is_none() {
@@ -93,7 +108,7 @@ pub fn convert_gemini_stream_chunk(
                         "index": state.response_index,
                         "delta": {
                             "type": "signature_delta",
-                            "signature": thought_signature
+                            "signature": signature_value.as_str()
                         }
                     }));
                     state.has_content = true;
@@ -118,7 +133,7 @@ pub fn convert_gemini_stream_chunk(
                                 "index": state.response_index,
                                 "delta": {
                                     "type": "signature_delta",
-                                    "signature": thought_signature
+                                    "signature": signature_value.as_str()
                                 }
                             }));
                             state.has_content = true;
@@ -176,7 +191,7 @@ pub fn convert_gemini_stream_chunk(
                             "index": state.response_index,
                             "delta": {
                                 "type": "signature_delta",
-                                "signature": thought_signature
+                                "signature": signature_value.as_str()
                             }
                         }));
                     }
@@ -428,6 +443,7 @@ pub fn force_finalize_gemini_stream(state: &mut GeminiStreamState) -> Vec<Value>
 pub fn convert_gemini_response(
     response: &Value,
     short_to_original: &HashMap<String, String>,
+    signature_model: Option<&str>,
 ) -> Value {
     let mut anthropic = json!({
         "id": "",
@@ -479,7 +495,8 @@ pub fn convert_gemini_response(
                             .and_then(|s| s.as_str())
                         {
                             if !sig.is_empty() {
-                                block["signature"] = json!(sig);
+                                block["signature"] =
+                                    json!(outbound_signature(signature_model, sig));
                             }
                         }
                         content_blocks.push(block);
@@ -508,12 +525,27 @@ pub fn convert_gemini_response(
                         name,
                         TOOL_USE_ID_COUNTER.fetch_add(1, Ordering::SeqCst),
                     );
-                    content_blocks.push(json!({
+                    let mut tool_block = json!({
                         "type": "tool_use",
                         "id": tool_id,
                         "name": original_name,
                         "input": args
-                    }));
+                    });
+                    // tool_use 签名只在 antigravity claude 组下发(对齐 CPA isClaudeTarget);
+                    // 非 claude 组 CPA 把该签名挂到前置 thinking 块或独立 carrier 块,
+                    // carrier 机制未移植,故此处不发。
+                    if let Some(model) = signature_model.filter(|m| model_group(m) == "claude") {
+                        let sig = part
+                            .get("thoughtSignature")
+                            .or_else(|| part.get("thought_signature"))
+                            .and_then(|s| s.as_str())
+                            .unwrap_or("");
+                        if !sig.is_empty() {
+                            tool_block["signature"] =
+                                json!(format_claude_signature_value(model, sig));
+                        }
+                    }
+                    content_blocks.push(tool_block);
                 }
             }
             anthropic["content"] = json!(content_blocks);
@@ -585,7 +617,7 @@ mod tests {
         });
 
         let tool_map = HashMap::new();
-        let anthropic = convert_gemini_response(&gemini, &tool_map);
+        let anthropic = convert_gemini_response(&gemini, &tool_map, None);
 
         assert_eq!(anthropic["type"], "message");
         assert_eq!(anthropic["role"], "assistant");
@@ -628,7 +660,7 @@ mod tests {
         let mut tool_map = HashMap::new();
         tool_map.insert("Rd".to_string(), "Read".to_string());
 
-        let anthropic = convert_gemini_response(&gemini, &tool_map);
+        let anthropic = convert_gemini_response(&gemini, &tool_map, None);
 
         let content = anthropic["content"].as_array().unwrap();
         assert_eq!(content.len(), 1);
@@ -655,7 +687,7 @@ mod tests {
                 "thoughtsTokenCount": 30
             }
         });
-        let anthropic = convert_gemini_response(&gemini, &HashMap::new());
+        let anthropic = convert_gemini_response(&gemini, &HashMap::new(), None);
         // output = candidates + thoughts(对齐 CPA)
         assert_eq!(anthropic["usage"]["output_tokens"], 50);
     }
@@ -668,7 +700,7 @@ mod tests {
                 "finishReason": "STOP"
             }]
         });
-        let anthropic = convert_gemini_response(&gemini, &HashMap::new());
+        let anthropic = convert_gemini_response(&gemini, &HashMap::new(), None);
         // 对齐 CPA:无 usageMetadata 时删除 usage
         assert!(anthropic.get("usage").is_none());
         assert!(anthropic.get("stop_sequence").is_some());
@@ -685,7 +717,7 @@ mod tests {
                 "candidatesTokenCount": 2
             }
         });
-        let anthropic = convert_gemini_response(&gemini, &HashMap::new());
+        let anthropic = convert_gemini_response(&gemini, &HashMap::new(), None);
         assert_eq!(anthropic["usage"]["input_tokens"], 4);
         assert_eq!(anthropic["usage"]["output_tokens"], 2);
     }
@@ -697,7 +729,7 @@ mod tests {
                 "content": {"parts": [{"text": "hi"}], "role": "model"}
             }]
         });
-        let anthropic = convert_gemini_response(&gemini, &HashMap::new());
+        let anthropic = convert_gemini_response(&gemini, &HashMap::new(), None);
         assert_eq!(anthropic["stop_reason"], "end_turn");
     }
     #[test]
@@ -711,7 +743,7 @@ mod tests {
                 "finishReason": "STOP"
             }]
         });
-        let anthropic = convert_gemini_response(&gemini, &HashMap::new());
+        let anthropic = convert_gemini_response(&gemini, &HashMap::new(), None);
         assert_eq!(anthropic["content"][0]["input"], json!({}));
     }
 
@@ -764,7 +796,7 @@ mod tests {
 
         let mut state = GeminiStreamState::default();
         let tool_map = HashMap::new();
-        let events = convert_gemini_stream_chunk(&chunk, &mut state, &tool_map);
+        let events = convert_gemini_stream_chunk(&chunk, &mut state, &tool_map, None);
 
         // 新状态机：第一个块会发送 content_block_start + content_block_delta
         assert_eq!(events.len(), 2);
@@ -789,7 +821,7 @@ mod tests {
                 "cachedContentTokenCount": 40
             }
         });
-        let anthropic = convert_gemini_response(&gemini, &HashMap::new());
+        let anthropic = convert_gemini_response(&gemini, &HashMap::new(), None);
         assert_eq!(anthropic["usage"]["input_tokens"], 60);
         assert_eq!(anthropic["usage"]["output_tokens"], 20);
         assert_eq!(anthropic["usage"]["cache_read_input_tokens"], 40);
@@ -809,7 +841,7 @@ mod tests {
                 "cachedContentTokenCount": 40
             }
         });
-        let anthropic = convert_gemini_response(&gemini, &HashMap::new());
+        let anthropic = convert_gemini_response(&gemini, &HashMap::new(), None);
         assert_eq!(anthropic["usage"]["input_tokens"], 0);
         assert_eq!(anthropic["usage"]["cache_read_input_tokens"], 40);
     }
@@ -827,7 +859,7 @@ mod tests {
                 "cachedContentTokenCount": 0
             }
         });
-        let anthropic = convert_gemini_response(&gemini, &HashMap::new());
+        let anthropic = convert_gemini_response(&gemini, &HashMap::new(), None);
         assert_eq!(anthropic["usage"]["input_tokens"], 10);
         assert!(anthropic["usage"].get("cache_read_input_tokens").is_none());
     }
@@ -916,5 +948,92 @@ mod tests {
         assert_eq!(delta["usage"]["input_tokens"], 40);
         assert_eq!(delta["usage"]["output_tokens"], 3);
         assert_eq!(delta["usage"]["cache_read_input_tokens"], 10);
+    }
+
+    #[test]
+    fn test_antigravity_claude_response_emits_native_signatures() {
+        // 对齐 CPA EmitsNativeSignaturesWithoutProviderPrefixes:
+        // claude 组 thinking / tool_use 签名解回原生 E 形,无前缀
+        use crate::convert::signature::fixtures::{
+            claude_native_signature, claude_upstream_signature,
+        };
+        let native1 = claude_native_signature(12, Some(2), "claude-sonnet-4-6", true);
+        let native2 = claude_native_signature(13, Some(2), "claude-opus-4-6", true);
+        let upstream1 = claude_upstream_signature(&native1);
+        let upstream2 = claude_upstream_signature(&native2);
+        let response = json!({
+            "candidates": [{
+                "content": {"parts": [
+                    {"text": "thought content", "thought": true, "thoughtSignature": upstream1},
+                    {"functionCall": {"name": "run_command", "args": {"command": "true"}},
+                     "thoughtSignature": upstream2}
+                ]},
+                "finishReason": "STOP"
+            }],
+            "usageMetadata": {"promptTokenCount": 1, "candidatesTokenCount": 1},
+            "modelVersion": "claude-sonnet-4-6-thinking",
+            "responseId": "resp-claude-native-sigs"
+        });
+
+        let anthropic =
+            convert_gemini_response(&response, &HashMap::new(), Some("claude-sonnet-4-6"));
+        let content = anthropic["content"].as_array().unwrap();
+        assert_eq!(content.len(), 2);
+        assert_eq!(content[0]["type"], "thinking");
+        assert_eq!(content[0]["signature"], native1);
+        assert_eq!(content[1]["type"], "tool_use");
+        assert_eq!(content[1]["name"], "run_command");
+        assert_eq!(content[1]["signature"], native2);
+    }
+
+    #[test]
+    fn test_plain_gemini_response_passes_signature_through() {
+        // plain gemini 路径 CPA 不做归一化:thinking 签名原样,tool_use 不发签名
+        let sig = "gemini-native-opaque";
+        let response = json!({
+            "candidates": [{
+                "content": {"parts": [
+                    {"text": "thought", "thought": true, "thoughtSignature": sig},
+                    {"functionCall": {"name": "run_command", "args": {}}, "thoughtSignature": sig}
+                ]},
+                "finishReason": "STOP"
+            }],
+            "usageMetadata": {"promptTokenCount": 1, "candidatesTokenCount": 1},
+            "modelVersion": "gemini-2.5-pro"
+        });
+
+        let anthropic = convert_gemini_response(&response, &HashMap::new(), None);
+        let content = anthropic["content"].as_array().unwrap();
+        assert_eq!(content[0]["signature"], sig);
+        assert!(content[1].get("signature").is_none());
+    }
+
+    #[test]
+    fn test_antigravity_claude_stream_signature_delta_is_native() {
+        // 流式 signature_delta 同样解回 E 形
+        use crate::convert::signature::fixtures::{
+            claude_native_default, claude_upstream_signature,
+        };
+        let native = claude_native_default();
+        let chunk = json!({
+            "candidates": [{
+                "content": {"parts": [
+                    {"text": "thinking", "thought": true,
+                     "thoughtSignature": claude_upstream_signature(&native)}
+                ]}
+            }]
+        });
+        let mut state = GeminiStreamState::default();
+        let events = convert_gemini_stream_chunk(
+            &chunk,
+            &mut state,
+            &HashMap::new(),
+            Some("claude-sonnet-4-6"),
+        );
+        let delta = events
+            .iter()
+            .find(|e| e["delta"]["type"] == "signature_delta")
+            .expect("signature_delta 应存在");
+        assert_eq!(delta["delta"]["signature"], native);
     }
 }
