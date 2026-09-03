@@ -347,18 +347,31 @@ async fn handle_count_tokens(
         let base_url = provider.base_urls()[0].clone(); // 取首个 URL（count_tokens 无需回退）
         let key = provider.key.clone();
         let proxy_url = provider.proxy_url.clone();
-        let runtime = state.runtime.read().await;
+        let (upstream_client, user_agents) = {
+            let runtime = state.runtime.read().await;
+            (runtime.upstream.clone(), runtime.user_agents.clone())
+        };
         drop(providers); // 释放读锁
 
         let url = format!(
             "{}/v1/messages/count_tokens",
             base_url.trim_end_matches('/')
         );
-        let proxy_key = runtime.upstream.resolve_proxy(proxy_url.as_deref());
-        let client = runtime.upstream.client_for(&proxy_key);
-        let resp = client
+        let proxy_key = upstream_client.resolve_proxy(proxy_url.as_deref());
+        let client = upstream_client.client_for(&proxy_key);
+        let inbound_user_agent = claude_inbound_user_agent(&headers);
+        let extra_headers = claude_relay_headers(&headers);
+        let mut request = client
             .post(&url)
-            .bearer_auth(&key)
+            .header(
+                header::USER_AGENT,
+                inbound_user_agent.unwrap_or(user_agents.claude_cli.as_str()),
+            )
+            .bearer_auth(&key);
+        for (name, value) in &extra_headers {
+            request = request.header(name, value);
+        }
+        let resp = request
             .json(&body_json)
             .send()
             .await
@@ -529,69 +542,54 @@ fn observe_drift_for(
     observe_drift(drift, &identity, structural_hash);
 }
 
-/// 构建 claude 直通的透传/重建头(对齐 applyClaudeHeaders 中转场景)。
-///
-/// anthropic-beta 按 body 内容条件重建,再追加 caller 自带 beta(去重);
-/// anthropic-version / x-app / stainless 系列等身份头仅透传(有就转发,
-/// 没有不补——中转站不校验,官方上游才需要完整强制集)。
-fn claude_relay_headers(headers: &HeaderMap, body: &Value) -> Vec<(String, String)> {
-    // 1. anthropic-beta 重建(基础集 + body 条件 + caller 追加)
-    let mut betas: Vec<String> = vec!["claude-code-20250219".to_string()];
-    let has_thinking = body.get("thinking").map(|t| !t.is_null()).unwrap_or(false);
-    let has_thinking_display = body
-        .get("thinking")
-        .and_then(|t| t.get("display"))
-        .map(|d| !d.is_null())
-        .unwrap_or(false);
-    if has_thinking && !has_thinking_display {
-        betas.push("redact-thinking".to_string());
-    }
-    if body.get("tools").map(|t| !t.is_null()).unwrap_or(false) {
-        betas.push("advanced-tool-use".to_string());
-    }
-    betas.push("effort-2025-11-24".to_string());
-    if body.get("speed").and_then(|s| s.as_str()) == Some("fast") {
-        betas.push("fast-mode".to_string());
-    }
-    // caller 自带 beta 追加(去重)
-    if let Some(v) = headers.get("anthropic-beta").and_then(|v| v.to_str().ok()) {
-        for b in v.split(',').map(|s| s.trim()).filter(|s| !s.is_empty()) {
-            if !betas.iter().any(|x| x == b) {
-                betas.push(b.to_string());
-            }
+/// 构建 Claude 中转请求头:保留入站头,排除认证、代理重建及连接管理头。
+fn claude_relay_headers(headers: &HeaderMap) -> HeaderMap {
+    let connection_header_names: Vec<String> = headers
+        .get_all(header::CONNECTION)
+        .iter()
+        .filter_map(|value| value.to_str().ok())
+        .flat_map(|value| value.split(','))
+        .map(str::trim)
+        .filter(|name| !name.is_empty())
+        .map(str::to_ascii_lowercase)
+        .collect();
+    let mut relay_headers = HeaderMap::new();
+    for (name, value) in headers.iter() {
+        if !is_claude_relay_header_excluded(name.as_str(), &connection_header_names) {
+            relay_headers.append(name.clone(), value.clone());
         }
     }
+    relay_headers
+}
 
-    let mut out: Vec<(String, String)> = vec![("anthropic-beta".into(), betas.join(","))];
+fn is_claude_relay_header_excluded(name: &str, connection_header_names: &[String]) -> bool {
+    let name = name.to_ascii_lowercase();
+    connection_header_names.iter().any(|item| item == &name)
+        || matches!(
+            name.as_str(),
+            "authorization"
+                | "x-api-key"
+                | "user-agent"
+                | "host"
+                | "content-length"
+                | "connection"
+                | "keep-alive"
+                | "proxy-connection"
+                | "proxy-authenticate"
+                | "proxy-authorization"
+                | "te"
+                | "trailer"
+                | "transfer-encoding"
+                | "upgrade"
+                | "http2-settings"
+        )
+}
 
-    // 2. 身份头透传(仅入站存在时)
-    const PASSTHROUGH: &[&str] = &[
-        "anthropic-version",
-        "x-app",
-        "x-claude-code-session-id",
-        "x-claude-code-agent-id",
-        "x-claude-code-parent-agent-id",
-        "x-claude-remote-container-id",
-        "x-claude-remote-session-id",
-        "x-client-app",
-        "x-anthropic-additional-protection",
-        "anthropic-dangerous-direct-browser-access",
-        "x-stainless-lang",
-        "x-stainless-package-version",
-        "x-stainless-runtime",
-        "x-stainless-runtime-version",
-        "x-stainless-os",
-        "x-stainless-arch",
-        "x-stainless-timeout",
-        "x-stainless-retry-count",
-    ];
-    for name in PASSTHROUGH {
-        if let Some(v) = headers.get(*name).and_then(|v| v.to_str().ok()) {
-            out.push(((*name).to_string(), v.to_string()));
-        }
-    }
-
-    out
+fn claude_inbound_user_agent(headers: &HeaderMap) -> Option<&str> {
+    headers
+        .get(header::USER_AGENT)
+        .and_then(|value| value.to_str().ok())
+        .filter(|value| !value.is_empty())
 }
 
 async fn handle_messages(
@@ -988,11 +986,15 @@ async fn handle_messages(
         }
     }
 
-    // claude 直通:透传/重建上游头(对齐 applyClaudeHeaders 中转场景)
-    let extra_headers = if matches!(route.protocol, Protocol::Claude) {
-        claude_relay_headers(&headers, &body_json)
+    let inbound_user_agent = if matches!(route.protocol, Protocol::Claude) {
+        claude_inbound_user_agent(&headers)
     } else {
-        Vec::new()
+        None
+    };
+    let extra_headers = if matches!(route.protocol, Protocol::Claude) {
+        claude_relay_headers(&headers)
+    } else {
+        HeaderMap::new()
     };
 
     // responses 协议:session-id/thread-id 头(对齐 Codex 官方客户端)
@@ -1074,6 +1076,7 @@ async fn handle_messages(
                         thread_id.as_deref(),
                         &extra_headers,
                         &user_agents,
+                        inbound_user_agent,
                     )
                     .await
                 {
@@ -1198,6 +1201,7 @@ async fn handle_messages(
                             thread_id.as_deref(),
                             &extra_headers,
                             &user_agents,
+                            inbound_user_agent,
                         )
                         .await?,
                 );
@@ -1253,6 +1257,7 @@ async fn handle_messages(
                     thread_id.as_deref(),
                     &extra_headers,
                     &user_agents,
+                    inbound_user_agent,
                 )
                 .await?;
             final_status = retry.status;
@@ -1750,6 +1755,13 @@ mod tests {
         h
     }
 
+    fn relay_has_header_value(headers: &HeaderMap, name: &str, expected: &str) -> bool {
+        headers
+            .get_all(name)
+            .iter()
+            .any(|value| value.to_str().ok() == Some(expected))
+    }
+
     #[test]
     fn test_should_inject_prompt_cache_key_matrix() {
         // chat+grok 假
@@ -1846,65 +1858,112 @@ mod tests {
     }
 
     #[test]
-    fn test_claude_relay_beta_rebuild_with_thinking_and_tools() {
-        // thinking(无 display)→ redact-thinking;tools → advanced-tool-use
-        let headers = headers_with(&[("anthropic-beta", "interleaved-thinking-2025-05-14")]);
-        let body = json!({
-            "thinking": {"type": "enabled", "budget_tokens": 4096},
-            "tools": [{"name": "t"}]
-        });
-        let out = claude_relay_headers(&headers, &body);
-        let beta = out.iter().find(|(k, _)| k == "anthropic-beta").unwrap();
-        let parts: Vec<&str> = beta.1.split(',').collect();
-        assert_eq!(parts[0], "claude-code-20250219");
-        assert!(parts.contains(&"redact-thinking"));
-        assert!(parts.contains(&"advanced-tool-use"));
-        assert!(parts.contains(&"effort-2025-11-24"));
-        // caller beta 追加
-        assert!(parts.contains(&"interleaved-thinking-2025-05-14"));
+    fn test_claude_relay_preserves_inbound_beta_verbatim() {
+        let headers = headers_with(&[("anthropic-beta", "custom-beta,custom-beta")]);
+        let out = claude_relay_headers(&headers);
+        assert!(relay_has_header_value(
+            &out,
+            "anthropic-beta",
+            "custom-beta,custom-beta"
+        ));
     }
 
     #[test]
+    fn test_claude_relay_forwards_custom_headers_and_filters_transport_headers() {
+        let headers = headers_with(&[
+            ("x-custom-header", "custom-value"),
+            ("authorization", "Bearer inbound"),
+            ("x-api-key", "inbound-key"),
+            ("user-agent", "claude-code/inbound"),
+            ("connection", "keep-alive, x-remove-me"),
+            ("x-remove-me", "remove-me"),
+        ]);
+        let out = claude_relay_headers(&headers);
+        assert!(relay_has_header_value(
+            &out,
+            "x-custom-header",
+            "custom-value"
+        ));
+        assert!(!out.contains_key("authorization"));
+        assert!(!out.contains_key("x-api-key"));
+        assert!(!out.contains_key("user-agent"));
+        assert!(!out.contains_key("connection"));
+        assert!(!out.contains_key("x-remove-me"));
+    }
+
+    #[test]
+    fn test_claude_relay_forwards_all_non_transport_headers() {
+        let headers = headers_with(&[
+            ("x-custom-header", "custom-value"),
+            ("anthropic-beta", "beta-a,beta-a"),
+            ("x-api-key", "inbound-key"),
+            ("authorization", "Bearer inbound"),
+            ("host", "inbound.example"),
+            ("content-length", "99"),
+            ("connection", "keep-alive"),
+            ("transfer-encoding", "chunked"),
+            ("user-agent", "claude-code/inbound"),
+        ]);
+        let out = claude_relay_headers(&headers);
+        assert!(relay_has_header_value(
+            &out,
+            "x-custom-header",
+            "custom-value"
+        ));
+        assert!(relay_has_header_value(
+            &out,
+            "anthropic-beta",
+            "beta-a,beta-a"
+        ));
+        for excluded in [
+            "x-api-key",
+            "authorization",
+            "host",
+            "content-length",
+            "connection",
+            "transfer-encoding",
+            "user-agent",
+        ] {
+            assert!(!out.contains_key(excluded), "{excluded}");
+        }
+    }
+    #[test]
     fn test_claude_relay_beta_no_redact_when_display_present() {
-        // thinking.display 存在 → 不加 redact-thinking(与直通头重建一致)
-        let headers = HeaderMap::new();
-        let body = json!({"thinking": {"type": "enabled", "display": "summarized"}});
-        let out = claude_relay_headers(&headers, &body);
-        let beta = &out.iter().find(|(k, _)| k == "anthropic-beta").unwrap().1;
-        assert!(!beta.contains("redact-thinking"));
+        let headers = headers_with(&[("anthropic-beta", "caller-beta")]);
+        let out = claude_relay_headers(&headers);
+        assert!(relay_has_header_value(
+            &out,
+            "anthropic-beta",
+            "caller-beta"
+        ));
     }
 
     #[test]
     fn test_claude_relay_beta_fast_mode() {
         let headers = HeaderMap::new();
-        let body = json!({"speed": "fast"});
-        let out = claude_relay_headers(&headers, &body);
-        let beta = &out.iter().find(|(k, _)| k == "anthropic-beta").unwrap().1;
-        assert!(beta.contains("fast-mode"));
+        let out = claude_relay_headers(&headers);
+        assert!(!out.contains_key("anthropic-beta"));
     }
 
     #[test]
     fn test_claude_relay_identity_headers_passthrough_only() {
-        // 入站有 → 透传;没有 → 不补
         let headers = headers_with(&[
             ("anthropic-version", "2023-06-01"),
             ("x-app", "cli"),
             ("x-stainless-os", "macOS"),
         ]);
-        let body = json!({});
-        let out = claude_relay_headers(&headers, &body);
-        assert!(out
-            .iter()
-            .any(|(k, v)| k == "anthropic-version" && v == "2023-06-01"));
-        assert!(out.iter().any(|(k, v)| k == "x-app" && v == "cli"));
-        assert!(out
-            .iter()
-            .any(|(k, v)| k == "x-stainless-os" && v == "macOS"));
-        // 未提供的头不出现
-        assert!(!out.iter().any(|(k, _)| k == "x-stainless-arch"));
+        let out = claude_relay_headers(&headers);
+        assert!(relay_has_header_value(
+            &out,
+            "anthropic-version",
+            "2023-06-01"
+        ));
+        assert!(relay_has_header_value(&out, "x-app", "cli"));
+        assert!(relay_has_header_value(&out, "x-stainless-os", "macOS"));
+        assert!(!out.contains_key("x-stainless-arch"));
 
-        let out2 = claude_relay_headers(&HeaderMap::new(), &body);
-        assert!(!out2.iter().any(|(k, _)| k == "anthropic-version"));
+        let out2 = claude_relay_headers(&HeaderMap::new());
+        assert!(out2.is_empty());
     }
 
     fn mock_state() -> AppState {
@@ -3069,6 +3128,20 @@ models:
                     .map(str::to_string)
             })
         }
+        fn header_values(&self, name: &str) -> Vec<String> {
+            self.headers
+                .lock()
+                .unwrap()
+                .as_ref()
+                .map(|headers| {
+                    headers
+                        .get_all(name)
+                        .iter()
+                        .filter_map(|value| value.to_str().ok().map(str::to_string))
+                        .collect()
+                })
+                .unwrap_or_default()
+        }
         fn has_header(&self, name: &str) -> bool {
             self.headers
                 .lock()
@@ -3080,6 +3153,138 @@ models:
         fn body(&self) -> Value {
             self.body.lock().unwrap().clone().unwrap_or(json!({}))
         }
+    }
+
+    #[tokio::test]
+    async fn test_claude_relay_forwards_headers_and_overrides_auth() {
+        let captured = CapturedUpstream::default();
+        let handler_cap = captured.clone();
+        let upstream = Router::new().route(
+            "/v1/messages",
+            post(move |headers: HeaderMap, body: Bytes| {
+                let captured = handler_cap.clone();
+                async move {
+                    captured.record(headers, body);
+                    (
+                        StatusCode::OK,
+                        [(header::CONTENT_TYPE, "application/json")],
+                        "{}",
+                    )
+                }
+            }),
+        );
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let upstream_addr = listener.local_addr().unwrap();
+        let server = tokio::spawn(async move {
+            axum::serve(listener, upstream).await.unwrap();
+        });
+
+        let state = mock_state();
+        state.providers.write().await[0].set_base_url_for_test(format!("http://{upstream_addr}"));
+        let app = app(state);
+        let request = Request::builder()
+            .uri("/v1/messages")
+            .method("POST")
+            .header("content-type", "application/json")
+            .header("x-custom-header", "custom-value")
+            .header("anthropic-beta", "beta-a")
+            .header("anthropic-beta", "beta-b")
+            .header("x-api-key", "inbound-key")
+            .header("authorization", "Bearer inbound")
+            .header("user-agent", "claude-code/inbound")
+            .header("connection", "x-remove-me")
+            .header("x-remove-me", "remove-me")
+            .body(Body::from(
+                json!({
+                    "model": "test-opus",
+                    "max_tokens": 64,
+                    "stream": false,
+                    "messages": [{"role": "user", "content": "hi"}]
+                })
+                .to_string(),
+            ))
+            .unwrap();
+        let response = app.oneshot(request).await.unwrap();
+        server.abort();
+
+        assert_eq!(response.status(), StatusCode::OK);
+        assert_eq!(
+            captured.header("authorization").as_deref(),
+            Some("Bearer sk-test")
+        );
+        assert_eq!(
+            captured.header("x-custom-header").as_deref(),
+            Some("custom-value")
+        );
+        assert_eq!(
+            captured.header_values("anthropic-beta"),
+            vec!["beta-a", "beta-b"]
+        );
+        assert_eq!(
+            captured.header_values("user-agent"),
+            vec!["claude-code/inbound"]
+        );
+        assert!(!captured.has_header("x-api-key"));
+        assert!(!captured.has_header("x-remove-me"));
+        assert_eq!(captured.body()["model"], "claude-opus-5");
+    }
+
+    #[tokio::test]
+    async fn test_count_tokens_relay_uses_fallback_user_agent() {
+        let captured = CapturedUpstream::default();
+        let handler_cap = captured.clone();
+        let upstream = Router::new().route(
+            "/v1/messages/count_tokens",
+            post(move |headers: HeaderMap, body: Bytes| {
+                let captured = handler_cap.clone();
+                async move {
+                    captured.record(headers, body);
+                    (
+                        StatusCode::OK,
+                        [(header::CONTENT_TYPE, "application/json")],
+                        r#"{"input_tokens":123}"#,
+                    )
+                }
+            }),
+        );
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let upstream_addr = listener.local_addr().unwrap();
+        let server = tokio::spawn(async move {
+            axum::serve(listener, upstream).await.unwrap();
+        });
+
+        let state = mock_state();
+        state.providers.write().await[0].set_base_url_for_test(format!("http://{upstream_addr}"));
+        let app = app(state);
+        let request = Request::builder()
+            .uri("/v1/messages/count_tokens")
+            .method("POST")
+            .header("content-type", "application/json")
+            .header("x-custom-header", "custom-value")
+            .header("anthropic-beta", "beta-a")
+            .header("x-api-key", "inbound-key")
+            .body(Body::from(
+                json!({"model": "test-opus", "messages": []}).to_string(),
+            ))
+            .unwrap();
+        let response = app.oneshot(request).await.unwrap();
+        let status = response.status();
+        let body = to_bytes(response.into_body(), 1024).await.unwrap();
+        server.abort();
+
+        assert_eq!(status, StatusCode::OK);
+        assert_eq!(body, r#"{"input_tokens":123}"#);
+        assert_eq!(
+            captured.header("authorization").as_deref(),
+            Some("Bearer sk-test")
+        );
+        assert_eq!(
+            captured.header("x-custom-header").as_deref(),
+            Some("custom-value")
+        );
+        assert_eq!(captured.header("anthropic-beta").as_deref(), Some("beta-a"));
+        assert_eq!(captured.header_values("user-agent"), vec![TEST_CLAUDE_CLI]);
+        assert!(!captured.has_header("x-api-key"));
     }
 
     #[tokio::test]

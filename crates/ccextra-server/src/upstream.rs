@@ -118,7 +118,15 @@ fn user_agent(
     protocol: Protocol,
     upstream_model: &str,
     user_agents: &crate::http::UserAgentSet,
+    inbound_user_agent: Option<&str>,
 ) -> String {
+    if matches!(protocol, Protocol::Claude) {
+        if let Some(value) = inbound_user_agent.filter(|value| !value.is_empty()) {
+            return value.to_string();
+        }
+        return user_agents.claude_cli.to_string();
+    }
+
     match protocol {
         // Antigravity 上游按 UA 识别客户端,非 antigravity UA 直接 404
         Protocol::Antigravity => user_agents.antigravity.to_string(),
@@ -210,9 +218,8 @@ impl UpstreamClient {
     /// - `session_id`:responses 链路发 `session-id` 头(对齐 cacheHelper,
     ///   值为 prompt_cache_key,上游按它做缓存亲和);grok 模型(chat/responses)
     ///   发 `x-grok-conv-id` 会话路由头(xAI 服务器缓存亲和)
-    /// - `extra_headers`:claude 直通的透传/重建头(对齐 applyClaudeHeaders
-    ///   的中转场景:anthropic-beta 按 body 条件重建 + caller beta 追加,
-    ///   anthropic-version / x-app / stainless 系列透传)
+    /// - `extra_headers`:Claude 入站头;已排除入站认证、User-Agent、传输与连接管理头
+    /// - `inbound_user_agent`:Claude 协议优先使用入站值,缺失时回退配置值
     #[allow(clippy::too_many_arguments)]
     pub async fn request(
         &self,
@@ -224,8 +231,9 @@ impl UpstreamClient {
         is_stream: bool,
         session_id: Option<&str>,
         thread_id: Option<&str>,
-        extra_headers: &[(String, String)],
+        extra_headers: &axum::http::HeaderMap,
         user_agents: &crate::http::UserAgentSet,
+        inbound_user_agent: Option<&str>,
     ) -> anyhow::Result<UpstreamResponse> {
         let proxy_key = self.resolve_proxy(provider_proxy);
         let client = self.client_for(&proxy_key);
@@ -245,7 +253,7 @@ impl UpstreamClient {
         // generativelanguage 不收 Bearer);其余 Bearer
         let mut req = client.post(&url).header(
             reqwest::header::USER_AGENT,
-            user_agent(protocol, upstream_model, user_agents),
+            user_agent(protocol, upstream_model, user_agents, inbound_user_agent),
         );
         if matches!(protocol, Protocol::Gemini) {
             req = req.header("x-goog-api-key", api_key);
@@ -288,7 +296,7 @@ impl UpstreamClient {
         }
 
         for (name, value) in extra_headers {
-            req = req.header(name.as_str(), value.as_str());
+            req = req.header(name, value);
         }
         let resp = req.json(body).send().await?;
 
@@ -329,6 +337,34 @@ mod tests {
     }
 
     #[test]
+    fn test_claude_user_agent_prefers_inbound_value() {
+        use std::sync::Arc;
+        let uas = crate::http::UserAgentSet {
+            claude_cli: Arc::new("configured-agent".to_string()),
+            codex_tui: Arc::new("codex".to_string()),
+            grok_version: Arc::new("1.0.5".to_string()),
+            antigravity: Arc::new("antigravity".to_string()),
+        };
+        assert_eq!(
+            user_agent(
+                Protocol::Claude,
+                "claude-opus-5",
+                &uas,
+                Some("inbound-agent")
+            ),
+            "inbound-agent"
+        );
+        assert_eq!(
+            user_agent(Protocol::Claude, "claude-opus-5", &uas, Some("")),
+            "configured-agent"
+        );
+        assert_eq!(
+            user_agent(Protocol::Claude, "claude-opus-5", &uas, None),
+            "configured-agent"
+        );
+    }
+
+    #[test]
     fn test_user_agent_per_protocol() {
         use std::sync::Arc;
         let uas = crate::http::UserAgentSet {
@@ -344,32 +380,39 @@ mod tests {
         const CODEX_TUI: &str =
             "codex-tui/0.149.1 (Mac OS 26.6.2; arm64) ghostty/1.3.1 (codex-tui; 0.149.1)";
         assert_eq!(
-            user_agent(Protocol::OpenAiChat, "gpt-5.6-terra", &uas),
+            user_agent(Protocol::OpenAiChat, "gpt-5.6-terra", &uas, None),
             CLAUDE_CLI
         );
         assert_eq!(
-            user_agent(Protocol::OpenAiResponses, "gpt-5.6-terra", &uas),
+            user_agent(Protocol::OpenAiResponses, "gpt-5.6-terra", &uas, None),
             CODEX_TUI
         );
         assert_eq!(
-            user_agent(Protocol::OpenAiResponses, "GPT-5.6-sol", &uas),
+            user_agent(Protocol::OpenAiResponses, "GPT-5.6-sol", &uas, None),
             CODEX_TUI
         );
         assert_eq!(
-            user_agent(Protocol::OpenAiResponses, "openai/gpt-5.6", &uas),
+            user_agent(Protocol::OpenAiResponses, "openai/gpt-5.6", &uas, None),
             CODEX_TUI
         );
-        let grok_ua = user_agent(Protocol::OpenAiResponses, "grok-4.6", &uas);
+        let grok_ua = user_agent(Protocol::OpenAiResponses, "grok-4.6", &uas, None);
         assert!(grok_ua.starts_with("grok-shell/1.0.5 ("));
-        assert_eq!(user_agent(Protocol::OpenAiChat, "grok-4.6", &uas), grok_ua);
-        assert_eq!(user_agent(Protocol::OpenAiChat, "Grok-4.6", &uas), grok_ua);
-        // chat+gpt 仍 claude-cli(回归,已有 gpt-5.6-terra 断言;再锁大小写)
-        assert_eq!(user_agent(Protocol::OpenAiChat, "GPT-4", &uas), CLAUDE_CLI);
-        // UA 格式: grok-shell/{version} ({os}; {arch}),platform 运行时取真实值
+        assert_eq!(
+            user_agent(Protocol::OpenAiChat, "grok-4.6", &uas, None),
+            grok_ua
+        );
+        assert_eq!(
+            user_agent(Protocol::OpenAiChat, "Grok-4.6", &uas, None),
+            grok_ua
+        );
+        assert_eq!(
+            user_agent(Protocol::OpenAiChat, "GPT-4", &uas, None),
+            CLAUDE_CLI
+        );
         assert!(grok_ua.contains(std::env::consts::OS));
         assert!(grok_ua.contains(std::env::consts::ARCH));
         assert_eq!(
-            user_agent(Protocol::Claude, "claude-opus-5", &uas),
+            user_agent(Protocol::Claude, "claude-opus-5", &uas, None),
             CLAUDE_CLI
         );
         assert!(is_gpt_model("gpt-5.6-terra"));

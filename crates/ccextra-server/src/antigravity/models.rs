@@ -12,8 +12,10 @@ pub async fn fetch_models(
     access_token: &str,
     project_id: Option<&str>,
     proxy_url: Option<&str>,
+    user_agent: Option<&str>,
 ) -> Result<Vec<ModelConfig>> {
     let client = oauth::http_client(proxy_url)?;
+    let ua = user_agent.unwrap_or(super::constants::REQUEST_UA);
 
     // 尝试生产和 daily 端点
     let base_urls = [API_ENDPOINT, DAILY_API_ENDPOINT];
@@ -32,7 +34,7 @@ pub async fn fetch_models(
             .post(&url)
             .header("Content-Type", "application/json")
             .header("Authorization", format!("Bearer {}", access_token))
-            .header("User-Agent", super::constants::REQUEST_UA)
+            .header("User-Agent", ua)
             .json(&body)
             .send()
             .await;

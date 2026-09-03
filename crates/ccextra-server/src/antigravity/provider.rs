@@ -64,7 +64,8 @@ pub async fn load_antigravity_providers(
             Some(cred.project_id.as_str())
         };
 
-        let models = match models::fetch_models(&cred.access_token, project_id_ref, proxy_url).await
+        let models = match models::fetch_models(&cred.access_token, project_id_ref, proxy_url, None)
+            .await
         {
             Ok(m) => {
                 tracing::info!("为 {} 获取了 {} 个模型", cred.email, m.len());
