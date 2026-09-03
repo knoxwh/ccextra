@@ -186,8 +186,10 @@ impl UpstreamClient {
         let mut builder = Client::builder()
             // 限制单个 host 最大空闲连接数，防毒化池
             .pool_max_idle_per_host(4)
-            // 连接驻留 90s 空闲淘汰(对齐 grok/codex 默认池策略)
-            .pool_idle_timeout(std::time::Duration::from_secs(90))
+            // 连接驻留 300s 空闲淘汰(对齐 codex 300s stream idle 精神)。
+            // Claude Code 两轮间隔(思考+工具执行)常超 90s,90s 淘汰会每轮
+            // 重付 TCP+TLS 握手,实测多 ~1.7s 首字延迟。
+            .pool_idle_timeout(std::time::Duration::from_secs(300))
             // 建连超时 10s，防 DNS/TLS 握手卡死
             .connect_timeout(std::time::Duration::from_secs(10))
             // TCP 层探活,防死连接滞留/中间设备静默断
@@ -372,31 +374,27 @@ mod tests {
         use std::sync::Arc;
         let uas = crate::http::UserAgentSet {
             claude_cli: Arc::new("claude-cli/2.1.246".to_string()),
-            codex_tui: Arc::new(
-                "codex-tui/0.149.1 (Mac OS 26.6.2; arm64) ghostty/1.3.1 (codex-tui; 0.149.1)"
-                    .to_string(),
-            ),
+            codex_tui: Arc::new("codex_cli_rs/0.149.1 (Mac OS 26.6.2; arm64)".to_string()),
             grok_version: Arc::new("1.0.5".to_string()),
             antigravity: Arc::new("antigravity/hub/2.10.0 darwin/arm64".to_string()),
         };
         const CLAUDE_CLI: &str = "claude-cli/2.1.246";
-        const CODEX_TUI: &str =
-            "codex-tui/0.149.1 (Mac OS 26.6.2; arm64) ghostty/1.3.1 (codex-tui; 0.149.1)";
+        const CODEX_CLI: &str = "codex_cli_rs/0.149.1 (Mac OS 26.6.2; arm64)";
         assert_eq!(
             user_agent(Protocol::OpenAiChat, "gpt-5.6-terra", &uas, None),
             CLAUDE_CLI
         );
         assert_eq!(
             user_agent(Protocol::OpenAiResponses, "gpt-5.6-terra", &uas, None),
-            CODEX_TUI
+            CODEX_CLI
         );
         assert_eq!(
             user_agent(Protocol::OpenAiResponses, "GPT-5.6-sol", &uas, None),
-            CODEX_TUI
+            CODEX_CLI
         );
         assert_eq!(
             user_agent(Protocol::OpenAiResponses, "openai/gpt-5.6", &uas, None),
-            CODEX_TUI
+            CODEX_CLI
         );
         let grok_ua = user_agent(Protocol::OpenAiResponses, "grok-4.6", &uas, None);
         assert!(grok_ua.starts_with("grok-shell/1.0.5 ("));

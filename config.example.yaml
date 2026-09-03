@@ -9,7 +9,7 @@ server:
 # User-Agent 自定义(可选)。以下为默认值。
 user_agents:
   claude_cli: "claude-cli/2.1.246"
-  codex_tui: "codex-tui/0.149.1 (Mac OS 26.6.2; arm64) ghostty/1.3.1 (codex-tui; 0.149.1)"
+  codex_tui: "codex_cli_rs/0.149.1 (Mac OS 26.6.2; arm64)"
   grok_version: "1.0.5"
   antigravity: "antigravity/hub/2.10.0 darwin/arm64"
 

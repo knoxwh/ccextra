@@ -495,8 +495,7 @@ fn cmd_xai_status(config_path: &str, auth_dir: Option<String>) -> Result<()> {
 /// 构建 UserAgentSet(从配置或使用默认值)
 fn build_user_agents(config: Option<&config::UserAgents>) -> UserAgentSet {
     const DEFAULT_CLAUDE_CLI: &str = "claude-cli/2.1.246";
-    const DEFAULT_CODEX_TUI: &str =
-        "codex-tui/0.149.1 (Mac OS 26.6.2; arm64) ghostty/1.3.1 (codex-tui; 0.149.1)";
+    const DEFAULT_CODEX_TUI: &str = "codex_cli_rs/0.149.1 (Mac OS 26.6.2; arm64)";
     const DEFAULT_GROK_VERSION: &str = "1.0.5";
     const DEFAULT_ANTIGRAVITY: &str = "antigravity/hub/2.10.0 darwin/arm64";
 
