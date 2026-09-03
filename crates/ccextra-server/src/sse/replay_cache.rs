@@ -65,7 +65,8 @@ impl StreamReplayExtractor {
             match event_type {
                 // 上游真实事件名带 response. 前缀(见 sse/responses.rs 的
                 // event_type 判别,data.type 同为全名)
-                Some("response.reasoning_text.delta") => {
+                Some("response.reasoning_text.delta")
+                | Some("response.reasoning_summary_text.delta") => {
                     self.collect_reasoning_delta(&value);
                 }
                 Some("response.output_item.done") => {
@@ -549,6 +550,30 @@ mod tests {
         let input = body["input"].as_array().unwrap();
         let reasoning = input.iter().find(|i| i["type"] == "reasoning").unwrap();
         assert_eq!(reasoning["summary"][0]["text"], "fallback text");
+    }
+
+    #[test]
+    fn test_reasoning_summary_text_delta_accumulated() {
+        let cache = ReplayCache::new(Duration::from_secs(60), 128);
+        let key = "sess-summary-delta".to_string();
+        let mut extractor = StreamReplayExtractor::new(cache.clone(), key.clone(), String::new());
+
+        // 测试 response.reasoning_summary_text.delta 累积
+        extractor.push(
+            b"event: response.reasoning_summary_text.delta\ndata: {\"output_index\":0,\"delta\":\"summary \"}\n\n",
+        );
+        extractor.push(
+            b"event: response.reasoning_summary_text.delta\ndata: {\"output_index\":0,\"delta\":\"part\"}\n\n",
+        );
+        extractor.push(b"event: response.output_item.done\ndata: {\"output_index\":0,\"item\":{\"type\":\"reasoning\",\"encrypted_content\":\"gAAA\"}}\n\n");
+        let completed = b"event: response.completed\ndata: {\"type\":\"response.completed\",\"response\":{\"id\":\"r5\"}}\n\n";
+        extractor.push(completed);
+
+        let mut body = json!({"input": []});
+        assert!(cache.apply_to_body(&key, &mut body, false));
+        let input = body["input"].as_array().unwrap();
+        let reasoning = input.iter().find(|i| i["type"] == "reasoning").unwrap();
+        assert_eq!(reasoning["summary"][0]["text"], "summary part");
     }
 
     #[test]

@@ -267,6 +267,9 @@ impl UpstreamClient {
         if matches!(protocol, Protocol::OpenAiResponses) {
             if let Some(sid) = session_id {
                 req = req.header("session-id", sid);
+                if is_gpt_model(upstream_model) {
+                    req = req.header("X-Codex-Window-Id", format!("{sid}:0"));
+                }
             }
             if let Some(tid) = thread_id {
                 req = req.header("thread-id", tid);

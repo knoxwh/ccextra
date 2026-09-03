@@ -291,7 +291,14 @@ reasoning replay 对齐 CPA 的 xAI/codex/antigravity reasoning replay 实现:
 
 chat UA 从 `claude-cli` 换成 `grok-shell`，网关按 UA 分流时旧前缀 miss 一轮，即对齐目的。Token-Auth 对 grok 一律带（官方仅 cli chat proxy URL 注入；ccextra responses 已一律带，chat 跟同一策略）。doom-loop 官方挂 `create_response_stream`；ccextra responses+grok 非流也发，维持现状。responses 双键：开关开时 `prompt_cache_key` 与 conv-id 都是 Claude session，官方「body key 覆盖 conv-id 路由」无意义；payload 已有**不同** key 时可能分流，12.4 已锁不硬剥。第三方兼容上游若拒未知头，与现 responses+grok 同一暴露面。
 
-## 13. 依赖升级记录
+## 13. GPT / Responses 协议调优记录 (2026-09-03)
+
+对齐 CPA 与官方 Codex CLI，消除 GPT 上游体感缺陷：
+1. **取消 GPT/Codex 工具输出强制截断**：原有 10KB `truncate_middle_chars` 截断切碎 Claude Code `Read`/`Grep` 输出导致模型陷入死循环；对齐 CPA 移除对 GPT 工具输出截断（仅 Grok 保留 40KB 限制）。
+2. **Replay Cache 捕获流式推理摘要**：`StreamReplayExtractor` 补齐 `response.reasoning_summary_text.delta` 监听，确保 GPT responses 推理摘要完整沉淀至服务端缓存。
+3. **补充会话亲和头**：GPT 出站请求注入 `X-Codex-Window-Id: <session_id>:0` 与 `Originator: codex_cli_rs`。
+
+## 14. 依赖升级记录
 
 ### 13.1 reqwest 0.12 → 0.13 (2026-08-31)
 

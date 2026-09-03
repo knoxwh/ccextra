@@ -819,24 +819,22 @@ async fn handle_messages(
     let outbound_model =
         resolve_outbound_model(&mut body_json, &route.upstream_model, route.protocol);
 
-    // tool_result 截断(仅 Responses 协议):策略按上游客户端分流,用 payload
-    // 覆盖后的 outbound_model 判定——规则可把 gpt-* 改成 grok-*(或反向),
-    // 截断策略须跟实际出站模型:
-    // - grok 模型 → grok-build 客户端策略(40KB 预算,2KB 预览 + footer)
-    // - 其余(GPT 等)→ codex 客户端策略(10KB bytes 中间截断)
-    if normalize_enabled && matches!(route.protocol, Protocol::OpenAiResponses) {
-        let strategy = if is_grok_model(&outbound_model) {
-            ccextra_core::normalize::UpstreamTruncation::GrokBuild
-        } else {
-            ccextra_core::normalize::UpstreamTruncation::Codex
-        };
+    // tool_result 截断(仅 Grok Responses 协议保留 grok-build 策略;
+    // GPT/Codex 上游对齐 CPA 不做截断,避免破坏代码读取导致死循环)
+    if normalize_enabled
+        && matches!(route.protocol, Protocol::OpenAiResponses)
+        && is_grok_model(&outbound_model)
+    {
         if let Err(e) = ccextra_core::cache_stabilization::truncate_tool_results::truncate(
             &mut body_json,
-            strategy,
+            ccextra_core::normalize::UpstreamTruncation::GrokBuild,
         ) {
             tracing::warn!("tool_result truncation failed: {}", e);
         }
-        // drift 必须看到最终截断后的 Responses body,避免大工具输出参与前缀哈希。
+    }
+
+    if normalize_enabled && matches!(route.protocol, Protocol::OpenAiResponses) {
+        // drift 必须看到最终 Responses body,避免大工具输出参与前缀哈希。
         observe_drift_for(
             &state.drift,
             &headers,
