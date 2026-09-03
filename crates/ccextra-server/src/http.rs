@@ -638,6 +638,13 @@ async fn handle_messages(
     let route = resolve_route(&model, &providers)?;
     let payload_rules = state.payload_rules.read().await;
 
+    // 检测跨轮工具调用死循环并注入 grok-build 恢复提醒(仅针对 grok 模型)
+    if is_grok_model(&route.upstream_model)
+        && ccextra_core::doom_loop::inject_loop_recovery_reminder_if_needed(&mut body_json)
+    {
+        tracing::warn!(model = %model, upstream = %route.upstream_model, "检测到 Grok 工具调用循环，已注入 RECOVERY_REMINDER");
+    }
+
     // 3. 归一化第一遍(按协议:claude 直通全量 / openai 转换前精简)
     // 对齐:claude 直通走 /v1/messages(全量),openai 走转换前
     // 精简子集(跳过 tool-def sort / volatile / cache_control / drift——
@@ -2387,6 +2394,161 @@ models:
         assert_eq!(attempts.load(Ordering::SeqCst), 2);
         assert!(saw_encrypted.load(Ordering::SeqCst));
         assert!(saw_trimmed.load(Ordering::SeqCst));
+    }
+
+    #[tokio::test]
+    async fn test_openai_responses_retries_on_422_invalid_encrypted_content() {
+        const VALID: &str = "gAAAAAAAAAAAAQIDBAUGBwgJCgsMDQ4PEBESExQVFhcYGRobHB0eHyAhIiMkJSYnKCkqKywtLi8wMTIzNDU2Nzg5Ojs8PT4_QA";
+        let attempts = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+        let handler_attempts = Arc::clone(&attempts);
+        let upstream = Router::new().route(
+            "/responses",
+            post(move || {
+                let attempts = Arc::clone(&handler_attempts);
+                async move {
+                    if attempts.fetch_add(1, Ordering::SeqCst) == 0 {
+                        (
+                            StatusCode::UNPROCESSABLE_ENTITY,
+                            [(header::CONTENT_TYPE, "application/json")],
+                            r#"{"error":{"code":"invalid_encrypted_content","message":"could not decrypt"}}"#,
+                        )
+                    } else {
+                        (
+                            StatusCode::OK,
+                            [(header::CONTENT_TYPE, "application/json")],
+                            r#"{"type":"response.completed","response":{"id":"resp_422_ok","model":"gpt-5","output":[],"usage":{"input_tokens":1,"output_tokens":1}}}"#,
+                        )
+                    }
+                }
+            }),
+        );
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let upstream_addr = listener.local_addr().unwrap();
+        let server = tokio::spawn(async move { axum::serve(listener, upstream).await.unwrap() });
+
+        let state = mock_state();
+        let provider: ProviderConfig = serde_yaml::from_str(&format!(
+            "name: test-422-retry\nprotocol: openai_responses\nbase_url: http://{}\nkey: sk-test\nproxy_url: direct\nmodels:\n  - name: gpt-5\n    alias: test-422-retry\n",
+            upstream_addr
+        ))
+        .unwrap();
+        state.providers.write().await.push(provider);
+        let app = app(state);
+        let request = Request::builder()
+            .uri("/v1/messages")
+            .method("POST")
+            .header("content-type", "application/json")
+            .body(Body::from(
+                serde_json::to_vec(&json!({
+                    "model": "test-422-retry", "max_tokens": 64, "stream": false,
+                    "messages": [
+                        {"role": "assistant", "content": [{"type": "thinking", "thinking": "t", "signature": VALID}]},
+                        {"role": "user", "content": "hi"}
+                    ]
+                }))
+                .unwrap(),
+            ))
+            .unwrap();
+        let response = app.oneshot(request).await.unwrap();
+        server.abort();
+
+        assert_eq!(response.status(), StatusCode::OK);
+        assert_eq!(attempts.load(Ordering::SeqCst), 2);
+    }
+
+    #[tokio::test]
+    async fn test_grok_model_triggers_loop_recovery_reminder_non_grok_skips() {
+        let captured = Arc::new(StdMutex::new(None));
+        let handler_captured = Arc::clone(&captured);
+        let upstream = Router::new().route(
+            "/responses",
+            post(move |body: axum::body::Bytes| {
+                let captured = Arc::clone(&handler_captured);
+                async move {
+                    *captured.lock().unwrap() = Some(serde_json::from_slice::<Value>(&body).unwrap());
+                    (
+                        StatusCode::OK,
+                        [(header::CONTENT_TYPE, "application/json")],
+                        r#"{"type":"response.completed","response":{"id":"resp_loop_test","model":"grok-4","output":[],"usage":{"input_tokens":1,"output_tokens":1}}}"#,
+                    )
+                }
+            }),
+        );
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let upstream_addr = listener.local_addr().unwrap();
+        let server = tokio::spawn(async move { axum::serve(listener, upstream).await.unwrap() });
+
+        let state = mock_state();
+        let provider: ProviderConfig = serde_yaml::from_str(&format!(
+            "name: test-grok-provider\nprotocol: openai_responses\nbase_url: http://{}\nkey: sk-test\nproxy_url: direct\nmodels:\n  - name: grok-4\n    alias: my-grok\n  - name: gpt-5\n    alias: my-gpt\n",
+            upstream_addr
+        ))
+        .unwrap();
+        state.providers.write().await.push(provider);
+        let app = app(state);
+
+        let repeating_messages = json!([
+            {
+                "role": "assistant",
+                "content": [{"type": "tool_use", "id": "call_1", "name": "Read", "input": {"path": "a"}}]
+            },
+            {
+                "role": "user",
+                "content": [{"type": "tool_result", "tool_use_id": "call_1", "content": ""}]
+            },
+            {
+                "role": "assistant",
+                "content": [{"type": "tool_use", "id": "call_2", "name": "Read", "input": {"path": "a"}}]
+            },
+            {
+                "role": "user",
+                "content": [{"type": "tool_result", "tool_use_id": "call_2", "content": ""}]
+            }
+        ]);
+
+        // 1. 请求 grok 模型 -> 触发注入 RECOVERY_REMINDER
+        let request = Request::builder()
+            .uri("/v1/messages")
+            .method("POST")
+            .header("content-type", "application/json")
+            .body(Body::from(
+                serde_json::to_vec(&json!({
+                    "model": "my-grok",
+                    "max_tokens": 64,
+                    "stream": false,
+                    "messages": repeating_messages
+                }))
+                .unwrap(),
+            ))
+            .unwrap();
+        let response = app.clone().oneshot(request).await.unwrap();
+        assert_eq!(response.status(), StatusCode::OK);
+        let body = captured.lock().unwrap().take().unwrap();
+        let body_str = body.to_string();
+        assert!(body_str.contains("Your messages have been flagged as looping"));
+
+        // 2. 请求 gpt 模型 -> 不应触发注入
+        let request = Request::builder()
+            .uri("/v1/messages")
+            .method("POST")
+            .header("content-type", "application/json")
+            .body(Body::from(
+                serde_json::to_vec(&json!({
+                    "model": "my-gpt",
+                    "max_tokens": 64,
+                    "stream": false,
+                    "messages": repeating_messages
+                }))
+                .unwrap(),
+            ))
+            .unwrap();
+        let response = app.oneshot(request).await.unwrap();
+        assert_eq!(response.status(), StatusCode::OK);
+        let body = captured.lock().unwrap().take().unwrap();
+        let body_str = body.to_string();
+        assert!(!body_str.contains("Your messages have been flagged as looping"));
+
+        server.abort();
     }
 
     #[tokio::test]
