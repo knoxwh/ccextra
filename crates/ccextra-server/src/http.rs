@@ -1239,7 +1239,7 @@ async fn handle_messages(
         let mut final_bytes = err_bytes;
         let mut retried_ok = false;
 
-        if status.as_u16() == 400
+        if (status.as_u16() == 400 || status.as_u16() == 422)
             && matches!(route.protocol, Protocol::OpenAiResponses)
             && is_thinking_signature_invalid(&final_bytes)
             && trim_encrypted_reasoning_items(&mut body_json)
