@@ -4,6 +4,29 @@
 
 pub const RECOVERY_REMINDER: &str = "<system_reminder>Your messages have been flagged as looping. Your response has been flagged as repeating the same text pattern. Avoid excessive repetition. If you are having trouble ask the user for guidance.</system_reminder>";
 
+// grok-build 官方双阶梯阈值常数(对齐 grok-build turn.rs L3491-3495)
+pub const NUDGE_AFTER_IDENTICAL_PROBLEMATIC_TOOL_CALLS: u32 = 4;
+pub const NUDGE_AFTER_IDENTICAL_TOOL_CALLS: u32 = 8;
+pub const MAX_CONSECUTIVE_IDENTICAL_PROBLEMATIC_TOOL_CALLS: u32 = 8;
+pub const MAX_CONSECUTIVE_IDENTICAL_TOOL_CALLS: u32 = 12;
+
+/// 工具是否属于高危死循环类型(对齐 grok-build is_problematically_repeating_kind: Read / Plan)
+pub fn is_problematically_repeating_tool(tool_name: &str) -> bool {
+    let lower = tool_name.to_ascii_lowercase();
+    lower.contains("read") || lower.contains("plan") || lower.contains("todo")
+}
+
+/// 动作停滞判定结果(对齐 grok-build IdenticalToolCallRun)
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum StationarityVerdict {
+    /// 正常，无重复
+    None,
+    /// 软提醒阶段(注入 RECOVERY_REMINDER)
+    Nudge { run_len: u32, tool_name: String },
+    /// 硬熔断阶段(立即中止 turn，防止无限循环)
+    HardStop { run_len: u32, tool_name: String },
+}
+
 /// 触发器类型
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum DoomLoopSignalKind {
@@ -147,47 +170,84 @@ fn extract_assistant_tool_calls(msg: &serde_json::Value) -> Vec<(&str, &serde_js
     calls
 }
 
-/// 检测最近的 assistant 消息是否存在连续重复的工具调用（跨轮 dead loop），
-/// 若重复则在尾部 user 消息中注入官方 grok-build RECOVERY_REMINDER。
-/// 返回是否注入了提醒。
-pub fn inject_loop_recovery_reminder_if_needed(body: &mut serde_json::Value) -> bool {
-    let Some(messages) = body.get_mut("messages").and_then(|m| m.as_array_mut()) else {
-        return false;
+/// 检查连续相同工具调用运行长度与判定
+pub fn check_action_stationarity(body: &serde_json::Value) -> StationarityVerdict {
+    let Some(messages) = body.get("messages").and_then(|m| m.as_array()) else {
+        return StationarityVerdict::None;
     };
     if messages.len() < 3 {
-        return false;
+        return StationarityVerdict::None;
     }
 
-    // 检查倒数第二条消息是否为 assistant（最后一条应是 user，带 tool_result 或新输入）
     let last_user_idx = messages.len() - 1;
     if messages[last_user_idx].get("role").and_then(|r| r.as_str()) != Some("user") {
-        return false;
+        return StationarityVerdict::None;
     }
 
-    // 从后往前收集最近几个 assistant 消息的工具调用签名
-    let mut assistant_signatures: Vec<String> = Vec::new();
+    // 从后往前统计连续相同工具调用的 assistant 次数
+    let mut target_signature: Option<String> = None;
+    let mut tool_name = String::new();
+    let mut run_len: u32 = 0;
+
     for msg in messages.iter().rev() {
         if msg.get("role").and_then(|r| r.as_str()) == Some("assistant") {
             let calls = extract_assistant_tool_calls(msg);
-            if !calls.is_empty() {
-                assistant_signatures.push(tool_step_signature(&calls));
-            } else {
+            if calls.is_empty() {
                 break;
             }
-            if assistant_signatures.len() >= 2 {
-                break;
+            let sig = tool_step_signature(&calls);
+            if let Some(target) = &target_signature {
+                if *target == sig {
+                    run_len += 1;
+                } else {
+                    break;
+                }
+            } else {
+                tool_name = calls[0].0.to_string();
+                target_signature = Some(sig);
+                run_len = 1;
             }
         }
     }
 
-    if assistant_signatures.len() < 2 {
+    if run_len < 2 {
+        return StationarityVerdict::None;
+    }
+
+    let is_problematic = is_problematically_repeating_tool(&tool_name);
+    let hard_stop_threshold = if is_problematic {
+        MAX_CONSECUTIVE_IDENTICAL_PROBLEMATIC_TOOL_CALLS
+    } else {
+        MAX_CONSECUTIVE_IDENTICAL_TOOL_CALLS
+    };
+    let nudge_threshold = if is_problematic {
+        NUDGE_AFTER_IDENTICAL_PROBLEMATIC_TOOL_CALLS
+    } else {
+        NUDGE_AFTER_IDENTICAL_TOOL_CALLS
+    };
+
+    if run_len >= hard_stop_threshold {
+        StationarityVerdict::HardStop { run_len, tool_name }
+    } else if run_len >= nudge_threshold {
+        StationarityVerdict::Nudge { run_len, tool_name }
+    } else {
+        StationarityVerdict::None
+    }
+}
+
+/// 检测最近的 assistant 消息是否存在连续重复的工具调用（跨轮 dead loop），
+/// 若重复则在尾部 user 消息中注入官方 grok-build RECOVERY_REMINDER。
+/// 返回是否注入了提醒。
+pub fn inject_loop_recovery_reminder_if_needed(body: &mut serde_json::Value) -> bool {
+    let verdict = check_action_stationarity(body);
+    if matches!(verdict, StationarityVerdict::None) {
         return false;
     }
 
-    // 若最近两个 assistant 轮次的工具调用签名完全一致，判定为陷入循环
-    if assistant_signatures[0] != assistant_signatures[1] {
+    let Some(messages) = body.get_mut("messages").and_then(|m| m.as_array_mut()) else {
         return false;
-    }
+    };
+    let last_user_idx = messages.len() - 1;
 
     // 检查最新 user 消息中是否已经注入过该 RECOVERY_REMINDER，避免重复堆叠
     let last_user_msg = &mut messages[last_user_idx];
@@ -367,13 +427,29 @@ mod tests {
                 {
                     "role": "user",
                     "content": [{"type": "tool_result", "tool_use_id": "call_2", "content": ""}]
+                },
+                {
+                    "role": "assistant",
+                    "content": [{"type": "tool_use", "id": "call_3", "name": "Read", "input": {"file_path": "/tmp/test"}}]
+                },
+                {
+                    "role": "user",
+                    "content": [{"type": "tool_result", "tool_use_id": "call_3", "content": ""}]
+                },
+                {
+                    "role": "assistant",
+                    "content": [{"type": "tool_use", "id": "call_4", "name": "Read", "input": {"file_path": "/tmp/test"}}]
+                },
+                {
+                    "role": "user",
+                    "content": [{"type": "tool_result", "tool_use_id": "call_4", "content": ""}]
                 }
             ]
         });
 
         assert!(inject_loop_recovery_reminder_if_needed(&mut body));
         let msgs = body["messages"].as_array().unwrap();
-        let last_user_content = &msgs[3]["content"];
+        let last_user_content = &msgs[7]["content"];
         assert_eq!(last_user_content[1]["type"], "text");
         assert!(last_user_content[1]["text"]
             .as_str()
@@ -382,5 +458,57 @@ mod tests {
 
         // 再次检测不应重复注入
         assert!(!inject_loop_recovery_reminder_if_needed(&mut body));
+    }
+
+    #[test]
+    fn test_check_action_stationarity_verdicts() {
+        let make_messages = |tool: &str, count: usize| {
+            let mut msgs = Vec::new();
+            for i in 0..count {
+                msgs.push(serde_json::json!({
+                    "role": "assistant",
+                    "content": [{"type": "tool_use", "id": format!("call_{i}"), "name": tool, "input": {"path": "same"}}]
+                }));
+                msgs.push(serde_json::json!({
+                    "role": "user",
+                    "content": [{"type": "tool_result", "tool_use_id": format!("call_{i}"), "content": ""}]
+                }));
+            }
+            serde_json::json!({"messages": msgs})
+        };
+
+        // 1 次重复 -> None
+        let body1 = make_messages("Read", 1);
+        assert_eq!(check_action_stationarity(&body1), StationarityVerdict::None);
+
+        // 2 次 Read (未达到 Nudge 阈值 4) -> None
+        let body2 = make_messages("Read", 2);
+        assert_eq!(check_action_stationarity(&body2), StationarityVerdict::None);
+
+        // 4 次 Read (达到 NUDGE_AFTER_IDENTICAL_PROBLEMATIC_TOOL_CALLS) -> Nudge
+        let body4 = make_messages("Read", 4);
+        assert!(matches!(
+            check_action_stationarity(&body4),
+            StationarityVerdict::Nudge { run_len: 4, .. }
+        ));
+
+        // 8 次 Read (达到 MAX_CONSECUTIVE_IDENTICAL_PROBLEMATIC_TOOL_CALLS) -> HardStop
+        let body8 = make_messages("Read", 8);
+        assert!(matches!(
+            check_action_stationarity(&body8),
+            StationarityVerdict::HardStop { run_len: 8, .. }
+        ));
+
+        // 通用工具 (如 Bash)，8 次仍为 Nudge，12 次才 HardStop
+        let bash8 = make_messages("Bash", 8);
+        assert!(matches!(
+            check_action_stationarity(&bash8),
+            StationarityVerdict::Nudge { run_len: 8, .. }
+        ));
+        let bash12 = make_messages("Bash", 12);
+        assert!(matches!(
+            check_action_stationarity(&bash12),
+            StationarityVerdict::HardStop { run_len: 12, .. }
+        ));
     }
 }

@@ -638,11 +638,76 @@ async fn handle_messages(
     let route = resolve_route(&model, &providers)?;
     let payload_rules = state.payload_rules.read().await;
 
-    // 检测跨轮工具调用死循环并注入 grok-build 恢复提醒(仅针对 grok 模型)
-    if is_grok_model(&route.upstream_model)
-        && ccextra_core::doom_loop::inject_loop_recovery_reminder_if_needed(&mut body_json)
-    {
-        tracing::warn!(model = %model, upstream = %route.upstream_model, "检测到 Grok 工具调用循环，已注入 RECOVERY_REMINDER");
+    // 检测跨轮工具调用死循环并对齐 grok-build 双阶梯处理(仅针对 grok 模型)
+    if is_grok_model(&route.upstream_model) {
+        match ccextra_core::doom_loop::check_action_stationarity(&body_json) {
+            ccextra_core::doom_loop::StationarityVerdict::HardStop { run_len, tool_name } => {
+                tracing::warn!(
+                    model = %model,
+                    upstream = %route.upstream_model,
+                    tool_name = %tool_name,
+                    run_len,
+                    "action stationarity: 达到硬停机阈值，直接熔断结束回合"
+                );
+                let is_stream = body_json
+                    .get("stream")
+                    .and_then(|v| v.as_bool())
+                    .unwrap_or(false);
+                if is_stream {
+                    let text = format!(
+                        "Loop detected: tool `{tool_name}` repeated with identical arguments {run_len} times. Halting turn."
+                    );
+                    let frames = vec![
+                        crate::sse::emit::message_start(
+                            "msg_stationarity_stop",
+                            &model,
+                            0,
+                            0,
+                            true,
+                        ),
+                        crate::sse::emit::content_block_start_text(0),
+                        crate::sse::emit::content_block_delta_text(0, &text),
+                        crate::sse::emit::content_block_stop(0),
+                        crate::sse::emit::message_delta("end_turn", None, 0, 0, 0, 0),
+                        crate::sse::emit::message_stop(),
+                    ];
+                    let stream =
+                        futures::stream::iter(frames.into_iter().map(Ok::<_, std::io::Error>));
+                    return Response::builder()
+                        .status(StatusCode::OK)
+                        .header(header::CONTENT_TYPE, "text/event-stream")
+                        .header(header::CACHE_CONTROL, "no-cache")
+                        .body(Body::from_stream(stream))
+                        .map_err(|e| AppError::new(anyhow::anyhow!("构造熔断流响应失败: {e}")));
+                } else {
+                    let text = format!(
+                        "Loop detected: tool `{tool_name}` repeated with identical arguments {run_len} times. Halting turn."
+                    );
+                    let resp = json!({
+                        "id": "msg_stationarity_stop",
+                        "type": "message",
+                        "role": "assistant",
+                        "model": model,
+                        "content": [{"type": "text", "text": text}],
+                        "stop_reason": "end_turn",
+                        "stop_sequence": null,
+                        "usage": {"input_tokens": 0, "output_tokens": 0}
+                    });
+                    return Response::builder()
+                        .status(StatusCode::OK)
+                        .header(header::CONTENT_TYPE, "application/json")
+                        .body(Body::from(serde_json::to_vec(&resp).unwrap()))
+                        .map_err(|e| AppError::new(anyhow::anyhow!("构造熔断响应失败: {e}")));
+                }
+            }
+            ccextra_core::doom_loop::StationarityVerdict::Nudge { .. } => {
+                if ccextra_core::doom_loop::inject_loop_recovery_reminder_if_needed(&mut body_json)
+                {
+                    tracing::warn!(model = %model, upstream = %route.upstream_model, "检测到 Grok 工具调用循环，已注入 RECOVERY_REMINDER");
+                }
+            }
+            ccextra_core::doom_loop::StationarityVerdict::None => {}
+        }
     }
 
     // 3. 归一化第一遍(按协议:claude 直通全量 / openai 转换前精简)
@@ -2503,6 +2568,22 @@ models:
             {
                 "role": "user",
                 "content": [{"type": "tool_result", "tool_use_id": "call_2", "content": ""}]
+            },
+            {
+                "role": "assistant",
+                "content": [{"type": "tool_use", "id": "call_3", "name": "Read", "input": {"path": "a"}}]
+            },
+            {
+                "role": "user",
+                "content": [{"type": "tool_result", "tool_use_id": "call_3", "content": ""}]
+            },
+            {
+                "role": "assistant",
+                "content": [{"type": "tool_use", "id": "call_4", "name": "Read", "input": {"path": "a"}}]
+            },
+            {
+                "role": "user",
+                "content": [{"type": "tool_result", "tool_use_id": "call_4", "content": ""}]
             }
         ]);
 
@@ -2542,11 +2623,47 @@ models:
                 .unwrap(),
             ))
             .unwrap();
-        let response = app.oneshot(request).await.unwrap();
+        let response = app.clone().oneshot(request).await.unwrap();
         assert_eq!(response.status(), StatusCode::OK);
         let body = captured.lock().unwrap().take().unwrap();
         let body_str = body.to_string();
         assert!(!body_str.contains("Your messages have been flagged as looping"));
+
+        // 3. 请求 grok 模型且达到 HardStop 阈值 (8次相同 Read) -> 直接熔断结束回合
+        let mut hard_stop_messages = Vec::new();
+        for i in 0..8 {
+            hard_stop_messages.push(json!({
+                "role": "assistant",
+                "content": [{"type": "tool_use", "id": format!("c_{i}"), "name": "Read", "input": {"file": "a"}}]
+            }));
+            hard_stop_messages.push(json!({
+                "role": "user",
+                "content": [{"type": "tool_result", "tool_use_id": format!("c_{i}"), "content": ""}]
+            }));
+        }
+        let request = Request::builder()
+            .uri("/v1/messages")
+            .method("POST")
+            .header("content-type", "application/json")
+            .body(Body::from(
+                serde_json::to_vec(&json!({
+                    "model": "my-grok",
+                    "max_tokens": 64,
+                    "stream": false,
+                    "messages": hard_stop_messages
+                }))
+                .unwrap(),
+            ))
+            .unwrap();
+        let response = app.oneshot(request).await.unwrap();
+        assert_eq!(response.status(), StatusCode::OK);
+        let resp_bytes = to_bytes(response.into_body(), 1024 * 1024).await.unwrap();
+        let resp_json: Value = serde_json::from_slice(&resp_bytes).unwrap();
+        assert_eq!(resp_json["stop_reason"], "end_turn");
+        assert!(resp_json["content"][0]["text"]
+            .as_str()
+            .unwrap()
+            .contains("Halting turn"));
 
         server.abort();
     }
