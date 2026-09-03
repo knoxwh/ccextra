@@ -73,6 +73,10 @@
       "reasoning_levels": ["low", "medium", "high", "xhigh", "max"]
     },
     {
+      "id": "claude-fable-5-1",
+      "reasoning_levels": ["low", "medium", "high", "xhigh", "max"]
+    },
+    {
       "id": "grok-4.6",
       "reasoning_levels": ["low", "medium", "high", "xhigh"]
     },

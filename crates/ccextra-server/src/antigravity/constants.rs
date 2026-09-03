@@ -19,6 +19,7 @@ pub const USERINFO_ENDPOINT: &str = "https://www.googleapis.com/oauth2/v2/userin
 
 pub const API_ENDPOINT: &str = "https://cloudcode-pa.googleapis.com";
 pub const DAILY_API_ENDPOINT: &str = "https://daily-cloudcode-pa.googleapis.com";
+pub const SANDBOX_DAILY_API_ENDPOINT: &str = "https://daily-cloudcode-pa.sandbox.googleapis.com";
 pub const API_VERSION: &str = "v1internal";
 
 /// 写死 hub 回退版本,不拉 updater manifest

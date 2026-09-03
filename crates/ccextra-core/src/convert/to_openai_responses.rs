@@ -19,12 +19,14 @@
 
 use std::collections::{HashMap, HashSet};
 
-use base64::engine::general_purpose::{URL_SAFE, URL_SAFE_NO_PAD};
-use base64::Engine;
 use serde_json::{json, Value};
 
 use super::gemini_schema::inline_local_refs;
 use super::shorten::{build_short_name_map, shorten_name_if_needed};
+use super::signature::{
+    compatible_signature_for_provider_block, is_valid_gpt_reasoning_signature,
+    is_valid_grok_encrypted_content, SignatureBlockKind, SignatureProvider,
+};
 use super::Result;
 
 /// GPT 上游追加的行为适配块(字节固定,缓存前缀稳定)。
@@ -104,81 +106,28 @@ fn needs_adapter_block(upstream_model: &str) -> bool {
     is_gpt_upstream(upstream_model) || is_grok_upstream(upstream_model)
 }
 
-/// 轻量签名提供方(对齐 CPA DetectSignatureProvider 的首字节预过滤,
-/// 不做 Fernet/CAIS/protobuf 完整校验)。Grok 无信封,Detect 永不返回 grok。
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-enum SignatureProvider {
-    Unknown,
-    Claude,
-    Gemini,
-    Gpt,
-}
-
-/// 按首字节区分 GPT/Claude/Gemini(对齐 CPA selfDescribingSignatureFirstChars = "CERg")。
-/// 'g' ← GPT Fernet 0x80;'C'/'R' ← Claude CAIS/双层;'E' ← Gemini/Claude 单层(轻量归 Gemini)。
-fn detect_signature_provider(raw: &str) -> SignatureProvider {
-    let sig = raw.trim();
-    if sig.is_empty() {
-        return SignatureProvider::Unknown;
-    }
-    match sig.as_bytes()[0] {
-        b'g' => SignatureProvider::Gpt,
-        b'C' | b'R' => SignatureProvider::Claude,
-        b'E' => SignatureProvider::Gemini,
-        _ => SignatureProvider::Unknown,
-    }
-}
-
-/// 目标不匹配则不可回放(对齐 DecideSignatureCompatibility)。
-/// GPT 目标只留 GPT 信封;grok 目标验证 encrypted_content 形状,拒绝外来信封。
-/// Claude/Gemini 目标检查 provider 匹配。
-pub fn signature_compatible_for_target(signature: &str, upstream_model: &str) -> bool {
-    let sig = signature.trim();
-    if sig.is_empty() {
-        return false;
-    }
-    let model_lower = upstream_model.to_ascii_lowercase();
-
-    // Grok 无自描述信封,按形状验证:拒绝外来 provider 信封,要求高熵 opaque blob
-    if model_lower.contains("grok") {
-        return is_valid_grok_encrypted_content(sig);
-    }
-
-    let detected = detect_signature_provider(sig);
-
-    // GPT 目标只接受 GPT Fernet 信封
-    if model_lower.starts_with("gpt")
-        || model_lower.starts_with("o1")
-        || model_lower.starts_with("o3")
-    {
-        return detected == SignatureProvider::Gpt;
-    }
-
-    // Claude 目标只接受 Claude 签名
-    if model_lower.contains("claude") {
-        return detected == SignatureProvider::Claude;
-    }
-
-    // Gemini 目标接受 Gemini/GeminiBypass 签名
-    if model_lower.contains("gemini") {
-        return detected == SignatureProvider::Gemini;
-    }
-
-    // 未知目标 → 不兼容
-    false
-}
-
 /// thinking signature → 可回放给目标上游的 reasoning.encrypted_content
+/// (对齐 CPA codex_claude_request.appendReasoningContent):
+/// GPT 目标走兼容性解析(剥 provider 前缀 + Fernet 形状校验);
+/// grok 目标无信封,按来源确认后做形状校验;其余一律丢弃。
 fn gpt_compatible_signature(signature: Option<&str>, upstream_model: &str) -> Option<String> {
-    let sig = signature.unwrap_or("").trim();
-    if sig.is_empty() {
+    let raw = signature.unwrap_or("").trim();
+    if let Some(normalized) = compatible_signature_for_provider_block(
+        SignatureProvider::Gpt,
+        raw,
+        SignatureBlockKind::Unknown,
+    ) {
+        return Some(normalized);
+    }
+    // 空签名:CPA 仅在 preserveEmptyThinkingBlocks 时保留空 encrypted_content,
+    // 该开关未移植,ccextra 一律丢弃无签名 thinking
+    if raw.is_empty() {
         return None;
     }
-    if signature_compatible_for_target(sig, upstream_model) {
-        Some(sig.to_string())
-    } else {
-        None
+    if is_grok_upstream(upstream_model) && is_valid_grok_encrypted_content(raw) {
+        return Some(raw.to_string());
     }
+    None
 }
 
 /// 移除 reasoning 项的孤儿 id(encrypted_content 已无且 store 非 true 时)
@@ -228,124 +177,6 @@ pub fn sanitize_gpt_reasoning_items(body: &mut Value) -> bool {
     }
     *input = kept;
     changed
-}
-
-/// 仅校验 GPT Fernet 信封外层形状，不验证可解密性。
-/// Fernet token 结构: version(1) + timestamp(8) + IV(16) + ciphertext(>=16,16 字节对齐) + HMAC(32)
-pub fn is_valid_gpt_reasoning_signature(signature: &str) -> bool {
-    // 最小长度 = 1 + 8 + 16 + 16 + 32 = 73 字节(含最短 ciphertext)
-    const MIN_DECODED_LEN: usize = 1 + 8 + 16 + 16 + 32;
-    const MAX_LEN: usize = 32 * 1024 * 1024;
-    if signature != signature.trim()
-        || signature.len() > MAX_LEN
-        || !signature.starts_with("gAAAA")
-        || !signature
-            .bytes()
-            .all(|byte| byte.is_ascii_alphanumeric() || matches!(byte, b'-' | b'_' | b'='))
-    {
-        return false;
-    }
-    let decoded = URL_SAFE_NO_PAD
-        .decode(signature)
-        .or_else(|_| URL_SAFE.decode(signature));
-    let Ok(decoded) = decoded else {
-        return false;
-    };
-    if decoded.len() < MIN_DECODED_LEN || decoded[0] != 0x80 {
-        return false;
-    }
-    let ciphertext_len = decoded.len() - 1 - 8 - 16 - 32;
-    ciphertext_len > 0 && ciphertext_len % 16 == 0
-}
-
-/// 校验 Grok encrypted_content 传输形状(对齐 CPA InspectGrokEncryptedContent)。
-/// 不验证可解密性。Grok 无信封,必须按来源确认后再调用此函数做安全检查。
-///
-/// 验证项:
-/// - unpadded standard base64(拒绝 '=')
-/// - 拒绝带 provider 前缀(claude#/gemini#/gpt#)
-/// - 拒绝外来信封(GPT gAAAA、Claude C/R、Gemini E、Kimi 固定长度)
-/// - 解码后 ≥32 字节
-/// - 字节熵比 ≥0.85(真密文高熵均匀分布)
-fn is_valid_grok_encrypted_content(signature: &str) -> bool {
-    const MAX_LEN: usize = 8 * 1024 * 1024;
-    const MIN_DECODED_LEN: usize = 32;
-    const MIN_ENTROPY_RATIO: f64 = 0.85;
-    // Kimi 两个观测固定长度(与 Grok 连续分布无交集)
-    const KIMI_LENGTHS: [usize; 2] = [344, 600];
-
-    if signature != signature.trim() || signature.len() > MAX_LEN {
-        return false;
-    }
-    // unpadded standard base64
-    if signature.contains('=') {
-        return false;
-    }
-    if !signature
-        .bytes()
-        .all(|b| b.is_ascii_alphanumeric() || b == b'+' || b == b'/')
-    {
-        return false;
-    }
-    // 拒绝 provider 前缀
-    if signature.contains('#') {
-        return false;
-    }
-    // 拒绝自描述信封(对齐 CPA maybeSelfDescribingSignatureEnvelope)
-    if let Some(first) = signature.as_bytes().first() {
-        if matches!(first, b'C' | b'E' | b'R' | b'g') {
-            // GPT Fernet
-            if signature.starts_with("gAAAA") {
-                return false;
-            }
-            // Claude/Gemini 留给 detect_signature_provider 细分,这里统一拒绝
-            let detected = detect_signature_provider(signature);
-            if matches!(
-                detected,
-                SignatureProvider::Claude | SignatureProvider::Gemini | SignatureProvider::Gpt
-            ) {
-                return false;
-            }
-        }
-    }
-
-    let Ok(decoded) = base64::engine::general_purpose::STANDARD_NO_PAD.decode(signature) else {
-        return false;
-    };
-    if decoded.len() < MIN_DECODED_LEN {
-        return false;
-    }
-    // Kimi 固定长度拒绝
-    if KIMI_LENGTHS.contains(&decoded.len()) {
-        return false;
-    }
-    // 熵检验
-    byte_entropy_ratio(&decoded) >= MIN_ENTROPY_RATIO
-}
-
-/// 计算字节熵比(对齐 CPA byteEntropyRatio)
-fn byte_entropy_ratio(buf: &[u8]) -> f64 {
-    if buf.is_empty() {
-        return 0.0;
-    }
-    let mut counts = [0usize; 256];
-    for &b in buf {
-        counts[b as usize] += 1;
-    }
-    let n = buf.len() as f64;
-    let mut entropy = 0.0;
-    for &count in &counts {
-        if count == 0 {
-            continue;
-        }
-        let p = count as f64 / n;
-        entropy -= p * p.log2();
-    }
-    let max_symbols = buf.len().min(256);
-    if max_symbols <= 1 {
-        return 0.0;
-    }
-    entropy / (max_symbols as f64).log2()
 }
 
 /// 上游 400 `invalid_encrypted_content` / thinking signature invalid 时,
@@ -1148,6 +979,7 @@ fn shorten_call_id(id: &str) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use base64::Engine;
     use serde_json::json;
 
     #[test]
@@ -1696,13 +1528,13 @@ mod tests {
 
     #[test]
     fn test_thinking_signature_gpt_compat_kept_else_dropped() {
-        // 仅验证转换层首字节过滤:gAAAA 前缀 → reasoning;'C' 开头 → 丢弃。
-        // gAAAA-claude-looking 不是完整 Fernet，HTTP 请求前 sanitizer 会剥除。
+        // 严格 Fernet 校验:gAAAA + 合法密文长度 → reasoning;其余首字节 → 丢弃
+        const VALID: &str = "gAAAAAAAAAAAAQIDBAUGBwgJCgsMDQ4PEBESExQVFhcYGRobHB0eHyAhIiMkJSYnKCkqKywtLi8wMTIzNDU2Nzg5Ojs8PT4_QA";
         let mut body = json!({
             "model": "test",
             "messages": [
                 {"role": "assistant", "content": [
-                    {"type": "thinking", "thinking": "t1", "signature": "gAAAA-claude-looking"},
+                    {"type": "thinking", "thinking": "t1", "signature": VALID},
                     {"type": "thinking", "thinking": "t2", "signature": "C4x2 weird"},
                     {"type": "text", "text": "answer"}
                 ]}
@@ -1711,10 +1543,7 @@ mod tests {
         convert_to_openai_responses(&mut body, "gpt-5.6-terra").unwrap();
         assert_eq!(body["input"][0]["role"], "developer");
         assert_eq!(body["input"][1]["type"], "reasoning");
-        assert_eq!(
-            body["input"][1]["encrypted_content"],
-            "gAAAA-claude-looking"
-        );
+        assert_eq!(body["input"][1]["encrypted_content"], VALID);
         assert_eq!(body["input"][1]["summary"], json!([]));
         assert_eq!(body["input"][2]["type"], "message");
         assert_eq!(body["input"][2]["content"][0]["text"], "answer");
@@ -1803,32 +1632,6 @@ mod tests {
         assert_eq!(input[1]["content"][0]["text"], "answer");
         // 无签名 thinking 被丢弃(无 reasoning 项)
         assert!(!input.iter().any(|i| i["type"] == "reasoning"));
-    }
-
-    #[test]
-    fn test_detect_signature_provider_first_byte() {
-        assert_eq!(
-            detect_signature_provider("gAAAA..."),
-            SignatureProvider::Gpt
-        );
-        assert_eq!(
-            detect_signature_provider("Cais..."),
-            SignatureProvider::Claude
-        );
-        assert_eq!(
-            detect_signature_provider("Rlayer..."),
-            SignatureProvider::Claude
-        );
-        assert_eq!(
-            detect_signature_provider("Egemini..."),
-            SignatureProvider::Gemini
-        );
-        assert_eq!(
-            detect_signature_provider("opaque-blob"),
-            SignatureProvider::Unknown
-        );
-        assert_eq!(detect_signature_provider(""), SignatureProvider::Unknown);
-        assert_eq!(detect_signature_provider("  "), SignatureProvider::Unknown);
     }
 
     #[test]
@@ -2498,53 +2301,40 @@ mod tests {
     }
 
     #[test]
-    fn test_is_valid_grok_encrypted_content() {
-        // 真实高熵测试:均匀分布
-        let mut high_entropy = vec![0u8; 64];
-        for (i, byte) in high_entropy.iter_mut().enumerate() {
-            *byte = (i * 7 % 256) as u8; // 伪随机分布
-        }
-        let high_entropy_b64 =
-            base64::engine::general_purpose::STANDARD_NO_PAD.encode(&high_entropy);
-
-        // 合法:高熵 standard base64
-        assert!(is_valid_grok_encrypted_content(&high_entropy_b64));
-
-        // 拒绝:GPT Fernet 前缀
-        assert!(!is_valid_grok_encrypted_content("gAAAAtest"));
-
-        // 拒绝:带填充
-        assert!(!is_valid_grok_encrypted_content("dGVzdA=="));
-
-        // 拒绝:provider 前缀
-        assert!(!is_valid_grok_encrypted_content("grok#abc"));
-
-        // 拒绝:URL-safe base64(Grok 用 standard)
-        let url_safe = base64::engine::general_purpose::URL_SAFE_NO_PAD.encode(&high_entropy);
-        assert!(!is_valid_grok_encrypted_content(&url_safe));
-
-        // 拒绝:太短
-        let short = base64::engine::general_purpose::STANDARD_NO_PAD.encode([0u8; 16]);
-        assert!(!is_valid_grok_encrypted_content(&short));
-
-        // 拒绝:Kimi 固定长度 344
-        let kimi_len = base64::engine::general_purpose::STANDARD_NO_PAD.encode([0xABu8; 258]); // 解码 258→编码 344
-        assert!(!is_valid_grok_encrypted_content(&kimi_len));
-    }
-
-    #[test]
-    fn test_signature_compatible_for_target_grok() {
-        // GPT 目标只接受 GPT 签名
-        assert!(signature_compatible_for_target("gAAAAtest", "gpt-5"));
-        assert!(!signature_compatible_for_target("Cais-claude", "gpt-5"));
-
-        // Grok 目标需通过完整验证
-        let mut high_entropy = vec![0u8; 64];
-        for (i, byte) in high_entropy.iter_mut().enumerate() {
+    fn test_gpt_compatible_signature() {
+        // 对齐 CPA codex_claude_request.appendReasoningContent
+        const VALID: &str = "gAAAAAAAAAAAAQIDBAUGBwgJCgsMDQ4PEBESExQVFhcYGRobHB0eHyAhIiMkJSYnKCkqKywtLi8wMTIzNDU2Nzg5Ojs8PT4_QA";
+        // GPT 目标:Fernet 形状通过,provider 前缀被剥掉
+        assert_eq!(
+            gpt_compatible_signature(Some(VALID), "gpt-5"),
+            Some(VALID.to_string())
+        );
+        let prefixed = format!("gpt#{VALID}");
+        assert_eq!(
+            gpt_compatible_signature(Some(&prefixed), "gpt-5"),
+            Some(VALID.to_string())
+        );
+        // 非 GPT 信封、空签名、缺字段一律丢弃
+        assert_eq!(gpt_compatible_signature(Some("Cais-claude"), "gpt-5"), None);
+        assert_eq!(gpt_compatible_signature(Some("gAAAA-short"), "gpt-5"), None);
+        assert_eq!(gpt_compatible_signature(Some(""), "gpt-5"), None);
+        assert_eq!(gpt_compatible_signature(None, "gpt-5"), None);
+        // grok 目标:无信封高熵 blob 通过
+        let mut opaque = vec![0u8; 64];
+        for (i, byte) in opaque.iter_mut().enumerate() {
             *byte = (i * 7 % 256) as u8;
         }
-        let valid = base64::engine::general_purpose::STANDARD_NO_PAD.encode(&high_entropy);
-        assert!(signature_compatible_for_target(&valid, "grok-4.6"));
-        assert!(!signature_compatible_for_target("gAAAA-gpt", "grok-beta"));
+        let grok = base64::engine::general_purpose::STANDARD_NO_PAD.encode(&opaque);
+        assert_eq!(
+            gpt_compatible_signature(Some(&grok), "grok-4.6"),
+            Some(grok.clone())
+        );
+        // CPA 先无条件试 GPT 兼容,再看 grok:合法 Fernet 对 grok 目标同样保留
+        assert_eq!(
+            gpt_compatible_signature(Some(VALID), "grok-beta"),
+            Some(VALID.to_string())
+        );
+        // 非 grok 目标不接受无信封 blob
+        assert_eq!(gpt_compatible_signature(Some(&grok), "gpt-5"), None);
     }
 }

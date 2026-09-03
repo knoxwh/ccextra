@@ -4,12 +4,15 @@ use serde_json::{json, Value};
 use std::collections::HashMap;
 
 use super::is_ignorable_system_text;
-use super::to_openai_responses::signature_compatible_for_target;
+use super::signature::{
+    resolve_thinking_signature, resolve_tool_use_thought_signature,
+    signature_provider_from_model_name, SignatureProvider, GEMINI_SKIP_THOUGHT_SIGNATURE_VALIDATOR,
+};
 use super::tool_id::tool_name_from_claude_tool_use_id;
 use super::tool_sanitize::sanitize_function_name;
 
 /// functionCall 附加的思考签名哨兵(对齐 CPA geminiClaudeThoughtSignature)
-const THOUGHT_SIGNATURE_SENTINEL: &str = "skip_thought_signature_validator";
+const THOUGHT_SIGNATURE_SENTINEL: &str = GEMINI_SKIP_THOUGHT_SIGNATURE_VALIDATOR;
 
 #[derive(Default)]
 struct ToolHistory {
@@ -200,6 +203,19 @@ fn convert_content_to_parts(
     parts
 }
 
+/// tool_use 块上可能携带的签名字段(对齐 CPA resolveToolUseThoughtSignature 的三条路径)。
+/// Anthropic 原生 tool_use 不带签名,通常返回 None。
+fn tool_use_signature_field(block: &Value) -> Option<&str> {
+    ["signature", "thought_signature"]
+        .iter()
+        .find_map(|key| block.get(*key).and_then(|v| v.as_str()))
+        .or_else(|| {
+            block
+                .pointer("/extra_content/google/thought_signature")
+                .and_then(|v| v.as_str())
+        })
+}
+
 /// 单个 content block → 0..n 个 Gemini parts(tool_result 可能追加图片 part)
 fn append_block_parts(
     parts: &mut Vec<Value>,
@@ -223,29 +239,33 @@ fn append_block_parts(
                 }
             }
         }
-        // thinking 块默认丢弃(Gemini 非 compat 路径);Antigravity 保留带兼容签名块
-        // (对齐 CPA antigravity 翻译器:空签名或不兼容签名块丢弃)
+        // thinking 块默认丢弃(Gemini 非 compat 路径);Antigravity 按目标族解析签名
+        // (对齐 CPA antigravity 翻译器:签名经 resolveProviderCompatibleSignature
+        // 归一化,claude 目标出双层 R 形;无签名时仅 gemini 目标保住思维文本)
         "thinking" => {
             if !antigravity {
                 return;
             }
             let text = block.get("thinking").and_then(|t| t.as_str()).unwrap_or("");
-            let signature = block
+            // 空文本块只在 CPA 的 detached carrier 路径上有意义,该机制未移植 → 丢弃
+            if text.is_empty() {
+                return;
+            }
+            let raw_signature = block
                 .get("signature")
                 .and_then(|s| s.as_str())
                 .unwrap_or("");
-            // 空文本、空签名或签名不兼容目标 → 丢弃
-            if text.is_empty()
-                || signature.is_empty()
-                || !signature_compatible_for_target(signature, upstream_model)
+            let signature = resolve_thinking_signature(upstream_model, raw_signature);
+            if signature.is_empty()
+                && signature_provider_from_model_name(upstream_model) != SignatureProvider::Gemini
             {
                 return;
             }
-            parts.push(json!({
-                "thought": true,
-                "text": text,
-                "thoughtSignature": signature
-            }));
+            let mut part = json!({ "thought": true, "text": text });
+            if !signature.is_empty() {
+                part["thoughtSignature"] = json!(signature);
+            }
+            parts.push(part);
         }
         "tool_use" => {
             // name 经清洗后必须匹配本轮 tools 声明(短名),否则上游无法配对
@@ -286,10 +306,19 @@ fn append_block_parts(
             if !tool_use_id.is_empty() {
                 function_call["id"] = json!(tool_use_id);
             }
-            parts.push(json!({
-                "thoughtSignature": THOUGHT_SIGNATURE_SENTINEL,
-                "functionCall": function_call
-            }));
+            // antigravity 按目标族解析(claude 目标不发哨兵,对齐 CPA
+            // resolveToolUseThoughtSignature);gemini 直连恒发哨兵
+            // (对齐 CPA gemini_claude_request 的 geminiClaudeThoughtSignature)
+            let thought_signature = if antigravity {
+                resolve_tool_use_thought_signature(upstream_model, tool_use_signature_field(block))
+            } else {
+                THOUGHT_SIGNATURE_SENTINEL.to_string()
+            };
+            parts.push(if thought_signature.is_empty() {
+                json!({ "functionCall": function_call })
+            } else {
+                json!({ "thoughtSignature": thought_signature, "functionCall": function_call })
+            });
         }
         "tool_result" => {
             let Some(tool_use_id) = block.get("tool_use_id").and_then(|i| i.as_str()) else {
@@ -698,11 +727,14 @@ mod tests {
 
     #[test]
     fn test_thinking_signature_compatibility_claude() {
-        // Claude 目标保留兼容签名,丢弃 GPT 签名
+        // Claude 目标:原生 E 形签名通过严格校验并归一化为上游 R 形;GPT 签名丢弃
+        use super::super::signature::fixtures::{claude_native_default, claude_upstream_signature};
+        let native = claude_native_default();
+        let upstream = claude_upstream_signature(&native);
         let messages = vec![json!({
             "role": "assistant",
             "content": [
-                {"type": "thinking", "thinking": "claude-ok", "signature": "C4x2-valid"},
+                {"type": "thinking", "thinking": "claude-ok", "signature": native},
                 {"type": "thinking", "thinking": "gpt-bad", "signature": "gAAAA-gpt"},
                 {"type": "text", "text": "answer"}
             ]
@@ -713,12 +745,14 @@ mod tests {
         assert_eq!(parts.len(), 2);
         assert_eq!(parts[0]["thought"], true);
         assert_eq!(parts[0]["text"], "claude-ok");
+        assert_eq!(parts[0]["thoughtSignature"], upstream);
         assert_eq!(parts[1]["text"], "answer");
     }
 
     #[test]
     fn test_thinking_signature_compatibility_grok() {
-        // Grok 目标需要高熵 opaque blob
+        // Grok 只是目标族:signatureProviderMatchesTarget 不含 grok(对齐 CPA),
+        // antigravity 路径下 grok 目标的 thinking 块一律丢弃
         let mut high_entropy = vec![0u8; 64];
         for (i, byte) in high_entropy.iter_mut().enumerate() {
             *byte = (i * 7 % 256) as u8;
@@ -735,11 +769,8 @@ mod tests {
         })];
         let contents = convert_messages(&messages, &HashMap::new(), true, "grok-beta");
         let parts = contents[0]["parts"].as_array().unwrap();
-        // 只保留 Grok 兼容签名
-        assert_eq!(parts.len(), 2);
-        assert_eq!(parts[0]["thought"], true);
-        assert_eq!(parts[0]["text"], "grok-ok");
-        assert_eq!(parts[1]["text"], "answer");
+        assert_eq!(parts.len(), 1);
+        assert_eq!(parts[0]["text"], "answer");
     }
 
     #[test]

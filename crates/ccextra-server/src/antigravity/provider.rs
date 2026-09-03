@@ -64,18 +64,17 @@ pub async fn load_antigravity_providers(
             Some(cred.project_id.as_str())
         };
 
-        let models = match models::fetch_models(&cred.access_token, project_id_ref, proxy_url, None)
-            .await
-        {
-            Ok(m) => {
-                tracing::info!("为 {} 获取了 {} 个模型", cred.email, m.len());
-                m
-            }
-            Err(e) => {
-                tracing::warn!("无法为 {} 获取模型列表: {}，使用空列表", cred.email, e);
-                Vec::new()
-            }
-        };
+        let models =
+            match models::fetch_models(&cred.access_token, project_id_ref, proxy_url, None).await {
+                Ok(m) => {
+                    tracing::info!("为 {} 获取了 {} 个模型", cred.email, m.len());
+                    m
+                }
+                Err(e) => {
+                    tracing::warn!("无法为 {} 获取模型列表: {}，使用空列表", cred.email, e);
+                    Vec::new()
+                }
+            };
 
         // 创建 ProviderConfig
         // Antigravity 使用 cloudcode-pa.googleapis.com 的内部 API,不是公开的 generativelanguage API

@@ -110,7 +110,10 @@ pub fn convert_to_antigravity(
 fn antigravity_max_completion_tokens(model: &str) -> Option<i64> {
     Some(match model {
         "claude-opus-4-6-thinking" | "claude-sonnet-4-6" => 64000,
-        "gemini-3.6-flash-high" | "gemini-3.7-flash-high" | "gemini-3-flash" => 65536,
+        "gemini-3.6-flash-high"
+        | "gemini-3.7-flash-high"
+        | "gemini-3.8-flash-high"
+        | "gemini-3-flash" => 65536,
         "gemini-pro-agent" | "gemini-3.1-pro-low" | "gemini-3.1-flash-lite" => 65535,
         "gpt-oss-120b-medium" => 32768,
         _ => return None,
@@ -232,12 +235,13 @@ mod tests {
 
     #[test]
     fn test_signed_thinking_preserved_unsigned_dropped() {
+        let valid_claude_sig = crate::convert::signature::fixtures::claude_native_default();
         let body = json!({
             "model": "m", "max_tokens": 100,
             "messages": [
                 {"role": "user", "content": "hi"},
                 {"role": "assistant", "content": [
-                    {"type": "thinking", "thinking": "t1", "signature": "C4x2-valid-claude-sig"},
+                    {"type": "thinking", "thinking": "t1", "signature": valid_claude_sig},
                     {"type": "thinking", "thinking": "t2"},
                     {"type": "text", "text": "answer"}
                 ]}
@@ -247,7 +251,10 @@ mod tests {
         let parts = out["request"]["contents"][1]["parts"].as_array().unwrap();
         assert_eq!(parts.len(), 2);
         assert_eq!(parts[0]["thought"], true);
-        assert_eq!(parts[0]["thoughtSignature"], "C4x2-valid-claude-sig");
+        assert!(parts[0]["thoughtSignature"]
+            .as_str()
+            .unwrap()
+            .starts_with('R'));
         assert_eq!(parts[1]["text"], "answer");
     }
 

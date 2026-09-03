@@ -1,13 +1,14 @@
 // Antigravity 模型列表获取
-use super::constants::{API_ENDPOINT, DAILY_API_ENDPOINT};
+use super::constants::{API_ENDPOINT, DAILY_API_ENDPOINT, SANDBOX_DAILY_API_ENDPOINT};
 use super::oauth;
 use anyhow::{anyhow, Result};
 use ccextra_core::route::ModelConfig;
 use serde_json::Value;
 
 const ANTIGRAVITY_MODELS_PATH: &str = "/v1internal:fetchAvailableModels";
+const MAX_FETCH_ATTEMPTS_PER_ENDPOINT: usize = 2;
 
-/// 从 Antigravity API 获取可用模型列表
+/// 从 Antigravity API 获取可用模型列表(对齐 CPA: daily -> prod -> sandbox)
 pub async fn fetch_models(
     access_token: &str,
     project_id: Option<&str>,
@@ -17,8 +18,8 @@ pub async fn fetch_models(
     let client = oauth::http_client(proxy_url)?;
     let ua = user_agent.unwrap_or(super::constants::REQUEST_UA);
 
-    // 尝试生产和 daily 端点
-    let base_urls = [API_ENDPOINT, DAILY_API_ENDPOINT];
+    // 对齐 CLIProxyAPI: daily 优先, prod 其次, sandbox 兜底
+    let base_urls = [DAILY_API_ENDPOINT, API_ENDPOINT, SANDBOX_DAILY_API_ENDPOINT];
 
     for base_url in base_urls {
         let url = format!("{}{}", base_url, ANTIGRAVITY_MODELS_PATH);
@@ -30,37 +31,44 @@ pub async fn fetch_models(
             serde_json::json!({})
         };
 
-        let resp = client
-            .post(&url)
-            .header("Content-Type", "application/json")
-            .header("Authorization", format!("Bearer {}", access_token))
-            .header("User-Agent", ua)
-            .json(&body)
-            .send()
-            .await;
+        for attempt in 1..=MAX_FETCH_ATTEMPTS_PER_ENDPOINT {
+            let resp = client
+                .post(&url)
+                .header("Content-Type", "application/json")
+                .header("Authorization", format!("Bearer {}", access_token))
+                .header("User-Agent", ua)
+                .json(&body)
+                .send()
+                .await;
 
-        let resp = match resp {
-            Ok(r) => r,
-            Err(e) => {
-                tracing::debug!("请求 {} 失败: {}", base_url, e);
+            let resp = match resp {
+                Ok(r) => r,
+                Err(e) => {
+                    tracing::debug!("请求 {} (第 {} 次) 失败: {}", base_url, attempt, e);
+                    continue;
+                }
+            };
+
+            if !resp.status().is_success() {
+                tracing::debug!(
+                    "请求 {} (第 {} 次) 返回状态: {}",
+                    base_url,
+                    attempt,
+                    resp.status()
+                );
                 continue;
             }
-        };
 
-        if !resp.status().is_success() {
-            tracing::debug!("请求 {} 返回状态: {}", base_url, resp.status());
-            continue;
+            let body: Value = match resp.json().await {
+                Ok(v) => v,
+                Err(e) => {
+                    tracing::debug!("解析 {} 响应失败: {}", base_url, e);
+                    continue;
+                }
+            };
+
+            return parse_models(&body);
         }
-
-        let body: Value = match resp.json().await {
-            Ok(v) => v,
-            Err(e) => {
-                tracing::debug!("解析 {} 响应失败: {}", base_url, e);
-                continue;
-            }
-        };
-
-        return parse_models(&body);
     }
 
     Err(anyhow!("无法从任何 Antigravity 端点获取模型列表"))
