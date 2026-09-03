@@ -11,9 +11,18 @@ pub const MAX_CONSECUTIVE_IDENTICAL_PROBLEMATIC_TOOL_CALLS: u32 = 8;
 pub const MAX_CONSECUTIVE_IDENTICAL_TOOL_CALLS: u32 = 12;
 
 /// 工具是否属于高危死循环类型(对齐 grok-build is_problematically_repeating_kind: Read / Plan)
+/// Claude Code 对应只读/探查与任务规划工具:
+/// - Read: Read, ReadMcpResource, grep, glob
+/// - Plan: TaskCreate, TaskUpdate, TaskGet, TaskList, EnterPlanMode, ExitPlanMode
+/// - MCP: codegraph (如 codegraph_explore)
 pub fn is_problematically_repeating_tool(tool_name: &str) -> bool {
     let lower = tool_name.to_ascii_lowercase();
-    lower.contains("read") || lower.contains("plan") || lower.contains("todo")
+    lower.contains("read")
+        || lower.contains("task")
+        || lower.contains("plan")
+        || lower.contains("grep")
+        || lower.contains("glob")
+        || lower.contains("codegraph")
 }
 
 /// 动作停滞判定结果(对齐 grok-build IdenticalToolCallRun)
@@ -481,25 +490,19 @@ mod tests {
         let body1 = make_messages("Read", 1);
         assert_eq!(check_action_stationarity(&body1), StationarityVerdict::None);
 
-        // 2 次 Read (未达到 Nudge 阈值 4) -> None
-        let body2 = make_messages("Read", 2);
-        assert_eq!(check_action_stationarity(&body2), StationarityVerdict::None);
-
-        // 4 次 Read (达到 NUDGE_AFTER_IDENTICAL_PROBLEMATIC_TOOL_CALLS) -> Nudge
-        let body4 = make_messages("Read", 4);
+        // 高危工具 (Read/Codegraph/Task)：4 次 Nudge，8 次 HardStop
+        let cg4 = make_messages("mcp__codegraph__codegraph_explore", 4);
         assert!(matches!(
-            check_action_stationarity(&body4),
+            check_action_stationarity(&cg4),
             StationarityVerdict::Nudge { run_len: 4, .. }
         ));
-
-        // 8 次 Read (达到 MAX_CONSECUTIVE_IDENTICAL_PROBLEMATIC_TOOL_CALLS) -> HardStop
-        let body8 = make_messages("Read", 8);
+        let cg8 = make_messages("mcp__codegraph__codegraph_explore", 8);
         assert!(matches!(
-            check_action_stationarity(&body8),
+            check_action_stationarity(&cg8),
             StationarityVerdict::HardStop { run_len: 8, .. }
         ));
 
-        // 通用工具 (如 Bash)，8 次仍为 Nudge，12 次才 HardStop
+        // 通用工具 (如 Bash)：8 次 Nudge，12 次 HardStop
         let bash8 = make_messages("Bash", 8);
         assert!(matches!(
             check_action_stationarity(&bash8),
