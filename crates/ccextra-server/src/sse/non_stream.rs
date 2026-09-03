@@ -14,7 +14,9 @@ use super::chat::map_finish_reason;
 use super::responses::{
     codex_stop_reason, map_stop_reason, sanitize_tool_id, stop_sequence, web_search_result_content,
 };
-use ccextra_core::convert::{fix_json_quotes, is_valid_gpt_reasoning_signature};
+use ccextra_core::convert::{
+    fix_json_quotes, is_valid_gpt_reasoning_signature, is_valid_grok_encrypted_content,
+};
 use ccextra_core::doom_loop::{is_confident, parse_trigger};
 
 /// redacted_thinking 前缀(对齐 responses.rs)
@@ -86,11 +88,13 @@ pub fn responses_to_anthropic(
                         .and_then(|v| v.as_str())
                         .unwrap_or("")
                         .to_string();
-                    // redacted_thinking 直接通过,普通签名验证 GPT Fernet 格式(对齐 CPA d5b57a2d)
+                    // redacted_thinking 直接通过,普通签名验证 GPT Fernet 或 Grok 格式
                     let is_redacted =
                         signature.starts_with(CLAUDE_RESPONSES_REDACTED_THINKING_PREFIX);
                     let valid_signature = if !signature.is_empty()
-                        && (is_redacted || is_valid_gpt_reasoning_signature(&signature))
+                        && (is_redacted
+                            || is_valid_gpt_reasoning_signature(&signature)
+                            || is_valid_grok_encrypted_content(&signature))
                     {
                         signature
                     } else {
@@ -572,6 +576,30 @@ mod tests {
         assert_eq!(out["content"][0]["type"], "thinking");
         assert_eq!(out["content"][0]["thinking"], "think step step two");
         assert_eq!(out["content"][0]["signature"], "gAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA");
+    }
+
+    #[test]
+    fn test_responses_nonstream_grok_encrypted_content_signature() {
+        const GROK_CIPHER: &str =
+            "5+C3No7B0G0P2dR5lSbMvwrctRb+B3vLAJ5/VYemHZNuaDbKv8IfNb+4Gyd125rfZtRtG4+iqYjT5uWOZbE44A";
+        let body = json!({
+            "type": "response.completed",
+            "response": {
+                "id": "r1",
+                "model": "grok-4.6",
+                "output": [{
+                    "type": "reasoning",
+                    "summary": [{"type": "summary_text", "text": "grok thinking"}],
+                    "encrypted_content": GROK_CIPHER
+                }],
+                "stop_reason": "end_turn",
+                "usage": {"input_tokens": 10, "output_tokens": 5}
+            }
+        });
+        let out = responses_to_anthropic(&body, None).unwrap();
+        assert_eq!(out["content"][0]["type"], "thinking");
+        assert_eq!(out["content"][0]["thinking"], "grok thinking");
+        assert_eq!(out["content"][0]["signature"], GROK_CIPHER);
     }
 
     #[test]

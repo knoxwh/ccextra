@@ -22,7 +22,7 @@ use super::emit;
 use super::parser::SseEvent;
 use super::parser::SseParser;
 use super::SseStreamPin;
-use ccextra_core::convert::is_valid_gpt_reasoning_signature;
+use ccextra_core::convert::{is_valid_gpt_reasoning_signature, is_valid_grok_encrypted_content};
 use ccextra_core::doom_loop::{is_confident, parse_trigger};
 
 /// message_start 的 model 兜底(同默认值)
@@ -519,8 +519,10 @@ impl ResponsesRelay {
                         let is_redacted =
                             sig.starts_with(CLAUDE_RESPONSES_REDACTED_THINKING_PREFIX);
 
-                        // redacted_thinking 直接通过,普通签名验证 GPT Fernet 格式(对齐 CPA d5b57a2d)
-                        let valid = is_redacted || is_valid_gpt_reasoning_signature(sig);
+                        // redacted_thinking 直接通过,普通签名验证 GPT Fernet 或 Grok 格式
+                        let valid = is_redacted
+                            || is_valid_gpt_reasoning_signature(sig)
+                            || is_valid_grok_encrypted_content(sig);
 
                         if valid {
                             self.thinking_signature = sig.to_string();
@@ -1580,6 +1582,26 @@ mod tests {
         assert!(s.contains("\"type\":\"thinking\""));
         assert!(s.contains("signature_delta"));
         assert!(s.contains("gAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA"));
+    }
+
+    #[test]
+    fn test_reasoning_grok_encrypted_content_signature() {
+        // Grok 无信封密文: 应合法保留并发送 signature_delta
+        const GROK_CIPHER: &str =
+            "5+C3No7B0G0P2dR5lSbMvwrctRb+B3vLAJ5/VYemHZNuaDbKv8IfNb+4Gyd125rfZtRtG4+iqYjT5uWOZbE44A";
+        let mut r = ResponsesRelay::new(None);
+        r.process(&created());
+        r.process(&ev(
+            r#"{"type":"response.output_item.added","item":{"type":"reasoning"}}"#,
+        ));
+        let out = r.process(&ev(&format!(
+            r#"{{"type":"response.output_item.done","item":{{"type":"reasoning","encrypted_content":"{GROK_CIPHER}"}}}}"#
+        )));
+        let bufs = out.concat();
+        let s = String::from_utf8_lossy(&bufs);
+        assert!(s.contains("\"type\":\"thinking\""));
+        assert!(s.contains("signature_delta"));
+        assert!(s.contains(GROK_CIPHER));
     }
 
     #[test]
