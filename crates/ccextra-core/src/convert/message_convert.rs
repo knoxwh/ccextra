@@ -37,6 +37,19 @@ pub fn convert_messages(
 
     for msg in messages {
         let role = msg.get("role").and_then(|r| r.as_str()).unwrap_or("");
+
+        // system 消息 → user 角色的 system-reminder 文本(对齐 ClaudeMessageSystemReminderText)
+        // 遇到 system 消息时不清除 pending_tool_use_ids,保持 tool 调用配对
+        if role == "system" {
+            if let Some(reminder) = system_reminder_text(&msg["content"], upstream_model) {
+                contents.push(json!({
+                    "role": "user",
+                    "parts": [{ "text": reminder }]
+                }));
+            }
+            continue;
+        }
+
         let preceding_tool_use_ids = std::mem::take(&mut tool_history.pending_tool_use_ids);
 
         match role {
@@ -67,15 +80,6 @@ pub fn convert_messages(
                     contents.push(json!({ "role": "model", "parts": parts }));
                 }
             }
-            // system 消息 → user 角色的 system-reminder 文本(对齐 ClaudeMessageSystemReminderText)
-            "system" => {
-                if let Some(reminder) = system_reminder_text(&msg["content"], upstream_model) {
-                    contents.push(json!({
-                        "role": "user",
-                        "parts": [{ "text": reminder }]
-                    }));
-                }
-            }
             _ => {}
         }
     }
@@ -92,12 +96,46 @@ pub fn convert_messages(
         }
     }
 
-    contents
+    merge_adjacent_gemini_contents(contents)
+}
+
+/// 合并连续相邻的 user content 回合(对齐 CPA MergeAdjacentGeminiContents)。
+/// 中段 system 降级为 user reminder 后,与前后相邻 user 或 tool_result 回合合并为单条;
+/// 连续 model 回合严格禁止合并(防止 thought signature 与推理索引漂移)。
+fn merge_adjacent_gemini_contents(contents: Vec<Value>) -> Vec<Value> {
+    if contents.len() <= 1 {
+        return contents;
+    }
+    let mut merged: Vec<Value> = Vec::with_capacity(contents.len());
+    for content in contents {
+        let role = content.get("role").and_then(|r| r.as_str()).unwrap_or("");
+        let Some(parts) = content.get("parts").and_then(|p| p.as_array()) else {
+            continue;
+        };
+        if parts.is_empty() {
+            continue;
+        }
+
+        if let Some(last) = merged.last_mut() {
+            let last_role = last.get("role").and_then(|r| r.as_str()).unwrap_or("");
+            if last_role == "user" && role == "user" {
+                if let (Some(last_parts), Some(cur_parts)) = (
+                    last.get_mut("parts").and_then(|p| p.as_array_mut()),
+                    content.get("parts").and_then(|p| p.as_array()),
+                ) {
+                    last_parts.extend(cur_parts.iter().cloned());
+                    continue;
+                }
+            }
+        }
+        merged.push(content);
+    }
+    merged
 }
 
 /// 按 preceding tool_use 顺序排列 tool_result;非结果块保留到结果之后。
-/// 数量或 ID 无法一一匹配时保持原始顺序,避免破坏不完整历史。
-fn align_tool_results(content: &Value, preceding_tool_use_ids: &[String]) -> Value {
+/// 数量或 ID 无法一一匹配时保持原始顺序,避免破坏不完整历史(对齐 CPA AlignClaudeToolResults)。
+pub(crate) fn align_tool_results(content: &Value, preceding_tool_use_ids: &[String]) -> Value {
     let Some(blocks) = content.as_array() else {
         return content.clone();
     };
@@ -814,5 +852,51 @@ mod tests {
         assert!(result_str.starts_with('['));
         assert!(result_str.contains(r#""text":"first""#));
         assert!(result_str.contains(r#""text":"second""#));
+    }
+
+    #[test]
+    fn test_convert_messages_tool_pairing_across_system_and_adjacent_user_merge() {
+        // assistant(tool_use) -> system(reminder) -> user(tool_result + text)
+        let messages = vec![
+            json!({
+                "role": "assistant",
+                "content": [{
+                    "type": "tool_use",
+                    "id": "Read-1",
+                    "name": "Read",
+                    "input": {"path": "a.txt"}
+                }]
+            }),
+            json!({
+                "role": "system",
+                "content": "Token usage: 10/100"
+            }),
+            json!({
+                "role": "user",
+                "content": [
+                    {"type": "tool_result", "tool_use_id": "Read-1", "content": "file ok"},
+                    {"type": "text", "text": "continue"}
+                ]
+            }),
+        ];
+        let mut map = HashMap::new();
+        map.insert("Read".to_string(), "Read".to_string());
+        let contents = convert_messages(&messages, &map, false, "gemini-2.0");
+
+        // 1. model 回合:包含 functionCall
+        assert_eq!(contents.len(), 2);
+        assert_eq!(contents[0]["role"], "model");
+        assert_eq!(contents[0]["parts"][0]["functionCall"]["name"], "Read");
+
+        // 2. user 回合:system reminder 与随后的 user 回合合并，且 tool_result 对应 functionResponse
+        assert_eq!(contents[1]["role"], "user");
+        let parts = contents[1]["parts"].as_array().unwrap();
+        assert_eq!(parts.len(), 3);
+        assert!(parts[0]["text"]
+            .as_str()
+            .unwrap()
+            .contains("<system-reminder>"));
+        assert_eq!(parts[1]["functionResponse"]["id"], "Read-1");
+        assert_eq!(parts[2]["text"], "continue");
     }
 }

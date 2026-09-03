@@ -532,42 +532,46 @@ pub fn convert_to_openai_responses(
     // --- messages → input[] ---
     // custom 工具调用的 call_id 集合(tool_result 需转 custom_tool_call_output)
     let mut custom_call_ids: HashSet<String> = HashSet::new();
-    // system role 的 reminder 消息预转 user(对齐 ClaudeMessageSystemReminderText)
-    let messages_array = body.get("messages").and_then(|v| v.as_array()).map(|msgs| {
-        let mut msgs: Vec<Value> = msgs.clone();
-        for m in &mut msgs {
-            if m.get("role").and_then(|v| v.as_str()) == Some("system") {
-                if let Some(text) = claude_system_reminder_text(m.get("content"), upstream_model) {
-                    m["role"] = json!("user");
-                    m["content"] = json!(text);
-                }
-            }
-        }
-        msgs
-    });
-    if let Some(messages) = messages_array.as_deref() {
+    let mut pending_tool_use_ids: Vec<String> = Vec::new();
+    let mut pending_system_reminders: Vec<Value> = Vec::new();
+
+    if let Some(messages) = body.get("messages").and_then(|v| v.as_array()) {
         for msg in messages {
             let role = msg.get("role").and_then(|v| v.as_str()).unwrap_or("user");
 
             // role=system 消息:reminder 文本 → user message(对齐 ClaudeMessageSystemReminderText)
+            // 当存在未应答 tool_use 时暂存 reminder,保持 tool 调用紧邻配对
             if role == "system" {
                 if let Some(text) = claude_system_reminder_text(msg.get("content"), upstream_model)
                 {
-                    openai["input"].as_array_mut().unwrap().push(json!({
+                    let reminder_msg = json!({
                         "type": "message",
                         "role": "user",
-                        "content": text
-                    }));
+                        "content": [{"type": "input_text", "text": text}]
+                    });
+                    if !pending_tool_use_ids.is_empty() {
+                        pending_system_reminders.push(reminder_msg);
+                    } else {
+                        openai["input"].as_array_mut().unwrap().push(reminder_msg);
+                    }
                 }
                 continue;
             }
 
-            let Some(content) = msg.get("content") else {
+            let Some(raw_content) = msg.get("content") else {
                 continue;
             };
-            if content.is_null() {
+            if raw_content.is_null() {
                 continue;
             }
+
+            // user 消息按 preceding tool_use_ids 对齐 tool_result
+            let content = if role == "user" && !pending_tool_use_ids.is_empty() {
+                super::message_convert::align_tool_results(raw_content, &pending_tool_use_ids)
+            } else {
+                raw_content.clone()
+            };
+            pending_tool_use_ids.clear();
 
             let mut content_items: Vec<Value> = Vec::new();
             let mut out_items: Vec<Value> = Vec::new();
@@ -589,6 +593,12 @@ pub fn convert_to_openai_responses(
                 if s.is_empty() {
                     continue;
                 }
+                if !pending_system_reminders.is_empty() {
+                    openai["input"]
+                        .as_array_mut()
+                        .unwrap()
+                        .extend(std::mem::take(&mut pending_system_reminders));
+                }
                 let item_type = if role == "assistant" {
                     "output_text"
                 } else {
@@ -603,6 +613,8 @@ pub fn convert_to_openai_responses(
             let Some(parts) = content.as_array() else {
                 continue;
             };
+
+            let mut tool_result_items: Vec<Value> = Vec::new();
 
             for part in parts {
                 let ptype = part.get("type").and_then(|v| v.as_str()).unwrap_or("");
@@ -666,6 +678,9 @@ pub fn convert_to_openai_responses(
                     "tool_use" => {
                         flush_message(&mut content_items, &mut out_items);
                         let id = part.get("id").and_then(|v| v.as_str()).unwrap_or("");
+                        if !id.is_empty() {
+                            pending_tool_use_ids.push(id.to_string());
+                        }
                         let name = part.get("name").and_then(|v| v.as_str()).unwrap_or("");
                         let short_name = if let Some(s) = tool_name_map.get(name) {
                             s.clone()
@@ -699,7 +714,6 @@ pub fn convert_to_openai_responses(
                         }
                     }
                     "tool_result" => {
-                        flush_message(&mut content_items, &mut out_items);
                         let call_id = part
                             .get("tool_use_id")
                             .and_then(|v| v.as_str())
@@ -709,13 +723,13 @@ pub fn convert_to_openai_responses(
                         result_image_parts.extend(images);
                         let short_id = shorten_call_id(call_id);
                         if custom_call_ids.contains(&short_id) {
-                            out_items.push(json!({
+                            tool_result_items.push(json!({
                                 "type": "custom_tool_call_output",
                                 "call_id": short_id,
                                 "output": output
                             }));
                         } else {
-                            out_items.push(json!({
+                            tool_result_items.push(json!({
                                 "type": "function_call_output",
                                 "call_id": short_id,
                                 "output": output
@@ -734,7 +748,29 @@ pub fn convert_to_openai_responses(
                     "content": result_image_parts
                 }));
             }
+
+            // 发射时序对齐 CPA: tool_result 先发 -> pending reminders -> 正文 out_items
+            if !tool_result_items.is_empty() {
+                openai["input"]
+                    .as_array_mut()
+                    .unwrap()
+                    .extend(tool_result_items);
+            }
+            if !pending_system_reminders.is_empty() {
+                openai["input"]
+                    .as_array_mut()
+                    .unwrap()
+                    .extend(std::mem::take(&mut pending_system_reminders));
+            }
             openai["input"].as_array_mut().unwrap().extend(out_items);
+        }
+
+        // EOF flush: 残余 reminder 照发
+        if !pending_system_reminders.is_empty() {
+            openai["input"]
+                .as_array_mut()
+                .unwrap()
+                .extend(pending_system_reminders);
         }
     }
 
@@ -2336,5 +2372,50 @@ mod tests {
         );
         // 非 grok 目标不接受无信封 blob
         assert_eq!(gpt_compatible_signature(Some(&grok), "gpt-5"), None);
+    }
+
+    #[test]
+    fn test_responses_tool_pairing_across_system_message() {
+        let mut body = json!({
+            "model": "test",
+            "messages": [
+                {"role": "assistant", "content": [
+                    {"type": "tool_use", "id": "t1", "name": "f1", "input": {}},
+                    {"type": "tool_use", "id": "t2", "name": "f2", "input": {}}
+                ]},
+                {"role": "system", "content": "Usage note: 50% remaining"},
+                {"role": "user", "content": [
+                    {"type": "tool_result", "tool_use_id": "t2", "content": "res2"},
+                    {"type": "tool_result", "tool_use_id": "t1", "content": "res1"},
+                    {"type": "text", "text": "next instruction"}
+                ]}
+            ]
+        });
+        convert_to_openai_responses(&mut body, "test-model").unwrap();
+        let input = body["input"].as_array().unwrap();
+        // 验证时序:
+        // 0: function_call(t1)
+        // 1: function_call(t2)
+        // 2: function_call_output(t1) - 对齐重排到前
+        // 3: function_call_output(t2)
+        // 4: message(user, system-reminder) - 延后发射
+        // 5: message(user, next instruction) - 正文
+        assert_eq!(input[0]["type"], "function_call");
+        assert_eq!(input[0]["call_id"], "t1");
+        assert_eq!(input[1]["type"], "function_call");
+        assert_eq!(input[1]["call_id"], "t2");
+        assert_eq!(input[2]["type"], "function_call_output");
+        assert_eq!(input[2]["call_id"], "t1");
+        assert_eq!(input[3]["type"], "function_call_output");
+        assert_eq!(input[3]["call_id"], "t2");
+        assert_eq!(input[4]["type"], "message");
+        assert_eq!(input[4]["role"], "user");
+        assert!(input[4]["content"][0]["text"]
+            .as_str()
+            .unwrap()
+            .contains("<system-reminder>"));
+        assert_eq!(input[5]["type"], "message");
+        assert_eq!(input[5]["role"], "user");
+        assert_eq!(input[5]["content"][0]["text"], "next instruction");
     }
 }

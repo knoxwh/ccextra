@@ -91,6 +91,9 @@ pub fn convert_to_openai_chat(body: &mut Value, upstream_model: &str) -> Result<
 
     // Messages 逐条转换
     if let Some(message_arr) = body.get("messages").and_then(|v| v.as_array()) {
+        let mut pending_tool_use_ids: Vec<String> = Vec::new();
+        let mut pending_system_reminders: Vec<Value> = Vec::new();
+
         for msg in message_arr {
             let role = msg
                 .get("role")
@@ -99,17 +102,56 @@ pub fn convert_to_openai_chat(body: &mut Value, upstream_model: &str) -> Result<
             let content = msg.get("content").cloned().unwrap_or(json!(""));
 
             // messages 内 role=system:提取文本包 <system-reminder> 转 user
+            // 当存在未应答 tool_use 时暂存 reminder,保持 tool 调用紧邻配对
             if role == "system" {
                 if let Some(reminder) = system_reminder_text(&content, upstream_model) {
-                    let converted = convert_message("user", &json!(reminder))?;
-                    messages.extend(converted);
+                    let reminder_msg = json!({
+                        "role": "user",
+                        "content": [{"type": "text", "text": reminder}]
+                    });
+                    if !pending_tool_use_ids.is_empty() {
+                        pending_system_reminders.push(reminder_msg);
+                    } else {
+                        messages.push(reminder_msg);
+                    }
                 }
                 continue;
             }
 
-            // 单条消息转换结果(可能展开成多条:tool_result 在前)
-            let converted = convert_message(role, &content)?;
-            messages.extend(converted);
+            // user 消息按 preceding tool_use_ids 对齐 tool_result
+            let content = if role == "user" && !pending_tool_use_ids.is_empty() {
+                super::message_convert::align_tool_results(&content, &pending_tool_use_ids)
+            } else {
+                content
+            };
+            let preceding_tool_calls_pending = !pending_tool_use_ids.is_empty();
+            pending_tool_use_ids.clear();
+
+            let (tool_results, main_msg, new_tool_use_ids) = convert_message_parts(role, &content)?;
+            pending_tool_use_ids.extend(new_tool_use_ids);
+
+            // 若前序有 pending tool call 且本条未回 tool_result,先 flush 暂存 reminder
+            if preceding_tool_calls_pending
+                && tool_results.is_empty()
+                && !pending_system_reminders.is_empty()
+            {
+                messages.extend(std::mem::take(&mut pending_system_reminders));
+            }
+
+            // OpenAI 要求: tool 消息必须紧跟带 tool_calls 的 assistant 消息。
+            // 顺序: tool_results -> 暂存 reminders -> 正文
+            messages.extend(tool_results);
+            if !pending_system_reminders.is_empty() {
+                messages.extend(std::mem::take(&mut pending_system_reminders));
+            }
+            if let Some(m) = main_msg {
+                messages.push(m);
+            }
+        }
+
+        // EOF flush:残余 reminder 照发
+        if !pending_system_reminders.is_empty() {
+            messages.extend(pending_system_reminders);
         }
     }
 
@@ -248,23 +290,25 @@ fn should_map_thinking_to_reasoning(part: &Value) -> bool {
     sig.is_empty() || sig.starts_with("gAAAA")
 }
 
-/// 转换单条消息,返回一个或多个 openai 消息(tool_result 展开在前)
-fn convert_message(role: &str, content: &Value) -> Result<Vec<Value>> {
-    // 字符串内容:统一为 text 数组(保留 跨协议形态归一化)。
-    // CC 客户端同一条消息当轮发数组、历史重建发字符串,若不统一,跨轮字节
-    // 漂移破坏上游缓存前缀(4096 回归)。空字符串丢弃消息(一致)。
+/// 转换单条消息的内容部件
+/// 返回: (展开的 tool_result 消息列表, 汇总后的主要消息, 本条消息产生的 tool_use ID 列表)
+fn convert_message_parts(
+    role: &str,
+    content: &Value,
+) -> Result<(Vec<Value>, Option<Value>, Vec<String>)> {
     if let Some(s) = content.as_str() {
         if s.is_empty() {
-            return Ok(Vec::new());
+            return Ok((Vec::new(), None, Vec::new()));
         }
-        return Ok(vec![
-            json!({"role": role, "content": [{"type": "text", "text": s}]}),
-        ]);
+        return Ok((
+            Vec::new(),
+            Some(json!({"role": role, "content": [{"type": "text", "text": s}]})),
+            Vec::new(),
+        ));
     }
 
-    // 空内容(缺失/null):丢弃消息(一致)
     if content.is_null() {
-        return Ok(Vec::new());
+        return Ok((Vec::new(), None, Vec::new()));
     }
 
     let Some(parts) = content.as_array() else {
@@ -275,15 +319,13 @@ fn convert_message(role: &str, content: &Value) -> Result<Vec<Value>> {
     let mut reasoning_parts: Vec<String> = Vec::new();
     let mut tool_calls: Vec<Value> = Vec::new();
     let mut tool_results: Vec<Value> = Vec::new();
-    // tool_result 抽出的图片 parts(对齐 sub2api toolResultImageParts),
-    // 并入该消息末尾的 user 消息 parts 尾部;文本始终留在 tool 消息
+    let mut new_tool_use_ids: Vec<String> = Vec::new();
     let mut deferred_images: Vec<Value> = Vec::new();
 
     for part in parts {
         let ptype = part.get("type").and_then(|v| v.as_str()).unwrap_or("");
         match ptype {
             "thinking" => {
-                // 仅 assistant 映射(防注入)。门闩见 should_map_thinking_to_reasoning。
                 if role == "assistant" && should_map_thinking_to_reasoning(part) {
                     if let Some(t) = part.get("thinking").and_then(|v| v.as_str()) {
                         if !t.trim().is_empty() {
@@ -295,7 +337,6 @@ fn convert_message(role: &str, content: &Value) -> Result<Vec<Value>> {
             "redacted_thinking" => { /* 显式忽略 */ }
             "text" => {
                 if let Some(t) = part.get("text").and_then(|v| v.as_str()) {
-                    // 对齐 convertClaudeContentPart:空白块与计费归属块剥离
                     if !t.trim().is_empty() && !super::is_attribution_text(t) {
                         content_items.push(json!({"type": "text", "text": t}));
                     }
@@ -310,9 +351,11 @@ fn convert_message(role: &str, content: &Value) -> Result<Vec<Value>> {
                 }
             }
             "tool_use" => {
-                // 仅 assistant 允许
                 if role == "assistant" {
                     let id = part.get("id").and_then(|v| v.as_str()).unwrap_or("");
+                    if !id.is_empty() {
+                        new_tool_use_ids.push(id.to_string());
+                    }
                     let name = part.get("name").and_then(|v| v.as_str()).unwrap_or("");
                     let args = part
                         .get("input")
@@ -343,26 +386,18 @@ fn convert_message(role: &str, content: &Value) -> Result<Vec<Value>> {
         }
     }
 
-    let mut out = Vec::new();
-    // tool_result 先发(紧跟上一轮 assistant 的 tool_calls)
-    out.extend(tool_results);
-
-    // assistant:单消息合并 content + reasoning_content + tool_calls
+    let mut main_msg = None;
     if role == "assistant" {
         let has_content = !content_items.is_empty();
         let has_reasoning = !reasoning_parts.is_empty();
         let has_tool_calls = !tool_calls.is_empty();
         if has_content || has_reasoning || has_tool_calls {
             let mut msg = json!({"role": "assistant"});
-
-            // 对齐 shouldOmitContent:tool_calls 存在且无有效文本时,省略 content 键
-            // (避免 Moonshot 等严格上游 400 Bad Request)
             if has_tool_calls && !has_content {
-                // 省略 content 键:不写任何 content 字段
+                // 省略 content 键
             } else if has_content {
                 msg["content"] = json!(content_items);
             } else {
-                // 无 tool_calls 且无 content:空串兜底(纯 reasoning 回合)
                 msg["content"] = json!("");
             }
 
@@ -372,20 +407,17 @@ fn convert_message(role: &str, content: &Value) -> Result<Vec<Value>> {
             if has_tool_calls {
                 msg["tool_calls"] = json!(tool_calls);
             }
-            out.push(msg);
+            main_msg = Some(msg);
         }
     } else {
-        // 非 assistant(通常 user):纯 content。tool_result 抽出的图片追加到
-        // parts 尾部(对齐 sub2api anthropicUserToChatMessages:先收集原 text/
-        // image blocks,再 append toolResultImageParts;图片存在才用数组形态)
-        let mut items = content_items.clone();
+        let mut items = content_items;
         items.extend(deferred_images);
         if !items.is_empty() {
-            out.push(json!({"role": role, "content": items}));
+            main_msg = Some(json!({"role": role, "content": items}));
         }
     }
 
-    Ok(out)
+    Ok((tool_results, main_msg, new_tool_use_ids))
 }
 
 /// tool_result content → (tool 消息 content, 图片 parts)。
@@ -1343,5 +1375,45 @@ mod tests {
             msg.get("content").is_none(),
             "仅 reasoning 不阻止 content 省略"
         );
+    }
+
+    #[test]
+    fn test_tool_pairing_across_system_message() {
+        let mut body = json!({
+            "model": "test",
+            "messages": [
+                {"role": "assistant", "content": [
+                    {"type": "tool_use", "id": "t1", "name": "f1", "input": {}},
+                    {"type": "tool_use", "id": "t2", "name": "f2", "input": {}}
+                ]},
+                {"role": "system", "content": "Usage note: 50% remaining"},
+                {"role": "user", "content": [
+                    {"type": "tool_result", "tool_use_id": "t2", "content": "res2"},
+                    {"type": "tool_result", "tool_use_id": "t1", "content": "res1"},
+                    {"type": "text", "text": "next instruction"}
+                ]}
+            ]
+        });
+        convert_to_openai_chat(&mut body, "gpt").unwrap();
+        let msgs = body["messages"].as_array().unwrap();
+        // 验证时序:
+        // 0: assistant(tool_calls: [t1, t2])
+        // 1: tool(t1) - 对齐重排到前
+        // 2: tool(t2)
+        // 3: user(system-reminder) - 延后发射
+        // 4: user(next instruction) - 正文
+        assert_eq!(msgs.len(), 5);
+        assert_eq!(msgs[0]["role"], "assistant");
+        assert_eq!(msgs[1]["role"], "tool");
+        assert_eq!(msgs[1]["tool_call_id"], "t1");
+        assert_eq!(msgs[2]["role"], "tool");
+        assert_eq!(msgs[2]["tool_call_id"], "t2");
+        assert_eq!(msgs[3]["role"], "user");
+        assert!(msgs[3]["content"][0]["text"]
+            .as_str()
+            .unwrap()
+            .contains("<system-reminder>"));
+        assert_eq!(msgs[4]["role"], "user");
+        assert_eq!(msgs[4]["content"][0]["text"], "next instruction");
     }
 }
