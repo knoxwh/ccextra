@@ -297,6 +297,7 @@ chat UA 从 `claude-cli` 换成 `grok-shell`，网关按 UA 分流时旧前缀 m
 1. **取消 GPT/Codex 工具输出强制截断**：原有 10KB `truncate_middle_chars` 截断切碎 Claude Code `Read`/`Grep` 输出导致模型陷入死循环；对齐 CPA 移除对 GPT 工具输出截断（仅 Grok 保留 40KB 限制）。
 2. **Replay Cache 捕获流式推理摘要**：`StreamReplayExtractor` 补齐 `response.reasoning_summary_text.delta` 监听，确保 GPT responses 推理摘要完整沉淀至服务端缓存。
 3. **补充会话亲和头**：GPT 出站请求注入 `X-Codex-Window-Id: <session_id>:0` 与 `Originator: codex_cli_rs`。
+4. **统一扩展 GPT/Codex 判定范围**：`is_gpt_upstream` 与 `is_gpt_model` 统一覆盖 `gpt`、`openai`、`codex` 以及 `o1/o3/o4` 前缀，并统一 `Session-Id`、`Thread-Id` 形式对齐官方规范。
 
 ## 14. 依赖升级记录
 

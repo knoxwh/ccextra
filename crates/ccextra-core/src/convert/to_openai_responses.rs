@@ -67,9 +67,16 @@ Keep intermediate progress updates short and infrequent. The final message must 
 
 NEVER coin acronyms, shorthand, or technical-sounding labels of your own. ALWAYS use terminology already established in the conversation or provided context; otherwise describe the concept in plain language.";
 
-/// 判定上游是否为 GPT 模型(仅按模型名前缀,对齐约定:responses 协议 + gpt*)
-fn is_gpt_upstream(upstream_model: &str) -> bool {
-    upstream_model.to_ascii_lowercase().starts_with("gpt")
+/// 判定上游是否为 GPT/Codex 模型(对齐 CPA signature_provider_from_model_name:
+/// 包含 gpt/openai/codex,或以 o1/o3/o4 前缀开头)
+pub fn is_gpt_upstream(upstream_model: &str) -> bool {
+    let lower = upstream_model.to_ascii_lowercase();
+    lower.contains("gpt")
+        || lower.contains("openai")
+        || lower.contains("codex")
+        || lower.starts_with("o1")
+        || lower.starts_with("o3")
+        || lower.starts_with("o4")
 }
 
 /// 判定上游是否为 Grok 模型(按模型名包含 grok)
@@ -1139,11 +1146,17 @@ mod tests {
 
     #[test]
     fn test_gpt_match_case_insensitive() {
-        // 前缀判定不区分大小写
+        // 判定包含 gpt/openai/codex 或 o1/o3/o4 前缀
         assert!(is_gpt_upstream("GPT-5.6-terra"));
         assert!(is_gpt_upstream("gpt-5.6-terra"));
+        assert!(is_gpt_upstream("openai/gpt-5.6"));
+        assert!(is_gpt_upstream("codex-mini"));
+        assert!(is_gpt_upstream("o3-mini"));
+        assert!(is_gpt_upstream("o1-preview"));
+        assert!(is_gpt_upstream("o4-high"));
         assert!(!is_gpt_upstream("claude-opus-5"));
-        assert!(!is_gpt_upstream("o3-mini"));
+        assert!(!is_gpt_upstream("grok-4.6"));
+        assert!(!is_gpt_upstream("gemini-2.5-pro"));
     }
 
     #[test]

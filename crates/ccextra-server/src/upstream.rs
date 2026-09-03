@@ -62,9 +62,9 @@ fn endpoint_path(protocol: Protocol, is_stream: bool) -> String {
 const GROK_TOKEN_AUTH: &str = "xai-grok-cli";
 const GROK_CLIENT_IDENTIFIER: &str = "grok-shell";
 
-/// 模型名是否按 *gpt* 匹配(大小写不敏感,含前缀/中缀/后缀)
-fn is_gpt_model(upstream_model: &str) -> bool {
-    upstream_model.to_ascii_lowercase().contains("gpt")
+/// 模型名是否为 GPT/Codex 模型(对齐 ccextra_core::convert::to_openai_responses::is_gpt_upstream)
+pub(crate) fn is_gpt_model(upstream_model: &str) -> bool {
+    ccextra_core::convert::to_openai_responses::is_gpt_upstream(upstream_model)
 }
 
 /// 模型名是否按 *grok* 匹配(大小写不敏感)
@@ -263,16 +263,16 @@ impl UpstreamClient {
         for (name, value) in stream_headers(protocol, is_stream) {
             req = req.header(name, value);
         }
-        // responses 协议:session-id/thread-id 始终带;Originator 仅 *gpt*
+        // responses 协议:Session-Id/Thread-Id 始终带;Originator 仅 *gpt*
         if matches!(protocol, Protocol::OpenAiResponses) {
             if let Some(sid) = session_id {
-                req = req.header("session-id", sid);
+                req = req.header("Session-Id", sid);
                 if is_gpt_model(upstream_model) {
                     req = req.header("X-Codex-Window-Id", format!("{sid}:0"));
                 }
             }
             if let Some(tid) = thread_id {
-                req = req.header("thread-id", tid);
+                req = req.header("Thread-Id", tid);
             }
             if is_gpt_model(upstream_model) {
                 req = req.header("Originator", "codex_cli_rs");
@@ -421,6 +421,9 @@ mod tests {
         assert!(is_gpt_model("gpt-5.6-terra"));
         assert!(is_gpt_model("ck-gpt-5.6"));
         assert!(is_gpt_model("openai/GPT-5"));
+        assert!(is_gpt_model("codex-mini"));
+        assert!(is_gpt_model("o3-mini"));
+        assert!(is_gpt_model("o1-preview"));
         assert!(!is_gpt_model("grok-4.6"));
         assert!(!is_gpt_model("claude-opus-5"));
         assert!(is_grok_model("grok-4.6"));

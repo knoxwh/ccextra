@@ -51,7 +51,7 @@ use tokio::sync::RwLock;
 
 use crate::sse::replay_cache::StreamReplayExtractor;
 use crate::sse::SseStreamPin;
-use crate::upstream::{is_grok_model, UpstreamClient, UpstreamResponse};
+use crate::upstream::{is_gpt_model, is_grok_model, UpstreamClient, UpstreamResponse};
 
 /// 配置重载闭包类型
 pub type ReloadFn =
@@ -845,9 +845,7 @@ async fn handle_messages(
     }
 
     // GPT/Codex 在最终 model 与 payload 落定后校验 reasoning 回放信封。
-    if matches!(route.protocol, Protocol::OpenAiResponses)
-        && outbound_model.to_ascii_lowercase().starts_with("gpt")
-    {
+    if matches!(route.protocol, Protocol::OpenAiResponses) && is_gpt_model(&outbound_model) {
         if let Some(obj) = body_json.as_object_mut() {
             for key in [
                 "previous_response_id",
