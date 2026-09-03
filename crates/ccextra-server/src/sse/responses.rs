@@ -1685,20 +1685,22 @@ mod tests {
     #[test]
     fn test_usage_maps_cache_write_tokens() {
         // 对齐 CPA 893abbab:cache_write_tokens → cache_creation_input_tokens,
-        // 0 时不下发该键
+        // 0 时不下发该键;Anthropic 互斥语义:input 扣除 cached 与 cache_write
         let mut r = ResponsesRelay::new(None);
         r.process(&created());
         let out = r.process(&ev(
             r#"{"type":"response.completed","response":{"id":"r1","output":[],
                 "usage":{"input_tokens":100,"output_tokens":5,
-                         "input_tokens_details":{"cached_tokens":80,"cache_write_tokens":150}}}}"#,
+                         "input_tokens_details":{"cached_tokens":80,"cache_write_tokens":15}}}}"#,
         ));
         let delta = out
             .iter()
             .find(|b| b.starts_with(b"event: message_delta"))
             .unwrap();
         let v = frame_data(delta);
-        assert_eq!(v["usage"]["cache_creation_input_tokens"], 150);
+        assert_eq!(v["usage"]["input_tokens"], 5); // 100 - 80 - 15
+        assert_eq!(v["usage"]["cache_read_input_tokens"], 80);
+        assert_eq!(v["usage"]["cache_creation_input_tokens"], 15);
 
         let mut r = ResponsesRelay::new(None);
         r.process(&created());
@@ -1712,6 +1714,7 @@ mod tests {
             .find(|b| b.starts_with(b"event: message_delta"))
             .unwrap();
         let v = frame_data(delta);
+        assert_eq!(v["usage"]["input_tokens"], 20); // 100 - 80 - 0
         assert!(v["usage"].get("cache_creation_input_tokens").is_none());
     }
 

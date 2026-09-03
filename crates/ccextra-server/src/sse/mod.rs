@@ -148,9 +148,9 @@ pub fn extract_usage_chat(usage: &serde_json::Value) -> (i64, i64, i64) {
 }
 
 /// 从 OpenAI Responses usage 提取四元组(input, output, cached, cache_write),
-/// cached 已从 input 扣除。
+/// cached 与 cache_write 均已从 input 扣除(对齐 Anthropic 互斥分项语义:
+/// total = input_tokens + cache_read + cache_creation)。
 ///
-/// 对齐 extractResponsesUsage:input_tokens - cached (if > 0);
 /// cache_write 先取 cache_write_tokens,再兜底 cache_creation_tokens(对齐 CPA 893abbab)。
 pub fn extract_usage_responses(usage: &serde_json::Value) -> (i64, i64, i64, i64) {
     let mut input = usage
@@ -177,6 +177,9 @@ pub fn extract_usage_responses(usage: &serde_json::Value) -> (i64, i64, i64, i64
                 .and_then(|v| v.as_i64())
         })
         .unwrap_or(0);
+    if cache_write > 0 {
+        input = (input - cache_write).max(0);
+    }
     (input, output, cached, cache_write)
 }
 
@@ -276,5 +279,22 @@ mod tests {
         assert_eq!(input, 100); // 150 - 50
         assert_eq!(output, 30);
         assert_eq!(cached, 50);
+    }
+
+    #[test]
+    fn test_extract_usage_responses_subtracts_cached_and_write() {
+        let usage = json!({
+            "input_tokens": 100,
+            "output_tokens": 10,
+            "input_tokens_details": {
+                "cached_tokens": 40,
+                "cache_write_tokens": 50
+            }
+        });
+        let (input, output, cached, cache_write) = extract_usage_responses(&usage);
+        assert_eq!(input, 10); // 100 - 40 - 50
+        assert_eq!(output, 10);
+        assert_eq!(cached, 40);
+        assert_eq!(cache_write, 50);
     }
 }

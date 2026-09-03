@@ -492,7 +492,8 @@ mod tests {
 
     #[test]
     fn test_responses_nonstream_cache_write_tokens() {
-        // 对齐 CPA 893abbab:cache_write_tokens → cache_creation_input_tokens,0 时不发
+        // 对齐 CPA 893abbab:cache_write_tokens → cache_creation_input_tokens,0 时不发;
+        // Anthropic 互斥语义:input_tokens 扣除 cached 与 cache_write
         let body = json!({
             "type": "response.completed",
             "response": {
@@ -501,11 +502,13 @@ mod tests {
                 "output": [{"type": "message",
                     "content": [{"type": "output_text", "text": "hi"}]}],
                 "usage": {"input_tokens": 100, "output_tokens": 5,
-                    "input_tokens_details": {"cached_tokens": 80, "cache_write_tokens": 150}}
+                    "input_tokens_details": {"cached_tokens": 80, "cache_write_tokens": 15}}
             }
         });
         let out = responses_to_anthropic(&body, None).unwrap();
-        assert_eq!(out["usage"]["cache_creation_input_tokens"], 150);
+        assert_eq!(out["usage"]["input_tokens"], 5); // 100 - 80 - 15
+        assert_eq!(out["usage"]["cache_read_input_tokens"], 80);
+        assert_eq!(out["usage"]["cache_creation_input_tokens"], 15);
 
         let body = json!({
             "type": "response.completed",
@@ -519,6 +522,7 @@ mod tests {
             }
         });
         let out = responses_to_anthropic(&body, None).unwrap();
+        assert_eq!(out["usage"]["input_tokens"], 20); // 100 - 80 - 0
         assert!(out["usage"].get("cache_creation_input_tokens").is_none());
     }
 
