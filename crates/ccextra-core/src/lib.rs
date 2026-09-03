@@ -17,7 +17,10 @@ pub mod secret;
 pub mod session;
 pub mod thinking;
 
-pub use doom_loop::{is_confident, parse_trigger, DoomLoopSignal, DoomLoopSignalKind};
+pub use doom_loop::{
+    inject_loop_recovery_reminder_if_needed, is_confident, parse_trigger, DoomLoopSignal,
+    DoomLoopSignalKind, RECOVERY_REMINDER,
+};
 pub use route::{Protocol, RouteDecision};
 
 /// 判断 antigravity 模型是否使用 reasoning replay(对齐 CPA

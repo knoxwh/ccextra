@@ -2,6 +2,8 @@
 //
 // 触发器解析 + 置信判定纯函数,server 层调用后决定是否中断流。
 
+pub const RECOVERY_REMINDER: &str = "<system_reminder>Your messages have been flagged as looping. Your response has been flagged as repeating the same text pattern. Avoid excessive repetition. If you are having trouble ask the user for guidance.</system_reminder>";
+
 /// 触发器类型
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum DoomLoopSignalKind {
@@ -95,6 +97,128 @@ pub fn is_confident(signal: &DoomLoopSignal) -> bool {
 
     signal.channel == THINKING_CHANNEL
         && matches!(signal.kind, DoomLoopSignalKind::TailRepetition(t) if t <= MAX_THRESHOLD)
+}
+
+/// 递归规范化 JSON 对象的键序（对齐 grok-build canonicalize_json）
+pub fn canonicalize_json(value: serde_json::Value) -> serde_json::Value {
+    match value {
+        serde_json::Value::Object(map) => {
+            let mut entries: Vec<_> = map.into_iter().collect();
+            entries.sort_by(|(a, _), (b, _)| a.cmp(b));
+            serde_json::Value::Object(
+                entries
+                    .into_iter()
+                    .map(|(k, v)| (k, canonicalize_json(v)))
+                    .collect(),
+            )
+        }
+        serde_json::Value::Array(items) => {
+            serde_json::Value::Array(items.into_iter().map(canonicalize_json).collect())
+        }
+        other => other,
+    }
+}
+
+/// 从 tool_use 计算单步签名字符串（对齐 grok-build step_signature）
+fn tool_step_signature(tool_calls: &[(&str, &serde_json::Value)]) -> String {
+    let mut parts: Vec<String> = tool_calls
+        .iter()
+        .map(|(name, input)| {
+            let args = canonicalize_json((*input).clone()).to_string();
+            format!("{}\u{1f}{}", name, args)
+        })
+        .collect();
+    parts.sort();
+    parts.join("\u{1e}")
+}
+
+/// 提取 assistant 消息中的工具调用 (name, input) 列表
+fn extract_assistant_tool_calls(msg: &serde_json::Value) -> Vec<(&str, &serde_json::Value)> {
+    let mut calls = Vec::new();
+    if let Some(parts) = msg.get("content").and_then(|c| c.as_array()) {
+        for part in parts {
+            if part.get("type").and_then(|t| t.as_str()) == Some("tool_use") {
+                let name = part.get("name").and_then(|n| n.as_str()).unwrap_or("");
+                let input = part.get("input").unwrap_or(&serde_json::Value::Null);
+                calls.push((name, input));
+            }
+        }
+    }
+    calls
+}
+
+/// 检测最近的 assistant 消息是否存在连续重复的工具调用（跨轮 dead loop），
+/// 若重复则在尾部 user 消息中注入官方 grok-build RECOVERY_REMINDER。
+/// 返回是否注入了提醒。
+pub fn inject_loop_recovery_reminder_if_needed(body: &mut serde_json::Value) -> bool {
+    let Some(messages) = body.get_mut("messages").and_then(|m| m.as_array_mut()) else {
+        return false;
+    };
+    if messages.len() < 3 {
+        return false;
+    }
+
+    // 检查倒数第二条消息是否为 assistant（最后一条应是 user，带 tool_result 或新输入）
+    let last_user_idx = messages.len() - 1;
+    if messages[last_user_idx].get("role").and_then(|r| r.as_str()) != Some("user") {
+        return false;
+    }
+
+    // 从后往前收集最近几个 assistant 消息的工具调用签名
+    let mut assistant_signatures: Vec<String> = Vec::new();
+    for msg in messages.iter().rev() {
+        if msg.get("role").and_then(|r| r.as_str()) == Some("assistant") {
+            let calls = extract_assistant_tool_calls(msg);
+            if !calls.is_empty() {
+                assistant_signatures.push(tool_step_signature(&calls));
+            } else {
+                break;
+            }
+            if assistant_signatures.len() >= 2 {
+                break;
+            }
+        }
+    }
+
+    if assistant_signatures.len() < 2 {
+        return false;
+    }
+
+    // 若最近两个 assistant 轮次的工具调用签名完全一致，判定为陷入循环
+    if assistant_signatures[0] != assistant_signatures[1] {
+        return false;
+    }
+
+    // 检查最新 user 消息中是否已经注入过该 RECOVERY_REMINDER，避免重复堆叠
+    let last_user_msg = &mut messages[last_user_idx];
+    if let Some(content_str) = last_user_msg.get("content").and_then(|c| c.as_str()) {
+        if content_str.contains("Your messages have been flagged as looping") {
+            return false;
+        }
+        let new_text = format!("{}\n\n{}", content_str, RECOVERY_REMINDER);
+        last_user_msg["content"] = serde_json::Value::String(new_text);
+        return true;
+    }
+
+    if let Some(parts) = last_user_msg
+        .get_mut("content")
+        .and_then(|c| c.as_array_mut())
+    {
+        for part in parts.iter() {
+            if let Some(t) = part.get("text").and_then(|v| v.as_str()) {
+                if t.contains("Your messages have been flagged as looping") {
+                    return false;
+                }
+            }
+        }
+        parts.push(serde_json::json!({
+            "type": "text",
+            "text": RECOVERY_REMINDER,
+        }));
+        return true;
+    }
+
+    false
 }
 
 #[cfg(test)]
@@ -222,5 +346,41 @@ mod tests {
         let label = "low_logprob@thinking";
         let sig = parse_trigger(label);
         assert!(!is_confident(&sig));
+    }
+
+    #[test]
+    fn test_inject_loop_recovery_reminder() {
+        let mut body = serde_json::json!({
+            "messages": [
+                {
+                    "role": "assistant",
+                    "content": [{"type": "tool_use", "id": "call_1", "name": "Read", "input": {"file_path": "/tmp/test"}}]
+                },
+                {
+                    "role": "user",
+                    "content": [{"type": "tool_result", "tool_use_id": "call_1", "content": ""}]
+                },
+                {
+                    "role": "assistant",
+                    "content": [{"type": "tool_use", "id": "call_2", "name": "Read", "input": {"file_path": "/tmp/test"}}]
+                },
+                {
+                    "role": "user",
+                    "content": [{"type": "tool_result", "tool_use_id": "call_2", "content": ""}]
+                }
+            ]
+        });
+
+        assert!(inject_loop_recovery_reminder_if_needed(&mut body));
+        let msgs = body["messages"].as_array().unwrap();
+        let last_user_content = &msgs[3]["content"];
+        assert_eq!(last_user_content[1]["type"], "text");
+        assert!(last_user_content[1]["text"]
+            .as_str()
+            .unwrap()
+            .contains("Your messages have been flagged as looping"));
+
+        // 再次检测不应重复注入
+        assert!(!inject_loop_recovery_reminder_if_needed(&mut body));
     }
 }
