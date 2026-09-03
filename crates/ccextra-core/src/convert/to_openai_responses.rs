@@ -29,30 +29,6 @@ use super::signature::{
 };
 use super::Result;
 
-/// GPT 上游追加的行为适配块(字节固定,缓存前缀稳定)。
-///
-/// 入站系统词构造自 Claude Code(CLAUDE.md 等),不是 GPT 原生运行环境;
-/// 本块以 codex gpt prompt 的结构为骨架(gpt_5_2_prompt 的身份/环境/执行/输出),
-/// 改造成 Claude Code agent loop 语义,明确工具边界与权限,抑制冗长与过度探索。
-/// 英文固定文本,不配置化;冲突时用户指令(CLAUDE.md)优先,本块只补缺省。
-const GPT_ADAPTER_BLOCK: &str = "\
-You are the model operating inside Claude Code's agent loop, not a standalone Codex session. The user interacts with Claude Code through this loop.
-
-## Operating environment
-Treat the supplied system instructions, CLAUDE.md, user instructions, declared tools, permission decisions, and tool results as your complete operating environment. User and project instructions take precedence over this block.
-Your capabilities are exactly the tools declared in the current request: the built-in Claude Code tools (Read, Edit, Write, Bash, LSP, Agent, WebFetch, WebSearch, TaskCreate/Update/List, and others) plus any additional declared tools. Use only declared tools and follow their schemas. Do not assume any additional tool or capability is available. Do not claim an action succeeded until its tool result confirms it.
-For a brand-new task with no prior context, be ambitious; when working in an existing codebase, do exactly what the user asks with surgical precision and keep changes minimal and consistent with the codebase style.
-
-## Working style
-You are a coding agent: keep going until the task is fully resolved end-to-end within the current turn, then yield. Solve problems at the root cause rather than surface-level patches. Do not fix unrelated bugs or add unrequested work; you may mention them in the final message.
-You may be in a dirty git worktree. Never revert existing changes you did not make. Never use destructive git commands (e.g. git reset --hard, git checkout --) unless the user explicitly requests them. Prefer git log / git blame for history context.
-Parallelize independent tool calls whenever possible, especially reads. When searching files from Bash, prefer rg over grep when available. Run tests or builds only to verify your own change, not to explore.
-
-## Output
-Be concise. Default final answers under 10 lines; small changes 2-5 sentences; multi-file work 1-2 bullets per file. Never dump file contents, before/after pairs, or entire methods unless explicitly asked; reference file paths instead.
-Don't expose extended reasoning — show conclusions, not the thought process.
-Stop when the task is done: report result plus one logical next step, then yield.";
-
 /// Grok 上游追加的行为适配块(字节固定,缓存前缀稳定)。
 ///
 /// 直接对齐官方 grok-build prompt.md 核心约束,仅替换环境声明为 Claude Code。
@@ -101,9 +77,9 @@ fn is_grok_upstream(upstream_model: &str) -> bool {
     upstream_model.to_ascii_lowercase().contains("grok")
 }
 
-/// 判定上游是否需要注入 developer message + adapter block(GPT 或 Grok)
+/// 判定上游是否需要注入 developer message + adapter block(仅 Grok 保留适配块)
 fn needs_adapter_block(upstream_model: &str) -> bool {
-    is_gpt_upstream(upstream_model) || is_grok_upstream(upstream_model)
+    is_grok_upstream(upstream_model)
 }
 
 /// thinking signature → 可回放给目标上游的 reasoning.encrypted_content
@@ -314,6 +290,35 @@ fn image_to_data_url(part: &Value) -> Option<String> {
     Some(format!("data:{media_type};base64,{data}"))
 }
 
+/// document block → input_file(对齐 CPA appendDocumentContent:
+/// 仅支持 base64 + application/pdf,输出 type=input_file,filename=document.pdf)
+fn document_to_input_file(part: &Value) -> Option<Value> {
+    let source = part.get("source")?;
+    if source.get("type").and_then(|v| v.as_str()) != Some("base64") {
+        return None;
+    }
+    let media_type = source
+        .get("media_type")
+        .or_else(|| source.get("mime_type"))
+        .and_then(|v| v.as_str())
+        .map(str::trim)?;
+    if !media_type.eq_ignore_ascii_case("application/pdf") {
+        return None;
+    }
+    let data = source
+        .get("data")
+        .or_else(|| source.get("base64"))
+        .and_then(|v| v.as_str())?;
+    if data.is_empty() {
+        return None;
+    }
+    Some(json!({
+        "type": "input_file",
+        "file_data": format!("data:{media_type};base64,{data}"),
+        "filename": "document.pdf"
+    }))
+}
+
 /// Claude custom 工具 tool_use.input → 字符串(对齐 unwrapCustomToolInput)
 ///
 /// 响应侧把 custom 工具字符串 input 包成 {"input": str} 对象发回;
@@ -460,13 +465,17 @@ pub fn convert_to_openai_responses(
     upstream_model: &str,
 ) -> Result<HashMap<String, String>> {
     // --- system → instructions / developer message ---
+    // 对齐 CPA convertClaudeRequestToCodex:
+    // GPT/Responses 上游将 system 作为 developer message 放入 input[] (instructions 留空)
+    // Grok 上游将 system 配合 GROK_ADAPTER_BLOCK 作为 developer message
+    // 其余 responses 上游保持 system → instructions
     let system = body
         .get("system")
         .map(|system| system_to_instructions_text(system, upstream_model))
         .unwrap_or_default();
     let gpt_upstream = is_gpt_upstream(upstream_model);
     let needs_adapter = needs_adapter_block(upstream_model);
-    let instructions = if needs_adapter {
+    let instructions = if gpt_upstream || needs_adapter {
         String::new()
     } else {
         system.clone()
@@ -477,18 +486,20 @@ pub fn convert_to_openai_responses(
         "instructions": instructions,
         "input": [],
     });
-    if needs_adapter {
+    if gpt_upstream {
+        if !system.is_empty() {
+            openai["input"].as_array_mut().unwrap().push(json!({
+                "type": "message",
+                "role": "developer",
+                "content": [{"type": "input_text", "text": system}]
+            }));
+        }
+    } else if needs_adapter {
         let mut developer = system;
         if !developer.is_empty() {
             developer.push_str("\n\n");
         }
-        // GPT 使用 GPT_ADAPTER_BLOCK, Grok 使用 GROK_ADAPTER_BLOCK
-        let adapter_block = if gpt_upstream {
-            GPT_ADAPTER_BLOCK
-        } else {
-            GROK_ADAPTER_BLOCK
-        };
-        developer.push_str(adapter_block);
+        developer.push_str(GROK_ADAPTER_BLOCK);
         openai["input"].as_array_mut().unwrap().push(json!({
             "type": "message",
             "role": "developer",
@@ -673,6 +684,11 @@ pub fn convert_to_openai_responses(
                     "image" => {
                         if let Some(url) = image_to_data_url(part) {
                             content_items.push(json!({"type": "input_image", "image_url": url}));
+                        }
+                    }
+                    "document" => {
+                        if let Some(doc) = document_to_input_file(part) {
+                            content_items.push(doc);
                         }
                     }
                     "tool_use" => {
@@ -1034,8 +1050,8 @@ mod tests {
     }
 
     #[test]
-    fn test_gpt_system_and_adapter_go_to_developer_message() {
-        // Codex 线将 system 与 Claude Code 适配块作为 developer 输入，instructions 留空。
+    fn test_gpt_system_goes_to_developer_message() {
+        // Codex 线将 system 作为 developer 输入，instructions 留空，且不注入阉割 adapter
         let mut body = json!({
             "model": "test",
             "system": "You are helpful",
@@ -1045,14 +1061,11 @@ mod tests {
         assert_eq!(body["instructions"], "");
         assert_eq!(body["input"][0]["type"], "message");
         assert_eq!(body["input"][0]["role"], "developer");
-        assert_eq!(
-            body["input"][0]["content"][0]["text"],
-            format!("You are helpful\n\n{}", GPT_ADAPTER_BLOCK)
-        );
+        assert_eq!(body["input"][0]["content"][0]["text"], "You are helpful");
     }
 
     #[test]
-    fn test_gpt_adapter_creates_developer_message_without_system() {
+    fn test_gpt_without_system_no_developer_message() {
         let mut body = json!({
             "model": "test",
             "messages": [{"role": "user", "content": "hi"}]
@@ -1060,10 +1073,9 @@ mod tests {
         convert_to_openai_responses(&mut body, "gpt-5.6-sol").unwrap();
         assert_eq!(body["instructions"], "");
         let input = body["input"].as_array().unwrap();
-        assert_eq!(input[0]["role"], "developer");
-        assert_eq!(input[0]["content"][0]["text"], GPT_ADAPTER_BLOCK);
-        assert_eq!(input[1]["role"], "user");
-        assert_eq!(input[1]["content"][0]["text"], "hi");
+        assert_eq!(input.len(), 1);
+        assert_eq!(input[0]["role"], "user");
+        assert_eq!(input[0]["content"][0]["text"], "hi");
     }
 
     #[test]
@@ -1123,50 +1135,6 @@ mod tests {
         assert!(GROK_ADAPTER_BLOCK.contains("in complete sentences"));
         assert!(GROK_ADAPTER_BLOCK.contains("NEVER coin acronyms"));
         assert!(GROK_ADAPTER_BLOCK.contains("Always respond in Simplified Chinese"));
-    }
-
-    #[test]
-    fn test_adapter_block_describes_claude_code_environment() {
-        assert!(GPT_ADAPTER_BLOCK
-            .contains("inside Claude Code's agent loop, not a standalone Codex session."));
-        assert!(
-            GPT_ADAPTER_BLOCK.contains("The user interacts with Claude Code through this loop.")
-        );
-        assert!(GPT_ADAPTER_BLOCK.contains("Your capabilities are exactly the tools declared"));
-        assert!(GPT_ADAPTER_BLOCK
-            .contains("Do not assume any additional tool or capability is available."));
-        assert!(GPT_ADAPTER_BLOCK.contains("Read, Edit, Write, Bash, LSP, Agent"));
-        assert!(GPT_ADAPTER_BLOCK
-            .contains("Do not claim an action succeeded until its tool result confirms it."));
-        assert!(GPT_ADAPTER_BLOCK.contains("Never revert existing changes you did not make."));
-        assert!(GPT_ADAPTER_BLOCK.contains("Never use destructive git commands"));
-        assert!(GPT_ADAPTER_BLOCK
-            .contains("Never dump file contents, before/after pairs, or entire methods"));
-    }
-
-    #[test]
-    fn test_gpt_adapter_supports_declared_apply_patch() {
-        let mut body = json!({
-            "model": "test",
-            "messages": [],
-            "tool_choice": {"type": "tool", "name": "apply_patch"},
-            "tools": [{"type": "custom", "name": "apply_patch", "description": "d"}]
-        });
-
-        convert_to_openai_responses(&mut body, "gpt-5.6-terra").unwrap();
-
-        // adapter 现在在 developer message 里
-        let developer = &body["input"][0];
-        assert_eq!(developer["role"], "developer");
-        let text = developer["content"][0]["text"].as_str().unwrap();
-        assert!(text.contains("inside Claude Code's agent loop, not a standalone Codex session."));
-        assert!(text.contains("built-in Claude Code tools (Read, Edit, Write, Bash"));
-        assert!(!text.contains("Never use apply_patch"));
-        assert!(!text.contains("Edit files only with the tools Claude Code provides"));
-        assert_eq!(body["tools"][0]["type"], "custom");
-        assert_eq!(body["tools"][0]["name"], "apply_patch");
-        assert_eq!(body["tool_choice"]["type"], "custom");
-        assert_eq!(body["tool_choice"]["name"], "apply_patch");
     }
 
     #[test]
@@ -1554,10 +1522,9 @@ mod tests {
         });
         convert_to_openai_responses(&mut body, "gpt-5.6-terra").unwrap();
         let input = body["input"].as_array().unwrap();
-        assert_eq!(input.len(), 2);
-        assert_eq!(input[0]["role"], "developer");
-        assert_eq!(input[1]["type"], "message");
-        assert_eq!(input[1]["content"][0]["text"], "answer");
+        assert_eq!(input.len(), 1);
+        assert_eq!(input[0]["type"], "message");
+        assert_eq!(input[0]["content"][0]["text"], "answer");
         // 无签名 thinking 被丢弃(无 reasoning 项)
         assert!(!input.iter().any(|i| i["type"] == "reasoning"));
     }
@@ -1577,12 +1544,11 @@ mod tests {
             ]
         });
         convert_to_openai_responses(&mut body, "gpt-5.6-terra").unwrap();
-        assert_eq!(body["input"][0]["role"], "developer");
-        assert_eq!(body["input"][1]["type"], "reasoning");
-        assert_eq!(body["input"][1]["encrypted_content"], VALID);
-        assert_eq!(body["input"][1]["summary"], json!([]));
-        assert_eq!(body["input"][2]["type"], "message");
-        assert_eq!(body["input"][2]["content"][0]["text"], "answer");
+        assert_eq!(body["input"][0]["type"], "reasoning");
+        assert_eq!(body["input"][0]["encrypted_content"], VALID);
+        assert_eq!(body["input"][0]["summary"], json!([]));
+        assert_eq!(body["input"][1]["type"], "message");
+        assert_eq!(body["input"][1]["content"][0]["text"], "answer");
     }
 
     #[test]
@@ -2130,6 +2096,55 @@ mod tests {
     }
 
     #[test]
+    fn test_document_block_to_input_file() {
+        // 对齐 CPA TestConvertClaudeRequestToCodex_PreservesBase64PDFDocumentContent
+        let mut body = json!({
+            "model": "test",
+            "messages": [{
+                "role": "user",
+                "content": [
+                    {"type": "text", "text": "before"},
+                    {"type": "document", "source": {"type": "base64", "media_type": "application/pdf", "data": "JVBERi0xLjQK"}},
+                    {"type": "text", "text": "after"}
+                ]
+            }]
+        });
+        convert_to_openai_responses(&mut body, "gpt-5.6-sol").unwrap();
+        let content = body["input"][0]["content"].as_array().unwrap();
+        assert_eq!(content.len(), 3);
+        assert_eq!(content[0]["type"], "input_text");
+        assert_eq!(content[0]["text"], "before");
+        assert_eq!(content[1]["type"], "input_file");
+        assert_eq!(
+            content[1]["file_data"],
+            "data:application/pdf;base64,JVBERi0xLjQK"
+        );
+        assert_eq!(content[1]["filename"], "document.pdf");
+        assert_eq!(content[2]["type"], "input_text");
+        assert_eq!(content[2]["text"], "after");
+    }
+
+    #[test]
+    fn test_document_non_pdf_or_non_base64_ignored() {
+        let mut body = json!({
+            "model": "test",
+            "messages": [{
+                "role": "user",
+                "content": [
+                    {"type": "document", "source": {"type": "url", "url": "https://example.com/doc.pdf"}},
+                    {"type": "document", "source": {"type": "base64", "media_type": "text/plain", "data": "aGVsbG8="}},
+                    {"type": "text", "text": "only text"}
+                ]
+            }]
+        });
+        convert_to_openai_responses(&mut body, "gpt-5.6-sol").unwrap();
+        let content = body["input"][0]["content"].as_array().unwrap();
+        assert_eq!(content.len(), 1);
+        assert_eq!(content[0]["type"], "input_text");
+        assert_eq!(content[0]["text"], "only text");
+    }
+
+    #[test]
     fn test_tool_result_array_output() {
         let mut body = json!({
             "model": "test",
@@ -2270,8 +2285,7 @@ mod tests {
         });
         convert_to_openai_responses(&mut body, "gpt-5").unwrap();
         let input = body["input"].as_array().unwrap();
-        assert_eq!(input.len(), 1);
-        assert_eq!(input[0]["role"], "developer");
+        assert_eq!(input.len(), 0);
     }
 
     #[test]
@@ -2287,10 +2301,9 @@ mod tests {
             ]
         });
         convert_to_openai_responses(&mut body, "gpt-5").unwrap();
-        assert_eq!(body["input"].as_array().unwrap().len(), 2);
-        assert_eq!(body["input"][0]["role"], "developer");
-        assert_eq!(body["input"][1]["type"], "message");
-        assert_eq!(body["input"][1]["content"][0]["text"], "result");
+        assert_eq!(body["input"].as_array().unwrap().len(), 1);
+        assert_eq!(body["input"][0]["type"], "message");
+        assert_eq!(body["input"][0]["content"][0]["text"], "result");
     }
 
     #[test]
@@ -2306,8 +2319,7 @@ mod tests {
         });
         convert_to_openai_responses(&mut body, "gpt-5").unwrap();
         let input = body["input"].as_array().unwrap();
-        assert_eq!(input.len(), 1);
-        assert_eq!(input[0]["role"], "developer");
+        assert_eq!(input.len(), 0);
     }
 
     #[test]
