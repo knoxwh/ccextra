@@ -58,7 +58,7 @@ Claude Code → ccextra:8222
 4. 协议转换（四条 body-to-body + claude 直通，content 形态归一化）
 5. post-transform 归一化（仅 openai 转换路径；chat 随后观测 drift）
 6. payload 参数覆盖（通配匹配，可限定协议）
-7. Responses 工具结果截断（仅归一化启用时；按最终上游模型分流：Grok 40KB + 2KB 预览，非 Grok 10KB）+ drift 观测
+7. drift 观测（Responses 协议在 payload 参数覆盖后观测）
 8. 剥离 prompt_cache_retention（仅 openai 路径）
 9. prompt_cache_key 注入（provider 级开关）+ 诊断落盘（可选）
 10. claude 直通：anthropic-beta 重建 + 身份头透传

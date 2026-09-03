@@ -164,10 +164,6 @@ pub fn normalize_anthropic_pretransform(body: &mut Value) -> NormalizeCounts {
 /// 3. 尾部 reminder 空白归一化(CC 重序列化历史内容时字节漂移 #48734)
 /// 4. 客户端 dateline 归一化(撇号/分隔符隐写还原,对齐 sub2api)
 ///
-/// tool_result 截断不在本管线:策略须按 payload 覆盖后的出站模型判定,
-/// 由 server 层在 apply_payload_overrides 之后单独调用
-/// truncate_tool_results::truncate。
-///
 /// 排序在 rstrip 前,两条归一化都落在 drift 检测前。
 pub fn normalize_target_post(body: &mut Value, shape: TargetShape) -> NormalizeCounts {
     let mut counts = NormalizeCounts::default();

@@ -98,7 +98,7 @@ responses 路径下,上游模型名以 `gpt` 开头(不区分大小写)时,拼�
 - gemini/antigravity 路径:同跑 `pretransform` 五模块子集(输入仍是 anthropic 形状),不写 `cachedContent`,不注入 `prompt_cache_key`,跳过 post 归一化与 drift
 
 **post-transform 归一化 / target_post**  
-转换后对目标协议 body 跑的二次归一化:tool_def normalize → sort stabilize → reminder rstrip → volatile strip(对齐 openai 转换后管线)。openai chat 随后观测 drift；responses 在 payload 后按最终 upstream_model 截断 `function_call_output` / `custom_tool_call_output` 的输出（仅 `normalize.enabled`：grok 40KB + 2KB 预览，非 grok 10KB），再观测最终 body。claude 直通与 gemini 路径跳过此步。
+转换后对目标协议 body 跑的二次归一化:tool_def normalize → sort stabilize → reminder rstrip → volatile strip(对齐 openai 转换后管线)。openai chat 随后观测 drift；responses 在 payload 覆盖后观测最终 body。claude 直通与 gemini 路径跳过此步。
 
 **九模块**  
 九个归一化单元:  

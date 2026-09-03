@@ -1,6 +1,4 @@
-// 截断 tool_result 内容，按上游客户端策略分流
-// - GPT:   对齐 codex TruncationPolicy::bytes(10_000):中间截断(保留首尾)
-// - Grok:  对齐 grok-build DEFAULT_TOOL_OUTPUT_BYTES(40KB,2KB 预览 + footer)
+// 截断 tool_result 内容(对齐 codex TruncationPolicy::bytes(10_000):中间截断，保留首尾)
 
 use serde_json::Value;
 
@@ -9,8 +7,6 @@ use serde_json::Value;
 pub enum UpstreamTruncation {
     /// codex 客户端:10KB bytes,中间截断(保留首尾)+ token/行数头
     Codex,
-    /// grok-build 客户端:40KB bytes,2KB 预览 + 指向完整输出的 footer
-    GrokBuild,
 }
 
 impl UpstreamTruncation {
@@ -19,16 +15,6 @@ impl UpstreamTruncation {
         match self {
             // codex 默认 TruncationPolicyConfig::bytes(10_000)
             UpstreamTruncation::Codex => 10_000,
-            // grok-build DEFAULT_TOOL_OUTPUT_BYTES = 40_000
-            UpstreamTruncation::GrokBuild => 40_000,
-        }
-    }
-
-    /// 预览字节数(grok-build PREVIEW_SIZE;codex 无预览概念)
-    fn preview_bytes(&self) -> Option<usize> {
-        match self {
-            UpstreamTruncation::Codex => None,
-            UpstreamTruncation::GrokBuild => Some(2_000),
         }
     }
 }
@@ -87,9 +73,7 @@ fn truncate_middle_chars(s: &str, max_bytes: usize) -> String {
 }
 
 /// 按策略截断文本
-/// - Codex: 中间截断 + token/行数头(对齐 formatted_truncate_text;
-///   头计入预算保证幂等)
-/// - GrokBuild: 2KB 预览 + footer(对齐 grok-build truncate_with_preview)
+/// Codex: 中间截断 + token/行数头(对齐 formatted_truncate_text; 头计入预算保证幂等)
 fn fit_text(text: &str, strategy: UpstreamTruncation) -> String {
     let budget = strategy.budget();
     if text.len() <= budget {
@@ -106,20 +90,11 @@ fn fit_text(text: &str, strategy: UpstreamTruncation) -> String {
             let result = truncate_middle_chars(text, budget.saturating_sub(header.len()));
             format!("{header}{result}")
         }
-        UpstreamTruncation::GrokBuild => {
-            // 对齐 grok-build truncate_with_preview:预览 + footer 报告总字节数
-            let preview = strategy.preview_bytes().unwrap_or(budget);
-            let preview = truncate_utf8_to_bytes(text, preview.min(text.len()));
-            format!(
-                "{preview}\n\n[Output truncated - {} bytes total]",
-                text.len()
-            )
-        }
     }
 }
 
 /// 块数组内单块截断到剩余预算(对齐 codex snippet 路径:无头,纯截断)。
-/// 返回 None 表示剩余预算放不下 marker/footer,应丢弃该块并计入 omitted。
+/// 返回 None 表示剩余预算放不下 marker,应丢弃该块并计入 omitted。
 fn fit_snippet(text: &str, strategy: UpstreamTruncation, budget: usize) -> Option<String> {
     if text.len() <= budget {
         return Some(text.to_string());
@@ -131,20 +106,6 @@ fn fit_snippet(text: &str, strategy: UpstreamTruncation, budget: usize) -> Optio
                 return None;
             }
             Some(truncate_middle_chars(text, budget))
-        }
-        UpstreamTruncation::GrokBuild => {
-            // footer 计入预算:preview 压到 budget - footer 长度内;
-            // 剩余放不下 footer 则丢弃
-            let footer = format!("\n\n[Output truncated - {} bytes total]", text.len());
-            if budget <= footer.len() {
-                return None;
-            }
-            let preview_budget = strategy
-                .preview_bytes()
-                .unwrap_or(budget)
-                .min(budget - footer.len());
-            let preview = truncate_utf8_to_bytes(text, preview_budget.min(text.len()));
-            Some(format!("{preview}{footer}"))
         }
     }
 }
@@ -271,10 +232,6 @@ fn truncate_block_array(blocks: &mut Vec<Value>, strategy: UpstreamTruncation) {
 ///
 /// 处理转换后的 body:`input[]` 里的 `function_call_output` / `custom_tool_call_output`
 /// 项,截断其 `output` 字段(string 或 input_text 块数组)。
-///
-/// 按上游客户端策略分流:
-/// - GPT → Codex(10KB)
-/// - Grok → GrokBuild(40KB + 2KB 预览)
 pub fn truncate(body: &mut Value, strategy: UpstreamTruncation) -> Result<(), String> {
     let input = body
         .get_mut("input")
@@ -305,9 +262,6 @@ mod tests {
     #[test]
     fn test_budgets() {
         assert_eq!(UpstreamTruncation::Codex.budget(), 10_000);
-        assert_eq!(UpstreamTruncation::GrokBuild.budget(), 40_000);
-        assert_eq!(UpstreamTruncation::Codex.preview_bytes(), None);
-        assert_eq!(UpstreamTruncation::GrokBuild.preview_bytes(), Some(2_000));
     }
 
     #[test]
@@ -355,58 +309,6 @@ mod tests {
             "tail must survive: {}",
             &output[..40]
         );
-    }
-
-    #[test]
-    fn test_grok_build_preview_footer() {
-        // grok-build 策略:40KB 预算,超限保留 2KB 预览 + footer
-        let mut body = json!({
-            "input": [
-                {"type": "function_call_output", "call_id": "1", "output": "x".repeat(50_000)}
-            ]
-        });
-
-        truncate(&mut body, UpstreamTruncation::GrokBuild).unwrap();
-
-        let output = body["input"][0]["output"].as_str().unwrap();
-        // 2KB 预览 + footer,远小于原始 50KB
-        assert!(output.len() < 3_000, "preview+footer: {}", output.len());
-        assert!(output.contains("[Output truncated - 50000 bytes total]"));
-    }
-
-    #[test]
-    fn test_grok_build_block_array_uses_fixed_preview() {
-        // 数组路径同样对齐 truncate_with_preview:固定 2KB UTF-8 安全预览。
-        let mut body = json!({
-            "input": [{
-                "type": "function_call_output",
-                "call_id": "1",
-                "output": [{"type": "input_text", "text": "日".repeat(20_000)}]
-            }]
-        });
-
-        truncate(&mut body, UpstreamTruncation::GrokBuild).unwrap();
-
-        let output = body["input"][0]["output"][0]["text"].as_str().unwrap();
-        let (preview, footer) = output.rsplit_once("\n\n").unwrap();
-        assert!(preview.len() <= 2_000, "preview bytes: {}", preview.len());
-        assert_eq!(footer, "[Output truncated - 60000 bytes total]");
-        assert!(output.len() < 3_000, "preview+footer: {}", output.len());
-    }
-
-    #[test]
-    fn test_grok_build_under_budget_preserved() {
-        // grok-build 策略:40KB 内不截断
-        let original = json!({
-            "input": [
-                {"type": "function_call_output", "call_id": "1", "output": "x".repeat(30_000)}
-            ]
-        });
-
-        let mut body = original.clone();
-        truncate(&mut body, UpstreamTruncation::GrokBuild).unwrap();
-
-        assert_eq!(body, original);
     }
 
     #[test]
@@ -602,21 +504,6 @@ mod tests {
     }
 
     #[test]
-    fn test_grok_truncation_idempotent() {
-        let mut body = json!({
-            "input": [
-                {"type": "function_call_output", "call_id": "1", "output": "x".repeat(50_000)}
-            ]
-        });
-
-        truncate(&mut body, UpstreamTruncation::GrokBuild).unwrap();
-        let snapshot = body.clone();
-        truncate(&mut body, UpstreamTruncation::GrokBuild).unwrap();
-
-        assert_eq!(body, snapshot, "second pass must be byte-identical");
-    }
-
-    #[test]
     fn test_codex_tiny_remaining_budget_drops_block() {
         // 首块 9,999 bytes 占预算,次块大文本只剩 1 byte:
         // 放不下 marker,应丢弃次块并计入 omitted,不越界
@@ -648,36 +535,6 @@ mod tests {
     }
 
     #[test]
-    fn test_grok_tiny_remaining_budget_drops_block() {
-        // 首块 39,999 bytes 占预算,次块大文本只剩 1 byte:
-        // 放不下 footer,应丢弃次块并计入 omitted,不越界
-        let mut body = json!({
-            "input": [
-                {"type": "function_call_output", "call_id": "1", "output": [
-                    {"type": "input_text", "text": "a".repeat(39_999)},
-                    {"type": "input_text", "text": "b".repeat(50_000)}
-                ]}
-            ]
-        });
-
-        truncate(&mut body, UpstreamTruncation::GrokBuild).unwrap();
-
-        let blocks = body["input"][0]["output"].as_array().unwrap();
-        let total: usize = blocks
-            .iter()
-            .filter_map(|b| b.get("text").and_then(|t| t.as_str()))
-            .map(str::len)
-            .sum();
-        assert!(total <= 40_000 + 32, "total: {total}");
-        assert_eq!(blocks.len(), 2);
-        assert_eq!(blocks[0]["text"].as_str().unwrap().len(), 39_999);
-        assert_eq!(
-            blocks[1]["text"].as_str().unwrap(),
-            "[omitted 1 text items ...]"
-        );
-    }
-
-    #[test]
     fn test_codex_array_idempotent() {
         // 数组路径幂等:截断后(含 omitted footer)二次 pass 零改动。
         // 首块 9,999 占预算,次块 50KB 截到剩余 1 byte 放不下 marker 被丢弃,
@@ -698,50 +555,5 @@ mod tests {
         truncate(&mut body, UpstreamTruncation::Codex).unwrap();
 
         assert_eq!(body, snapshot, "second pass must be byte-identical");
-    }
-
-    #[test]
-    fn test_grok_array_idempotent() {
-        let mut body = json!({
-            "input": [
-                {"type": "function_call_output", "call_id": "1", "output": [
-                    {"type": "input_text", "text": "a".repeat(39_999)},
-                    {"type": "input_text", "text": "b".repeat(50_000)}
-                ]}
-            ]
-        });
-
-        truncate(&mut body, UpstreamTruncation::GrokBuild).unwrap();
-        let snapshot = body.clone();
-        truncate(&mut body, UpstreamTruncation::GrokBuild).unwrap();
-
-        assert_eq!(body, snapshot, "second pass must be byte-identical");
-    }
-
-    #[test]
-    fn test_grok_array_partial_remaining_fits() {
-        // 剩余预算 > footer 长度:次块截到剩余内,总文本 ≤ 40KB
-        let mut body = json!({
-            "input": [
-                {"type": "function_call_output", "call_id": "1", "output": [
-                    {"type": "input_text", "text": "a".repeat(39_000)},
-                    {"type": "input_text", "text": "b".repeat(50_000)}
-                ]}
-            ]
-        });
-
-        truncate(&mut body, UpstreamTruncation::GrokBuild).unwrap();
-
-        let blocks = body["input"][0]["output"].as_array().unwrap();
-        let total: usize = blocks
-            .iter()
-            .filter_map(|b| b.get("text").and_then(|t| t.as_str()))
-            .map(str::len)
-            .sum();
-        assert!(total <= 40_000, "total: {total}");
-        assert!(blocks[1]["text"]
-            .as_str()
-            .unwrap()
-            .contains("[Output truncated - 50000 bytes total]"));
     }
 }

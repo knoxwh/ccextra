@@ -58,7 +58,7 @@ Claude Code → ccextra:8222
 4. Protocol convert (four body-to-body paths + Claude passthrough; content shape normalized)
 5. Post-transform normalize (OpenAI conversion paths only; Chat observes drift afterward)
 6. Payload overrides (wildcard match, optional protocol scope)
-7. Responses tool-result truncation (only when normalization is enabled; final upstream model: Grok 40KB plus 2KB preview, non-Grok 10KB) + drift observe
+7. Drift observe (Responses protocol observed after payload overrides)
 8. Strip prompt_cache_retention (OpenAI paths only)
 9. Inject prompt_cache_key (per-provider switch) + optional diagnostic dump
 10. Claude passthrough: rebuild anthropic-beta + forward identity headers

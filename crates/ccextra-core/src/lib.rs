@@ -18,11 +18,7 @@ pub mod session;
 pub mod thinking;
 
 pub use doom_loop::{
-    check_action_stationarity, inject_loop_recovery_reminder_if_needed, is_confident,
-    is_problematically_repeating_tool, parse_trigger, DoomLoopSignal, DoomLoopSignalKind,
-    StationarityVerdict, MAX_CONSECUTIVE_IDENTICAL_PROBLEMATIC_TOOL_CALLS,
-    MAX_CONSECUTIVE_IDENTICAL_TOOL_CALLS, NUDGE_AFTER_IDENTICAL_PROBLEMATIC_TOOL_CALLS,
-    NUDGE_AFTER_IDENTICAL_TOOL_CALLS, RECOVERY_REMINDER,
+    is_confident, parse_trigger, DoomLoopSignal, DoomLoopSignalKind,
 };
 pub use route::{Protocol, RouteDecision};
 

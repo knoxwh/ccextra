@@ -68,14 +68,12 @@ drift 观测 (claude / openai chat 在各自归一化后；gemini/antigravity �
     ↓
 Payload 参数覆盖
     ↓
-responses tool_result 截断（仅 `normalize.enabled`；按 payload 后最终 upstream_model：grok 40KB + 2KB 预览，非 grok 10KB）
-    ↓
-responses drift 观测（最终截断 body）
+responses drift 观测（最终 body）
     ↓
 上游请求
 ```
 
-**理由**：`cache_control` 注入需 anthropic 结构且对 openai 上游无意义；转换引入新漂移需二次清理；claude / openai chat 在各自归一化后观测，responses 则在 payload 后截断 tool_result 再观测最终 body。gemini/antigravity 不做前缀稳定，空臂占位，避免九模块误改 Gemini 请求体。
+**理由**：`cache_control` 注入需 anthropic 结构且对 openai 上游无意义；转换引入新漂移需二次清理；claude / openai chat 在各自归一化后观测，responses 则在 payload 覆盖后观测最终 body。gemini/antigravity 不做前缀稳定，空臂占位，避免九模块误改 Gemini 请求体。
 
 ### OpenAI Chat 兼容性增强
 
@@ -158,7 +156,7 @@ Claude Code → ccextra:8222
      claude 模型不启用 replay,对齐 antigravityUsesReasoningReplayCache)
 5. normalize_target_post (仅 openai；claude / openai chat 分别在自身归一化后观测 drift)
 6. Payload 参数覆盖 (通配匹配，可限定协议；claude 直通须显式 protocol)
-7. responses tool_result 截断（仅 `normalize.enabled`；按 payload 后最终 upstream_model 分流：grok 40KB + 2KB 预览，非 grok 10KB）+ drift 观测
+7. responses drift 观测（仅 `normalize.enabled`，在 payload 覆盖后观测最终 body）
 8. 剥离 prompt_cache_retention (非 claude 路径)
 9. prompt_cache_key 注入 (provider 级开关,仅 openai;chat+grok 跳过,见 §12;grok 判定用 payload 后出站 model)
 10. 诊断落盘 (可选) + claude 直通: anthropic-beta 重建 + 身份头透传
