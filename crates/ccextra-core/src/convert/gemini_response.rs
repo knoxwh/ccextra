@@ -4,6 +4,7 @@ use serde_json::{json, Value};
 use std::collections::HashMap;
 use std::sync::atomic::{AtomicU64, Ordering};
 
+use super::antigravity_tools::antigravity_upstream_tool_name_to_client;
 use super::signature::{format_claude_signature_value, model_group};
 use super::tool_id::claude_tool_id_for;
 
@@ -247,6 +248,13 @@ pub fn convert_gemini_stream_chunk(
                     .and_then(|n| n.as_str())
                     .unwrap_or("");
 
+                // 对齐 CPA 6a26e92a:Antigravity 响应侧还原工具名
+                let restored_upstream_name = if signature_model.is_some() {
+                    antigravity_upstream_tool_name_to_client(upstream_tool_name)
+                } else {
+                    upstream_tool_name.to_string()
+                };
+
                 // 处理流式分块：名称为空表示续传
                 if state.response_type == ResponseType::Function && upstream_tool_name.is_empty() {
                     if let Some(args) = function_call.get("args") {
@@ -283,13 +291,13 @@ pub fn convert_gemini_stream_chunk(
 
                 // 还原原始工具名
                 let client_tool_name = short_to_original
-                    .get(upstream_tool_name)
+                    .get(&restored_upstream_name)
                     .map(|s| s.as_str())
-                    .unwrap_or(upstream_tool_name);
+                    .unwrap_or(&restored_upstream_name);
 
                 // 生成唯一工具使用 ID(对齐 CPA:{name}-{counter},可被请求侧反解)
                 let tool_use_id = claude_tool_id_for(
-                    upstream_tool_name,
+                    &restored_upstream_name,
                     TOOL_USE_ID_COUNTER.fetch_add(1, Ordering::SeqCst),
                 );
 
@@ -508,21 +516,29 @@ pub fn convert_gemini_response(
                 // 工具调用:id 自生成(对齐 CPA,不透传上游 id),name 还原原名
                 if let Some(function_call) = part.get("functionCall") {
                     saw_tool_call = true;
-                    let name = function_call
+                    let upstream_name = function_call
                         .get("name")
                         .and_then(|n| n.as_str())
                         .unwrap_or("");
+
+                    // 对齐 CPA 6a26e92a:Antigravity 响应侧还原工具名
+                    let restored_name = if signature_model.is_some() {
+                        antigravity_upstream_tool_name_to_client(upstream_name)
+                    } else {
+                        upstream_name.to_string()
+                    };
+
                     let original_name = short_to_original
-                        .get(name)
+                        .get(&restored_name)
                         .map(|s| s.as_str())
-                        .unwrap_or(name);
+                        .unwrap_or(&restored_name);
                     // args 仅接受对象,否则兜底 {}(对齐 CPA gjson.Valid && IsObject)
                     let args = match function_call.get("args") {
                         Some(a) if a.is_object() => a.clone(),
                         _ => json!({}),
                     };
                     let tool_id = claude_tool_id_for(
-                        name,
+                        &restored_name,
                         TOOL_USE_ID_COUNTER.fetch_add(1, Ordering::SeqCst),
                     );
                     let mut tool_block = json!({

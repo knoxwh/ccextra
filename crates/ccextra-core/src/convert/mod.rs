@@ -9,6 +9,7 @@
 use thiserror::Error;
 
 pub mod antigravity;
+pub mod antigravity_tools;
 pub mod fix_json;
 pub mod gemini;
 pub mod gemini_response;
@@ -24,6 +25,9 @@ pub mod tool_id;
 pub mod tool_sanitize;
 
 pub use antigravity::convert_to_antigravity;
+pub use antigravity_tools::{
+    antigravity_tool_name_to_upstream, antigravity_upstream_tool_name_to_client,
+};
 pub use fix_json::fix_json_quotes;
 pub use gemini::convert_to_gemini;
 pub use gemini_response::{

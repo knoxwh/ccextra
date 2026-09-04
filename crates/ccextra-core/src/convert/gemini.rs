@@ -3,6 +3,7 @@
 use serde_json::Value;
 use std::collections::{HashMap, HashSet};
 
+use super::antigravity_tools::antigravity_tool_name_to_upstream;
 use super::gemini_schema::{clean_json_schema_for_gemini, clean_nested_schema_for_antigravity};
 use super::is_ignorable_system_text;
 use super::message_convert::convert_messages;
@@ -214,8 +215,14 @@ pub fn convert_to_gemini_with(
                         .get(choice_name)
                         .cloned()
                         .unwrap_or_else(|| sanitize_function_name(choice_name));
+                    // 对齐 CPA 6a26e92a:Antigravity tool_choice 冲突名加前缀
+                    let upstream_name = if flavor == SchemaFlavor::Antigravity {
+                        antigravity_tool_name_to_upstream(&gemini_name)
+                    } else {
+                        gemini_name
+                    };
                     gemini["toolConfig"]["functionCallingConfig"]["allowedFunctionNames"] =
-                        serde_json::json!([gemini_name]);
+                        serde_json::json!([upstream_name]);
                 }
             }
             _ => {}
@@ -281,7 +288,14 @@ pub fn convert_tool_definitions(
             .cloned()
             .unwrap_or_else(|| sanitize_function_name(original_name));
 
-        let mut gemini_tool = serde_json::json!({ "name": short_name });
+        // 对齐 CPA 6a26e92a:Antigravity 冲突工具名加 external_ 前缀
+        let upstream_name = if flavor == SchemaFlavor::Antigravity {
+            antigravity_tool_name_to_upstream(&short_name)
+        } else {
+            short_name.clone()
+        };
+
+        let mut gemini_tool = serde_json::json!({ "name": upstream_name });
         if let Some(desc) = tool.get("description") {
             gemini_tool["description"] = desc.clone();
         }

@@ -3,6 +3,7 @@
 use serde_json::{json, Value};
 use std::collections::HashMap;
 
+use super::antigravity_tools::antigravity_tool_name_to_upstream;
 use super::is_ignorable_system_text;
 use super::signature::{
     resolve_thinking_signature, resolve_tool_use_thought_signature,
@@ -341,6 +342,12 @@ fn append_block_parts(
                 "name": short,
                 "args": input
             });
+            // 对齐 CPA 6a26e92a:Antigravity 冲突工具名加 external_ 前缀
+            if antigravity {
+                if let Some(name_str) = function_call.get("name").and_then(|n| n.as_str()) {
+                    function_call["name"] = json!(antigravity_tool_name_to_upstream(name_str));
+                }
+            }
             if !tool_use_id.is_empty() {
                 function_call["id"] = json!(tool_use_id);
             }
@@ -379,6 +386,14 @@ fn append_block_parts(
                 });
 
             let (result, images) = convert_tool_result_content(block.get("content"));
+
+            // 对齐 CPA 6a26e92a:Antigravity 冲突工具名加 external_ 前缀
+            let upstream_func_name = if antigravity {
+                antigravity_tool_name_to_upstream(&func_name)
+            } else {
+                func_name.clone()
+            };
+
             // 对齐 CPA fixCLIToolResponse 归一化:Antigravity 把工具图嵌进
             // functionResponse.parts(inlineData 驼峰 + 显式 mimeType,缺省
             // image/png——Cloud Code Assist 忽略无 mimeType 的 inlineData),
@@ -400,7 +415,7 @@ fn append_block_parts(
                 parts.push(json!({
                     "functionResponse": {
                         "id": tool_use_id,
-                        "name": func_name,
+                        "name": upstream_func_name,
                         "response": { "result": result },
                         "parts": image_parts
                     }
@@ -409,7 +424,7 @@ fn append_block_parts(
                 parts.push(json!({
                     "functionResponse": {
                         "id": tool_use_id,
-                        "name": func_name,
+                        "name": upstream_func_name,
                         "response": { "result": result }
                     }
                 }));
