@@ -86,6 +86,9 @@ responses 路径下,上游模型名以 `gpt` 开头(不区分大小写)时,拼�
 **gpt trigger**  
 注入适配块的触发条件:`OpenAiResponses` 协议 + 上游模型名小写后以 `gpt` 为前缀。o 系列(o1/o3)不触发。
 
+**strict schema 降级**  
+OpenAI Responses 协议 strict 模式要求 schema 中所有 declared properties 必须存在于 sibling required 列表中。若存在未列入 required 的属性，自动降级 `strict: false`，避免上游报 400（对齐 CPA `aa365277`）。
+
 ## 缓存归一化
 
 **归一化 / normalization**  

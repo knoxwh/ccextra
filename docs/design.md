@@ -108,6 +108,10 @@ openai_body["instructions"] = json!(instructions_str);
 
 超 64 字符缩短并建 short→original 还原表；流式 / 非流响应按表还原原名。测试：`test_tool_name_shortened_with_unique_suffix`。
 
+**坑3：OpenAI Responses strict schema 缺 required 报错 400**（responses 路径）
+
+OpenAI strict 模式要求 declared properties 必须全部显式列在 sibling required 列表中。若入站 `output_config.format(json_schema)` 的 schema 存在遗漏属性，递归检测并自动将 `text.format.strict` 降级为 `false`，防上游 400（对齐 CPA `aa365277`）。测试：`test_output_config_format_optional_property_downgrades_strict`。
+
 ## 5. 响应转发（SSE 状态机）
 
 ```

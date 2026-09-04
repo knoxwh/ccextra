@@ -957,7 +957,12 @@ pub fn convert_to_openai_responses(
             .and_then(|v| v.as_str())
             .filter(|s| !s.is_empty())
             .unwrap_or("cli_proxy_structured_output");
-        let strict = format.get("strict") != Some(&Value::Bool(false));
+        let mut strict = format.get("strict") != Some(&Value::Bool(false));
+        // OpenAI strict 模式要求 declared properties 必须全部在 required 列表中(递归检查)
+        // 若缺失则降级 strict=false,避免上游报 400(对齐 CPA codexSchemaMissesRequired)
+        if strict && codex_schema_misses_required(&format["schema"]) {
+            strict = false;
+        }
         openai["text"] = json!({
             "format": {
                 "type": "json_schema",
@@ -1034,6 +1039,86 @@ fn shorten_call_id(id: &str) -> String {
         prefix_len -= 1;
     }
     format!("{}{}", &id[..prefix_len], suffix)
+}
+
+/// JSON Schema 关键字:其值为 subschemas 的 map
+const CODEX_SCHEMA_MAP_KEYWORDS: [&str; 6] = [
+    "properties",
+    "$defs",
+    "definitions",
+    "patternProperties",
+    "dependentSchemas",
+    "dependencies",
+];
+
+/// JSON Schema 关键字:其值为单个 nested schema 或 schema 列表
+const CODEX_SCHEMA_VALUE_KEYWORDS: [&str; 16] = [
+    "items",
+    "prefixItems",
+    "contains",
+    "additionalProperties",
+    "propertyNames",
+    "unevaluatedProperties",
+    "unevaluatedItems",
+    "additionalItems",
+    "contentSchema",
+    "anyOf",
+    "oneOf",
+    "allOf",
+    "not",
+    "if",
+    "then",
+    "else",
+];
+
+/// 递归检查 JSON Schema 是否有 declared property 遗漏在 sibling required 列表中
+/// (对齐 CPA codexSchemaMissesRequired)
+fn codex_schema_misses_required(schema: &Value) -> bool {
+    let Value::Object(map) = schema else {
+        if let Value::Array(arr) = schema {
+            return arr.iter().any(codex_schema_misses_required);
+        }
+        return false;
+    };
+
+    if let Some(Value::Object(props)) = map.get("properties") {
+        match map.get("required") {
+            Some(Value::Array(req_arr)) => {
+                let required_names: HashSet<&str> =
+                    req_arr.iter().filter_map(|v| v.as_str()).collect();
+                for prop_name in props.keys() {
+                    if !required_names.contains(prop_name.as_str()) {
+                        return true;
+                    }
+                }
+            }
+            _ => {
+                if !props.is_empty() {
+                    return true;
+                }
+            }
+        }
+    }
+
+    for &keyword in &CODEX_SCHEMA_MAP_KEYWORDS {
+        if let Some(Value::Object(children)) = map.get(keyword) {
+            for child in children.values() {
+                if codex_schema_misses_required(child) {
+                    return true;
+                }
+            }
+        }
+    }
+
+    for &keyword in &CODEX_SCHEMA_VALUE_KEYWORDS {
+        if let Some(child) = map.get(keyword) {
+            if codex_schema_misses_required(child) {
+                return true;
+            }
+        }
+    }
+
+    false
 }
 #[cfg(test)]
 mod tests {
@@ -1826,6 +1911,34 @@ mod tests {
         convert_to_openai_responses(&mut body, "test-model").unwrap();
         assert_eq!(body["text"]["format"]["name"], "custom_schema");
         assert_eq!(body["text"]["format"]["strict"], false);
+    }
+
+    #[test]
+    fn test_output_config_format_optional_property_downgrades_strict() {
+        let mut body = json!({
+            "model": "test",
+            "output_config": {"format": {
+                "type": "json_schema",
+                "name": "cli_proxy_structured_output",
+                "strict": true,
+                "schema": {
+                    "type": "object",
+                    "properties": {
+                        "answer": {"type": "string"},
+                        "impossible": {"type": "string"}
+                    },
+                    "required": ["answer"],
+                    "additionalProperties": false
+                }
+            }},
+            "messages": []
+        });
+        convert_to_openai_responses(&mut body, "test-model").unwrap();
+        assert_eq!(body["text"]["format"]["strict"], false);
+        assert_eq!(
+            body["text"]["format"]["name"],
+            "cli_proxy_structured_output"
+        );
     }
 
     #[test]
