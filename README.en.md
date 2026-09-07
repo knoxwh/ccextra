@@ -2,268 +2,92 @@
 
 **[中文](README.md)** | **English**
 
-> Single-process Rust proxy that connects Claude Code to any upstream: protocol translation, prompt-cache optimization, and model routing
+> Single-process Rust proxy that routes, converts, and relays Claude Code Anthropic Messages requests to upstream providers.
 
-[![Rust](https://img.shields.io/badge/rust-1.75%2B-orange)](https://www.rust-lang.org/)
-[![License: MIT](https://img.shields.io/badge/license-MIT-blue.svg)](LICENSE)
-[![Tests](https://img.shields.io/badge/tests-749%20passing-success)]()
-[![Workspace](https://img.shields.io/badge/workspace-3%20crates-lightgrey)]()
-[![Docs: design](https://img.shields.io/badge/docs-architecture-informational)](docs/design.md)
+## Overview
 
-## 📚 Quick Navigation
+One process listens on one port. Anthropic-shaped input resolves to a provider by model alias. Deterministic normalization reduces cross-turn serialization drift and improves upstream prompt-cache reuse.
 
-[🚀 Quick Start](#quick-start) · [⚙️ Configuration](#configuration-reference) · [🏗️ Architecture](docs/design.md) · [📖 Glossary](docs/glossary.md) · [🧪 Testing](#testing)
+## Upstream protocols
 
-One binary, one port. Serves six upstream options at once: native Claude, OpenAI Chat Completions, OpenAI Responses, Google Gemini, Antigravity (Cloud Code Assist over OAuth), and xAI Grok (OAuth). Routes Claude Code requests by model to the matching provider, and deterministically normalizes request bodies so upstream prompt caches hit as often as possible.
+| `protocol` | Upstream API | Behavior |
+| --- | --- | --- |
+| `claude` | Anthropic Messages | Replaces only `model`; remaining request content stays intact. |
+| `openai_chat` | Chat Completions | Converts messages, tools, images, and reasoning. |
+| `openai_responses` | Responses | Converts to `instructions` and `input`; supports reasoning replay. |
+| `gemini` | Gemini GenerateContent | Uses Gemini content, tool, and schema shapes. |
+| `antigravity` | Cloud Code Assist | Uses Gemini shapes inside an Antigravity transport envelope. |
 
-```
-Claude Code          (ANTHROPIC_BASE_URL → http://127.0.0.1:8222)
-     │  POST /v1/messages
-     ▼
-ccextra :8222  ──  route → normalize → convert → upstream
-     │  Response: streaming SSE / non-stream JSON back the same path
-     ├── claude            → native Claude protocol
-     ├── openai_chat       → OpenAI Chat Completions
-     ├── openai_responses  → OpenAI Responses
-     ├── gemini            → Google Gemini API
-     ├── antigravity       → Cloud Code Assist (OAuth auto-injected, no manual config)
-     └── xai               → xAI Grok (OAuth auto-injected, no manual config)
-```
-
-## Features
-
-| Category | What it does |
-| ---- | ---- |
-| **Multi-protocol** | Native Claude / OpenAI Chat Completions / OpenAI Responses / Google Gemini / Antigravity / xAI Grok |
-| **Model routing** | Inbound model name resolves via alias to exactly one provider. Conflicts fail at startup; no implicit fallback |
-| **Byte-level passthrough** | Claude → Claude changes only the `model` field. Remaining bytes stay intact so normalization is not undone |
-| **Prompt-cache optimization** | Nine-module normalization kills serialization drift so upstream prompt cache can hit. A drift detector watches blind spots across turns |
-| **Streaming state machines** | Hand-written SSE parser plus five independent relay paths (Claude / OpenAI Chat / Responses / Gemini / Antigravity). A dropped stream emits a structured error event instead of a bare hang-up; all streaming paths wrap a 10s idle keepalive (`: keepalive`) frame |
-| **Fault retry** | Upstream 429 / 5xx / network errors retry with exponential backoff respecting `Retry-After` (capped by a 10s total budget) |
-| **Hot reload** | `POST /reload` updates providers / payload / normalize / `user_agents` / `logging.request_body` / secret / global proxy without restart, and clears the bcrypt verify cache. `logging.level` applies at startup only |
-| **Proxy** | Global default plus per-provider override. SOCKS supported |
-| **Payload overrides** | Wildcard match on model name (e.g. `*glm*`) to override request params. Can be scoped to a protocol |
-| **Ingress auth** | Optional `secret_key`. Plaintext is hashed to bcrypt and written back. Verify results are cached |
-| **Model list** | `GET /v1/models` returns an Anthropic-shaped catalog. Claude Code fetches this on startup |
-| **Diagnostics** | Optional per-request dump of the upstream body, for cache-drift debugging |
-
-## How it works
-
-```
-Claude Code → ccextra:8222
-    ↓
-1. Parse inbound Anthropic body + ingress auth
-2. Route: model → provider → protocol
-3. Pre-transform normalize (full set for Claude / slim subset for others; gemini/antigravity skip drift)
-4. Protocol convert (four body-to-body paths + Claude passthrough; content shape normalized)
-5. Post-transform normalize (OpenAI conversion paths only; Chat observes drift afterward)
-6. Payload overrides (wildcard match, optional protocol scope)
-7. Drift observe (Responses protocol observed after payload overrides)
-8. Strip prompt_cache_retention (OpenAI paths only)
-9. Inject prompt_cache_key (per-provider switch) + optional diagnostic dump
-10. Claude passthrough: rebuild anthropic-beta + forward identity headers
-11. Upstream request (reqwest + protocol-specific UA + proxy)
-12. Relay response (streaming SSE state machine / non-stream: Claude byte-passthrough, OpenAI via non_stream, gemini/antigravity via convert_gemini_response back to Anthropic; convert failure returns upstream bytes as-is; upstream errors mapped to Anthropic shape)
-    ↓
-Upstream provider
-```
+xAI Grok OAuth injects an `openai_responses` provider; it is not a separate `protocol`.
 
 ## Quick start
 
-### OAuth subscription login (Antigravity / xAI Grok)
-
-**Recommended first step**: Complete OAuth login — no manual API key in `config.yaml` required. ccextra discovers credentials at startup and auto-injects providers:
-
-```bash
-# 1. Antigravity (Google Cloud Code Assist) login
-./ccextra antigravity-login
-# View saved credential status
-./ccextra antigravity-status
-# Query quota and model availability
-./scripts/check_antigravity_quota.sh
-
-# 2. xAI Grok device-code authorization
-./ccextra xai-login
-# View saved credential status
-./ccextra xai-status
-# Verify xAI connectivity and models
-./scripts/check_grok_quota.sh
-```
-
-### Build
-
 ```bash
 cargo build --release
-```
-
-Requires Rust 1.75+.
-
-### Configure
-
-```bash
 cp config.example.yaml config.yaml
-# Edit config.yaml and fill in real keys
+./target/release/ccextra --config config.yaml
 ```
-
-Minimal example:
 
 ```yaml
 server:
   host: "127.0.0.1"
   port: 8222
-
 providers:
-  - name: claude
-    protocol: claude
-    base_url: https://xxxx
-    key: sk-ant-xxx
-    models:
-      - name: claude-opus-5
-        alias: claude-opus-5
-
-  - name: saic
-    protocol: openai_chat
-    base_url: https://xxxx/compatible-mode/v1
-    key: sk-xxx
-    models:
-      - name: glm-5.1
-        alias: glm-5.1
-
-  - name: ckff-codex
+  - name: upstream
     protocol: openai_responses
-    base_url: https://xxxx/v1
+    base_url: https://example.com/v1
     key: sk-xxx
     prompt_cache_key: true
     models:
       - name: gpt-5.6-terra
         alias: gpt-5.6-terra
-
-  - name: gemini
-    protocol: gemini
-    base_url: https://generativelanguage.googleapis.com
-    key: YOUR_GEMINI_API_KEY
-    models:
-      - name: gemini-2.0-flash-exp
-        alias: gemini-flash
+normalize:
+  enabled: true
+  drift_detector: true
 ```
-
-### Run
-
-```bash
-./build.sh                                # Build and place binary at root ./ccextra
-./ccextra --config config.yaml            # Run in foreground
-```
-
-Or use the scripts:
-
-```bash
-./start.sh    # start in background
-./stop.sh     # stop
-./restart.sh  # restart
-./build.sh    # build (restarts if already running)
-```
-
-### Point Claude Code at it
 
 ```bash
 export ANTHROPIC_BASE_URL=http://127.0.0.1:8222
+export ANTHROPIC_AUTH_TOKEN=sk-ccextra-xxx # required when secret_key is set
 ```
 
-If `secret_key` is set:
-
-```bash
-export ANTHROPIC_AUTH_TOKEN=sk-ccextra-xxx
-```
-
-### Verify
-
-```bash
-# Send a request
-curl http://127.0.0.1:8222/v1/messages \
-  -H "Content-Type: application/json" \
-  -d '{"model": "claude-opus-5", "messages": [{"role": "user", "content": "hi"}], "max_tokens": 1024}'
-
-# Model list (Claude Code fetches this on startup)
-curl http://127.0.0.1:8222/v1/models -H "x-api-key: sk-ccextra-xxx"
-
-# Hot-reload config
-curl -X POST http://127.0.0.1:8222/reload
-
-# Health check
-curl http://127.0.0.1:8222/health
-```
-
-`/v1/models` returns an Anthropic-shaped catalog:
-
-```json
-{
-  "data": [
-    {"id": "claude-opus-5", "object": "model", "owned_by": "claude",
-     "type": "model", "display_name": "claude-opus-5",
-     "max_input_tokens": 200000, "max_tokens": 64000}
-  ]
-}
-```
+`build.sh` updates root `./ccextra`; `start.sh`, `stop.sh`, and `restart.sh` manage a background process.
 
 ## Configuration
 
-Full knobs live in [`config.example.yaml`](config.example.yaml). Highlights:
+See [config.example.yaml](config.example.yaml) for every field. `models[].alias` is inbound model name and cannot duplicate across providers. `base_url` accepts an ordered fallback array. Provider `proxy_url` overrides `server.proxy_url`; `"direct"` disables proxy use.
 
-| Key | Meaning |
-| ------ | ---- |
-| `server.host` / `server.port` | Listen address. Default `127.0.0.1:8222` |
-| `server.proxy_url` | Global proxy fallback, optional. `"direct"` means no proxy |
-| `secret_key` | Ingress auth, optional. When set, `/v1/models` and `/v1/messages` require a matching key or they 401. Accepts `x-api-key` or `Authorization: Bearer`. Plaintext is hashed to bcrypt and written back. `/reload` swaps the secret and clears the bcrypt verify cache |
-| `providers[].protocol` | Upstream protocol: `claude` / `openai_chat` / `openai_responses` / `gemini` / `antigravity`. Antigravity and xAI Grok usually need no manual entry: at startup ccextra scans `auth_dir` (default `.cache/antigravity`) and `xai_auth_dir` (default `.cache/xai`) for OAuth credentials and injects providers automatically |
-| `providers[].base_url` / `key` | Upstream URL and API key |
-| `providers[].models[].alias` | Inbound model name → real upstream model name |
-| `providers[].prompt_cache_key` | Cache-bucket key = session ID (aligned with Codex 0.147). OpenAI protocols only |
-| `payload` | Wildcard match on model name (`*glm*`) to override request params. Can be scoped with `protocol` |
-| `user_agents` | Override outbound User-Agents (`claude_cli` / `codex_tui` / `grok_version` / `antigravity`); optional, missing fields use built-in defaults, and `/reload` applies changes |
-| `normalize.enabled` | Master switch for normalization. `drift_detector` turns on cross-turn drift observation |
-| `logging.request_body` | Dump each upstream body under `logs/` for cache-drift debugging |
+`secret_key` enables ingress authentication. Plaintext keys become bcrypt hashes on load and are written back; requests accept `x-api-key` or `Authorization: Bearer`. `payload` applies model-glob top-level overrides, optionally scoped by `protocol`. `prompt_cache_key` applies only to OpenAI paths, uses Claude Code session ID, and never replaces a nonempty key.
 
-## Layout
+`user_agents` overrides Claude, Codex, Grok, and Antigravity identifiers. `logging.request_body` writes diagnostic requests under `logs/`. `POST /reload` reloads providers, payload, normalization, auth, proxy, and User-Agent. Restart for `logging.level` changes.
 
-```
-ccextra/
-├── crates/
-│   ├── ccextra-core/           # Pure logic, no IO
-│   │   ├── cache_stabilization/  # Nine-module normalization
-│   │   ├── convert/              # Protocol-convert paths (claude/openai×2/gemini/antigravity)
-│   │   ├── thinking.rs           # Thinking-level mapping
-│   │   ├── prompt_cache.rs       # prompt_cache_key inject (key = session ID, Codex-aligned)
-│   │   ├── secret.rs             # Ingress key bcrypt recognition
-│   │   ├── route.rs              # Route decision
-│   │   ├── session.rs            # Session identity derivation
-│   │   └── normalize.rs          # Normalization orchestration
-│   ├── ccextra-server/         # IO layer
-│   │   ├── http.rs               # axum entry + pipeline
-│   │   ├── upstream.rs           # reqwest client (protocol-specific UA)
-│   │   └── sse/                  # SSE parse + state machines
-│   └── ccextra-cli/            # Entry + config
-├── config.example.yaml         # Config example
-├── docs/
-│   ├── design.md               # Architecture (Chinese)
-│   └── glossary.md             # Domain glossary (Chinese)
-├── start.sh / stop.sh / restart.sh / build.sh
-├── README.md                   # Chinese (default)
-└── README.en.md                # English
-```
+## Endpoints
 
-## Tests
+| Endpoint | Purpose |
+| --- | --- |
+| `POST /v1/messages` | Main request endpoint. |
+| `POST /v1/messages/count_tokens` | Exact upstream count for Claude; previous-turn recorded count for the session otherwise, or 0 when absent. |
+| `GET /v1/models` | Anthropic-shaped model list. |
+| `GET /health` | Returns `ok`. |
+| `POST /reload` | Reloads configuration. |
+
+With `secret_key`, the first three Anthropic endpoints require authentication.
+
+## Runtime behavior
+
+Requests pass through authentication, routing, normalization, protocol conversion, payload overrides, cache-key injection, and upstream delivery. Claude passthrough preserves inbound identity headers and rebuilds required `anthropic-beta`. All streaming output returns as Anthropic SSE and emits `: keepalive` after 10 seconds idle.
+
+Network errors, 429, and 5xx retry with exponential backoff within a 3-second total budget and constrained `Retry-After`; ordered `base_url` values are tried in sequence.
+
+## OAuth and development
 
 ```bash
+./ccextra antigravity-login
+./ccextra antigravity-status
+./ccextra xai-login
+./ccextra xai-status
 cargo test --workspace
+cargo clippy --workspace --all-targets -- -D warnings
 ```
 
-Currently 749 tests (546 core + 203 server), covering cache normalization, protocol conversion (Claude/OpenAI/Gemini/Antigravity/xAI Grok), SSE state machines, the HTTP pipeline, and config parsing.
-
-## Docs
-
-- **[docs/design.md](docs/design.md)** — Architecture: convert paths, normalization, SSE relay, Gemini/Antigravity protocols, performance (Chinese)
-- **[docs/glossary.md](docs/glossary.md)** — Domain glossary (Chinese)
-
-## License
-
-[MIT](LICENSE)
+Antigravity credentials default to `.cache/antigravity` beside the config file; xAI defaults to `.cache/xai`. xAI loads at startup. Antigravity loads in background and refreshes models every three hours. See [architecture](docs/design.md), [glossary](docs/glossary.md), and [MIT license](LICENSE).
