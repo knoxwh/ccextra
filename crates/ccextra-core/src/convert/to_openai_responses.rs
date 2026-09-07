@@ -39,6 +39,9 @@ use super::Result;
 /// - `# Session-specific guidance` — 会话级指令
 /// - `# MCP Server Instructions` — MCP 工具说明
 /// - `# Context management` — 上下文压缩提示
+/// - `<safety_guardrails>` — 风险分级决策树、注入防御、秘密保护
+/// - `<git_safety>` — commit/push 规则、破坏性操作确认
+/// - `<content_safety>` — child safety、恶意代码拒绝、仇恨言论过滤
 /// - CLAUDE.md / memory / 项目指令内容
 /// - **无段落标记的普通文本**(用户自定义 system prompt)
 ///
@@ -83,6 +86,10 @@ fn strip_claude_system_for_gpt(system: &str) -> String {
         "# claudeMd",
         "# currentDate",
         "Contents of",
+        // 安全约束(决策树/硬规则,非过度推理触发器)
+        "<safety_guardrails>",
+        "<git_safety>",
+        "<content_safety>",
     ];
 
     // 黑名单 header 前缀(明确丢弃)
@@ -91,9 +98,6 @@ fn strip_claude_system_for_gpt(system: &str) -> String {
         "<capabilities>",
         "<response_style>",
         "<rules>",
-        "<safety_guardrails>",
-        "<git_safety>",
-        "<content_safety>",
         "<investigate_before_answering>",
         "<verification>",
         "<tool_use>",
@@ -2131,7 +2135,7 @@ mod tests {
 
     #[test]
     fn test_gpt_upstream_strips_claude_triggers() {
-        // GPT 上游清洗 system:保留 Memory/Environment/Language,丢弃 identity/concise-style
+        // GPT 上游清洗 system:保留 Memory/Environment/Language/safety_guardrails,丢弃 identity/concise-style
         let mut body = json!({
             "model": "test",
             "system": r#"
@@ -2156,6 +2160,13 @@ Keep responses short.
 # Language
 Always respond in Simplified Chinese (简体中文).
 
+<safety_guardrails>
+Consider the reversibility and potential impact of your actions.
+Scale your caution to the potential impact:
+- Low-risk: proceed without hesitation
+- High-risk: explain and wait for confirmation
+</safety_guardrails>
+
 IMPORTANT: Assist with authorized security testing, defensive security, CTF challenges.
 "#,
             "messages": [{"role": "user", "content": "test"}]
@@ -2174,6 +2185,9 @@ IMPORTANT: Assist with authorized security testing, defensive security, CTF chal
         assert!(dev_text.contains("Working directory: /project"));
         assert!(dev_text.contains("# Language"));
         assert!(dev_text.contains("Simplified Chinese"));
+        assert!(dev_text.contains("<safety_guardrails>"));
+        assert!(dev_text.contains("Consider the reversibility and potential impact"));
+        assert!(dev_text.contains("Low-risk: proceed without hesitation"));
 
         // 剥离的块
         assert!(!dev_text.contains("<identity>"));
