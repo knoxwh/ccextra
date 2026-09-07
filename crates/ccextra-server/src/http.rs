@@ -1700,8 +1700,8 @@ mod tests {
     use tower::util::ServiceExt;
 
     // 测试用默认 User-Agent 值
-    const TEST_CLAUDE_CLI: &str = "claude-cli/2.1.246";
-    const TEST_CODEX_TUI: &str = "codex_cli_rs/0.149.1 (Mac OS 26.6.2; arm64)";
+    const TEST_CLAUDE_CLI: &str = "claude-cli/2.1.258";
+    const TEST_CODEX_TUI: &str = "codex_cli_rs/0.153.3 (Mac OS 26.6.2; arm64)";
     const TEST_GROK_VERSION: &str = "1.0.5";
     const TEST_ANTIGRAVITY: &str = "antigravity/hub/2.10.0 darwin/arm64";
 

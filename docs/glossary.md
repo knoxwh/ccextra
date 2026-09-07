@@ -46,7 +46,7 @@ OpenAI `/v1/responses` 协议(Codex CLI 默认)。请求体用顶层 `instructio
 发往上游的真实模型名,与入站 alias 可能不同。
 
 **按协议 UA 分流**  
-上游请求按协议+模型分流 User-Agent / Originator。可选顶层 `user_agents` 覆盖 `claude_cli` / `codex_tui` / `grok_version` / `antigravity`；字段缺失用内置默认值，`/reload` 生效。仅 responses + `*gpt*`(大小写不敏感)用 `codex_tui`（默认 `codex-tui/0.149.1 ...`）且带 `Originator: codex_cli_rs`;chat 或 responses + `*grok*` 用 `grok-shell/{grok_version} ({os}; {arch})`(默认 `1.0.5`，对齐 grok-build 默认 UA);antigravity 用 `antigravity`（默认 `antigravity/hub/2.10.0 darwin/arm64`，非 antigravity UA 上游直接 404）;其余(claude / 非 grok 的 chat / 非 gpt 非 grok 的 responses / gemini)用 `claude_cli`（默认 `claude-cli/2.1.246`）,不带 Originator。antigravity 信封里另有 `userAgent=antigravity`,与 HTTP 头不是同一字段。部分上游按 UA 识别客户端并分流缓存/特性,reqwest 默认 UA 会被判为非官方客户端。
+上游请求按协议+模型分流 User-Agent / Originator。可选顶层 `user_agents` 覆盖 `claude_cli` / `codex_tui` / `grok_version` / `antigravity`；字段缺失用内置默认值，`/reload` 生效。仅 responses + `*gpt*`(大小写不敏感)用 `codex_tui`（默认 `codex-tui/0.153.3 ...`）且带 `Originator: codex_cli_rs`;chat 或 responses + `*grok*` 用 `grok-shell/{grok_version} ({os}; {arch})`(默认 `1.0.5`，对齐 grok-build 默认 UA);antigravity 用 `antigravity`（默认 `antigravity/hub/2.10.0 darwin/arm64`，非 antigravity UA 上游直接 404）;其余(claude / 非 grok 的 chat / 非 gpt 非 grok 的 responses / gemini)用 `claude_cli`（默认 `claude-cli/2.1.258`）,不带 Originator。antigravity 信封里另有 `userAgent=antigravity`,与 HTTP 头不是同一字段。部分上游按 UA 识别客户端并分流缓存/特性,reqwest 默认 UA 会被判为非官方客户端。
 
 **grok CLI 身份头**  
 chat/responses + grok 发 `X-XAI-Token-Auth=xai-grok-cli`、`x-grok-client-version`（取 `user_agents.grok_version`）、`x-grok-client-identifier=grok-shell`、`x-grok-model-override`,以及有会话时的 `x-grok-conv-id`。`x-grok-doom-loop-check` 仅 responses。不发 `req-id` / `session-id` / `agent-id` / `turn-idx`(无官方会话计数源;conv-id 已承担粘性)。

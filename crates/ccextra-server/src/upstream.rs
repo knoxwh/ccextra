@@ -373,13 +373,13 @@ mod tests {
     fn test_user_agent_per_protocol() {
         use std::sync::Arc;
         let uas = crate::http::UserAgentSet {
-            claude_cli: Arc::new("claude-cli/2.1.246".to_string()),
-            codex_tui: Arc::new("codex_cli_rs/0.149.1 (Mac OS 26.6.2; arm64)".to_string()),
+            claude_cli: Arc::new("claude-cli/2.1.258".to_string()),
+            codex_tui: Arc::new("codex_cli_rs/0.153.3 (Mac OS 26.6.2; arm64)".to_string()),
             grok_version: Arc::new("1.0.5".to_string()),
             antigravity: Arc::new("antigravity/hub/2.10.0 darwin/arm64".to_string()),
         };
-        const CLAUDE_CLI: &str = "claude-cli/2.1.246";
-        const CODEX_CLI: &str = "codex_cli_rs/0.149.1 (Mac OS 26.6.2; arm64)";
+        const CLAUDE_CLI: &str = "claude-cli/2.1.258";
+        const CODEX_CLI: &str = "codex_cli_rs/0.153.3 (Mac OS 26.6.2; arm64)";
         assert_eq!(
             user_agent(Protocol::OpenAiChat, "gpt-5.6-terra", &uas, None),
             CLAUDE_CLI
