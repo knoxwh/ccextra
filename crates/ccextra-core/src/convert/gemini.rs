@@ -90,7 +90,9 @@ pub fn convert_to_gemini_with(
 
     // 对齐 CPA EnsureGeminiLeadingUserContent:切片历史/工具续跑时首 turn 可能为
     // model,Gemini 侧要求 contents 以 user 开头,前置空 user turn。
-    // Antigravity claude 目标跳过(adapter 拒空 text part)。
+    // 对齐 CPA EnsureGeminiTrailingUserContent(5dc428f3):尾 turn 为 model 且不含
+    // functionResponse 时追加空 user turn;含 functionResponse 则保留(上游期望模型续写)。
+    // Antigravity claude 目标两者皆跳过(adapter 拒空 text part)。
     let is_claude_target = upstream_model.to_lowercase().contains("claude");
     if !(flavor == SchemaFlavor::Antigravity && is_claude_target) {
         if let Some(contents) = gemini.get_mut("contents").and_then(|c| c.as_array_mut()) {
@@ -104,6 +106,14 @@ pub fn convert_to_gemini_with(
                     0,
                     serde_json::json!({"role": "user", "parts": [{"text": ""}]}),
                 );
+            }
+            let trailing_is_model = contents
+                .last()
+                .and_then(|c| c.get("role"))
+                .and_then(|r| r.as_str())
+                .is_some_and(|role| role == "model" || role == "assistant");
+            if trailing_is_model && !content_has_function_response(contents.last().unwrap()) {
+                contents.push(serde_json::json!({"role": "user", "parts": [{"text": ""}]}));
             }
         }
     }
@@ -161,7 +171,7 @@ pub fn convert_to_gemini_with(
                     } else {
                         generation_config.insert(
                             "thinkingConfig".into(),
-                            serde_json::json!({"thinkingLevel": "high"}),
+                            serde_json::json!({"thinkingLevel": "HIGH"}),
                         );
                     }
                 } else {
@@ -172,6 +182,13 @@ pub fn convert_to_gemini_with(
                         "minimal" | "low" | "medium" | "high" => clamped,
                         "max" | "xhigh" => "high",
                         _ => "high",
+                    };
+                    // 对齐 CPA 9dfddd61:generativelanguage 大小写敏感,小写 level 触发
+                    // 400 invalid argument;Antigravity 上游保持小写(CPA 该路径不归一化)
+                    let level = if flavor == SchemaFlavor::Gemini {
+                        level.to_uppercase()
+                    } else {
+                        level.to_string()
                     };
                     generation_config.insert(
                         "thinkingConfig".into(),
@@ -203,6 +220,13 @@ pub fn convert_to_gemini_with(
             }
             "none" => {
                 gemini["toolConfig"]["functionCallingConfig"]["mode"] = serde_json::json!("NONE");
+                // 对齐 CPA a76da711:Antigravity tool_choice=none 时不发 tools
+                // (上游拒 mode=NONE 与 tools 并存);Gemini 直连保留声明
+                if flavor == SchemaFlavor::Antigravity {
+                    if let Some(obj) = gemini.as_object_mut() {
+                        obj.remove("tools");
+                    }
+                }
             }
             "any" => {
                 gemini["toolConfig"]["functionCallingConfig"]["mode"] = serde_json::json!("ANY");
@@ -241,6 +265,14 @@ fn gemini_thinking_max_budget(model: &str) -> Option<i64> {
         m if m.starts_with("gemini-") => 32768,
         _ => return None,
     })
+}
+
+/// 对齐 CPA contentHasFunctionResponse:content turn 是否含 functionResponse part
+fn content_has_function_response(content: &Value) -> bool {
+    content
+        .get("parts")
+        .and_then(|p| p.as_array())
+        .is_some_and(|parts| parts.iter().any(|part| part.get("functionResponse").is_some()))
 }
 
 /// 转换工具定义: Anthropic tools → Gemini functionDeclarations
@@ -475,11 +507,11 @@ mod tests {
             gemini["generationConfig"]["thinkingConfig"]["thinkingBudget"],
             32768
         );
-        // 未知模型兜底 thinkingLevel=high
+        // 未知模型兜底 thinkingLevel=HIGH(对齐 CPA 9dfddd61:直连大小写敏感)
         let (gemini, _) = convert_to_gemini(&anthropic, "unknown-model");
         assert_eq!(
             gemini["generationConfig"]["thinkingConfig"]["thinkingLevel"],
-            "high"
+            "HIGH"
         );
         // 显式 effort 透传
         let mut with_effort = anthropic.clone();
@@ -487,7 +519,7 @@ mod tests {
         let (gemini, _) = convert_to_gemini(&with_effort, "gemini-2.5-pro");
         assert_eq!(
             gemini["generationConfig"]["thinkingConfig"]["thinkingLevel"],
-            "low"
+            "LOW"
         );
     }
 
@@ -513,7 +545,7 @@ mod tests {
 
     #[test]
     fn test_convert_to_gemini_thinking_effort_invalid() {
-        // 不合法 effort 值兜底 "high"
+        // 不合法 effort 值兜底 "HIGH"
         let anthropic = json!({
             "model": "m", "max_tokens": 1000,
             "thinking": {"type": "adaptive"},
@@ -523,8 +555,80 @@ mod tests {
         let (gemini, _) = convert_to_gemini(&anthropic, "gemini-2.5-pro");
         assert_eq!(
             gemini["generationConfig"]["thinkingConfig"]["thinkingLevel"],
+            "HIGH"
+        );
+    }
+
+    #[test]
+    fn test_convert_to_antigravity_thinking_level_stays_lowercase() {
+        // Antigravity 上游不做大小写归一化(CPA 9dfddd61 仅改 AI Studio 直连路径)
+        let anthropic = json!({
+            "model": "m", "max_tokens": 1000,
+            "thinking": {"type": "adaptive"},
+            "output_config": {"effort": "high"},
+            "messages": [{"role": "user", "content": "hi"}]
+        });
+        let (gemini, _) = convert_to_gemini_with(
+            &anthropic,
+            "gemini-3.7-flash-high",
+            SchemaFlavor::Antigravity,
+        );
+        assert_eq!(
+            gemini["generationConfig"]["thinkingConfig"]["thinkingLevel"],
             "high"
         );
+    }
+
+    #[test]
+    fn test_convert_to_gemini_appends_trailing_user_turn() {
+        // 对齐 CPA 5dc428f3:尾 turn 为 model 时补空 user turn
+        let anthropic = json!({
+            "model": "m", "max_tokens": 100,
+            "messages": [
+                {"role": "user", "content": "hi"},
+                {"role": "assistant", "content": "hello"}
+            ]
+        });
+        let (gemini, _) = convert_to_gemini(&anthropic, "gemini-2.5-pro");
+        let contents = gemini["contents"].as_array().unwrap();
+        assert_eq!(contents.len(), 3);
+        assert_eq!(contents[2]["role"], "user");
+        assert_eq!(contents[2]["parts"][0]["text"], "");
+
+        // Antigravity claude 目标跳过(adapter 拒空 text part)
+        let (gemini, _) =
+            convert_to_gemini_with(&anthropic, "claude-opus-5", SchemaFlavor::Antigravity);
+        assert_eq!(gemini["contents"].as_array().unwrap().len(), 2);
+
+        // Antigravity 非 claude 目标同样补齐(跳过条件只限 claude 目标,不限 flavor)
+        let (gemini, _) =
+            convert_to_gemini_with(&anthropic, "gemini-3.7-flash-high", SchemaFlavor::Antigravity);
+        let contents = gemini["contents"].as_array().unwrap();
+        assert_eq!(contents.len(), 3);
+        assert_eq!(contents[2]["role"], "user");
+        assert_eq!(contents[2]["parts"][0]["text"], "");
+    }
+
+    #[test]
+    fn test_convert_to_gemini_keeps_trailing_function_response_turn() {
+        // 尾 turn 含 functionResponse 时不补空 user turn(上游期望模型续写)
+        let anthropic = json!({
+            "model": "m", "max_tokens": 100,
+            "messages": [
+                {"role": "user", "content": "hi"},
+                {"role": "assistant", "content": [
+                    {"type": "tool_use", "id": "t1", "name": "Read", "input": {}}
+                ]},
+                {"role": "user", "content": [
+                    {"type": "tool_result", "tool_use_id": "t1", "content": "ok"}
+                ]}
+            ]
+        });
+        let (gemini, _) = convert_to_gemini(&anthropic, "gemini-2.5-pro");
+        let contents = gemini["contents"].as_array().unwrap();
+        assert_eq!(contents.len(), 3);
+        assert_eq!(contents[2]["role"], "user");
+        assert!(contents[2]["parts"][0].get("functionResponse").is_some());
     }
 
     fn adaptive_max_body() -> Value {
@@ -597,6 +701,17 @@ mod tests {
         };
         let (g, _) = convert_to_gemini(&base(json!({"type": "none"})), "m");
         assert_eq!(g["toolConfig"]["functionCallingConfig"]["mode"], "NONE");
+        // Gemini 直连保留工具声明
+        assert!(g.get("tools").is_some());
+
+        // 对齐 CPA a76da711:Antigravity tool_choice=none 删 tools
+        let (g, _) = convert_to_gemini_with(
+            &base(json!({"type": "none"})),
+            "gemini-3.7-flash-high",
+            SchemaFlavor::Antigravity,
+        );
+        assert_eq!(g["toolConfig"]["functionCallingConfig"]["mode"], "NONE");
+        assert!(g.get("tools").is_none());
 
         let (g, _) = convert_to_gemini(&base(json!({"type": "tool", "name": "Read"})), "m");
         assert_eq!(g["toolConfig"]["functionCallingConfig"]["mode"], "ANY");
