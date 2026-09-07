@@ -86,10 +86,6 @@ fn strip_claude_system_for_gpt(system: &str) -> String {
         "# claudeMd",
         "# currentDate",
         "Contents of",
-        // 安全约束(决策树/硬规则,非过度推理触发器)
-        "<safety_guardrails>",
-        "<git_safety>",
-        "<content_safety>",
     ];
 
     // 黑名单 header 前缀(明确丢弃)
@@ -98,6 +94,9 @@ fn strip_claude_system_for_gpt(system: &str) -> String {
         "<capabilities>",
         "<response_style>",
         "<rules>",
+        "<safety_guardrails>",
+        "<git_safety>",
+        "<content_safety>",
         "<investigate_before_answering>",
         "<verification>",
         "<tool_use>",
@@ -2185,9 +2184,6 @@ IMPORTANT: Assist with authorized security testing, defensive security, CTF chal
         assert!(dev_text.contains("Working directory: /project"));
         assert!(dev_text.contains("# Language"));
         assert!(dev_text.contains("Simplified Chinese"));
-        assert!(dev_text.contains("<safety_guardrails>"));
-        assert!(dev_text.contains("Consider the reversibility and potential impact"));
-        assert!(dev_text.contains("Low-risk: proceed without hesitation"));
 
         // 剥离的块
         assert!(!dev_text.contains("<identity>"));
@@ -2196,6 +2192,8 @@ IMPORTANT: Assist with authorized security testing, defensive security, CTF chal
         assert!(!dev_text.contains("verbose and explain everything"));
         assert!(!dev_text.contains("# Output Style: Concise"));
         assert!(!dev_text.contains("Keep responses short"));
+        assert!(!dev_text.contains("<safety_guardrails>"));
+        assert!(!dev_text.contains("Consider the reversibility and potential impact"));
         assert!(!dev_text.contains("IMPORTANT: Assist with authorized security testing"));
     }
 
