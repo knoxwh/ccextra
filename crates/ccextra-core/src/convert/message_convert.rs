@@ -134,7 +134,7 @@ fn merge_adjacent_gemini_contents(contents: Vec<Value>) -> Vec<Value> {
     merged
 }
 
-/// 按 preceding tool_use 顺序排列 tool_result;非结果块保留到结果之后。
+/// 按 preceding tool_use 顺序排列 tool_result;非结果块保留在原索引位置。
 /// 数量或 ID 无法一一匹配时保持原始顺序,避免破坏不完整历史(对齐 CPA AlignClaudeToolResults)。
 pub(crate) fn align_tool_results(content: &Value, preceding_tool_use_ids: &[String]) -> Value {
     let Some(blocks) = content.as_array() else {
@@ -145,19 +145,18 @@ pub(crate) fn align_tool_results(content: &Value, preceding_tool_use_ids: &[Stri
     }
 
     let mut tool_results = Vec::new();
-    let mut other_blocks = Vec::new();
-    for block in blocks {
+    let mut tool_result_slots = Vec::new();
+    for (index, block) in blocks.iter().enumerate() {
         if block.get("type").and_then(|t| t.as_str()) == Some("tool_result") {
             tool_results.push(block);
-        } else {
-            other_blocks.push(block);
+            tool_result_slots.push(index);
         }
     }
     if tool_results.len() != preceding_tool_use_ids.len() {
         return content.clone();
     }
 
-    let mut ordered = Vec::with_capacity(blocks.len());
+    let mut reordered = Vec::with_capacity(tool_results.len());
     let mut used = vec![false; tool_results.len()];
     for tool_use_id in preceding_tool_use_ids {
         let Some(index) = tool_results.iter().enumerate().find_map(|(index, result)| {
@@ -169,9 +168,13 @@ pub(crate) fn align_tool_results(content: &Value, preceding_tool_use_ids: &[Stri
             return content.clone();
         };
         used[index] = true;
-        ordered.push(tool_results[index].clone());
+        reordered.push(tool_results[index].clone());
     }
-    ordered.extend(other_blocks.into_iter().cloned());
+
+    let mut ordered = blocks.clone();
+    for (slot, result) in tool_result_slots.into_iter().zip(reordered) {
+        ordered[slot] = result;
+    }
     Value::Array(ordered)
 }
 
@@ -654,11 +657,12 @@ mod tests {
 
         let responses = contents[1]["parts"].as_array().unwrap();
         assert_eq!(responses.len(), 4);
-        assert_eq!(responses[0]["functionResponse"]["id"], "opaque-a");
-        assert_eq!(responses[1]["functionResponse"]["id"], "opaque-b");
-        assert_eq!(responses[0]["functionResponse"]["name"], "Rd");
-        assert_eq!(responses[2]["text"], "results");
-        assert_eq!(responses[3]["text"], "continue");
+        // 对齐 CPA 8564142f:文本块留在原索引,结果块按 tool_use 顺序回填结果槽位
+        assert_eq!(responses[0]["text"], "results");
+        assert_eq!(responses[1]["functionResponse"]["id"], "opaque-a");
+        assert_eq!(responses[1]["functionResponse"]["name"], "Rd");
+        assert_eq!(responses[2]["text"], "continue");
+        assert_eq!(responses[3]["functionResponse"]["id"], "opaque-b");
     }
 
     #[test]
@@ -913,5 +917,33 @@ mod tests {
             .contains("<system-reminder>"));
         assert_eq!(parts[1]["functionResponse"]["id"], "Read-1");
         assert_eq!(parts[2]["text"], "continue");
+    }
+
+    #[test]
+    fn test_align_tool_results_preserves_non_result_slots() {
+        // 对齐 CPA 8564142f:非结果块留在原索引,结果块按 tool_use 顺序回填结果槽位
+        let content = json!([
+            {"type": "tool_result", "tool_use_id": "call_2", "content": "two"},
+            {"type": "text", "text": "extra user text"},
+            {"type": "tool_result", "tool_use_id": "call_1", "content": "one"}
+        ]);
+        let aligned = align_tool_results(&content, &["call_1".into(), "call_2".into()]);
+        let parts = aligned.as_array().unwrap();
+        assert_eq!(parts.len(), 3);
+        assert_eq!(parts[0]["tool_use_id"], "call_1");
+        assert_eq!(parts[1]["text"], "extra user text");
+        assert_eq!(parts[2]["tool_use_id"], "call_2");
+
+        let leading = json!([
+            {"type": "text", "text": "leading text"},
+            {"type": "tool_result", "tool_use_id": "call_2", "content": "two"},
+            {"type": "tool_result", "tool_use_id": "call_1", "content": "one"}
+        ]);
+        let aligned = align_tool_results(&leading, &["call_1".into(), "call_2".into()]);
+        let parts = aligned.as_array().unwrap();
+        assert_eq!(parts.len(), 3);
+        assert_eq!(parts[0]["text"], "leading text");
+        assert_eq!(parts[1]["tool_use_id"], "call_1");
+        assert_eq!(parts[2]["tool_use_id"], "call_2");
     }
 }
