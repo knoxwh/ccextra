@@ -29,6 +29,33 @@ use super::signature::{
 };
 use super::Result;
 
+/// GPT/Codex 上游的行为适配块(字节固定,缓存前缀稳定)。
+///
+/// 基于官方 Codex CLI gpt_5_codex_prompt.md(截至 2026-09),精简为核心行为约束:
+/// 默认简洁、行动导向、跳过过度规划、简单任务不用 plan 工具。
+/// 明确 Claude Code 环境与工具集,压制 GPT-5 过度推理与冗长输出。
+/// 英文固定文本,不配置化;冲突时用户指令(CLAUDE.md)优先,本块只补缺省。
+const GPT_CODEX_ADAPTER_BLOCK: &str = "\
+You are Codex, based on GPT-5. You are running as a coding agent in Claude Code CLI on a user's computer.
+
+Always respond in Simplified Chinese (简体中文). Use Simplified Chinese for all explanations, communications, and user-facing messages. Technical terms, code identifiers, file paths, command names, and error strings should remain in their original form.
+
+## Work policy
+Default: be very concise; friendly coding teammate tone.
+Action-oriented: Infer user intent and bias towards action. Skip excessive planning for straightforward tasks (roughly the easiest 25%).
+For code changes: Lead with a quick explanation of the change, jump right in, and provide context on where and why changes were made.
+Offer logical next steps briefly (tests, build, verify) when relevant.
+Do not narrate your internal reasoning or steps. Do not invent unprompted warnings or disclaimers.
+
+## Tool calling
+Use specialized tools instead of bash commands when possible. For file operations, prefer Read/Edit/Write over cat/sed/awk. Reserve bash for actual system commands.
+NEVER use bash echo to communicate with the user. Output all communication directly in your response text.
+
+## Communication
+Plain text; CLI handles styling. Be concise, collaborative, factual. Lead with the answer, then give supporting detail.
+Skip heavy formatting for simple confirmations. Don't dump large files you've written; reference paths only.
+The user does not see command execution outputs directly. When asked to show output, relay the important details or summarize key lines.";
+
 /// Grok 上游追加的行为适配块(字节固定,缓存前缀稳定)。
 ///
 /// 直接对齐官方 grok-build prompt.md 核心约束,仅替换环境声明为 Claude Code。
@@ -84,9 +111,9 @@ fn is_grok_upstream(upstream_model: &str) -> bool {
     upstream_model.to_ascii_lowercase().contains("grok")
 }
 
-/// 判定上游是否需要注入 developer message + adapter block(仅 Grok 保留适配块)
+/// 判定上游是否需要注入 developer message + adapter block(GPT/Grok 保留适配块)
 fn needs_adapter_block(upstream_model: &str) -> bool {
-    is_grok_upstream(upstream_model)
+    is_gpt_upstream(upstream_model) || is_grok_upstream(upstream_model)
 }
 
 /// thinking signature → 可回放给目标上游的 reasoning.encrypted_content
@@ -473,16 +500,14 @@ pub fn convert_to_openai_responses(
 ) -> Result<HashMap<String, String>> {
     // --- system → instructions / developer message ---
     // 对齐 CPA convertClaudeRequestToCodex:
-    // GPT/Responses 上游将 system 作为 developer message 放入 input[] (instructions 留空)
-    // Grok 上游将 system 配合 GROK_ADAPTER_BLOCK 作为 developer message
-    // 其余 responses 上游保持 system → instructions
+    // GPT/Grok 上游将 system 配合 ADAPTER_BLOCK 作为 developer message 放入 input[]
+    // (instructions 留空);其余 responses 上游保持 system → instructions
     let system = body
         .get("system")
         .map(|system| system_to_instructions_text(system, upstream_model))
         .unwrap_or_default();
-    let gpt_upstream = is_gpt_upstream(upstream_model);
     let needs_adapter = needs_adapter_block(upstream_model);
-    let instructions = if gpt_upstream || needs_adapter {
+    let instructions = if needs_adapter {
         String::new()
     } else {
         system.clone()
@@ -493,20 +518,17 @@ pub fn convert_to_openai_responses(
         "instructions": instructions,
         "input": [],
     });
-    if gpt_upstream {
+    if needs_adapter {
+        let adapter = if is_gpt_upstream(upstream_model) {
+            GPT_CODEX_ADAPTER_BLOCK
+        } else {
+            GROK_ADAPTER_BLOCK
+        };
+        let mut developer = String::from(adapter);
         if !system.is_empty() {
-            openai["input"].as_array_mut().unwrap().push(json!({
-                "type": "message",
-                "role": "developer",
-                "content": [{"type": "input_text", "text": system}]
-            }));
-        }
-    } else if needs_adapter {
-        let mut developer = system;
-        if !developer.is_empty() {
             developer.push_str("\n\n");
+            developer.push_str(&system);
         }
-        developer.push_str(GROK_ADAPTER_BLOCK);
         openai["input"].as_array_mut().unwrap().push(json!({
             "type": "message",
             "role": "developer",
@@ -662,12 +684,12 @@ pub fn convert_to_openai_responses(
                                         "content": null,
                                         "encrypted_content": good
                                     });
-                                    if gpt_upstream {
+                                    if is_gpt_upstream(upstream_model) {
                                         reasoning["summary"] = json!([]);
                                     }
                                     out_items.push(reasoning);
                                 }
-                            } else if !gpt_upstream
+                            } else if !is_gpt_upstream(upstream_model)
                                 && !upstream_model.to_ascii_lowercase().contains("grok")
                             {
                                 if let Some(t) = part.get("thinking").and_then(|v| v.as_str()) {
@@ -929,7 +951,7 @@ pub fn convert_to_openai_responses(
     // --- service_tier:speed/service_tier fast → priority(对齐 normalizeCodexServiceTier) ---
     let service_tier = body.get("service_tier").and_then(|v| v.as_str());
     if body.get("speed").and_then(|v| v.as_str()) == Some("fast")
-        || (gpt_upstream && matches!(service_tier, Some("fast" | "priority")))
+        || (is_gpt_upstream(upstream_model) && matches!(service_tier, Some("fast" | "priority")))
     {
         openai["service_tier"] = json!("priority");
     }
@@ -974,7 +996,7 @@ pub fn convert_to_openai_responses(
     }
 
     // --- text.verbosity(仅 GPT 目标对齐 Codex: 默认 low,压制推理发散与冗余输出) ---
-    if gpt_upstream {
+    if is_gpt_upstream(upstream_model) {
         if let Some(text_obj) = openai.get_mut("text").and_then(|v| v.as_object_mut()) {
             text_obj.insert("verbosity".to_string(), json!("low"));
         } else {
@@ -1152,7 +1174,7 @@ mod tests {
 
     #[test]
     fn test_gpt_system_goes_to_developer_message() {
-        // Codex 线将 system 作为 developer 输入，instructions 留空，且不注入阉割 adapter
+        // GPT 上游将 adapter + system 作为 developer 输入，instructions 留空
         let mut body = json!({
             "model": "test",
             "system": "You are helpful",
@@ -1162,11 +1184,14 @@ mod tests {
         assert_eq!(body["instructions"], "");
         assert_eq!(body["input"][0]["type"], "message");
         assert_eq!(body["input"][0]["role"], "developer");
-        assert_eq!(body["input"][0]["content"][0]["text"], "You are helpful");
+        let dev_text = body["input"][0]["content"][0]["text"].as_str().unwrap();
+        assert!(dev_text.starts_with("You are Codex, based on GPT-5."));
+        assert!(dev_text.contains("You are helpful"));
     }
 
     #[test]
     fn test_gpt_without_system_no_developer_message() {
+        // GPT 上游空 system 时仍注入 adapter block
         let mut body = json!({
             "model": "test",
             "messages": [{"role": "user", "content": "hi"}]
@@ -1174,9 +1199,10 @@ mod tests {
         convert_to_openai_responses(&mut body, "gpt-5.6-sol").unwrap();
         assert_eq!(body["instructions"], "");
         let input = body["input"].as_array().unwrap();
-        assert_eq!(input.len(), 1);
-        assert_eq!(input[0]["role"], "user");
-        assert_eq!(input[0]["content"][0]["text"], "hi");
+        assert_eq!(input.len(), 2); // developer + user
+        assert_eq!(input[0]["role"], "developer");
+        assert_eq!(input[1]["role"], "user");
+        assert_eq!(input[1]["content"][0]["text"], "hi");
     }
 
     #[test]
@@ -1194,7 +1220,7 @@ mod tests {
 
     #[test]
     fn test_grok_system_and_adapter_go_to_developer_message() {
-        // Grok 线将 system 与 GROK_ADAPTER_BLOCK 作为 developer 输入，instructions 留空。
+        // Grok 线将 adapter + system 作为 developer 输入，instructions 留空。
         let mut body = json!({
             "model": "test",
             "system": "You are helpful",
@@ -1206,7 +1232,7 @@ mod tests {
         assert_eq!(body["input"][0]["role"], "developer");
         assert_eq!(
             body["input"][0]["content"][0]["text"],
-            format!("You are helpful\n\n{}", GROK_ADAPTER_BLOCK)
+            format!("{}\n\nYou are helpful", GROK_ADAPTER_BLOCK)
         );
     }
 
@@ -1629,9 +1655,11 @@ mod tests {
         });
         convert_to_openai_responses(&mut body, "gpt-5.6-terra").unwrap();
         let input = body["input"].as_array().unwrap();
-        assert_eq!(input.len(), 1);
-        assert_eq!(input[0]["type"], "message");
-        assert_eq!(input[0]["content"][0]["text"], "answer");
+        // developer message + assistant message
+        assert_eq!(input.len(), 2);
+        assert_eq!(input[0]["role"], "developer"); // adapter block
+        assert_eq!(input[1]["type"], "message");
+        assert_eq!(input[1]["content"][0]["text"], "answer");
         // 无签名 thinking 被丢弃(无 reasoning 项)
         assert!(!input.iter().any(|i| i["type"] == "reasoning"));
     }
@@ -1651,11 +1679,13 @@ mod tests {
             ]
         });
         convert_to_openai_responses(&mut body, "gpt-5.6-terra").unwrap();
-        assert_eq!(body["input"][0]["type"], "reasoning");
-        assert_eq!(body["input"][0]["encrypted_content"], VALID);
-        assert_eq!(body["input"][0]["summary"], json!([]));
-        assert_eq!(body["input"][1]["type"], "message");
-        assert_eq!(body["input"][1]["content"][0]["text"], "answer");
+        // input[0] = developer (adapter), input[1] = reasoning, input[2] = message
+        assert_eq!(body["input"][0]["role"], "developer");
+        assert_eq!(body["input"][1]["type"], "reasoning");
+        assert_eq!(body["input"][1]["encrypted_content"], VALID);
+        assert_eq!(body["input"][1]["summary"], json!([]));
+        assert_eq!(body["input"][2]["type"], "message");
+        assert_eq!(body["input"][2]["content"][0]["text"], "answer");
     }
 
     #[test]
@@ -1962,6 +1992,75 @@ mod tests {
         convert_to_openai_responses(&mut body, "test-model").unwrap();
         assert!(body.get("text").is_none());
         assert_eq!(body["reasoning"]["effort"], "high");
+    }
+
+    #[test]
+    fn test_gpt_upstream_injects_adapter_block() {
+        // GPT 上游注入 GPT_CODEX_ADAPTER_BLOCK 作为 developer message 前缀
+        let mut body = json!({
+            "model": "test",
+            "system": "Custom system instructions",
+            "messages": [{"role": "user", "content": "hello"}]
+        });
+        convert_to_openai_responses(&mut body, "gpt-5.4").unwrap();
+
+        assert_eq!(body["instructions"], "");
+        let input = body["input"].as_array().unwrap();
+        assert_eq!(input[0]["role"], "developer");
+        let dev_text = input[0]["content"][0]["text"].as_str().unwrap();
+        assert!(dev_text.starts_with("You are Codex, based on GPT-5."));
+        assert!(dev_text.contains("Custom system instructions"));
+    }
+
+    #[test]
+    fn test_gpt_upstream_adapter_with_empty_system() {
+        // GPT 上游空 system 时只发 adapter block（无多余换行）
+        let mut body = json!({
+            "model": "test",
+            "messages": [{"role": "user", "content": "test"}]
+        });
+        convert_to_openai_responses(&mut body, "o1-preview").unwrap();
+
+        let input = body["input"].as_array().unwrap();
+        assert_eq!(input[0]["role"], "developer");
+        let dev_text = input[0]["content"][0]["text"].as_str().unwrap();
+        assert!(dev_text.starts_with("You are Codex"));
+        // adapter block 本身包含多个 \n\n 分隔的段落，这是正常的
+        // 只要不是在末尾追加了额外的 "\n\n" + 空 system 即可
+        assert!(!dev_text.ends_with("\n\n"));
+    }
+
+    #[test]
+    fn test_grok_upstream_still_injects_grok_adapter() {
+        // Grok 上游仍然注入 GROK_ADAPTER_BLOCK(无回归)
+        let mut body = json!({
+            "model": "test",
+            "system": "Test system",
+            "messages": [{"role": "user", "content": "hi"}]
+        });
+        convert_to_openai_responses(&mut body, "grok-3.5").unwrap();
+
+        let input = body["input"].as_array().unwrap();
+        assert_eq!(input[0]["role"], "developer");
+        let dev_text = input[0]["content"][0]["text"].as_str().unwrap();
+        assert!(dev_text.starts_with("You are operating inside Claude Code's agent loop"));
+        assert!(dev_text.contains("Test system"));
+    }
+
+    #[test]
+    fn test_non_adapter_upstream_uses_instructions() {
+        // 非 adapter 上游(glm/deepseek)保持 system → instructions
+        let mut body = json!({
+            "model": "test",
+            "system": "System prompt",
+            "messages": [{"role": "user", "content": "test"}]
+        });
+        convert_to_openai_responses(&mut body, "glm-5.1").unwrap();
+
+        assert_eq!(body["instructions"], "System prompt");
+        let input = body["input"].as_array().unwrap();
+        // 首条消息应该是 user,不是 developer
+        assert_eq!(input[0]["role"], "user");
     }
 
     #[test]
@@ -2273,7 +2372,8 @@ mod tests {
             }]
         });
         convert_to_openai_responses(&mut body, "gpt-5.6-sol").unwrap();
-        let content = body["input"][0]["content"].as_array().unwrap();
+        // input[0] = developer (adapter), input[1] = user message
+        let content = body["input"][1]["content"].as_array().unwrap();
         assert_eq!(content.len(), 3);
         assert_eq!(content[0]["type"], "input_text");
         assert_eq!(content[0]["text"], "before");
@@ -2301,7 +2401,8 @@ mod tests {
             }]
         });
         convert_to_openai_responses(&mut body, "gpt-5.6-sol").unwrap();
-        let content = body["input"][0]["content"].as_array().unwrap();
+        // input[0] = developer, input[1] = user message
+        let content = body["input"][1]["content"].as_array().unwrap();
         assert_eq!(content.len(), 1);
         assert_eq!(content[0]["type"], "input_text");
         assert_eq!(content[0]["text"], "only text");
@@ -2467,7 +2568,9 @@ mod tests {
         });
         convert_to_openai_responses(&mut body, "gpt-5").unwrap();
         let input = body["input"].as_array().unwrap();
-        assert_eq!(input.len(), 0);
+        // 只有 developer message (adapter)
+        assert_eq!(input.len(), 1);
+        assert_eq!(input[0]["role"], "developer");
     }
 
     #[test]
@@ -2483,9 +2586,10 @@ mod tests {
             ]
         });
         convert_to_openai_responses(&mut body, "gpt-5").unwrap();
-        assert_eq!(body["input"].as_array().unwrap().len(), 1);
-        assert_eq!(body["input"][0]["type"], "message");
-        assert_eq!(body["input"][0]["content"][0]["text"], "result");
+        // input[0] = developer, input[1] = message
+        assert_eq!(body["input"].as_array().unwrap().len(), 2);
+        assert_eq!(body["input"][1]["type"], "message");
+        assert_eq!(body["input"][1]["content"][0]["text"], "result");
     }
 
     #[test]
@@ -2501,7 +2605,9 @@ mod tests {
         });
         convert_to_openai_responses(&mut body, "gpt-5").unwrap();
         let input = body["input"].as_array().unwrap();
-        assert_eq!(input.len(), 0);
+        // 只有 developer message
+        assert_eq!(input.len(), 1);
+        assert_eq!(input[0]["role"], "developer");
     }
 
     #[test]
