@@ -625,7 +625,7 @@ pub fn convert_to_openai_responses(
     // --- system → instructions / developer message ---
     // 对齐 CPA convertClaudeRequestToCodex:
     // GPT/Grok 上游将 system 配合 ADAPTER_BLOCK 作为 developer message 放入 input[]
-    // (instructions 留空);GPT 路径清洗 system 剥离触发过度推理的块;
+    // (instructions 留空);两者均清洗 system 剥离触发过度推理的块;
     // 其余 responses 上游保持 system → instructions
     let system = body
         .get("system")
@@ -650,12 +650,8 @@ pub fn convert_to_openai_responses(
             GROK_ADAPTER_BLOCK
         };
 
-        // GPT 上游清洗 system,剥离 Claude 触发块;Grok 保持原样
-        let base_system = if is_gpt_upstream(upstream_model) {
-            strip_claude_system_for_gpt(&system)
-        } else {
-            system
-        };
+        // GPT/Grok 上游均清洗 system,剥离 Claude 触发块
+        let base_system = strip_claude_system_for_gpt(&system);
 
         let mut developer = String::from(adapter);
         if !base_system.is_empty() {
@@ -1353,7 +1349,7 @@ mod tests {
 
     #[test]
     fn test_grok_system_and_adapter_go_to_developer_message() {
-        // Grok 线将 adapter + system 作为 developer 输入，instructions 留空。
+        // Grok 线将 adapter + 清洗后的 system 作为 developer 输入，instructions 留空。
         let mut body = json!({
             "model": "test",
             "system": "You are helpful",
@@ -1363,10 +1359,9 @@ mod tests {
         assert_eq!(body["instructions"], "");
         assert_eq!(body["input"][0]["type"], "message");
         assert_eq!(body["input"][0]["role"], "developer");
-        assert_eq!(
-            body["input"][0]["content"][0]["text"],
-            format!("{}\n\nYou are helpful", GROK_ADAPTER_BLOCK)
-        );
+        let dev_text = body["input"][0]["content"][0]["text"].as_str().unwrap();
+        assert!(dev_text.starts_with("You are operating inside Claude Code"));
+        assert!(dev_text.contains("You are helpful"));
     }
 
     #[test]
@@ -2211,20 +2206,28 @@ Contents of /Users/user/.claude/memory/MEMORY.md:
     }
 
     #[test]
-    fn test_grok_upstream_no_stripping() {
-        // Grok 上游不清洗 system,完整保留
+    fn test_grok_upstream_also_strips_triggers() {
+        // Grok 上游同样清洗 system,剥离触发块
         let mut body = json!({
             "model": "test",
             "system": r#"<identity>Claude</identity>
 # Memory
-Path: /memory"#,
+Path: /memory
+
+<response_style>
+Be verbose.
+</response_style>"#,
             "messages": [{"role": "user", "content": "test"}]
         });
         convert_to_openai_responses(&mut body, "grok-3.5").unwrap();
 
         let dev_text = body["input"][0]["content"][0]["text"].as_str().unwrap();
-        assert!(dev_text.contains("<identity>Claude</identity>"));
+        assert!(dev_text.starts_with("You are operating inside Claude Code"));
         assert!(dev_text.contains("# Memory"));
+        assert!(dev_text.contains("Path: /memory"));
+        // 触发块被剥离
+        assert!(!dev_text.contains("<identity>Claude</identity>"));
+        assert!(!dev_text.contains("<response_style>"));
     }
 
     #[test]
