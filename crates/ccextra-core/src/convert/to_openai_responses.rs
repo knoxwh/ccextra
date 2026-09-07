@@ -110,6 +110,13 @@ fn strip_claude_system_for_gpt(system: &str) -> String {
     const DISCARD_LINE_PATTERNS: &[&str] = &[
         "IMPORTANT: Assist with authorized security testing",
         "When you use a pronoun for someone",
+        "Claude Code is available as a CLI",     // 产品宣传
+        "Fast mode for Claude Code uses",        // 产品特性说明
+    ];
+
+    // 段落级黑名单触发器(匹配到该行,整个段落丢弃直到下个段落标记)
+    const DISCARD_PARAGRAPH_TRIGGERS: &[&str] = &[
+        "Available agent types",  // subagent 列表段落
     ];
 
     for line in system.lines() {
@@ -117,6 +124,14 @@ fn strip_claude_system_for_gpt(system: &str) -> String {
 
         // 独立行黑名单检测(立即跳过)
         if DISCARD_LINE_PATTERNS.iter().any(|p| line.contains(p)) {
+            continue;
+        }
+
+        // 段落级黑名单触发器检测(触发后整段丢弃)
+        if DISCARD_PARAGRAPH_TRIGGERS.iter().any(|p| line.contains(p)) {
+            // 丢弃当前段落累积内容
+            current_section.clear();
+            section_retention_state = SectionState::Discard;
             continue;
         }
 
@@ -2134,10 +2149,14 @@ mod tests {
 
     #[test]
     fn test_gpt_upstream_strips_claude_triggers() {
-        // GPT 上游清洗 system:保留 Memory/Environment/Language/safety_guardrails,丢弃 identity/concise-style
+        // GPT 上游清洗 system:保留 Memory/Environment/Language,丢弃 identity/concise-style/agent-types/产品宣传
         let mut body = json!({
             "model": "test",
             "system": r#"
+Available agent types for the Agent tool:
+- claude: Catch-all for any task
+- Explore: Read-only search agent
+
 <identity>
 You are Claude, Anthropic's AI assistant.
 </identity>
@@ -2148,6 +2167,8 @@ Memory path: /home/user/.claude/memory
 # Environment
 Working directory: /project
 Shell: bash
+- Claude Code is available as a CLI in the terminal, desktop app (Mac/Windows), web app (claude.ai/code), and IDE extensions (VS Code, JetBrains).
+- Fast mode for Claude Code uses Claude Opus with faster output (it does not downgrade to a smaller model). It can be toggled with /fast and is available on Opus 5/4.8.
 
 <response_style>
 Be very verbose and explain everything in detail.
@@ -2186,6 +2207,8 @@ IMPORTANT: Assist with authorized security testing, defensive security, CTF chal
         assert!(dev_text.contains("Simplified Chinese"));
 
         // 剥离的块
+        assert!(!dev_text.contains("Available agent types"));
+        assert!(!dev_text.contains("- claude: Catch-all"));
         assert!(!dev_text.contains("<identity>"));
         assert!(!dev_text.contains("Claude, Anthropic's AI assistant"));
         assert!(!dev_text.contains("<response_style>"));
@@ -2195,6 +2218,8 @@ IMPORTANT: Assist with authorized security testing, defensive security, CTF chal
         assert!(!dev_text.contains("<safety_guardrails>"));
         assert!(!dev_text.contains("Consider the reversibility and potential impact"));
         assert!(!dev_text.contains("IMPORTANT: Assist with authorized security testing"));
+        assert!(!dev_text.contains("Claude Code is available as a CLI"));
+        assert!(!dev_text.contains("Fast mode for Claude Code"));
     }
 
     #[test]
