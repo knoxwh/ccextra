@@ -1,6 +1,10 @@
 {
   "models": [
     {
+      "id": "gpt-6-astra",
+      "reasoning_levels": ["low", "medium", "high", "xhigh", "max"]
+    },
+    {
       "id": "gpt-5.6-terra",
       "reasoning_levels": ["low", "medium", "high", "xhigh", "max"]
     },
