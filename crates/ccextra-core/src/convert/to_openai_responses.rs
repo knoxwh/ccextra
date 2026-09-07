@@ -973,6 +973,15 @@ pub fn convert_to_openai_responses(
         });
     }
 
+    // --- text.verbosity(仅 GPT 目标对齐 Codex: 默认 low,压制推理发散与冗余输出) ---
+    if gpt_upstream {
+        if let Some(text_obj) = openai.get_mut("text").and_then(|v| v.as_object_mut()) {
+            text_obj.insert("verbosity".to_string(), json!("low"));
+        } else {
+            openai["text"] = json!({"verbosity": "low"});
+        }
+    }
+
     // --- stop 删除(对齐 CPA sanitizeXAIResponsesBody:responses 不支持 stop) ---
     if let Some(obj) = openai.as_object_mut() {
         obj.remove("stop");
@@ -1943,7 +1952,7 @@ mod tests {
 
     #[test]
     fn test_output_config_without_format_no_text() {
-        // 仅 effort / 缺 format → 不发 text(对齐 CPA effort-only 子例)
+        // 仅 effort / 缺 format 且非 GPT → 不发 text(对齐 CPA effort-only 子例)
         let mut body = json!({
             "model": "test",
             "thinking": {"type": "adaptive"},
@@ -1953,6 +1962,34 @@ mod tests {
         convert_to_openai_responses(&mut body, "test-model").unwrap();
         assert!(body.get("text").is_none());
         assert_eq!(body["reasoning"]["effort"], "high");
+    }
+
+    #[test]
+    fn test_gpt_upstream_injects_text_verbosity_low() {
+        // GPT 目标且无 format 时自动注入 text.verbosity = "low"
+        let mut body = json!({
+            "model": "test",
+            "messages": []
+        });
+        convert_to_openai_responses(&mut body, "gpt-5.4").unwrap();
+        assert_eq!(body["text"]["verbosity"], "low");
+        assert!(body["text"].get("format").is_none());
+
+        // GPT 目标带有 format 时合入 verbosity
+        let mut body = json!({
+            "model": "test",
+            "output_config": {"format": {
+                "type": "json_schema",
+                "schema": {"type": "object"}
+            }},
+            "messages": []
+        });
+        convert_to_openai_responses(&mut body, "gpt-5.4").unwrap();
+        assert_eq!(body["text"]["verbosity"], "low");
+        assert_eq!(
+            body["text"]["format"]["name"],
+            "cli_proxy_structured_output"
+        );
     }
 
     #[test]

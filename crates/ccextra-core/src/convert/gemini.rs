@@ -272,7 +272,11 @@ fn content_has_function_response(content: &Value) -> bool {
     content
         .get("parts")
         .and_then(|p| p.as_array())
-        .is_some_and(|parts| parts.iter().any(|part| part.get("functionResponse").is_some()))
+        .is_some_and(|parts| {
+            parts
+                .iter()
+                .any(|part| part.get("functionResponse").is_some())
+        })
 }
 
 /// 转换工具定义: Anthropic tools → Gemini functionDeclarations
@@ -601,8 +605,11 @@ mod tests {
         assert_eq!(gemini["contents"].as_array().unwrap().len(), 2);
 
         // Antigravity 非 claude 目标同样补齐(跳过条件只限 claude 目标,不限 flavor)
-        let (gemini, _) =
-            convert_to_gemini_with(&anthropic, "gemini-3.7-flash-high", SchemaFlavor::Antigravity);
+        let (gemini, _) = convert_to_gemini_with(
+            &anthropic,
+            "gemini-3.7-flash-high",
+            SchemaFlavor::Antigravity,
+        );
         let contents = gemini["contents"].as_array().unwrap();
         assert_eq!(contents.len(), 3);
         assert_eq!(contents[2]["role"], "user");
