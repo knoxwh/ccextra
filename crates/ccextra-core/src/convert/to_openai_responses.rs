@@ -29,6 +29,130 @@ use super::signature::{
 };
 use super::Result;
 
+/// 为 GPT 上游清洗 Claude system prompt(白名单保留核心上下文,剥离触发过度推理的块)。
+///
+/// **保留**(白名单):
+/// - `# Memory` — 持久化内存路径与 schema
+/// - `# Environment` — cwd/OS/shell/git 状态
+/// - `# Language` — zh-CN 正字法要求
+/// - `# Harness` — 工具使用、权限模式
+/// - `# Session-specific guidance` — 会话级指令
+/// - `# MCP Server Instructions` — MCP 工具说明
+/// - `# Context management` — 上下文压缩提示
+/// - CLAUDE.md / memory / 项目指令内容
+/// - **无段落标记的普通文本**(用户自定义 system prompt)
+///
+/// **丢弃**(触发 GPT-5 过度推理):
+/// - `<identity>` — Claude 品牌、模型族、平台描述
+/// - `IMPORTANT: Assist with authorized security testing...` — 安全预评估触发器
+/// - `When you use a pronoun for someone...` — 代词检查循环
+/// - `# Output Style: Concise` + `# Concise Style Active` — 严格简洁规则(被 adapter 替代)
+/// - `<response_style>`, `<capabilities>`, `<rules>` — 冗长行为约束(adapter 已覆盖)
+/// - `<investigate_before_answering>`, `<verification>`, `<tool_use>` — 过度规划触发器
+/// - `<default_to_action>`, `<context_awareness>` — 元指令(adapter 已简化)
+///
+/// 实现策略:按 XML 标签 / markdown header 分段,白名单匹配保留,黑名单丢弃,其余保留。
+fn strip_claude_system_for_gpt(system: &str) -> String {
+    let mut retained_sections = Vec::new();
+    let mut current_section = String::new();
+    let mut section_retention_state = SectionState::Unknown;
+
+    #[derive(PartialEq)]
+    enum SectionState {
+        Retain,   // 白名单段落
+        Discard,  // 黑名单段落
+        Unknown,  // 未分类(默认保留)
+    }
+
+    // 白名单 header 前缀(markdown 与 XML 标签)
+    const RETAIN_HEADERS: &[&str] = &[
+        "# Memory",
+        "# Environment",
+        "# Language",
+        "# Harness",
+        "# Session-specific guidance",
+        "# MCP Server Instructions",
+        "# Context management",
+        "# claudeMd",
+        "# currentDate",
+        "Contents of",
+    ];
+
+    // 黑名单 header 前缀(明确丢弃)
+    const DISCARD_HEADERS: &[&str] = &[
+        "<identity>",
+        "<capabilities>",
+        "<response_style>",
+        "<rules>",
+        "<safety_guardrails>",
+        "<git_safety>",
+        "<content_safety>",
+        "<investigate_before_answering>",
+        "<verification>",
+        "<tool_use>",
+        "<default_to_action>",
+        "<context_awareness>",
+        "# Output Style:",
+        "# Concise Style Active",
+    ];
+
+    // 黑名单独立行模式(整行匹配,不依赖段落结构)
+    const DISCARD_LINE_PATTERNS: &[&str] = &[
+        "IMPORTANT: Assist with authorized security testing",
+        "When you use a pronoun for someone",
+    ];
+
+    for line in system.lines() {
+        let trimmed = line.trim();
+
+        // 独立行黑名单检测(立即跳过)
+        if DISCARD_LINE_PATTERNS.iter().any(|p| line.contains(p)) {
+            continue;
+        }
+
+        // 检测新段落开始(markdown header 或 XML 标签)
+        let is_section_start = trimmed.starts_with('#') || trimmed.starts_with('<');
+
+        if is_section_start {
+            // 保存上一段落
+            if section_retention_state != SectionState::Discard
+                && !current_section.trim().is_empty()
+            {
+                retained_sections.push(current_section.trim().to_string());
+            }
+            current_section.clear();
+
+            // 判定新段落状态
+            if RETAIN_HEADERS
+                .iter()
+                .any(|h| trimmed.starts_with(h) || line.starts_with(h))
+            {
+                section_retention_state = SectionState::Retain;
+            } else if DISCARD_HEADERS
+                .iter()
+                .any(|h| trimmed.contains(h) || line.contains(h))
+            {
+                section_retention_state = SectionState::Discard;
+            } else {
+                // 未分类段落默认保留
+                section_retention_state = SectionState::Unknown;
+            }
+        }
+
+        if section_retention_state != SectionState::Discard {
+            current_section.push_str(line);
+            current_section.push('\n');
+        }
+    }
+
+    // 保存最后一段
+    if section_retention_state != SectionState::Discard && !current_section.trim().is_empty() {
+        retained_sections.push(current_section.trim().to_string());
+    }
+
+    retained_sections.join("\n\n")
+}
+
 /// GPT/Codex 上游的行为适配块(字节固定,缓存前缀稳定)。
 ///
 /// 基于官方 Codex CLI gpt_5_codex_prompt.md(截至 2026-09),精简为核心行为约束:
@@ -501,7 +625,8 @@ pub fn convert_to_openai_responses(
     // --- system → instructions / developer message ---
     // 对齐 CPA convertClaudeRequestToCodex:
     // GPT/Grok 上游将 system 配合 ADAPTER_BLOCK 作为 developer message 放入 input[]
-    // (instructions 留空);其余 responses 上游保持 system → instructions
+    // (instructions 留空);GPT 路径清洗 system 剥离触发过度推理的块;
+    // 其余 responses 上游保持 system → instructions
     let system = body
         .get("system")
         .map(|system| system_to_instructions_text(system, upstream_model))
@@ -524,10 +649,18 @@ pub fn convert_to_openai_responses(
         } else {
             GROK_ADAPTER_BLOCK
         };
+
+        // GPT 上游清洗 system,剥离 Claude 触发块;Grok 保持原样
+        let base_system = if is_gpt_upstream(upstream_model) {
+            strip_claude_system_for_gpt(&system)
+        } else {
+            system
+        };
+
         let mut developer = String::from(adapter);
-        if !system.is_empty() {
+        if !base_system.is_empty() {
             developer.push_str("\n\n");
-            developer.push_str(&system);
+            developer.push_str(&base_system);
         }
         openai["input"].as_array_mut().unwrap().push(json!({
             "type": "message",
@@ -1992,6 +2125,106 @@ mod tests {
         convert_to_openai_responses(&mut body, "test-model").unwrap();
         assert!(body.get("text").is_none());
         assert_eq!(body["reasoning"]["effort"], "high");
+    }
+
+    #[test]
+    fn test_gpt_upstream_strips_claude_triggers() {
+        // GPT 上游清洗 system:保留 Memory/Environment/Language,丢弃 identity/concise-style
+        let mut body = json!({
+            "model": "test",
+            "system": r#"
+<identity>
+You are Claude, Anthropic's AI assistant.
+</identity>
+
+# Memory
+Memory path: /home/user/.claude/memory
+
+# Environment
+Working directory: /project
+Shell: bash
+
+<response_style>
+Be very verbose and explain everything in detail.
+</response_style>
+
+# Output Style: Concise
+Keep responses short.
+
+# Language
+Always respond in Simplified Chinese (简体中文).
+
+IMPORTANT: Assist with authorized security testing, defensive security, CTF challenges.
+"#,
+            "messages": [{"role": "user", "content": "test"}]
+        });
+        convert_to_openai_responses(&mut body, "gpt-5.4").unwrap();
+
+        let dev_text = body["input"][0]["content"][0]["text"].as_str().unwrap();
+
+        // adapter 前缀存在
+        assert!(dev_text.starts_with("You are Codex, based on GPT-5."));
+
+        // 保留的块
+        assert!(dev_text.contains("# Memory"));
+        assert!(dev_text.contains("Memory path: /home/user/.claude/memory"));
+        assert!(dev_text.contains("# Environment"));
+        assert!(dev_text.contains("Working directory: /project"));
+        assert!(dev_text.contains("# Language"));
+        assert!(dev_text.contains("Simplified Chinese"));
+
+        // 剥离的块
+        assert!(!dev_text.contains("<identity>"));
+        assert!(!dev_text.contains("Claude, Anthropic's AI assistant"));
+        assert!(!dev_text.contains("<response_style>"));
+        assert!(!dev_text.contains("verbose and explain everything"));
+        assert!(!dev_text.contains("# Output Style: Concise"));
+        assert!(!dev_text.contains("Keep responses short"));
+        assert!(!dev_text.contains("IMPORTANT: Assist with authorized security testing"));
+    }
+
+    #[test]
+    fn test_gpt_strip_preserves_claudemd_and_memory() {
+        // 确保 CLAUDE.md 与 memory 内容不被剥离
+        let mut body = json!({
+            "model": "test",
+            "system": r#"
+# claudeMd
+Contents of /Users/user/.claude/CLAUDE.md:
+Project-specific instructions here.
+
+Contents of /Users/user/.claude/memory/MEMORY.md:
+- [fact1](fact1.md) — description
+
+<identity>Claude branding</identity>
+"#,
+            "messages": [{"role": "user", "content": "hi"}]
+        });
+        convert_to_openai_responses(&mut body, "o1-preview").unwrap();
+
+        let dev_text = body["input"][0]["content"][0]["text"].as_str().unwrap();
+        assert!(dev_text.contains("# claudeMd"));
+        assert!(dev_text.contains("Contents of /Users/user/.claude/CLAUDE.md"));
+        assert!(dev_text.contains("Project-specific instructions"));
+        assert!(dev_text.contains("Contents of /Users/user/.claude/memory"));
+        assert!(!dev_text.contains("<identity>"));
+    }
+
+    #[test]
+    fn test_grok_upstream_no_stripping() {
+        // Grok 上游不清洗 system,完整保留
+        let mut body = json!({
+            "model": "test",
+            "system": r#"<identity>Claude</identity>
+# Memory
+Path: /memory"#,
+            "messages": [{"role": "user", "content": "test"}]
+        });
+        convert_to_openai_responses(&mut body, "grok-3.5").unwrap();
+
+        let dev_text = body["input"][0]["content"][0]["text"].as_str().unwrap();
+        assert!(dev_text.contains("<identity>Claude</identity>"));
+        assert!(dev_text.contains("# Memory"));
     }
 
     #[test]
