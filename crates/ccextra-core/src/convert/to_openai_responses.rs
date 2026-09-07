@@ -29,7 +29,7 @@ use super::signature::{
 };
 use super::Result;
 
-/// 为 GPT 上游清洗 Claude system prompt(白名单保留核心上下文,剥离触发过度推理的块)。
+/// 为 GPT/Grok/Gemini 上游清洗 Claude system prompt(白名单保留核心上下文,剥离触发过度推理的块)。
 ///
 /// **保留**(白名单):
 /// - `# Memory` — 持久化内存路径与 schema
@@ -42,7 +42,7 @@ use super::Result;
 /// - CLAUDE.md / memory / 项目指令内容
 /// - **无段落标记的普通文本**(用户自定义 system prompt)
 ///
-/// **丢弃**(触发 GPT-5 过度推理):
+/// **丢弃**(触发 GPT-5/Grok/Gemini 过度推理):
 /// - `<identity>` — Claude 品牌、模型族、平台描述
 /// - `IMPORTANT: Assist with authorized security testing...` — 安全预评估触发器
 /// - `When you use a pronoun for someone...` — 代词检查循环
@@ -52,6 +52,13 @@ use super::Result;
 /// - `<default_to_action>`, `<context_awareness>` — 元指令(adapter 已简化)
 ///
 /// 实现策略:按 XML 标签 / markdown header 分段,白名单匹配保留,黑名单丢弃,其余保留。
+///
+/// Gemini/Antigravity 调用别名(功能相同,名称区分用途)。
+pub fn strip_claude_system_for_gemini(system: &str) -> String {
+    strip_claude_system_for_gpt(system)
+}
+
+/// 内部实现(GPT/Grok/Gemini 共用)
 fn strip_claude_system_for_gpt(system: &str) -> String {
     let mut retained_sections = Vec::new();
     let mut current_section = String::new();

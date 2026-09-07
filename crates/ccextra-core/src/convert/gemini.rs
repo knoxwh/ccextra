@@ -49,11 +49,16 @@ pub fn convert_to_gemini_with(
         None => (HashMap::new(), HashMap::new()),
     };
 
-    // system → systemInstruction(过滤 attribution 文本与非 Claude 目标身份声明,对齐 CPA)
+    // system → systemInstruction(过滤 attribution 文本与非 Claude 目标身份声明,对齐 CPA;
+    // 清洗 Claude 触发块压制过度推理)
     let mut system_parts = Vec::new();
     match body.get("system") {
-        Some(Value::String(s)) if !is_ignorable_system_text(s, upstream_model) => {
-            system_parts.push(serde_json::json!({"text": s.trim()}));
+        Some(Value::String(s)) => {
+            // 先清洗,再过滤 ignorable 文本
+            let cleaned = super::to_openai_responses::strip_claude_system_for_gemini(s);
+            if !cleaned.trim().is_empty() && !is_ignorable_system_text(&cleaned, upstream_model) {
+                system_parts.push(serde_json::json!({"text": cleaned.trim()}));
+            }
         }
         Some(Value::Array(arr)) => {
             for block in arr {
@@ -61,8 +66,11 @@ pub fn convert_to_gemini_with(
                     continue;
                 }
                 if let Some(text) = block.get("text").and_then(|t| t.as_str()) {
-                    if !is_ignorable_system_text(text, upstream_model) {
-                        system_parts.push(serde_json::json!({"text": text.trim()}));
+                    let cleaned = super::to_openai_responses::strip_claude_system_for_gemini(text);
+                    if !cleaned.trim().is_empty()
+                        && !is_ignorable_system_text(&cleaned, upstream_model)
+                    {
+                        system_parts.push(serde_json::json!({"text": cleaned.trim()}));
                     }
                 }
             }
@@ -439,6 +447,51 @@ mod tests {
         assert_eq!(parts.len(), 1);
         assert_eq!(parts[0]["text"], "You are helpful");
         assert_eq!(gemini["systemInstruction"]["role"], "user");
+    }
+
+    #[test]
+    fn test_convert_to_gemini_strips_claude_triggers() {
+        // Gemini 上游清洗 system:剥离 identity/response_style,保留 Memory/Language
+        let anthropic = json!({
+            "model": "m", "max_tokens": 100,
+            "system": r#"
+<identity>You are Claude</identity>
+
+# Memory
+Memory path: /home/.claude/memory
+
+# Language
+Always respond in zh-CN.
+
+<response_style>
+Be very verbose.
+</response_style>
+
+IMPORTANT: Assist with authorized security testing.
+"#,
+            "messages": [{"role": "user", "content": "test"}]
+        });
+        let (gemini, _) = convert_to_gemini(&anthropic, "gemini-2.0");
+
+        let parts = gemini["systemInstruction"]["parts"].as_array().unwrap();
+        let combined_text = parts
+            .iter()
+            .filter_map(|p| p["text"].as_str())
+            .collect::<Vec<_>>()
+            .join("\n");
+
+        // 保留的块
+        assert!(combined_text.contains("# Memory"));
+        assert!(combined_text.contains("Memory path: /home/.claude/memory"));
+        assert!(combined_text.contains("# Language"));
+        assert!(combined_text.contains("zh-CN"));
+
+        // 剥离的块
+        assert!(!combined_text.contains("<identity>"));
+        assert!(!combined_text.contains("You are Claude"));
+        assert!(!combined_text.contains("<response_style>"));
+        assert!(!combined_text.contains("Be very verbose"));
+        assert!(!combined_text.contains("IMPORTANT: Assist with authorized security testing"));
     }
 
     #[test]
