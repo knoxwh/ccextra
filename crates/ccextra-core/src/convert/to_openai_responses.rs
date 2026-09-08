@@ -56,12 +56,16 @@ use super::Result;
 ///
 /// 实现策略:按 XML 标签 / markdown header 分段,白名单匹配保留,黑名单丢弃,其余保留。
 ///
-/// Gemini/Antigravity 调用别名(功能相同,名称区分用途)。
+/// Gemini/Antigravity/OpenAI-Chat 调用别名(功能相同,名称区分用途)。
 pub fn strip_claude_system_for_gemini(system: &str) -> String {
     strip_claude_system_for_gpt(system)
 }
 
-/// 内部实现(GPT/Grok/Gemini 共用)
+pub fn strip_claude_system_for_chat(system: &str) -> String {
+    strip_claude_system_for_gpt(system)
+}
+
+/// 内部实现(GPT/Grok/Gemini/Chat 共用)
 fn strip_claude_system_for_gpt(system: &str) -> String {
     let mut retained_sections = Vec::new();
     let mut current_section = String::new();

@@ -64,20 +64,22 @@ pub fn convert_to_openai_chat(body: &mut Value, upstream_model: &str) -> Result<
 
     let mut messages: Vec<Value> = Vec::new();
 
-    // System → messages[0](逐块剥离计费归属、非 Claude 目标身份声明与空白,输出 text 数组,一致)
+    // System → messages[0](清洗 Claude 触发块,逐块剥离计费归属、非 Claude 目标身份声明与空白,输出 text 数组,一致)
     if let Some(system) = body.get("system") {
         let mut items: Vec<Value> = Vec::new();
         match system {
             Value::String(s) => {
-                if !super::is_ignorable_system_text(s, upstream_model) {
-                    items.push(json!({"type": "text", "text": s.trim()}));
+                let cleaned = super::to_openai_responses::strip_claude_system_for_chat(s);
+                if !cleaned.trim().is_empty() && !super::is_ignorable_system_text(&cleaned, upstream_model) {
+                    items.push(json!({"type": "text", "text": cleaned.trim()}));
                 }
             }
             Value::Array(blocks) => {
                 for b in blocks {
                     if let Some(t) = b.get("text").and_then(|v| v.as_str()) {
-                        if !super::is_ignorable_system_text(t, upstream_model) {
-                            items.push(json!({"type": "text", "text": t.trim()}));
+                        let cleaned = super::to_openai_responses::strip_claude_system_for_chat(t);
+                        if !cleaned.trim().is_empty() && !super::is_ignorable_system_text(&cleaned, upstream_model) {
+                            items.push(json!({"type": "text", "text": cleaned.trim()}));
                         }
                     }
                 }
@@ -555,6 +557,71 @@ mod tests {
         assert_eq!(body["messages"][0]["role"], "system");
         // content 为 text 数组(对齐 system 数组形态)
         assert_eq!(body["messages"][0]["content"][0]["text"], "You are helpful");
+    }
+
+    #[test]
+    fn test_chat_strips_claude_triggers() {
+        let mut body = json!({
+            "model": "test",
+            "system": r#"
+<identity>You are Claude</identity>
+
+# Memory
+Memory path: /home/.claude/memory
+
+# Language
+Always respond in zh-CN.
+
+<response_style>
+Be very verbose.
+</response_style>
+
+IMPORTANT: Assist with authorized security testing.
+"#,
+            "messages": [{"role": "user", "content": "hi"}]
+        });
+        convert_to_openai_chat(&mut body, "gpt-4o").unwrap();
+        let msgs = body["messages"].as_array().unwrap();
+        assert_eq!(msgs[0]["role"], "system");
+        let content = msgs[0]["content"][0]["text"].as_str().unwrap();
+
+        // 保留的块
+        assert!(content.contains("# Memory"));
+        assert!(content.contains("Memory path: /home/.claude/memory"));
+        assert!(content.contains("# Language"));
+        assert!(content.contains("zh-CN"));
+
+        // 剥离的块
+        assert!(!content.contains("<identity>"));
+        assert!(!content.contains("You are Claude"));
+        assert!(!content.contains("<response_style>"));
+        assert!(!content.contains("Be very verbose"));
+        assert!(!content.contains("IMPORTANT: Assist with authorized security testing"));
+    }
+
+    #[test]
+    fn test_chat_strips_claude_triggers_array_system() {
+        let mut body = json!({
+            "model": "test",
+            "system": [
+                {"type": "text", "text": "<identity>You are Claude</identity>\n# Memory\nPath: /m"},
+                {"type": "text", "text": "<response_style>verbose</response_style>\n# Language\nzh-CN"}
+            ],
+            "messages": [{"role": "user", "content": "hi"}]
+        });
+        convert_to_openai_chat(&mut body, "gpt-4o").unwrap();
+        let msgs = body["messages"].as_array().unwrap();
+        assert_eq!(msgs[0]["role"], "system");
+        let content_blocks = msgs[0]["content"].as_array().unwrap();
+        assert_eq!(content_blocks.len(), 2);
+
+        let t0 = content_blocks[0]["text"].as_str().unwrap();
+        assert!(t0.contains("# Memory"));
+        assert!(!t0.contains("<identity>"));
+
+        let t1 = content_blocks[1]["text"].as_str().unwrap();
+        assert!(t1.contains("# Language"));
+        assert!(!t1.contains("<response_style>"));
     }
 
     #[test]
