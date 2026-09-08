@@ -152,6 +152,18 @@ query_quota() {
         req_body="{}"
     fi
 
+    local summary_resp=""
+    for endpoint in "$DAILY_API_ENDPOINT" "$API_ENDPOINT" "$SANDBOX_DAILY_API_ENDPOINT"; do
+        summary_resp="$(curl -sS -X POST "${endpoint}/v1internal:retrieveUserQuotaSummary" \
+            -H "Authorization: Bearer ${token}" \
+            -H "Content-Type: application/json" \
+            -H "User-Agent: ${USER_AGENT}" \
+            -d "$req_body" 2>/dev/null || true)"
+        if [[ -n "$summary_resp" ]] && echo "$summary_resp" | jq -e '.groups' >/dev/null 2>&1; then
+            break
+        fi
+    done
+
     local resp=""
     for endpoint in "$DAILY_API_ENDPOINT" "$API_ENDPOINT" "$SANDBOX_DAILY_API_ENDPOINT"; do
         resp="$(curl -sS -X POST "${endpoint}/v1internal:fetchAvailableModels" \
@@ -165,6 +177,9 @@ query_quota() {
     done
 
     if [[ "$RAW_OUTPUT" == true ]]; then
+        echo "=== retrieveUserQuotaSummary ==="
+        echo "$summary_resp" | jq .
+        echo "=== fetchAvailableModels ==="
         echo "$resp" | jq .
         return
     fi
@@ -184,6 +199,34 @@ query_quota() {
     echo "=========================================================================================="
     echo "📧 账号: ${email} | 🆔 项目: ${project_id:-无}"
     echo "------------------------------------------------------------------------------------------"
+
+    if [[ -n "$summary_resp" ]] && echo "$summary_resp" | jq -e '.groups' >/dev/null 2>&1; then
+        echo "【分组配额（周限额 / 5小时）】"
+        printf "%-26s %-12s %-10s %s\n" "配额组" "周期" "剩余额度" "重置时间"
+        printf "%-26s %-12s %-10s %s\n" "--------------------------" "------------" "----------" "-------------------"
+        echo "$summary_resp" | jq -c '
+            .groups[] |
+            .displayName as $gname |
+            .buckets[] |
+            {
+                group: $gname,
+                window: (.window // .bucketId),
+                remaining: (((.remainingFraction // 0) * 100 * 100 | floor) / 100),
+                reset_time: (.resetTime // "")
+            }
+        ' | while read -r bucket; do
+            local b_group b_win b_rem b_reset b_reset_fmt
+            b_group="$(echo "$bucket" | jq -r '.group')"
+            b_win="$(echo "$bucket" | jq -r '.window')"
+            b_rem="$(echo "$bucket" | jq -r '.remaining')%"
+            b_reset="$(echo "$bucket" | jq -r '.reset_time')"
+            b_reset_fmt="$(format_reset_time "$b_reset")"
+            printf "%-26s %-12s %-10s %s\n" "$b_group" "$b_win" "$b_rem" "$b_reset_fmt"
+        done
+        echo "------------------------------------------------------------------------------------------"
+    fi
+
+    echo "【单模型状态（短期窗口）】"
     printf "%-32s %-10s %-20s %s\n" "模型 ID" "剩余额度" "重置时间" "模型名称"
     echo "------------------------------------------------------------------------------------------"
 
