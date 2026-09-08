@@ -1247,20 +1247,109 @@ IMPORTANT: Assist with authorized security testing.
     }
 
     #[test]
-    fn test_gpt52_named_variant_drops_sampling() {
-        let mut body = json!({
-            "model": "test",
-            "system": "You are helpful",
-            "messages": [],
-            "max_tokens": 1024,
-            "temperature": 0.2,
-            "top_p": 0.8
-        });
-        convert_to_openai_chat(&mut body, "gpt-5.2-chat-latest").unwrap();
-        assert_eq!(body["max_completion_tokens"], 1024);
-        assert!(body.get("temperature").is_none());
-        assert!(body.get("top_p").is_none());
-        assert_eq!(body["messages"][0]["role"], "developer");
+    fn test_gpt_standard_model_field_adaptation() {
+        // 合并 4 个标准 GPT-5/6 分支测试
+        struct Case {
+            name: &'static str,
+            model: &'static str,
+            has_reasoning: bool,
+            expect_max_completion_tokens: bool,
+            expect_temperature_dropped: bool,
+            expect_top_p_dropped: bool,
+            expect_developer_role: bool,
+        }
+
+        let cases = vec![
+            Case {
+                name: "gpt-5.2 named variant with reasoning",
+                model: "gpt-5.2-chat-latest",
+                has_reasoning: false,
+                expect_max_completion_tokens: true,
+                expect_temperature_dropped: true,
+                expect_top_p_dropped: true,
+                expect_developer_role: true,
+            },
+            Case {
+                name: "gpt-5.2 without reasoning",
+                model: "gpt-5.2",
+                has_reasoning: false,
+                expect_max_completion_tokens: true,
+                expect_temperature_dropped: false,
+                expect_top_p_dropped: true,
+                expect_developer_role: true,
+            },
+            Case {
+                name: "gpt-5.2 dated snapshot",
+                model: "gpt-5.2-2025-12-11",
+                has_reasoning: false,
+                expect_max_completion_tokens: true,
+                expect_temperature_dropped: false,
+                expect_top_p_dropped: false,
+                expect_developer_role: true,
+            },
+            Case {
+                name: "gpt-5.2 with reasoning effort",
+                model: "gpt-5.2",
+                has_reasoning: true,
+                expect_max_completion_tokens: true,
+                expect_temperature_dropped: true,
+                expect_top_p_dropped: true,
+                expect_developer_role: true,
+            },
+        ];
+
+        for case in cases {
+            let mut body = json!({
+                "model": "test",
+                "system": "You are helpful",
+                "messages": [],
+                "max_tokens": 1024,
+                "temperature": 0.2,
+                "top_p": 0.8
+            });
+            if case.has_reasoning {
+                body["output_config"] = json!({"effort": "high"});
+            }
+
+            convert_to_openai_chat(&mut body, case.model).unwrap();
+
+            if case.expect_max_completion_tokens {
+                assert_eq!(body["max_completion_tokens"], 1024, "Failed at case: {}", case.name);
+                assert!(body.get("max_tokens").is_none(), "Failed at case: {}", case.name);
+            }
+
+            if case.expect_temperature_dropped {
+                assert!(body.get("temperature").is_none(), "Failed at case: {}", case.name);
+            } else {
+                assert_eq!(body["temperature"], 0.2, "Failed at case: {}", case.name);
+            }
+
+            if case.expect_top_p_dropped {
+                assert!(body.get("top_p").is_none(), "Failed at case: {}", case.name);
+            }
+
+            if case.expect_developer_role {
+                assert_eq!(body["messages"][0]["role"], "developer", "Failed at case: {}", case.name);
+            }
+        }
+
+        // GPT-6 Astra 测试（支持多个模型名）
+        for model in ["gpt-6-astra", "gpt-6-astra-2026-09-03"] {
+            let mut body = json!({
+                "model": "test",
+                "system": "You are helpful",
+                "messages": [],
+                "max_tokens": 1024,
+                "temperature": 0.2,
+                "top_p": 0.8
+            });
+            convert_to_openai_chat(&mut body, model).unwrap();
+            assert_eq!(body["max_completion_tokens"], 1024, "{model}");
+            assert!(body.get("max_tokens").is_none(), "{model}");
+            assert!(body.get("temperature").is_none(), "{model}");
+            assert!(body.get("top_p").is_none(), "{model}");
+            assert_eq!(body["messages"][0]["role"], "developer", "{model}");
+        }
     }
 
     #[test]
@@ -1281,24 +1370,6 @@ IMPORTANT: Assist with authorized security testing.
     }
 
     #[test]
-    fn test_gpt52_without_reasoning_keeps_sampling() {
-        let mut body = json!({
-            "model": "test",
-            "system": "You are helpful",
-            "messages": [],
-            "max_tokens": 1024,
-            "temperature": 0.2,
-            "top_p": 0.8
-        });
-        convert_to_openai_chat(&mut body, "gpt-5.2").unwrap();
-        assert_eq!(body["max_completion_tokens"], 1024);
-        assert!(body.get("max_tokens").is_none());
-        assert_eq!(body["temperature"], 0.2);
-        assert!(body.get("top_p").is_none());
-        assert_eq!(body["messages"][0]["role"], "developer");
-    }
-
-    #[test]
     fn test_gpt52_disabled_thinking_keeps_sampling() {
         let mut body = json!({
             "model": "test",
@@ -1314,60 +1385,6 @@ IMPORTANT: Assist with authorized security testing.
         assert_eq!(body["temperature"], 0.2);
         assert_eq!(body["reasoning_effort"], "none");
         assert_eq!(body["messages"][0]["role"], "developer");
-    }
-
-    #[test]
-    fn test_gpt52_dated_snapshot_keeps_sampling() {
-        let mut body = json!({
-            "model": "test",
-            "system": "You are helpful",
-            "messages": [],
-            "max_tokens": 1024,
-            "temperature": 0.2,
-            "top_p": 0.8
-        });
-        convert_to_openai_chat(&mut body, "gpt-5.2-2025-12-11").unwrap();
-        assert_eq!(body["max_completion_tokens"], 1024);
-        assert_eq!(body["temperature"], 0.2);
-        assert_eq!(body["messages"][0]["role"], "developer");
-    }
-
-    #[test]
-    fn test_gpt52_with_reasoning_drops_sampling() {
-        let mut body = json!({
-            "model": "test",
-            "system": "You are helpful",
-            "output_config": {"effort": "high"},
-            "messages": [],
-            "max_tokens": 1024,
-            "temperature": 0.2,
-            "top_p": 0.8
-        });
-        convert_to_openai_chat(&mut body, "gpt-5.2").unwrap();
-        assert_eq!(body["max_completion_tokens"], 1024);
-        assert!(body.get("temperature").is_none());
-        assert!(body.get("top_p").is_none());
-        assert_eq!(body["messages"][0]["role"], "developer");
-    }
-
-    #[test]
-    fn test_gpt6_astra_and_snapshot_use_model_compatible_fields() {
-        for model in ["gpt-6-astra", "gpt-6-astra-2026-09-03"] {
-            let mut body = json!({
-                "model": "test",
-                "system": "You are helpful",
-                "messages": [],
-                "max_tokens": 1024,
-                "temperature": 0.2,
-                "top_p": 0.8
-            });
-            convert_to_openai_chat(&mut body, model).unwrap();
-            assert_eq!(body["max_completion_tokens"], 1024, "{model}");
-            assert!(body.get("max_tokens").is_none(), "{model}");
-            assert!(body.get("temperature").is_none(), "{model}");
-            assert!(body.get("top_p").is_none(), "{model}");
-            assert_eq!(body["messages"][0]["role"], "developer", "{model}");
-        }
     }
 
     #[test]
