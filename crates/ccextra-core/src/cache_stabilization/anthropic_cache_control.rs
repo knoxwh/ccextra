@@ -528,233 +528,216 @@ mod tests {
     }
 
     #[test]
-    fn slot3_skips_live_assistant_tail_and_finds_last_user_message() {
-        // 对话尾部是 assistant 回复；标记必须落在最后一条用户消息上，
-        // 而不是尾部的 assistant 消息。
-        let mut body = json!({
-            "tools": [{"name": "search", "description": "search"}],
-            "messages": [
-                {"role": "user", "content": "first"},
-                {"role": "assistant", "content": "second"},
-                {
-                    "role": "user",
-                    "content": [
-                        {"type": "text", "text": "remember this"},
-                        {"type": "text", "text": "and this"}
-                    ]
-                },
-                {"role": "assistant", "content": "latest reply"}
-            ],
-        });
-        let outcome = auto_place_anthropic_cache_control(&mut body);
-        assert_eq!(
-            outcome,
-            AutoPlaceOutcome::Applied {
-                placed_count: 2,
-                locations: vec!["tools[0]".to_string(), "messages[2].content[1]".to_string(),],
-            }
-        );
-        assert_eq!(
-            body.pointer("/messages/2/content/1/cache_control"),
-            Some(&json!({"type": "ephemeral"})),
-        );
-        // 尾部的 assistant 必须保持无标记。
-        assert!(body.pointer("/messages/3/cache_control").is_none());
-        assert!(body.pointer("/messages/3/content/cache_control").is_none());
-    }
-
-    #[test]
-    fn slot3_skips_tool_result_tail_and_finds_last_user_message() {
-        // 多工具回合：尾部是携带 tool_result 的用户消息。
-        // 槽位 3 必须跳过那个实时的 tool_result 尾部，落在更早的人类
-        // 用户消息上，使缓存的 prefix 在易变的 assistant/tool_result
-        // 回合之前停止。
-        let mut body = json!({
-            "tools": [{"name": "search", "description": "search"}],
-            "messages": [
-                {
-                    "role": "user",
-                    "content": [{"type": "text", "text": "first"}]
-                },
-                {
-                    "role": "assistant",
-                    "content": [
+    fn test_slot3_user_message_selection() {
+        struct Case {
+            name: &'static str,
+            body: Value,
+            expect_slot3_location: Option<&'static str>,
+        }
+        let cases = vec![
+            Case {
+                name: "skips live assistant tail",
+                body: json!({
+                    "tools": [{"name": "search", "description": "search"}],
+                    "messages": [
+                        {"role": "user", "content": "first"},
+                        {"role": "assistant", "content": "second"},
                         {
-                            "type": "tool_use",
-                            "id": "tu_1",
-                            "name": "search",
-                            "input": {"q": "x"}
-                        }
-                    ]
-                },
-                {
-                    "role": "user",
-                    "content": [
-                        {
-                            "type": "tool_result",
-                            "tool_use_id": "tu_1",
-                            "content": "result"
-                        }
-                    ]
-                }
-            ],
-        });
-        let outcome = auto_place_anthropic_cache_control(&mut body);
-        assert_eq!(
-            outcome,
-            AutoPlaceOutcome::Applied {
-                placed_count: 2,
-                locations: vec!["tools[0]".to_string(), "messages[0].content[0]".to_string(),],
-            }
-        );
-        assert_eq!(
-            body.pointer("/messages/0/content/0/cache_control"),
-            Some(&json!({"type": "ephemeral"})),
-        );
-        // tool_result 尾部必须保持无标记。
-        assert!(body
-            .pointer("/messages/2/content/0/cache_control")
-            .is_none());
-        assert!(body
-            .pointer("/messages/1/content/0/cache_control")
-            .is_none());
-    }
-
-    #[test]
-    fn slot3_skips_user_message_that_contains_tool_result_before_text() {
-        // 即使一条 user 角色消息以文本结尾，该消息中任何更早的
-        // tool_result 块也是易变的。槽位 3 必须跳过整条消息，并把缓存
-        // 边界保持在工具输出之前。
-        let mut body = json!({
-            "tools": [{"name": "search", "description": "search"}],
-            "messages": [
-                {
-                    "role": "user",
-                    "content": [{"type": "text", "text": "first"}]
-                },
-                {
-                    "role": "assistant",
-                    "content": [
-                        {
-                            "type": "tool_use",
-                            "id": "tu_1",
-                            "name": "search",
-                            "input": {"q": "x"}
-                        }
-                    ]
-                },
-                {
-                    "role": "user",
-                    "content": [
-                        {
-                            "type": "tool_result",
-                            "tool_use_id": "tu_1",
-                            "content": "result"
+                            "role": "user",
+                            "content": [
+                                {"type": "text", "text": "remember this"},
+                                {"type": "text", "text": "and this"}
+                            ]
                         },
-                        {"type": "text", "text": "human follow-up"}
-                    ]
-                }
-            ],
-        });
-        let outcome = auto_place_anthropic_cache_control(&mut body);
-        assert_eq!(
-            outcome,
-            AutoPlaceOutcome::Applied {
-                placed_count: 2,
-                locations: vec!["tools[0]".to_string(), "messages[0].content[0]".to_string(),],
-            }
-        );
-        assert_eq!(
-            body.pointer("/messages/0/content/0/cache_control"),
-            Some(&json!({"type": "ephemeral"})),
-        );
-        assert!(body
-            .pointer("/messages/2/content/0/cache_control")
-            .is_none());
-        assert!(body
-            .pointer("/messages/2/content/1/cache_control")
-            .is_none());
-    }
-
-    #[test]
-    fn slot3_falls_back_to_earliest_user_when_no_later_user_array_block() {
-        // messages.len() >= 2 但第一条之后的所有消息都是 assistant。
-        // 槽位 3 仍必须落在第一条（也是唯一一条）携带数组形式内容的
-        // 用户消息上。
-        let mut body = json!({
-            "tools": [{"name": "search", "description": "search"}],
-            "messages": [
-                {
-                    "role": "user",
-                    "content": [
-                        {"type": "text", "text": "only user"}
-                    ]
+                        {"role": "assistant", "content": "latest reply"}
+                    ],
+                }),
+                expect_slot3_location: Some("messages[2].content[1]"),
+            },
+            Case {
+                name: "skips tool_result tail",
+                body: json!({
+                    "tools": [{"name": "search", "description": "search"}],
+                    "messages": [
+                        {
+                            "role": "user",
+                            "content": [{"type": "text", "text": "first"}]
+                        },
+                        {
+                            "role": "assistant",
+                            "content": [
+                                {
+                                    "type": "tool_use",
+                                    "id": "tu_1",
+                                    "name": "search",
+                                    "input": {"q": "x"}
+                                }
+                            ]
+                        },
+                        {
+                            "role": "user",
+                            "content": [
+                                {
+                                    "type": "tool_result",
+                                    "tool_use_id": "tu_1",
+                                    "content": "result"
+                                }
+                            ]
+                        }
+                    ],
+                }),
+                expect_slot3_location: Some("messages[0].content[0]"),
+            },
+            Case {
+                name: "skips user message with tool_result before text",
+                body: json!({
+                    "tools": [{"name": "search", "description": "search"}],
+                    "messages": [
+                        {
+                            "role": "user",
+                            "content": [{"type": "text", "text": "first"}]
+                        },
+                        {
+                            "role": "assistant",
+                            "content": [
+                                {
+                                    "type": "tool_use",
+                                    "id": "tu_1",
+                                    "name": "search",
+                                    "input": {"q": "x"}
+                                }
+                            ]
+                        },
+                        {
+                            "role": "user",
+                            "content": [
+                                {
+                                    "type": "tool_result",
+                                    "tool_use_id": "tu_1",
+                                    "content": "result"
+                                },
+                                {"type": "text", "text": "human follow-up"}
+                            ]
+                        }
+                    ],
+                }),
+                expect_slot3_location: Some("messages[0].content[0]"),
+            },
+            Case {
+                name: "falls back to earliest user when no later user array",
+                body: json!({
+                    "tools": [{"name": "search", "description": "search"}],
+                    "messages": [
+                        {
+                            "role": "user",
+                            "content": [
+                                {"type": "text", "text": "only user"}
+                            ]
+                        },
+                        {"role": "assistant", "content": "reply one"},
+                        {"role": "assistant", "content": "reply two"}
+                    ],
+                }),
+                expect_slot3_location: Some("messages[0].content[0]"),
+            },
+        ];
+        for case in cases {
+            let mut body = case.body.clone();
+            let outcome = auto_place_anthropic_cache_control(&mut body);
+            let expected_locations = if let Some(loc) = case.expect_slot3_location {
+                vec!["tools[0]".to_string(), loc.to_string()]
+            } else {
+                vec!["tools[0]".to_string()]
+            };
+            assert_eq!(
+                outcome,
+                AutoPlaceOutcome::Applied {
+                    placed_count: expected_locations.len(),
+                    locations: expected_locations.clone(),
                 },
-                {"role": "assistant", "content": "reply one"},
-                {"role": "assistant", "content": "reply two"}
-            ],
-        });
-        let outcome = auto_place_anthropic_cache_control(&mut body);
-        assert_eq!(
-            outcome,
-            AutoPlaceOutcome::Applied {
-                placed_count: 2,
-                locations: vec!["tools[0]".to_string(), "messages[0].content[0]".to_string(),],
+                "Failed at case: {}",
+                case.name
+            );
+            if let Some(loc) = case.expect_slot3_location {
+                let pointer = format!("/{}", loc.replace("[", "/").replace("]", "").replace(".", "/"));
+                assert_eq!(
+                    body.pointer(&format!("{}/cache_control", pointer)),
+                    Some(&json!({"type": "ephemeral"})),
+                    "Case '{}': marker not found at expected location",
+                    case.name
+                );
             }
-        );
-        assert_eq!(
-            body.pointer("/messages/0/content/0/cache_control"),
-            Some(&json!({"type": "ephemeral"})),
-        );
+        }
     }
 
     #[test]
-    fn malformed_system_block_does_not_panic() {
-        // 最后一个 system 块不是对象 → 跳过槽位 2，仍放置槽位 1。
-        let mut body = json!({
-            "system": [
-                {"type": "text", "text": "rule 1"},
-                "not-an-object"
-            ],
-            "tools": [{"name": "search", "description": "search"}],
-            "messages": [{"role": "user", "content": "hi"}],
-        });
-        let outcome = auto_place_anthropic_cache_control(&mut body);
-        assert_eq!(
-            outcome,
-            AutoPlaceOutcome::Applied {
-                placed_count: 1,
-                locations: vec!["tools[0]".to_string()],
-            }
-        );
-        assert!(body.pointer("/tools/0/cache_control").is_some());
-    }
-
-    #[test]
-    fn malformed_message_content_block_does_not_panic() {
-        // 最后一条消息的最后一个内容块不是对象 → 跳过槽位 3。
-        let mut body = json!({
-            "tools": [{"name": "search", "description": "search"}],
-            "messages": [
-                {"role": "user", "content": "first"},
-                {"role": "assistant", "content": "second"},
-                {
-                    "role": "user",
-                    "content": [
-                        {"type": "text", "text": "ok"},
+    fn test_malformed_entries_do_not_panic() {
+        struct Case {
+            name: &'static str,
+            body: Value,
+            expect_placed: usize,
+            expect_locations: Vec<&'static str>,
+        }
+        let cases = vec![
+            Case {
+                name: "malformed system block",
+                body: json!({
+                    "system": [
+                        {"type": "text", "text": "rule 1"},
                         "not-an-object"
-                    ]
-                }
-            ],
-        });
-        let outcome = auto_place_anthropic_cache_control(&mut body);
-        assert_eq!(
-            outcome,
-            AutoPlaceOutcome::Applied {
-                placed_count: 1,
-                locations: vec!["tools[0]".to_string()],
+                    ],
+                    "tools": [{"name": "search", "description": "search"}],
+                    "messages": [{"role": "user", "content": "hi"}],
+                }),
+                expect_placed: 1,
+                expect_locations: vec!["tools[0]"],
+            },
+            Case {
+                name: "malformed message content block",
+                body: json!({
+                    "tools": [{"name": "search", "description": "search"}],
+                    "messages": [
+                        {"role": "user", "content": "first"},
+                        {"role": "assistant", "content": "second"},
+                        {
+                            "role": "user",
+                            "content": [
+                                {"type": "text", "text": "ok"},
+                                "not-an-object"
+                            ]
+                        }
+                    ],
+                }),
+                expect_placed: 1,
+                expect_locations: vec!["tools[0]"],
+            },
+            Case {
+                name: "malformed tool entry",
+                body: json!({
+                    "tools": ["not-an-object"],
+                    "messages": [{"role": "user", "content": "hi"}],
+                }),
+                expect_placed: 0,
+                expect_locations: vec![],
+            },
+        ];
+        for case in cases {
+            let before = case.body.clone();
+            let mut body = case.body.clone();
+            let outcome = auto_place_anthropic_cache_control(&mut body);
+            assert_eq!(
+                outcome,
+                AutoPlaceOutcome::Applied {
+                    placed_count: case.expect_placed,
+                    locations: case.expect_locations.iter().map(|s| s.to_string()).collect(),
+                },
+                "Failed at case: {}",
+                case.name
+            );
+            if case.expect_placed == 0 {
+                assert_eq!(body, before, "Case '{}' must not mutate", case.name);
             }
-        );
+        }
     }
 
     #[test]
@@ -783,71 +766,73 @@ mod tests {
     }
 
     #[test]
-    fn does_nothing_when_no_tools_present() {
-        // 没有 tools 字段的请求体。返回 Applied{0}，不修改。
-        let mut body = json!({
-            "model": "claude-3-5-sonnet-20241022",
-            "system": "You are helpful.",
-            "messages": [{"role": "user", "content": "hi"}],
-        });
-        let before = body.clone();
-        let outcome = auto_place_anthropic_cache_control(&mut body);
-        assert_eq!(
-            outcome,
-            AutoPlaceOutcome::Applied {
-                placed_count: 0,
-                locations: Vec::new(),
+    fn test_skip_conditions() {
+        struct Case {
+            name: &'static str,
+            body: Value,
+            expect_placed: usize,
+            check_system_unchanged: bool,
+        }
+        let cases = vec![
+            Case {
+                name: "no tools present",
+                body: json!({
+                    "model": "claude-3-5-sonnet-20241022",
+                    "system": "You are helpful.",
+                    "messages": [{"role": "user", "content": "hi"}],
+                }),
+                expect_placed: 0,
+                check_system_unchanged: false,
+            },
+            Case {
+                name: "tools array empty",
+                body: json!({
+                    "tools": [],
+                    "messages": [{"role": "user", "content": "hi"}],
+                }),
+                expect_placed: 0,
+                check_system_unchanged: false,
+            },
+            Case {
+                name: "string system stays string",
+                body: json!({
+                    "system": "You are helpful. Cite sources.",
+                    "tools": [{"name": "search", "description": "search"}],
+                    "messages": [{"role": "user", "content": "hi"}],
+                }),
+                expect_placed: 1,
+                check_system_unchanged: true,
+            },
+        ];
+        for case in cases {
+            let before = case.body.clone();
+            let mut body = case.body.clone();
+            let outcome = auto_place_anthropic_cache_control(&mut body);
+            assert_eq!(
+                outcome,
+                AutoPlaceOutcome::Applied {
+                    placed_count: case.expect_placed,
+                    locations: if case.expect_placed == 0 {
+                        Vec::new()
+                    } else {
+                        vec!["tools[0]".to_string()]
+                    },
+                },
+                "Failed at case: {}",
+                case.name
+            );
+            if case.expect_placed == 0 {
+                assert_eq!(body, before, "Case '{}' must not mutate", case.name);
             }
-        );
-        assert_eq!(body, before, "Applied{{0}} path must not mutate");
-    }
-
-    #[test]
-    fn does_nothing_when_tools_array_is_empty() {
-        let mut body = json!({
-            "tools": [],
-            "messages": [{"role": "user", "content": "hi"}],
-        });
-        let before = body.clone();
-        let outcome = auto_place_anthropic_cache_control(&mut body);
-        assert_eq!(
-            outcome,
-            AutoPlaceOutcome::Applied {
-                placed_count: 0,
-                locations: Vec::new(),
+            if case.check_system_unchanged {
+                assert_eq!(
+                    body.get("system"),
+                    before.get("system"),
+                    "Case '{}': system must stay unchanged",
+                    case.name
+                );
             }
-        );
-        assert_eq!(body, before, "empty-tools path must not mutate");
-    }
-
-    #[test]
-    fn system_string_form_does_not_get_converted_to_array() {
-        // 保守的首发策略：纯字符串 `system` 保持为纯字符串。
-        // 我们只在工具上放置。
-        let mut body = json!({
-            "system": "You are helpful. Cite sources.",
-            "tools": [{"name": "search", "description": "search"}],
-            "messages": [{"role": "user", "content": "hi"}],
-        });
-        let outcome = auto_place_anthropic_cache_control(&mut body);
-        assert!(matches!(
-            outcome,
-            AutoPlaceOutcome::Applied {
-                placed_count: 1,
-                ..
-            }
-        ));
-        // system 仍是纯字符串。
-        assert_eq!(
-            body.get("system"),
-            Some(&json!("You are helpful. Cite sources.")),
-            "string-form `system` must stay untouched on first ship",
-        );
-        // 标记反而落在 tools[0] 上。
-        assert_eq!(
-            body.pointer("/tools/0/cache_control"),
-            Some(&json!({"type": "ephemeral"})),
-        );
+        }
     }
 
     #[test]
@@ -985,23 +970,4 @@ mod tests {
         );
     }
 
-    #[test]
-    fn malformed_tool_entry_does_not_panic() {
-        // 防御性：一个带非对象工具的 Anthropic 请求会从上游收到 400，
-        // 但我们绝不会对畸形请求体 panic。改为跳过该槽位。
-        let mut body = json!({
-            "tools": ["not-an-object"],
-            "messages": [{"role": "user", "content": "hi"}],
-        });
-        let before = body.clone();
-        let outcome = auto_place_anthropic_cache_control(&mut body);
-        assert_eq!(
-            outcome,
-            AutoPlaceOutcome::Applied {
-                placed_count: 0,
-                locations: Vec::new(),
-            }
-        );
-        assert_eq!(body, before, "malformed-tool path must not mutate");
-    }
 }
