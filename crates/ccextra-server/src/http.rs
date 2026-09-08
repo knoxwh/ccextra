@@ -2715,66 +2715,116 @@ models:
     }
 
     #[test]
-    fn test_check_secret_ok() {
-        let mut headers = HeaderMap::new();
-        headers.insert("x-api-key", "s3cret".parse().unwrap());
-        assert!(check_secret(&headers, &Some("s3cret".into())).is_ok());
+    fn test_secret_validation() {
+        // 测试 secret 验证逻辑
+        struct Case {
+            name: &'static str,
+            headers: HeaderMap,
+            secret: Option<String>,
+            expect_ok: bool,
+        }
+
+        let mut h_ok = HeaderMap::new();
+        h_ok.insert("x-api-key", "s3cret".parse().unwrap());
+
+        let mut h_wrong = HeaderMap::new();
+        h_wrong.insert("x-api-key", "wrong".parse().unwrap());
+
+        let cases = vec![
+            Case {
+                name: "ok",
+                headers: h_ok,
+                secret: Some("s3cret".into()),
+                expect_ok: true,
+            },
+            Case {
+                name: "missing",
+                headers: HeaderMap::new(),
+                secret: Some("s3cret".into()),
+                expect_ok: false,
+            },
+            Case {
+                name: "wrong",
+                headers: h_wrong,
+                secret: Some("s3cret".into()),
+                expect_ok: false,
+            },
+            Case {
+                name: "disabled",
+                headers: HeaderMap::new(),
+                secret: None,
+                expect_ok: true,
+            },
+        ];
+
+        for case in cases {
+            let result = check_secret(&case.headers, &case.secret);
+            assert_eq!(
+                result.is_ok(),
+                case.expect_ok,
+                "Failed at case: {}",
+                case.name
+            );
+        }
     }
 
     #[test]
-    fn test_check_secret_missing() {
-        let headers = HeaderMap::new();
-        assert!(check_secret(&headers, &Some("s3cret".into())).is_err());
+    fn test_secret_bearer_auth() {
+        // 测试 Bearer token 验证
+        let mut h_ok = HeaderMap::new();
+        h_ok.insert("authorization", "Bearer s3cret".parse().unwrap());
+        assert!(check_secret(&h_ok, &Some("s3cret".into())).is_ok());
+
+        let mut h_wrong = HeaderMap::new();
+        h_wrong.insert("authorization", "Bearer wrong".parse().unwrap());
+        assert!(check_secret(&h_wrong, &Some("s3cret".into())).is_err());
     }
 
     #[test]
-    fn test_check_secret_wrong() {
-        let mut headers = HeaderMap::new();
-        headers.insert("x-api-key", "wrong".parse().unwrap());
-        assert!(check_secret(&headers, &Some("s3cret".into())).is_err());
-    }
+    fn test_api_key_extraction() {
+        // 测试 key 提取逻辑
+        struct Case {
+            name: &'static str,
+            headers: HeaderMap,
+            expect_key: &'static str,
+        }
 
-    #[test]
-    fn test_check_secret_disabled() {
-        let headers = HeaderMap::new();
-        assert!(check_secret(&headers, &None).is_ok());
-    }
+        let mut h_bearer = HeaderMap::new();
+        h_bearer.insert("authorization", "Bearer tok".parse().unwrap());
 
-    #[test]
-    fn test_check_secret_bearer() {
-        let mut headers = HeaderMap::new();
-        headers.insert("authorization", "Bearer s3cret".parse().unwrap());
-        assert!(check_secret(&headers, &Some("s3cret".into())).is_ok());
-    }
+        let mut h_bearer_case = HeaderMap::new();
+        h_bearer_case.insert("authorization", "bearer     tok".parse().unwrap());
 
-    #[test]
-    fn test_check_secret_bearer_wrong() {
-        let mut headers = HeaderMap::new();
-        headers.insert("authorization", "Bearer wrong".parse().unwrap());
-        assert!(check_secret(&headers, &Some("s3cret".into())).is_err());
-    }
+        let mut h_prefer_x = HeaderMap::new();
+        h_prefer_x.insert("x-api-key", "xkey".parse().unwrap());
+        h_prefer_x.insert("authorization", "Bearer bkey".parse().unwrap());
 
-    #[test]
-    fn test_extract_key_bearer() {
-        let mut headers = HeaderMap::new();
-        headers.insert("authorization", "Bearer tok".parse().unwrap());
-        assert_eq!(extract_key(&headers), "tok");
-    }
+        let cases = vec![
+            Case {
+                name: "bearer",
+                headers: h_bearer,
+                expect_key: "tok",
+            },
+            Case {
+                name: "bearer case and whitespace",
+                headers: h_bearer_case,
+                expect_key: "tok",
+            },
+            Case {
+                name: "prefers x-api-key",
+                headers: h_prefer_x,
+                expect_key: "xkey",
+            },
+        ];
 
-    #[test]
-    fn test_extract_key_bearer_case_and_whitespace() {
-        // RFC 6750:scheme 大小写不敏感,容忍多余空白
-        let mut headers = HeaderMap::new();
-        headers.insert("authorization", "bearer     tok".parse().unwrap());
-        assert_eq!(extract_key(&headers), "tok");
-    }
-
-    #[test]
-    fn test_extract_key_prefers_x_api_key() {
-        let mut headers = HeaderMap::new();
-        headers.insert("x-api-key", "xkey".parse().unwrap());
-        headers.insert("authorization", "Bearer bkey".parse().unwrap());
-        assert_eq!(extract_key(&headers), "xkey");
+        for case in cases {
+            assert_eq!(
+                extract_key(&case.headers),
+                case.expect_key,
+                "Failed at case: {}",
+                case.name
+            );
+        }
     }
 
     #[tokio::test]
