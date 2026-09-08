@@ -115,6 +115,11 @@ struct ResponsesRelay {
     estimated_input: Option<usize>,
     /// doom loop 检测:已见触发器 raw label 去重(服务端重发累计集)
     doom_loop_seen: HashSet<String>,
+
+    /// 空 incomplete 终态检测(对齐 CPA IsCodexTerminalEmptyIncomplete):
+    /// 已见有效输出 delta 与已完成 output item 计数
+    saw_output_delta: bool,
+    output_items_seen: usize,
 }
 
 impl ResponsesRelay {
@@ -145,6 +150,8 @@ impl ResponsesRelay {
             tool_names: None,
             estimated_input,
             doom_loop_seen: HashSet::new(),
+            saw_output_delta: false,
+            output_items_seen: 0,
         }
     }
 
@@ -174,6 +181,12 @@ impl ResponsesRelay {
             Err(_) => return Vec::new(),
         };
         let event_type = root.get("type").and_then(|v| v.as_str()).unwrap_or("");
+
+        // 有效输出 delta 记账(对齐 CPA HasMeaningfulCodexOutputDelta:非空
+        // 文本/推理/工具参数 delta 均算产出;在 defer 之前,计账不受影响)
+        if is_meaningful_output_delta(&root, event_type) {
+            self.saw_output_delta = true;
+        }
 
         // 函数调用进行中,非关键事件 defer(对齐 shouldDeferCodexStreamEvent):
         // 避免流式 function_call 的 start/delta 与文本/思考块交错
@@ -401,6 +414,17 @@ impl ResponsesRelay {
                 self.append_buffered_arguments()
             }
             "response.completed" | "response.incomplete" => {
+                // 上游静默中止(0 token 空 incomplete):报错触发 CC 自动重试,
+                // 而非伪造成功空消息(对齐 CPA IsCodexTerminalEmptyIncomplete → 502)
+                if is_terminal_empty_incomplete(
+                    &root,
+                    self.saw_output_delta,
+                    self.output_items_seen,
+                ) {
+                    return self.stream_error(
+                        "upstream terminated with incomplete empty response (0 tokens)",
+                    );
+                }
                 let response = root.get("response");
                 self.update_identity(response);
                 // 终态响应对象上的 doom_loop_check 字段(对齐 grok-build 双路报告)
@@ -479,7 +503,10 @@ impl ResponsesRelay {
     /// output_item.done 分派(message 文本兜底 / reasoning 收尾)
     fn output_item_done(&mut self, root: &Value) -> Vec<Bytes> {
         let item = match root.get("item") {
-            Some(i) => i,
+            Some(i) => {
+                self.output_items_seen += 1;
+                i
+            }
             None => return Vec::new(),
         };
         let item_type = item.get("type").and_then(|v| v.as_str()).unwrap_or("");
@@ -1176,6 +1203,53 @@ impl ResponsesRelay {
         self.finished = true;
         vec![emit::error_event(message)]
     }
+}
+
+/// 有效输出 delta(对齐 CPA HasMeaningfulCodexOutputDelta):文本、推理、
+/// 工具参数 delta 非空才算产出;custom_tool_call_input 不计入
+fn is_meaningful_output_delta(root: &Value, event_type: &str) -> bool {
+    let meaningful = matches!(
+        event_type,
+        "response.output_text.delta"
+            | "response.reasoning_text.delta"
+            | "response.reasoning_summary_text.delta"
+            | "response.function_call_arguments.delta"
+    );
+    if !meaningful {
+        return false;
+    }
+    root.get("delta")
+        .and_then(|v| v.as_str())
+        .map(|s| !s.trim().is_empty())
+        .unwrap_or(false)
+}
+
+/// 空 incomplete 终态(对齐 CPA IsCodexTerminalEmptyIncomplete):上游静默中止
+/// ——无任何输出 delta、无已完成 output item、response.output 空,且
+/// output_tokens 为显式整数 0(缺失/null/浮点/非零一律不算)
+pub(crate) fn is_terminal_empty_incomplete(
+    root: &Value,
+    saw_output_delta: bool,
+    output_items_seen: usize,
+) -> bool {
+    if root.get("type").and_then(|v| v.as_str()) != Some("response.incomplete") {
+        return false;
+    }
+    if saw_output_delta || output_items_seen > 0 {
+        return false;
+    }
+    let has_output_items = root
+        .pointer("/response/output")
+        .and_then(|v| v.as_array())
+        .is_some_and(|arr| !arr.is_empty());
+    if has_output_items {
+        return false;
+    }
+    let Some(tokens) = root.pointer("/response/usage/output_tokens") else {
+        return false;
+    };
+    // 显式整数 0(缺失/null/浮点/非零一律不算;与 as_i64 联合排除 0.0)
+    tokens.as_i64() == Some(0) && tokens == &serde_json::Value::from(0)
 }
 
 /// 流内 error 事件 → anthropic error(对齐 codexStreamErrorToClaudeError)
@@ -2327,5 +2401,71 @@ mod tests {
         assert!(s.contains("redacted_thinking_data"));
         assert!(s.contains("sig_only"));
         assert!(s.contains("content_block_stop"));
+    }
+
+    #[test]
+    fn test_empty_incomplete_becomes_error() {
+        // 0 token 空 incomplete:报错而非伪成功(对齐 CPA 502 语义)
+        let mut r = ResponsesRelay::new(None);
+        r.process(&created());
+        let out = r.process(&ev(
+            r#"{"type":"response.incomplete","response":{"id":"r1","output":[],"usage":{"output_tokens":0}}}"#,
+        ));
+        assert_eq!(out.len(), 1);
+        let v = frame_data(&out[0]);
+        assert_eq!(v["type"], "error");
+        assert!(v["error"]["message"]
+            .as_str()
+            .unwrap()
+            .contains("incomplete empty response"));
+    }
+
+    #[test]
+    fn test_empty_incomplete_with_output_not_error() {
+        // 已有输出 delta:空 incomplete 判定不成立,正常收尾
+        let mut r = ResponsesRelay::new(None);
+        r.process(&created());
+        r.process(&ev(r#"{"type":"response.output_text.delta","delta":"hi"}"#));
+        let out = r.process(&ev(
+            r#"{"type":"response.incomplete","response":{"id":"r1","output":[],"usage":{"output_tokens":0}}}"#,
+        ));
+        assert!(out.iter().any(|b| b.starts_with(b"event: message_delta")));
+    }
+
+    #[test]
+    fn test_empty_incomplete_guards() {
+        // output_tokens 非显式整数 0(缺失/浮点/非零):不算静默中止
+        for usage in [
+            r#""usage":{}"#,
+            r#""usage":{"output_tokens":0.5}"#,
+            r#""usage":{"output_tokens":3}"#,
+        ] {
+            let mut r = ResponsesRelay::new(None);
+            r.process(&created());
+            let out = r.process(&ev(&format!(
+                r#"{{"type":"response.incomplete","response":{{"id":"r1","output":[],{usage}}}}}"#
+            )));
+            assert!(
+                out.iter().any(|b| b.starts_with(b"event: message_delta")),
+                "usage={usage} 应正常收尾"
+            );
+        }
+        // 有已完成 item(response.output_item.done 计数):不算
+        let mut r = ResponsesRelay::new(None);
+        r.process(&created());
+        r.process(&ev(
+            r#"{"type":"response.output_item.done","item":{"type":"reasoning"}}"#,
+        ));
+        let out = r.process(&ev(
+            r#"{"type":"response.incomplete","response":{"id":"r1","output":[],"usage":{"output_tokens":0}}}"#,
+        ));
+        assert!(out.iter().any(|b| b.starts_with(b"event: message_delta")));
+        // response.completed 不触发该判定
+        let mut r = ResponsesRelay::new(None);
+        r.process(&created());
+        let out = r.process(&ev(
+            r#"{"type":"response.completed","response":{"id":"r1","output":[],"usage":{"output_tokens":0}}}"#,
+        ));
+        assert!(out.iter().any(|b| b.starts_with(b"event: message_delta")));
     }
 }

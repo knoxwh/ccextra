@@ -69,9 +69,9 @@ fn strip_claude_system_for_gpt(system: &str) -> String {
 
     #[derive(PartialEq)]
     enum SectionState {
-        Retain,   // 白名单段落
-        Discard,  // 黑名单段落
-        Unknown,  // 未分类(默认保留)
+        Retain,  // 白名单段落
+        Discard, // 黑名单段落
+        Unknown, // 未分类(默认保留)
     }
 
     // 白名单 header 前缀(markdown 与 XML 标签)
@@ -110,13 +110,13 @@ fn strip_claude_system_for_gpt(system: &str) -> String {
     const DISCARD_LINE_PATTERNS: &[&str] = &[
         "IMPORTANT: Assist with authorized security testing",
         "When you use a pronoun for someone",
-        "Claude Code is available as a CLI",     // 产品宣传
-        "Fast mode for Claude Code uses",        // 产品特性说明
+        "Claude Code is available as a CLI", // 产品宣传
+        "Fast mode for Claude Code uses",    // 产品特性说明
     ];
 
     // 段落级黑名单触发器(匹配到该行,整个段落丢弃直到下个段落标记)
     const DISCARD_PARAGRAPH_TRIGGERS: &[&str] = &[
-        "Available agent types",  // subagent 列表段落
+        "Available agent types", // subagent 列表段落
     ];
 
     for line in system.lines() {
@@ -594,6 +594,172 @@ fn normalize_tool_parameters(schema: &Value) -> Value {
     s
 }
 
+/// 纯 const union → enum(对齐 CPA helps/codex_tool_schema.go NormalizeCodexToolSchemas)
+///
+/// 仅当 properties.* 的 oneOf/anyOf 分支数 ≥ 阈值、每分支只含 const(外加
+/// description/title)且语义值唯一时,才把 union 替换为等价 enum(MCP 服务器
+/// 生成的大 union 会让上游中止);已有 enum 且与 union 语义一致时仅删冗余
+/// union。其余结构一律不动。
+const CODEX_UNION_BRANCH_THRESHOLD: usize = 8;
+
+fn simplify_pure_const_unions(params: &mut Value) {
+    let Some(props) = params.get_mut("properties").and_then(|v| v.as_object_mut()) else {
+        return;
+    };
+    for (_key, prop) in props.iter_mut() {
+        if !prop.is_object() {
+            continue;
+        }
+        let has_one_of = prop.get("oneOf").is_some();
+        let has_any_of = prop.get("anyOf").is_some();
+        // 同一属性同时带 oneOf 和 anyOf:保留复合约束,不动
+        if has_one_of && has_any_of {
+            continue;
+        }
+        let union_name = if has_one_of {
+            "oneOf"
+        } else if has_any_of {
+            "anyOf"
+        } else {
+            continue;
+        };
+        let Some(Value::Array(branches)) = prop.get(union_name) else {
+            continue;
+        };
+        if branches.len() < CODEX_UNION_BRANCH_THRESHOLD {
+            continue;
+        }
+        // 逐分支证明为纯、唯一 const 定义,收集语义键与原始 JSON
+        let mut semantic_keys: Vec<String> = Vec::with_capacity(branches.len());
+        let mut raw_values: Vec<String> = Vec::with_capacity(branches.len());
+        let mut seen: HashSet<String> = HashSet::new();
+        let mut pure = true;
+        for branch in branches {
+            let Some((key, raw)) = pure_const_branch(branch) else {
+                pure = false;
+                break;
+            };
+            if !seen.insert(key.clone()) {
+                // 语义值重复违反互斥性,保留原 schema
+                pure = false;
+                break;
+            }
+            semantic_keys.push(key);
+            raw_values.push(raw);
+        }
+        if !pure || raw_values.is_empty() {
+            continue;
+        }
+        let obj = prop.as_object_mut().unwrap();
+        if let Some(existing) = obj.get("enum") {
+            // 已有 enum:仅当与 union 语义一致时删冗余 union
+            let identical = existing
+                .as_array()
+                .map(|arr| {
+                    arr.len() == semantic_keys.len()
+                        && arr
+                            .iter()
+                            .all(|v| semantic_keys.contains(&canonical_json_value_key(v)))
+                })
+                .unwrap_or(false);
+            if identical {
+                obj.remove(union_name);
+            }
+            continue;
+        }
+        // 用原始 JSON token 组装 enum,避免数值精度损失
+        if let Ok(enum_val) = serde_json::from_str::<Value>(&format!("[{}]", raw_values.join(",")))
+        {
+            obj.insert("enum".to_string(), enum_val);
+            obj.remove(union_name);
+        }
+    }
+}
+
+/// 分支是否为纯 const 定义:只允许 const/description/title 键
+fn pure_const_branch(branch: &Value) -> Option<(String, String)> {
+    let obj = branch.as_object()?;
+    let const_val = obj.get("const")?;
+    for key in obj.keys() {
+        if key != "const" && key != "description" && key != "title" {
+            return None;
+        }
+    }
+    Some((canonical_json_value_key(const_val), const_val.to_string()))
+}
+
+/// JSON 值的语义键(对齐 CPA canonicalJSONValueKey:类型前缀 + 数值有理数标准化)
+fn canonical_json_value_key(val: &Value) -> String {
+    match val {
+        Value::String(s) => format!("s:{s}"),
+        Value::Number(n) => format!("n:{}", rational_number_key(&n.to_string())),
+        Value::Bool(b) => format!("b:{b}"),
+        Value::Null => "null".to_string(),
+        _ => String::new(),
+    }
+}
+
+/// 数值 token 有理数标准化("1.50"/"150e-2" → "3/2",整数千进制尾零消去),
+/// 用于语义去重;无法解析时回退原始 token(仅影响重复判定,不改发出去的值)
+fn rational_number_key(raw: &str) -> String {
+    let raw = raw.trim();
+    let (mantissa, exp) = match raw.split_once(['e', 'E']) {
+        Some((m, e)) => match e.trim().parse::<i32>() {
+            Ok(v) => (m, v),
+            Err(_) => return raw.to_string(),
+        },
+        None => (raw, 0),
+    };
+    let (sign, mantissa) = match mantissa.strip_prefix('-') {
+        Some(rest) => ("-", rest),
+        None => ("", mantissa.trim_start_matches('+')),
+    };
+    let (int_part, frac_part) = match mantissa.split_once('.') {
+        Some((i, f)) => (i, f),
+        None => (mantissa, ""),
+    };
+    if int_part.is_empty() && frac_part.is_empty() {
+        return raw.to_string();
+    }
+    if !int_part
+        .chars()
+        .chain(frac_part.chars())
+        .all(|c| c.is_ascii_digit())
+    {
+        return raw.to_string();
+    }
+    let digits = format!("{int_part}{frac_part}");
+    let den_exp: i32 = frac_part.len() as i32 - exp;
+    // 大指数(>10^18 量级)超 i128 表示,直接回退
+    let num_shift = if den_exp > 0 { 0 } else { -den_exp };
+    let den_shift = if den_exp > 0 { den_exp } else { 0 };
+    if den_shift > 30 || num_shift > 30 {
+        return raw.to_string();
+    }
+    let scaled = |value: u128, shift: i32| -> u128 {
+        (0..shift)
+            .try_fold(value, |acc, _| acc.checked_mul(10))
+            .unwrap_or(u128::MAX)
+    };
+    let digits_val = match digits.parse::<u128>() {
+        Ok(v) => v,
+        Err(_) => return raw.to_string(),
+    };
+    let num = scaled(digits_val, num_shift);
+    let den = scaled(1, den_shift);
+    if num == 0 {
+        return "0".to_string();
+    }
+    let gcd = |mut a: u128, mut b: u128| {
+        while b != 0 {
+            (a, b) = (b, a % b);
+        }
+        a
+    };
+    let g = gcd(num, den);
+    format!("{sign}{}/{}", num / g, den / g)
+}
+
 /// branch type 是否只允许 object(字符串 "object" 或数组全 "object")
 fn branch_schema_type_is_object_only(t: &Value) -> bool {
     match t {
@@ -1020,7 +1186,8 @@ pub fn convert_to_openai_responses(
             }
             // input_schema → parameters
             let schema = tool.get("input_schema").cloned().unwrap_or(json!(null));
-            let params = normalize_tool_parameters(&schema);
+            let mut params = normalize_tool_parameters(&schema);
+            simplify_pure_const_unions(&mut params);
             t["parameters"] = params;
             // 剥 codex 不认的字段(一致)
             if let Some(obj) = t.as_object_mut() {
@@ -2492,6 +2659,104 @@ Be verbose.
         assert!(body.get("temperature").is_none());
         assert!(body.get("top_p").is_none());
         assert!(body.get("top_k").is_none());
+    }
+
+    #[test]
+    fn test_pure_const_union_to_enum() {
+        // ≥8 纯 const 分支(允许 description/title)→ 替换为 enum
+        let branches: Vec<Value> = (0..9)
+            .map(|i| json!({"const": i, "title": format!("t{i}")}))
+            .collect();
+        let mut params = json!({"properties": {"kind": {"oneOf": branches}}});
+        simplify_pure_const_unions(&mut params);
+        let prop = &params["properties"]["kind"];
+        assert!(prop.get("oneOf").is_none());
+        assert_eq!(prop["enum"], serde_json::json!([0, 1, 2, 3, 4, 5, 6, 7, 8]));
+    }
+
+    #[test]
+    fn test_pure_const_union_guards() {
+        let branches: Vec<Value> = (0..9)
+            .map(|i| json!({"const": i, "title": format!("t{i}")}))
+            .collect();
+        // 分支数不足阈值:不动
+        let mut params = json!({"properties": {"kind": {"oneOf": branches[..7].to_vec()}}});
+        simplify_pure_const_unions(&mut params);
+        assert!(params["properties"]["kind"].get("oneOf").is_some());
+
+        // 分支含其他约束键(type):不动
+        let mut guarded: Vec<Value> = (0..8)
+            .map(|i| json!({"const": i, "type": "string"}))
+            .collect();
+        guarded[0] = json!({"const": 0, "type": "string"});
+        let mut params = json!({"properties": {"kind": {"anyOf": guarded}}});
+        simplify_pure_const_unions(&mut params);
+        assert!(params["properties"]["kind"].get("anyOf").is_some());
+
+        // 语义值重复(1.5 与 1.50 同值):不动
+        let dup: Vec<Value> = (0..7)
+            .map(|i| json!({"const": i}))
+            .chain([json!({"const": "x"})])
+            .chain([json!({"const": "x"})])
+            .collect();
+        let mut params = json!({"properties": {"kind": {"oneOf": dup}}});
+        simplify_pure_const_unions(&mut params);
+        assert!(params["properties"]["kind"].get("oneOf").is_some());
+
+        // 同时带 oneOf 与 anyOf:不动
+        let both = json!({"properties": {"kind": {
+            "oneOf": branches.clone(),
+            "anyOf": branches
+        }}});
+        let mut params = both;
+        simplify_pure_const_unions(&mut params);
+        assert!(params["properties"]["kind"].get("oneOf").is_some());
+        assert!(params["properties"]["kind"].get("anyOf").is_some());
+    }
+
+    #[test]
+    fn test_pure_const_union_existing_enum() {
+        // 已有 enum 且与 union 语义一致:仅删 union
+        let branches: Vec<Value> = (0..9).map(|i| json!({"const": i})).collect();
+        let mut params = json!({"properties": {"kind": {
+            "oneOf": branches,
+            "enum": [8, 7, 6, 5, 4, 3, 2, 1, 0]
+        }}});
+        simplify_pure_const_unions(&mut params);
+        let prop = &params["properties"]["kind"];
+        assert!(prop.get("oneOf").is_none());
+        assert_eq!(prop["enum"], serde_json::json!([8, 7, 6, 5, 4, 3, 2, 1, 0]));
+
+        // enum 不一致:整组不动
+        let branches: Vec<Value> = (0..9).map(|i| json!({"const": i})).collect();
+        let mut params = json!({"properties": {"kind": {
+            "oneOf": branches,
+            "enum": [0, 1, 2, 3, 4, 5, 6, 7, 99]
+        }}});
+        simplify_pure_const_unions(&mut params);
+        assert!(params["properties"]["kind"].get("oneOf").is_some());
+    }
+
+    #[test]
+    fn test_pure_const_union_numeric_precision() {
+        // 大整数分支逐字保留(arbitrary_precision,无精度损失)
+        let raw = "9007199254740993";
+        let branches: Vec<Value> = (0..8)
+            .map(|i| {
+                let token = if i == 7 {
+                    raw.to_string()
+                } else {
+                    i.to_string()
+                };
+                serde_json::from_str::<Value>(&format!("{{\"const\": {token}}}")).unwrap()
+            })
+            .collect();
+        let mut params = json!({"properties": {"id": {"oneOf": branches}}});
+        simplify_pure_const_unions(&mut params);
+        assert_eq!(
+            params["properties"]["id"]["enum"][7].to_string(),
+            raw.to_string()
+        );
     }
 
     #[test]

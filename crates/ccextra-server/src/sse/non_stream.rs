@@ -49,6 +49,21 @@ pub fn responses_to_anthropic(
         return Some(err);
     }
 
+    // 上游静默中止(0 token 空 incomplete):返回错误而非伪成功空消息
+    // (对齐 CPA IsCodexTerminalEmptyIncomplete;JSON body 无逐项 delta 事件,
+    // 只能凭 output 空与显式 0 token 判定)
+    if ty == "response.incomplete" && super::responses::is_terminal_empty_incomplete(body, false, 0)
+    {
+        tracing::warn!("responses 非流收到 0 token 空 incomplete,返回错误触发 CC 重试");
+        return Some(json!({
+            "type": "error",
+            "error": {
+                "type": "api_error",
+                "message": "upstream terminated with incomplete empty response (0 tokens)"
+            }
+        }));
+    }
+
     let mut content: Vec<Value> = Vec::new();
     let mut has_tool_use = false;
 
