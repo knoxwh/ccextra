@@ -1829,110 +1829,118 @@ mod tests {
     }
 
     #[test]
-    fn ancillary_request_detected_when_tools_empty_and_single_message() {
-        // 标题生成形态：空 tools、单条 user 消息。
-        let body = json!({
-            "model": "claude-3-5-sonnet-20241022",
-            "system": "you are an assistant",
-            "tools": [],
-            "messages": [{"role": "user", "content": "Write the title"}],
-        });
-        assert!(is_ancillary_request(&body, ApiKind::Anthropic));
-    }
+    fn test_ancillary_request_detection() {
+        struct Case {
+            name: &'static str,
+            body: Value,
+            kind: ApiKind,
+            expect_ancillary: bool,
+        }
 
-    #[test]
-    fn main_conversation_not_ancillary_when_tools_present() {
-        // 主会话：有 tools、多条消息。
-        let body = json!({
-            "model": "claude-3-5-sonnet-20241022",
-            "system": "you are an assistant",
-            "tools": [{"name": "bash"}],
-            "messages": [
-                {"role": "user", "content": "hi"},
-                {"role": "assistant", "content": "hello"}
-            ],
-        });
-        assert!(!is_ancillary_request(&body, ApiKind::Anthropic));
-    }
+        let cases = vec![
+            Case {
+                name: "空tools+单消息",
+                body: json!({
+                    "model": "claude-3-5-sonnet-20241022",
+                    "system": "you are an assistant",
+                    "tools": [],
+                    "messages": [{"role": "user", "content": "Write the title"}],
+                }),
+                kind: ApiKind::Anthropic,
+                expect_ancillary: true,
+            },
+            Case {
+                name: "有tools非附属",
+                body: json!({
+                    "model": "claude-3-5-sonnet-20241022",
+                    "system": "you are an assistant",
+                    "tools": [{"name": "bash"}],
+                    "messages": [
+                        {"role": "user", "content": "hi"},
+                        {"role": "assistant", "content": "hello"}
+                    ],
+                }),
+                kind: ApiKind::Anthropic,
+                expect_ancillary: false,
+            },
+            Case {
+                name: "空消息",
+                body: json!({
+                    "model": "claude-3-5-sonnet-20241022",
+                    "system": "you are an assistant",
+                    "tools": [],
+                    "messages": [],
+                }),
+                kind: ApiKind::Anthropic,
+                expect_ancillary: true,
+            },
+            Case {
+                name: "Responses input回退",
+                body: json!({
+                    "model": "gpt-5.4",
+                    "instructions": "be brief",
+                    "tools": [],
+                    "input": [{"role": "user", "content": "Write the title"}],
+                }),
+                kind: ApiKind::OpenAiResponses,
+                expect_ancillary: true,
+            },
+            Case {
+                name: "tools缺失",
+                body: json!({
+                    "model": "claude-3-5-sonnet-20241022",
+                    "system": "you are an assistant",
+                    "messages": [{"role": "user", "content": "hi"}],
+                }),
+                kind: ApiKind::Anthropic,
+                expect_ancillary: true,
+            },
+            Case {
+                name: "Chat system前缀",
+                body: json!({
+                    "model": "gpt-4",
+                    "messages": [
+                        {"role": "system", "content": "be brief"},
+                        {"role": "user", "content": "Write the title"}
+                    ],
+                    "tools": [],
+                }),
+                kind: ApiKind::OpenAiChat,
+                expect_ancillary: true,
+            },
+            Case {
+                name: "Responses developer前缀",
+                body: json!({
+                    "model": "gpt-5.4",
+                    "tools": [],
+                    "input": [
+                        {"role": "developer", "content": "system"},
+                        {"role": "user", "content": "Write the title"}
+                    ],
+                }),
+                kind: ApiKind::OpenAiResponses,
+                expect_ancillary: true,
+            },
+            Case {
+                name: "tools为null",
+                body: json!({
+                    "model": "claude-3-5-sonnet-20241022",
+                    "system": "you are an assistant",
+                    "tools": null,
+                    "messages": [{"role": "user", "content": "hi"}],
+                }),
+                kind: ApiKind::Anthropic,
+                expect_ancillary: true,
+            },
+        ];
 
-    #[test]
-    fn ancillary_request_when_tools_empty_and_no_messages() {
-        // 边界情况：空 tools、零条消息。
-        let body = json!({
-            "model": "claude-3-5-sonnet-20241022",
-            "system": "you are an assistant",
-            "tools": [],
-            "messages": [],
-        });
-        assert!(is_ancillary_request(&body, ApiKind::Anthropic));
-    }
-
-    #[test]
-    fn ancillary_request_responses_uses_input_fallback() {
-        // OpenAI Responses 形态：空 tools、`input`（而非 `messages`）中单个条目。
-        // 验证 messages_array 的 input→messages 回退。
-        let body = json!({
-            "model": "gpt-5.4",
-            "instructions": "be brief",
-            "tools": [],
-            "input": [{"role": "user", "content": "Write the title"}],
-        });
-        assert!(is_ancillary_request(&body, ApiKind::OpenAiResponses));
-    }
-
-    #[test]
-    fn ancillary_request_when_tools_field_absent() {
-        // 完全没有 `tools` 字段 + 单条消息 → 视为附属
-        // （tools 缺失通过 unwrap_or(true) 映射为空）。
-        let body = json!({
-            "model": "claude-3-5-sonnet-20241022",
-            "system": "you are an assistant",
-            "messages": [{"role": "user", "content": "hi"}],
-        });
-        assert!(is_ancillary_request(&body, ApiKind::Anthropic));
-    }
-
-    #[test]
-    fn ancillary_request_openai_chat_with_system_prefix() {
-        // 带 system 前缀 + 单条 user 消息的 OpenAI Chat 标题请求。
-        // system 条目不得计入消息总数（与 extract_early_messages 一致），
-        // 否则 msg_count=2，守卫将无法跳过它。
-        let body = json!({
-            "model": "gpt-4",
-            "messages": [
-                {"role": "system", "content": "be brief"},
-                {"role": "user", "content": "Write the title"}
-            ],
-            "tools": [],
-        });
-        assert!(is_ancillary_request(&body, ApiKind::OpenAiChat));
-    }
-
-    #[test]
-    fn ancillary_request_responses_with_developer_prefix() {
-        // 带 developer 前缀 + `input` 中单个 user 条目的 OpenAI Responses
-        // 标题请求。developer 条目不得计入消息总数。
-        let body = json!({
-            "model": "gpt-5.4",
-            "tools": [],
-            "input": [
-                {"role": "developer", "content": "system"},
-                {"role": "user", "content": "Write the title"}
-            ],
-        });
-        assert!(is_ancillary_request(&body, ApiKind::OpenAiResponses));
-    }
-
-    #[test]
-    fn ancillary_request_when_tools_null() {
-        // tools:null 必须与缺失/空 tools 同等对待——"没有可用的 tools"——
-        // 因此单消息请求是附属请求。
-        let body = json!({
-            "model": "claude-3-5-sonnet-20241022",
-            "system": "you are an assistant",
-            "tools": null,
-            "messages": [{"role": "user", "content": "hi"}],
-        });
-        assert!(is_ancillary_request(&body, ApiKind::Anthropic));
+        for case in cases {
+            assert_eq!(
+                is_ancillary_request(&case.body, case.kind),
+                case.expect_ancillary,
+                "Failed at case: {}",
+                case.name
+            );
+        }
     }
 }
