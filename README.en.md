@@ -59,7 +59,7 @@ See [config.example.yaml](config.example.yaml) for every field. `models[].alias`
 
 `secret_key` enables ingress authentication. Plaintext keys become bcrypt hashes on load and are written back; requests accept `x-api-key` or `Authorization: Bearer`. `payload` applies model-glob top-level overrides, optionally scoped by `protocol`. `prompt_cache_key` applies only to OpenAI paths, uses Claude Code session ID, and never replaces a nonempty key.
 
-`user_agents` overrides Claude, Codex, Grok, and Antigravity identifiers. `logging.request_body` writes diagnostic requests under `logs/`. `POST /reload` reloads providers, payload, normalization, auth, proxy, and User-Agent. Restart for `logging.level` changes.
+`user_agents` overrides Claude, Codex, Grok, and Antigravity identifiers. `logging.request_body` writes diagnostic requests under `logs/`. `POST /reload` reloads providers, payload, normalization, auth, proxy, and User-Agent. Restart for `logging.level` changes. `antigravity.connection-pool` controls the Antigravity upstream connection pool: short connections by default; with `enabled: true`, idle connections are kept per `idle-conn-timeout` (default 30s, capped at 210s) and `max-idle-conns-per-host` (default 2, capped at 100).
 
 ## Endpoints
 

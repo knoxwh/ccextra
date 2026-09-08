@@ -59,7 +59,7 @@ export ANTHROPIC_AUTH_TOKEN=sk-ccextra-xxx # 配置 secret_key 时需要
 
 `secret_key` 启用入口认证。明文 key 在加载时转为 bcrypt 并写回配置；请求接受 `x-api-key` 或 `Authorization: Bearer`。`payload` 按模型 glob 覆盖顶层参数，可用 `protocol` 限定。`prompt_cache_key` 只用于 OpenAI 路径，取 Claude Code 会话 ID，且不覆盖已有非空值。
 
-`user_agents` 可覆盖 Claude、Codex、Grok、Antigravity 标识。`logging.request_body` 将诊断请求写入 `logs/`。`POST /reload` 重载 providers、payload、归一化、认证、代理和 User-Agent；`logging.level` 需重启。
+`user_agents` 可覆盖 Claude、Codex、Grok、Antigravity 标识。`logging.request_body` 将诊断请求写入 `logs/`。`POST /reload` 重载 providers、payload、归一化、认证、代理和 User-Agent；`logging.level` 需重启。`antigravity.connection-pool` 控制 Antigravity 上游连接池：默认短连接，显式 `enabled: true` 后按 `idle-conn-timeout`（默认 30s，上限 210s）与 `max-idle-conns-per-host`（默认 2，上限 100）保留空闲连接。
 
 ## 端点
 

@@ -192,6 +192,7 @@ async fn main() -> Result<()> {
                 logging: cfg.logging,
                 secret: cfg.secret_key,
                 proxy_url: cfg.server.proxy_url,
+                antigravity: cfg.antigravity,
                 user_agents,
             })
         })
@@ -208,7 +209,10 @@ async fn main() -> Result<()> {
             normalize: config.normalize,
             logging: config.logging,
             secret: config.secret_key,
-            upstream: UpstreamClient::new(config.server.proxy_url),
+            upstream: UpstreamClient::with_ant_pool(
+                config.server.proxy_url,
+                config.antigravity.as_ref(),
+            ),
             user_agents,
         })),
         reload,

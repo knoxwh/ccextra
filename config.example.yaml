@@ -23,6 +23,14 @@ secret_key: "sk-ccextra-xxx"
 # xAI Grok 凭证目录(可选)。默认配置文件旁 .cache/xai。
 # xai_auth_dir: ".cache/xai"
 
+# Antigravity 连接池(可选)。默认短连接:空闲连接响应结束即关闭,
+# 防止凭证轮换下 socket 堆积与陈旧连接错误;仅显式 enabled: true 才保留池。
+# antigravity:
+#   connection-pool:
+#     enabled: false             # 是否启用连接池(默认 false = 短连接)
+#     idle-conn-timeout: "30s"   # 空闲连接存活时长(默认 30s,上限 210s)
+#     max-idle-conns-per-host: 2 # 每凭证每 host 最大空闲连接数(默认 2,上限 100)
+
 # Provider 定义
 providers:
   - name: xxx1

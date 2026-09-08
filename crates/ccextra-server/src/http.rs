@@ -89,6 +89,8 @@ pub struct ReloadData {
     pub secret: Option<String>,
     /// 全局代理 URL;"direct"/"" 或 None = 直连
     pub proxy_url: Option<String>,
+    /// Antigravity 连接池配置(默认短连接,对齐 CPA connection-pool)
+    pub antigravity: Option<crate::upstream::AntigravityConfig>,
     pub user_agents: UserAgentSet,
 }
 
@@ -358,7 +360,7 @@ async fn handle_count_tokens(
             base_url.trim_end_matches('/')
         );
         let proxy_key = upstream_client.resolve_proxy(proxy_url.as_deref());
-        let client = upstream_client.client_for(&proxy_key);
+        let client = upstream_client.client_for(&proxy_key, Protocol::Claude);
         let inbound_user_agent = claude_inbound_user_agent(&headers);
         let extra_headers = claude_relay_headers(&headers);
         let mut request = client
@@ -440,7 +442,7 @@ async fn handle_reload(State(state): State<AppState>) -> Result<&'static str, Ap
         normalize: data.normalize,
         logging: data.logging,
         secret: data.secret,
-        upstream: UpstreamClient::new(data.proxy_url),
+        upstream: UpstreamClient::with_ant_pool(data.proxy_url, data.antigravity.as_ref()),
         user_agents: data.user_agents,
     };
     // secret 可能变更,旧 bcrypt 校验结果一律作废(不比较新旧值)
@@ -2815,6 +2817,7 @@ models:
                     },
                     secret,
                     proxy_url: None,
+                    antigravity: None,
                     user_agents: test_user_agents(),
                 })
             })
@@ -2922,6 +2925,7 @@ models:
                     },
                     secret: None,
                     proxy_url: Some("socks5://127.0.0.1:1080".into()),
+                    antigravity: None,
                     user_agents: test_user_agents(),
                 })
             })

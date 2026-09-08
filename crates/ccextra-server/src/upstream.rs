@@ -5,9 +5,11 @@
 
 use std::collections::HashMap;
 use std::sync::Mutex;
+use std::time::Duration;
 
 use ccextra_core::route::Protocol;
 use reqwest::Client;
+use serde::Deserialize;
 
 /// 上游请求结果
 pub struct UpstreamResponse {
@@ -145,18 +147,144 @@ fn user_agent(
     }
 }
 
+/// Antigravity 连接池配置(对齐 CPA AntigravityConnectionPoolConfig)
+///
+/// 默认短连接:空闲连接响应结束即关闭,防止凭证轮换下 socket 堆积与
+/// 陈旧连接错误(CPA #5494);仅在显式启用时保留连接池。
+#[derive(Debug, Deserialize, Clone, Default)]
+pub struct AntigravityConfig {
+    /// 连接池子配置;字段缺失按默认值处理
+    #[serde(default, rename = "connection-pool")]
+    pub connection_pool: AntigravityConnectionPoolConfig,
+}
+
+#[derive(Debug, Deserialize, Clone, Default)]
+pub struct AntigravityConnectionPoolConfig {
+    /// 是否启用连接池;默认 false(短连接模式)
+    #[serde(default)]
+    pub enabled: Option<bool>,
+    /// 空闲连接存活时长,如 "30s";默认 30s,上限 210s(防超 GFE 240s cutoff)
+    #[serde(default, rename = "idle-conn-timeout")]
+    pub idle_conn_timeout: Option<String>,
+    /// 每凭证每 host 最大空闲连接数;默认 2,上限 100;负值回退短连接
+    #[serde(default, rename = "max-idle-conns-per-host")]
+    pub max_idle_conns_per_host: Option<i64>,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq)]
+pub struct AntigravityPoolSettings {
+    /// 短连接模式:不保留任何空闲连接(其余字段无意义)
+    pub short_mode: bool,
+    pub idle_conn_timeout: Duration,
+    pub max_idle_conns_per_host: usize,
+}
+
+pub(crate) const ANTIGRAVITY_DEFAULT_IDLE_CONN_TIMEOUT: Duration = Duration::from_secs(30);
+pub(crate) const ANTIGRAVITY_MAX_ALLOWED_IDLE_CONN_TIMEOUT: Duration = Duration::from_secs(210);
+pub(crate) const ANTIGRAVITY_DEFAULT_MAX_IDLE_CONNS_PER_HOST: usize = 2;
+pub(crate) const ANTIGRAVITY_MAX_ALLOWED_MAX_IDLE_CONNS_PER_HOST: usize = 100;
+
+impl AntigravityPoolSettings {
+    /// 按配置解析连接池设置(对齐 CPA resolveAntigravityPoolSettings)
+    pub fn resolve(cfg: Option<&AntigravityConfig>) -> Self {
+        let defaults = Self {
+            short_mode: true,
+            idle_conn_timeout: ANTIGRAVITY_DEFAULT_IDLE_CONN_TIMEOUT,
+            max_idle_conns_per_host: ANTIGRAVITY_DEFAULT_MAX_IDLE_CONNS_PER_HOST,
+        };
+        let Some(cfg) = cfg else {
+            return defaults;
+        };
+        let pool = &cfg.connection_pool;
+        // 仅显式 enabled: true 才启用连接池,其余一律短连接
+        if !pool.enabled.unwrap_or(false) {
+            return defaults;
+        }
+        let mut settings = Self {
+            short_mode: false,
+            ..defaults
+        };
+        if let Some(raw) = pool
+            .idle_conn_timeout
+            .as_deref()
+            .map(str::trim)
+            .filter(|s| !s.is_empty())
+        {
+            match parse_go_duration(raw) {
+                // 0/负值(归一为 ZERO)回退短连接(对齐 CPA d <= 0)
+                Ok(d) if d.is_zero() => return defaults,
+                Ok(d) => {
+                    settings.idle_conn_timeout = d.min(ANTIGRAVITY_MAX_ALLOWED_IDLE_CONN_TIMEOUT)
+                }
+                Err(e) => {
+                    tracing::warn!("antigravity 非法 idle-conn-timeout {raw:?}: {e},沿用默认值");
+                }
+            }
+        }
+        if let Some(val) = pool.max_idle_conns_per_host {
+            if val < 0 {
+                return defaults;
+            }
+            settings.max_idle_conns_per_host =
+                (val as usize).min(ANTIGRAVITY_MAX_ALLOWED_MAX_IDLE_CONNS_PER_HOST);
+        }
+        settings
+    }
+}
+
+/// 解析 Go time.Duration 字符串子集:ns/us/ms/s/m/h,支持十进制小数
+/// (如 "1.5s",对齐 Go time.ParseDuration 浮点形式);负值或 0 归一为
+/// ZERO(调用方据此回退短连接,对齐 CPA d <= 0),其余非法输入返回 Err
+fn parse_go_duration(raw: &str) -> anyhow::Result<Duration> {
+    let raw = raw.trim();
+    let split = raw
+        .find(|c: char| c.is_ascii_alphabetic() || c == 'µ')
+        .unwrap_or(raw.len());
+    let (value, unit) = raw.split_at(split);
+    let value: f64 = value
+        .parse()
+        .map_err(|_| anyhow::anyhow!("非法时长数值 {value:?}"))?;
+    let secs = match unit {
+        "ns" => value / 1e9,
+        "us" | "µs" => value / 1e6,
+        "ms" => value / 1e3,
+        "s" => value,
+        "m" => value * 60.0,
+        "h" => value * 3600.0,
+        "" => return Err(anyhow::anyhow!("缺少时间单位")),
+        other => return Err(anyhow::anyhow!("不支持的时间单位 {other:?}")),
+    };
+    if !secs.is_finite() || secs > u64::MAX as f64 {
+        return Err(anyhow::anyhow!("时长溢出"));
+    }
+    if secs <= 0.0 {
+        return Ok(Duration::ZERO);
+    }
+    Ok(Duration::from_secs_f64(secs))
+}
+
 #[derive(Clone)]
 pub struct UpstreamClient {
     global_proxy: Option<String>,
-    /// key(最终代理) → client
-    clients: std::sync::Arc<Mutex<HashMap<String, Client>>>,
+    /// (最终代理, 是否 antigravity) → client
+    clients: std::sync::Arc<Mutex<HashMap<(String, bool), Client>>>,
+    /// Antigravity 连接池设置(短连接默认,对齐 CPA antigravity.executor)
+    ant_pool: AntigravityPoolSettings,
 }
 
 impl UpstreamClient {
     pub fn new(global_proxy: Option<String>) -> Self {
+        Self::with_ant_pool(global_proxy, None)
+    }
+
+    pub fn with_ant_pool(
+        global_proxy: Option<String>,
+        ant_cfg: Option<&AntigravityConfig>,
+    ) -> Self {
         Self {
             global_proxy,
             clients: std::sync::Arc::new(Mutex::new(HashMap::new())),
+            ant_pool: AntigravityPoolSettings::resolve(ant_cfg),
         }
     }
 
@@ -178,9 +306,14 @@ impl UpstreamClient {
         self.resolve_proxy(provider_proxy)
     }
 
-    /// 按最终代理取(或构建)client
-    pub(crate) fn client_for(&self, proxy_key: &str) -> Client {
-        if let Some(c) = self.clients.lock().unwrap().get(proxy_key) {
+    /// 按最终代理 + 协议取(或构建)client
+    ///
+    /// Antigravity 连接池设置独立生效(对齐 CPA antigravity executor transport):
+    /// 缓存键为 (代理, 是否 antigravity) 元组,专属 transport 不影响其他协议共享池。
+    pub(crate) fn client_for(&self, proxy_key: &str, protocol: Protocol) -> Client {
+        let ant = matches!(protocol, Protocol::Antigravity);
+        let cache_key = (proxy_key.to_string(), ant);
+        if let Some(c) = self.clients.lock().unwrap().get(&cache_key) {
             return c.clone();
         }
         let mut builder = Client::builder()
@@ -200,6 +333,18 @@ impl UpstreamClient {
             .http2_keep_alive_interval(std::time::Duration::from_secs(15))
             .http2_keep_alive_timeout(std::time::Duration::from_secs(5))
             .http2_keep_alive_while_idle(true);
+        if ant {
+            // Antigravity 专属池:默认短连接(不保留空闲连接,响应结束即关,
+            // 不发 Connection: close);显式启用时按配置保留池
+            let pool = self.ant_pool;
+            if pool.short_mode {
+                builder = builder.pool_max_idle_per_host(0);
+            } else {
+                builder = builder
+                    .pool_max_idle_per_host(pool.max_idle_conns_per_host)
+                    .pool_idle_timeout(pool.idle_conn_timeout);
+            }
+        }
         if proxy_key == "direct" {
             builder = builder.no_proxy();
         } else if let Ok(proxy) = reqwest::Proxy::all(proxy_key) {
@@ -209,7 +354,7 @@ impl UpstreamClient {
         self.clients
             .lock()
             .unwrap()
-            .insert(proxy_key.to_string(), client.clone());
+            .insert(cache_key, client.clone());
         client
     }
 
@@ -238,7 +383,7 @@ impl UpstreamClient {
         inbound_user_agent: Option<&str>,
     ) -> anyhow::Result<UpstreamResponse> {
         let proxy_key = self.resolve_proxy(provider_proxy);
-        let client = self.client_for(&proxy_key);
+        let client = self.client_for(&proxy_key, protocol);
 
         let upstream_model = body.get("model").and_then(|v| v.as_str()).unwrap_or("");
 
@@ -627,12 +772,12 @@ mod tests {
     #[test]
     fn test_client_caching() {
         let client = UpstreamClient::new(None);
-        let _c1 = client.client_for("direct");
-        let _c2 = client.client_for("direct");
+        let _c1 = client.client_for("direct", Protocol::OpenAiChat);
+        let _c2 = client.client_for("direct", Protocol::OpenAiChat);
         // 同一 proxy_key 应返回相同 client(Arc clone)
         // 通过计数验证缓存命中
         let count_before = client.clients.lock().unwrap().len();
-        let _c3 = client.client_for("direct");
+        let _c3 = client.client_for("direct", Protocol::OpenAiChat);
         let count_after = client.clients.lock().unwrap().len();
         assert_eq!(count_before, count_after, "缓存应命中,不应重建 client");
     }
@@ -640,9 +785,55 @@ mod tests {
     #[test]
     fn test_client_different_proxies() {
         let client = UpstreamClient::new(None);
-        let _c1 = client.client_for("direct");
-        let _c2 = client.client_for("http://proxy1:8080");
-        let _c3 = client.client_for("http://proxy2:9090");
+        let _c1 = client.client_for("direct", Protocol::OpenAiChat);
+        let _c2 = client.client_for("http://proxy1:8080", Protocol::OpenAiChat);
+        let _c3 = client.client_for("http://proxy2:9090", Protocol::OpenAiChat);
         assert_eq!(client.clients.lock().unwrap().len(), 3);
+    }
+
+    #[test]
+    fn test_antigravity_short_connection_isolation() {
+        // Antigravity 默认短连接:缓存键独立于其他协议(#ant 后缀)
+        let client = UpstreamClient::new(None);
+        let _c1 = client.client_for("direct", Protocol::Antigravity);
+        let _c2 = client.client_for("direct", Protocol::OpenAiChat);
+        assert_eq!(client.clients.lock().unwrap().len(), 2);
+
+        // 默认(未启用连接池)解析为短连接
+        assert!(client.ant_pool.short_mode);
+    }
+
+    #[test]
+    fn test_antigravity_pool_settings_resolution() {
+        use super::{AntigravityConfig, AntigravityPoolSettings};
+
+        // 缺省:短连接
+        assert!(AntigravityPoolSettings::resolve(None).short_mode);
+
+        // enabled: true → 默认 2 连接 / 30s
+        let cfg: AntigravityConfig =
+            serde_yaml::from_str("connection-pool:\n  enabled: true").unwrap();
+        let s = AntigravityPoolSettings::resolve(Some(&cfg));
+        assert!(!s.short_mode);
+        assert_eq!(s.max_idle_conns_per_host, 2);
+        assert_eq!(s.idle_conn_timeout, Duration::from_secs(30));
+
+        // 超上限钳制:timeout ≤210s,idle ≤100
+        let cfg: AntigravityConfig =
+            serde_yaml::from_str("connection-pool:\n  enabled: true\n  idle-conn-timeout: \"600s\"\n  max-idle-conns-per-host: 500").unwrap();
+        let s = AntigravityPoolSettings::resolve(Some(&cfg));
+        assert_eq!(s.idle_conn_timeout, Duration::from_secs(210));
+        assert_eq!(s.max_idle_conns_per_host, 100);
+
+        // 负值 / 0 timeout 回退短连接
+        let cfg: AntigravityConfig = serde_yaml::from_str(
+            "connection-pool:\n  enabled: true\n  max-idle-conns-per-host: -1",
+        )
+        .unwrap();
+        assert!(AntigravityPoolSettings::resolve(Some(&cfg)).short_mode);
+        let cfg: AntigravityConfig =
+            serde_yaml::from_str("connection-pool:\n  enabled: true\n  idle-conn-timeout: \"0s\"")
+                .unwrap();
+        assert!(AntigravityPoolSettings::resolve(Some(&cfg)).short_mode);
     }
 }

@@ -4,6 +4,7 @@ use anyhow::Result;
 use ccextra_core::route::ProviderConfig;
 use ccextra_core::secret::looks_like_bcrypt;
 use ccextra_server::http::{LoggingConfig, NormalizeConfig, PayloadRule};
+use ccextra_server::upstream::AntigravityConfig;
 use serde::Deserialize;
 use std::fs;
 
@@ -23,6 +24,9 @@ pub struct Config {
     /// xAI 凭证目录(可选);默认配置文件旁 `.cache/xai`
     #[serde(default)]
     pub xai_auth_dir: Option<String>,
+    /// Antigravity 连接池配置(可选);默认短连接
+    #[serde(default)]
+    pub antigravity: Option<AntigravityConfig>,
     /// User-Agent 覆盖(可选);缺失时用默认值
     #[serde(default)]
     pub user_agents: Option<UserAgents>,
