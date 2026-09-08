@@ -209,6 +209,37 @@ Plain text; CLI handles styling. Be concise, collaborative, factual. Lead with t
 Skip heavy formatting for simple confirmations. Don't dump large files you've written; reference paths only.
 The user does not see command execution outputs directly. When asked to show output, relay the important details or summarize key lines.";
 
+/// GPT-6 Astra 上游的行为适配块(字节固定,缓存前缀稳定)。
+///
+/// 身份句取自官方 Codex gpt-6-astra instructions_template。
+/// 环境仍声明 Claude Code CLI 与 Read/Edit/Write,不搬 21KB 全文,
+/// 也不注入 commentary/final、functions.exec、persistent/multi-agent/guardian。
+const GPT_6_ASTRA_ADAPTER_BLOCK: &str = "\
+You are Codex, an agent based on GPT-6. You and the user share one workspace, and your job is to collaborate with them until their intended goal is completely handled.
+You are running as a coding agent in Claude Code CLI on a user's computer.
+
+Always respond in Simplified Chinese (简体中文). Use Simplified Chinese for all explanations, communications, and user-facing messages. Technical terms, code identifiers, file paths, command names, and error strings should remain in their original form.
+
+## Work policy
+Default: be very concise; friendly coding teammate tone.
+Action-oriented: Infer user intent and bias towards action. Skip excessive planning for straightforward tasks (roughly the easiest 25%).
+For code changes: Lead with a quick explanation of the change, jump right in, and provide context on where and why changes were made.
+Offer logical next steps briefly (tests, build, verify) when relevant.
+Do not narrate your internal reasoning or steps. Do not invent unprompted warnings or disclaimers.
+User authorization and preferences persist across turns. Do not request permission again when the user has already authorized an action in an earlier turn.
+When the user asks to do work, treat it as an instruction and do it. Do not stop at acknowledging capability, proposing a plan, or offering to continue.
+Compaction does not end the task. Continue from the summarized state; do not restart from scratch or redo completed work.
+Avoid AI slop and unprompted contrastive framing such as \"X, not Y\" or \"This isn't about X. It's about Y.\".
+
+## Tool calling
+Use specialized tools instead of bash commands when possible. For file operations, prefer Read/Edit/Write over cat/sed/awk. Reserve bash for actual system commands.
+NEVER use bash echo to communicate with the user. Output all communication directly in your response text.
+
+## Communication
+Plain text; CLI handles styling. Be concise, collaborative, factual. Lead with the answer, then give supporting detail.
+Skip heavy formatting for simple confirmations. Don't dump large files you've written; reference paths only.
+The user does not see command execution outputs directly. When asked to show output, relay the important details or summarize key lines.";
+
 /// Grok 上游追加的行为适配块(字节固定,缓存前缀稳定)。
 ///
 /// 直接对齐官方 grok-build prompt.md 核心约束,仅替换环境声明为 Claude Code。
@@ -257,6 +288,21 @@ pub fn is_gpt_upstream(upstream_model: &str) -> bool {
         || lower.starts_with("o1")
         || lower.starts_with("o3")
         || lower.starts_with("o4")
+}
+
+/// GPT-6 Astra 及别名: gpt-6 / gpt-6-astra / gpt-6-astra-*
+/// 容忍供应商前缀、大小写、下划线(对齐 sub2api isOpenAIGPT6AstraModel)
+fn is_gpt6_astra(upstream_model: &str) -> bool {
+    let name = upstream_model
+        .rsplit('/')
+        .next()
+        .unwrap_or(upstream_model)
+        .trim();
+    let canonical: String = name
+        .chars()
+        .map(|c| if c == '_' { '-' } else { c.to_ascii_lowercase() })
+        .collect();
+    canonical == "gpt-6" || canonical == "gpt-6-astra" || canonical.starts_with("gpt-6-astra-")
 }
 
 /// 判定上游是否为 Grok 模型(按模型名包含 grok)
@@ -839,7 +885,9 @@ pub fn convert_to_openai_responses(
         "input": [],
     });
     if needs_adapter {
-        let adapter = if is_gpt_upstream(upstream_model) {
+        let adapter = if is_gpt6_astra(upstream_model) {
+            GPT_6_ASTRA_ADAPTER_BLOCK
+        } else if is_gpt_upstream(upstream_model) {
             GPT_CODEX_ADAPTER_BLOCK
         } else {
             GROK_ADAPTER_BLOCK
@@ -1262,9 +1310,14 @@ pub fn convert_to_openai_responses(
     // claude 入站走 default 分支不 preserve。CC 的 max_tokens 常为 64000,
     // 透传 max_output_tokens 超 grok 上限会 400 触发客户端重试死循环) ---
 
-    // --- reasoning.effort(对齐 thinking 分支,默认 medium) ---
+    // --- reasoning.effort(对齐 thinking 分支;GPT-6 Astra 默认 low,其余 medium) ---
     // 保留入站 reasoning.effort,钳制到模型支持级别(对齐 codex compact.rs:704 保留 turn_context.reasoning_effort)
-    let effort = crate::thinking::resolve_effort_from_body(body).unwrap_or("medium");
+    let default_effort = if is_gpt6_astra(upstream_model) {
+        "low"
+    } else {
+        "medium"
+    };
+    let effort = crate::thinking::resolve_effort_from_body(body).unwrap_or(default_effort);
     let effort = crate::thinking::clamp_effort(effort, upstream_model);
     // grok 模型对齐 grok-build:reasoning.summary=concise(其余模型不设)
     openai["reasoning"] = if upstream_model.to_ascii_lowercase().contains("grok") {
@@ -1601,6 +1654,19 @@ mod tests {
         assert!(!is_gpt_upstream("claude-opus-5"));
         assert!(!is_gpt_upstream("grok-4.6"));
         assert!(!is_gpt_upstream("gemini-2.5-pro"));
+    }
+
+    #[test]
+    fn test_gpt6_astra_match() {
+        assert!(is_gpt6_astra("gpt-6-astra"));
+        assert!(is_gpt6_astra("gpt-6"));
+        assert!(is_gpt6_astra("openai/gpt-6-astra"));
+        assert!(is_gpt6_astra("OPENAI/GPT-6_ASTRA"));
+        assert!(is_gpt6_astra("gpt-6-astra-2026-09-01"));
+        assert!(!is_gpt6_astra("gpt-5.6-terra"));
+        assert!(!is_gpt6_astra("gpt-6-flash"));
+        assert!(!is_gpt6_astra("gpt-60"));
+        assert!(!is_gpt6_astra("grok-4.6"));
     }
 
     #[test]
@@ -2208,6 +2274,32 @@ mod tests {
     }
 
     #[test]
+    fn test_gpt6_astra_default_effort_low() {
+        let mut body = json!({"model": "test", "messages": []});
+        convert_to_openai_responses(&mut body, "gpt-6-astra").unwrap();
+        assert_eq!(body["reasoning"]["effort"], "low");
+    }
+
+    #[test]
+    fn test_non_astra_gpt_default_effort_medium() {
+        // 锁在 GPT 模型上:误把 is_gpt6_astra 写成 is_gpt_upstream 时,gpt-5.4 会变 low
+        let mut body = json!({"model": "test", "messages": []});
+        convert_to_openai_responses(&mut body, "gpt-5.4").unwrap();
+        assert_eq!(body["reasoning"]["effort"], "medium");
+    }
+
+    #[test]
+    fn test_gpt6_astra_explicit_effort_high() {
+        let mut body = json!({
+            "model": "test",
+            "output_config": {"effort": "high"},
+            "messages": []
+        });
+        convert_to_openai_responses(&mut body, "gpt-6-astra").unwrap();
+        assert_eq!(body["reasoning"]["effort"], "high");
+    }
+
+    #[test]
     fn test_thinking_effort_mapping() {
         let mut body = json!({
             "model": "test",
@@ -2461,6 +2553,43 @@ Be verbose.
         let dev_text = input[0]["content"][0]["text"].as_str().unwrap();
         assert!(dev_text.starts_with("You are Codex, based on GPT-5."));
         assert!(dev_text.contains("Custom system instructions"));
+    }
+
+    #[test]
+    fn test_gpt6_astra_injects_adapter_block() {
+        let mut body = json!({
+            "model": "test",
+            "system": "Custom system instructions",
+            "messages": [{"role": "user", "content": "hello"}]
+        });
+        convert_to_openai_responses(&mut body, "gpt-6-astra").unwrap();
+
+        assert_eq!(body["instructions"], "");
+        let input = body["input"].as_array().unwrap();
+        assert_eq!(input[0]["role"], "developer");
+        let dev_text = input[0]["content"][0]["text"].as_str().unwrap();
+        assert!(dev_text.starts_with("You are Codex, an agent based on GPT-6."));
+        assert!(dev_text.contains("Claude Code CLI"));
+        assert!(dev_text.contains("persist across turns"));
+        assert!(dev_text.contains("Do not stop at acknowledging capability"));
+        assert!(dev_text.contains("Compaction does not end the task"));
+        assert!(dev_text.contains("X, not Y"));
+        assert!(dev_text.contains("Read/Edit/Write"));
+        assert!(dev_text.contains("Custom system instructions"));
+        assert!(!dev_text.contains("based on GPT-5."));
+        assert!(!dev_text.contains("functions.exec"));
+        assert!(!dev_text.contains("commentary"));
+    }
+
+    #[test]
+    fn test_gpt6_alias_uses_astra_adapter() {
+        let mut body = json!({
+            "model": "test",
+            "messages": [{"role": "user", "content": "hi"}]
+        });
+        convert_to_openai_responses(&mut body, "gpt-6").unwrap();
+        let dev_text = body["input"][0]["content"][0]["text"].as_str().unwrap();
+        assert!(dev_text.starts_with("You are Codex, an agent based on GPT-6."));
     }
 
     #[test]

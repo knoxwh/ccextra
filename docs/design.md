@@ -62,7 +62,7 @@ Anthropic `system` 成为 system message；用户、助手、图片、工具调�
 
 ### OpenAI Responses
 
-普通上游把 system 放到 `instructions`。GPT/Grok 上游使用固定 developer 适配块，并清理不兼容的 Claude 系统段落。工具、tool choice、图片和自定义工具转换为 Responses 项；过长工具名使用请求侧缩写和响应侧反向映射。严格 JSON schema 不满足 Responses 要求时自动降级 `strict`。
+普通上游把 system 放到 `instructions`。GPT/Grok 上游使用固定 developer 适配块，并清理不兼容的 Claude 系统段落。GPT-6 Astra 使用独立适配块，未指定 effort 时默认 `low`；其余 Responses 上游默认 `medium`。工具、tool choice、图片和自定义工具转换为 Responses 项；过长工具名使用请求侧缩写和响应侧反向映射。严格 JSON schema 不满足 Responses 要求时自动降级 `strict`。
 
 ### Gemini 与 Antigravity
 
