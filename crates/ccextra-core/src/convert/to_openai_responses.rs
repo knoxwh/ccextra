@@ -300,7 +300,13 @@ fn is_gpt6_astra(upstream_model: &str) -> bool {
         .trim();
     let canonical: String = name
         .chars()
-        .map(|c| if c == '_' { '-' } else { c.to_ascii_lowercase() })
+        .map(|c| {
+            if c == '_' {
+                '-'
+            } else {
+                c.to_ascii_lowercase()
+            }
+        })
         .collect();
     canonical == "gpt-6" || canonical == "gpt-6-astra" || canonical.starts_with("gpt-6-astra-")
 }

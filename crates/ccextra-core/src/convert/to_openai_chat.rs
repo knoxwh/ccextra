@@ -4,7 +4,7 @@
 // cache_control/image 丢失,故不采用)。
 //
 // 主要映射:
-// - system → messages[0] {role: system}
+// - system → messages[0] {role: system|developer}
 // - thinking.budget_tokens → reasoning_effort
 // - content 块逐项转换:thinking→reasoning_content, image→data URL,
 //   tool_use→tool_calls, tool_result→role=tool(tool_result 先发保相邻,
@@ -27,19 +27,37 @@ use super::{ConvertError, Result};
 pub fn convert_to_openai_chat(body: &mut Value, upstream_model: &str) -> Result<()> {
     let mut openai = serde_json::Map::new();
 
-    // 对齐 顶层键序:model,max_tokens,temperature/top_p,stop,stream,
+    // 对齐 顶层键序:model,max_tokens|max_completion_tokens,temperature/top_p,stop,stream,
     // reasoning_effort,messages,tools,tool_choice,user
     openai.insert("model".into(), json!(upstream_model));
+    // thinking → reasoning_effort(忠实 thinking 映射;顶层 output_config 优先)
+    // 先解析,能力矩阵按最终 effort 判定采样是否可发。
+    let reasoning_effort = crate::thinking::resolve_effort_from_body(body)
+        .map(|effort| crate::thinking::clamp_effort(effort, upstream_model));
+    let capabilities = openai_chat_capabilities(upstream_model, reasoning_effort.unwrap_or(""));
 
-    // max_tokens 透传
+    // max_tokens 透传;o/GPT-5/Astra 改发 max_completion_tokens
     if let Some(val) = body.get("max_tokens") {
-        openai.insert("max_tokens".into(), val.clone());
+        let key = if capabilities.use_max_completion_tokens {
+            "max_completion_tokens"
+        } else {
+            "max_tokens"
+        };
+        openai.insert(key.into(), val.clone());
     }
     // 对齐:temperature 与 top_p 互斥,top_p 仅在无 temperature 时发
-    if let Some(val) = body.get("temperature") {
-        openai.insert("temperature".into(), val.clone());
-    } else if let Some(val) = body.get("top_p") {
-        openai.insert("top_p".into(), val.clone());
+    if capabilities.supports_temperature {
+        if let Some(val) = body.get("temperature") {
+            openai.insert("temperature".into(), val.clone());
+        } else if capabilities.supports_top_p {
+            if let Some(val) = body.get("top_p") {
+                openai.insert("top_p".into(), val.clone());
+            }
+        }
+    } else if capabilities.supports_top_p {
+        if let Some(val) = body.get("top_p") {
+            openai.insert("top_p".into(), val.clone());
+        }
     }
     // stop_sequences → stop(单元素发字符串,一致)
     if let Some(seqs) = body.get("stop_sequences").and_then(|v| v.as_array()) {
@@ -55,10 +73,7 @@ pub fn convert_to_openai_chat(body: &mut Value, upstream_model: &str) -> Result<
         body.get("stream").unwrap_or(&json!(false)).clone(),
     );
 
-    // thinking → reasoning_effort(忠实 thinking 映射;顶层 output_config 优先)
-    if let Some(effort) = crate::thinking::resolve_effort_from_body(body) {
-        // 钳制到模型支持级别(查注册表)
-        let effort = crate::thinking::clamp_effort(effort, upstream_model);
+    if let Some(effort) = reasoning_effort {
         openai.insert("reasoning_effort".into(), json!(effort));
     }
 
@@ -70,7 +85,9 @@ pub fn convert_to_openai_chat(body: &mut Value, upstream_model: &str) -> Result<
         match system {
             Value::String(s) => {
                 let cleaned = super::to_openai_responses::strip_claude_system_for_chat(s);
-                if !cleaned.trim().is_empty() && !super::is_ignorable_system_text(&cleaned, upstream_model) {
+                if !cleaned.trim().is_empty()
+                    && !super::is_ignorable_system_text(&cleaned, upstream_model)
+                {
                     items.push(json!({"type": "text", "text": cleaned.trim()}));
                 }
             }
@@ -78,7 +95,9 @@ pub fn convert_to_openai_chat(body: &mut Value, upstream_model: &str) -> Result<
                 for b in blocks {
                     if let Some(t) = b.get("text").and_then(|v| v.as_str()) {
                         let cleaned = super::to_openai_responses::strip_claude_system_for_chat(t);
-                        if !cleaned.trim().is_empty() && !super::is_ignorable_system_text(&cleaned, upstream_model) {
+                        if !cleaned.trim().is_empty()
+                            && !super::is_ignorable_system_text(&cleaned, upstream_model)
+                        {
                             items.push(json!({"type": "text", "text": cleaned.trim()}));
                         }
                     }
@@ -87,7 +106,12 @@ pub fn convert_to_openai_chat(body: &mut Value, upstream_model: &str) -> Result<
             _ => return Err(ConvertError::InvalidType("system".into())),
         }
         if !items.is_empty() {
-            messages.push(json!({"role": "system", "content": items}));
+            let role = if capabilities.use_developer_role {
+                "developer"
+            } else {
+                "system"
+            };
+            messages.push(json!({"role": role, "content": items}));
         }
     }
 
@@ -239,6 +263,91 @@ pub fn convert_to_openai_chat(body: &mut Value, upstream_model: &str) -> Result<
 
     *body = Value::Object(openai);
     Ok(())
+}
+
+/// 对齐 new-api GetOpenAIChatCapabilities。
+/// 未识别模型保留参数;后续 GPT 代际不自动继承现有限制。
+struct OpenAiChatCapabilities {
+    use_max_completion_tokens: bool,
+    use_developer_role: bool,
+    supports_temperature: bool,
+    supports_top_p: bool,
+}
+
+fn openai_chat_capabilities(model_name: &str, reasoning_effort: &str) -> OpenAiChatCapabilities {
+    let mut capabilities = OpenAiChatCapabilities {
+        use_max_completion_tokens: false,
+        use_developer_role: false,
+        supports_temperature: true,
+        supports_top_p: true,
+    };
+    if is_openai_reasoning_o_model(model_name) {
+        capabilities.use_max_completion_tokens = true;
+        capabilities.use_developer_role =
+            !model_name.starts_with("o1-mini") && !model_name.starts_with("o1-preview");
+        capabilities.supports_temperature = false;
+        return capabilities;
+    }
+
+    let is_gpt5_model = is_openai_gpt5_model(model_name);
+    if !is_gpt5_model && !is_openai_model_snapshot(model_name, "gpt-6-astra") {
+        return capabilities;
+    }
+    capabilities.use_max_completion_tokens = true;
+    capabilities.use_developer_role = true;
+
+    // 标准 GPT-5.1/5.2/5.4 在无 reasoning 时支持采样。
+    // 命名变体(pro/codex/chat-latest)不继承。Astra 永不支持采样。
+    let supports_sampling = is_gpt5_model
+        && (reasoning_effort.is_empty() || reasoning_effort == "none")
+        && ["gpt-5.1", "gpt-5.2", "gpt-5.4"]
+            .iter()
+            .any(|base| is_openai_model_snapshot(model_name, base));
+    capabilities.supports_temperature = supports_sampling;
+    capabilities.supports_top_p = supports_sampling;
+    capabilities
+}
+
+fn is_openai_reasoning_o_model(model_name: &str) -> bool {
+    model_name.starts_with("o1") || model_name.starts_with("o3") || model_name.starts_with("o4")
+}
+
+fn is_openai_gpt5_model(model_name: &str) -> bool {
+    model_name == "gpt-5" || model_name.starts_with("gpt-5-") || model_name.starts_with("gpt-5.")
+}
+
+fn is_openai_model_snapshot(model_name: &str, base_model: &str) -> bool {
+    if model_name == base_model {
+        return true;
+    }
+    let Some(rest) = model_name.strip_prefix(base_model) else {
+        return false;
+    };
+    rest.strip_prefix('-').is_some_and(is_date_only)
+}
+
+fn is_date_only(s: &str) -> bool {
+    let bytes = s.as_bytes();
+    if bytes.len() != 10 || bytes[4] != b'-' || bytes[7] != b'-' {
+        return false;
+    }
+    if !bytes[0..4].iter().all(u8::is_ascii_digit)
+        || !bytes[5..7].iter().all(u8::is_ascii_digit)
+        || !bytes[8..10].iter().all(u8::is_ascii_digit)
+    {
+        return false;
+    }
+    let year: i32 = s[0..4].parse().unwrap_or(0);
+    let month: u8 = s[5..7].parse().unwrap_or(0);
+    let day: u8 = s[8..10].parse().unwrap_or(0);
+    let max_day = match month {
+        1 | 3 | 5 | 7 | 8 | 10 | 12 => 31,
+        4 | 6 | 9 | 11 => 30,
+        2 if year % 4 == 0 && (year % 100 != 0 || year % 400 == 0) => 29,
+        2 => 28,
+        _ => return false,
+    };
+    day >= 1 && day <= max_day
 }
 
 /// messages 内 role=system 消息 → 文本提取,包 <system-reminder> 标记
@@ -1100,6 +1209,199 @@ IMPORTANT: Assist with authorized security testing.
         convert_to_openai_chat(&mut body, "gpt").unwrap();
         assert_eq!(body["temperature"], 0.5);
         assert!(body.get("top_p").is_none());
+    }
+
+    #[test]
+    fn test_o1_mini_uses_model_compatible_fields() {
+        let mut body = json!({
+            "model": "test",
+            "system": "You are helpful",
+            "messages": [],
+            "max_tokens": 1024,
+            "temperature": 0.2,
+            "top_p": 0.8
+        });
+        convert_to_openai_chat(&mut body, "o1-mini").unwrap();
+        assert_eq!(body["max_completion_tokens"], 1024);
+        assert!(body.get("max_tokens").is_none());
+        assert!(body.get("temperature").is_none());
+        assert_eq!(body["top_p"], 0.8);
+        assert_eq!(body["messages"][0]["role"], "system");
+    }
+
+    #[test]
+    fn test_o3_mini_uses_developer_role() {
+        let mut body = json!({
+            "model": "test",
+            "system": "You are helpful",
+            "messages": [],
+            "max_tokens": 1024,
+            "temperature": 0.2,
+            "top_p": 0.8
+        });
+        convert_to_openai_chat(&mut body, "o3-mini").unwrap();
+        assert_eq!(body["max_completion_tokens"], 1024);
+        assert!(body.get("temperature").is_none());
+        assert_eq!(body["top_p"], 0.8);
+        assert_eq!(body["messages"][0]["role"], "developer");
+    }
+
+    #[test]
+    fn test_gpt52_named_variant_drops_sampling() {
+        let mut body = json!({
+            "model": "test",
+            "system": "You are helpful",
+            "messages": [],
+            "max_tokens": 1024,
+            "temperature": 0.2,
+            "top_p": 0.8
+        });
+        convert_to_openai_chat(&mut body, "gpt-5.2-chat-latest").unwrap();
+        assert_eq!(body["max_completion_tokens"], 1024);
+        assert!(body.get("temperature").is_none());
+        assert!(body.get("top_p").is_none());
+        assert_eq!(body["messages"][0]["role"], "developer");
+    }
+
+    #[test]
+    fn test_future_gpt_generation_keeps_default_fields() {
+        let mut body = json!({
+            "model": "test",
+            "system": "You are helpful",
+            "messages": [],
+            "max_tokens": 1024,
+            "temperature": 0.2,
+            "top_p": 0.8
+        });
+        convert_to_openai_chat(&mut body, "gpt-7").unwrap();
+        assert_eq!(body["max_tokens"], 1024);
+        assert_eq!(body["temperature"], 0.2);
+        assert!(body.get("top_p").is_none());
+        assert_eq!(body["messages"][0]["role"], "system");
+    }
+
+    #[test]
+    fn test_gpt52_without_reasoning_keeps_sampling() {
+        let mut body = json!({
+            "model": "test",
+            "system": "You are helpful",
+            "messages": [],
+            "max_tokens": 1024,
+            "temperature": 0.2,
+            "top_p": 0.8
+        });
+        convert_to_openai_chat(&mut body, "gpt-5.2").unwrap();
+        assert_eq!(body["max_completion_tokens"], 1024);
+        assert!(body.get("max_tokens").is_none());
+        assert_eq!(body["temperature"], 0.2);
+        assert!(body.get("top_p").is_none());
+        assert_eq!(body["messages"][0]["role"], "developer");
+    }
+
+    #[test]
+    fn test_gpt52_disabled_thinking_keeps_sampling() {
+        let mut body = json!({
+            "model": "test",
+            "system": "You are helpful",
+            "thinking": {"type": "disabled"},
+            "messages": [],
+            "max_tokens": 1024,
+            "temperature": 0.2,
+            "top_p": 0.8
+        });
+        convert_to_openai_chat(&mut body, "gpt-5.2").unwrap();
+        assert_eq!(body["max_completion_tokens"], 1024);
+        assert_eq!(body["temperature"], 0.2);
+        assert_eq!(body["reasoning_effort"], "none");
+        assert_eq!(body["messages"][0]["role"], "developer");
+    }
+
+    #[test]
+    fn test_gpt52_dated_snapshot_keeps_sampling() {
+        let mut body = json!({
+            "model": "test",
+            "system": "You are helpful",
+            "messages": [],
+            "max_tokens": 1024,
+            "temperature": 0.2,
+            "top_p": 0.8
+        });
+        convert_to_openai_chat(&mut body, "gpt-5.2-2025-12-11").unwrap();
+        assert_eq!(body["max_completion_tokens"], 1024);
+        assert_eq!(body["temperature"], 0.2);
+        assert_eq!(body["messages"][0]["role"], "developer");
+    }
+
+    #[test]
+    fn test_gpt52_with_reasoning_drops_sampling() {
+        let mut body = json!({
+            "model": "test",
+            "system": "You are helpful",
+            "output_config": {"effort": "high"},
+            "messages": [],
+            "max_tokens": 1024,
+            "temperature": 0.2,
+            "top_p": 0.8
+        });
+        convert_to_openai_chat(&mut body, "gpt-5.2").unwrap();
+        assert_eq!(body["max_completion_tokens"], 1024);
+        assert!(body.get("temperature").is_none());
+        assert!(body.get("top_p").is_none());
+        assert_eq!(body["messages"][0]["role"], "developer");
+    }
+
+    #[test]
+    fn test_gpt6_astra_and_snapshot_use_model_compatible_fields() {
+        for model in ["gpt-6-astra", "gpt-6-astra-2026-09-03"] {
+            let mut body = json!({
+                "model": "test",
+                "system": "You are helpful",
+                "messages": [],
+                "max_tokens": 1024,
+                "temperature": 0.2,
+                "top_p": 0.8
+            });
+            convert_to_openai_chat(&mut body, model).unwrap();
+            assert_eq!(body["max_completion_tokens"], 1024, "{model}");
+            assert!(body.get("max_tokens").is_none(), "{model}");
+            assert!(body.get("temperature").is_none(), "{model}");
+            assert!(body.get("top_p").is_none(), "{model}");
+            assert_eq!(body["messages"][0]["role"], "developer", "{model}");
+        }
+    }
+
+    #[test]
+    fn test_invalid_gpt6_astra_snapshot_keeps_default_fields() {
+        let mut body = json!({
+            "model": "test",
+            "system": "You are helpful",
+            "messages": [],
+            "max_tokens": 1024,
+            "temperature": 0.2,
+            "top_p": 0.8
+        });
+        convert_to_openai_chat(&mut body, "gpt-6-astra-2026-99-03").unwrap();
+        assert_eq!(body["max_tokens"], 1024);
+        assert_eq!(body["temperature"], 0.2);
+        assert!(body.get("top_p").is_none());
+        assert_eq!(body["messages"][0]["role"], "system");
+    }
+
+    #[test]
+    fn test_unknown_gpt6_astra_variant_keeps_default_fields() {
+        let mut body = json!({
+            "model": "test",
+            "system": "You are helpful",
+            "messages": [],
+            "max_tokens": 1024,
+            "temperature": 0.2,
+            "top_p": 0.8
+        });
+        convert_to_openai_chat(&mut body, "gpt-6-astra-pro").unwrap();
+        assert_eq!(body["max_tokens"], 1024);
+        assert_eq!(body["temperature"], 0.2);
+        assert!(body.get("top_p").is_none());
+        assert_eq!(body["messages"][0]["role"], "system");
     }
 
     #[test]
