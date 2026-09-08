@@ -2280,10 +2280,41 @@ mod tests {
     }
 
     #[test]
-    fn test_gpt6_astra_default_effort_low() {
-        let mut body = json!({"model": "test", "messages": []});
-        convert_to_openai_responses(&mut body, "gpt-6-astra").unwrap();
-        assert_eq!(body["reasoning"]["effort"], "low");
+    fn test_gpt6_astra_effort_handling() {
+        // 测试 Astra default effort 和 explicit effort
+        struct Case {
+            name: &'static str,
+            body: Value,
+            expected_effort: &'static str,
+        }
+
+        let cases = vec![
+            Case {
+                name: "default effort low",
+                body: json!({"model": "test", "messages": []}),
+                expected_effort: "low",
+            },
+            Case {
+                name: "explicit effort high",
+                body: json!({
+                    "model": "test",
+                    "output_config": {"effort": "high"},
+                    "messages": []
+                }),
+                expected_effort: "high",
+            },
+        ];
+
+        for case in cases {
+            let mut body = case.body.clone();
+            convert_to_openai_responses(&mut body, "gpt-6-astra").unwrap();
+            assert_eq!(
+                body["reasoning"]["effort"],
+                case.expected_effort,
+                "Failed at case: {}",
+                case.name
+            );
+        }
     }
 
     #[test]
@@ -2292,17 +2323,6 @@ mod tests {
         let mut body = json!({"model": "test", "messages": []});
         convert_to_openai_responses(&mut body, "gpt-5.4").unwrap();
         assert_eq!(body["reasoning"]["effort"], "medium");
-    }
-
-    #[test]
-    fn test_gpt6_astra_explicit_effort_high() {
-        let mut body = json!({
-            "model": "test",
-            "output_config": {"effort": "high"},
-            "messages": []
-        });
-        convert_to_openai_responses(&mut body, "gpt-6-astra").unwrap();
-        assert_eq!(body["reasoning"]["effort"], "high");
     }
 
     #[test]
