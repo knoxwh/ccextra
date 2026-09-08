@@ -1657,28 +1657,8 @@ mod tests {
     }
 
     #[test]
-    fn early_message_item_hashes_identify_changed_position() {
-        let before = extract_early_messages(
-            &anthropic_body("sys", json!([]), vec!["first", "second", "third"]),
-            ApiKind::Anthropic,
-        );
-        let after = extract_early_messages(
-            &anthropic_body("sys", json!([]), vec!["first", "changed", "third"]),
-            ApiKind::Anthropic,
-        );
-
-        let previous = early_message_item_hashes(&before);
-        let current = early_message_item_hashes(&after);
-
-        assert_eq!(previous.len(), 3);
-        assert_eq!(current.len(), 3);
-        assert_eq!(previous[0], current[0]);
-        assert_ne!(previous[1], current[1]);
-        assert_eq!(previous[2], current[2]);
-    }
-
-    #[test]
-    fn early_message_item_hashes_are_12_hex_prefixes() {
+    fn test_early_message_item_hashes() {
+        // 测试 12 位 hex 前缀格式
         let messages = extract_early_messages(
             &anthropic_body("sys", json!([]), vec!["hello", "world"]),
             ApiKind::Anthropic,
@@ -1695,10 +1675,8 @@ mod tests {
                 prefix
             );
         }
-    }
 
-    #[test]
-    fn structural_hash_early_message_item_hashes_are_12_hex_prefixes() {
+        // 测试通过 compute_structural_hash 也符合规范
         let h = compute_structural_hash(
             &anthropic_body("sys", json!([]), vec!["a", "b", "c"]),
             ApiKind::Anthropic,
@@ -1714,10 +1692,30 @@ mod tests {
                 prefix
             );
         }
+
+        // 测试位置识别：变化位置的 hash 不同
+        let before = extract_early_messages(
+            &anthropic_body("sys", json!([]), vec!["first", "second", "third"]),
+            ApiKind::Anthropic,
+        );
+        let after = extract_early_messages(
+            &anthropic_body("sys", json!([]), vec!["first", "changed", "third"]),
+            ApiKind::Anthropic,
+        );
+
+        let previous = early_message_item_hashes(&before);
+        let current = early_message_item_hashes(&after);
+
+        assert_eq!(previous.len(), 3);
+        assert_eq!(current.len(), 3);
+        assert_eq!(previous[0], current[0], "first unchanged");
+        assert_ne!(previous[1], current[1], "second changed");
+        assert_eq!(previous[2], current[2], "third unchanged");
     }
 
     #[test]
-    fn early_messages_window_caps_at_eight() {
+    fn test_early_messages_window_behavior() {
+        // 测试 8 条上限
         let h1 = compute_structural_hash(
             &anthropic_body(
                 "s",
@@ -1726,7 +1724,7 @@ mod tests {
             ),
             ApiKind::Anthropic,
         );
-        // 只修改第 9 条消息不能使 early_messages 漂移。
+        // 只修改第 9 条消息不能使 early_messages 漂移
         let h2 = compute_structural_hash(
             &anthropic_body(
                 "s",
@@ -1735,8 +1733,9 @@ mod tests {
             ),
             ApiKind::Anthropic,
         );
-        assert_eq!(h1.early_messages, h2.early_messages);
-        // 但修改第 1 条消息必须使其漂移。
+        assert_eq!(h1.early_messages, h2.early_messages, "9th message outside window");
+
+        // 但修改第 1 条消息必须使其漂移
         let h3 = compute_structural_hash(
             &anthropic_body(
                 "s",
@@ -1745,7 +1744,7 @@ mod tests {
             ),
             ApiKind::Anthropic,
         );
-        assert_ne!(h1.early_messages, h3.early_messages);
+        assert_ne!(h1.early_messages, h3.early_messages, "1st message inside window");
     }
 
     #[test]
