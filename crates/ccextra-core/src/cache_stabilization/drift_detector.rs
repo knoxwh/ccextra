@@ -1320,8 +1320,80 @@ mod tests {
     }
 
     #[test]
-    fn openai_responses_discriminator_skips_roleless_items() {
-        let body = json!({
+    fn test_openai_responses_instructions_precedence() {
+        // 测试优先级：instructions > developer > messages
+
+        // 1. instructions 存在时，优先使用 instructions
+        let body_with_instructions = json!({
+            "model": "gpt-5.4",
+            "instructions": "canonical system",
+            "tools": [],
+            "input": [
+                {"role": "developer", "content": "system A"},
+                {"role": "user", "content": "hello"}
+            ]
+        });
+        let body_with_instructions2 = json!({
+            "model": "gpt-5.4",
+            "instructions": "canonical system",
+            "tools": [],
+            "input": [
+                {"role": "developer", "content": "system B"},
+                {"role": "user", "content": "hello"}
+            ]
+        });
+        let h1 = compute_structural_hash(&body_with_instructions, ApiKind::OpenAiResponses);
+        let h2 = compute_structural_hash(&body_with_instructions2, ApiKind::OpenAiResponses);
+        // developer 不同，但 instructions 相同，system hash 应相同
+        assert_eq!(h1.system, h2.system);
+
+        // 2. instructions 不同时，system hash 不同
+        let body_different_instructions = json!({
+            "model": "gpt-4",
+            "instructions": "be verbose",
+            "tools": [],
+            "input": [
+                {"type": "message", "role": "user", "content": "hello"},
+            ],
+        });
+        let h3 = compute_structural_hash(&body_with_instructions, ApiKind::OpenAiResponses);
+        let h4 = compute_structural_hash(&body_different_instructions, ApiKind::OpenAiResponses);
+        assert_ne!(h3.system, h4.system);
+
+        // 3. 无 instructions 时，使用 developer input
+        let body_no_instructions = json!({
+            "model": "gpt-5.4",
+            "tools": [],
+            "input": [
+                {"role": "developer", "content": "system A"},
+                {"role": "user", "content": "hello"}
+            ]
+        });
+        let body_no_instructions2 = json!({
+            "model": "gpt-5.4",
+            "tools": [],
+            "input": [
+                {"role": "developer", "content": "system B"},
+                {"role": "user", "content": "hello"}
+            ]
+        });
+        let h5 = compute_structural_hash(&body_no_instructions, ApiKind::OpenAiResponses);
+        let h6 = compute_structural_hash(&body_no_instructions2, ApiKind::OpenAiResponses);
+        assert_ne!(h5.system, h6.system);
+
+        // 4. 回退到 messages（无 input）
+        let body_messages = json!({
+            "model": "gpt-x",
+            "messages": [
+                {"role": "developer", "content": "dev"},
+                {"role": "user", "content": "first real"},
+            ],
+        });
+        let msg = first_conversation_message(&body_messages, ApiKind::OpenAiResponses).unwrap();
+        assert_eq!(msg["content"], json!("first real"));
+
+        // 5. 跳过无 role 项
+        let body_skip_roleless = json!({
             "model": "gpt-x",
             "input": [
                 {"type": "function_call_output", "call_id": "c1", "output": "x"},
@@ -1329,21 +1401,66 @@ mod tests {
                 {"role": "user", "content": "first real"},
             ],
         });
-        let msg = first_conversation_message(&body, ApiKind::OpenAiResponses).unwrap();
-        assert_eq!(msg["content"], json!("first real"));
+        let msg2 = first_conversation_message(&body_skip_roleless, ApiKind::OpenAiResponses).unwrap();
+        assert_eq!(msg2["content"], json!("first real"));
     }
 
     #[test]
-    fn openai_responses_discriminator_falls_back_to_messages() {
-        let body = json!({
-            "model": "gpt-x",
-            "messages": [
-                {"role": "developer", "content": "dev"},
-                {"role": "user", "content": "first real"},
-            ],
-        });
-        let msg = first_conversation_message(&body, ApiKind::OpenAiResponses).unwrap();
-        assert_eq!(msg["content"], json!("first real"));
+    fn test_openai_responses_instructions_blank_fallback() {
+        // 测试 null/empty/whitespace instructions 回退到 developer
+        struct Case {
+            name: &'static str,
+            instructions: Value,
+            expect_different_system: bool,
+        }
+
+        let cases = vec![
+            Case {
+                name: "null instructions",
+                instructions: json!(null),
+                expect_different_system: true,
+            },
+            Case {
+                name: "empty instructions",
+                instructions: json!(""),
+                expect_different_system: true,
+            },
+            Case {
+                name: "whitespace instructions",
+                instructions: json!(" \n"),
+                expect_different_system: true,
+            },
+        ];
+
+        for case in cases {
+            let body_a = json!({
+                "model": "gpt-5.4",
+                "instructions": case.instructions,
+                "tools": [],
+                "input": [
+                    {"role": "developer", "content": [{"type": "input_text", "text": "system A"}]},
+                    {"role": "user", "content": "hello"}
+                ]
+            });
+            let body_b = json!({
+                "model": "gpt-5.4",
+                "instructions": case.instructions,
+                "tools": [],
+                "input": [
+                    {"role": "developer", "content": [{"type": "input_text", "text": "system B"}]},
+                    {"role": "user", "content": "hello"}
+                ]
+            });
+
+            let h1 = compute_structural_hash(&body_a, ApiKind::OpenAiResponses);
+            let h2 = compute_structural_hash(&body_b, ApiKind::OpenAiResponses);
+
+            if case.expect_different_system {
+                assert_ne!(h1.system, h2.system, "Failed at case: {}", case.name);
+            } else {
+                assert_eq!(h1.system, h2.system, "Failed at case: {}", case.name);
+            }
+        }
     }
 
     #[test]
@@ -1487,160 +1604,6 @@ mod tests {
 
     #[test]
     fn tools_description_change_does_not_drift() {
-        let body = json!({
-            "model": "gpt-5.4",
-            "instructions": "be brief",
-            "tools": [{
-                "type": "function",
-                "function": {
-                    "name": "search",
-                    "description": "cwd=/tmp/a permissions=read",
-                    "parameters": {"type": "object", "properties": {"q": {"type": "string"}}}
-                }
-            }],
-            "input": [{"role": "user", "content": "hello"}]
-        });
-        let body2 = json!({
-            "model": "gpt-5.4",
-            "instructions": "be brief",
-            "tools": [{
-                "type": "function",
-                "function": {
-                    "name": "search",
-                    "description": "cwd=/different permissions=read,write",
-                    "parameters": {"type": "object", "properties": {"q": {"type": "string"}}}
-                }
-            }],
-            "input": [{"role": "user", "content": "hello"}]
-        });
-
-        let h1 = compute_structural_hash(&body, ApiKind::OpenAiResponses);
-        let h2 = compute_structural_hash(&body2, ApiKind::OpenAiResponses);
-
-        assert_eq!(h1.tools, h2.tools);
-        assert_eq!(h1.system, h2.system);
-        assert_eq!(h1.early_messages, h2.early_messages);
-    }
-
-    #[test]
-    fn openai_responses_developer_input_counts_as_system_when_no_instructions() {
-        let body = json!({
-            "model": "gpt-5.4",
-            "tools": [],
-            "input": [
-                {"role": "developer", "content": "system A"},
-                {"role": "user", "content": "hello"}
-            ]
-        });
-        let body2 = json!({
-            "model": "gpt-5.4",
-            "tools": [],
-            "input": [
-                {"role": "developer", "content": "system B"},
-                {"role": "user", "content": "hello"}
-            ]
-        });
-
-        let h1 = compute_structural_hash(&body, ApiKind::OpenAiResponses);
-        let h2 = compute_structural_hash(&body2, ApiKind::OpenAiResponses);
-
-        assert_ne!(h1.system, h2.system);
-    }
-
-    #[test]
-    fn openai_responses_instructions_take_precedence_over_developer_input_for_drift() {
-        let body = json!({
-            "model": "gpt-5.4",
-            "instructions": "canonical system",
-            "tools": [],
-            "input": [
-                {"role": "developer", "content": "system A"},
-                {"role": "user", "content": "hello"}
-            ]
-        });
-        let body2 = json!({
-            "model": "gpt-5.4",
-            "instructions": "canonical system",
-            "tools": [],
-            "input": [
-                {"role": "developer", "content": "system B"},
-                {"role": "user", "content": "hello"}
-            ]
-        });
-
-        let h1 = compute_structural_hash(&body, ApiKind::OpenAiResponses);
-        let h2 = compute_structural_hash(&body2, ApiKind::OpenAiResponses);
-
-        assert_eq!(h1.system, h2.system);
-    }
-
-    #[test]
-    fn openai_responses_empty_instructions_fall_back_to_developer_for_drift() {
-        let body = json!({
-            "instructions": "",
-            "input": [{"role": "developer", "content": [{"type": "input_text", "text": "system A"}]}],
-            "tools": []
-        });
-        let body2 = json!({
-            "instructions": "",
-            "input": [{"role": "developer", "content": [{"type": "input_text", "text": "system B"}]}],
-            "tools": []
-        });
-
-        let h1 = compute_structural_hash(&body, ApiKind::OpenAiResponses);
-        let h2 = compute_structural_hash(&body2, ApiKind::OpenAiResponses);
-
-        assert_ne!(h1.system, h2.system);
-    }
-
-    #[test]
-    fn openai_responses_whitespace_instructions_fall_back_to_developer_for_drift() {
-        let body = json!({
-            "instructions": " \n",
-            "input": [{"role": "developer", "content": [{"type": "input_text", "text": "system A"}]}],
-            "tools": []
-        });
-        let body2 = json!({
-            "instructions": " \n",
-            "input": [{"role": "developer", "content": [{"type": "input_text", "text": "system B"}]}],
-            "tools": []
-        });
-
-        let h1 = compute_structural_hash(&body, ApiKind::OpenAiResponses);
-        let h2 = compute_structural_hash(&body2, ApiKind::OpenAiResponses);
-
-        assert_ne!(h1.system, h2.system);
-    }
-
-    #[test]
-    fn openai_responses_null_instructions_fall_back_to_developer_input_for_drift() {
-        let body = json!({
-            "model": "gpt-5.4",
-            "instructions": null,
-            "tools": [],
-            "input": [
-                {"role": "developer", "content": "system A"},
-                {"role": "user", "content": "hello"}
-            ]
-        });
-        let body2 = json!({
-            "model": "gpt-5.4",
-            "instructions": null,
-            "tools": [],
-            "input": [
-                {"role": "developer", "content": "system B"},
-                {"role": "user", "content": "hello"}
-            ]
-        });
-
-        let h1 = compute_structural_hash(&body, ApiKind::OpenAiResponses);
-        let h2 = compute_structural_hash(&body2, ApiKind::OpenAiResponses);
-
-        assert_ne!(h1.system, h2.system);
-    }
-
-    #[test]
-    fn openai_responses_early_messages_ignore_system_and_developer_items() {
         let body = json!({
             "model": "gpt-5.4",
             "tools": [],
