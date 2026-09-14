@@ -57,6 +57,14 @@
       "reasoning_levels": ["low", "high", "max"]
     },
     {
+      "id": "kimi-k2.8",
+      "reasoning_levels": ["low", "high", "max"]
+    },
+    {
+      "id": "kimi-k2.8-code",
+      "reasoning_levels": ["low", "high", "max"]
+    },
+    {
       "id": "doubao-seed-2-1-pro",
       "reasoning_levels": ["low", "medium", "high"]
     },

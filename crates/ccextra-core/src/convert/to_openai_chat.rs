@@ -33,7 +33,15 @@ pub fn convert_to_openai_chat(body: &mut Value, upstream_model: &str) -> Result<
     // thinking → reasoning_effort(忠实 thinking 映射;顶层 output_config 优先)
     // 先解析,能力矩阵按最终 effort 判定采样是否可发。
     let reasoning_effort = crate::thinking::resolve_effort_from_body(body)
-        .map(|effort| crate::thinking::clamp_effort(effort, upstream_model));
+        .map(|effort| {
+            // 对齐 CPA kimi ModeNone:直接走 disabled 形状,不过 clampLevel
+            // (clamp 会把 none 钳到最近支持级别,违背显式禁用语义)
+            if effort == "none" && is_kimi_upstream_model(upstream_model) {
+                effort
+            } else {
+                crate::thinking::clamp_effort(effort, upstream_model)
+            }
+        });
     let capabilities = openai_chat_capabilities(upstream_model, reasoning_effort.unwrap_or(""));
 
     // max_tokens 透传;o/GPT-5/Astra 改发 max_completion_tokens
@@ -74,7 +82,17 @@ pub fn convert_to_openai_chat(body: &mut Value, upstream_model: &str) -> Result<
     );
 
     if let Some(effort) = reasoning_effort {
-        openai.insert("reasoning_effort".into(), json!(effort));
+        if is_kimi_upstream_model(upstream_model) {
+            // 对齐 CPA kimi Applier:reasoning_effort 换写 thinking.type/effort
+            apply_kimi_thinking_shape(&mut openai, reasoning_effort);
+        } else {
+            openai.insert("reasoning_effort".into(), json!(effort));
+        }
+    }
+    // 对齐 CPA normalizeKimiTemperature:K2.8 禁用思考仅收 0.6,启用/默认仅收 1.0,
+    // 其余删 temperature 交上游默认,防 400(须在 thinking 写回之后)
+    if is_kimi_upstream_model(upstream_model) {
+        normalize_kimi_temperature(&mut openai);
     }
 
     let mut messages: Vec<Value> = Vec::new();
@@ -324,6 +342,57 @@ fn is_openai_model_snapshot(model_name: &str, base_model: &str) -> bool {
         return false;
     };
     rest.strip_prefix('-').is_some_and(is_date_only)
+}
+
+/// Kimi 上游识别(对齐 signature_provider_from_model_name 的 kimi 判定,
+/// 中转站常用 moonshot/k2 前缀命名)。
+fn is_kimi_upstream_model(model_name: &str) -> bool {
+    let lower = model_name.trim().to_ascii_lowercase();
+    lower.contains("kimi")
+        || lower.contains("moonshot")
+        || lower.starts_with("k2")
+        || lower.starts_with("k3")
+}
+
+/// Kimi thinking 写回(对齐 CPA internal/thinking/provider/kimi):
+/// enabled → 删 reasoning_effort、thinking.type="enabled" + thinking.effort;
+/// disabled → 删 thinking 对象与 reasoning_effort、thinking.type="disabled";
+/// 无 thinking(None/禁用)→ 原样。
+fn apply_kimi_thinking_shape(
+    openai: &mut serde_json::Map<String, Value>,
+    reasoning_effort: Option<&str>,
+) {
+    let Some(effort) = reasoning_effort else {
+        return;
+    };
+    openai.remove("reasoning_effort");
+    if effort == "none" {
+        openai.insert("thinking".into(), json!({"type": "disabled"}));
+    } else {
+        openai.insert(
+            "thinking".into(),
+            json!({"type": "enabled", "effort": effort}),
+        );
+    }
+}
+
+/// Kimi temperature 守卫(对齐 CPA normalizeKimiTemperature):
+/// 无 temperature 原样;thinking.type=disabled 仅收 0.6,否则删;
+/// 默认/enabled 仅收 1.0,否则删。
+fn normalize_kimi_temperature(openai: &mut serde_json::Map<String, Value>) {
+    let Some(temp) = openai.get("temperature").and_then(|v| v.as_f64()) else {
+        return;
+    };
+    let disabled = openai
+        .get("thinking")
+        .and_then(|t| t.get("type"))
+        .and_then(|v| v.as_str())
+        .map(|t| t.eq_ignore_ascii_case("disabled"))
+        .unwrap_or(false);
+    let keep = if disabled { temp == 0.6 } else { temp == 1.0 };
+    if !keep {
+        openai.remove("temperature");
+    }
 }
 
 fn is_date_only(s: &str) -> bool {
@@ -1801,5 +1870,89 @@ IMPORTANT: Assist with authorized security testing.
             .contains("<system-reminder>"));
         assert_eq!(msgs[4]["role"], "user");
         assert_eq!(msgs[4]["content"][0]["text"], "next instruction");
+    }
+
+    /// 对齐 CPA kimi Applier + normalizeKimiTemperature(8bd67f33):
+    /// enabled 写 thinking.type/effort,disabled 写 thinking.type=disabled,
+    /// 均删 reasoning_effort;temperature 按 thinking 形状守卫
+    #[test]
+    fn test_kimi_k28_thinking_shape_and_temperature_guard() {
+        // enabled + temperature=1.0:thinking.type=enabled + effort,temperature 保留
+        let mut body = json!({
+            "model": "kimi-k2.8",
+            "thinking": {"type": "enabled", "budget_tokens": 24576},
+            "temperature": 1.0,
+            "messages": [{"role": "user", "content": "hi"}],
+            "max_tokens": 100
+        });
+        convert_to_openai_chat(&mut body, "kimi-k2.8").unwrap();
+        assert_eq!(body["reasoning_effort"], Value::Null);
+        assert_eq!(body["thinking"]["type"], "enabled");
+        assert_eq!(body["thinking"]["effort"], "high");
+        assert_eq!(body["temperature"], 1.0);
+
+        // enabled + temperature=0.6:守卫删除;budget 8192 → medium 后钳到
+        // K2.8 levels [low,high,max],low/high 并列 tie-break 取低(对齐 clampLevel)
+        let mut body = json!({
+            "model": "kimi-k2.8",
+            "thinking": {"type": "enabled", "budget_tokens": 8192},
+            "temperature": 0.6,
+            "messages": [{"role": "user", "content": "hi"}]
+        });
+        convert_to_openai_chat(&mut body, "kimi-k2.8").unwrap();
+        assert_eq!(body["temperature"], Value::Null);
+        assert_eq!(body["thinking"]["effort"], "low");
+    }
+
+    #[test]
+    fn test_kimi_k28_disabled_thinking_and_temperature() {
+        // disabled + temperature=0.6:thinking.type=disabled,temperature 保留
+        let mut body = json!({
+            "model": "kimi-k2.8",
+            "thinking": {"type": "disabled"},
+            "temperature": 0.6,
+            "messages": [{"role": "user", "content": "hi"}]
+        });
+        convert_to_openai_chat(&mut body, "kimi-k2.8-code").unwrap();
+        assert_eq!(body["reasoning_effort"], Value::Null);
+        assert_eq!(body["thinking"]["type"], "disabled");
+        assert!(body["thinking"].get("effort").is_none());
+        assert_eq!(body["temperature"], 0.6);
+
+        // disabled + temperature=0.7:删除
+        let mut body = json!({
+            "model": "kimi-k2.8",
+            "thinking": {"type": "disabled"},
+            "temperature": 0.7,
+            "messages": [{"role": "user", "content": "hi"}]
+        });
+        convert_to_openai_chat(&mut body, "kimi-k2.8").unwrap();
+        assert_eq!(body["temperature"], Value::Null);
+    }
+
+    #[test]
+    fn test_kimi_k28_xhigh_clamp_and_non_kimi_unchanged() {
+        // budget 100000 → xhigh,钳到 K2.8 levels [low,high,max] 得 high
+        // (对齐 CPA clampLevel 最近距离);无 temperature:守卫不注入不删除
+        let mut body = json!({
+            "model": "kimi-k2.8",
+            "thinking": {"type": "enabled", "budget_tokens": 100000},
+            "messages": [{"role": "user", "content": "hi"}]
+        });
+        convert_to_openai_chat(&mut body, "kimi-k2.8").unwrap();
+        assert_eq!(body["thinking"]["effort"], "high");
+        assert!(body.get("temperature").is_none());
+
+        // 非 kimi 模型行为不变:reasoning_effort 照发,无 thinking 对象
+        let mut body = json!({
+            "model": "glm-5.1",
+            "thinking": {"type": "enabled", "budget_tokens": 8192},
+            "temperature": 0.6,
+            "messages": [{"role": "user", "content": "hi"}]
+        });
+        convert_to_openai_chat(&mut body, "glm-5.1").unwrap();
+        assert_eq!(body["reasoning_effort"], "medium");
+        assert!(body.get("thinking").is_none());
+        assert_eq!(body["temperature"], 0.6);
     }
 }
