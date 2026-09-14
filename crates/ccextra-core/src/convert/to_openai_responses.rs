@@ -1279,8 +1279,18 @@ pub fn convert_to_openai_responses(
             // web search 工具特殊映射(对齐 convertClaudeWebSearchToolToCodex)
             if super::is_web_search_tool_type(tool_type) {
                 let mut ws = json!({"type": "web_search"});
+                // 对齐 grok-build xai-grok-sampling-types tool_overrides::to_tool_entry:
+                // xAI filters 域过滤键为 excluded_domains(OpenAI 官方为 blocked_domains);
+                // 两者互斥,并存时按 allowed 优先(与上游 validate 报错一致)
                 if let Some(domains) = tool.get("allowed_domains").and_then(|v| v.as_array()) {
                     ws["filters"] = json!({"allowed_domains": domains});
+                } else if let Some(domains) = tool.get("blocked_domains").and_then(|v| v.as_array()) {
+                    let key = if is_grok_upstream(upstream_model) {
+                        "excluded_domains"
+                    } else {
+                        "blocked_domains"
+                    };
+                    ws["filters"] = json!({key: domains});
                 }
                 if let Some(loc) = tool.get("user_location") {
                     if loc.is_object() {
@@ -3066,6 +3076,40 @@ Be verbose.
         });
         convert_to_openai_responses(&mut body, "test-model").unwrap();
         assert_eq!(body["tool_choice"]["type"], "web_search");
+    }
+
+    /// 对齐 grok-build tool_overrides:xAI filters 用 excluded_domains,
+    /// OpenAI 用 blocked_domains;allowed 与 blocked 并存按 allowed 优先
+    #[test]
+    fn test_web_search_blocked_domains_mapping() {
+        let mut body = json!({
+            "model": "test",
+            "messages": [],
+            "tools": [{"type": "web_search_20250305", "name": "web",
+                        "blocked_domains": ["a.com", "b.com"]}]
+        });
+        convert_to_openai_responses(&mut body, "grok-4.6").unwrap();
+        assert_eq!(body["tools"][0]["filters"]["excluded_domains"][0], "a.com");
+
+        let mut body = json!({
+            "model": "test",
+            "messages": [],
+            "tools": [{"type": "web_search_20250305", "name": "web",
+                        "blocked_domains": ["a.com"]}]
+        });
+        convert_to_openai_responses(&mut body, "gpt-5.6-terra").unwrap();
+        assert_eq!(body["tools"][0]["filters"]["blocked_domains"][0], "a.com");
+
+        // 并存:allowed 优先,不产出 excluded/blocked
+        let mut body = json!({
+            "model": "test",
+            "messages": [],
+            "tools": [{"type": "web_search_20250305", "name": "web",
+                        "allowed_domains": ["x.com"], "blocked_domains": ["a.com"]}]
+        });
+        convert_to_openai_responses(&mut body, "grok-4.6").unwrap();
+        assert_eq!(body["tools"][0]["filters"]["allowed_domains"][0], "x.com");
+        assert!(body["tools"][0]["filters"].get("excluded_domains").is_none());
     }
 
     #[test]
