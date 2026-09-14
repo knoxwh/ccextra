@@ -21,6 +21,9 @@ use std::collections::{HashMap, HashSet};
 
 use serde_json::{json, Value};
 
+use super::has_unsupported_unicode_property_escape;
+use super::{SCHEMA_MAP_KEYWORDS, SCHEMA_VALUE_KEYWORDS};
+
 use super::gemini_schema::inline_local_refs;
 use super::shorten::{build_short_name_map, shorten_name_if_needed};
 use super::signature::{
@@ -600,16 +603,19 @@ fn normalize_tool_parameters(schema: &Value) -> Value {
             &inlined_owned
         }
     };
+    // 对齐 CPA 7fac6b15:递归删除 $schema/$id dialect 关键字
+    let mut s = schema.clone();
+    strip_dialect_keywords_from_schema(&mut s);
+
     // xAI 系上游(对齐 CPA normalizeXAIObjectRootUnionBranchTypes +
     // xaiFunctionParametersNeedSimplification):root 为 object 且带 root union 时,
     // 先补缺失 type,仍非 object-only → 整体简化,宁可工具参数不可用也不让请求被拒。
     // root 非 object 的 schema 不处理直透(对齐 CPA root 检查)。
-    if schema.get("type").and_then(|v| v.as_str()) == Some("object")
+    if s.get("type").and_then(|v| v.as_str()) == Some("object")
         && ["anyOf", "oneOf"]
             .iter()
-            .any(|k| schema.get(*k).is_some_and(|v| v.is_array()))
+            .any(|k| s.get(*k).is_some_and(|v| v.is_array()))
     {
-        let mut s = schema.clone();
         // 先补缺失 type(基于补后数据判定,对齐 CPA 先 normalize 后 needSimplification)
         for union_key in ["anyOf", "oneOf"] {
             let Some(Value::Array(arr)) = s.get_mut(union_key) else {
@@ -637,17 +643,85 @@ fn normalize_tool_parameters(schema: &Value) -> Value {
         }
         return s;
     }
-    let mut s = schema.clone();
-    let s_type = s.get("type").and_then(|v| v.as_str()).unwrap_or("");
-    if s_type.is_empty() {
-        s["type"] = json!("object");
-    }
-    if s.get("type").and_then(|v| v.as_str()) == Some("object")
-        && s.get("properties").map_or(true, |v| !v.is_object())
-    {
+    // 对齐 CPA 7fac6b15:type 可为字符串或数组(union ["object","null"]);
+    // 数组含 "object" 时保留原数组仅补 properties,不得覆盖成字符串
+    let type_is_object = match s.get("type") {
+        None | Some(Value::Null) => {
+            s["type"] = json!("object");
+            true
+        }
+        Some(Value::String(t)) if t.is_empty() => {
+            s["type"] = json!("object");
+            true
+        }
+        Some(Value::String(t)) => t == "object",
+        Some(Value::Array(arr)) => arr.iter().any(|e| e.as_str() == Some("object")),
+        _ => false,
+    };
+    if type_is_object && s.get("properties").map_or(true, |v| !v.is_object()) {
         s["properties"] = json!({});
     }
     s
+}
+
+/// 递归删除 $schema/$id dialect 关键字(对齐 CPA 7fac6b15 stripDialectKeywordsFromSchema),
+/// 并剥离含 \p{...}/\P{...} 的 pattern(对齐 CPA e56abd56)
+fn strip_dialect_keywords_from_schema(v: &mut Value) {
+    match v {
+        Value::Object(map) => {
+            map.remove("$schema");
+            map.remove("$id");
+
+            // 对齐 CPA e56abd56:Python re 编译失败的 pattern 直接删
+            if let Some(Value::String(p)) = map.get("pattern") {
+                if has_unsupported_unicode_property_escape(p) {
+                    map.shift_remove("pattern");
+                }
+            }
+
+            // 对齐 CPA 37ce368c:patternProperties 正则键含 \p{...} 时整键删除
+            if let Some(Value::Object(pat_props)) = map.get_mut("patternProperties") {
+                let bad_keys: Vec<String> = pat_props
+                    .keys()
+                    .filter(|k| has_unsupported_unicode_property_escape(k))
+                    .cloned()
+                    .collect();
+                for k in bad_keys {
+                    pat_props.shift_remove(&k);
+                }
+            }
+
+            // 对齐 CPA codexSchemaMapKeywords(即 SCHEMA_MAP_KEYWORDS)
+            for map_key in SCHEMA_MAP_KEYWORDS {
+                if let Some(Value::Object(sub_map)) = map.get_mut(*map_key) {
+                    for sub_schema in sub_map.values_mut() {
+                        strip_dialect_keywords_from_schema(sub_schema);
+                    }
+                }
+            }
+
+            // 对齐 CPA codexSchemaValueKeywords(即 SCHEMA_VALUE_KEYWORDS)
+            for val_key in SCHEMA_VALUE_KEYWORDS {
+                if let Some(val) = map.get_mut(*val_key) {
+                    match val {
+                        Value::Object(_) => strip_dialect_keywords_from_schema(val),
+                        Value::Array(arr) => {
+                            for item in arr {
+                                strip_dialect_keywords_from_schema(item);
+                            }
+                        }
+                        _ => {}
+                    }
+                }
+            }
+        }
+        Value::Array(arr) => {
+            for item in arr {
+                strip_dialect_keywords_from_schema(item);
+            }
+        }
+        _ => {}
+    }
 }
 
 /// 纯 const union → enum(对齐 CPA helps/codex_tool_schema.go NormalizeCodexToolSchemas)
@@ -1456,36 +1530,8 @@ fn shorten_call_id(id: &str) -> String {
     format!("{}{}", &id[..prefix_len], suffix)
 }
 
-/// JSON Schema 关键字:其值为 subschemas 的 map
-const CODEX_SCHEMA_MAP_KEYWORDS: [&str; 6] = [
-    "properties",
-    "$defs",
-    "definitions",
-    "patternProperties",
-    "dependentSchemas",
-    "dependencies",
-];
-
-/// JSON Schema 关键字:其值为单个 nested schema 或 schema 列表
-const CODEX_SCHEMA_VALUE_KEYWORDS: [&str; 16] = [
-    "items",
-    "prefixItems",
-    "contains",
-    "additionalProperties",
-    "propertyNames",
-    "unevaluatedProperties",
-    "unevaluatedItems",
-    "additionalItems",
-    "contentSchema",
-    "anyOf",
-    "oneOf",
-    "allOf",
-    "not",
-    "if",
-    "then",
-    "else",
-];
-
+/// JSON Schema 关键字表已统一到 mod.rs(SCHEMA_MAP_KEYWORDS / SCHEMA_VALUE_KEYWORDS,
+/// 对齐 CPA e56abd56 util 导出)
 /// 递归检查 JSON Schema 是否有 declared property 遗漏在 sibling required 列表中
 /// (对齐 CPA codexSchemaMissesRequired)
 fn codex_schema_misses_required(schema: &Value) -> bool {
@@ -1515,7 +1561,7 @@ fn codex_schema_misses_required(schema: &Value) -> bool {
         }
     }
 
-    for &keyword in &CODEX_SCHEMA_MAP_KEYWORDS {
+    for &keyword in SCHEMA_MAP_KEYWORDS {
         if let Some(Value::Object(children)) = map.get(keyword) {
             for child in children.values() {
                 if codex_schema_misses_required(child) {
@@ -1525,7 +1571,7 @@ fn codex_schema_misses_required(schema: &Value) -> bool {
         }
     }
 
-    for &keyword in &CODEX_SCHEMA_VALUE_KEYWORDS {
+    for &keyword in SCHEMA_VALUE_KEYWORDS {
         if let Some(child) = map.get(keyword) {
             if codex_schema_misses_required(child) {
                 return true;
@@ -2309,8 +2355,7 @@ mod tests {
             let mut body = case.body.clone();
             convert_to_openai_responses(&mut body, "gpt-6-astra").unwrap();
             assert_eq!(
-                body["reasoning"]["effort"],
-                case.expected_effort,
+                body["reasoning"]["effort"], case.expected_effort,
                 "Failed at case: {}",
                 case.name
             );
@@ -3421,5 +3466,59 @@ Be verbose.
         assert_eq!(input[5]["type"], "message");
         assert_eq!(input[5]["role"], "user");
         assert_eq!(input[5]["content"][0]["text"], "next instruction");
+    }
+
+    #[test]
+    fn test_strip_dialect_keywords_from_tool_schema() {
+        // 对齐 CPA 7fac6b15:递归删除 $schema/$id
+        let mut body = json!({
+            "model": "test",
+            "messages": [{"role": "user", "content": "hi"}],
+            "tools": [{
+                "name": "example",
+                "input_schema": {
+                    "$schema": "http://json-schema.org/draft-07/schema#",
+                    "$id": "https://example.com/schema",
+                    "type": "object",
+                    "properties": {
+                        "nested": {
+                            "$schema": "http://json-schema.org/draft-07/schema#",
+                            "type": "string"
+                        }
+                    },
+                    "anyOf": [{
+                        "$id": "branch1",
+                        "type": "object"
+                    }]
+                }
+            }]
+        });
+        convert_to_openai_responses(&mut body, "test-model").unwrap();
+        let params = &body["tools"][0]["parameters"];
+        assert!(params.get("$schema").is_none());
+        assert!(params.get("$id").is_none());
+        assert!(params["properties"]["nested"].get("$schema").is_none());
+        assert!(params["anyOf"][0].get("$id").is_none());
+    }
+
+    #[test]
+    fn test_tool_schema_union_type_array_keeps_properties() {
+        // 对齐 CPA 7fac6b15:type 数组 ["object","null"] 保留,仅补 properties
+        let mut body = json!({
+            "model": "test",
+            "messages": [{"role": "user", "content": "hi"}],
+            "tools": [
+                {"name": "u", "input_schema": {"type": ["object", "null"]}},
+                {"name": "s", "input_schema": {"type": "string"}}
+            ]
+        });
+        convert_to_openai_responses(&mut body, "test-model").unwrap();
+        let union = &body["tools"][0]["parameters"];
+        assert_eq!(union["type"], json!(["object", "null"]));
+        assert_eq!(union["properties"], json!({}));
+        // 字符串 type 非 object:type 原样,不补 properties
+        let scalar = &body["tools"][1]["parameters"];
+        assert_eq!(scalar["type"], "string");
+        assert!(scalar.get("properties").is_none());
     }
 }

@@ -217,10 +217,10 @@ pub fn responses_to_anthropic(
 
     // usage:cached 从 input 扣,cache_write 映射为 cache_creation_input_tokens
     // (对齐 extractResponsesUsage / CPA 893abbab)
-    let (input_tokens, output_tokens, cached, cache_write) = response
+    let (input_tokens, output_tokens, cached, cache_write, thinking_tokens) = response
         .get("usage")
         .map(super::extract_usage_responses)
-        .unwrap_or((0, 0, 0, 0));
+        .unwrap_or((0, 0, 0, 0, -1));
 
     let stop_reason = map_stop_reason(&codex_stop_reason(response), has_tool_use);
     let stop_seq = stop_sequence(response);
@@ -233,6 +233,7 @@ pub fn responses_to_anthropic(
         output_tokens,
         cached,
         cache_write,
+        thinking_tokens,
     )
 }
 
@@ -381,7 +382,8 @@ pub fn openai_chat_to_anthropic(body: &Value) -> Option<Value> {
         input_tokens,
         output_tokens,
         cached,
-        0, // chat 路径不透传 cache_write(对齐 CPA:仅 responses 转换映射)
+        0,  // chat 路径不透传 cache_write(对齐 CPA:仅 responses 转换映射)
+        -1, // chat 路径无 thinking_tokens
     )
 }
 
@@ -396,6 +398,7 @@ fn build_message(
     output_tokens: i64,
     cached: i64,
     cache_write: i64,
+    thinking_tokens: i64,
 ) -> Option<Value> {
     let mut out = json!({
         "id": source.get("id").and_then(|v| v.as_str()).unwrap_or(""),
@@ -412,6 +415,10 @@ fn build_message(
     }
     if cache_write > 0 {
         out["usage"]["cache_creation_input_tokens"] = json!(cache_write);
+    }
+    // 对齐 CPA e365ab0c:thinking_tokens ≥ 0 时写入
+    if thinking_tokens >= 0 {
+        out["usage"]["output_tokens_details"] = json!({"thinking_tokens": thinking_tokens});
     }
     Some(out)
 }

@@ -1165,10 +1165,10 @@ impl ResponsesRelay {
 
         // usage(对齐 extractResponsesUsage:cached 从 input 扣除;cache_write
         // 映射为 cache_creation_input_tokens,对齐 CPA 893abbab)
-        let (input_tokens, output_tokens, cached, cache_write) = response
+        let (input_tokens, output_tokens, cached, cache_write, thinking_tokens) = response
             .and_then(|r| r.get("usage"))
             .map(super::extract_usage_responses)
-            .unwrap_or((0, 0, 0, 0));
+            .unwrap_or((0, 0, 0, 0, -1));
 
         let stop_seq = response.and_then(stop_sequence);
         let raw_reason = response.map(codex_stop_reason).unwrap_or_default();
@@ -1181,6 +1181,7 @@ impl ResponsesRelay {
             output_tokens,
             cached,
             cache_write,
+            thinking_tokens,
         ));
         out.push(emit::message_stop());
         out

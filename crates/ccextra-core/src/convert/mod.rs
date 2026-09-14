@@ -104,9 +104,49 @@ pub fn normalize_object_schema_properties(schema: serde_json::Value) -> serde_js
             if is_object_type && !map.contains_key("properties") {
                 map.insert("properties".into(), serde_json::json!({}));
             }
-            for (_, v) in map.iter_mut() {
-                let taken = std::mem::take(v);
-                *v = normalize_object_schema_properties(taken);
+            // 对齐 CPA e56abd56:剥离含 \p{...}/\P{...} 的 pattern
+            // (Python re 编译报 bad escape \p,上游 schema 校验失败)
+            if let Some(Value::String(p)) = map.get("pattern") {
+                if has_unsupported_unicode_property_escape(p) {
+                    map.shift_remove("pattern");
+                }
+            }
+            // 对齐 CPA 37ce368c:patternProperties 正则键含 \p{...} 时整键删除
+            if let Some(Value::Object(pat_props)) = map.get_mut("patternProperties") {
+                let bad_keys: Vec<String> = pat_props
+                    .keys()
+                    .filter(|k| has_unsupported_unicode_property_escape(k))
+                    .cloned()
+                    .collect();
+                for k in bad_keys {
+                    pat_props.shift_remove(&k);
+                }
+            }
+            // 仅沿 schema 关键字递归,避免误删用户数据中的 pattern 键
+            for map_key in SCHEMA_MAP_KEYWORDS {
+                if let Some(Value::Object(sub_map)) = map.get_mut(*map_key) {
+                    for v in sub_map.values_mut() {
+                        let taken = std::mem::take(v);
+                        *v = normalize_object_schema_properties(taken);
+                    }
+                }
+            }
+            for val_key in SCHEMA_VALUE_KEYWORDS {
+                if let Some(val) = map.get_mut(*val_key) {
+                    match val {
+                        Value::Object(_) => {
+                            let taken = std::mem::take(val);
+                            *val = normalize_object_schema_properties(taken);
+                        }
+                        Value::Array(arr) => {
+                            for item in arr.iter_mut() {
+                                let taken = std::mem::take(item);
+                                *item = normalize_object_schema_properties(taken);
+                            }
+                        }
+                        _ => {}
+                    }
+                }
             }
             Value::Object(map)
         }
@@ -119,6 +159,54 @@ pub fn normalize_object_schema_properties(schema: serde_json::Value) -> serde_js
         other => other,
     }
 }
+
+/// 对齐 CPA util.HasUnsupportedUnicodePropertyEscape:检测未转义的
+/// \p{...}/\P{...}(Python re 编译失败)。跳过被反斜杠转义的字符。
+pub fn has_unsupported_unicode_property_escape(pattern: &str) -> bool {
+    let b = pattern.as_bytes();
+    let mut i = 0;
+    while i < b.len() {
+        if b[i] != b'\\' {
+            i += 1;
+            continue;
+        }
+        if i + 2 < b.len() && (b[i + 1] == b'p' || b[i + 1] == b'P') && b[i + 2] == b'{' {
+            return true;
+        }
+        i += 2; // 跳过反斜杠与其后一个字符
+    }
+    false
+}
+
+/// 对齐 CPA util.SchemaMapKeywords:值为 subschema 映射的关键字
+pub const SCHEMA_MAP_KEYWORDS: &[&str] = &[
+    "properties",
+    "$defs",
+    "definitions",
+    "patternProperties",
+    "dependentSchemas",
+    "dependencies",
+];
+
+/// 对齐 CPA util.SchemaValueKeywords:值为单个 subschema 或数组的关键字
+pub const SCHEMA_VALUE_KEYWORDS: &[&str] = &[
+    "items",
+    "prefixItems",
+    "contains",
+    "additionalProperties",
+    "propertyNames",
+    "unevaluatedProperties",
+    "unevaluatedItems",
+    "additionalItems",
+    "contentSchema",
+    "anyOf",
+    "oneOf",
+    "allOf",
+    "not",
+    "if",
+    "then",
+    "else",
+];
 
 #[derive(Debug, Error)]
 pub enum ConvertError {
@@ -133,3 +221,86 @@ pub enum ConvertError {
 }
 
 pub type Result<T> = std::result::Result<T, ConvertError>;
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn test_has_unsupported_unicode_property_escape() {
+        // 对齐 CPA e56abd56 测试矩阵
+        assert!(has_unsupported_unicode_property_escape(r"\p{L}"));
+        assert!(has_unsupported_unicode_property_escape(r"\P{L}"));
+        assert!(has_unsupported_unicode_property_escape("a\\p{Han}b"));
+        // 双反斜杠后跟 p{ 是字面量,不算
+        assert!(!has_unsupported_unicode_property_escape(r"\\p{L}"));
+        // 无花括号的 \p 不算
+        assert!(!has_unsupported_unicode_property_escape(r"\pL"));
+        assert!(!has_unsupported_unicode_property_escape(r"^\d{4}-\d{2}$"));
+    }
+
+    #[test]
+    fn test_normalize_object_schema_properties_strips_bad_patterns() {
+        // \p{...} pattern 被剥离,普通 pattern 保留
+        let schema: serde_json::Value = serde_json::from_str(
+            r#"{
+                "type": "object",
+                "properties": {
+                    "a": {"type": "string", "pattern": "\\p{Han}+"},
+                    "b": {"type": "string", "pattern": "^\\d+$"}
+                },
+                "anyOf": [{"type": "string", "pattern": "\\P{L}"}]
+            }"#,
+        )
+        .unwrap();
+        let out = normalize_object_schema_properties(schema);
+        assert!(out["properties"]["a"].get("pattern").is_none());
+        assert_eq!(out["properties"]["b"]["pattern"], r"^\d+$");
+        assert!(out["anyOf"][0].get("pattern").is_none());
+    }
+
+    #[test]
+    fn test_normalize_object_schema_properties_strips_bad_pattern_property_keys() {
+        // 对齐 CPA 37ce368c:patternProperties 正则键含 \p{...} 时整键删除
+        let schema: serde_json::Value = serde_json::from_str(
+            r#"{
+                "type": "object",
+                "patternProperties": {
+                    "^\\p{Han}$": {"type": "string"},
+                    "^[a-z]+$": {"type": "string"}
+                }
+            }"#,
+        )
+        .unwrap();
+        let out = normalize_object_schema_properties(schema);
+        let props = out["patternProperties"].as_object().unwrap();
+        assert_eq!(props.len(), 1, "只应保留合法键: {props:?}");
+        assert!(props.contains_key("^[a-z]+$"));
+    }
+
+    #[test]
+    fn test_normalize_object_schema_properties_preserves_user_data() {
+        // schema-aware:仅沿 schema 关键字递归,非关键字下的 pattern 键保留
+        let schema: serde_json::Value = serde_json::from_str(
+            r#"{
+                "type": "object",
+                "properties": {
+                    "cfg": {
+                        "type": "object",
+                        "description": "use \\p{L} to match letters",
+                        "default": {"pattern": "\\p{L}"}
+                    }
+                }
+            }"#,
+        )
+        .unwrap();
+        let out = normalize_object_schema_properties(schema);
+        assert_eq!(out["properties"]["cfg"]["default"]["pattern"], r"\p{L}");
+        // properties 缺省补空 object 仍生效
+        let bare = normalize_object_schema_properties(
+            serde_json::json!({"type": "object", "pattern": "\\p{L}"}),
+        );
+        assert!(bare.get("pattern").is_none());
+        assert!(bare["properties"].is_object());
+    }
+}

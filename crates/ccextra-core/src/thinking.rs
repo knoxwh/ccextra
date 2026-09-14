@@ -430,11 +430,7 @@ mod tests {
                 reasoning_levels: vec!["low".into(), "high".into(), "max".into()],
             },
             ModelCapability {
-                id: "gemini-3.7-flash-medium".into(),
-                reasoning_levels: vec!["medium".into()],
-            },
-            ModelCapability {
-                id: "gemini-3.7-flash-high".into(),
+                id: "gemini-3.8-flash-high".into(),
                 reasoning_levels: vec!["high".into()],
             },
         ]
@@ -506,19 +502,11 @@ mod tests {
     fn test_clamp_effort_registry_gemini_flash_sku() {
         let reg = mock_registry();
         assert_eq!(
-            clamp_effort_with_registry("max", "gemini-3.7-flash-medium", &reg),
-            "medium"
-        );
-        assert_eq!(
-            clamp_effort_with_registry("high", "gemini-3.7-flash-medium", &reg),
-            "medium"
-        );
-        assert_eq!(
-            clamp_effort_with_registry("max", "gemini-3.7-flash-high", &reg),
+            clamp_effort_with_registry("max", "gemini-3.8-flash-high", &reg),
             "high"
         );
         assert_eq!(
-            clamp_effort_with_registry("medium", "gemini-3.7-flash-high", &reg),
+            clamp_effort_with_registry("medium", "gemini-3.8-flash-high", &reg),
             "high"
         );
     }

@@ -107,7 +107,7 @@ fn parse_models(body: &Value) -> Result<Vec<ModelConfig>> {
             .and_then(|v| v.as_str())
             .unwrap_or(model_id);
 
-        // Antigravity 直接使用模型 ID（如 gemini-3.7-flash-medium）
+        // Antigravity 直接使用模型 ID（如 gemini-3.8-flash-medium）
         // 不使用 model 字段的内部占位符（如 MODEL_PLACEHOLDER_M299）
         let max_input_tokens = model_data
             .get("maxTokens")
@@ -143,8 +143,8 @@ mod tests {
     fn test_parse_models_filters_defunct_models() {
         let body = json!({
             "models": {
-                "gemini-3.7-flash-high": {
-                    "displayName": "Gemini 3.7 Flash High",
+                "gemini-3.8-flash-high": {
+                    "displayName": "Gemini 3.8 Flash High",
                     "maxTokens": 1000000,
                     "maxOutputTokens": 65536
                 },
@@ -172,7 +172,7 @@ mod tests {
         assert_eq!(models.len(), 2);
 
         let names: Vec<&str> = models.iter().map(|m| m.name.as_str()).collect();
-        assert!(names.contains(&"gemini-3.7-flash-high"));
+        assert!(names.contains(&"gemini-3.8-flash-high"));
         assert!(names.contains(&"claude-opus-4-6-thinking"));
         assert!(!names.contains(&"gemini-3-flash-agent"));
         assert!(!names.contains(&"gemini-3.5-flash-low"));

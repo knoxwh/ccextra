@@ -659,7 +659,10 @@ mod tests {
                 case.name
             );
             if let Some(loc) = case.expect_slot3_location {
-                let pointer = format!("/{}", loc.replace("[", "/").replace("]", "").replace(".", "/"));
+                let pointer = format!(
+                    "/{}",
+                    loc.replace("[", "/").replace("]", "").replace(".", "/")
+                );
                 assert_eq!(
                     body.pointer(&format!("{}/cache_control", pointer)),
                     Some(&json!({"type": "ephemeral"})),
@@ -729,7 +732,11 @@ mod tests {
                 outcome,
                 AutoPlaceOutcome::Applied {
                     placed_count: case.expect_placed,
-                    locations: case.expect_locations.iter().map(|s| s.to_string()).collect(),
+                    locations: case
+                        .expect_locations
+                        .iter()
+                        .map(|s| s.to_string())
+                        .collect(),
                 },
                 "Failed at case: {}",
                 case.name
@@ -969,5 +976,4 @@ mod tests {
              schema property keys do not count as markers",
         );
     }
-
 }

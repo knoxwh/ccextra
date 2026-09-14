@@ -3,7 +3,9 @@
 // 采用"单 active block"模型(相比三独立 flag 更简洁):
 // - 任意时刻只有一个 active block(text 或 thinking),切换类型时先 close 再开
 // - tool 调用独立 pending map,不占 active block,完工时 flush 完整 input_json
-// - finish 时统一 finalize(close 全部 + message_delta + message_stop)
+// - 对齐 CPA ef99119e:tool 块开启未收尾期间到达的 text/thinking 进缓冲,
+//   收尾后按独立块冲刷,保证 Anthropic 内容块严格顺序
+// - finish 时统一 finalize(close 全部 + 刷缓冲 + message_delta + message_stop)
 //
 // 核心难点:工具调用 index 一致。OpenAI 的 tool_calls[N] 用 index 标识,
 // Anthropic 的 content_block 用连续 index 分配。两者需映射。
@@ -54,6 +56,10 @@ struct ChatRelay {
     // 待发 tool calls(按 OpenAI index 索引)
     tool_calls: HashMap<usize, ToolCall>,
     saw_tool_call: bool,
+    // 对齐 CPA ef99119e:当前开启未收尾的 tool 块(有 start 无 stop)
+    open_tool_index: Option<usize>,
+    // tool 块开启期间到达的 text/thinking,收尾后按独立块冲刷
+    interleaved: Vec<(BlockType, String)>,
 
     // usage
     usage_seen: bool,
@@ -82,6 +88,8 @@ impl ChatRelay {
             next_block_index: 0,
             tool_calls: HashMap::new(),
             saw_tool_call: false,
+            open_tool_index: None,
+            interleaved: Vec::new(),
             usage_seen: false,
             usage_input: 0,
             usage_output: 0,
@@ -246,6 +254,8 @@ impl ChatRelay {
             self.close_active_block(&mut frames);
         }
         self.flush_pending_tool_calls(&mut frames);
+        // 对齐 CPA ef99119e:工具块全部收尾后,刷缓冲的交错内容
+        self.flush_interleaved(&mut frames);
 
         frames.push(emit::message_delta(
             map_finish_reason(&self.finish_reason),
@@ -253,7 +263,8 @@ impl ChatRelay {
             self.usage_input,
             self.usage_output,
             self.usage_cached,
-            0, // chat 路径不透传 cache_write(对齐 CPA:仅 responses 转换映射)
+            0,  // chat 路径不透传 cache_write(对齐 CPA:仅 responses 转换映射)
+            -1, // chat 路径无 thinking_tokens
         ));
         frames.push(emit::message_stop());
 
@@ -299,6 +310,12 @@ impl ChatRelay {
 
     /// 发 content_block_delta,自动开块(切换类型先 close 当前)
     fn emit_content_delta(&mut self, block_type: BlockType, content: &str) -> Vec<Bytes> {
+        // 对齐 CPA ef99119e:tool 块开启未收尾时,交错 text/thinking 进缓冲,
+        // 保持 Anthropic 内容块严格顺序
+        if self.open_tool_index.is_some() {
+            self.buffer_interleaved(block_type, content);
+            return Vec::new();
+        }
         // 发新内容前关掉待发 tool calls(它们不占 active block)
         let mut frames = self.close_pending_tool_calls();
         frames.extend(self.ensure_block(block_type));
@@ -413,6 +430,7 @@ impl ChatRelay {
         self.next_block_index += 1;
         call.started = true;
         self.saw_tool_call = true;
+        self.open_tool_index = Some(openai_index);
     }
 
     /// 发一条 tool_use 的 content_block_start 帧(幂等)
@@ -465,6 +483,39 @@ impl ChatRelay {
         }
     }
 
+    /// 缓冲交错内容(对齐 InterleavedContentChunks:同类型尾部合并)
+    fn buffer_interleaved(&mut self, block_type: BlockType, text: &str) {
+        if let Some((bt, buf)) = self.interleaved.last_mut() {
+            if *bt == block_type {
+                buf.push_str(text);
+                return;
+            }
+        }
+        self.interleaved.push((block_type, text.to_string()));
+    }
+
+    /// 刷缓冲交错内容(对齐 emitBufferedInterleavedContent):每段独立
+    /// start→delta→stop,在全部工具块收尾后调用
+    fn flush_interleaved(&mut self, frames: &mut Vec<Bytes>) {
+        let chunks = std::mem::take(&mut self.interleaved);
+        for (block_type, text) in chunks {
+            if text.is_empty() {
+                continue;
+            }
+            let index = self.next_block_index;
+            self.next_block_index += 1;
+            frames.push(match block_type {
+                BlockType::Text => emit::content_block_start_text(index),
+                BlockType::Thinking => emit::content_block_start_thinking(index),
+            });
+            frames.push(match block_type {
+                BlockType::Text => emit::content_block_delta_text(index, &text),
+                BlockType::Thinking => emit::content_block_delta_thinking(index, &text),
+            });
+            frames.push(emit::content_block_stop(index));
+        }
+    }
+
     /// 关闭待发 tool calls(发新 text/thinking 前调用)
     fn close_pending_tool_calls(&mut self) -> Vec<Bytes> {
         let mut frames = Vec::new();
@@ -492,6 +543,9 @@ impl ChatRelay {
             }
             frames.push(emit::content_block_stop(block_index));
             self.tool_calls.get_mut(&index).unwrap().closed = true;
+            if self.open_tool_index == Some(index) {
+                self.open_tool_index = None;
+            }
         }
         frames
     }
@@ -737,6 +791,46 @@ mod tests {
             .any(|b| b.starts_with(b"event: content_block_stop")));
         assert!(out2.iter().any(|b| b.starts_with(b"event: message_delta")));
         assert!(out2.iter().any(|b| b.starts_with(b"event: message_stop")));
+    }
+
+    #[test]
+    fn test_interleaved_text_while_tool_open_buffers_until_close() {
+        // 对齐 CPA ef99119e:tool 块开启未收尾时到达的 text 不得插出交错块;
+        // 缓冲在工具收尾后按独立 start→delta→stop 冲刷
+        let mut r = ChatRelay::new(None);
+        // tool_calls 完整到达(start 帧延迟到收尾,但块进入开启态)
+        let out1 = r.process(&super::super::parser::SseEvent {
+            event: Some("c".into()),
+            data: r#"{"choices":[{"delta":{"tool_calls":[{"index":0,"id":"call_1","function":{"name":"get_weather","arguments":""}}]}}]}"#.into(),
+        });
+        assert!(out1
+            .iter()
+            .all(|b| !b.starts_with(b"event: content_block_start")));
+        // tool 开启期间到达 text → 必须缓冲,不发 delta/stop
+        let out2 = r.process(&super::super::parser::SseEvent {
+            event: Some("c".into()),
+            data: r#"{"choices":[{"delta":{"content":"hi"}}]}"#.into(),
+        });
+        assert!(out2.is_empty(), "开启期间 text 应缓冲: {out2:?}");
+        // args 后续增量仍须累积,不得因提前收尾而丢失
+        let _ = r.process(&super::super::parser::SseEvent {
+            event: Some("c".into()),
+            data: r#"{"choices":[{"delta":{"tool_calls":[{"index":0,"function":{"arguments":"{\"city\":\"SF\"}"}}]}}]}"#.into(),
+        });
+        // finalize:tool 块收尾后刷缓冲 text,再收尾消息
+        let out3 = r.process(&super::super::parser::SseEvent {
+            event: Some("c".into()),
+            data: r#"{"choices":[{"delta":{},"finish_reason":"tool_calls"}],"usage":{"prompt_tokens":10,"completion_tokens":5}}"#.into(),
+        });
+        let buf3 = out3.concat();
+        let s = String::from_utf8_lossy(&buf3);
+        assert!(s.contains("tool_use"), "应先收尾 tool 块: {s}");
+        assert!(s.contains("text_delta"), "缓冲 text 应冲刷: {s}");
+        assert!(s.contains("SF"), "args 不得丢失: {s}");
+        // 顺序:tool_use 的 input_json(缓冲 text 之前)不得被 text 顶开
+        let tool_input = s.find("input_json_delta").unwrap();
+        let text_delta = s.find("text_delta").unwrap();
+        assert!(tool_input < text_delta, "tool 块应先于缓冲 text 收尾: {s}");
     }
 
     #[test]

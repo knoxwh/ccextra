@@ -491,10 +491,12 @@ fn inspect_claude_cais_signature(raw: &str) -> Result<(), String> {
     }
 
     let mut container: Option<Vec<u8>> = None;
+    let mut envelope_version: u64 = 0;
     walk_protobuf_fields(&decoded, |num, typ, raw_field| {
         match num {
             1 => {
-                cais_varint(typ, raw_field, "CAIS top-level field 1 envelope version")?;
+                envelope_version =
+                    cais_varint(typ, raw_field, "CAIS top-level field 1 envelope version")?;
             }
             2 => {
                 container = Some(cais_bytes(
@@ -515,13 +517,25 @@ fn inspect_claude_cais_signature(raw: &str) -> Result<(), String> {
     })?;
 
     let mut channel_block: Option<Vec<u8>> = None;
+    let mut container_signature_bytes: Option<Vec<u8>> = None;
+    // 对齐 CPA 75ce6352:CAQS(Envelope v4)签名字节可位于 Container Field 5
     walk_protobuf_fields(&container, |num, typ, raw_field| {
-        if num == 1 {
-            channel_block = Some(cais_bytes(
-                typ,
-                raw_field,
-                "CAIS container field 1 channel block",
-            )?);
+        match num {
+            1 => {
+                channel_block = Some(cais_bytes(
+                    typ,
+                    raw_field,
+                    "CAIS container field 1 channel block",
+                )?);
+            }
+            5 => {
+                container_signature_bytes = Some(cais_bytes(
+                    typ,
+                    raw_field,
+                    "CAIS container field 5 signature bytes",
+                )?);
+            }
+            _ => {}
         }
         Ok(())
     })?;
@@ -529,13 +543,20 @@ fn inspect_claude_cais_signature(raw: &str) -> Result<(), String> {
         "invalid Claude CAIS signature: missing container field 1 channel block".to_string()
     })?;
 
-    inspect_cais_channel_block(&channel_block)
+    inspect_cais_channel_block(&channel_block, envelope_version, container_signature_bytes)
 }
 
-fn inspect_cais_channel_block(channel_block: &[u8]) -> Result<(), String> {
+/// CAQS(Envelope v4)差异(对齐 CPA 75ce6352):明文 model_text 缺省,
+/// 签名字节可回退 Container Field 5,block kind 限 thinking/narration。
+fn inspect_cais_channel_block(
+    channel_block: &[u8],
+    envelope_version: u64,
+    container_signature_bytes: Option<Vec<u8>>,
+) -> Result<(), String> {
     let mut have_channel_id = false;
     let mut have_signature_bytes = false;
     let mut have_model_text = false;
+    let mut block_kind = String::new();
     walk_protobuf_fields(channel_block, |num, typ, raw| {
         match num {
             1 => {
@@ -565,7 +586,7 @@ fn inspect_cais_channel_block(channel_block: &[u8]) -> Result<(), String> {
                 cais_varint(typ, raw, "CAIS channel field 7")?;
             }
             8 => {
-                cais_utf8(typ, raw, "CAIS channel field 8 block kind")?;
+                block_kind = cais_utf8(typ, raw, "CAIS channel field 8 block kind")?;
             }
             11 => {
                 let value = cais_utf8(typ, raw, "CAIS channel field 11 context id")?;
@@ -579,20 +600,31 @@ fn inspect_cais_channel_block(channel_block: &[u8]) -> Result<(), String> {
         }
         Ok(())
     })?;
+    // 对齐 CPA 75ce6352:v≥4 签名字节可回退 Container Field 5
+    if !have_signature_bytes && envelope_version >= 4 {
+        if let Some(bytes) = container_signature_bytes {
+            if !bytes.is_empty() {
+                have_signature_bytes = true;
+            }
+        }
+    }
     if !have_channel_id {
         return Err(
             "invalid Claude CAIS signature: missing channel field 1 channel_id".to_string(),
         );
     }
     if !have_signature_bytes {
-        return Err(
-            "invalid Claude CAIS signature: missing channel field 5 signature bytes".to_string(),
-        );
+        return Err("invalid Claude CAIS signature: missing signature bytes".to_string());
     }
-    if !have_model_text {
+    if !have_model_text && envelope_version < 4 {
         return Err(
             "invalid Claude CAIS signature: missing channel field 6 model_text".to_string(),
         );
+    }
+    if envelope_version >= 4 && block_kind != "thinking" && block_kind != "narration" {
+        return Err(format!(
+            "invalid Claude CAQS signature: expected block kind \"thinking\" or \"narration\", got {block_kind:?}"
+        ));
     }
     Ok(())
 }
@@ -1295,6 +1327,90 @@ mod tests {
         non_claude_raw_signature,
     };
     use super::*;
+
+    /// 测试用 protobuf 构造:varint 值编码
+    fn pb_varint(mut n: u64) -> Vec<u8> {
+        let mut out = Vec::new();
+        loop {
+            let byte = (n & 0x7f) as u8;
+            n >>= 7;
+            if n == 0 {
+                out.push(byte);
+                break;
+            }
+            out.push(byte | 0x80);
+        }
+        out
+    }
+
+    /// 测试用 protobuf 构造:length-delimited 字段
+    fn pb_bytes(num: u64, payload: &[u8]) -> Vec<u8> {
+        let mut out = pb_varint((num << 3) | 2);
+        out.extend(pb_varint(payload.len() as u64));
+        out.extend_from_slice(payload);
+        out
+    }
+
+    /// 测试用 protobuf 构造:varint 字段
+    fn pb_uint(num: u64, val: u64) -> Vec<u8> {
+        let mut out = pb_varint(num << 3);
+        out.extend(pb_varint(val));
+        out
+    }
+
+    /// CAQS fixture(对齐 CPA 75ce6352):EnvelopeVersion 4、channel_id 17、
+    /// 无 model_text,签名字节放 Container Field 5
+    fn caqs_signature_fixture(block_kind: &str) -> String {
+        let sig_bytes = [0xabu8; 32];
+        let channel = [
+            pb_uint(1, 17),                     // channel_id 17
+            pb_uint(3, 4),                      // version
+            pb_bytes(8, block_kind.as_bytes()), // block kind
+        ]
+        .concat();
+        let container = [
+            pb_bytes(1, &channel),   // container field 1 channel block
+            pb_bytes(5, &sig_bytes), // container field 5 signature bytes
+        ]
+        .concat();
+        let mut top = pb_uint(1, 4); // envelope version 4
+        top.extend(pb_bytes(2, &container));
+        STANDARD.encode(&top)
+    }
+
+    #[test]
+    fn test_caqs_signature_thinking_accepted() {
+        // 对齐 CPA 75ce6352:CAQS(v4)无 model_text、签名在 Container Field 5
+        let sig = caqs_signature_fixture("thinking");
+        assert!(is_valid_claude_cais_signature(&sig));
+        // narration 同样合法
+        assert!(is_valid_claude_cais_signature(&caqs_signature_fixture(
+            "narration"
+        )));
+    }
+
+    #[test]
+    fn test_caqs_signature_rejects_bad_block_kind() {
+        let sig = caqs_signature_fixture("summary");
+        assert!(!is_valid_claude_cais_signature(&sig));
+    }
+
+    #[test]
+    fn test_cais_v3_still_requires_model_text() {
+        // v<4:无 model_text 仍必须拒绝(对齐 CPA haveModelText && v<4)
+        let sig_bytes = [0xcdu8; 32];
+        let channel = [
+            pb_uint(1, 16),
+            pb_uint(3, 3),
+            pb_bytes(5, &sig_bytes),
+            pb_bytes(8, b"thinking"),
+        ]
+        .concat();
+        let container = [pb_bytes(1, &channel)].concat();
+        let mut top = pb_uint(1, 3);
+        top.extend(pb_bytes(2, &container));
+        assert!(!is_valid_claude_cais_signature(&STANDARD.encode(&top)));
+    }
 
     #[test]
     fn test_claude_native_signature_reencoded_for_upstream() {

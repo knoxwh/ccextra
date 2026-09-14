@@ -56,7 +56,7 @@ pub fn convert_messages(
         match role {
             "user" => {
                 let content = align_tool_results(&msg["content"], &preceding_tool_use_ids);
-                let parts = convert_content_to_parts(
+                let mut parts = convert_content_to_parts(
                     &content,
                     original_to_short,
                     antigravity,
@@ -65,6 +65,8 @@ pub fn convert_messages(
                     false,
                 );
                 if !parts.is_empty() {
+                    // 对齐 CPA 4fde97f4:user turn 构建后重排 parts
+                    reorder_gemini_user_parts(&mut parts);
                     contents.push(json!({ "role": "user", "parts": parts }));
                 }
             }
@@ -125,6 +127,8 @@ fn merge_adjacent_gemini_contents(contents: Vec<Value>) -> Vec<Value> {
                     content.get("parts").and_then(|p| p.as_array()),
                 ) {
                     last_parts.extend(cur_parts.iter().cloned());
+                    // 对齐 CPA 4fde97f4:合并后重排 user parts,text 在 functionResponse 前
+                    reorder_gemini_user_parts(last_parts);
                     continue;
                 }
             }
@@ -132,6 +136,46 @@ fn merge_adjacent_gemini_contents(contents: Vec<Value>) -> Vec<Value> {
         merged.push(content);
     }
     merged
+}
+
+/// 对齐 CPA ReorderGeminiUserParts:user turn 内 text parts 重排到 functionResponse 前,
+/// 防止上游验证失败(如 Vertex AI 400 "Requests ending with a model turn are not supported")
+fn reorder_gemini_user_parts(parts: &mut Vec<Value>) {
+    let has_function_response = parts
+        .iter()
+        .any(|p| p.get("functionResponse").is_some() || p.get("function_response").is_some());
+    if !has_function_response {
+        return;
+    }
+
+    let mut has_trailing_text = false;
+    let mut saw_fr = false;
+    for p in parts.iter() {
+        let is_fr = p.get("functionResponse").is_some() || p.get("function_response").is_some();
+        if is_fr {
+            saw_fr = true;
+        } else if saw_fr && p.get("text").is_some() {
+            has_trailing_text = true;
+            break;
+        }
+    }
+
+    if !has_trailing_text {
+        return;
+    }
+
+    let original = std::mem::take(parts);
+    let mut text_parts = Vec::new();
+    let mut tool_parts = Vec::new();
+    for p in original {
+        if p.get("text").is_some() {
+            text_parts.push(p);
+        } else {
+            tool_parts.push(p);
+        }
+    }
+    parts.extend(text_parts);
+    parts.extend(tool_parts);
 }
 
 /// 按 preceding tool_use 顺序排列 tool_result;非结果块保留在原索引位置。
@@ -657,11 +701,11 @@ mod tests {
 
         let responses = contents[1]["parts"].as_array().unwrap();
         assert_eq!(responses.len(), 4);
-        // 对齐 CPA 8564142f:文本块留在原索引,结果块按 tool_use 顺序回填结果槽位
+        // 对齐 CPA 4fde97f4:重排后所有 text 在 functionResponse 前
         assert_eq!(responses[0]["text"], "results");
-        assert_eq!(responses[1]["functionResponse"]["id"], "opaque-a");
-        assert_eq!(responses[1]["functionResponse"]["name"], "Rd");
-        assert_eq!(responses[2]["text"], "continue");
+        assert_eq!(responses[1]["text"], "continue");
+        assert_eq!(responses[2]["functionResponse"]["id"], "opaque-a");
+        assert_eq!(responses[2]["functionResponse"]["name"], "Rd");
         assert_eq!(responses[3]["functionResponse"]["id"], "opaque-b");
     }
 
@@ -908,6 +952,7 @@ mod tests {
         assert_eq!(contents[0]["parts"][0]["functionCall"]["name"], "Read");
 
         // 2. user 回合:system reminder 与随后的 user 回合合并，且 tool_result 对应 functionResponse
+        // 对齐 CPA 4fde97f4:重排后 text parts 在 functionResponse 前
         assert_eq!(contents[1]["role"], "user");
         let parts = contents[1]["parts"].as_array().unwrap();
         assert_eq!(parts.len(), 3);
@@ -915,8 +960,72 @@ mod tests {
             .as_str()
             .unwrap()
             .contains("<system-reminder>"));
-        assert_eq!(parts[1]["functionResponse"]["id"], "Read-1");
-        assert_eq!(parts[2]["text"], "continue");
+        assert_eq!(parts[1]["text"], "continue");
+        assert_eq!(parts[2]["functionResponse"]["id"], "Read-1");
+    }
+
+    #[test]
+    fn test_reorder_gemini_user_parts_text_before_function_response() {
+        // 对齐 CPA 4fde97f4:user turn 中 text 重排到 functionResponse 前
+        let messages = vec![
+            json!({
+                "role": "assistant",
+                "content": [{
+                    "type": "tool_use",
+                    "id": "Read-1",
+                    "name": "Read",
+                    "input": {"path": "file.txt"}
+                }]
+            }),
+            json!({
+                "role": "user",
+                "content": [
+                    {"type": "tool_result", "tool_use_id": "Read-1", "content": "file content"},
+                    {"type": "text", "text": "trailing text after tool result"}
+                ]
+            }),
+        ];
+        let mut map = HashMap::new();
+        map.insert("Read".to_string(), "Read".to_string());
+        let contents = convert_messages(&messages, &map, false, "gemini-2.0");
+
+        assert_eq!(contents.len(), 2);
+        let user_parts = contents[1]["parts"].as_array().unwrap();
+        // text 应重排到 functionResponse 前
+        assert_eq!(user_parts.len(), 2);
+        assert_eq!(user_parts[0]["text"], "trailing text after tool result");
+        assert!(user_parts[1]["functionResponse"].is_object());
+    }
+
+    #[test]
+    fn test_reorder_gemini_user_parts_preserves_order_without_trailing_text() {
+        // 无尾随 text 时保持原顺序
+        let messages = vec![
+            json!({
+                "role": "assistant",
+                "content": [{
+                    "type": "tool_use",
+                    "id": "Read-1",
+                    "name": "Read",
+                    "input": {}
+                }]
+            }),
+            json!({
+                "role": "user",
+                "content": [
+                    {"type": "text", "text": "leading text"},
+                    {"type": "tool_result", "tool_use_id": "Read-1", "content": "ok"}
+                ]
+            }),
+        ];
+        let mut map = HashMap::new();
+        map.insert("Read".to_string(), "Read".to_string());
+        let contents = convert_messages(&messages, &map, false, "gemini-2.0");
+
+        let user_parts = contents[1]["parts"].as_array().unwrap();
+        // text 已在前,无需重排
+        assert_eq!(user_parts[0]["text"], "leading text");
+        assert!(user_parts[1]["functionResponse"].is_object());
     }
 
     #[test]

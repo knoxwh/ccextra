@@ -12,7 +12,7 @@ use super::gemini::{convert_to_gemini_with, SchemaFlavor};
 /// ```json
 /// {
 ///   "project": "<project_id>",
-///   "model": "gemini-3.7-flash-medium",
+///   "model": "gemini-3.8-flash-medium",
 ///   "userAgent": "antigravity",
 ///   "requestType": "agent",
 ///   "requestId": "agent-<hex>",
@@ -95,6 +95,9 @@ pub fn convert_to_antigravity(
             }
         }
 
+        // 对齐 CPA dc21a426:归一化 responseJsonSchema/response_json_schema → responseSchema
+        normalize_generation_config_response_schema(&mut request_obj);
+
         // 稳定 sessionId:取首条 user 文本的 sha256 前 8 字节(对齐 generateStableSessionID)
         let session_id = stable_session_id(&request_obj);
         request_obj.insert("sessionId".to_string(), Value::String(session_id));
@@ -110,14 +113,32 @@ pub fn convert_to_antigravity(
 fn antigravity_max_completion_tokens(model: &str) -> Option<i64> {
     Some(match model {
         "claude-opus-4-6-thinking" | "claude-sonnet-4-6" => 64000,
-        "gemini-3.6-flash-high"
-        | "gemini-3.7-flash-high"
-        | "gemini-3.8-flash-high"
-        | "gemini-3-flash" => 65536,
+        "gemini-3.6-flash-high" | "gemini-3.8-flash-high" | "gemini-3-flash" => 65536,
         "gemini-pro-agent" | "gemini-3.1-pro-low" | "gemini-3.1-flash-lite" => 65535,
         "gpt-oss-120b-medium" => 32768,
         _ => return None,
     })
+}
+
+/// 对齐 CPA dc21a426:归一化 generationConfig.responseJsonSchema → responseSchema
+/// 处理 generationConfig 和 generation_config 两种命名，以及 camelCase/snake_case schema 键
+fn normalize_generation_config_response_schema(request_obj: &mut serde_json::Map<String, Value>) {
+    for container in ["generationConfig", "generation_config"] {
+        let Some(Value::Object(gc)) = request_obj.get_mut(container) else {
+            continue;
+        };
+
+        let has_response_schema = gc.contains_key("responseSchema");
+
+        for schema_key in ["responseJsonSchema", "response_json_schema"] {
+            if let Some(schema) = gc.remove(schema_key) {
+                // 只在 responseSchema 不存在时移动
+                if !has_response_schema {
+                    gc.insert("responseSchema".to_string(), schema);
+                }
+            }
+        }
+    }
 }
 
 /// 对齐 CLIProxyAPI generateStableSessionID:
@@ -201,7 +222,7 @@ mod tests {
             ],
             "messages": [{"role": "user", "content": "hi"}]
         });
-        let (out, _) = convert_to_antigravity(&body, "gemini-3.7-flash-medium", None);
+        let (out, _) = convert_to_antigravity(&body, "gemini-3.8-flash-medium", None);
         let parts = out["request"]["systemInstruction"]["parts"]
             .as_array()
             .unwrap();
@@ -307,5 +328,88 @@ mod tests {
         assert_eq!(schema["required"], json!(["_"]));
         assert_eq!(schema["properties"]["_"]["type"], "boolean");
         assert_eq!(schema["properties"]["flag"]["type"], "string");
+    }
+
+    #[test]
+    fn test_normalize_response_json_schema_camel_case() {
+        // 直接测试 normalize 函数，不依赖完整转换链
+        let mut request_obj = serde_json::Map::new();
+        let mut gc = serde_json::Map::new();
+        gc.insert(
+            "responseJsonSchema".to_string(),
+            json!({
+                "type": "object",
+                "properties": {"message": {"type": "string"}},
+                "required": ["message"]
+            }),
+        );
+        request_obj.insert("generationConfig".to_string(), Value::Object(gc));
+
+        normalize_generation_config_response_schema(&mut request_obj);
+
+        let gc = request_obj["generationConfig"].as_object().unwrap();
+        assert!(gc.get("responseJsonSchema").is_none());
+        assert_eq!(
+            gc["responseSchema"]["properties"]["message"]["type"],
+            "string"
+        );
+    }
+
+    #[test]
+    fn test_normalize_response_json_schema_snake_case() {
+        let mut request_obj = serde_json::Map::new();
+        let mut gc = serde_json::Map::new();
+        gc.insert(
+            "response_json_schema".to_string(),
+            json!({"type": "object", "properties": {"data": {"type": "string"}}}),
+        );
+        request_obj.insert("generationConfig".to_string(), Value::Object(gc));
+
+        normalize_generation_config_response_schema(&mut request_obj);
+
+        let gc = request_obj["generationConfig"].as_object().unwrap();
+        assert!(gc.get("response_json_schema").is_none());
+        assert_eq!(gc["responseSchema"]["properties"]["data"]["type"], "string");
+    }
+
+    #[test]
+    fn test_normalize_preserves_existing_response_schema() {
+        let mut request_obj = serde_json::Map::new();
+        let mut gc = serde_json::Map::new();
+        gc.insert(
+            "responseSchema".to_string(),
+            json!({"type": "object", "properties": {"name": {"type": "string"}}}),
+        );
+        gc.insert(
+            "responseJsonSchema".to_string(),
+            json!({"type": "object", "properties": {"stale": {"type": "string"}}}),
+        );
+        request_obj.insert("generationConfig".to_string(), Value::Object(gc));
+
+        normalize_generation_config_response_schema(&mut request_obj);
+
+        let gc = request_obj["generationConfig"].as_object().unwrap();
+        // responseJsonSchema 应被删除
+        assert!(gc.get("responseJsonSchema").is_none());
+        // responseSchema 保持原值（name 属性，不是 stale）
+        assert_eq!(gc["responseSchema"]["properties"]["name"]["type"], "string");
+        assert!(gc["responseSchema"]["properties"].get("stale").is_none());
+    }
+
+    #[test]
+    fn test_normalize_handles_generation_config_snake_case() {
+        let mut request_obj = serde_json::Map::new();
+        let mut gc = serde_json::Map::new();
+        gc.insert(
+            "responseJsonSchema".to_string(),
+            json!({"type": "object", "properties": {"x": {"type": "number"}}}),
+        );
+        request_obj.insert("generation_config".to_string(), Value::Object(gc));
+
+        normalize_generation_config_response_schema(&mut request_obj);
+
+        let gc = request_obj["generation_config"].as_object().unwrap();
+        assert!(gc.get("responseJsonSchema").is_none());
+        assert_eq!(gc["responseSchema"]["properties"]["x"]["type"], "number");
     }
 }

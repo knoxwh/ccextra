@@ -209,8 +209,8 @@ pub fn convert_gemini_stream_chunk(
                             }
                         }));
                         state.has_content = true;
-                    } else {
-                        // 状态转换到文本
+                    } else if !text.is_empty() {
+                        // 状态转换到文本(对齐 CPA fd3e6623:只在非空时转换,防止空 text 关闭活动块)
                         if state.response_type != ResponseType::None {
                             events.push(json!({
                                 "type": "content_block_stop",
@@ -1051,5 +1051,68 @@ mod tests {
             .find(|e| e["delta"]["type"] == "signature_delta")
             .expect("signature_delta 应存在");
         assert_eq!(delta["delta"]["signature"], native);
+    }
+
+    #[test]
+    fn test_gemini_stream_empty_text_keeps_thinking_block_open() {
+        // 对齐 CPA fd3e6623:空 text parts 不关闭活动 thinking 块
+        let chunk1 = json!({
+            "candidates": [{
+                "content": {"parts": [
+                    {"text": "思考中", "thought": true}
+                ]}
+            }]
+        });
+        let chunk2 = json!({
+            "candidates": [{
+                "content": {"parts": [
+                    {"text": ""}
+                ]}
+            }]
+        });
+
+        let mut state = GeminiStreamState::default();
+        let events1 = convert_gemini_stream_chunk(&chunk1, &mut state, &HashMap::new(), None);
+        assert_eq!(state.response_type, ResponseType::Thinking);
+        let start = events1.iter().find(|e| e["type"] == "content_block_start");
+        assert!(start.is_some());
+        assert_eq!(start.unwrap()["content_block"]["type"], "thinking");
+
+        let events2 = convert_gemini_stream_chunk(&chunk2, &mut state, &HashMap::new(), None);
+        // 空 text 不应关闭 thinking 块
+        assert!(events2.iter().all(|e| e["type"] != "content_block_stop"));
+        assert_eq!(state.response_type, ResponseType::Thinking);
+    }
+
+    #[test]
+    fn test_gemini_stream_non_empty_text_transitions_from_thinking() {
+        // 非空普通 text 正常触发状态转换
+        let chunk1 = json!({
+            "candidates": [{
+                "content": {"parts": [
+                    {"text": "思考", "thought": true}
+                ]}
+            }]
+        });
+        let chunk2 = json!({
+            "candidates": [{
+                "content": {"parts": [
+                    {"text": "回答"}
+                ]}
+            }]
+        });
+
+        let mut state = GeminiStreamState::default();
+        convert_gemini_stream_chunk(&chunk1, &mut state, &HashMap::new(), None);
+        assert_eq!(state.response_type, ResponseType::Thinking);
+
+        let events2 = convert_gemini_stream_chunk(&chunk2, &mut state, &HashMap::new(), None);
+        // 非空 text 应关闭 thinking 并开始 text 块
+        let stop = events2.iter().find(|e| e["type"] == "content_block_stop");
+        assert!(stop.is_some());
+        let start = events2.iter().find(|e| e["type"] == "content_block_start");
+        assert!(start.is_some());
+        assert_eq!(start.unwrap()["content_block"]["type"], "text");
+        assert_eq!(state.response_type, ResponseType::Content);
     }
 }

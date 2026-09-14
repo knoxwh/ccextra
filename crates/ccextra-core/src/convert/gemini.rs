@@ -159,7 +159,7 @@ pub fn convert_to_gemini_with(
                 // 对齐 CPA:effort 显式给则透传 thinkingLevel;否则按目标模型
                 // thinking.max 发 thinkingBudget,查不到再兜底 "high"。
                 // Antigravity 无预算表,走 thinkingLevel,并按注册表钳到模型档位
-                // (gemini-3.7-flash-medium 只认 medium,effort=max 不得抬成 high)
+                // (gemini-3.8-flash-high 只认 high,effort=max 不得抬成 max)
                 let effort = body
                     .pointer("/output_config/effort")
                     .and_then(|e| e.as_str())
@@ -589,7 +589,7 @@ IMPORTANT: Assist with authorized security testing.
             "output_config": {"effort": "max"},
             "messages": [{"role": "user", "content": "hi"}]
         });
-        let (gemini, _) = convert_to_gemini(&anthropic, "gemini-3.7");
+        let (gemini, _) = convert_to_gemini(&anthropic, "gemini-3.8");
         // 3.x 模型预算表返回 32768
         assert_eq!(
             gemini["generationConfig"]["thinkingConfig"]["thinkingBudget"],
@@ -627,7 +627,7 @@ IMPORTANT: Assist with authorized security testing.
         });
         let (gemini, _) = convert_to_gemini_with(
             &anthropic,
-            "gemini-3.7-flash-high",
+            "gemini-3.8-flash-high",
             SchemaFlavor::Antigravity,
         );
         assert_eq!(
@@ -660,7 +660,7 @@ IMPORTANT: Assist with authorized security testing.
         // Antigravity 非 claude 目标同样补齐(跳过条件只限 claude 目标,不限 flavor)
         let (gemini, _) = convert_to_gemini_with(
             &anthropic,
-            "gemini-3.7-flash-high",
+            "gemini-3.8-flash-high",
             SchemaFlavor::Antigravity,
         );
         let contents = gemini["contents"].as_array().unwrap();
@@ -701,16 +701,16 @@ IMPORTANT: Assist with authorized security testing.
     }
 
     #[test]
-    fn test_antigravity_clamps_effort_max_to_medium_sku() {
-        // medium SKU 注册表只认 medium,effort=max 不得抬成 high
+    fn test_antigravity_clamps_effort_max_to_high_sku() {
+        // high SKU 注册表只认 high,effort=max 不得抬成其他
         let (gemini, _) = convert_to_gemini_with(
             &adaptive_max_body(),
-            "gemini-3.7-flash-medium",
+            "gemini-3.8-flash-high",
             SchemaFlavor::Antigravity,
         );
         assert_eq!(
             gemini["generationConfig"]["thinkingConfig"]["thinkingLevel"],
-            "medium"
+            "high"
         );
         assert!(gemini["generationConfig"]["thinkingConfig"]
             .get("thinkingBudget")
@@ -718,20 +718,7 @@ IMPORTANT: Assist with authorized security testing.
     }
 
     #[test]
-    fn test_antigravity_clamps_effort_max_to_high_sku() {
-        let (gemini, _) = convert_to_gemini_with(
-            &adaptive_max_body(),
-            "gemini-3.7-flash-high",
-            SchemaFlavor::Antigravity,
-        );
-        assert_eq!(
-            gemini["generationConfig"]["thinkingConfig"]["thinkingLevel"],
-            "high"
-        );
-    }
-
-    #[test]
-    fn test_antigravity_default_effort_clamps_to_medium_sku() {
+    fn test_antigravity_default_effort_clamps_to_high_sku() {
         // 无 output_config.effort 时 CPA 缺省 high,再按 SKU 钳制
         let anthropic = json!({
             "model": "m", "max_tokens": 1000,
@@ -740,12 +727,12 @@ IMPORTANT: Assist with authorized security testing.
         });
         let (gemini, _) = convert_to_gemini_with(
             &anthropic,
-            "gemini-3.7-flash-medium",
+            "gemini-3.8-flash-high",
             SchemaFlavor::Antigravity,
         );
         assert_eq!(
             gemini["generationConfig"]["thinkingConfig"]["thinkingLevel"],
-            "medium"
+            "high"
         );
     }
 
@@ -767,7 +754,7 @@ IMPORTANT: Assist with authorized security testing.
         // 对齐 CPA a76da711:Antigravity tool_choice=none 删 tools
         let (g, _) = convert_to_gemini_with(
             &base(json!({"type": "none"})),
-            "gemini-3.7-flash-high",
+            "gemini-3.8-flash-high",
             SchemaFlavor::Antigravity,
         );
         assert_eq!(g["toolConfig"]["functionCallingConfig"]["mode"], "NONE");

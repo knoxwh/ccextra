@@ -1401,7 +1401,8 @@ mod tests {
                 {"role": "user", "content": "first real"},
             ],
         });
-        let msg2 = first_conversation_message(&body_skip_roleless, ApiKind::OpenAiResponses).unwrap();
+        let msg2 =
+            first_conversation_message(&body_skip_roleless, ApiKind::OpenAiResponses).unwrap();
         assert_eq!(msg2["content"], json!("first real"));
     }
 
@@ -1733,7 +1734,10 @@ mod tests {
             ),
             ApiKind::Anthropic,
         );
-        assert_eq!(h1.early_messages, h2.early_messages, "9th message outside window");
+        assert_eq!(
+            h1.early_messages, h2.early_messages,
+            "9th message outside window"
+        );
 
         // 但修改第 1 条消息必须使其漂移
         let h3 = compute_structural_hash(
@@ -1744,7 +1748,10 @@ mod tests {
             ),
             ApiKind::Anthropic,
         );
-        assert_ne!(h1.early_messages, h3.early_messages, "1st message inside window");
+        assert_ne!(
+            h1.early_messages, h3.early_messages,
+            "1st message inside window"
+        );
     }
 
     #[test]

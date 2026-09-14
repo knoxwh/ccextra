@@ -69,6 +69,7 @@ pub fn message_delta(
     output_tokens: i64,
     cache_read: i64,
     cache_write: i64,
+    thinking_tokens: i64,
 ) -> Bytes {
     let mut event = json!({
         "type": "message_delta",
@@ -80,6 +81,10 @@ pub fn message_delta(
     }
     if cache_write > 0 {
         event["usage"]["cache_creation_input_tokens"] = json!(cache_write);
+    }
+    // 对齐 CPA e365ab0c:thinking_tokens ≥ 0 时写入
+    if thinking_tokens >= 0 {
+        event["usage"]["output_tokens_details"] = json!({"thinking_tokens": thinking_tokens});
     }
     sse("message_delta", &event)
 }

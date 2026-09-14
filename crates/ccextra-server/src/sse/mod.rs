@@ -152,7 +152,7 @@ pub fn extract_usage_chat(usage: &serde_json::Value) -> (i64, i64, i64) {
 /// total = input_tokens + cache_read + cache_creation)。
 ///
 /// cache_write 先取 cache_write_tokens,再兜底 cache_creation_tokens(对齐 CPA 893abbab)。
-pub fn extract_usage_responses(usage: &serde_json::Value) -> (i64, i64, i64, i64) {
+pub fn extract_usage_responses(usage: &serde_json::Value) -> (i64, i64, i64, i64, i64) {
     let mut input = usage
         .get("input_tokens")
         .and_then(|v| v.as_i64())
@@ -180,7 +180,17 @@ pub fn extract_usage_responses(usage: &serde_json::Value) -> (i64, i64, i64, i64
     if cache_write > 0 {
         input = (input - cache_write).max(0);
     }
-    (input, output, cached, cache_write)
+    // 对齐 CPA e365ab0c:reasoning_tokens → thinking_tokens(非负且不超过 output)
+    let thinking = usage
+        .pointer("/output_tokens_details/reasoning_tokens")
+        .and_then(|v| v.as_i64())
+        .unwrap_or(-1);
+    let thinking = if thinking >= 0 {
+        thinking.min(output)
+    } else {
+        -1
+    };
+    (input, output, cached, cache_write, thinking)
 }
 
 #[cfg(test)]
@@ -291,10 +301,50 @@ mod tests {
                 "cache_write_tokens": 50
             }
         });
-        let (input, output, cached, cache_write) = extract_usage_responses(&usage);
+        let (input, output, cached, cache_write, thinking) = extract_usage_responses(&usage);
         assert_eq!(input, 10); // 100 - 40 - 50
         assert_eq!(output, 10);
         assert_eq!(cached, 40);
         assert_eq!(cache_write, 50);
+        assert_eq!(thinking, -1); // 无 reasoning_tokens
+    }
+
+    #[test]
+    fn test_extract_usage_responses_thinking_tokens() {
+        // 对齐 CPA e365ab0c:reasoning_tokens → thinking_tokens
+        let usage = json!({
+            "input_tokens": 100,
+            "output_tokens": 50,
+            "output_tokens_details": {"reasoning_tokens": 20}
+        });
+        let (_, _, _, _, thinking) = extract_usage_responses(&usage);
+        assert_eq!(thinking, 20);
+
+        // 超过 output_tokens 封顶
+        let usage = json!({
+            "input_tokens": 100,
+            "output_tokens": 50,
+            "output_tokens_details": {"reasoning_tokens": 999}
+        });
+        let (_, output, _, _, thinking) = extract_usage_responses(&usage);
+        assert_eq!(thinking, output);
+
+        // 负数拒绝
+        let usage = json!({
+            "input_tokens": 100,
+            "output_tokens": 50,
+            "output_tokens_details": {"reasoning_tokens": -5}
+        });
+        let (_, _, _, _, thinking) = extract_usage_responses(&usage);
+        assert_eq!(thinking, -1);
+
+        // 显式 0
+        let usage = json!({
+            "input_tokens": 100,
+            "output_tokens": 50,
+            "output_tokens_details": {"reasoning_tokens": 0}
+        });
+        let (_, _, _, _, thinking) = extract_usage_responses(&usage);
+        assert_eq!(thinking, 0);
     }
 }
