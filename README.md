@@ -13,8 +13,8 @@
 | `protocol` | 上游接口 | 说明 |
 | --- | --- | --- |
 | `claude` | Anthropic Messages | 仅替换 `model`，其余请求内容保持原样。 |
-| `openai_chat` | Chat Completions | 转换 messages、工具、图片和 reasoning。 |
-| `openai_responses` | Responses | 转换为 `instructions` 和 `input`，支持 reasoning replay。 |
+| `openai_chat` | Chat Completions | 转换 messages、工具、图片和 reasoning（支持 Kimi K2.8）。 |
+| `openai_responses` | Responses | 转换为 `instructions` 和 `input`，支持 reasoning replay 与 web_search 过滤。 |
 | `gemini` | Gemini GenerateContent | 使用 Gemini 内容、工具和 schema 形状。 |
 | `antigravity` | Cloud Code Assist | 使用 Gemini 形状并封装运输信封。 |
 
@@ -86,6 +86,7 @@ export ANTHROPIC_AUTH_TOKEN=sk-ccextra-xxx # 配置 secret_key 时需要
 ./ccextra antigravity-status
 ./ccextra xai-login
 ./ccextra xai-status
+./scripts/check_antigravity_quota.sh
 cargo test --workspace
 cargo clippy --workspace --all-targets -- -D warnings
 ```

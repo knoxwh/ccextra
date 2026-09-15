@@ -13,8 +13,8 @@ One process listens on one port. Anthropic-shaped input resolves to a provider b
 | `protocol` | Upstream API | Behavior |
 | --- | --- | --- |
 | `claude` | Anthropic Messages | Replaces only `model`; remaining request content stays intact. |
-| `openai_chat` | Chat Completions | Converts messages, tools, images, and reasoning. |
-| `openai_responses` | Responses | Converts to `instructions` and `input`; supports reasoning replay. |
+| `openai_chat` | Chat Completions | Converts messages, tools, images, and reasoning (supports Kimi K2.8). |
+| `openai_responses` | Responses | Converts to `instructions` and `input`; supports reasoning replay and web_search filtering. |
 | `gemini` | Gemini GenerateContent | Uses Gemini content, tool, and schema shapes. |
 | `antigravity` | Cloud Code Assist | Uses Gemini shapes inside an Antigravity transport envelope. |
 
@@ -86,6 +86,7 @@ Network errors, 429, and 5xx retry with exponential backoff within a 3-second to
 ./ccextra antigravity-status
 ./ccextra xai-login
 ./ccextra xai-status
+./scripts/check_antigravity_quota.sh
 cargo test --workspace
 cargo clippy --workspace --all-targets -- -D warnings
 ```
