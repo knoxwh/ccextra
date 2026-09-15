@@ -115,6 +115,7 @@ fn antigravity_max_completion_tokens(model: &str) -> Option<i64> {
         "claude-opus-4-6-thinking" | "claude-sonnet-4-6" => 64000,
         "gemini-3.6-flash-high" | "gemini-3.8-flash-high" | "gemini-3-flash" => 65536,
         "gemini-pro-agent" | "gemini-3.1-pro-low" | "gemini-3.1-flash-lite" => 65535,
+        "gemini-3.5-flash-lite" => 65535,
         "gpt-oss-120b-medium" => 32768,
         _ => return None,
     })

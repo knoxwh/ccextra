@@ -433,6 +433,9 @@ impl ResponsesRelay {
                 }
                 let mut out = self.finalize_thinking();
                 out.extend(self.stop_text());
+                // 终态兜底:正文只在 completed 里时补发(对齐 sub2api,须在合成
+                // 空 text 块之前;发过 delta 或已合成则 no-op)
+                out.extend(self.recover_terminal_text(response));
                 out.extend(self.append_function_calls_from_terminal(response));
                 out.extend(self.append_deferred_events());
                 out.extend(self.finalize_thinking());
@@ -515,26 +518,12 @@ impl ResponsesRelay {
                 if self.has_text_delta {
                     return Vec::new();
                 }
-                // 无 delta 流时从 item.content 补发文本(同兜底)
-                let mut text = String::new();
-                if let Some(parts) = item.get("content").and_then(|v| v.as_array()) {
-                    for part in parts {
-                        if part.get("type").and_then(|v| v.as_str()) == Some("output_text") {
-                            if let Some(t) = part.get("text").and_then(|v| v.as_str()) {
-                                text.push_str(t);
-                            }
-                        }
-                    }
-                }
+                // 无 delta 流时从 item.content 补发文本(与 recover_terminal_text 共用)
+                let text = extract_output_text(item.get("content"));
                 if text.is_empty() {
                     return Vec::new();
                 }
-                let mut out = self.finalize_thinking();
-                out.extend(self.start_text());
-                out.extend(self.text_delta(&text));
-                out.extend(self.stop_text());
-                self.has_text_delta = true;
-                out
+                self.emit_recovered_text(&text)
             }
             "reasoning" => {
                 let mut out = self.stop_text();
@@ -1020,6 +1009,48 @@ impl ResponsesRelay {
         out
     }
 
+    /// 终态文本兜底(对齐 sub2api resToAnthRecoverTerminalText):部分上游不发任何
+    /// output_text.delta,正文只出现在 response.completed 的 output[].message 里。
+    /// 仅在本次流从未发过文本时补发,避免重复。
+    fn recover_terminal_text(&mut self, response: Option<&Value>) -> Vec<Bytes> {
+        if self.has_text_delta {
+            return Vec::new();
+        }
+        let Some(output) = response
+            .and_then(|r| r.get("output"))
+            .and_then(|v| v.as_array())
+        else {
+            return Vec::new();
+        };
+        let mut text = String::new();
+        for item in output {
+            if item.get("type").and_then(|v| v.as_str()) != Some("message") {
+                continue;
+            }
+            text.push_str(&extract_output_text(item.get("content")));
+        }
+        if text.is_empty() {
+            return Vec::new();
+        }
+        let mut out = self.ensure_started();
+        out.extend(self.emit_recovered_text(&text));
+        out
+    }
+
+    /// 补发文本块(与 output_item.done 的 message 兜底共用):
+    /// 关思考块 → 开 text → delta → 关 text
+    fn emit_recovered_text(&mut self, text: &str) -> Vec<Bytes> {
+        if self.has_text_delta {
+            return Vec::new();
+        }
+        let mut out = self.finalize_thinking();
+        out.extend(self.start_text());
+        out.extend(self.text_delta(text));
+        out.extend(self.stop_text());
+        self.has_text_delta = true;
+        out
+    }
+
     /// 清空调用状态(对齐 clearCodexFunctionCalls,completed 后调用)
     fn clear_function_calls(&mut self) {
         self.function_calls.clear();
@@ -1223,6 +1254,21 @@ fn is_meaningful_output_delta(root: &Value, event_type: &str) -> bool {
         .and_then(|v| v.as_str())
         .map(|s| !s.trim().is_empty())
         .unwrap_or(false)
+}
+
+/// message item content 数组里的 output_text 拼接(文本兜底共用)
+fn extract_output_text(content: Option<&Value>) -> String {
+    let mut text = String::new();
+    if let Some(parts) = content.and_then(|v| v.as_array()) {
+        for part in parts {
+            if part.get("type").and_then(|v| v.as_str()) == Some("output_text") {
+                if let Some(t) = part.get("text").and_then(|v| v.as_str()) {
+                    text.push_str(t);
+                }
+            }
+        }
+    }
+    text
 }
 
 /// 空 incomplete 终态(对齐 CPA IsCodexTerminalEmptyIncomplete):上游静默中止
@@ -1826,6 +1872,41 @@ mod tests {
         let s = String::from_utf8_lossy(&bufs);
         assert!(s.contains("message_stop"));
         assert!(s.contains("\"type\":\"text\""));
+    }
+
+    #[test]
+    fn test_terminal_text_recovered_from_completed_output() {
+        // 正文只出现在 response.completed 的 output[].message(无任何 delta):
+        // 补发文本,不再合成空块(对齐 sub2api resToAnthRecoverTerminalText)
+        let mut r = ResponsesRelay::new(None);
+        r.process(&created());
+        let out = r.process(&ev(
+            r#"{"type":"response.completed","response":{"id":"r1","output":[
+                {"type":"message","role":"assistant","content":[
+                    {"type":"output_text","text":"最终答案"}
+                ]}],"usage":{"input_tokens":10,"output_tokens":5}}}"#,
+        ));
+        let s = s(&out);
+        assert!(s.contains("text_delta"), "应补发正文: {s}");
+        assert!(s.contains("最终答案"));
+        // 仅一个 text 块,不与合成空块叠加
+        assert_eq!(s.matches("event: content_block_start").count(), 1);
+
+        // 已流式发出过文本则不重复补发
+        let mut r2 = ResponsesRelay::new(None);
+        r2.process(&created());
+        r2.process(&ev(
+            r#"{"type":"response.output_text.delta","delta":"流式"}"#,
+        ));
+        let out2 = r2.process(&ev(
+            r#"{"type":"response.completed","response":{"id":"r2","output":[
+                {"type":"message","role":"assistant","content":[
+                    {"type":"output_text","text":"流式+终态"}
+                ]}]}}"#,
+        ));
+        let buf2 = out2.concat();
+        let s2 = String::from_utf8_lossy(&buf2);
+        assert!(!s2.contains("终态"), "已发 delta 不得重复: {s2}");
     }
 
     #[test]

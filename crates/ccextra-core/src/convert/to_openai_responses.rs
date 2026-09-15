@@ -359,6 +359,16 @@ fn remove_reasoning_id_if_orphan(item: &mut Value, store_true: bool) -> bool {
     false
 }
 
+/// reasoning.summary 是否为空(缺失/null/空数组;字符串形式视为非空)
+/// 对齐 CPA openaiResponsesReasoningSummaryIsEmpty
+fn reasoning_summary_is_empty(summary: Option<&Value>) -> bool {
+    match summary {
+        None | Some(Value::Null) => true,
+        Some(Value::Array(a)) => a.is_empty(),
+        Some(_) => false,
+    }
+}
+
 /// GPT/Codex 请求发送前仅剥离格式无效的 encrypted_content。
 /// `store` 非 true 时顺带丢掉无法回放的 reasoning id；空 reasoning 项整项丢弃。
 pub fn sanitize_gpt_reasoning_items(body: &mut Value) -> bool {
@@ -384,10 +394,44 @@ pub fn sanitize_gpt_reasoning_items(body: &mut Value) -> bool {
             }
             changed = true;
         }
+        // 对齐 CPA sanitizeOpenAIResponsesReasoningEncryptedContent:官方 Codex
+        // schema 对 reasoning.content 设 maxItems:0,第三方通道回放的明文 thinking
+        // 数组会被 400。summary 为空时先把 reasoning_text 提升为 summary_text,
+        // 然后一律强制 content: []。
+        let had_content_parts =
+            matches!(item.get("content"), Some(Value::Array(parts)) if !parts.is_empty());
+        if had_content_parts {
+            let promoted: Vec<Value> = if reasoning_summary_is_empty(item.get("summary")) {
+                item.get("content")
+                    .and_then(|v| v.as_array())
+                    .map(|parts| {
+                        parts
+                            .iter()
+                            .filter(|p| {
+                                p.get("type").and_then(|v| v.as_str()) == Some("reasoning_text")
+                            })
+                            .filter_map(|p| p.get("text").and_then(|v| v.as_str()))
+                            .filter(|t| !t.is_empty())
+                            .map(|t| json!({"type": "summary_text", "text": t}))
+                            .collect()
+                    })
+                    .unwrap_or_default()
+            } else {
+                Vec::new()
+            };
+            if let Some(obj) = item.as_object_mut() {
+                if !promoted.is_empty() {
+                    obj.insert("summary".into(), Value::Array(promoted));
+                }
+                obj.insert("content".into(), json!([]));
+            }
+            changed = true;
+        }
         if remove_reasoning_id_if_orphan(&mut item, store_true) {
             changed = true;
         }
-        if reasoning_item_empty(&item) {
+        // 清空前的 content 数组形式不算空项(对齐 CPA changed 分支 keep)
+        if reasoning_item_empty(&item) && !had_content_parts {
             changed = true;
             continue;
         }
@@ -1284,7 +1328,8 @@ pub fn convert_to_openai_responses(
                 // 两者互斥,并存时按 allowed 优先(与上游 validate 报错一致)
                 if let Some(domains) = tool.get("allowed_domains").and_then(|v| v.as_array()) {
                     ws["filters"] = json!({"allowed_domains": domains});
-                } else if let Some(domains) = tool.get("blocked_domains").and_then(|v| v.as_array()) {
+                } else if let Some(domains) = tool.get("blocked_domains").and_then(|v| v.as_array())
+                {
                     let key = if is_grok_upstream(upstream_model) {
                         "excluded_domains"
                     } else {
@@ -2276,6 +2321,43 @@ mod tests {
     }
 
     #[test]
+    fn test_sanitize_gpt_reasoning_promotes_content_to_summary() {
+        // 对齐 CPA:reasoning.content 数组(官方 Codex schema maxItems:0)清空;
+        // summary 为空时 reasoning_text 先提升为 summary_text
+        let mut body = json!({
+            "store": false,
+            "input": [
+                {"type": "reasoning", "id": "rs_a", "content": [
+                    {"type": "reasoning_text", "text": "明文思考"}
+                ]},
+                {"type": "reasoning", "content": [
+                    {"type": "reasoning_text", "text": "保留"}
+                ], "summary": [{"type": "summary_text", "text": "已有"}]},
+                {"type": "reasoning", "content": [
+                    {"type": "input_text", "text": "非 reasoning_text 不提升"}
+                ]}
+            ]
+        });
+        assert!(sanitize_gpt_reasoning_items(&mut body));
+        let input = body["input"].as_array().unwrap();
+        // item0:content 提升进 summary 后强制清空
+        assert_eq!(
+            input[0]["summary"],
+            json!([{"type": "summary_text", "text": "明文思考"}])
+        );
+        assert_eq!(input[0]["content"], json!([]));
+        // item1:summary 非空,不提升,仅清空 content
+        assert_eq!(
+            input[1]["summary"],
+            json!([{"type": "summary_text", "text": "已有"}])
+        );
+        assert_eq!(input[1]["content"], json!([]));
+        // item2:无 reasoning_text,summary 不动,content 仍清空
+        assert!(input[2].get("summary").is_none());
+        assert_eq!(input[2]["content"], json!([]));
+    }
+
+    #[test]
     fn test_sanitize_gpt_reasoning_keeps_id_with_store_true() {
         let mut body = json!({
             "store": true,
@@ -3109,7 +3191,9 @@ Be verbose.
         });
         convert_to_openai_responses(&mut body, "grok-4.6").unwrap();
         assert_eq!(body["tools"][0]["filters"]["allowed_domains"][0], "x.com");
-        assert!(body["tools"][0]["filters"].get("excluded_domains").is_none());
+        assert!(body["tools"][0]["filters"]
+            .get("excluded_domains")
+            .is_none());
     }
 
     #[test]

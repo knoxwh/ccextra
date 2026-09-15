@@ -32,16 +32,15 @@ pub fn convert_to_openai_chat(body: &mut Value, upstream_model: &str) -> Result<
     openai.insert("model".into(), json!(upstream_model));
     // thinking → reasoning_effort(忠实 thinking 映射;顶层 output_config 优先)
     // 先解析,能力矩阵按最终 effort 判定采样是否可发。
-    let reasoning_effort = crate::thinking::resolve_effort_from_body(body)
-        .map(|effort| {
-            // 对齐 CPA kimi ModeNone:直接走 disabled 形状,不过 clampLevel
-            // (clamp 会把 none 钳到最近支持级别,违背显式禁用语义)
-            if effort == "none" && is_kimi_upstream_model(upstream_model) {
-                effort
-            } else {
-                crate::thinking::clamp_effort(effort, upstream_model)
-            }
-        });
+    let reasoning_effort = crate::thinking::resolve_effort_from_body(body).map(|effort| {
+        // 对齐 CPA kimi ModeNone:直接走 disabled 形状,不过 clampLevel
+        // (clamp 会把 none 钳到最近支持级别,违背显式禁用语义)
+        if effort == "none" && is_kimi_upstream_model(upstream_model) {
+            effort
+        } else {
+            crate::thinking::clamp_effort(effort, upstream_model)
+        }
+    });
     let capabilities = openai_chat_capabilities(upstream_model, reasoning_effort.unwrap_or(""));
 
     // max_tokens 透传;o/GPT-5/Astra 改发 max_completion_tokens
@@ -1383,12 +1382,24 @@ IMPORTANT: Assist with authorized security testing.
             convert_to_openai_chat(&mut body, case.model).unwrap();
 
             if case.expect_max_completion_tokens {
-                assert_eq!(body["max_completion_tokens"], 1024, "Failed at case: {}", case.name);
-                assert!(body.get("max_tokens").is_none(), "Failed at case: {}", case.name);
+                assert_eq!(
+                    body["max_completion_tokens"], 1024,
+                    "Failed at case: {}",
+                    case.name
+                );
+                assert!(
+                    body.get("max_tokens").is_none(),
+                    "Failed at case: {}",
+                    case.name
+                );
             }
 
             if case.expect_temperature_dropped {
-                assert!(body.get("temperature").is_none(), "Failed at case: {}", case.name);
+                assert!(
+                    body.get("temperature").is_none(),
+                    "Failed at case: {}",
+                    case.name
+                );
             } else {
                 assert_eq!(body["temperature"], 0.2, "Failed at case: {}", case.name);
             }
@@ -1398,7 +1409,11 @@ IMPORTANT: Assist with authorized security testing.
             }
 
             if case.expect_developer_role {
-                assert_eq!(body["messages"][0]["role"], "developer", "Failed at case: {}", case.name);
+                assert_eq!(
+                    body["messages"][0]["role"], "developer",
+                    "Failed at case: {}",
+                    case.name
+                );
             }
         }
 
