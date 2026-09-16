@@ -178,8 +178,15 @@ impl ChatRelay {
             .and_then(|v| v.as_str())
         {
             if !fr.is_empty() {
-                self.finish_reason = if self.saw_tool_call {
+                // 对齐 CPA 772c63c8 effectiveOpenAIFinishReason:
+                // length/content_filter 优先于 tool 判定;累积 args 截断或
+                // 非法 JSON 时降级 length(→max_tokens),不发非法 tool_use
+                self.finish_reason = if fr == "length" || fr == "content_filter" {
+                    fr.to_string()
+                } else if self.saw_tool_call && self.has_valid_tool_call_arguments() {
                     "tool_calls".to_string()
+                } else if self.saw_tool_call {
+                    "length".to_string()
                 } else if fr == "tool_calls" {
                     "stop".to_string()
                 } else {
@@ -258,7 +265,9 @@ impl ChatRelay {
         self.flush_interleaved(&mut frames);
 
         frames.push(emit::message_delta(
-            map_finish_reason(&self.finish_reason),
+            // 对齐 CPA terminalOpenAIFinishReason:终态动态计算,无
+            // finish_reason 的 [DONE] 回合仍按 saw_tool_call + args 校验兜底
+            map_finish_reason(&self.effective_finish_reason()),
             None,
             self.usage_input,
             self.usage_output,
@@ -449,6 +458,51 @@ impl ChatRelay {
         let index = call.block_index;
         call.start_emitted = true;
         frames.push(emit::content_block_start_tool_use(index, &id, &name));
+    }
+
+    /// 终态 finish_reason(对齐 CPA effectiveOpenAIFinishReason):
+    /// length/content_filter 原样保留;saw_tool_call 按 args 校验在
+    /// tool_calls/length 间定;否则用已存值(空值由 map_finish_reason 兜底)
+    fn effective_finish_reason(&self) -> String {
+        if self.finish_reason == "length" || self.finish_reason == "content_filter" {
+            return self.finish_reason.clone();
+        }
+        if self.saw_tool_call {
+            return if self.has_valid_tool_call_arguments() {
+                "tool_calls".to_string()
+            } else {
+                "length".to_string()
+            };
+        }
+        self.finish_reason.clone()
+    }
+
+    /// 校验全部累积 tool arguments 可修复为合法 JSON object
+    /// (对齐 CPA hasValidToolCallArguments:未开始的空占位项跳过,
+    /// 空/"{}" 视为有效,其余经 fix_json_quotes 后必须解析成 object)
+    fn has_valid_tool_call_arguments(&self) -> bool {
+        for call in self.tool_calls.values() {
+            if !call.start_emitted
+                && call.name.is_empty()
+                && call.id.is_empty()
+                && call.arguments.is_empty()
+            {
+                continue;
+            }
+            if call.arguments.is_empty() {
+                continue;
+            }
+            let args = call.arguments.trim();
+            if args == "{}" {
+                continue;
+            }
+            let fixed = fix_json_quotes(args);
+            match serde_json::from_str::<Value>(&fixed) {
+                Ok(v) if v.is_object() => {}
+                _ => return false,
+            }
+        }
+        true
     }
 
     /// 关闭所有待发 tool calls(发完整 input_json + stop)
@@ -1178,6 +1232,146 @@ mod tests {
         assert_eq!(map_finish_reason("tool_calls"), "tool_use");
         assert_eq!(map_finish_reason("function_call"), "tool_use");
         assert_eq!(map_finish_reason("unknown"), "end_turn");
+    }
+
+    #[test]
+    fn test_tool_truncated_args_finish_maps_max_tokens() {
+        // 对齐 CPA 772c63c8:args 截断(非法 JSON)时 finish 降级 length,
+        // 不发 tool_use,客户端拿不到非法 tool input
+        let mut r = ChatRelay::new(None);
+        let _ = r.process(&super::super::parser::SseEvent {
+            event: Some("c".into()),
+            data: r#"{"id":"1","choices":[{"delta":{"tool_calls":[{"index":0,"id":"call_1","function":{"name":"write_file","arguments":"{\"path\":\"/tmp/t.txt\",\"content\":\"hello"}}]}}]}"#.into(),
+        });
+        let out2 = r.process(&super::super::parser::SseEvent {
+            event: Some("c".into()),
+            data: r#"{"id":"1","choices":[{"delta":{},"finish_reason":"stop"}],"usage":{"prompt_tokens":10,"completion_tokens":400}}"#.into(),
+        });
+        let bufs = out2.concat();
+        let s = String::from_utf8_lossy(&bufs);
+        assert!(s.contains("\"stop_reason\":\"max_tokens\""), "{s}");
+    }
+
+    #[test]
+    fn test_tool_valid_args_finish_maps_tool_use() {
+        // 合法 args 不受影响:stop/tool_calls 仍映射 tool_use
+        let mut r = ChatRelay::new(None);
+        let _ = r.process(&super::super::parser::SseEvent {
+            event: Some("c".into()),
+            data: r#"{"id":"1","choices":[{"delta":{"tool_calls":[{"index":0,"id":"call_1","function":{"name":"write_file","arguments":"{\"path\":\"/tmp/t.txt\"}"}}]}}]}"#.into(),
+        });
+        let out = r.process(&super::super::parser::SseEvent {
+            event: Some("c".into()),
+            data: r#"{"id":"1","choices":[{"delta":{},"finish_reason":"stop"}],"usage":{"prompt_tokens":10,"completion_tokens":20}}"#.into(),
+        });
+        let bufs = out.concat();
+        let s = String::from_utf8_lossy(&bufs);
+        assert!(s.contains("\"stop_reason\":\"tool_use\""), "{s}");
+    }
+
+    #[test]
+    fn test_length_and_content_filter_priority_over_tool() {
+        // 对齐 CPA 772c63c8:length/content_filter 优先于 saw_tool_call
+        let mut r = ChatRelay::new(None);
+        let _ = r.process(&super::super::parser::SseEvent {
+            event: Some("c".into()),
+            data: r#"{"id":"1","choices":[{"delta":{"tool_calls":[{"index":0,"id":"call_1","function":{"name":"f","arguments":"{}"}}]}}]}"#.into(),
+        });
+        let out = r.process(&super::super::parser::SseEvent {
+            event: Some("c".into()),
+            data: r#"{"id":"1","choices":[{"delta":{},"finish_reason":"length"}],"usage":{"prompt_tokens":10,"completion_tokens":400}}"#.into(),
+        });
+        let bufs = out.concat();
+        let s = String::from_utf8_lossy(&bufs);
+        assert!(s.contains("\"stop_reason\":\"max_tokens\""), "{s}");
+
+        let mut r = ChatRelay::new(None);
+        let _ = r.process(&super::super::parser::SseEvent {
+            event: Some("c".into()),
+            data: r#"{"id":"1","choices":[{"delta":{"tool_calls":[{"index":0,"id":"call_1","function":{"name":"f","arguments":"{}"}}]}}]}"#.into(),
+        });
+        let out = r.process(&super::super::parser::SseEvent {
+            event: Some("c".into()),
+            data: r#"{"id":"1","choices":[{"delta":{},"finish_reason":"content_filter"}],"usage":{"prompt_tokens":10,"completion_tokens":5}}"#.into(),
+        });
+        let bufs = out.concat();
+        let s = String::from_utf8_lossy(&bufs);
+        assert!(s.contains("\"stop_reason\":\"refusal\""), "{s}");
+    }
+
+    #[test]
+    fn test_tool_whitespace_args_finish_maps_max_tokens() {
+        // 纯空白 args 非法(对齐 CPA:TrimSpace 后为空 → 无效)
+        let mut r = ChatRelay::new(None);
+        let _ = r.process(&super::super::parser::SseEvent {
+            event: Some("c".into()),
+            data: r#"{"id":"1","choices":[{"delta":{"tool_calls":[{"index":0,"id":"call_1","function":{"name":"f","arguments":" \n\t"}}]}}]}"#.into(),
+        });
+        let out = r.process(&super::super::parser::SseEvent {
+            event: Some("c".into()),
+            data: r#"{"id":"1","choices":[{"delta":{},"finish_reason":"stop"}],"usage":{"prompt_tokens":1,"completion_tokens":2}}"#.into(),
+        });
+        let bufs = out.concat();
+        let s = String::from_utf8_lossy(&bufs);
+        assert!(s.contains("\"stop_reason\":\"max_tokens\""), "{s}");
+    }
+
+    #[test]
+    fn test_tool_empty_args_finish_maps_tool_use() {
+        // 空 arguments(无参调用)有效:仍映射 tool_use(对齐 CPA
+        // TestStreamingTool_EmptyArgumentsWithToolCallsEmitsToolUse)
+        let mut r = ChatRelay::new(None);
+        let _ = r.process(&super::super::parser::SseEvent {
+            event: Some("c".into()),
+            data: r#"{"id":"1","choices":[{"delta":{"tool_calls":[{"index":0,"id":"call_1","function":{"name":"f"}}]}}]}"#.into(),
+        });
+        let out = r.process(&super::super::parser::SseEvent {
+            event: Some("c".into()),
+            data: r#"{"id":"1","choices":[{"delta":{},"finish_reason":"stop"}],"usage":{"prompt_tokens":1,"completion_tokens":2}}"#.into(),
+        });
+        let bufs = out.concat();
+        let s = String::from_utf8_lossy(&bufs);
+        assert!(s.contains("\"stop_reason\":\"tool_use\""), "{s}");
+    }
+
+    #[test]
+    fn test_tool_parallel_one_truncated_maps_max_tokens() {
+        // 并行 tool_calls 任一项截断即整体降级(对齐 CPA
+        // TestStreamingTool_ParallelCallsOneTruncatedEmitsMaxTokens)
+        let mut r = ChatRelay::new(None);
+        let _ = r.process(&super::super::parser::SseEvent {
+            event: Some("c".into()),
+            data: r#"{"id":"1","choices":[{"delta":{"tool_calls":[
+                {"index":0,"id":"call_1","function":{"name":"f","arguments":"{}"}},
+                {"index":1,"id":"call_2","function":{"name":"g","arguments":"{\"a\":"}}
+            ]}}]}"#
+                .into(),
+        });
+        let out = r.process(&super::super::parser::SseEvent {
+            event: Some("c".into()),
+            data: r#"{"id":"1","choices":[{"delta":{},"finish_reason":"stop"}],"usage":{"prompt_tokens":1,"completion_tokens":2}}"#.into(),
+        });
+        let bufs = out.concat();
+        let s = String::from_utf8_lossy(&bufs);
+        assert!(s.contains("\"stop_reason\":\"max_tokens\""), "{s}");
+    }
+
+    #[test]
+    fn test_done_without_finish_reason_truncated_args_maps_max_tokens() {
+        // 无 finish_reason 的 [DONE] 终态动态计算(对齐 CPA
+        // TestStreamingTool_TruncatedArgumentsWithoutFinishReasonEmitsMaxTokens)
+        let mut r = ChatRelay::new(None);
+        let _ = r.process(&super::super::parser::SseEvent {
+            event: Some("c".into()),
+            data: r#"{"id":"1","choices":[{"delta":{"tool_calls":[{"index":0,"id":"call_1","function":{"name":"write_file","arguments":"{\"path\":\"/tmp/t.txt\",\"content\":\"hello"}}]}}]}"#.into(),
+        });
+        let out = r.process(&super::super::parser::SseEvent {
+            event: None,
+            data: "[DONE]".into(),
+        });
+        let bufs = out.concat();
+        let s = String::from_utf8_lossy(&bufs);
+        assert!(s.contains("\"stop_reason\":\"max_tokens\""), "{s}");
     }
 
     #[test]
