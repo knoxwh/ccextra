@@ -506,6 +506,35 @@ fn reasoning_item_empty(item: &Value) -> bool {
 /// tool_result content → responses output 与图片 parts 元组(对齐 convertToolResultOutput)。
 /// function_call_output.output 只接受文本,内嵌 image 抽出为元组第二项,
 /// 由调用方追加成随后的 user message(input_image parts)。
+/// 孤儿 tool_result 的 content → 独立 user text 输入项
+/// (对齐 CPA 8c984672 buildOpenAIResponsesStandaloneToolOutputTextParts:
+/// 每个非空文本一个 input_text part;空白/无文本丢弃)
+fn orphan_tool_output_as_user(content: Option<&Value>) -> Option<Value> {
+    let texts: Vec<String> = match content {
+        Some(Value::String(s)) => vec![s.clone()],
+        Some(Value::Array(parts)) => parts
+            .iter()
+            .filter_map(|p| p.get("text").and_then(|v| v.as_str()))
+            .map(String::from)
+            .collect(),
+        Some(other) => vec![other.to_string()],
+        None => Vec::new(),
+    };
+    let parts: Vec<Value> = texts
+        .into_iter()
+        .filter(|t| !t.trim().is_empty())
+        .map(|t| json!({"type": "input_text", "text": t}))
+        .collect();
+    if parts.is_empty() {
+        return None;
+    }
+    Some(json!({
+        "type": "message",
+        "role": "user",
+        "content": parts
+    }))
+}
+
 fn tool_result_output(content: &Value) -> (Value, Vec<Value>) {
     match content {
         Value::Array(items) => {
@@ -1068,6 +1097,8 @@ pub fn convert_to_openai_responses(
     // --- messages → input[] ---
     // custom 工具调用的 call_id 集合(tool_result 需转 custom_tool_call_output)
     let mut custom_call_ids: HashSet<String> = HashSet::new();
+    // 已发射 function_call 的 call_id 集合(孤儿 tool_result 判定用)
+    let mut emitted_call_ids: HashSet<String> = HashSet::new();
     let mut pending_tool_use_ids: Vec<String> = Vec::new();
     let mut pending_system_reminders: Vec<Value> = Vec::new();
 
@@ -1230,6 +1261,7 @@ pub fn convert_to_openai_responses(
                         };
                         let is_custom = custom_tool_names.contains(name);
                         let short_id = shorten_call_id(id);
+                        emitted_call_ids.insert(short_id.clone());
                         if is_custom {
                             // custom 工具:Claude tool_use.input 是 {"input": str} 对象,
                             // 解包回字符串,发 custom_tool_call(对齐转换 custom 分支)
@@ -1269,6 +1301,12 @@ pub fn convert_to_openai_responses(
                                 "call_id": short_id,
                                 "output": output
                             }));
+                        } else if !emitted_call_ids.contains(&short_id) {
+                            // 孤儿 output(无配对 function_call)不发,转 user text
+                            // (对齐 CPA 8c984672 appendStandaloneResponsesToolOutputAsUser)
+                            if let Some(item) = orphan_tool_output_as_user(part.get("content")) {
+                                tool_result_items.push(item);
+                            }
                         } else {
                             tool_result_items.push(json!({
                                 "type": "function_call_output",
@@ -2112,6 +2150,52 @@ mod tests {
         assert_eq!(body["input"][0]["name"], "get_weather");
         assert_eq!(body["input"][1]["type"], "function_call_output");
         assert_eq!(body["input"][1]["output"], "sunny");
+    }
+
+    #[test]
+    fn test_orphan_tool_result_becomes_user_text() {
+        // 对齐 CPA 8c984672:无配对 tool_use 的 tool_result 不发孤儿
+        // function_call_output,转 user text(防上游严格配对校验 400)
+        let mut body = json!({
+            "model": "test",
+            "messages": [
+                {"role": "user", "content": [
+                    {"type": "tool_result", "tool_use_id": "gone", "content": "leftover output"}
+                ]}
+            ]
+        });
+        convert_to_openai_responses(&mut body, "test-model").unwrap();
+        assert_eq!(body["input"][0]["type"], "message");
+        assert_eq!(body["input"][0]["role"], "user");
+        assert_eq!(body["input"][0]["content"][0]["type"], "input_text");
+        assert_eq!(body["input"][0]["content"][0]["text"], "leftover output");
+    }
+
+    #[test]
+    fn test_unmatched_explicit_call_id_not_rebound() {
+        // 对齐 CPA 8c984672:显式 call_id 与 pending call 不匹配时,
+        // 不得被改写/重绑,整体按 user text 发出
+        let mut body = json!({
+            "model": "test",
+            "messages": [
+                {"role": "assistant", "content": [
+                    {"type": "tool_use", "id": "t1", "name": "Read", "input": {}}
+                ]},
+                {"role": "user", "content": [
+                    {"type": "tool_result", "tool_use_id": "t_other", "content": "other_result"}
+                ]}
+            ]
+        });
+        convert_to_openai_responses(&mut body, "test-model").unwrap();
+        let items = body["input"].as_array().unwrap();
+        assert_eq!(items[0]["type"], "function_call");
+        assert_eq!(items[0]["call_id"], "t1");
+        for item in items {
+            assert_ne!(item["type"], "function_call_output", "{item}");
+            if item["type"] == "message" {
+                assert_eq!(item["content"][0]["text"], "other_result");
+            }
+        }
     }
 
     #[test]
@@ -3302,8 +3386,10 @@ Be verbose.
             }]
         });
         convert_to_openai_responses(&mut body, "test-model").unwrap();
-        // 图片抽出(对齐 sub2api):output 只留文本字符串,图片进随后的 user message
-        assert_eq!(body["input"][0]["output"], "result");
+        // 孤儿(无 tool_use):文本转 user text,图片进随后的 user message
+        assert_eq!(body["input"][0]["type"], "message");
+        assert_eq!(body["input"][0]["content"][0]["type"], "input_text");
+        assert_eq!(body["input"][0]["content"][0]["text"], "result");
         assert_eq!(body["input"][1]["type"], "message");
         assert_eq!(body["input"][1]["role"], "user");
         let parts = body["input"][1]["content"].as_array().unwrap();
@@ -3327,12 +3413,17 @@ Be verbose.
             }]
         });
         convert_to_openai_responses(&mut body, "test-model").unwrap();
-        assert_eq!(body["input"][0]["output"], "line1\nline2");
+        assert_eq!(body["input"][0]["type"], "message");
+        let parts = body["input"][0]["content"].as_array().unwrap();
+        assert_eq!(parts.len(), 2);
+        assert_eq!(parts[0]["text"], "line1");
+        assert_eq!(parts[1]["text"], "line2");
     }
 
     #[test]
-    fn test_tool_result_image_only_uses_placeholder() {
-        // 只有图片的 tool_result:output 用占位,图片进随后的 user message
+    fn test_tool_result_image_only_orphan_dropped() {
+        // 只有图片的孤儿 tool_result:无文本 part 不发独立项,
+        // 图片仍进随后的 user message
         let mut body = json!({
             "model": "test",
             "messages": [{
@@ -3347,8 +3438,8 @@ Be verbose.
             }]
         });
         convert_to_openai_responses(&mut body, "test-model").unwrap();
-        assert_eq!(body["input"][0]["output"], "(no output)");
-        assert_eq!(body["input"][1]["content"][0]["type"], "input_image");
+        assert_eq!(body["input"][0]["type"], "message");
+        assert_eq!(body["input"][0]["content"][0]["type"], "input_image");
     }
 
     #[test]
