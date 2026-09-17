@@ -54,7 +54,7 @@ ccextra 将 Anthropic Messages 入口接到不同上游协议，同时尽量保�
 
 ### Claude
 
-`convert_passthrough` 只改 `model`。身份头按安全规则透传，并根据 body 重建所需 `anthropic-beta`。
+`convert_passthrough` 只改 `model`。身份头按排除表透传，`anthropic-beta` 原样转发、缺失时不补。
 
 ### OpenAI Chat
 

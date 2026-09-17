@@ -1,12 +1,33 @@
 # ccextra
 
+[![License: MIT](https://img.shields.io/badge/License-MIT-blue.svg)](LICENSE)
+![Rust](https://img.shields.io/badge/rust-1.75%2B-orange.svg)
+![Version](https://img.shields.io/badge/version-0.2.0-green.svg)
+
 **[中文](README.md)** | **English**
 
-> Single-process Rust proxy that routes, converts, and relays Claude Code Anthropic Messages requests to upstream providers.
+Single-process Rust proxy that routes, converts, and relays Claude Code Anthropic Messages requests to upstream providers.
 
-## Overview
+## Features
 
-One process listens on one port. Anthropic-shaped input resolves to a provider by model alias. Deterministic normalization reduces cross-turn serialization drift and improves upstream prompt-cache reuse.
+- **Multi-protocol upstreams**: Claude, OpenAI Chat, OpenAI Responses, Gemini, and Antigravity share one endpoint, routed by model alias.
+- **Claude passthrough**: a `claude` provider replaces only `model` and leaves the rest of the request intact.
+- **Deterministic normalization**: stabilizes tool and schema order, historical reminders, tool-argument key order, and trailing whitespace to cut cross-turn serialization drift, aimed at raising upstream prompt-cache hit rate.
+- **Dynamic providers**: xAI Grok OAuth injects a Responses provider; Antigravity credentials load in the background and refresh models on a timer.
+- **Hot reload**: `POST /reload` swaps providers, payload, normalization, auth, proxy, User-Agent, and the reasoning registry without a restart.
+
+## Architecture
+
+```mermaid
+flowchart LR
+    CC["Claude Code"] --> P["ccextra"]
+    P -->|claude| A["Anthropic Messages"]
+    P -->|openai_chat| B["Chat Completions"]
+    P -->|openai_responses| C["Responses"]
+    P -->|gemini / antigravity| D["Gemini GenerateContent"]
+```
+
+One process listens on one port. Input is always Anthropic-shaped; every path returns Anthropic responses (including SSE). See [architecture](docs/design.md).
 
 ## Upstream protocols
 
@@ -22,11 +43,18 @@ xAI Grok OAuth injects an `openai_responses` provider; it is not a separate `pro
 
 ## Quick start
 
+### Prerequisites
+
+- Rust 1.75 or newer
+- At least one upstream provider URL and key (OAuth providers need no key)
+
 ```bash
 cargo build --release
 cp config.example.yaml config.yaml
 ./target/release/ccextra --config config.yaml
 ```
+
+### Example configuration
 
 ```yaml
 server:
@@ -46,22 +74,36 @@ normalize:
   drift_detector: true
 ```
 
+### Point Claude Code at it
+
 ```bash
 export ANTHROPIC_BASE_URL=http://127.0.0.1:8222
 export ANTHROPIC_AUTH_TOKEN=sk-ccextra-xxx # required when secret_key is set
 ```
 
-`build.sh` updates root `./ccextra`; `start.sh`, `stop.sh`, and `restart.sh` manage a background process.
+For a background process, `build.sh` builds release and updates root `./ccextra`; `start.sh`, `stop.sh`, and `restart.sh` manage the process.
 
 ## Configuration
 
-See [config.example.yaml](config.example.yaml) for every field. `models[].alias` is inbound model name and cannot duplicate across providers. `base_url` accepts an ordered fallback array. Provider `proxy_url` overrides `server.proxy_url`; `"direct"` disables proxy use. Reasoning levels live in [models.json](models.json) next to the config.
+See [config.example.yaml](config.example.yaml) for every field. Key points:
 
-`secret_key` enables ingress authentication. Plaintext keys become bcrypt hashes on load and are written back; requests accept `x-api-key` or `Authorization: Bearer`. `payload` applies model-glob top-level overrides, optionally scoped by `protocol`. `prompt_cache_key` applies only to OpenAI paths, uses Claude Code session ID, and never replaces a nonempty key.
+- `models[].alias` is the inbound model name and cannot duplicate across providers; `base_url` accepts an ordered fallback array.
+- Provider `proxy_url` overrides `server.proxy_url`; `"direct"` disables proxy use.
+- `secret_key` enables ingress authentication: plaintext keys become bcrypt hashes on load and are written back; requests accept `x-api-key` or `Authorization: Bearer`.
+- `payload` applies model-glob top-level overrides, optionally scoped by `protocol`.
+- `prompt_cache_key` applies only to OpenAI paths, uses Claude Code session ID, and never replaces a nonempty key.
+- `models_file` points at the reasoning-level table (default [models.json](models.json) next to the config). Exact `id` match clamps inbound effort to the nearest supported level; missing file or unknown models leave effort unchanged.
 
-`user_agents` overrides Claude, Codex, Grok, and Antigravity identifiers. `logging.request_body` writes diagnostic requests under `logs/`. `POST /reload` reloads providers, payload, normalization, auth, proxy, User-Agent, and the reasoning registry. Restart for `logging.level` changes. `antigravity.connection-pool` controls the Antigravity upstream connection pool: short connections by default; with `enabled: true`, idle connections are kept per `idle-conn-timeout` (default 30s, capped at 210s) and `max-idle-conns-per-host` (default 2, capped at 100).
+<details>
+<summary>Advanced options</summary>
 
-`models_file` is the reasoning-level table (default `models.json` next to the config). Exact `id` match clamps inbound effort to the nearest supported level; missing file or unknown models leave effort unchanged. Edit the file and `POST /reload`; no rebuild.
+- `user_agents` overrides Claude, Codex, Grok, and Antigravity identifiers.
+- `logging.request_body` writes diagnostic requests under `logs/`.
+- `POST /reload` reloads providers, payload, normalization, auth, proxy, User-Agent, and the reasoning registry; restart for `logging.level` changes.
+- `antigravity.connection-pool` controls the Antigravity upstream connection pool: short connections by default; with `enabled: true`, idle connections are kept per `idle-conn-timeout` (default 30s, capped at 210s) and `max-idle-conns-per-host` (default 2, capped at 100).
+- Edits to `models.json` take effect after `POST /reload`; no rebuild needed.
+
+</details>
 
 ## Endpoints
 
@@ -77,11 +119,11 @@ With `secret_key`, the first three Anthropic endpoints require authentication.
 
 ## Runtime behavior
 
-Requests pass through authentication, routing, normalization, protocol conversion, payload overrides, cache-key injection, and upstream delivery. Claude passthrough preserves inbound identity headers and rebuilds required `anthropic-beta`. All streaming output returns as Anthropic SSE and emits `: keepalive` after 10 seconds idle.
+Requests pass through authentication, routing, normalization, protocol conversion, payload overrides, cache-key injection, and upstream delivery. Claude passthrough preserves inbound identity headers; `anthropic-beta` passes through verbatim and is never synthesized. All streaming output returns as Anthropic SSE and emits `: keepalive` after 10 seconds idle.
 
 Network errors, 429, and 5xx retry with exponential backoff within a 3-second total budget and constrained `Retry-After`; ordered `base_url` values are tried in sequence.
 
-## OAuth and development
+## OAuth and operations
 
 ```bash
 ./ccextra antigravity-login
@@ -89,8 +131,20 @@ Network errors, 429, and 5xx retry with exponential backoff within a 3-second to
 ./ccextra xai-login
 ./ccextra xai-status
 ./scripts/check_antigravity_quota.sh
+./scripts/check_grok_quota.sh
+```
+
+Antigravity credentials default to `.cache/antigravity` beside the config file; xAI defaults to `.cache/xai`. xAI loads at startup. Antigravity loads in background and refreshes models every three hours. Call `POST /reload` after config edits.
+
+## Development
+
+```bash
 cargo test --workspace
 cargo clippy --workspace --all-targets -- -D warnings
 ```
 
-Antigravity credentials default to `.cache/antigravity` beside the config file; xAI defaults to `.cache/xai`. xAI loads at startup. Antigravity loads in background and refreshes models every three hours. See [architecture](docs/design.md), [glossary](docs/glossary.md), and [MIT license](LICENSE).
+Three crates: `ccextra-cli` handles config, CLI, and startup; `ccextra-server` handles HTTP, upstream requests, and SSE; `ccextra-core` holds routing, normalization, and conversion logic. See [architecture](docs/design.md) and [glossary](docs/glossary.md).
+
+## License
+
+[MIT](LICENSE)
