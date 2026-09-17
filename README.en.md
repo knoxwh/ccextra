@@ -11,7 +11,7 @@ Single-process Rust proxy that routes, converts, and relays Claude Code Anthropi
 ## Features
 
 - **Multi-protocol upstreams**: Claude, OpenAI Chat, OpenAI Responses, Gemini, and Antigravity share one endpoint, routed by model alias.
-- **Claude passthrough**: a `claude` provider replaces only `model` (non-Claude models also get their system prompt cleaned of billing fingerprints, Claude identity, and Claude trigger blocks, plus out-of-range effort clamped from `models.json`) and leaves the rest of the request intact.
+- **Claude passthrough**: a `claude` provider replaces only `model` (non-Claude models also get their system prompt cleaned of billing fingerprints, Claude identity, and Claude trigger blocks, plus out-of-range effort clamped from `models.json`, or pinned via `force_effort`) and leaves the rest of the request intact.
 - **Deterministic normalization**: stabilizes tool and schema order, historical reminders, tool-argument key order, and trailing whitespace to cut cross-turn serialization drift, aimed at raising upstream prompt-cache hit rate.
 - **Dynamic providers**: xAI Grok OAuth injects a Responses provider; Antigravity credentials load in the background and refresh models on a timer.
 - **Hot reload**: `POST /reload` swaps providers, payload, normalization, auth, proxy, User-Agent, and the reasoning registry without a restart.
@@ -92,7 +92,7 @@ See [config.example.yaml](config.example.yaml) for every field. Key points:
 - `secret_key` enables ingress authentication: plaintext keys become bcrypt hashes on load and are written back; requests accept `x-api-key` or `Authorization: Bearer`.
 - `payload` applies model-glob top-level overrides, optionally scoped by `protocol`.
 - `prompt_cache_key` applies only to OpenAI paths, uses Claude Code session ID, and never replaces a nonempty key.
-- `models_file` points at the reasoning-level table (default [models.json](models.json) next to the config). Exact `id` match clamps inbound effort to the nearest supported level; missing file or unknown models leave effort unchanged.
+- `models_file` points at the reasoning-level table (default [models.json](models.json) next to the config). Exact `id` match clamps inbound effort to the nearest supported level; missing file or unknown models leave effort unchanged. An entry may set `force_effort`: wherever clamping would apply, effort is rewritten to this fixed value (unclamped); native `*claude*` models and requests with thinking explicitly disabled are unaffected.
 
 <details>
 <summary>Advanced options</summary>

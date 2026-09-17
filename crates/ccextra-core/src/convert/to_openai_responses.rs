@@ -1500,7 +1500,11 @@ pub fn convert_to_openai_responses_with(
         "medium"
     };
     let effort = crate::thinking::resolve_effort_from_body(body).unwrap_or(default_effort);
-    let effort = crate::thinking::clamp_effort(effort, upstream_model, registry);
+    // 固定 effort 优先(生效范围与 clamp 一致,值不钳制)
+    let effort = match crate::thinking::forced_effort(upstream_model, registry) {
+        Some(forced) => forced,
+        None => crate::thinking::clamp_effort(effort, upstream_model, registry),
+    };
     // grok 模型对齐 grok-build:reasoning.summary=concise(其余模型不设)
     openai["reasoning"] = if upstream_model.to_ascii_lowercase().contains("grok") {
         json!({"effort": effort, "summary": "concise"})
@@ -1693,18 +1697,15 @@ mod tests {
         vec![crate::thinking::ModelCapability {
             id: "gpt-6-astra".into(),
             reasoning_levels: vec!["low".into(), "medium".into()],
+            force_effort: None,
         }]
     }
 
     fn glm51_registry() -> Vec<crate::thinking::ModelCapability> {
         vec![crate::thinking::ModelCapability {
             id: "glm-5.1".into(),
-            reasoning_levels: vec![
-                "low".into(),
-                "medium".into(),
-                "high".into(),
-                "xhigh".into(),
-            ],
+            reasoning_levels: vec!["low".into(), "medium".into(), "high".into(), "xhigh".into()],
+            force_effort: None,
         }]
     }
 
@@ -2572,6 +2573,27 @@ mod tests {
         let mut body = json!({"model": "test", "messages": []});
         convert_to_openai_responses(&mut body, "gpt-5.4").unwrap();
         assert_eq!(body["reasoning"]["effort"], "medium");
+    }
+
+    #[test]
+    fn test_force_effort_overrides_inbound_and_default() {
+        // force_effort 固定档:显式 effort 与默认 effort 均改写为固定值
+        let registry = vec![crate::thinking::ModelCapability {
+            id: "gpt-6-astra".into(),
+            reasoning_levels: vec!["low".into(), "medium".into()],
+            force_effort: Some("low".into()),
+        }];
+        let mut explicit = json!({
+            "model": "test",
+            "output_config": {"effort": "high"},
+            "messages": []
+        });
+        convert_to_openai_responses_with(&mut explicit, "gpt-6-astra", &registry).unwrap();
+        assert_eq!(explicit["reasoning"]["effort"], "low");
+
+        let mut no_effort = json!({"model": "test", "messages": []});
+        convert_to_openai_responses_with(&mut no_effort, "gpt-6-astra", &registry).unwrap();
+        assert_eq!(no_effort["reasoning"]["effort"], "low");
     }
 
     #[test]

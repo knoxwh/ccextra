@@ -35,7 +35,7 @@ xAI Grok 不是 protocol。它使用 OAuth 凭证动态创建 `openai_responses`
 `payload` 中按模型 glob 匹配的顶层 JSON 覆盖。规则可用 `protocol` 限定；Claude 直通必须显式限定才接受覆盖。
 
 **reasoning 注册表**
-用户 `models.json`（路径由 `models_file` 指定，默认同目录）。按上游模型 `id` 精确匹配，把 effort 钳到该模型支持的最近档。缺文件或未收录不钳。core 不读文件。
+用户 `models.json`（路径由 `models_file` 指定，默认同目录）。按上游模型 `id` 精确匹配，把 effort 钳到该模型支持的最近档。缺文件或未收录不钳。条目可设 `force_effort` 固定档：凡钳制介入处改写为该值（不钳制）。core 不读文件。
 
 **全局代理与 provider 代理**
 `server.proxy_url` 是默认值；provider `proxy_url` 优先。`"direct"` 或空值表示不走代理。

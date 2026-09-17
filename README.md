@@ -11,7 +11,7 @@
 ## 特性
 
 - **多协议上游**：Claude、OpenAI Chat、OpenAI Responses、Gemini、Antigravity 共用一个入口，按模型 alias 路由。
-- **Claude 直通**：`claude` provider 只替换 `model`，非 Claude 模型另清洗 system（计费指纹、Claude 身份与触发块）并按 `models.json` 把越档 effort 钳到支持档，其余请求内容保持原样。
+- **Claude 直通**：`claude` provider 只替换 `model`，非 Claude 模型另清洗 system（计费指纹、Claude 身份与触发块）并按 `models.json` 把越档 effort 钳到支持档（或 `force_effort` 固定档），其余请求内容保持原样。
 - **确定性归一化**：稳定工具和 schema 顺序、历史 reminder、工具参数键序与尾部空白，减少跨轮序列化漂移，目标是提高上游 prompt cache 命中率。
 - **动态 provider**：xAI Grok 经 OAuth 注入 Responses provider；Antigravity 凭证后台加载并定时刷新模型。
 - **热重载**：`POST /reload` 替换 providers、payload、归一化、认证、代理、User-Agent 和 reasoning 注册表，无需重启。
@@ -92,7 +92,7 @@ export ANTHROPIC_AUTH_TOKEN=sk-ccextra-xxx # 配置 secret_key 时需要
 - `secret_key` 启用入口认证：明文 key 在加载时转为 bcrypt 并写回配置，请求接受 `x-api-key` 或 `Authorization: Bearer`。
 - `payload` 按模型 glob 覆盖顶层参数，可用 `protocol` 限定。
 - `prompt_cache_key` 只用于 OpenAI 路径，取 Claude Code 会话 ID，且不覆盖已有非空值。
-- `models_file` 指向 reasoning 级别表（默认配置文件旁 [models.json](models.json)），按上游模型 `id` 精确匹配，把入站 effort 钳到该模型支持的最近档；缺文件或未收录的模型不钳。
+- `models_file` 指向 reasoning 级别表（默认配置文件旁 [models.json](models.json)），按上游模型 `id` 精确匹配，把入站 effort 钳到该模型支持的最近档；缺文件或未收录的模型不钳。条目可加 `force_effort`：凡钳制会介入的 effort 一律改写为该固定值（不钳制），`*claude*` 原生模型与显式关闭思考的请求不受影响。
 
 <details>
 <summary>进阶选项</summary>

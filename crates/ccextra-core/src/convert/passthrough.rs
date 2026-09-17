@@ -159,7 +159,8 @@ fn sanitize_system_messages(body: &mut Value, upstream_model: &str) -> bool {
 ///
 /// 非 Claude 模型经 claude 协议接入百炼等上游时,平台档位宽于模型档位
 /// (`medium`/`xhigh` 发给只有 `low`/`high`/`max` 的模型会 400),
-/// 故按 models.json 注册表钳到最近档。
+/// 故按 models.json 注册表钳到最近档;条目设置 `force_effort` 时
+/// 改写为该固定值(不钳制)。
 ///
 /// 跳过条件:
 /// - 上游模型匹配 glob `*claude*`(大小写不敏感):Claude 模型不钳
@@ -201,15 +202,23 @@ pub fn clamp_passthrough_effort(
     } else {
         return false; // 无显式 effort(如仅 legacy budget_tokens)不处理
     };
-    let Some(current) = body.pointer(pointer).and_then(Value::as_str).map(str::to_string) else {
+    let Some(current) = body
+        .pointer(pointer)
+        .and_then(Value::as_str)
+        .map(str::to_string)
+    else {
         return false;
     };
-    let clamped = clamp_effort(&current, upstream_model, registry);
-    if clamped == current {
-        return false; // 不越档:字节不变
+    // 固定 effort 优先(生效范围与 clamp 一致,值不钳制)
+    let target = match crate::thinking::forced_effort(upstream_model, registry) {
+        Some(forced) => forced.to_string(),
+        None => clamp_effort(&current, upstream_model, registry).to_string(),
+    };
+    if target == current {
+        return false; // 值不变:字节不变
     }
     if let Some(slot) = body.pointer_mut(pointer) {
-        *slot = Value::String(clamped.to_string());
+        *slot = Value::String(target);
     }
     true
 }
@@ -225,10 +234,12 @@ mod tests {
             ModelCapability {
                 id: "glm-5.3".into(),
                 reasoning_levels: vec!["low".into(), "high".into(), "max".into()],
+                force_effort: None,
             },
             ModelCapability {
                 id: "claude-opus-5".into(),
                 reasoning_levels: vec!["low".into(), "high".into(), "max".into()],
+                force_effort: None,
             },
         ]
     }
@@ -259,7 +270,10 @@ mod tests {
             ],
             "messages": []
         });
-        assert!(sanitize_passthrough_prompt(&mut body, "deepseek-v4.1-flash"));
+        assert!(sanitize_passthrough_prompt(
+            &mut body,
+            "deepseek-v4.1-flash"
+        ));
         let blocks = body["system"].as_array().unwrap();
         assert_eq!(blocks.len(), 1);
         let text = blocks[0]["text"].as_str().unwrap();
@@ -316,7 +330,10 @@ mod tests {
             "messages": []
         });
         let claude_before = serde_json::to_string(&claude_body).unwrap();
-        assert!(!sanitize_passthrough_prompt(&mut claude_body, "claude-opus-5"));
+        assert!(!sanitize_passthrough_prompt(
+            &mut claude_body,
+            "claude-opus-5"
+        ));
         assert_eq!(serde_json::to_string(&claude_body).unwrap(), claude_before);
     }
 
@@ -331,7 +348,8 @@ mod tests {
     /// 嵌套 thinking.output_config.effort 越档:xhigh 与 high/max 等距,tie 取低
     #[test]
     fn test_clamp_nested_thinking_output_config_effort() {
-        let mut body = json!({"thinking": {"type": "enabled", "output_config": {"effort": "xhigh"}}});
+        let mut body =
+            json!({"thinking": {"type": "enabled", "output_config": {"effort": "xhigh"}}});
         assert!(clamp_passthrough_effort(&mut body, "glm-5.3", &registry()));
         assert_eq!(body["thinking"]["output_config"]["effort"], "high");
     }
@@ -340,7 +358,11 @@ mod tests {
     #[test]
     fn test_claude_model_skipped() {
         let mut body = json!({"output_config": {"effort": "medium"}});
-        assert!(!clamp_passthrough_effort(&mut body, "claude-opus-5", &registry()));
+        assert!(!clamp_passthrough_effort(
+            &mut body,
+            "claude-opus-5",
+            &registry()
+        ));
         assert_eq!(body["output_config"]["effort"], "medium");
     }
 
@@ -348,7 +370,11 @@ mod tests {
     #[test]
     fn test_claude_model_case_insensitive_skip() {
         let mut body = json!({"output_config": {"effort": "medium"}});
-        assert!(!clamp_passthrough_effort(&mut body, "US.Anthropic.CLAUDE-Sonnet-4", &registry()));
+        assert!(!clamp_passthrough_effort(
+            &mut body,
+            "US.Anthropic.CLAUDE-Sonnet-4",
+            &registry()
+        ));
         assert_eq!(body["output_config"]["effort"], "medium");
     }
 
@@ -356,7 +382,11 @@ mod tests {
     #[test]
     fn test_registry_miss_and_empty_skipped() {
         let mut body = json!({"output_config": {"effort": "medium"}});
-        assert!(!clamp_passthrough_effort(&mut body, "glm-9.9-unknown", &registry()));
+        assert!(!clamp_passthrough_effort(
+            &mut body,
+            "glm-9.9-unknown",
+            &registry()
+        ));
         assert!(!clamp_passthrough_effort(&mut body, "glm-5.3", &[]));
         assert_eq!(body["output_config"]["effort"], "medium");
     }
@@ -389,7 +419,8 @@ mod tests {
     /// thinking 显式 disabled:上游不校验 effort(实测百炼忽略越档值)
     #[test]
     fn test_thinking_disabled_skipped() {
-        let mut body = json!({"thinking": {"type": "disabled", "output_config": {"effort": "medium"}}});
+        let mut body =
+            json!({"thinking": {"type": "disabled", "output_config": {"effort": "medium"}}});
         assert!(!clamp_passthrough_effort(&mut body, "glm-5.3", &registry()));
         assert_eq!(body["thinking"]["output_config"]["effort"], "medium");
     }
@@ -409,5 +440,56 @@ mod tests {
         let before = serde_json::to_string(&body).unwrap();
         assert!(!clamp_passthrough_effort(&mut body, "glm-5.3", &registry()));
         assert_eq!(serde_json::to_string(&body).unwrap(), before);
+    }
+
+    /// force_effort:入站在档(钳制本不会动)也改写为固定值,
+    /// 且固定值不受 reasoning_levels 钳制
+    #[test]
+    fn test_force_effort_overrides_without_clamp() {
+        let reg = vec![ModelCapability {
+            id: "glm-5.3".into(),
+            reasoning_levels: vec!["low".into(), "high".into()],
+            force_effort: Some("max".into()),
+        }];
+        let mut body = json!({"output_config": {"effort": "high"}});
+        assert!(clamp_passthrough_effort(&mut body, "glm-5.3", &reg));
+        assert_eq!(body["output_config"]["effort"], "max");
+    }
+
+    /// force_effort 与当前值相同:不写回,字节不变
+    #[test]
+    fn test_force_effort_same_value_no_writeback() {
+        let reg = vec![ModelCapability {
+            id: "glm-5.3".into(),
+            reasoning_levels: vec!["low".into(), "high".into(), "max".into()],
+            force_effort: Some("high".into()),
+        }];
+        let mut body = json!({"model": "x", "output_config": {"effort": "high"}, "messages": []});
+        let before = serde_json::to_string(&body).unwrap();
+        assert!(!clamp_passthrough_effort(&mut body, "glm-5.3", &reg));
+        assert_eq!(serde_json::to_string(&body).unwrap(), before);
+    }
+
+    /// force_effort 跳过条件与 clamp 一致:claude 模型、disabled 不改写
+    #[test]
+    fn test_force_effort_skips_claude_and_disabled() {
+        let reg = vec![ModelCapability {
+            id: "claude-opus-5".into(),
+            reasoning_levels: vec!["low".into(), "high".into()],
+            force_effort: Some("low".into()),
+        }];
+        let mut body = json!({"output_config": {"effort": "high"}});
+        assert!(!clamp_passthrough_effort(&mut body, "claude-opus-5", &reg));
+        assert_eq!(body["output_config"]["effort"], "high");
+
+        let reg2 = vec![ModelCapability {
+            id: "glm-5.3".into(),
+            reasoning_levels: vec!["low".into(), "high".into()],
+            force_effort: Some("low".into()),
+        }];
+        let mut body2 =
+            json!({"thinking": {"type": "disabled", "output_config": {"effort": "high"}}});
+        assert!(!clamp_passthrough_effort(&mut body2, "glm-5.3", &reg2));
+        assert_eq!(body2["thinking"]["output_config"]["effort"], "high");
     }
 }

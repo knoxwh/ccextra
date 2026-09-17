@@ -727,11 +727,7 @@ async fn handle_messages(
             }
         }
         Protocol::OpenAiChat => {
-            convert_to_openai_chat_with(
-                &mut body_json,
-                &route.upstream_model,
-                &thinking_registry,
-            )?;
+            convert_to_openai_chat_with(&mut body_json, &route.upstream_model, &thinking_registry)?;
             if normalize_enabled {
                 normalize_target_post(&mut body_json, TargetShape::OpenAiChat);
                 observe_drift_for(
@@ -2180,6 +2176,7 @@ models:
             Arc::new(vec![ccextra_core::thinking::ModelCapability {
                 id: "glm-5.3".into(),
                 reasoning_levels: vec!["low".into(), "high".into(), "max".into()],
+                force_effort: None,
             }]);
         let app = app(state);
 

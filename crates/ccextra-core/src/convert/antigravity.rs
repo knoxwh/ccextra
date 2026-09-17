@@ -40,12 +40,8 @@ pub fn convert_to_antigravity_with(
     registry: &[crate::thinking::ModelCapability],
 ) -> (Value, HashMap<String, String>) {
     // 1. 先转换为 Gemini 格式(Antigravity 用 VALIDATED schema 语义)
-    let (gemini_body, short_to_original) = convert_to_gemini_with_registry(
-        body,
-        upstream_model,
-        SchemaFlavor::Antigravity,
-        registry,
-    );
+    let (gemini_body, short_to_original) =
+        convert_to_gemini_with_registry(body, upstream_model, SchemaFlavor::Antigravity, registry);
 
     // 2. 包裹为 Antigravity 格式(对齐 CLIProxyAPI geminiToAntigravity)
     let mut antigravity = serde_json::json!({

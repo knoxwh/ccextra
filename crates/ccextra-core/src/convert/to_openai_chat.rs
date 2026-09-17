@@ -47,7 +47,11 @@ pub fn convert_to_openai_chat_with(
         if effort == "none" && is_kimi_upstream_model(upstream_model) {
             effort
         } else {
-            crate::thinking::clamp_effort(effort, upstream_model, registry)
+            // 固定 effort 优先(生效范围与 clamp 一致,值不钳制)
+            match crate::thinking::forced_effort(upstream_model, registry) {
+                Some(forced) => forced,
+                None => crate::thinking::clamp_effort(effort, upstream_model, registry),
+            }
         }
     });
     let capabilities = openai_chat_capabilities(upstream_model, reasoning_effort.unwrap_or(""));
@@ -1786,15 +1790,49 @@ IMPORTANT: Assist with authorized security testing.
         });
         let registry = vec![crate::thinking::ModelCapability {
             id: "glm-5.1".into(),
-            reasoning_levels: vec![
-                "low".into(),
-                "medium".into(),
-                "high".into(),
-                "xhigh".into(),
-            ],
+            reasoning_levels: vec!["low".into(), "medium".into(), "high".into(), "xhigh".into()],
+            force_effort: None,
         }];
         convert_to_openai_chat_with(&mut body, "glm-5.1", &registry).unwrap();
         assert_eq!(body["reasoning_effort"], "xhigh");
+    }
+
+    #[test]
+    fn test_force_effort_overrides_inbound() {
+        // force_effort 固定档:入站 max 不钳到 xhigh,直接改写为 low
+        let mut body = json!({
+            "model": "test",
+            "output_config": {"effort": "max"},
+            "thinking": {"type": "adaptive"},
+            "messages": [{"role": "user", "content": "test"}]
+        });
+        let registry = vec![crate::thinking::ModelCapability {
+            id: "glm-5.1".into(),
+            reasoning_levels: vec!["low".into(), "medium".into(), "high".into(), "xhigh".into()],
+            force_effort: Some("low".into()),
+        }];
+        convert_to_openai_chat_with(&mut body, "glm-5.1", &registry).unwrap();
+        assert_eq!(body["reasoning_effort"], "low");
+    }
+
+    #[test]
+    fn test_force_effort_kimi_writes_thinking_shape() {
+        // kimi 上游:固定档写 thinking.effort,不发 reasoning_effort
+        let mut body = json!({
+            "model": "test",
+            "output_config": {"effort": "high"},
+            "thinking": {"type": "adaptive"},
+            "messages": [{"role": "user", "content": "test"}]
+        });
+        let registry = vec![crate::thinking::ModelCapability {
+            id: "kimi-k2.8".into(),
+            reasoning_levels: vec!["low".into(), "high".into(), "max".into()],
+            force_effort: Some("low".into()),
+        }];
+        convert_to_openai_chat_with(&mut body, "kimi-k2.8", &registry).unwrap();
+        assert_eq!(body["reasoning_effort"], Value::Null);
+        assert_eq!(body["thinking"]["type"], "enabled");
+        assert_eq!(body["thinking"]["effort"], "low");
     }
 
     #[test]
@@ -1909,6 +1947,7 @@ IMPORTANT: Assist with authorized security testing.
         vec![crate::thinking::ModelCapability {
             id: "kimi-k2.8".into(),
             reasoning_levels: vec!["low".into(), "high".into(), "max".into()],
+            force_effort: None,
         }]
     }
 

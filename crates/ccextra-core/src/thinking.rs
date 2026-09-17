@@ -62,6 +62,10 @@ const THRESHOLD_HIGH: i64 = 24576;
 pub struct ModelCapability {
     pub id: String,
     pub reasoning_levels: Vec<String>,
+    /// 固定 effort:设置后凡 clamp 介入的 effort 一律改用该值(不钳制);
+    /// 非法级别值视为未设置
+    #[serde(default)]
+    pub force_effort: Option<String>,
 }
 
 #[derive(Deserialize)]
@@ -74,25 +78,37 @@ pub fn parse_registry(json: &str) -> Result<Vec<ModelCapability>, serde_json::Er
     serde_json::from_str::<RegistryFile>(json).map(|r| r.models)
 }
 
+/// 按上游模型名查注册表条目(大小写不敏感精确匹配)
+fn find_capability<'a>(
+    model: &str,
+    registry: &'a [ModelCapability],
+) -> Option<&'a ModelCapability> {
+    let model_lower = model.trim().to_ascii_lowercase();
+    registry
+        .iter()
+        .find(|cap| cap.id.to_ascii_lowercase() == model_lower)
+}
+
 /// 查找模型支持的 reasoning_levels(精确匹配或别名匹配,测试可注入 registry)
 ///
 /// 匹配逻辑(大小写不敏感):
 /// 1. 精确匹配:`glm-5.1` 匹配 `glm-5.1`
 /// 2. 别名匹配:`glm-5.1-27717e1a8a72-glm51` 也能匹配到独立条目
 fn lookup_model_levels_impl(model: &str, registry: &[ModelCapability]) -> Option<Vec<Level>> {
-    let model_lower = model.trim().to_ascii_lowercase();
-    registry.iter().find_map(|cap| {
-        if cap.id.to_ascii_lowercase() == model_lower {
-            Some(
-                cap.reasoning_levels
-                    .iter()
-                    .filter_map(|s| Level::parse(s))
-                    .collect(),
-            )
-        } else {
-            None
-        }
+    find_capability(model, registry).map(|cap| {
+        cap.reasoning_levels
+            .iter()
+            .filter_map(|s| Level::parse(s))
+            .collect()
     })
+}
+
+/// 查询模型固定 effort(force_effort;非法级别值视为未设置)
+pub fn forced_effort(model: &str, registry: &[ModelCapability]) -> Option<&'static str> {
+    find_capability(model, registry)
+        .and_then(|cap| cap.force_effort.as_deref())
+        .and_then(Level::parse)
+        .map(Level::as_str)
 }
 
 /// budget → level
@@ -357,17 +373,45 @@ mod tests {
 
     #[test]
     fn test_parse_registry_roundtrip() {
-        let json = r#"{"models":[{"id":"gpt-6-astra","reasoning_levels":["low","medium"]}]}"#;
+        let json = r#"{"models":[
+            {"id":"gpt-6-astra","reasoning_levels":["low","medium"],"force_effort":"low"},
+            {"id":"kimi-k3","reasoning_levels":["low","high"]}
+        ]}"#;
         let reg = parse_registry(json).unwrap();
-        assert_eq!(reg.len(), 1);
+        assert_eq!(reg.len(), 2);
         assert_eq!(reg[0].id, "gpt-6-astra");
         assert_eq!(reg[0].reasoning_levels, ["low", "medium"]);
+        assert_eq!(reg[0].force_effort.as_deref(), Some("low"));
+        assert_eq!(reg[1].force_effort, None);
         assert_eq!(clamp_effort("high", "gpt-6-astra", &reg), "medium");
     }
 
     #[test]
     fn test_parse_registry_invalid_json() {
         assert!(parse_registry("{").is_err());
+    }
+
+    #[test]
+    fn test_forced_effort_lookup() {
+        let reg = vec![
+            ModelCapability {
+                id: "glm-5.3".into(),
+                reasoning_levels: vec!["low".into(), "high".into()],
+                force_effort: Some("high".into()),
+            },
+            ModelCapability {
+                id: "bad".into(),
+                reasoning_levels: vec!["low".into()],
+                force_effort: Some("bogus".into()),
+            },
+        ];
+        assert_eq!(forced_effort("glm-5.3", &reg), Some("high"));
+        // 大小写不敏感
+        assert_eq!(forced_effort("GLM-5.3", &reg), Some("high"));
+        // 非法级别值视为未设置
+        assert_eq!(forced_effort("bad", &reg), None);
+        // 未收录模型
+        assert_eq!(forced_effort("missing", &reg), None);
     }
 
     // mock registry 供测试用(不依赖 models.json 实际内容)
@@ -381,10 +425,12 @@ mod tests {
                     "high".into(),
                     "xhigh".into(),
                 ],
+                force_effort: None,
             },
             ModelCapability {
                 id: "glm-5.2".into(),
                 reasoning_levels: vec!["low".into(), "high".into(), "max".into()],
+                force_effort: None,
             },
             ModelCapability {
                 id: "gpt-5.6-terra".into(),
@@ -394,6 +440,7 @@ mod tests {
                     "high".into(),
                     "xhigh".into(),
                 ],
+                force_effort: None,
             },
             ModelCapability {
                 id: "gpt-5.6-sol".into(),
@@ -403,6 +450,7 @@ mod tests {
                     "high".into(),
                     "xhigh".into(),
                 ],
+                force_effort: None,
             },
             ModelCapability {
                 id: "grok-4.6".into(),
@@ -412,14 +460,17 @@ mod tests {
                     "high".into(),
                     "xhigh".into(),
                 ],
+                force_effort: None,
             },
             ModelCapability {
                 id: "kimi-k3".into(),
                 reasoning_levels: vec!["low".into(), "high".into(), "max".into()],
+                force_effort: None,
             },
             ModelCapability {
                 id: "gemini-3.8-flash-high".into(),
                 reasoning_levels: vec!["high".into()],
+                force_effort: None,
             },
         ]
     }
@@ -428,10 +479,7 @@ mod tests {
     fn test_clamp_effort_registry_glm51() {
         let reg = mock_registry();
         assert_eq!(clamp_effort("max", "glm-5.1", &reg), "xhigh");
-        assert_eq!(
-            clamp_effort("xhigh", "glm-5.1", &reg),
-            "xhigh"
-        );
+        assert_eq!(clamp_effort("xhigh", "glm-5.1", &reg), "xhigh");
         assert_eq!(clamp_effort("high", "glm-5.1", &reg), "high");
     }
 
@@ -445,29 +493,17 @@ mod tests {
     #[test]
     fn test_clamp_effort_registry_gpt56() {
         let reg = mock_registry();
-        assert_eq!(
-            clamp_effort("max", "gpt-5.6-terra", &reg),
-            "xhigh"
-        );
-        assert_eq!(
-            clamp_effort("max", "gpt-5.6-sol", &reg),
-            "xhigh"
-        );
+        assert_eq!(clamp_effort("max", "gpt-5.6-terra", &reg), "xhigh");
+        assert_eq!(clamp_effort("max", "gpt-5.6-sol", &reg), "xhigh");
     }
 
     #[test]
     fn test_clamp_effort_registry_grok46() {
         let reg = mock_registry();
         assert_eq!(clamp_effort("max", "grok-4.6", &reg), "xhigh");
-        assert_eq!(
-            clamp_effort("xhigh", "grok-4.6", &reg),
-            "xhigh"
-        );
+        assert_eq!(clamp_effort("xhigh", "grok-4.6", &reg), "xhigh");
         assert_eq!(clamp_effort("high", "grok-4.6", &reg), "high");
-        assert_eq!(
-            clamp_effort("medium", "grok-4.6", &reg),
-            "medium"
-        );
+        assert_eq!(clamp_effort("medium", "grok-4.6", &reg), "medium");
     }
 
     #[test]
@@ -489,10 +525,7 @@ mod tests {
     #[test]
     fn test_clamp_effort_registry_gemini_flash_sku() {
         let reg = mock_registry();
-        assert_eq!(
-            clamp_effort("max", "gemini-3.8-flash-high", &reg),
-            "high"
-        );
+        assert_eq!(clamp_effort("max", "gemini-3.8-flash-high", &reg), "high");
         assert_eq!(
             clamp_effort("medium", "gemini-3.8-flash-high", &reg),
             "high"

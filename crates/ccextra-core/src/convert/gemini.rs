@@ -194,7 +194,11 @@ pub fn convert_to_gemini_with_registry(
                     }
                 } else {
                     let raw = effort.unwrap_or_else(|| "high".to_string());
-                    let clamped = crate::thinking::clamp_effort(&raw, upstream_model, registry);
+                    // 固定 effort 优先(生效范围与 clamp 一致,值不钳制)
+                    let clamped = match crate::thinking::forced_effort(upstream_model, registry) {
+                        Some(forced) => forced,
+                        None => crate::thinking::clamp_effort(&raw, upstream_model, registry),
+                    };
                     // Gemini 3 thinkingLevel 白名单;max/xhigh 落到 high
                     let level = match clamped {
                         "minimal" | "low" | "medium" | "high" => clamped,
@@ -716,6 +720,7 @@ IMPORTANT: Assist with authorized security testing.
         let registry = vec![crate::thinking::ModelCapability {
             id: "gemini-3.8-flash-high".into(),
             reasoning_levels: vec!["high".into()],
+            force_effort: None,
         }];
         let (gemini, _) = convert_to_gemini_with_registry(
             &adaptive_max_body(),
@@ -748,6 +753,26 @@ IMPORTANT: Assist with authorized security testing.
         assert_eq!(
             gemini["generationConfig"]["thinkingConfig"]["thinkingLevel"],
             "high"
+        );
+    }
+
+    #[test]
+    fn test_antigravity_force_effort_overrides_inbound() {
+        // force_effort 固定档:入站 max 不按 SKU 钳,直接改写为 low
+        let registry = vec![crate::thinking::ModelCapability {
+            id: "gemini-3.8-flash-high".into(),
+            reasoning_levels: vec!["high".into()],
+            force_effort: Some("low".into()),
+        }];
+        let (gemini, _) = convert_to_gemini_with_registry(
+            &adaptive_max_body(),
+            "gemini-3.8-flash-high",
+            SchemaFlavor::Antigravity,
+            &registry,
+        );
+        assert_eq!(
+            gemini["generationConfig"]["thinkingConfig"]["thinkingLevel"],
+            "low"
         );
     }
 
