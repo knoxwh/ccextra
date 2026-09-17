@@ -13,7 +13,7 @@ use serde_json::Value;
 // use crate::cache_stabilization::anthropic_cache_control::{
 //     auto_place_anthropic_cache_control, AutoPlaceOutcome,
 // };
-use crate::cache_stabilization::content_strip::strip_bookkeeping_content;
+// use crate::cache_stabilization::content_strip::strip_bookkeeping_content;
 use crate::cache_stabilization::drift_detector::ApiKind as DriftApiKind;
 use crate::cache_stabilization::reminder_rstrip::normalize_reminder_trailing_whitespace;
 use crate::cache_stabilization::smoosh_split::split_smooshed_reminders;
@@ -88,8 +88,8 @@ pub fn normalize_anthropic_full(body: &mut Value) -> NormalizeCounts {
     // 2. smoosh 拆分
     counts.smoosh_count = split_smooshed_reminders(body, DriftApiKind::Anthropic);
 
-    // 3. bookkeeping 剥离
-    counts.bookkeeping_count = strip_bookkeeping_content(body, DriftApiKind::Anthropic);
+    // 3. bookkeeping 剥离(临时禁用:活尾保留导致缓存前缀每轮变化,实际无效)
+    // counts.bookkeeping_count = strip_bookkeeping_content(body, DriftApiKind::Anthropic);
 
     // 4. tool_use.input 键序归一化
     counts.tool_input_count = normalize_tool_use_inputs(body, DriftApiKind::Anthropic);
@@ -144,8 +144,8 @@ pub fn normalize_anthropic_pretransform(body: &mut Value) -> NormalizeCounts {
         tool_sorted,
         // 1. smoosh 拆分
         smoosh_count: split_smooshed_reminders(body, DriftApiKind::Anthropic),
-        // 2. bookkeeping 剥离
-        bookkeeping_count: strip_bookkeeping_content(body, DriftApiKind::Anthropic),
+        // 2. bookkeeping 剥离(临时禁用:活尾保留导致缓存前缀每轮变化,实际无效)
+        // bookkeeping_count: strip_bookkeeping_content(body, DriftApiKind::Anthropic),
         // 3. tool_use.input 键序归一化
         tool_input_count: normalize_tool_use_inputs(body, DriftApiKind::Anthropic),
         // 4. system reminder 列表块排序
@@ -233,6 +233,7 @@ mod tests {
     }
 
     #[test]
+    #[ignore = "bookkeeping 剥离已临时禁用"]
     fn test_pretransform_runs_history_subset() {
         // 转换前:bookkeeping 剥离生效
         let mut body = json!({
