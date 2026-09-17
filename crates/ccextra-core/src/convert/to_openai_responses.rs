@@ -2517,13 +2517,13 @@ mod tests {
                 expected_effort: "low",
             },
             Case {
-                name: "explicit effort high",
+                name: "explicit effort high clamps to medium",
                 body: json!({
                     "model": "test",
                     "output_config": {"effort": "high"},
                     "messages": []
                 }),
-                expected_effort: "high",
+                expected_effort: "medium",
             },
         ];
 
