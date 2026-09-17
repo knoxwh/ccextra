@@ -10,9 +10,9 @@
 
 use serde_json::Value;
 
-use crate::cache_stabilization::anthropic_cache_control::{
-    auto_place_anthropic_cache_control, AutoPlaceOutcome,
-};
+// use crate::cache_stabilization::anthropic_cache_control::{
+//     auto_place_anthropic_cache_control, AutoPlaceOutcome,
+// };
 use crate::cache_stabilization::content_strip::strip_bookkeeping_content;
 use crate::cache_stabilization::drift_detector::ApiKind as DriftApiKind;
 use crate::cache_stabilization::reminder_rstrip::normalize_reminder_trailing_whitespace;
@@ -103,11 +103,11 @@ pub fn normalize_anthropic_full(body: &mut Value) -> NormalizeCounts {
     // 7. 客户端 dateline 归一化(撇号/分隔符隐写还原,对齐 sub2api)
     counts.volatile_count = normalize_client_dateline(body, VolatileApiKind::Anthropic);
 
-    // 8. cache_control 自动注入
-    if let AutoPlaceOutcome::Applied { placed_count, .. } = auto_place_anthropic_cache_control(body)
-    {
-        counts.cache_control_placed = placed_count;
-    }
+    // 8. cache_control 自动注入(临时禁用:与工具排序守卫冲突,导致缓存不稳定)
+    // if let AutoPlaceOutcome::Applied { placed_count, .. } = auto_place_anthropic_cache_control(body)
+    // {
+    //     counts.cache_control_placed = placed_count;
+    // }
 
     // 9. volatile 检测→告警(只读,不改 body)
     let findings = detect_volatile_content(body, VolatileApiKind::Anthropic);
@@ -219,6 +219,7 @@ mod tests {
     }
 
     #[test]
+    #[ignore = "cache_control 自动注入已临时禁用"]
     fn test_anthropic_full_places_cache_control() {
         let mut body = json!({
             "model": "test",
