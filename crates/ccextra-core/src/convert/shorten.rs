@@ -9,20 +9,32 @@ use std::collections::HashMap;
 const NAME_LIMIT: usize = 64;
 
 /// mcp__ 前缀工具名缩短:保留 mcp__ + 末段 __ 后的名字
+/// 对齐 CPA capResponsesChatToolName:截断后去除前导分隔符(部分严格上游拒绝非字母数字开头)
 pub fn shorten_name_if_needed(name: &str) -> String {
     if name.len() <= NAME_LIMIT {
         return name.to_string();
     }
-    if let Some(rest) = name.strip_prefix("mcp__") {
+    let truncated = if let Some(rest) = name.strip_prefix("mcp__") {
         if let Some(idx) = rest.rfind("__") {
             let cand = format!("mcp__{}", &rest[idx + 2..]);
             if cand.len() > NAME_LIMIT {
-                return cand[..NAME_LIMIT].to_string();
+                cand[..NAME_LIMIT].to_string()
+            } else {
+                cand
             }
-            return cand;
+        } else {
+            name[..NAME_LIMIT].to_string()
         }
+    } else {
+        name[..NAME_LIMIT].to_string()
+    };
+    // 去除前导 _ 和 - (对齐 CPA strings.TrimLeft(truncated, "_-"))
+    let trimmed = truncated.trim_start_matches(&['_', '-'][..]);
+    if !trimmed.is_empty() {
+        trimmed.to_string()
+    } else {
+        truncated
     }
-    name[..NAME_LIMIT].to_string()
 }
 
 /// 候选名冲突时追加 `_N` 后缀直到唯一
@@ -104,6 +116,46 @@ mod tests {
         let sb = &m[&b];
         assert_ne!(sa, sb);
         assert!(sb.ends_with("_1"));
+    }
+
+    #[test]
+    fn test_trim_leading_separators() {
+        // 对齐 CPA:截断后**开头**的分隔符被清除
+        // 构造截断后以 _ 开头的场景：名字以 _ 开头且超长
+        let name = "_".to_string() + &"tool_name_".repeat(10);
+        let short = shorten_name_if_needed(&name);
+        assert!(!short.starts_with('_'));
+        assert!(short.len() <= 64);
+    }
+
+    #[test]
+    fn test_trim_leading_hyphens() {
+        // 构造截断后以 - 开头的场景：名字以 - 开头且超长
+        let name = "--tool-name-".repeat(10);
+        let short = shorten_name_if_needed(&name);
+        assert!(!short.starts_with('-'));
+        assert!(short.len() <= 64);
+    }
+
+    #[test]
+    fn test_trim_mixed_leading_separators() {
+        // 混合前导分隔符：名字以 _- 混合开头
+        let name = "_-_-".to_string() + &"x".repeat(70);
+        let short = shorten_name_if_needed(&name);
+        assert!(!short.starts_with('_'));
+        assert!(!short.starts_with('-'));
+        assert_eq!(short, "x".repeat(60)); // 截断前64 = "_-_-" + 60个x，trim后剩60个x
+    }
+
+    #[test]
+    fn test_all_separators_fallback() {
+        // 截断后全是分隔符 → 保留原截断(不清空)
+        let name = "_".repeat(80);
+        let names = vec![name.clone()];
+        let m = build_short_name_map(&names);
+        let short = &m[&name];
+        assert_eq!(short.len(), 64);
+        assert_eq!(short, &"_".repeat(64));
     }
 
     #[test]
