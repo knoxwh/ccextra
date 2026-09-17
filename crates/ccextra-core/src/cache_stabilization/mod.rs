@@ -19,9 +19,6 @@
 //! - [`tool_def_normalize`] — PR-E1 / PR-E2：按名称对 `tools[]` 进行
 //!   字母排序，并递归排序每个 tool 的 `input_schema` / `function.parameters`
 //!   内部的 JSON Schema 对象键。
-//! - [`anthropic_cache_control`] — PR-E3：当客户未放置任何
-//!   `cache_control` 标记时，自动在最后一个 tool 定义上插入一个 ephemeral
-//!   标记。**会修改请求字节**。
 //! - [`reminder_rstrip`] — PR-E7：折叠 `text` 块（system + messages）中
 //!   结尾 `</system-reminder>` 周围的尾部空白，使 CC 的字节级重新序列化
 //!   漂移（anthropics/claude-code#48734 form 1）不会使 prompt-cache
@@ -31,8 +28,6 @@
 //!   使 cache prefix 漂移。仅作用于 system；
 //!   tool 定义的排序由 [`tool_def_normalize`] 处理。
 
-pub mod anthropic_cache_control;
-pub mod content_strip;
 pub mod drift_detector;
 pub mod json_walker;
 pub mod reminder_rstrip;
@@ -43,7 +38,6 @@ pub mod tool_input_normalize;
 pub mod truncate_tool_results;
 pub mod volatile_detector;
 
-pub use content_strip::strip_bookkeeping_content;
 pub use drift_detector::{
     compute_structural_hash, derive_session_key, observe_drift, ApiKind as DriftApiKind, DriftState,
 };

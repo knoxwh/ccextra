@@ -10,10 +10,6 @@
 
 use serde_json::Value;
 
-// use crate::cache_stabilization::anthropic_cache_control::{
-//     auto_place_anthropic_cache_control, AutoPlaceOutcome,
-// };
-// use crate::cache_stabilization::content_strip::strip_bookkeeping_content;
 use crate::cache_stabilization::drift_detector::ApiKind as DriftApiKind;
 use crate::cache_stabilization::reminder_rstrip::normalize_reminder_trailing_whitespace;
 use crate::cache_stabilization::smoosh_split::split_smooshed_reminders;
@@ -39,13 +35,11 @@ pub use crate::cache_stabilization::truncate_tool_results::UpstreamTruncation;
 pub struct NormalizeCounts {
     pub tool_sorted: bool,
     pub smoosh_count: usize,
-    pub bookkeeping_count: usize,
     pub tool_input_count: usize,
     pub sort_count: usize,
     pub rstrip_count: usize,
     /// dateline 指纹句改写的文本块个数
     pub volatile_count: usize,
-    pub cache_control_placed: usize,
 }
 
 /// 转换后目标 body 的形状,决定 post-transform 用哪套工具归一化
@@ -55,18 +49,16 @@ pub enum TargetShape {
     OpenAiResponses,
 }
 
-/// 入站 anthropic 转换前归一化:九模块全跑
+/// 入站 anthropic 转换前归一化:七模块全跑
 ///
 /// 顺序:
 /// 1. tool_def 排序 + schema 键递归排序(仅当无 cache_control 时)
 /// 2. smoosh 拆分(剥掉 tool_result.content 里的 reminder)
-/// 3. bookkeeping 剥离(历史 user 消息的每轮 reminder)
-/// 4. tool_use.input 键序归一化
-/// 5. system reminder 列表块排序
-/// 6. 尾部 reminder 空白归一化
-/// 7. 客户端 dateline 归一化(仅全量;撇号/分隔符隐写还原,对齐 sub2api)
-/// 8. cache_control 自动注入(仅全量)
-/// 9. volatile 检测→告警(只读,不改 body)
+/// 3. tool_use.input 键序归一化
+/// 4. system reminder 列表块排序
+/// 5. 尾部 reminder 空白归一化
+/// 6. 客户端 dateline 归一化(仅全量;撇号/分隔符隐写还原,对齐 sub2api)
+/// 7. volatile 检测→告警(只读,不改 body)
 ///
 /// drift 观测(compute_structural_hash + observe_drift)需要 DriftState,
 /// 由 server 层在调用本函数后单独执行。
@@ -88,28 +80,19 @@ pub fn normalize_anthropic_full(body: &mut Value) -> NormalizeCounts {
     // 2. smoosh 拆分
     counts.smoosh_count = split_smooshed_reminders(body, DriftApiKind::Anthropic);
 
-    // 3. bookkeeping 剥离(临时禁用:活尾保留导致缓存前缀每轮变化,实际无效)
-    // counts.bookkeeping_count = strip_bookkeeping_content(body, DriftApiKind::Anthropic);
-
-    // 4. tool_use.input 键序归一化
+    // 3. tool_use.input 键序归一化
     counts.tool_input_count = normalize_tool_use_inputs(body, DriftApiKind::Anthropic);
 
-    // 5. system reminder 列表块排序
+    // 4. system reminder 列表块排序
     counts.sort_count = stabilize_block_sort(body, DriftApiKind::Anthropic);
 
-    // 6. 尾部 reminder 空白归一化
+    // 5. 尾部 reminder 空白归一化
     counts.rstrip_count = normalize_reminder_trailing_whitespace(body, DriftApiKind::Anthropic);
 
-    // 7. 客户端 dateline 归一化(撇号/分隔符隐写还原,对齐 sub2api)
+    // 6. 客户端 dateline 归一化(撇号/分隔符隐写还原,对齐 sub2api)
     counts.volatile_count = normalize_client_dateline(body, VolatileApiKind::Anthropic);
 
-    // 8. cache_control 自动注入(临时禁用:与工具排序守卫冲突,导致缓存不稳定)
-    // if let AutoPlaceOutcome::Applied { placed_count, .. } = auto_place_anthropic_cache_control(body)
-    // {
-    //     counts.cache_control_placed = placed_count;
-    // }
-
-    // 9. volatile 检测→告警(只读,不改 body)
+    // 7. volatile 检测→告警(只读,不改 body)
     let findings = detect_volatile_content(body, VolatileApiKind::Anthropic);
     if !findings.is_empty() {
         emit_volatile_warnings(&findings, "unknown");
@@ -120,7 +103,7 @@ pub fn normalize_anthropic_full(body: &mut Value) -> NormalizeCounts {
 
 /// 入站 anthropic 转换前归一化:精简子集(openai 转换链路转换前调用)。
 ///
-/// 跑:tool_def 排序 + schema 键排序 → smoosh → content_strip → tool_input → sort → rstrip。
+/// 跑:tool_def 排序 + schema 键排序 → smoosh → tool_input → sort → rstrip。
 /// tool_def 排序提升 gemini/antigravity 隐式前缀缓存命中率(对齐 full 管线)。
 /// schema 键必须在 tool_input 之前排:转换把 `tool_use.input` 冻成
 /// `arguments` 字符串,post 无法再改。跳过 volatile strip、auto cache_control、
@@ -219,42 +202,6 @@ mod tests {
     }
 
     #[test]
-    #[ignore = "cache_control 自动注入已临时禁用"]
-    fn test_anthropic_full_places_cache_control() {
-        let mut body = json!({
-            "model": "test",
-            "tools": [{"name": "a", "input_schema": {"type": "object"}}],
-            "messages": [{"role": "user", "content": "hi"}]
-        });
-
-        let counts = normalize_anthropic_full(&mut body);
-
-        assert!(counts.cache_control_placed > 0);
-    }
-
-    #[test]
-    #[ignore = "bookkeeping 剥离已临时禁用"]
-    fn test_pretransform_runs_history_subset() {
-        // 转换前:bookkeeping 剥离生效
-        let mut body = json!({
-            "messages": [
-                {"role": "user", "content": [
-                    {"type": "text", "text": "work"},
-                    {"type": "text", "text": "<system-reminder>\nToken usage: 1/2; 1 remaining\n</system-reminder>"}
-                ]}
-            ]
-        });
-
-        let counts = normalize_anthropic_pretransform(&mut body);
-
-        assert!(counts.bookkeeping_count > 0, "bookkeeping should strip");
-        // 无 tool-def sort / volatile / cache_control 注入
-        assert!(!counts.tool_sorted);
-        assert_eq!(counts.volatile_count, 0);
-        assert_eq!(counts.cache_control_placed, 0);
-    }
-
-    #[test]
     fn test_pretransform_rstrips_reminder_trailing() {
         // 转换前:rstrip 折叠尾部空白(独立块,不经 bookkeeping)
         let mut body = json!({
@@ -291,7 +238,6 @@ mod tests {
 
         let counts = normalize_anthropic_pretransform(&mut body);
 
-        assert_eq!(counts.cache_control_placed, 0);
         // pretransform 现在排序 tool_def(提升 gemini/antigravity 缓存命中)
         assert!(
             counts.tool_sorted,
