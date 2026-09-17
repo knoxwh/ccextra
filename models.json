@@ -2,22 +2,19 @@
   "models": [
     {
       "id": "gpt-6-astra",
-      "reasoning_levels": ["low", "medium"]
+      "reasoning_levels": ["low", "medium", "high", "xhigh", "max"],
+      "force_effort": "medium"
     },
     {
       "id": "gpt-5.6-terra",
-      "reasoning_levels": ["low", "medium", "high", "xhigh", "max"]
+      "reasoning_levels": ["none", "low", "medium", "high", "xhigh", "max"]
     },
     {
       "id": "gpt-5.6-sol",
-      "reasoning_levels": ["low", "medium", "high", "xhigh", "max"]
+      "reasoning_levels": ["none", "low", "medium", "high", "xhigh", "max"]
     },
     {
       "id": "glm-5.1",
-      "reasoning_levels": ["low", "medium", "high", "xhigh"]
-    },
-    {
-      "id": "glm-5.1-27717e1a8a72-glm51",
       "reasoning_levels": ["low", "medium", "high", "xhigh"]
     },
     {
@@ -33,7 +30,15 @@
       "reasoning_levels": ["low", "high", "max"]
     },
     {
+      "id": "ZHIPU/GLM-5.3-Flash",
+      "reasoning_levels": ["low", "high", "max"]
+    },
+    {
       "id": "qwen3.8-max",
+      "reasoning_levels": ["low", "medium", "high", "xhigh", "max"]
+    },
+    {
+      "id": "qwen3.8-max-0902",
       "reasoning_levels": ["low", "medium", "high", "xhigh", "max"]
     },
     {
@@ -98,19 +103,23 @@
     },
     {
       "id": "gemini-3.7-flash-high",
-      "reasoning_levels": ["high"]
+      "reasoning_levels": ["high"],
+      "force_effort": "high"
     },
     {
       "id": "gemini-3.7-flash-medium",
-      "reasoning_levels": ["medium"]
+      "reasoning_levels": ["medium"],
+      "force_effort": "medium"
     },
     {
       "id": "gemini-3.8-flash-high",
-      "reasoning_levels": ["high"]
+      "reasoning_levels": ["high"],
+      "force_effort": "high"
     },
     {
       "id": "gemini-3.8-flash-medium",
-      "reasoning_levels": ["medium"]
+      "reasoning_levels": ["medium"],
+      "force_effort": "medium"
     }
   ]
 }
