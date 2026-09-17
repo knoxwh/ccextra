@@ -49,7 +49,7 @@ xAI Grok 不是 protocol。它使用 OAuth 凭证动态创建 `openai_responses`
 转换器直接读写 `serde_json::Value`，不经过通用中间协议类型，并为每个目标协议单独处理图片、工具和 content 语义。
 
 **直通路径**
-Anthropic 到 Claude 的路径。只改 `model`，并按规则转发身份头。
+Anthropic 到 Claude 的路径。只改 `model`，并按规则转发身份头。非 Claude 模型额外清洗 system（剥计费归属指纹、Claude 身份声明与触发块）并钳制越档 effort；匹配 `*claude*` 的模型两项都跳过，保持逐字节直通。
 
 **转换路径**
 Anthropic 到 Chat、Responses、Gemini 或 Antigravity 的独立转换路径。它们重建目标 body，再在需要时映射响应。

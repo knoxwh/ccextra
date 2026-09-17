@@ -28,8 +28,8 @@ use ccextra_core::cache_stabilization::drift_detector::{
 use ccextra_core::convert::{
     clamp_passthrough_effort, convert_passthrough, convert_to_antigravity_with,
     convert_to_gemini_with_registry, convert_to_openai_chat_with, convert_to_openai_responses_with,
-    is_thinking_signature_invalid, sanitize_gpt_reasoning_items, trim_encrypted_reasoning_items,
-    ConvertError,
+    is_thinking_signature_invalid, sanitize_gpt_reasoning_items, sanitize_passthrough_prompt,
+    trim_encrypted_reasoning_items, ConvertError,
 };
 use ccextra_core::normalize::{
     normalize_anthropic_full, normalize_anthropic_pretransform, normalize_target_post, TargetShape,
@@ -709,6 +709,14 @@ async fn handle_messages(
     match route.protocol {
         Protocol::Claude => {
             convert_passthrough(&mut body_json, &route.upstream_model)?;
+            // 非 Claude 模型的 system 清洗(剥离计费指纹、Claude 身份与触发块;
+            // `*claude*` 模型保持逐字节直通)
+            if sanitize_passthrough_prompt(&mut body_json, &route.upstream_model) {
+                tracing::debug!(
+                    model = %route.upstream_model,
+                    "claude 直通 system 已清洗"
+                );
+            }
             // 非 Claude 模型的越档 effort 钳制(百炼等上游对越档值 400);
             // `*claude*` 模型与 thinking disabled 跳过,值不变不写回
             if clamp_passthrough_effort(&mut body_json, &route.upstream_model, &thinking_registry) {
@@ -2185,6 +2193,10 @@ models:
                     "model": "test-glm",
                     "max_tokens": 64,
                     "output_config": {"effort": "medium"},
+                    "system": [
+                        {"type": "text", "text": "x-anthropic-billing-header: fp=abc"},
+                        {"type": "text", "text": "# Memory\nPath: /tmp"}
+                    ],
                     "messages": [{"role": "user", "content": "hi"}]
                 }))
                 .unwrap(),
@@ -2196,8 +2208,13 @@ models:
         assert_eq!(sent["model"], "glm-5.3");
         assert_eq!(sent["output_config"]["effort"], "low");
         assert_eq!(sent["messages"][0]["content"], "hi");
+        // 计费指纹块被剥离,白名单段保留
+        let sys = sent["system"].as_array().unwrap();
+        assert_eq!(sys.len(), 1);
+        assert!(sys[0]["text"].as_str().unwrap().contains("# Memory"));
 
-        // Claude 模型:glob `*claude*` 跳过,越档 effort 原样直通
+        // Claude 模型:glob `*claude*` 跳过,越档 effort 与 system 原样直通
+        let claude_identity = "You are Claude Code, Anthropic's official CLI for Claude.";
         let request = Request::builder()
             .uri("/v1/messages")
             .method("POST")
@@ -2207,6 +2224,7 @@ models:
                     "model": "test-claude-local",
                     "max_tokens": 64,
                     "output_config": {"effort": "medium"},
+                    "system": claude_identity,
                     "messages": [{"role": "user", "content": "hi"}]
                 }))
                 .unwrap(),
@@ -2217,6 +2235,7 @@ models:
         let sent = captured.lock().unwrap().clone();
         assert_eq!(sent["model"], "claude-opus-5");
         assert_eq!(sent["output_config"]["effort"], "medium");
+        assert_eq!(sent["system"], claude_identity);
 
         server.abort();
     }

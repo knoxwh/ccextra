@@ -38,7 +38,7 @@ pub use gemini_schema::{
     clean_json_schema_for_antigravity, clean_json_schema_for_gemini,
     clean_nested_schema_for_antigravity,
 };
-pub use passthrough::{clamp_passthrough_effort, convert_passthrough};
+pub use passthrough::{clamp_passthrough_effort, convert_passthrough, sanitize_passthrough_prompt};
 pub use reasoning_replay::{
     append_replay_turn, build_replay_turn, compute_input_prefix_fingerprint,
     input_prefix_fingerprint, insert_replay_turns, REPLAY_TURN_TYPE,

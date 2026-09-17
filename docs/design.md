@@ -31,7 +31,7 @@ ccextra 将 Anthropic Messages 入口接到不同上游协议，同时尽量保�
 1. 读取请求体并校验 `x-api-key` 或 `Authorization: Bearer`。
 2. 由入站 `model` 解析 `(provider, protocol, upstream_model)`。
 3. 按协议执行转换前归一化。
-4. 转换成目标请求体，或在 Claude 路径只替换 `model` 并钳制非 Claude 模型的越档 effort。
+4. 转换成目标请求体，或在 Claude 路径只替换 `model`，再清洗非 Claude 模型的 system 并钳制其越档 effort。
 5. OpenAI 路径执行转换后归一化；Gemini 和 Antigravity 跳过该步骤。
 6. 应用 `payload` 顶层参数覆盖，保留已有非空 `prompt_cache_key`。
 7. 为符合条件的 OpenAI 请求注入会话 cache key，必要时写诊断日志。
@@ -54,7 +54,7 @@ ccextra 将 Anthropic Messages 入口接到不同上游协议，同时尽量保�
 
 ### Claude
 
-`convert_passthrough` 只改 `model`，再对非 Claude 模型钳制越档 effort：命中 glob `*claude*` 的模型、`thinking.type: disabled` 或注册表未命中的请求跳过；写回优先顶层 `output_config.effort`，回退 `thinking.output_config.effort`，值不变不写回。身份头按排除表透传，`anthropic-beta` 原样转发、缺失时不补。
+`convert_passthrough` 只改 `model`，再对非 Claude 模型做两件事。一是 system 清洗（对齐 chat/responses/gemini）：顶层 `system` 与 `messages` 内 `role: system` 项剥掉计费归属指纹块（逐请求变化，破坏上游缓存前缀）、Claude 身份声明与 `<identity>`/`<rules>`/`# Output Style:` 等 Claude 触发段，保留白名单段与 `cache_control`，清空后移除该块或消息。二是越档 effort 钳制：命中 glob `*claude*` 的模型、`thinking.type: disabled` 或注册表未命中的请求跳过；写回优先顶层 `output_config.effort`，回退 `thinking.output_config.effort`，值不变不写回。`*claude*` 模型两项都跳过，保持逐字节直通。身份头按排除表透传，`anthropic-beta` 原样转发、缺失时不补。
 
 ### OpenAI Chat
 

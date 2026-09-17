@@ -11,7 +11,7 @@ Single-process Rust proxy that routes, converts, and relays Claude Code Anthropi
 ## Features
 
 - **Multi-protocol upstreams**: Claude, OpenAI Chat, OpenAI Responses, Gemini, and Antigravity share one endpoint, routed by model alias.
-- **Claude passthrough**: a `claude` provider replaces only `model` (non-Claude models also get out-of-range effort clamped from `models.json`) and leaves the rest of the request intact.
+- **Claude passthrough**: a `claude` provider replaces only `model` (non-Claude models also get their system prompt cleaned of billing fingerprints, Claude identity, and Claude trigger blocks, plus out-of-range effort clamped from `models.json`) and leaves the rest of the request intact.
 - **Deterministic normalization**: stabilizes tool and schema order, historical reminders, tool-argument key order, and trailing whitespace to cut cross-turn serialization drift, aimed at raising upstream prompt-cache hit rate.
 - **Dynamic providers**: xAI Grok OAuth injects a Responses provider; Antigravity credentials load in the background and refresh models on a timer.
 - **Hot reload**: `POST /reload` swaps providers, payload, normalization, auth, proxy, User-Agent, and the reasoning registry without a restart.
@@ -33,7 +33,7 @@ One process listens on one port. Input is always Anthropic-shaped; every path re
 
 | `protocol` | Upstream API | Behavior |
 | --- | --- | --- |
-| `claude` | Anthropic Messages | Replaces only `model` (plus effort clamping for non-Claude models); remaining request content stays intact. |
+| `claude` | Anthropic Messages | Replaces only `model` (plus system cleaning and effort clamping for non-Claude models); remaining request content stays intact. |
 | `openai_chat` | Chat Completions | Converts messages, tools, images, and reasoning (supports Kimi K2.8). |
 | `openai_responses` | Responses | Converts to `instructions` and `input`; supports reasoning replay and web_search filtering. |
 | `gemini` | Gemini GenerateContent | Uses Gemini content, tool, and schema shapes. |
