@@ -20,7 +20,7 @@ pub enum SchemaFlavor {
 ///
 /// 返回 (Gemini 请求体, 短名→原名映射)
 pub fn convert_to_gemini(body: &Value, upstream_model: &str) -> (Value, HashMap<String, String>) {
-    convert_to_gemini_with(body, upstream_model, SchemaFlavor::Gemini)
+    convert_to_gemini_with_registry(body, upstream_model, SchemaFlavor::Gemini, &[])
 }
 
 /// 带 schema 语义的转换入口(Antigravity 走 VALIDATED 清洗)
@@ -28,6 +28,16 @@ pub fn convert_to_gemini_with(
     body: &Value,
     upstream_model: &str,
     flavor: SchemaFlavor,
+) -> (Value, HashMap<String, String>) {
+    convert_to_gemini_with_registry(body, upstream_model, flavor, &[])
+}
+
+/// 带 reasoning 注册表的 Gemini 转换(HTTP 热重载快照注入;查不到不钳)
+pub fn convert_to_gemini_with_registry(
+    body: &Value,
+    upstream_model: &str,
+    flavor: SchemaFlavor,
+    registry: &[crate::thinking::ModelCapability],
 ) -> (Value, HashMap<String, String>) {
     let mut gemini = serde_json::json!({ "contents": [] });
     gemini["model"] = serde_json::json!(upstream_model);
@@ -184,7 +194,7 @@ pub fn convert_to_gemini_with(
                     }
                 } else {
                     let raw = effort.unwrap_or_else(|| "high".to_string());
-                    let clamped = crate::thinking::clamp_effort(&raw, upstream_model);
+                    let clamped = crate::thinking::clamp_effort(&raw, upstream_model, registry);
                     // Gemini 3 thinkingLevel 白名单;max/xhigh 落到 high
                     let level = match clamped {
                         "minimal" | "low" | "medium" | "high" => clamped,
@@ -703,10 +713,15 @@ IMPORTANT: Assist with authorized security testing.
     #[test]
     fn test_antigravity_clamps_effort_max_to_high_sku() {
         // high SKU 注册表只认 high,effort=max 不得抬成其他
-        let (gemini, _) = convert_to_gemini_with(
+        let registry = vec![crate::thinking::ModelCapability {
+            id: "gemini-3.8-flash-high".into(),
+            reasoning_levels: vec!["high".into()],
+        }];
+        let (gemini, _) = convert_to_gemini_with_registry(
             &adaptive_max_body(),
             "gemini-3.8-flash-high",
             SchemaFlavor::Antigravity,
+            &registry,
         );
         assert_eq!(
             gemini["generationConfig"]["thinkingConfig"]["thinkingLevel"],

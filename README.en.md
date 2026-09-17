@@ -55,11 +55,13 @@ export ANTHROPIC_AUTH_TOKEN=sk-ccextra-xxx # required when secret_key is set
 
 ## Configuration
 
-See [config.example.yaml](config.example.yaml) for every field. `models[].alias` is inbound model name and cannot duplicate across providers. `base_url` accepts an ordered fallback array. Provider `proxy_url` overrides `server.proxy_url`; `"direct"` disables proxy use.
+See [config.example.yaml](config.example.yaml) for every field. `models[].alias` is inbound model name and cannot duplicate across providers. `base_url` accepts an ordered fallback array. Provider `proxy_url` overrides `server.proxy_url`; `"direct"` disables proxy use. Reasoning levels live in [models.json](models.json) next to the config.
 
 `secret_key` enables ingress authentication. Plaintext keys become bcrypt hashes on load and are written back; requests accept `x-api-key` or `Authorization: Bearer`. `payload` applies model-glob top-level overrides, optionally scoped by `protocol`. `prompt_cache_key` applies only to OpenAI paths, uses Claude Code session ID, and never replaces a nonempty key.
 
-`user_agents` overrides Claude, Codex, Grok, and Antigravity identifiers. `logging.request_body` writes diagnostic requests under `logs/`. `POST /reload` reloads providers, payload, normalization, auth, proxy, and User-Agent. Restart for `logging.level` changes. `antigravity.connection-pool` controls the Antigravity upstream connection pool: short connections by default; with `enabled: true`, idle connections are kept per `idle-conn-timeout` (default 30s, capped at 210s) and `max-idle-conns-per-host` (default 2, capped at 100).
+`user_agents` overrides Claude, Codex, Grok, and Antigravity identifiers. `logging.request_body` writes diagnostic requests under `logs/`. `POST /reload` reloads providers, payload, normalization, auth, proxy, User-Agent, and the reasoning registry. Restart for `logging.level` changes. `antigravity.connection-pool` controls the Antigravity upstream connection pool: short connections by default; with `enabled: true`, idle connections are kept per `idle-conn-timeout` (default 30s, capped at 210s) and `max-idle-conns-per-host` (default 2, capped at 100).
+
+`models_file` is the reasoning-level table (default `models.json` next to the config). Exact `id` match clamps inbound effort to the nearest supported level; missing file or unknown models leave effort unchanged. Edit the file and `POST /reload`; no rebuild.
 
 ## Endpoints
 

@@ -23,6 +23,10 @@ secret_key: "sk-ccextra-xxx"
 # xAI Grok 凭证目录(可选)。默认配置文件旁 .cache/xai。
 # xai_auth_dir: ".cache/xai"
 
+# reasoning 级别注册表(可选)。相对配置文件解析,默认同目录 models.json。
+# 缺文件 = 不钳制 effort;/reload 会重读。示例见仓库根 models.json。
+# models_file: "models.json"
+
 # Antigravity 连接池(可选)。默认短连接:空闲连接响应结束即关闭,
 # 防止凭证轮换下 socket 堆积与陈旧连接错误;仅显式 enabled: true 才保留池。
 # antigravity:
@@ -56,9 +60,6 @@ providers:
     models:
       - name: glm-5.1
         alias: glm-5.1
-        # 可选:覆盖静态注册表的 reasoning_effort 上限
-        # 注册表已内置常见模型(glm/gpt/kimi/qwen/doubao/deepseek/claude),按模糊匹配自动降级
-        # 仅特情况需手动配置(如注册表遗漏的新模型)
 
   - name: xxx-codex
     protocol: openai_responses

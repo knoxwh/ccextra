@@ -55,11 +55,13 @@ export ANTHROPIC_AUTH_TOKEN=sk-ccextra-xxx # 配置 secret_key 时需要
 
 ## 配置
 
-完整字段见 [config.example.yaml](config.example.yaml)。`models[].alias` 是入站模型名，不能跨 provider 重复。`base_url` 可为按顺序回退的数组；`server.proxy_url` 可被 provider `proxy_url` 覆盖，`"direct"` 表示直连。
+完整字段见 [config.example.yaml](config.example.yaml)。`models[].alias` 是入站模型名，不能跨 provider 重复。`base_url` 可为按顺序回退的数组；`server.proxy_url` 可被 provider `proxy_url` 覆盖，`"direct"` 表示直连。reasoning 级别表见同目录 [models.json](models.json)。
 
 `secret_key` 启用入口认证。明文 key 在加载时转为 bcrypt 并写回配置；请求接受 `x-api-key` 或 `Authorization: Bearer`。`payload` 按模型 glob 覆盖顶层参数，可用 `protocol` 限定。`prompt_cache_key` 只用于 OpenAI 路径，取 Claude Code 会话 ID，且不覆盖已有非空值。
 
-`user_agents` 可覆盖 Claude、Codex、Grok、Antigravity 标识。`logging.request_body` 将诊断请求写入 `logs/`。`POST /reload` 重载 providers、payload、归一化、认证、代理和 User-Agent；`logging.level` 需重启。`antigravity.connection-pool` 控制 Antigravity 上游连接池：默认短连接，显式 `enabled: true` 后按 `idle-conn-timeout`（默认 30s，上限 210s）与 `max-idle-conns-per-host`（默认 2，上限 100）保留空闲连接。
+`user_agents` 可覆盖 Claude、Codex、Grok、Antigravity 标识。`logging.request_body` 将诊断请求写入 `logs/`。`POST /reload` 重载 providers、payload、归一化、认证、代理、User-Agent 和 reasoning 注册表；`logging.level` 需重启。`antigravity.connection-pool` 控制 Antigravity 上游连接池：默认短连接，显式 `enabled: true` 后按 `idle-conn-timeout`（默认 30s，上限 210s）与 `max-idle-conns-per-host`（默认 2，上限 100）保留空闲连接。
+
+`models_file` 指向 reasoning 级别表（默认配置文件旁 `models.json`）。按上游模型 `id` 精确匹配，把入站 effort 钳到该模型支持的最近档；缺文件或未收录的模型不钳。改文件后 `POST /reload` 生效，不必重编译。
 
 ## 端点
 

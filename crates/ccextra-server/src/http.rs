@@ -26,9 +26,9 @@ use ccextra_core::cache_stabilization::drift_detector::{
     DriftState,
 };
 use ccextra_core::convert::{
-    convert_passthrough, convert_to_openai_chat, convert_to_openai_responses,
-    is_thinking_signature_invalid, sanitize_gpt_reasoning_items, trim_encrypted_reasoning_items,
-    ConvertError,
+    convert_passthrough, convert_to_antigravity_with, convert_to_gemini_with_registry,
+    convert_to_openai_chat_with, convert_to_openai_responses_with, is_thinking_signature_invalid,
+    sanitize_gpt_reasoning_items, trim_encrypted_reasoning_items, ConvertError,
 };
 use ccextra_core::normalize::{
     normalize_anthropic_full, normalize_anthropic_pretransform, normalize_target_post, TargetShape,
@@ -69,6 +69,8 @@ pub struct RuntimeConfig {
     pub upstream: UpstreamClient,
     /// User-Agent 字符串(启动或 /reload 时加载)
     pub user_agents: UserAgentSet,
+    /// reasoning 级别注册表(启动或 /reload 从用户 models.json 读入;空 = 不钳)
+    pub thinking_registry: Arc<Vec<ccextra_core::thinking::ModelCapability>>,
 }
 
 /// User-Agent 配置集(启动时从 config 加载,Arc 包装避免请求时 clone)
@@ -92,6 +94,7 @@ pub struct ReloadData {
     /// Antigravity 连接池配置(默认短连接,对齐 CPA connection-pool)
     pub antigravity: Option<crate::upstream::AntigravityConfig>,
     pub user_agents: UserAgentSet,
+    pub thinking_registry: Arc<Vec<ccextra_core::thinking::ModelCapability>>,
 }
 
 #[derive(Clone)]
@@ -444,6 +447,7 @@ async fn handle_reload(State(state): State<AppState>) -> Result<&'static str, Ap
         secret: data.secret,
         upstream: UpstreamClient::with_ant_pool(data.proxy_url, data.antigravity.as_ref()),
         user_agents: data.user_agents,
+        thinking_registry: data.thinking_registry,
     };
     // secret 可能变更,旧 bcrypt 校验结果一律作废(不比较新旧值)
     if let Ok(mut cache) = auth_cache().lock() {
@@ -607,6 +611,7 @@ async fn handle_messages(
         normalize_drift_detector,
         upstream_client,
         user_agents,
+        thinking_registry,
     ) = {
         let rt = state.runtime.read().await;
         (
@@ -616,6 +621,7 @@ async fn handle_messages(
             rt.normalize.drift_detector,
             rt.upstream.clone(),
             rt.user_agents.clone(),
+            rt.thinking_registry.clone(),
         )
     };
     check_secret(&headers, &secret)?;
@@ -704,7 +710,11 @@ async fn handle_messages(
             convert_passthrough(&mut body_json, &route.upstream_model)?;
         }
         Protocol::OpenAiChat => {
-            convert_to_openai_chat(&mut body_json, &route.upstream_model)?;
+            convert_to_openai_chat_with(
+                &mut body_json,
+                &route.upstream_model,
+                &thinking_registry,
+            )?;
             if normalize_enabled {
                 normalize_target_post(&mut body_json, TargetShape::OpenAiChat);
                 observe_drift_for(
@@ -718,7 +728,11 @@ async fn handle_messages(
         }
         Protocol::OpenAiResponses => {
             // reverse map:short→original(超长工具名缩短后,响应侧还原原名)
-            let rev = convert_to_openai_responses(&mut body_json, &route.upstream_model)?;
+            let rev = convert_to_openai_responses_with(
+                &mut body_json,
+                &route.upstream_model,
+                &thinking_registry,
+            )?;
             if !rev.is_empty() {
                 tool_names = Some(Arc::new(rev));
             }
@@ -754,9 +768,12 @@ async fn handle_messages(
             }
         }
         Protocol::Gemini => {
-            use ccextra_core::convert::convert_to_gemini;
-            let (gemini_body, short_to_original) =
-                convert_to_gemini(&body_json, &route.upstream_model);
+            let (gemini_body, short_to_original) = convert_to_gemini_with_registry(
+                &body_json,
+                &route.upstream_model,
+                ccextra_core::convert::gemini::SchemaFlavor::Gemini,
+                &thinking_registry,
+            );
             body_json = gemini_body;
             if !short_to_original.is_empty() {
                 tool_names = Some(Arc::new(short_to_original));
@@ -764,8 +781,6 @@ async fn handle_messages(
         }
         Protocol::Antigravity => {
             // Antigravity 使用包裹后的 Gemini 格式
-            use ccextra_core::convert::convert_to_antigravity;
-
             // 从 provider metadata 中提取 project_id
             let project_id = {
                 let provider = find_provider(&providers, &route.provider);
@@ -775,8 +790,12 @@ async fn handle_messages(
                     .map(|s| s.as_str())
             };
 
-            let (antigravity_body, short_to_original) =
-                convert_to_antigravity(&body_json, &route.upstream_model, project_id);
+            let (antigravity_body, short_to_original) = convert_to_antigravity_with(
+                &body_json,
+                &route.upstream_model,
+                project_id,
+                &thinking_registry,
+            );
             body_json = antigravity_body;
             if !short_to_original.is_empty() {
                 tool_names = Some(Arc::new(short_to_original));
@@ -2005,6 +2024,7 @@ mod tests {
                 secret: None,
                 upstream: UpstreamClient::new(None),
                 user_agents: test_user_agents(),
+                thinking_registry: Arc::new(vec![]),
             })),
             reload: reload_returning_secret(None),
             drift: DriftState::new(1000),
@@ -2869,6 +2889,7 @@ models:
                     proxy_url: None,
                     antigravity: None,
                     user_agents: test_user_agents(),
+                    thinking_registry: Arc::new(vec![]),
                 })
             })
         })
@@ -2977,6 +2998,7 @@ models:
                     proxy_url: Some("socks5://127.0.0.1:1080".into()),
                     antigravity: None,
                     user_agents: test_user_agents(),
+                    thinking_registry: Arc::new(vec![]),
                 })
             })
         });

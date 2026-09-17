@@ -184,6 +184,7 @@ async fn main() -> Result<()> {
             providers = merge_providers(providers, xai_providers);
 
             let user_agents = build_user_agents(cfg.user_agents.as_ref());
+            let thinking_registry = load_thinking_registry(&config_path, cfg.models_file.as_deref())?;
 
             Ok(ReloadData {
                 providers,
@@ -194,11 +195,13 @@ async fn main() -> Result<()> {
                 proxy_url: cfg.server.proxy_url,
                 antigravity: cfg.antigravity,
                 user_agents,
+                thinking_registry,
             })
         })
     });
 
     let user_agents = build_user_agents(config.user_agents.as_ref());
+    let thinking_registry = load_thinking_registry(&cli.config, config.models_file.as_deref())?;
     // 后台注入任务需要的全局代理(与 UpstreamClient 各持一份)
     let injection_proxy = config.server.proxy_url.clone();
 
@@ -214,6 +217,7 @@ async fn main() -> Result<()> {
                 config.antigravity.as_ref(),
             ),
             user_agents,
+            thinking_registry,
         })),
         reload,
         drift: DriftState::new(1000),
@@ -266,6 +270,48 @@ fn xai_auth_dir_from(config_path: &str, override_dir: Option<String>) -> PathBuf
         load_optional_config(config_path).and_then(|cfg| cfg.xai_auth_dir)
     };
     pin_auth_dir(config_path, raw.as_deref(), resolve_xai_auth_dir)
+}
+
+/// 读用户 models.json。缺文件 = 空表不钳;解析失败则启动/reload 报错。
+fn load_thinking_registry(
+    config_path: &str,
+    models_file: Option<&str>,
+) -> anyhow::Result<Arc<Vec<ccextra_core::thinking::ModelCapability>>> {
+    let path = pin_path(config_path, models_file.unwrap_or("models.json"));
+    match std::fs::read_to_string(&path) {
+        Ok(text) => {
+            let models = ccextra_core::thinking::parse_registry(&text).map_err(|e| {
+                anyhow::anyhow!("解析 reasoning 注册表失败 {}: {e}", path.display())
+            })?;
+            tracing::info!(
+                "加载 reasoning 注册表 {} 条: {}",
+                models.len(),
+                path.display()
+            );
+            Ok(Arc::new(models))
+        }
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => {
+            tracing::info!("未找到 reasoning 注册表 {}, 不钳制 effort", path.display());
+            Ok(Arc::new(Vec::new()))
+        }
+        Err(e) => Err(anyhow::anyhow!(
+            "读取 reasoning 注册表失败 {}: {e}",
+            path.display()
+        )),
+    }
+}
+
+/// 相对路径钉在配置文件所在目录,不跟进程 cwd 走
+fn pin_path(config_path: &str, raw: &str) -> PathBuf {
+    let path = PathBuf::from(raw);
+    if path.is_absolute() {
+        return path;
+    }
+    let parent = PathBuf::from(config_path);
+    match parent.parent().filter(|p| !p.as_os_str().is_empty()) {
+        Some(dir) => dir.join(path),
+        None => path,
+    }
 }
 
 /// 相对路径钉在配置文件所在目录,不跟进程 cwd 走
@@ -529,9 +575,10 @@ fn build_user_agents(config: Option<&config::UserAgents>) -> UserAgentSet {
 
 #[cfg(test)]
 mod tests {
-    use super::pin_auth_dir;
+    use super::{load_thinking_registry, pin_auth_dir, pin_path};
     use ccextra_server::antigravity::resolve_auth_dir as resolve_antigravity_auth_dir;
     use ccextra_server::xai::resolve_auth_dir as resolve_xai_auth_dir;
+    use std::io::Write;
     use std::path::PathBuf;
 
     #[test]
@@ -566,5 +613,40 @@ mod tests {
             ),
             home.join(".cli-proxy-api")
         );
+    }
+
+    #[test]
+    fn pin_path_relative_next_to_config() {
+        assert_eq!(
+            pin_path("/tmp/proj/config.yaml", "models.json"),
+            PathBuf::from("/tmp/proj/models.json")
+        );
+        assert_eq!(
+            pin_path("/tmp/proj/config.yaml", "/abs/models.json"),
+            PathBuf::from("/abs/models.json")
+        );
+    }
+
+    #[test]
+    fn load_thinking_registry_missing_is_empty() {
+        let reg = load_thinking_registry("/tmp/does-not-exist/config.yaml", None).unwrap();
+        assert!(reg.is_empty());
+    }
+
+    #[test]
+    fn load_thinking_registry_parses_file() {
+        let dir = tempfile::tempdir().unwrap();
+        let models = dir.path().join("models.json");
+        std::fs::write(
+            &models,
+            r#"{"models":[{"id":"gpt-6-astra","reasoning_levels":["low","medium"]}]}"#,
+        )
+        .unwrap();
+        let cfg = dir.path().join("config.yaml");
+        let mut f = std::fs::File::create(&cfg).unwrap();
+        f.write_all(b"unused").unwrap();
+        let reg = load_thinking_registry(cfg.to_str().unwrap(), None).unwrap();
+        assert_eq!(reg.len(), 1);
+        assert_eq!(reg[0].id, "gpt-6-astra");
     }
 }

@@ -30,6 +30,9 @@ pub struct Config {
     /// User-Agent 覆盖(可选);缺失时用默认值
     #[serde(default)]
     pub user_agents: Option<UserAgents>,
+    /// reasoning 级别注册表路径(可选);相对配置文件解析,默认同目录 `models.json`
+    #[serde(default)]
+    pub models_file: Option<String>,
 }
 
 #[derive(Debug, Deserialize, Clone)]
@@ -273,6 +276,39 @@ logging:
         let config = Config::load(file.path().to_str().unwrap()).unwrap();
         assert!(config.providers[0].prompt_cache_key);
         assert!(!config.providers[1].prompt_cache_key);
+        assert!(config.models_file.is_none());
+    }
+
+    #[test]
+    fn test_load_models_file() {
+        let yaml = r#"
+server:
+  host: "127.0.0.1"
+  port: 8222
+
+providers:
+  - name: test
+    protocol: claude
+    base_url: https://example.com
+    key: sk-test
+    models:
+      - name: m1
+        alias: a1
+
+normalize:
+  enabled: true
+  drift_detector: false
+
+logging:
+  level: info
+  request_body: false
+
+models_file: "custom-models.json"
+"#;
+        let mut file = NamedTempFile::new().unwrap();
+        file.write_all(yaml.as_bytes()).unwrap();
+        let config = Config::load(file.path().to_str().unwrap()).unwrap();
+        assert_eq!(config.models_file.as_deref(), Some("custom-models.json"));
     }
 
     #[test]

@@ -1016,6 +1016,15 @@ pub fn convert_to_openai_responses(
     body: &mut Value,
     upstream_model: &str,
 ) -> Result<HashMap<String, String>> {
+    convert_to_openai_responses_with(body, upstream_model, &[])
+}
+
+/// 带 reasoning 注册表的转换入口(HTTP 热重载快照注入;查不到不钳)
+pub fn convert_to_openai_responses_with(
+    body: &mut Value,
+    upstream_model: &str,
+    registry: &[crate::thinking::ModelCapability],
+) -> Result<HashMap<String, String>> {
     // --- system → instructions / developer message ---
     // 对齐 CPA convertClaudeRequestToCodex:
     // GPT/Grok 上游将 system 配合 ADAPTER_BLOCK 作为 developer message 放入 input[]
@@ -1491,7 +1500,7 @@ pub fn convert_to_openai_responses(
         "medium"
     };
     let effort = crate::thinking::resolve_effort_from_body(body).unwrap_or(default_effort);
-    let effort = crate::thinking::clamp_effort(effort, upstream_model);
+    let effort = crate::thinking::clamp_effort(effort, upstream_model, registry);
     // grok 模型对齐 grok-build:reasoning.summary=concise(其余模型不设)
     openai["reasoning"] = if upstream_model.to_ascii_lowercase().contains("grok") {
         json!({"effort": effort, "summary": "concise"})
@@ -1679,6 +1688,25 @@ mod tests {
     use super::*;
     use base64::Engine;
     use serde_json::json;
+
+    fn astra_registry() -> Vec<crate::thinking::ModelCapability> {
+        vec![crate::thinking::ModelCapability {
+            id: "gpt-6-astra".into(),
+            reasoning_levels: vec!["low".into(), "medium".into()],
+        }]
+    }
+
+    fn glm51_registry() -> Vec<crate::thinking::ModelCapability> {
+        vec![crate::thinking::ModelCapability {
+            id: "glm-5.1".into(),
+            reasoning_levels: vec![
+                "low".into(),
+                "medium".into(),
+                "high".into(),
+                "xhigh".into(),
+            ],
+        }]
+    }
 
     #[test]
     fn test_system_goes_to_instructions() {
@@ -2529,7 +2557,7 @@ mod tests {
 
         for case in cases {
             let mut body = case.body.clone();
-            convert_to_openai_responses(&mut body, "gpt-6-astra").unwrap();
+            convert_to_openai_responses_with(&mut body, "gpt-6-astra", &astra_registry()).unwrap();
             assert_eq!(
                 body["reasoning"]["effort"], case.expected_effort,
                 "Failed at case: {}",
@@ -2927,7 +2955,7 @@ Be verbose.
             "thinking": {"type": "adaptive"},
             "messages": []
         });
-        convert_to_openai_responses(&mut body, "glm-5.1").unwrap();
+        convert_to_openai_responses_with(&mut body, "glm-5.1", &glm51_registry()).unwrap();
         assert_eq!(body["reasoning"]["effort"], "xhigh");
     }
 
@@ -2966,7 +2994,7 @@ Be verbose.
             "messages": [],
             "output_config": {"effort": "max"}
         });
-        convert_to_openai_responses(&mut body, "glm-5.1").unwrap();
+        convert_to_openai_responses_with(&mut body, "glm-5.1", &glm51_registry()).unwrap();
         assert_eq!(body["reasoning"]["effort"], "xhigh");
     }
 

@@ -4,7 +4,7 @@
 use serde_json::Value;
 use std::collections::HashMap;
 
-use super::gemini::{convert_to_gemini_with, SchemaFlavor};
+use super::gemini::{convert_to_gemini_with_registry, SchemaFlavor};
 
 /// 转换 Anthropic 请求体为 Antigravity 格式
 ///
@@ -29,9 +29,23 @@ pub fn convert_to_antigravity(
     upstream_model: &str,
     project_id: Option<&str>,
 ) -> (Value, HashMap<String, String>) {
+    convert_to_antigravity_with(body, upstream_model, project_id, &[])
+}
+
+/// 带 reasoning 注册表的 Antigravity 转换
+pub fn convert_to_antigravity_with(
+    body: &Value,
+    upstream_model: &str,
+    project_id: Option<&str>,
+    registry: &[crate::thinking::ModelCapability],
+) -> (Value, HashMap<String, String>) {
     // 1. 先转换为 Gemini 格式(Antigravity 用 VALIDATED schema 语义)
-    let (gemini_body, short_to_original) =
-        convert_to_gemini_with(body, upstream_model, SchemaFlavor::Antigravity);
+    let (gemini_body, short_to_original) = convert_to_gemini_with_registry(
+        body,
+        upstream_model,
+        SchemaFlavor::Antigravity,
+        registry,
+    );
 
     // 2. 包裹为 Antigravity 格式(对齐 CLIProxyAPI geminiToAntigravity)
     let mut antigravity = serde_json::json!({

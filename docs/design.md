@@ -8,9 +8,9 @@ ccextra 将 Anthropic Messages 入口接到不同上游协议，同时尽量保�
 
 ## 分层
 
-- `ccextra-core`：纯逻辑。负责路由、归一化、会话派生、thinking 映射和协议转换；不依赖 `tokio`、`reqwest` 或文件系统。
+- `ccextra-core`：纯逻辑。负责路由、归一化、会话派生、thinking 映射和协议转换；不依赖 `tokio`、`reqwest` 或文件系统。reasoning 注册表由调用方传入，core 只解析字符串。
 - `ccextra-server`：HTTP、上游请求、SSE、OAuth provider 运行时注入和响应状态机。
-- `ccextra-cli`：命令行、YAML 配置加载、日志初始化和进程启动。
+- `ccextra-cli`：命令行、YAML 配置加载、日志初始化和进程启动。用户 `models.json` 在此读取。
 
 这种分层使转换规则可用单元测试验证，网络和锁生命周期集中在 server。
 
@@ -62,7 +62,7 @@ Anthropic `system` 成为 system message；o 系列（`o1-mini`/`o1-preview` 除
 
 ### OpenAI Responses
 
-普通上游把 system 放到 `instructions`。GPT/Grok 上游使用固定 developer 适配块，并清理不兼容的 Claude 系统段落。GPT-6 Astra 使用独立适配块，未指定 effort 时默认 `low`，且仅支持 `low`/`medium`（更高档钳到 `medium`）；其余 Responses 上游默认 `medium`。工具、tool choice、图片和自定义工具转换为 Responses 项；过长工具名使用请求侧缩写和响应侧反向映射。纯 const union（≥8 分支）简化为 enum 并清理 JSON Schema 方言关键字。web_search 按家族映射：Grok 映射为 `filters.excluded_domains`，OpenAI 映射为 `filters.blocked_domains`，`allowed_domains` 优先。reasoning 清洗时将空 summary 的 `reasoning_text` 提升为 `summary_text`，强制 `reasoning.content: []`。严格 JSON schema 不满足 Responses 要求时自动降级 `strict`。
+普通上游把 system 放到 `instructions`。GPT/Grok 上游使用固定 developer 适配块，并清理不兼容的 Claude 系统段落。GPT-6 Astra 使用独立适配块，未指定 effort 时默认 `low`；其余 Responses 上游默认 `medium`。effort 再按用户 `models.json` 钳到该模型支持档（Astra 示例为 `low`/`medium`，更高档钳到 `medium`）。查不到或未配置文件则不钳。工具、tool choice、图片和自定义工具转换为 Responses 项；过长工具名使用请求侧缩写和响应侧反向映射。纯 const union（≥8 分支）简化为 enum 并清理 JSON Schema 方言关键字。web_search 按家族映射：Grok 映射为 `filters.excluded_domains`，OpenAI 映射为 `filters.blocked_domains`，`allowed_domains` 优先。reasoning 清洗时将空 summary 的 `reasoning_text` 提升为 `summary_text`，强制 `reasoning.content: []`。严格 JSON schema 不满足 Responses 要求时自动降级 `strict`。
 
 ### Gemini 与 Antigravity
 
@@ -92,11 +92,11 @@ Responses 流会收集可回放 reasoning。服务端以模型和会话为键保
 
 Antigravity 上游默认短连接：空闲连接在响应结束后立即关闭，防止凭证轮换下 socket 堆积与陈旧连接错误。`antigravity.connection-pool` 显式启用连接池（`idle-conn-timeout` 默认 30s、上限 210s，不超过 Google Frontend 240s keep-alive 截止；`max-idle-conns-per-host` 默认 2、上限 100），其余协议共享全局客户端不受影响。
 
-`xai-login` 使用 OAuth device flow。启动和配置重载扫描 xAI 凭证，必要时提前刷新 token，并为每份有效凭证注入一个 Responses provider。相对 `auth_dir` 和 `xai_auth_dir` 始终相对配置文件目录解析。
+`xai-login` 使用 OAuth device flow。启动和配置重载扫描 xAI 凭证，必要时提前刷新 token，并为每份有效凭证注入一个 Responses provider。相对 `auth_dir`、`xai_auth_dir` 和 `models_file` 始终相对配置文件目录解析。缺省 `models.json` 与配置同目录。缺文件或模型未收录时不钳 effort；解析失败则启动或 `/reload` 报错。
 
 ## 并发、安全与诊断
 
-运行时配置、providers 和 payload 使用独立 `RwLock`。请求先复制快照并在网络 `await` 前释放读锁；热重载不是跨三把锁的原子事务，因此极短窗口内请求可能看到混合快照。
+运行时配置、providers 和 payload 使用独立 `RwLock`。reasoning 注册表放在 `RuntimeConfig`，随 `/reload` 整块替换。请求先复制快照并在网络 `await` 前释放读锁；热重载不是跨三把锁的原子事务，因此极短窗口内请求可能看到混合快照。
 
 `secret_key` 明文会写回 bcrypt；验证结果最多缓存 1024 项，重载时清空。`logging.request_body` 保存最终出站请求的诊断数据，敏感入站头会脱敏。归一化只在能够安全处理时改变 body，避免优化本身阻断请求；转换失败由 HTTP 层返回 Anthropic error。
 

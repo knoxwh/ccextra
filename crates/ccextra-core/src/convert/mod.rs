@@ -24,12 +24,12 @@ pub mod to_openai_responses;
 pub mod tool_id;
 pub mod tool_sanitize;
 
-pub use antigravity::convert_to_antigravity;
+pub use antigravity::{convert_to_antigravity, convert_to_antigravity_with};
 pub use antigravity_tools::{
     antigravity_tool_name_to_upstream, antigravity_upstream_tool_name_to_client,
 };
 pub use fix_json::fix_json_quotes;
-pub use gemini::convert_to_gemini;
+pub use gemini::{convert_to_gemini, convert_to_gemini_with_registry};
 pub use gemini_response::{
     convert_gemini_response, convert_gemini_stream_chunk, finalize_gemini_stream,
     force_finalize_gemini_stream, GeminiStreamState,
@@ -49,10 +49,10 @@ pub use signature::{
     format_claude_signature_value, is_valid_gpt_reasoning_signature,
     is_valid_grok_encrypted_content, model_group,
 };
-pub use to_openai_chat::convert_to_openai_chat;
+pub use to_openai_chat::{convert_to_openai_chat, convert_to_openai_chat_with};
 pub use to_openai_responses::{
-    convert_to_openai_responses, is_thinking_signature_invalid, sanitize_gpt_reasoning_items,
-    trim_encrypted_reasoning_items,
+    convert_to_openai_responses, convert_to_openai_responses_with, is_thinking_signature_invalid,
+    sanitize_gpt_reasoning_items, trim_encrypted_reasoning_items,
 };
 
 /// Claude Code 每请求注入 system 的计费+prompt 指纹块前缀(内容逐请求变化)。

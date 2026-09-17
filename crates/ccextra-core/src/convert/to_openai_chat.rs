@@ -25,6 +25,15 @@ use super::{ConvertError, Result};
 /// 差异:content 字符串保持数组(采用跨协议形态归一化,解决客户端跨轮
 /// 数组/字符串漂移,见 convert_message 注释)。
 pub fn convert_to_openai_chat(body: &mut Value, upstream_model: &str) -> Result<()> {
+    convert_to_openai_chat_with(body, upstream_model, &[])
+}
+
+/// 带 reasoning 注册表的转换入口(HTTP 热重载快照注入;查不到不钳)
+pub fn convert_to_openai_chat_with(
+    body: &mut Value,
+    upstream_model: &str,
+    registry: &[crate::thinking::ModelCapability],
+) -> Result<()> {
     let mut openai = serde_json::Map::new();
 
     // 对齐 顶层键序:model,max_tokens|max_completion_tokens,temperature/top_p,stop,stream,
@@ -38,7 +47,7 @@ pub fn convert_to_openai_chat(body: &mut Value, upstream_model: &str) -> Result<
         if effort == "none" && is_kimi_upstream_model(upstream_model) {
             effort
         } else {
-            crate::thinking::clamp_effort(effort, upstream_model)
+            crate::thinking::clamp_effort(effort, upstream_model, registry)
         }
     });
     let capabilities = openai_chat_capabilities(upstream_model, reasoning_effort.unwrap_or(""));
@@ -1775,7 +1784,16 @@ IMPORTANT: Assist with authorized security testing.
             "thinking": {"type": "adaptive"},
             "messages": [{"role": "user", "content": "test"}]
         });
-        convert_to_openai_chat(&mut body, "glm-5.1").unwrap();
+        let registry = vec![crate::thinking::ModelCapability {
+            id: "glm-5.1".into(),
+            reasoning_levels: vec![
+                "low".into(),
+                "medium".into(),
+                "high".into(),
+                "xhigh".into(),
+            ],
+        }];
+        convert_to_openai_chat_with(&mut body, "glm-5.1", &registry).unwrap();
         assert_eq!(body["reasoning_effort"], "xhigh");
     }
 
@@ -1887,11 +1905,19 @@ IMPORTANT: Assist with authorized security testing.
         assert_eq!(msgs[4]["content"][0]["text"], "next instruction");
     }
 
+    fn kimi_k28_registry() -> Vec<crate::thinking::ModelCapability> {
+        vec![crate::thinking::ModelCapability {
+            id: "kimi-k2.8".into(),
+            reasoning_levels: vec!["low".into(), "high".into(), "max".into()],
+        }]
+    }
+
     /// 对齐 CPA kimi Applier + normalizeKimiTemperature(8bd67f33):
     /// enabled 写 thinking.type/effort,disabled 写 thinking.type=disabled,
     /// 均删 reasoning_effort;temperature 按 thinking 形状守卫
     #[test]
     fn test_kimi_k28_thinking_shape_and_temperature_guard() {
+        let registry = kimi_k28_registry();
         // enabled + temperature=1.0:thinking.type=enabled + effort,temperature 保留
         let mut body = json!({
             "model": "kimi-k2.8",
@@ -1900,7 +1926,7 @@ IMPORTANT: Assist with authorized security testing.
             "messages": [{"role": "user", "content": "hi"}],
             "max_tokens": 100
         });
-        convert_to_openai_chat(&mut body, "kimi-k2.8").unwrap();
+        convert_to_openai_chat_with(&mut body, "kimi-k2.8", &registry).unwrap();
         assert_eq!(body["reasoning_effort"], Value::Null);
         assert_eq!(body["thinking"]["type"], "enabled");
         assert_eq!(body["thinking"]["effort"], "high");
@@ -1914,7 +1940,7 @@ IMPORTANT: Assist with authorized security testing.
             "temperature": 0.6,
             "messages": [{"role": "user", "content": "hi"}]
         });
-        convert_to_openai_chat(&mut body, "kimi-k2.8").unwrap();
+        convert_to_openai_chat_with(&mut body, "kimi-k2.8", &registry).unwrap();
         assert_eq!(body["temperature"], Value::Null);
         assert_eq!(body["thinking"]["effort"], "low");
     }
@@ -1954,7 +1980,7 @@ IMPORTANT: Assist with authorized security testing.
             "thinking": {"type": "enabled", "budget_tokens": 100000},
             "messages": [{"role": "user", "content": "hi"}]
         });
-        convert_to_openai_chat(&mut body, "kimi-k2.8").unwrap();
+        convert_to_openai_chat_with(&mut body, "kimi-k2.8", &kimi_k28_registry()).unwrap();
         assert_eq!(body["thinking"]["effort"], "high");
         assert!(body.get("temperature").is_none());
 

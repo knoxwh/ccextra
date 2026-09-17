@@ -2,11 +2,10 @@
 //
 // 语义:
 // - budget 阈值决定最小/低/中/高级别(auto/none 单列)
-// - thinking 配置 → reasoning.effort 字符串,按模型能力钳制
-// - 静态注册表(models.json)记录常见模型支持的 reasoning_levels
-// - YAML 配置 max_reasoning_effort 可覆盖注册表
+// - thinking 配置 → reasoning.effort 字符串,按调用方传入的注册表钳制
+// - 注册表由 cli 从用户 models.json 读入;core 不读文件、不编进二进制
+// - 查不到模型或不传表 → 不钳制
 
-use once_cell::sync::Lazy;
 use serde::Deserialize;
 
 /// 思考级别(与 Anthropic thinking 级别对应)
@@ -58,33 +57,22 @@ const THRESHOLD_LOW: i64 = 1024;
 const THRESHOLD_MEDIUM: i64 = 8192;
 const THRESHOLD_HIGH: i64 = 24576;
 
-/// 默认支持集(无 registry 时用安全的通用集,排除 auto/none/minimal)
-pub const DEFAULT_SUPPORTED: [Level; 5] = [
-    Level::Low,
-    Level::Medium,
-    Level::High,
-    Level::XHigh,
-    Level::Max,
-];
-
-/// 模型能力定义(来自 models.json)
-#[derive(Debug, Clone, Deserialize)]
-struct ModelCapability {
-    id: String,
-    reasoning_levels: Vec<String>,
+/// 模型能力定义(来自用户 models.json)
+#[derive(Debug, Clone, PartialEq, Eq, Deserialize)]
+pub struct ModelCapability {
+    pub id: String,
+    pub reasoning_levels: Vec<String>,
 }
 
-/// 静态注册表(编译时嵌入 models.json)
-static MODEL_REGISTRY: Lazy<Vec<ModelCapability>> = Lazy::new(|| {
-    const JSON: &str = include_str!("../models.json");
-    #[derive(Deserialize)]
-    struct Registry {
-        models: Vec<ModelCapability>,
-    }
-    serde_json::from_str::<Registry>(JSON)
-        .map(|r| r.models)
-        .unwrap_or_default()
-});
+#[derive(Deserialize)]
+struct RegistryFile {
+    models: Vec<ModelCapability>,
+}
+
+/// 解析用户 models.json 文本。core 不读文件。
+pub fn parse_registry(json: &str) -> Result<Vec<ModelCapability>, serde_json::Error> {
+    serde_json::from_str::<RegistryFile>(json).map(|r| r.models)
+}
 
 /// 查找模型支持的 reasoning_levels(精确匹配或别名匹配,测试可注入 registry)
 ///
@@ -148,25 +136,10 @@ pub fn resolve_effort_from_body(body: &serde_json::Value) -> Option<&'static str
     body.get("thinking").and_then(resolve_effort)
 }
 
-/// 钳制 effort 到模型支持的最大级别
+/// 钳制 effort 到模型支持的最近级别
 ///
-/// 逻辑:查注册表,降级到最近支持级别(CLIProxyAPI 风格)
-/// 查不到 → 不钳制
-///
-/// 示例:
-/// - `clamp_effort("max", "glm-5.1")` → "xhigh"(注册表 glm-5.1 支持到 xhigh)
-/// - `clamp_effort("max", "glm-5.2")` → "max"(注册表 glm-5.2 支持 max)
-/// - `clamp_effort("max", "gpt-5.6-terra")` → "max"(注册表支持 max)
-pub fn clamp_effort<'a>(effort: &'a str, model: &str) -> &'a str {
-    clamp_effort_with_registry(effort, model, &MODEL_REGISTRY)
-}
-
-/// 内部钳制逻辑(测试可注入 registry)
-fn clamp_effort_with_registry<'a>(
-    effort: &'a str,
-    model: &str,
-    registry: &[ModelCapability],
-) -> &'a str {
+/// 查不到模型或注册表为空 → 不钳制
+pub fn clamp_effort<'a>(effort: &'a str, model: &str, registry: &[ModelCapability]) -> &'a str {
     let Some(effort_level) = Level::parse(effort) else {
         return effort; // 非法值直透
     };
@@ -373,13 +346,28 @@ mod tests {
 
     #[test]
     fn test_clamp_effort_no_limit() {
-        assert_eq!(clamp_effort("max", "unknown-model"), "max");
-        assert_eq!(clamp_effort("xhigh", "unknown-model"), "xhigh");
+        assert_eq!(clamp_effort("max", "unknown-model", &[]), "max");
+        assert_eq!(clamp_effort("xhigh", "unknown-model", &[]), "xhigh");
     }
 
     #[test]
     fn test_clamp_effort_invalid_effort_passthrough() {
-        assert_eq!(clamp_effort("bogus", "any-model"), "bogus");
+        assert_eq!(clamp_effort("bogus", "any-model", &[]), "bogus");
+    }
+
+    #[test]
+    fn test_parse_registry_roundtrip() {
+        let json = r#"{"models":[{"id":"gpt-6-astra","reasoning_levels":["low","medium"]}]}"#;
+        let reg = parse_registry(json).unwrap();
+        assert_eq!(reg.len(), 1);
+        assert_eq!(reg[0].id, "gpt-6-astra");
+        assert_eq!(reg[0].reasoning_levels, ["low", "medium"]);
+        assert_eq!(clamp_effort("high", "gpt-6-astra", &reg), "medium");
+    }
+
+    #[test]
+    fn test_parse_registry_invalid_json() {
+        assert!(parse_registry("{").is_err());
     }
 
     // mock registry 供测试用(不依赖 models.json 实际内容)
@@ -439,30 +427,30 @@ mod tests {
     #[test]
     fn test_clamp_effort_registry_glm51() {
         let reg = mock_registry();
-        assert_eq!(clamp_effort_with_registry("max", "glm-5.1", &reg), "xhigh");
+        assert_eq!(clamp_effort("max", "glm-5.1", &reg), "xhigh");
         assert_eq!(
-            clamp_effort_with_registry("xhigh", "glm-5.1", &reg),
+            clamp_effort("xhigh", "glm-5.1", &reg),
             "xhigh"
         );
-        assert_eq!(clamp_effort_with_registry("high", "glm-5.1", &reg), "high");
+        assert_eq!(clamp_effort("high", "glm-5.1", &reg), "high");
     }
 
     #[test]
     fn test_clamp_effort_registry_glm52() {
         let reg = mock_registry();
-        assert_eq!(clamp_effort_with_registry("max", "glm-5.2", &reg), "max");
-        assert_eq!(clamp_effort_with_registry("xhigh", "glm-5.2", &reg), "high");
+        assert_eq!(clamp_effort("max", "glm-5.2", &reg), "max");
+        assert_eq!(clamp_effort("xhigh", "glm-5.2", &reg), "high");
     }
 
     #[test]
     fn test_clamp_effort_registry_gpt56() {
         let reg = mock_registry();
         assert_eq!(
-            clamp_effort_with_registry("max", "gpt-5.6-terra", &reg),
+            clamp_effort("max", "gpt-5.6-terra", &reg),
             "xhigh"
         );
         assert_eq!(
-            clamp_effort_with_registry("max", "gpt-5.6-sol", &reg),
+            clamp_effort("max", "gpt-5.6-sol", &reg),
             "xhigh"
         );
     }
@@ -470,14 +458,14 @@ mod tests {
     #[test]
     fn test_clamp_effort_registry_grok46() {
         let reg = mock_registry();
-        assert_eq!(clamp_effort_with_registry("max", "grok-4.6", &reg), "xhigh");
+        assert_eq!(clamp_effort("max", "grok-4.6", &reg), "xhigh");
         assert_eq!(
-            clamp_effort_with_registry("xhigh", "grok-4.6", &reg),
+            clamp_effort("xhigh", "grok-4.6", &reg),
             "xhigh"
         );
-        assert_eq!(clamp_effort_with_registry("high", "grok-4.6", &reg), "high");
+        assert_eq!(clamp_effort("high", "grok-4.6", &reg), "high");
         assert_eq!(
-            clamp_effort_with_registry("medium", "grok-4.6", &reg),
+            clamp_effort("medium", "grok-4.6", &reg),
             "medium"
         );
     }
@@ -485,28 +473,28 @@ mod tests {
     #[test]
     fn test_clamp_effort_registry_kimi() {
         let reg = mock_registry();
-        assert_eq!(clamp_effort_with_registry("max", "kimi-k3", &reg), "max");
-        assert_eq!(clamp_effort_with_registry("xhigh", "kimi-k3", &reg), "high");
-        assert_eq!(clamp_effort_with_registry("medium", "kimi-k3", &reg), "low");
-        assert_eq!(clamp_effort_with_registry("high", "kimi-k3", &reg), "high");
+        assert_eq!(clamp_effort("max", "kimi-k3", &reg), "max");
+        assert_eq!(clamp_effort("xhigh", "kimi-k3", &reg), "high");
+        assert_eq!(clamp_effort("medium", "kimi-k3", &reg), "low");
+        assert_eq!(clamp_effort("high", "kimi-k3", &reg), "high");
     }
 
     #[test]
     fn test_clamp_effort_registry_case_insensitive() {
         let reg = mock_registry();
-        assert_eq!(clamp_effort_with_registry("max", "GLM-5.1", &reg), "xhigh");
-        assert_eq!(clamp_effort_with_registry("xhigh", "Kimi-K3", &reg), "high");
+        assert_eq!(clamp_effort("max", "GLM-5.1", &reg), "xhigh");
+        assert_eq!(clamp_effort("xhigh", "Kimi-K3", &reg), "high");
     }
 
     #[test]
     fn test_clamp_effort_registry_gemini_flash_sku() {
         let reg = mock_registry();
         assert_eq!(
-            clamp_effort_with_registry("max", "gemini-3.8-flash-high", &reg),
+            clamp_effort("max", "gemini-3.8-flash-high", &reg),
             "high"
         );
         assert_eq!(
-            clamp_effort_with_registry("medium", "gemini-3.8-flash-high", &reg),
+            clamp_effort("medium", "gemini-3.8-flash-high", &reg),
             "high"
         );
     }
