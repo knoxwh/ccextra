@@ -11,7 +11,7 @@
 ## 特性
 
 - **多协议上游**：Claude、OpenAI Chat、OpenAI Responses、Gemini、Antigravity 共用一个入口，按模型 alias 路由。
-- **Claude 直通**：`claude` provider 只替换 `model`，其余请求内容保持原样。
+- **Claude 直通**：`claude` provider 只替换 `model`，非 Claude 模型另按 `models.json` 把越档 effort 钳到支持档，其余请求内容保持原样。
 - **确定性归一化**：稳定工具和 schema 顺序、历史 reminder、工具参数键序与尾部空白，减少跨轮序列化漂移，目标是提高上游 prompt cache 命中率。
 - **动态 provider**：xAI Grok 经 OAuth 注入 Responses provider；Antigravity 凭证后台加载并定时刷新模型。
 - **热重载**：`POST /reload` 替换 providers、payload、归一化、认证、代理、User-Agent 和 reasoning 注册表，无需重启。
@@ -33,7 +33,7 @@ flowchart LR
 
 | `protocol` | 上游接口 | 说明 |
 | --- | --- | --- |
-| `claude` | Anthropic Messages | 仅替换 `model`，其余请求内容保持原样。 |
+| `claude` | Anthropic Messages | 仅替换 `model`（非 Claude 模型另钳制越档 effort），其余请求内容保持原样。 |
 | `openai_chat` | Chat Completions | 转换 messages、工具、图片和 reasoning（支持 Kimi K2.8）。 |
 | `openai_responses` | Responses | 转换为 `instructions` 和 `input`，支持 reasoning replay 与 web_search 过滤。 |
 | `gemini` | Gemini GenerateContent | 使用 Gemini 内容、工具和 schema 形状。 |

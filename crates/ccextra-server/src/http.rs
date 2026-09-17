@@ -26,9 +26,10 @@ use ccextra_core::cache_stabilization::drift_detector::{
     DriftState,
 };
 use ccextra_core::convert::{
-    convert_passthrough, convert_to_antigravity_with, convert_to_gemini_with_registry,
-    convert_to_openai_chat_with, convert_to_openai_responses_with, is_thinking_signature_invalid,
-    sanitize_gpt_reasoning_items, trim_encrypted_reasoning_items, ConvertError,
+    clamp_passthrough_effort, convert_passthrough, convert_to_antigravity_with,
+    convert_to_gemini_with_registry, convert_to_openai_chat_with, convert_to_openai_responses_with,
+    is_thinking_signature_invalid, sanitize_gpt_reasoning_items, trim_encrypted_reasoning_items,
+    ConvertError,
 };
 use ccextra_core::normalize::{
     normalize_anthropic_full, normalize_anthropic_pretransform, normalize_target_post, TargetShape,
@@ -708,6 +709,14 @@ async fn handle_messages(
     match route.protocol {
         Protocol::Claude => {
             convert_passthrough(&mut body_json, &route.upstream_model)?;
+            // 非 Claude 模型的越档 effort 钳制(百炼等上游对越档值 400);
+            // `*claude*` 模型与 thinking disabled 跳过,值不变不写回
+            if clamp_passthrough_effort(&mut body_json, &route.upstream_model, &thinking_registry) {
+                tracing::debug!(
+                    model = %route.upstream_model,
+                    "claude 直通 effort 已钳制到模型支持档"
+                );
+            }
         }
         Protocol::OpenAiChat => {
             convert_to_openai_chat_with(
@@ -2106,6 +2115,110 @@ models:
 
         assert_eq!(attempts.load(Ordering::SeqCst), 2);
         assert!(String::from_utf8_lossy(&response_body).contains("retry ok"));
+    }
+
+    /// Claude 直通:越档 effort 在发上游前被钳制;`*claude*` 模型原样直通。
+    #[tokio::test]
+    async fn test_claude_passthrough_clamps_effort_before_upstream() {
+        let captured = Arc::new(std::sync::Mutex::new(Value::Null));
+        let handler_captured = Arc::clone(&captured);
+        let upstream = Router::new().route(
+            "/v1/messages",
+            post(move |body: axum::body::Bytes| {
+                let captured = Arc::clone(&handler_captured);
+                async move {
+                    *captured.lock().unwrap() = serde_json::from_slice(&body).unwrap_or(json!({}));
+                    (
+                        [(header::CONTENT_TYPE, "application/json")],
+                        json!({
+                            "id": "msg_1",
+                            "type": "message",
+                            "role": "assistant",
+                            "model": "glm-5.3",
+                            "content": [{"type": "text", "text": "ok"}],
+                            "stop_reason": "end_turn",
+                            "usage": {"input_tokens": 1, "output_tokens": 1}
+                        })
+                        .to_string(),
+                    )
+                }
+            }),
+        );
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let upstream_addr = listener.local_addr().unwrap();
+        let server = tokio::spawn(async move {
+            axum::serve(listener, upstream).await.unwrap();
+        });
+
+        let state = mock_state();
+        let providers_yaml = format!(
+            r#"
+- name: test-bailian
+  protocol: claude
+  base_url: "http://{}"
+  key: sk-test
+  proxy_url: "direct"
+  models:
+    - name: glm-5.3
+      alias: test-glm
+    - name: claude-opus-5
+      alias: test-claude-local
+"#,
+            upstream_addr
+        );
+        let providers: Vec<ProviderConfig> = serde_yaml::from_str(&providers_yaml).unwrap();
+        state.providers.write().await.extend(providers);
+        state.runtime.write().await.thinking_registry =
+            Arc::new(vec![ccextra_core::thinking::ModelCapability {
+                id: "glm-5.3".into(),
+                reasoning_levels: vec!["low".into(), "high".into(), "max".into()],
+            }]);
+        let app = app(state);
+
+        // 非 Claude 模型:medium 越档,钳到 low(与 low/high 等距,tie 取低)
+        let request = Request::builder()
+            .uri("/v1/messages")
+            .method("POST")
+            .header("content-type", "application/json")
+            .body(Body::from(
+                serde_json::to_vec(&json!({
+                    "model": "test-glm",
+                    "max_tokens": 64,
+                    "output_config": {"effort": "medium"},
+                    "messages": [{"role": "user", "content": "hi"}]
+                }))
+                .unwrap(),
+            ))
+            .unwrap();
+        let response = app.clone().oneshot(request).await.unwrap();
+        assert_eq!(response.status(), StatusCode::OK);
+        let sent = captured.lock().unwrap().clone();
+        assert_eq!(sent["model"], "glm-5.3");
+        assert_eq!(sent["output_config"]["effort"], "low");
+        assert_eq!(sent["messages"][0]["content"], "hi");
+
+        // Claude 模型:glob `*claude*` 跳过,越档 effort 原样直通
+        let request = Request::builder()
+            .uri("/v1/messages")
+            .method("POST")
+            .header("content-type", "application/json")
+            .body(Body::from(
+                serde_json::to_vec(&json!({
+                    "model": "test-claude-local",
+                    "max_tokens": 64,
+                    "output_config": {"effort": "medium"},
+                    "messages": [{"role": "user", "content": "hi"}]
+                }))
+                .unwrap(),
+            ))
+            .unwrap();
+        let response = app.oneshot(request).await.unwrap();
+        assert_eq!(response.status(), StatusCode::OK);
+        let sent = captured.lock().unwrap().clone();
+        assert_eq!(sent["model"], "claude-opus-5");
+        assert_eq!(sent["output_config"]["effort"], "medium");
+
+        server.abort();
     }
 
     /// GPT Responses 在请求前剥离格式无效的 encrypted_content，避免触发 400 重试。
