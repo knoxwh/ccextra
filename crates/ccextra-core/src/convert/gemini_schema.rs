@@ -797,7 +797,12 @@ fn remove_unsupported_keywords(schema: &mut Value, opts: CleanOptions) {
         "const",
         "$ref",
         "$id",
+        "id",
         "additionalProperties",
+        "$anchor",
+        "$vocabulary",
+        "$dynamicRef",
+        "$dynamicAnchor",
         "propertyNames",
         "patternProperties",
         "if",
@@ -1401,6 +1406,57 @@ mod tests {
         let out = clean_json_schema_for_gemini(&schema);
         assert!(out["properties"].get("type").is_some());
         assert!(out["properties"].get("format").is_some());
+    }
+
+    #[test]
+    fn test_schema_identifier_keywords_stripped() {
+        // 对齐 CPA f668ac41(Issue #5888):draft-04 "id" 与 2019-09/2020-12
+        // 标识关键字从 schema 节点剥离,属性名映射里的 "id" 属性保留
+        let schema = json!({
+            "id": "http://example.com/root.json",
+            "$anchor": "rootAnchor",
+            "$vocabulary": {"https://json-schema.org/draft/2020-12/vocab/core": true},
+            "type": "object",
+            "properties": {
+                "kind": {
+                    "type": "string",
+                    "enum": ["short", "video"],
+                    "id": "ContentType",
+                    "$anchor": "contentTypeAnchor",
+                    "$dynamicAnchor": "dynAnchor",
+                    "$dynamicRef": "#dynAnchor",
+                    "description": "Kind"
+                },
+                "id": {
+                    "type": "string",
+                    "description": "Property legitimately named id should survive"
+                }
+            },
+            "required": ["kind"]
+        });
+        for out in [
+            clean_json_schema_for_gemini(&schema),
+            clean_json_schema_for_antigravity(&schema),
+        ] {
+            // 根节点标识关键字剥离
+            assert!(out.get("id").is_none(), "root id kept: {out}");
+            assert!(out.get("$anchor").is_none(), "root $anchor kept: {out}");
+            assert!(
+                out.get("$vocabulary").is_none(),
+                "root $vocabulary kept: {out}"
+            );
+            // 属性 schema 内的标识关键字剥离
+            assert!(out["properties"]["kind"].get("id").is_none());
+            assert!(out["properties"]["kind"].get("$anchor").is_none());
+            assert!(out["properties"]["kind"].get("$dynamicAnchor").is_none());
+            assert!(out["properties"]["kind"].get("$dynamicRef").is_none());
+            // 属性名 "id" 本身保留
+            assert!(
+                out["properties"].get("id").is_some(),
+                "property id dropped: {out}"
+            );
+            assert_eq!(out["properties"]["id"]["type"], "string");
+        }
     }
 
     #[test]
