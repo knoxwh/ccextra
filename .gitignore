@@ -12,6 +12,9 @@ config.yaml
 config.*.yaml
 !config.example.yaml
 
+# 用户自管 reasoning 注册表
+models.json
+
 # 编译产物
 /ccextra
 
