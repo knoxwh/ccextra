@@ -1,8 +1,8 @@
 //! PR-E9:从 `tool_result.content` 中剥离开被"揉合"的 `<system-reminder>` 块。
 //!
 //! Claude Code 有时会把 `<system-reminder>` 文本直接追加到 `tool_result` 块的
-//! 字符串内容中,而不是作为独立的文本块发出。`content_strip` 针对的是独立的
-//! 文本块,无法触及这些被揉合的 reminder。本模块先将其剥离,把:
+//! 字符串内容中,而不是作为独立的文本块发出。本模块处理这类被揉合的
+//! reminder,先将其剥离,把:
 //!   tool_result.content: "...output\n\n<system-reminder>…</system-reminder>"
 //! 转换为:
 //!   tool_result.content: "...output"

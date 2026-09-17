@@ -648,8 +648,8 @@ async fn handle_messages(
 
     // 3. 归一化第一遍(按协议:claude 直通全量 / openai 转换前精简)
     // 对齐:claude 直通走 /v1/messages(全量),openai 走转换前
-    // 精简子集(跳过 tool-def sort / volatile / cache_control / drift——
-    // 这些在转换后 openai handler 处理)
+    // 精简子集(跳过 dateline 归一化 / volatile 告警 / drift——dateline 和
+    // drift 在转换后 openai handler 处理;cache_control 由转换器丢弃)
     if normalize_enabled {
         match route.protocol {
             Protocol::Claude => {

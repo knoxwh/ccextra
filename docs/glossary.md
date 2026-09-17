@@ -55,7 +55,7 @@ Anthropic 到 Claude 的路径。只改 `model`，并按规则转发身份头。
 Anthropic 到 Chat、Responses、Gemini 或 Antigravity 的独立转换路径。它们重建目标 body，再在需要时映射响应。
 
 **工具调用**
-Anthropic `tool_use` 和 `tool_result`。转换器保持 call ID 配对；空工具结果会补安全的非空输出。Responses 过长工具名在请求侧缩短、响应侧还原。
+Anthropic `tool_use` 和 `tool_result`。转换器保持 call ID 配对；空工具结果会补安全的非空输出。Responses 过长工具名在请求侧缩短、响应侧还原，缩短结果去掉前导 `_`/`-`（全为分隔符时保留原截断值）。
 
 **服务端 web search 工具**
 Claude `web_search_*` 工具。Chat 路径删除它；Responses 映射为 `web_search`；Gemini 风格路径删除它。

@@ -1,7 +1,7 @@
-// 归一化:编排九模块
+// 归一化:编排缓存稳定化模块
 //
 // 三条管线:
-// - normalize_anthropic_full:  入站 anthropic 转换前,九模块全跑
+// - normalize_anthropic_full:  入站 anthropic 转换前,全量管线
 // - normalize_target_post:     转换后目标 body 二次归一化(openai chat / responses)
 //
 // 说明:
@@ -49,7 +49,7 @@ pub enum TargetShape {
     OpenAiResponses,
 }
 
-/// 入站 anthropic 转换前归一化:七模块全跑
+/// 入站 anthropic 转换前归一化:全量管线
 ///
 /// 顺序:
 /// 1. tool_def 排序 + schema 键递归排序(仅当无 cache_control 时)
@@ -106,8 +106,8 @@ pub fn normalize_anthropic_full(body: &mut Value) -> NormalizeCounts {
 /// 跑:tool_def 排序 + schema 键排序 → smoosh → tool_input → sort → rstrip。
 /// tool_def 排序提升 gemini/antigravity 隐式前缀缓存命中率(对齐 full 管线)。
 /// schema 键必须在 tool_input 之前排:转换把 `tool_use.input` 冻成
-/// `arguments` 字符串,post 无法再改。跳过 volatile strip、auto cache_control、
-/// volatile detect warn——cache_control 转换时丢弃;volatile / drift 留转换后。
+/// `arguments` 字符串,post 无法再改。跳过 dateline 归一化和 volatile
+/// detect 告警——dateline 留转换后,告警只在全量管线运行。
 pub fn normalize_anthropic_pretransform(body: &mut Value) -> NormalizeCounts {
     let mut tool_sorted = false;
 
@@ -127,13 +127,11 @@ pub fn normalize_anthropic_pretransform(body: &mut Value) -> NormalizeCounts {
         tool_sorted,
         // 1. smoosh 拆分
         smoosh_count: split_smooshed_reminders(body, DriftApiKind::Anthropic),
-        // 2. bookkeeping 剥离(临时禁用:活尾保留导致缓存前缀每轮变化,实际无效)
-        // bookkeeping_count: strip_bookkeeping_content(body, DriftApiKind::Anthropic),
-        // 3. tool_use.input 键序归一化
+        // 2. tool_use.input 键序归一化
         tool_input_count: normalize_tool_use_inputs(body, DriftApiKind::Anthropic),
-        // 4. system reminder 列表块排序
+        // 3. system reminder 列表块排序
         sort_count: stabilize_block_sort(body, DriftApiKind::Anthropic),
-        // 5. 尾部 reminder 空白归一化
+        // 4. 尾部 reminder 空白归一化
         rstrip_count: normalize_reminder_trailing_whitespace(body, DriftApiKind::Anthropic),
         ..Default::default()
     }

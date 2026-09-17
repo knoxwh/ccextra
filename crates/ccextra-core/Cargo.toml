@@ -18,7 +18,7 @@ base64.workspace = true
 globset.workspace = true
 tracing.workspace = true
 
-# cache_stabilization 模块依赖
+# cache_stabilization 与 session 依赖
 md-5 = "0.10"
 lru = "0.12"
 regex = "1"
