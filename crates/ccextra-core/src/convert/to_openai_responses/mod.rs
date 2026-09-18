@@ -43,6 +43,7 @@ use messages::*;
 use reasoning::*;
 use schema::*;
 
+/// Anthropic messages → OpenAI responses
 pub fn convert_to_openai_responses(
     body: &mut Value,
     upstream_model: &str,

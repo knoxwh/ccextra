@@ -5,6 +5,7 @@ use crate::convert::gemini_schema::inline_local_refs;
 use crate::convert::has_unsupported_unicode_property_escape;
 use crate::convert::{SCHEMA_MAP_KEYWORDS, SCHEMA_VALUE_KEYWORDS};
 
+/// input_schema → parameters(对齐 normalizeToolParameters)
 pub(crate) fn normalize_tool_parameters(schema: &Value) -> Value {
     if schema.is_null() || !schema.is_object() {
         return json!({"type": "object", "properties": {}});
