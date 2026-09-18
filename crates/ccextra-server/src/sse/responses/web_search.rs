@@ -55,4 +55,3 @@ pub fn web_search_result_content(root: &Value, item: &Value) -> Vec<Value> {
     }
     out
 }
-

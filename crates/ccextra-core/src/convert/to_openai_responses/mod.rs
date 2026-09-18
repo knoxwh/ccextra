@@ -25,8 +25,8 @@ pub mod schema;
 #[cfg(test)]
 mod tests;
 
-use std::collections::{HashMap, HashSet};
 use serde_json::{json, Value};
+use std::collections::{HashMap, HashSet};
 
 use crate::convert::shorten::{build_short_name_map, shorten_name_if_needed};
 use crate::convert::Result;

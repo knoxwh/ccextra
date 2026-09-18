@@ -7,7 +7,6 @@ use super::state_machine::ResponsesRelay;
 use super::CLAUDE_RESPONSES_REDACTED_THINKING_PREFIX;
 
 impl ResponsesRelay {
-
     pub(crate) fn start_thinking(&mut self) -> Vec<Bytes> {
         if self.thinking_open {
             return Vec::new();

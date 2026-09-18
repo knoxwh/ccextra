@@ -1,8 +1,8 @@
-use std::collections::HashMap;
-use std::sync::{Mutex as StdMutex, OnceLock};
+use crate::http::error::AppError;
 use axum::http::HeaderMap;
 use ccextra_core::secret::looks_like_bcrypt;
-use crate::http::error::AppError;
+use std::collections::HashMap;
+use std::sync::{Mutex as StdMutex, OnceLock};
 
 /// bcrypt 验证结果缓存:key→已验证,避免每请求一次 ~100ms 的 bcrypt verify
 /// 上限 1024 条,超限清空(防内存无限增长);secret 可热重载,/reload 一律清空缓存
@@ -89,10 +89,16 @@ mod tests {
     #[test]
     fn test_extract_key_fallback_bearer() {
         let mut headers = HeaderMap::new();
-        headers.insert("authorization", HeaderValue::from_static("Bearer secret-token"));
+        headers.insert(
+            "authorization",
+            HeaderValue::from_static("Bearer secret-token"),
+        );
         assert_eq!(extract_key(&headers), "secret-token");
 
-        headers.insert("authorization", HeaderValue::from_static("bearer   token2  "));
+        headers.insert(
+            "authorization",
+            HeaderValue::from_static("bearer   token2  "),
+        );
         assert_eq!(extract_key(&headers), "token2");
     }
 

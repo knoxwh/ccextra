@@ -12,9 +12,7 @@ use ccextra_core::doom_loop::{is_confident, parse_trigger};
 use super::compensations::*;
 use super::function_call::*;
 use super::web_search::*;
-use super::{
-    CLAUDE_RESPONSES_REDACTED_THINKING_PREFIX, FALLBACK_MODEL, SUMMARY_PART_SEPARATOR,
-};
+use super::{CLAUDE_RESPONSES_REDACTED_THINKING_PREFIX, FALLBACK_MODEL, SUMMARY_PART_SEPARATOR};
 
 pub(crate) struct ResponsesRelay {
     pub(crate) message_started: bool,
@@ -97,7 +95,10 @@ impl ResponsesRelay {
         }
     }
 
-    pub(crate) fn with_tool_names(mut self, tool_names: Option<Arc<HashMap<String, String>>>) -> Self {
+    pub(crate) fn with_tool_names(
+        mut self,
+        tool_names: Option<Arc<HashMap<String, String>>>,
+    ) -> Self {
         self.tool_names = tool_names;
         self
     }
@@ -410,7 +411,10 @@ impl ResponsesRelay {
     }
 
     /// 终态响应对象上的 doom_loop_check 字段(双路报告第二处)
-    pub(crate) fn check_terminal_doom_loop(&mut self, response: Option<&Value>) -> Option<Vec<Bytes>> {
+    pub(crate) fn check_terminal_doom_loop(
+        &mut self,
+        response: Option<&Value>,
+    ) -> Option<Vec<Bytes>> {
         let triggers = response?
             .pointer("/doom_loop_check/triggers")
             .and_then(|v| v.as_array())
@@ -785,4 +789,3 @@ impl ResponsesRelay {
         vec![emit::error_event(message)]
     }
 }
-

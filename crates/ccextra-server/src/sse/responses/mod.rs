@@ -22,7 +22,6 @@ mod tests;
 use async_stream::stream;
 use bytes::Bytes;
 use futures::Stream;
-use futures::StreamExt;
 use std::collections::HashMap;
 use std::sync::Arc;
 
@@ -64,12 +63,17 @@ where
 
     Box::pin(stream! {
         loop {
-            let Some(chunk) = stream.next().await else { break };
-            let chunk = match chunk {
-                Ok(c) => c,
-                Err(e) => {
-                    // 上游中断:发结构化 error 事件,不裸断流
+            let chunk = match crate::sse::next_upstream_chunk(&mut stream).await {
+                Ok(Some(Ok(c))) => c,
+                Ok(Some(Err(e))) => {
                     for out in relay.stream_error(&e.to_string()) {
+                        yield Ok(out);
+                    }
+                    return;
+                }
+                Ok(None) => break,
+                Err(msg) => {
+                    for out in relay.stream_error(msg) {
                         yield Ok(out);
                     }
                     return;

@@ -1,11 +1,11 @@
-use super::*;
 use super::compensations::*;
 use super::state_machine::*;
+use super::*;
+use crate::sse::parser::SseEvent;
 use bytes::Bytes;
 use serde_json::{json, Value};
 use std::collections::HashMap;
 use std::sync::Arc;
-use crate::sse::parser::SseEvent;
 
 fn s(bufs: &[Bytes]) -> String {
     String::from_utf8_lossy(&bufs.concat()).into_owned()
@@ -977,16 +977,21 @@ fn test_empty_incomplete_guards() {
     assert!(out.iter().any(|b| b.starts_with(b"event: message_delta")));
 }
 
-
 #[test]
 fn test_golden_sse_typical_flows_byte_invariance() {
     // 1. 文本增量 (Text Delta Stream)
     {
         let mut r = ResponsesRelay::new(Some(100));
         let mut out = Vec::new();
-        out.extend(r.process(&ev(r#"{"type":"response.created","response":{"id":"resp_1","model":"gpt-5"}}"#)));
-        out.extend(r.process(&ev(r#"{"type":"response.output_text.delta","delta":"hello "}"#)));
-        out.extend(r.process(&ev(r#"{"type":"response.output_text.delta","delta":"world"}"#)));
+        out.extend(r.process(&ev(
+            r#"{"type":"response.created","response":{"id":"resp_1","model":"gpt-5"}}"#,
+        )));
+        out.extend(r.process(&ev(
+            r#"{"type":"response.output_text.delta","delta":"hello "}"#,
+        )));
+        out.extend(r.process(&ev(
+            r#"{"type":"response.output_text.delta","delta":"world"}"#,
+        )));
         out.extend(r.process(&ev(r#"{"type":"response.completed","response":{"id":"resp_1","usage":{"input_tokens":100,"output_tokens":2}}}"#)));
         let text_stream = s(&out);
         assert_eq!(
@@ -1008,10 +1013,16 @@ fn test_golden_sse_typical_flows_byte_invariance() {
         let mut r = ResponsesRelay::new(None);
         let mut out = Vec::new();
         let sig = "gAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA";
-        out.extend(r.process(&ev(r#"{"type":"response.created","response":{"id":"resp_2","model":"gpt-5"}}"#)));
-        out.extend(r.process(&ev(r#"{"type":"response.reasoning_summary_text.delta","delta":"thinking step 1"}"#)));
+        out.extend(r.process(&ev(
+            r#"{"type":"response.created","response":{"id":"resp_2","model":"gpt-5"}}"#,
+        )));
+        out.extend(r.process(&ev(
+            r#"{"type":"response.reasoning_summary_text.delta","delta":"thinking step 1"}"#,
+        )));
         out.extend(r.process(&ev(&format!(r#"{{"type":"response.output_item.done","item":{{"type":"reasoning","encrypted_content":"{sig}"}}}}"#))));
-        out.extend(r.process(&ev(r#"{"type":"response.output_text.delta","delta":"answer"}"#)));
+        out.extend(r.process(&ev(
+            r#"{"type":"response.output_text.delta","delta":"answer"}"#,
+        )));
         out.extend(r.process(&ev(r#"{"type":"response.completed","response":{"id":"resp_2","usage":{"input_tokens":50,"output_tokens":10}}}"#)));
         let thinking_stream = s(&out);
         assert_eq!(
@@ -1038,7 +1049,9 @@ fn test_golden_sse_typical_flows_byte_invariance() {
     {
         let mut r = ResponsesRelay::new(None);
         let mut out = Vec::new();
-        out.extend(r.process(&ev(r#"{"type":"response.created","response":{"id":"resp_3","model":"gpt-5"}}"#)));
+        out.extend(r.process(&ev(
+            r#"{"type":"response.created","response":{"id":"resp_3","model":"gpt-5"}}"#,
+        )));
         out.extend(r.process(&ev(r#"{"type":"response.output_item.added","item":{"type":"function_call","call_id":"c1","name":"tool_a"}}"#)));
         out.extend(r.process(&ev(r#"{"type":"response.function_call_arguments.delta","call_id":"c1","delta":"{\"x\":1}"}"#)));
         out.extend(r.process(&ev(r#"{"type":"response.output_item.done","item":{"type":"function_call","call_id":"c1","name":"tool_a","arguments":"{\"x\":1}"}}"#)));
@@ -1062,8 +1075,12 @@ concat!(
     {
         let mut r = ResponsesRelay::new(None);
         let mut out = Vec::new();
-        out.extend(r.process(&ev(r#"{"type":"response.created","response":{"id":"resp_4","model":"gpt-5"}}"#)));
-        let inc = ev(r#"{"type":"response.incomplete","response":{"id":"resp_4","output":[],"usage":{"input_tokens":10,"output_tokens":0}}}"#);
+        out.extend(r.process(&ev(
+            r#"{"type":"response.created","response":{"id":"resp_4","model":"gpt-5"}}"#,
+        )));
+        let inc = ev(
+            r#"{"type":"response.incomplete","response":{"id":"resp_4","output":[],"usage":{"input_tokens":10,"output_tokens":0}}}"#,
+        );
         out.extend(r.process(&inc));
         let inc_stream = s(&out);
         assert!(inc_stream.contains("event: error"));

@@ -25,6 +25,7 @@ use std::collections::HashMap;
 use std::io;
 use std::pin::Pin;
 use std::sync::Arc;
+use std::time::Duration;
 
 /// 统一响应流类型:可 Send 的固定字节流
 pub type SseStreamPin = Pin<Box<dyn Stream<Item = Result<Bytes, io::Error>> + Send>>;
@@ -34,8 +35,25 @@ pub type SseStreamPin = Pin<Box<dyn Stream<Item = Result<Bytes, io::Error>> + Se
 /// 官方 API 自带兜底,转换路径须等价提供。claude 直通同样注入。
 /// 帧用 SSE 注释行 `: keepalive`(对齐 sub2api openai_compact_sse_keepalive):
 /// eventsource 解析层直接忽略,不进入客户端事件流,任何协议下游都可见字节。
-const KEEPALIVE_INTERVAL: std::time::Duration = std::time::Duration::from_secs(10);
+const KEEPALIVE_INTERVAL: Duration = Duration::from_secs(10);
 const KEEPALIVE_FRAME: &str = ": keepalive\n\n";
+/// 上游流 chunk 空闲上限(对齐 grok DEFAULT_IDLE_TIMEOUT_SECS)。
+/// 必须包在转换前的上游 stream.next(),不能包 keepalive 之后。
+pub(crate) const STREAM_IDLE_TIMEOUT: Duration = Duration::from_secs(300);
+pub(crate) const STREAM_IDLE_MESSAGE: &str = "upstream stream idle timeout (300s)";
+
+/// 等到下一上游 chunk;超时返回 Idle。
+pub(crate) async fn next_upstream_chunk<S>(
+    stream: &mut Pin<Box<S>>,
+) -> Result<Option<Result<Bytes, reqwest::Error>>, &'static str>
+where
+    S: Stream<Item = Result<Bytes, reqwest::Error>> + ?Sized,
+{
+    match tokio::time::timeout(STREAM_IDLE_TIMEOUT, stream.next()).await {
+        Ok(item) => Ok(item),
+        Err(_) => Err(STREAM_IDLE_MESSAGE),
+    }
+}
 
 /// 空闲超时心跳:每 interval 无上游字节则发一帧注释行占位。
 /// 任意真实字节(含转发帧)重置计时器;空字节块不发不重置。

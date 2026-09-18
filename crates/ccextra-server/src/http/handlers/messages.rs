@@ -41,15 +41,21 @@ use crate::upstream::{is_gpt_model, is_grok_model, UpstreamResponse};
 /// 诊断日志请求序号:与毫秒时间戳组合,避免并发请求覆盖同一文件。
 static UPSTREAM_LOG_SEQUENCE: AtomicU64 = AtomicU64::new(0);
 
-
 /// 按 provider 名查找 provider 配置
-pub(crate) fn find_provider<'a>(providers: &'a [ProviderConfig], name: &str) -> Option<&'a ProviderConfig> {
+pub(crate) fn find_provider<'a>(
+    providers: &'a [ProviderConfig],
+    name: &str,
+) -> Option<&'a ProviderConfig> {
     providers.iter().find(|p| p.name == name)
 }
 
 /// 解析 payload 后最终模型。仅 OpenAI 的无效覆盖回退路由模型并同步写回 body,
 /// 确保 Grok 判定与 UpstreamClient 读取的 model 一致；其余协议保留 payload 原语义。
-pub(crate) fn resolve_outbound_model(body: &mut Value, fallback: &str, protocol: Protocol) -> String {
+pub(crate) fn resolve_outbound_model(
+    body: &mut Value,
+    fallback: &str,
+    protocol: Protocol,
+) -> String {
     match body
         .get("model")
         .and_then(|v| v.as_str())
@@ -132,8 +138,6 @@ pub(crate) fn observe_drift_for(
     let structural_hash = compute_structural_hash(body, kind);
     observe_drift(drift, &identity, structural_hash);
 }
-
-
 
 // ── 上游请求诊断落盘(配合 logs/upstream_request_*)────────
 
@@ -521,76 +525,80 @@ pub async fn handle_messages(
     // 7. 上游请求
     // 从配置中 clone 出上游所需字段后立即释放两把读锁,避免整个上游请求
     // (慢上游/长连接建立)期间持锁,防止 /reload 写锁被无限期阻塞。
-    let (upstream_base_urls, mut upstream_key, upstream_proxy, provider_prompt_cache_key) = {
+    let (
+        upstream_base_urls,
+        mut upstream_key,
+        upstream_proxy,
+        provider_prompt_cache_key,
+        antigravity_refresh,
+        xai_refresh,
+    ) = {
         let provider = find_provider(&providers, &route.provider)
             .ok_or_else(|| AppError::new(anyhow::anyhow!("provider 未找到: {}", route.provider)))?;
+        let meta = provider.metadata.as_ref();
+        let antigravity_refresh = if matches!(route.protocol, Protocol::Antigravity) {
+            match (
+                meta.and_then(|m| m.get("auth_dir")).cloned(),
+                meta.and_then(|m| m.get("email")).cloned(),
+            ) {
+                (Some(auth_dir), Some(email)) => Some((auth_dir, email)),
+                _ => None,
+            }
+        } else {
+            None
+        };
+        let xai_refresh = meta
+            .filter(|m| m.get("provider_type").map(|s| s.as_str()) == Some("xai"))
+            .and_then(|m| {
+                let auth_dir = m.get("auth_dir")?.clone();
+                let email = m.get("email").cloned().unwrap_or_default();
+                let sub = m.get("sub").cloned().unwrap_or_default();
+                Some((auth_dir, email, sub))
+            });
         (
             provider.base_urls().to_vec(),
             provider.key.clone(),
             provider.proxy_url.clone(),
             provider.prompt_cache_key,
+            antigravity_refresh,
+            xai_refresh,
         )
     };
+    drop(payload_rules);
+    drop(providers);
 
     // Antigravity 协议运行时 token 校验与自动刷新（对齐 CLIProxyAPI ensureAccessToken）
-    if matches!(route.protocol, Protocol::Antigravity) {
-        if let Some(provider) = find_provider(&providers, &route.provider) {
-            if let Some(meta) = &provider.metadata {
-                if let (Some(auth_dir_str), Some(email)) = (meta.get("auth_dir"), meta.get("email"))
-                {
-                    let auth_dir = std::path::Path::new(auth_dir_str);
-                    match crate::antigravity::ensure_credential_fresh(
-                        auth_dir,
-                        email,
-                        upstream_proxy.as_deref(),
-                    )
-                    .await
-                    {
-                        Ok(fresh_cred) => {
-                            upstream_key = fresh_cred.access_token;
-                        }
-                        Err(e) => {
-                            tracing::warn!(email = %email, "Antigravity 凭证运行时刷新失败: {e}");
-                        }
-                    }
-                }
+    if let Some((auth_dir_str, email)) = antigravity_refresh {
+        let auth_dir = std::path::Path::new(&auth_dir_str);
+        match crate::antigravity::ensure_credential_fresh(
+            auth_dir,
+            &email,
+            upstream_proxy.as_deref(),
+        )
+        .await
+        {
+            Ok(fresh_cred) => {
+                upstream_key = fresh_cred.access_token;
+            }
+            Err(e) => {
+                tracing::warn!(email = %email, "Antigravity 凭证运行时刷新失败: {e}");
             }
         }
     }
 
     // xAI 运行时 token 校验与自动刷新
-    if let Some(provider) = find_provider(&providers, &route.provider) {
-        if let Some(meta) = &provider.metadata {
-            if meta.get("provider_type").map(|s| s.as_str()) == Some("xai") {
-                if let Some(auth_dir_str) = meta.get("auth_dir") {
-                    let auth_dir = std::path::Path::new(auth_dir_str);
-                    let email = meta.get("email").map(|s| s.as_str()).unwrap_or("");
-                    let sub = meta.get("sub").map(|s| s.as_str()).unwrap_or("");
-                    let id = if !email.is_empty() { email } else { sub };
-                    match crate::xai::ensure_credential_fresh(
-                        auth_dir,
-                        id,
-                        upstream_proxy.as_deref(),
-                    )
-                    .await
-                    {
-                        Ok(fresh_cred) => {
-                            upstream_key = fresh_cred.access_token;
-                        }
-                        Err(e) => {
-                            tracing::warn!(
-                                email = %email,
-                                sub = %sub,
-                                "xAI 凭证运行时刷新失败: {e}"
-                            );
-                        }
-                    }
-                }
+    if let Some((auth_dir_str, email, sub)) = xai_refresh {
+        let auth_dir = std::path::Path::new(&auth_dir_str);
+        let id = if !email.is_empty() { &email } else { &sub };
+        match crate::xai::ensure_credential_fresh(auth_dir, id, upstream_proxy.as_deref()).await {
+            Ok(fresh_cred) => {
+                upstream_key = fresh_cred.access_token;
+            }
+            Err(e) => {
+                tracing::warn!(email = %email, sub = %sub, "xAI 凭证运行时刷新失败: {e}");
             }
         }
     }
-    drop(payload_rules);
-    drop(providers);
 
     // prompt_cache_key 注入(provider 级开关;仅 openai;chat+grok 跳过,对齐 grok-build)
     if should_inject_prompt_cache_key(provider_prompt_cache_key, route.protocol, &outbound_model)
@@ -1065,4 +1073,3 @@ pub async fn handle_messages(
             .map_err(|e| AppError::new(anyhow::anyhow!("构造响应失败: {e}")))?)
     }
 }
-

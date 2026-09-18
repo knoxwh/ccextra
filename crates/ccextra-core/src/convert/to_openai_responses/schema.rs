@@ -1,5 +1,5 @@
-use std::collections::HashSet;
 use serde_json::{json, Value};
+use std::collections::HashSet;
 
 use crate::convert::gemini_schema::inline_local_refs;
 use crate::convert::has_unsupported_unicode_property_escape;
@@ -380,4 +380,3 @@ pub(crate) fn codex_schema_misses_required(schema: &Value) -> bool {
 
     false
 }
-

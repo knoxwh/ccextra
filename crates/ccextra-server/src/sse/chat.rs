@@ -15,7 +15,6 @@ use std::collections::HashMap;
 use async_stream::stream;
 use bytes::Bytes;
 use futures::Stream;
-use futures::StreamExt;
 use serde_json::Value;
 
 use super::emit;
@@ -691,7 +690,23 @@ pub fn relay_claude_passthrough<S>(stream: S) -> SseStreamPin
 where
     S: Stream<Item = Result<Bytes, reqwest::Error>> + Send + 'static,
 {
-    Box::pin(stream.map(|chunk| chunk.map_err(std::io::Error::other)))
+    Box::pin(stream! {
+        let mut stream = Box::pin(stream);
+        loop {
+            match crate::sse::next_upstream_chunk(&mut stream).await {
+                Ok(Some(Ok(chunk))) => yield Ok(chunk),
+                Ok(Some(Err(e))) => {
+                    yield Err(std::io::Error::other(e));
+                    return;
+                }
+                Ok(None) => return,
+                Err(msg) => {
+                    yield Ok(crate::sse::emit::error_event(msg));
+                    return;
+                }
+            }
+        }
+    })
 }
 
 /// OpenAI chat → Anthropic SSE 状态机(realtime)
@@ -708,12 +723,17 @@ where
 
     Box::pin(stream! {
         loop {
-            let Some(chunk) = stream.next().await else { break };
-            let chunk = match chunk {
-                Ok(c) => c,
-                Err(e) => {
-                    // 上游中断:发结构化 error 事件,不裸断流
+            let chunk = match crate::sse::next_upstream_chunk(&mut stream).await {
+                Ok(Some(Ok(c))) => c,
+                Ok(Some(Err(e))) => {
                     for out in relay.stream_error(&e.to_string()) {
+                        yield Ok(out);
+                    }
+                    return;
+                }
+                Ok(None) => break,
+                Err(msg) => {
+                    for out in relay.stream_error(msg) {
                         yield Ok(out);
                     }
                     return;

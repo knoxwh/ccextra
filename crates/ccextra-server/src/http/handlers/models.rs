@@ -1,3 +1,6 @@
+use crate::http::auth::check_secret;
+use crate::http::error::AppError;
+use crate::http::AppState;
 use axum::{
     extract::State,
     http::{header, HeaderMap, StatusCode},
@@ -5,9 +8,6 @@ use axum::{
 };
 use ccextra_core::route::ProviderConfig;
 use serde_json::Value;
-use crate::http::auth::check_secret;
-use crate::http::error::AppError;
-use crate::http::AppState;
 
 /// 构建 Anthropic 格式模型列表(参考 GetAvailableModels claude 分支)
 pub fn build_models_list(providers: &[ProviderConfig]) -> Value {

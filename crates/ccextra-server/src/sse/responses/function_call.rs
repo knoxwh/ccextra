@@ -1,9 +1,9 @@
 use bytes::Bytes;
 use serde_json::Value;
 
-use crate::sse::emit;
 use super::compensations::{extract_output_text, sanitize_tool_id};
 use super::state_machine::ResponsesRelay;
+use crate::sse::emit;
 
 /// 单个 function_call 流式块(对齐 codexFunctionCallStream)
 ///
@@ -272,7 +272,10 @@ impl ResponsesRelay {
 
     /// completed/incomplete 时从 response.output 补齐函数调用
     /// (对齐 appendCodexFunctionCallsFromTerminal:避免工具调用在非流式/迟到场景丢失)
-    pub(crate) fn append_function_calls_from_terminal(&mut self, response: Option<&Value>) -> Vec<Bytes> {
+    pub(crate) fn append_function_calls_from_terminal(
+        &mut self,
+        response: Option<&Value>,
+    ) -> Vec<Bytes> {
         if let Some(output) = response
             .and_then(|r| r.get("output"))
             .and_then(|v| v.as_array())
@@ -384,5 +387,4 @@ impl ResponsesRelay {
         self.active_function_call = None;
         self.last_function_call = None;
     }
-
 }

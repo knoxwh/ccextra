@@ -24,7 +24,9 @@ use handlers::models::handle_models;
 use handlers::reload::handle_reload;
 
 pub use auth::{check_secret, extract_key, verify_cached};
-pub use claude_relay::{claude_inbound_user_agent, claude_relay_headers, is_claude_relay_header_excluded};
+pub use claude_relay::{
+    claude_inbound_user_agent, claude_relay_headers, is_claude_relay_header_excluded,
+};
 pub use error::{extract_upstream_error, to_anthropic_error, AppError};
 pub use retry::{
     compute_retry_delay, jitter_backoff, parse_retry_after, CF_EDGE_MAX_RETRY_BACKOFF,
@@ -136,4 +138,3 @@ pub async fn serve(addr: &str, state: AppState) -> anyhow::Result<()> {
 
 #[cfg(test)]
 mod tests;
-

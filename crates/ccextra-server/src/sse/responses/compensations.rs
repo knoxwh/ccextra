@@ -1,6 +1,6 @@
+use crate::sse::emit;
 use bytes::Bytes;
 use serde_json::Value;
-use crate::sse::emit;
 
 /// 工具参数 delta 非空才算产出;custom_tool_call_input 不计入
 pub(crate) fn is_meaningful_output_delta(root: &Value, event_type: &str) -> bool {
@@ -187,4 +187,3 @@ pub fn sanitize_tool_id(id: &str) -> String {
     }
     out
 }
-

@@ -8,7 +8,7 @@ use ccextra_core::convert::{
     convert_gemini_stream_chunk, finalize_gemini_stream, force_finalize_gemini_stream,
     GeminiStreamState,
 };
-use futures::{Stream, StreamExt};
+use futures::Stream;
 use std::collections::HashMap;
 use std::sync::Arc;
 
@@ -206,25 +206,14 @@ where
         let input_tokens = estimated_input_tokens.unwrap_or(1);
 
         let mut stream = Box::pin(stream);
-        while let Some(result) = stream.next().await {
-            match result {
-                Ok(chunk_bytes) => {
-                    for output in process_gemini_events(
-                        parser.push(&chunk_bytes),
-                        &mut relay,
-                        input_tokens as i64,
-                        &tool_map,
-                        signature_model.as_deref(),
-                    ) {
-                        yield Ok(output);
-                    }
-                }
-                Err(e) => {
+        loop {
+            let chunk_bytes = match crate::sse::next_upstream_chunk(&mut stream).await {
+                Ok(Some(Ok(bytes))) => bytes,
+                Ok(Some(Err(e))) => {
                     if relay.finished {
                         break;
                     }
                     tracing::error!("Gemini 流读取错误: {}", e);
-                    // 发送结构化错误事件
                     let error_event = serde_json::json!({
                         "type": "error",
                         "error": {
@@ -232,11 +221,28 @@ where
                             "message": format!("上游流中断: {}", e)
                         }
                     });
-                    let error_bytes = emit::sse("error", &error_event);
-                    yield Ok(error_bytes);
+                    yield Ok(emit::sse("error", &error_event));
                     relay.upstream_failed = true;
                     break;
                 }
+                Ok(None) => break,
+                Err(msg) => {
+                    if relay.finished {
+                        break;
+                    }
+                    yield Ok(emit::error_event(msg));
+                    relay.upstream_failed = true;
+                    break;
+                }
+            };
+            for output in process_gemini_events(
+                parser.push(&chunk_bytes),
+                &mut relay,
+                input_tokens as i64,
+                &tool_map,
+                signature_model.as_deref(),
+            ) {
+                yield Ok(output);
             }
         }
 
@@ -266,6 +272,7 @@ where
 mod tests {
     use super::*;
     use futures::stream;
+    use futures::StreamExt;
 
     async fn collect_output<S>(stream: S) -> String
     where

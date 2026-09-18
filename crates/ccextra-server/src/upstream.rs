@@ -11,6 +11,13 @@ use ccextra_core::route::Protocol;
 use reqwest::Client;
 use serde::Deserialize;
 
+/// 连接池空闲淘汰(对齐 grok `GROK_POOL_IDLE_TIMEOUT_SECS` 默认 90s)。
+/// 300s 是 grok/codex 的**流 chunk 空闲**，不是池寿命。
+const POOL_IDLE_TIMEOUT: Duration = Duration::from_secs(90);
+const CONNECT_TIMEOUT: Duration = Duration::from_secs(10);
+/// send() 上限(对齐 grok 流 idle 300s)。无 Client::timeout，避免掐整条 SSE。
+const SEND_TIMEOUT: Duration = Duration::from_secs(300);
+
 /// 上游请求结果
 pub struct UpstreamResponse {
     pub status: reqwest::StatusCode,
@@ -310,21 +317,23 @@ impl UpstreamClient {
     ///
     /// Antigravity 连接池设置独立生效(对齐 CPA antigravity executor transport):
     /// 缓存键为 (代理, 是否 antigravity) 元组,专属 transport 不影响其他协议共享池。
-    pub(crate) fn client_for(&self, proxy_key: &str, protocol: Protocol) -> Client {
+    pub(crate) fn client_for(&self, proxy_key: &str, protocol: Protocol) -> anyhow::Result<Client> {
         let ant = matches!(protocol, Protocol::Antigravity);
         let cache_key = (proxy_key.to_string(), ant);
-        if let Some(c) = self.clients.lock().unwrap().get(&cache_key) {
-            return c.clone();
+        let mut clients = self
+            .clients
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
+        if let Some(c) = clients.get(&cache_key) {
+            return Ok(c.clone());
         }
         let mut builder = Client::builder()
             // 限制单个 host 最大空闲连接数，防毒化池
             .pool_max_idle_per_host(4)
-            // 连接驻留 300s 空闲淘汰(对齐 codex 300s stream idle 精神)。
-            // Claude Code 两轮间隔(思考+工具执行)常超 90s,90s 淘汰会每轮
-            // 重付 TCP+TLS 握手,实测多 ~1.7s 首字延迟。
-            .pool_idle_timeout(std::time::Duration::from_secs(300))
+            // 池空闲 90s(对齐 grok);300s 是流 chunk idle，不是池寿命。
+            .pool_idle_timeout(POOL_IDLE_TIMEOUT)
             // 建连超时 10s，防 DNS/TLS 握手卡死
-            .connect_timeout(std::time::Duration::from_secs(10))
+            .connect_timeout(CONNECT_TIMEOUT)
             // TCP 层探活,防死连接滞留/中间设备静默断
             .tcp_keepalive(std::time::Duration::from_secs(60))
             // 禁 Nagle:SSE 首帧/心跳/delta 都是小包,不等积压直接发,压 TTFT
@@ -350,12 +359,11 @@ impl UpstreamClient {
         } else if let Ok(proxy) = reqwest::Proxy::all(proxy_key) {
             builder = builder.proxy(proxy);
         }
-        let client = builder.build().unwrap_or_else(|_| Client::new());
-        self.clients
-            .lock()
-            .unwrap()
-            .insert(cache_key, client.clone());
-        client
+        let client = builder
+            .build()
+            .map_err(|e| anyhow::anyhow!("构建上游 HTTP client 失败: {e}"))?;
+        clients.insert(cache_key, client.clone());
+        Ok(client)
     }
 
     /// 发起上游请求,返回原始响应(字节或流由调用方决定)
@@ -382,8 +390,61 @@ impl UpstreamClient {
         user_agents: &crate::http::UserAgentSet,
         inbound_user_agent: Option<&str>,
     ) -> anyhow::Result<UpstreamResponse> {
+        match self
+            .request_once(
+                base_url,
+                api_key,
+                protocol,
+                provider_proxy,
+                body,
+                is_stream,
+                session_id,
+                thread_id,
+                extra_headers,
+                user_agents,
+                inbound_user_agent,
+            )
+            .await
+        {
+            Ok(resp) => Ok(resp),
+            Err(e) if is_stale_connection(&e) => {
+                tracing::warn!(error = %e, "上游连接失效,换新连接重试一次");
+                self.request_once(
+                    base_url,
+                    api_key,
+                    protocol,
+                    provider_proxy,
+                    body,
+                    is_stream,
+                    session_id,
+                    thread_id,
+                    extra_headers,
+                    user_agents,
+                    inbound_user_agent,
+                )
+                .await
+            }
+            Err(e) => Err(e),
+        }
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    async fn request_once(
+        &self,
+        base_url: &str,
+        api_key: &str,
+        protocol: Protocol,
+        provider_proxy: Option<&str>,
+        body: &serde_json::Value,
+        is_stream: bool,
+        session_id: Option<&str>,
+        thread_id: Option<&str>,
+        extra_headers: &axum::http::HeaderMap,
+        user_agents: &crate::http::UserAgentSet,
+        inbound_user_agent: Option<&str>,
+    ) -> anyhow::Result<UpstreamResponse> {
         let proxy_key = self.resolve_proxy(provider_proxy);
-        let client = self.client_for(&proxy_key, protocol);
+        let client = self.client_for(&proxy_key, protocol)?;
 
         let upstream_model = body.get("model").and_then(|v| v.as_str()).unwrap_or("");
 
@@ -448,11 +509,42 @@ impl UpstreamClient {
         for (name, value) in extra_headers {
             req = req.header(name, value);
         }
-        let resp = req.json(body).send().await?;
+        let resp = send_with_timeout(req.json(body)).await?;
 
         let status = resp.status();
         Ok(UpstreamResponse { status, body: resp })
     }
+}
+
+/// send() 等到响应头。流式之后读 body 走 chunk idle,不套 Client::timeout。
+pub(crate) async fn send_with_timeout(
+    request: reqwest::RequestBuilder,
+) -> anyhow::Result<reqwest::Response> {
+    match tokio::time::timeout(SEND_TIMEOUT, request.send()).await {
+        Ok(Ok(resp)) => Ok(resp),
+        Ok(Err(e)) => Err(e.into()),
+        Err(_) => Err(anyhow::anyhow!(
+            "上游请求超时 ({}s)",
+            SEND_TIMEOUT.as_secs()
+        )),
+    }
+}
+
+/// 死连接:立刻换连接再试,不耗 3s 重试预算。
+/// send() 的 300s 超时不走这里,避免再挂 300s。
+fn is_stale_connection(err: &anyhow::Error) -> bool {
+    if let Some(e) = err.downcast_ref::<reqwest::Error>() {
+        if e.is_connect() || e.is_timeout() {
+            return true;
+        }
+    }
+    let msg = err.to_string().to_ascii_lowercase();
+    msg.contains("connection reset")
+        || msg.contains("broken pipe")
+        || msg.contains("connection closed")
+        || msg.contains("error 54")
+        || msg.contains("error 32")
+        || msg.contains("error 104")
 }
 
 impl Default for UpstreamClient {
@@ -770,14 +862,27 @@ mod tests {
     }
 
     #[test]
+    fn test_stale_connection_detects_reset_not_timeout_message() {
+        assert!(is_stale_connection(&anyhow::anyhow!(
+            "connection reset by peer"
+        )));
+        assert!(is_stale_connection(&anyhow::anyhow!("Broken pipe")));
+        assert!(
+            !is_stale_connection(&anyhow::anyhow!("上游请求超时 (300s)")),
+            "send 超时不得立刻再挂 300s"
+        );
+        assert!(!is_stale_connection(&anyhow::anyhow!("invalid api key")));
+    }
+
+    #[test]
     fn test_client_caching() {
         let client = UpstreamClient::new(None);
-        let _c1 = client.client_for("direct", Protocol::OpenAiChat);
-        let _c2 = client.client_for("direct", Protocol::OpenAiChat);
+        let _c1 = client.client_for("direct", Protocol::OpenAiChat).unwrap();
+        let _c2 = client.client_for("direct", Protocol::OpenAiChat).unwrap();
         // 同一 proxy_key 应返回相同 client(Arc clone)
         // 通过计数验证缓存命中
         let count_before = client.clients.lock().unwrap().len();
-        let _c3 = client.client_for("direct", Protocol::OpenAiChat);
+        let _c3 = client.client_for("direct", Protocol::OpenAiChat).unwrap();
         let count_after = client.clients.lock().unwrap().len();
         assert_eq!(count_before, count_after, "缓存应命中,不应重建 client");
     }
@@ -785,9 +890,13 @@ mod tests {
     #[test]
     fn test_client_different_proxies() {
         let client = UpstreamClient::new(None);
-        let _c1 = client.client_for("direct", Protocol::OpenAiChat);
-        let _c2 = client.client_for("http://proxy1:8080", Protocol::OpenAiChat);
-        let _c3 = client.client_for("http://proxy2:9090", Protocol::OpenAiChat);
+        let _c1 = client.client_for("direct", Protocol::OpenAiChat).unwrap();
+        let _c2 = client
+            .client_for("http://proxy1:8080", Protocol::OpenAiChat)
+            .unwrap();
+        let _c3 = client
+            .client_for("http://proxy2:9090", Protocol::OpenAiChat)
+            .unwrap();
         assert_eq!(client.clients.lock().unwrap().len(), 3);
     }
 
@@ -795,8 +904,8 @@ mod tests {
     fn test_antigravity_short_connection_isolation() {
         // Antigravity 默认短连接:缓存键独立于其他协议(#ant 后缀)
         let client = UpstreamClient::new(None);
-        let _c1 = client.client_for("direct", Protocol::Antigravity);
-        let _c2 = client.client_for("direct", Protocol::OpenAiChat);
+        let _c1 = client.client_for("direct", Protocol::Antigravity).unwrap();
+        let _c2 = client.client_for("direct", Protocol::OpenAiChat).unwrap();
         assert_eq!(client.clients.lock().unwrap().len(), 2);
 
         // 默认(未启用连接池)解析为短连接

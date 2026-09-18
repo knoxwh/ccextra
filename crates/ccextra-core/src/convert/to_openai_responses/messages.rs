@@ -152,7 +152,6 @@ pub(crate) fn unwrap_custom_tool_input(input: Option<&Value>) -> String {
     }
 }
 
-
 /// call_id 超 64 字符确定性截短(对齐 shortenCodexCallIDIfNeeded)
 pub(crate) fn shorten_call_id(id: &str) -> String {
     const LIMIT: usize = 64;
@@ -168,4 +167,3 @@ pub(crate) fn shorten_call_id(id: &str) -> String {
     }
     format!("{}{}", &id[..prefix_len], suffix)
 }
-

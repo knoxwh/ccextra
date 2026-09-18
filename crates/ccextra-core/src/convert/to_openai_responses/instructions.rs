@@ -329,7 +329,10 @@ pub(crate) fn system_to_instructions_text(system: &Value, upstream_model: &str) 
 }
 
 /// role=system 消息的 reminder 文本(对齐 ClaudeMessageSystemReminderText)
-pub(crate) fn claude_system_reminder_text(content: Option<&Value>, upstream_model: &str) -> Option<String> {
+pub(crate) fn claude_system_reminder_text(
+    content: Option<&Value>,
+    upstream_model: &str,
+) -> Option<String> {
     let parts: Vec<String> = match content {
         Some(Value::String(s)) => {
             let s = strip_attribution_line(s);
@@ -358,4 +361,3 @@ pub(crate) fn claude_system_reminder_text(content: Option<&Value>, upstream_mode
     }
     Some(format!("<system-reminder>\n{text}\n</system-reminder>"))
 }
-

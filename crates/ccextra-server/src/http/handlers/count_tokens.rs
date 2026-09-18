@@ -63,7 +63,7 @@ pub async fn handle_count_tokens(
             base_url.trim_end_matches('/')
         );
         let proxy_key = upstream_client.resolve_proxy(proxy_url.as_deref());
-        let client = upstream_client.client_for(&proxy_key, Protocol::Claude);
+        let client = upstream_client.client_for(&proxy_key, Protocol::Claude)?;
         let inbound_user_agent = claude_inbound_user_agent(&headers);
         let extra_headers = claude_relay_headers(&headers);
         let mut request = client
@@ -76,9 +76,7 @@ pub async fn handle_count_tokens(
         for (name, value) in &extra_headers {
             request = request.header(name, value);
         }
-        let resp = request
-            .json(&body_json)
-            .send()
+        let resp = crate::upstream::send_with_timeout(request.json(&body_json))
             .await
             .map_err(|e| AppError::new(anyhow::anyhow!("上游请求失败: {e}")))?;
 

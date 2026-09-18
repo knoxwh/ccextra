@@ -1,16 +1,19 @@
 use serde_json::{json, Value};
 
+use super::instructions::is_grok_upstream;
 use crate::convert::signature::{
     compatible_signature_for_provider_block, is_valid_gpt_reasoning_signature,
     is_valid_grok_encrypted_content, SignatureBlockKind, SignatureProvider,
 };
-use super::instructions::is_grok_upstream;
 
 /// thinking signature → 可回放给目标上游的 reasoning.encrypted_content
 /// (对齐 CPA codex_claude_request.appendReasoningContent):
 /// GPT 目标走兼容性解析(剥 provider 前缀 + Fernet 形状校验);
 /// grok 目标无信封,按来源确认后做形状校验;其余一律丢弃。
-pub(crate) fn gpt_compatible_signature(signature: Option<&str>, upstream_model: &str) -> Option<String> {
+pub(crate) fn gpt_compatible_signature(
+    signature: Option<&str>,
+    upstream_model: &str,
+) -> Option<String> {
     let raw = signature.unwrap_or("").trim();
     if let Some(normalized) = compatible_signature_for_provider_block(
         SignatureProvider::Gpt,
@@ -184,4 +187,3 @@ pub(crate) fn reasoning_item_empty(item: &Value) -> bool {
     };
     content_empty && summary_empty && item.get("encrypted_content").is_none()
 }
-
