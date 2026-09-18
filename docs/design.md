@@ -9,7 +9,10 @@ ccextra 将 Anthropic Messages 入口接到不同上游协议，同时尽量保�
 ## 分层
 
 - `ccextra-core`：纯逻辑。负责路由、归一化、会话派生、thinking 映射和协议转换；不依赖 `tokio`、`reqwest` 或文件系统。reasoning 注册表由调用方传入，core 只解析字符串。
+  - `convert/`：协议请求体转换（含 `to_openai_responses/` 专用子模块：`instructions`、`messages`、`reasoning`、`schema`）。
 - `ccextra-server`：HTTP、上游请求、SSE、OAuth provider 运行时注入和响应状态机。
+  - `http/`：请求处理与路由装配（`handlers/`、`auth`、`retry`、`claude_relay`、`error`）。
+  - `sse/`：响应流状态机（含 `responses/` 专用子模块：`state_machine`、`function_call`、`thinking`、`compensations`、`web_search`）。
 - `ccextra-cli`：命令行、YAML 配置加载、日志初始化和进程启动。用户 `models.json` 在此读取。
 
 这种分层使转换规则可用单元测试验证，网络和锁生命周期集中在 server。
@@ -67,6 +70,19 @@ Anthropic `system` 成为 system message；o 系列（`o1-mini`/`o1-preview` 除
 ### Gemini 与 Antigravity
 
 两条路径共享 Gemini `contents`、`parts`、`functionCall` 和 `functionResponse` 模型，剥离 Claude system triggers。工具 schema 会清理本地引用和不支持关键字，规范化 `responseJsonSchema` 为 `responseSchema`；工具结果强制字符串化为 `response.result`；user turn 尾部文本重排至 `functionResponse` 前。Gemini 使用 API key 和 Google 端点。Antigravity 额外套 `model`、`request`、`project`、`requestId` 等信封；Claude 模型使用 `VALIDATED` 工具模式，冲突工具名加 `external_` 前缀；`gemini-3.5-flash-lite` 限制 `max_completion_tokens` 上限为 65535。
+
+### 各协议 System 提示词清洗差异矩阵
+
+| 目标协议 / 模型 | 计费归属指纹 (`x-anthropic-billing-header`) | Claude 身份声明与品牌块 (`<identity>`) | 行为策略与冗长触发块 (`<rules>` / `<response_style>` 等) | 简洁样式触发块 (`# Output Style:` / `# Concise Style Active`) | 白名单段落 (`# Memory` / `# Environment` / `# Language` / CLAUDE.md) | 目标承载位置与行为适配块 |
+| :--- | :--- | :--- | :--- | :--- | :--- | :--- |
+| **Claude 原生模型** (`*claude*`) | 保留（直通不改） | 保留（原生匹配） | 保留 | 保留 | 保留 | 原生 `system` 字段（保持入站逐字节不变） |
+| **Claude 路由非 Claude 模型** | 剥离（防破坏上游前缀缓存） | 剥离 | 剥离 | 剥离 | 保留 | 原生 `system` 字段（保留 `cache_control`） |
+| **OpenAI Chat** (全量模型) | 剥离 | 剥离 | 剥离 | 剥离 | 保留 | o 系列/GPT-5/Astra 入 `developer` message；其余入 `system` message |
+| **OpenAI Responses** (GPT / Codex) | 剥离 | 剥离 | 剥离 | 剥离 | 保留 | `instructions` 留空；注入 `GPT_CODEX_ADAPTER_BLOCK` + 白名单入 `developer` message |
+| **OpenAI Responses** (GPT-6 Astra) | 剥离 | 剥离 | 剥离 | 剥离 | 保留 | `instructions` 留空；注入 `GPT_6_ASTRA_ADAPTER_BLOCK` + 白名单入 `developer` message |
+| **OpenAI Responses** (xAI Grok) | 剥离 | 剥离 | 剥离 | 剥离 | 保留 | `instructions` 留空；注入 `GROK_ADAPTER_BLOCK` + 白名单入 `developer` message |
+| **OpenAI Responses** (其他上游，如 GLM/DeepSeek) | 剥离 | 剥离 | 剥离 | 剥离 | 保留 | 仅合并白名单段落直入 `instructions` 字段；无 developer 适配块注入 |
+| **Gemini / Antigravity** | 剥离 | 剥离 | 剥离 | 剥离 | 保留 | 转换为 `system_instruction.parts`（剥离 Claude 触发块后转 Gemini 结构） |
 
 ## 传输与可靠性
 
