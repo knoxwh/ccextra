@@ -282,6 +282,21 @@ mod tests {
         assert_eq!(blocks[0]["cache_control"]["type"], "ephemeral");
     }
 
+    /// 归属行与指令同块:只剥行,保留剩余指令(对齐 sub2api be4a4990)
+    #[test]
+    fn test_sanitize_system_attribution_line_keeps_rest() {
+        let mut body = json!({
+            "system": [
+                {"type": "text", "text": "x-anthropic-billing-header: fp=abc\nKeep these instructions."}
+            ],
+            "messages": []
+        });
+        assert!(sanitize_passthrough_prompt(&mut body, "glm-5.3"));
+        let blocks = body["system"].as_array().unwrap();
+        assert_eq!(blocks.len(), 1);
+        assert_eq!(blocks[0]["text"], "Keep these instructions.");
+    }
+
     /// 全部块被丢弃时移除 system 键
     #[test]
     fn test_sanitize_removes_system_when_all_dropped() {

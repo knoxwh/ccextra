@@ -70,6 +70,8 @@ pub fn strip_claude_system_for_chat(system: &str) -> String {
 
 /// 内部实现(GPT/Grok/Gemini/Chat 共用)
 fn strip_claude_system_for_gpt(system: &str) -> String {
+    // 先剥前导计费归属行:归属行与指令同块时保留剩余指令(对齐 sub2api be4a4990)
+    let system = super::strip_attribution_line(system);
     let mut retained_sections = Vec::new();
     let mut current_section = String::new();
     let mut section_retention_state = SectionState::Unknown;
@@ -989,7 +991,7 @@ fn system_to_instructions_text(system: &Value, upstream_model: &str) -> String {
     let mut texts: Vec<String> = Vec::new();
     match system {
         Value::String(s) => {
-            let trimmed = s.trim();
+            let trimmed = super::strip_attribution_line(s).trim();
             if !super::is_ignorable_system_text(trimmed, upstream_model) {
                 texts.push(trimmed.to_string());
             }
@@ -998,7 +1000,7 @@ fn system_to_instructions_text(system: &Value, upstream_model: &str) -> String {
             for b in blocks {
                 if b.get("type").and_then(|v| v.as_str()) == Some("text") {
                     if let Some(t) = b.get("text").and_then(|v| v.as_str()) {
-                        let trimmed = t.trim();
+                        let trimmed = super::strip_attribution_line(t).trim();
                         if !super::is_ignorable_system_text(trimmed, upstream_model) {
                             texts.push(trimmed.to_string());
                         }
@@ -1598,13 +1600,19 @@ pub fn convert_to_openai_responses_with(
 /// role=system 消息的 reminder 文本(对齐 ClaudeMessageSystemReminderText)
 fn claude_system_reminder_text(content: Option<&Value>, upstream_model: &str) -> Option<String> {
     let parts: Vec<String> = match content {
-        Some(Value::String(s)) if !super::is_ignorable_system_text(s, upstream_model) => {
-            vec![s.trim().to_string()]
+        Some(Value::String(s)) => {
+            let s = super::strip_attribution_line(s);
+            if !super::is_ignorable_system_text(s, upstream_model) {
+                vec![s.trim().to_string()]
+            } else {
+                Vec::new()
+            }
         }
         Some(Value::Array(items)) => items
             .iter()
             .filter(|i| i.get("type").and_then(|v| v.as_str()) == Some("text"))
             .filter_map(|i| i.get("text").and_then(|v| v.as_str()))
+            .map(super::strip_attribution_line)
             .filter(|t| !super::is_ignorable_system_text(t, upstream_model))
             .map(|t| t.trim().to_string())
             .collect(),
@@ -1875,6 +1883,24 @@ mod tests {
         convert_to_openai_responses(&mut body, "test-model").unwrap();
         // attribution 与 Claude 身份句被过滤，只保留 "Real"
         assert_eq!(body["instructions"], "Real");
+    }
+
+    #[test]
+    fn test_system_attribution_line_keeps_rest() {
+        // 对齐 sub2api be4a4990:归属行与指令同块只删行(CRLF 行尾),非前导字面量不动
+        let mut body = json!({
+            "model": "test",
+            "system": [
+                {"type": "text", "text": "x-anthropic-billing-header: fp=abc\r\nKeep these instructions."},
+                {"type": "text", "text": "Explain this metadata: x-anthropic-billing-header: fp=abc"}
+            ],
+            "messages": []
+        });
+        convert_to_openai_responses(&mut body, "test-model").unwrap();
+        assert_eq!(
+            body["instructions"],
+            "Keep these instructions.\n\nExplain this metadata: x-anthropic-billing-header: fp=abc"
+        );
     }
 
     #[test]

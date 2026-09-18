@@ -436,6 +436,7 @@ fn is_date_only(s: &str) -> bool {
 fn system_reminder_text(content: &Value, upstream_model: &str) -> Option<String> {
     let parts: Vec<&str> = match content {
         Value::String(s) => {
+            let s = super::strip_attribution_line(s);
             if super::is_ignorable_system_text(s, upstream_model) {
                 return None;
             }
@@ -448,6 +449,7 @@ fn system_reminder_text(content: &Value, upstream_model: &str) -> Option<String>
                     return None;
                 }
                 let t = b.get("text").and_then(|v| v.as_str())?;
+                let t = super::strip_attribution_line(t);
                 if super::is_ignorable_system_text(t, upstream_model) {
                     None
                 } else {
@@ -1011,6 +1013,38 @@ IMPORTANT: Assist with authorized security testing.
         let content = body["messages"][0]["content"].as_array().unwrap();
         assert_eq!(content.len(), 1);
         assert_eq!(content[0]["text"], "Real instructions");
+    }
+
+    #[test]
+    fn test_system_attribution_line_keeps_rest() {
+        // 对齐 sub2api be4a4990:归属行与指令同块只删行,不丢整块
+        let mut body = json!({
+            "model": "test",
+            "system": "x-anthropic-billing-header: fp=abc\nKeep these instructions.",
+            "messages": []
+        });
+        convert_to_openai_chat(&mut body, "gpt").unwrap();
+        let content = body["messages"][0]["content"].as_array().unwrap();
+        assert_eq!(content[0]["text"], "Keep these instructions.");
+    }
+
+    #[test]
+    fn test_system_reminder_attribution_line_keeps_rest() {
+        // role=system 混合归属行:只剥行,剩余指令进 reminder
+        let mut body = json!({
+            "model": "test",
+            "messages": [
+                {"role": "system", "content": "x-anthropic-billing-header: fp=abc\npermissions note"},
+                {"role": "user", "content": "hi"}
+            ]
+        });
+        convert_to_openai_chat(&mut body, "gpt").unwrap();
+        let msgs = body["messages"].as_array().unwrap();
+        assert_eq!(msgs.len(), 2);
+        let sys = msgs[0]["content"][0]["text"].as_str().unwrap();
+        assert!(sys.contains("<system-reminder>"));
+        assert!(sys.contains("permissions note"));
+        assert!(!sys.contains("x-anthropic-billing-header"));
     }
 
     #[test]

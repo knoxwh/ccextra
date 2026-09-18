@@ -228,6 +228,7 @@ fn system_reminder_text(content: &Value, upstream_model: &str) -> Option<String>
     let mut parts: Vec<&str> = Vec::new();
     match content {
         Value::String(s) => {
+            let s = super::strip_attribution_line(s);
             if !is_ignorable_system_text(s, upstream_model) {
                 parts.push(s.trim());
             }
@@ -238,6 +239,7 @@ fn system_reminder_text(content: &Value, upstream_model: &str) -> Option<String>
                     continue;
                 }
                 if let Some(text) = item.get("text").and_then(|t| t.as_str()) {
+                    let text = super::strip_attribution_line(text);
                     if !is_ignorable_system_text(text, upstream_model) {
                         parts.push(text.trim());
                     }
@@ -635,6 +637,19 @@ mod tests {
         let text = contents[0]["parts"][0]["text"].as_str().unwrap();
         assert!(text.starts_with("<system-reminder>"));
         assert!(text.contains("permissions note"));
+    }
+
+    #[test]
+    fn test_convert_messages_system_reminder_attribution_line_keeps_rest() {
+        // 对齐 sub2api be4a4990:归属行与指令同块只删行,剩余指令进 reminder
+        let messages = vec![
+            json!({"role": "system", "content": "x-anthropic-billing-header: abc\npermissions note"}),
+        ];
+        let contents = convert_messages(&messages, &HashMap::new(), false, "gemini-2.0");
+        assert_eq!(contents.len(), 1);
+        let text = contents[0]["parts"][0]["text"].as_str().unwrap();
+        assert!(text.contains("permissions note"));
+        assert!(!text.contains("x-anthropic-billing-header"));
     }
 
     #[test]

@@ -464,6 +464,22 @@ mod tests {
     }
 
     #[test]
+    fn test_convert_to_gemini_system_attribution_line_keeps_rest() {
+        // 对齐 sub2api be4a4990:归属行与指令同块只删行,不丢整块
+        let anthropic = json!({
+            "model": "m", "max_tokens": 100,
+            "system": [
+                {"type": "text", "text": "x-anthropic-billing-header: abc\nKeep these instructions."}
+            ],
+            "messages": [{"role": "user", "content": "hi"}]
+        });
+        let (gemini, _) = convert_to_gemini(&anthropic, "gemini-2.0");
+        let parts = gemini["systemInstruction"]["parts"].as_array().unwrap();
+        assert_eq!(parts.len(), 1);
+        assert_eq!(parts[0]["text"], "Keep these instructions.");
+    }
+
+    #[test]
     fn test_convert_to_gemini_strips_claude_triggers() {
         // Gemini 上游清洗 system:剥离 identity/response_style,保留 Memory/Language
         let anthropic = json!({

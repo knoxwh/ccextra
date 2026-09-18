@@ -71,6 +71,28 @@ pub fn is_attribution_text(text: &str) -> bool {
         .starts_with(CLAUDE_CODE_ATTRIBUTION_PREFIX)
 }
 
+/// 剥离文本前导的计费归属行(含 CR/LF/CRLF 行尾),保留其余内容。
+/// 对齐 sub2api be4a4990:归属行与后续指令同块时只删行,不丢整块;
+/// 纯归属文本返回空串。非前导出现的归属字面量不动。
+pub fn strip_attribution_line(text: &str) -> &str {
+    let trimmed = text.trim_start();
+    if !trimmed.starts_with(CLAUDE_CODE_ATTRIBUTION_PREFIX) {
+        return text;
+    }
+    let rest = match trimmed.find(['\r', '\n']) {
+        // 无行尾:整段都是归属行
+        None => return "",
+        Some(end) => &trimmed[end..],
+    };
+    // 消费行尾分隔符(CRLF 算一个)
+    let rest = rest
+        .strip_prefix("\r\n")
+        .or_else(|| rest.strip_prefix('\r'))
+        .or_else(|| rest.strip_prefix('\n'))
+        .unwrap_or(rest);
+    rest
+}
+
 /// 是否为 Claude 官方固定身份声明句
 pub fn is_claude_identity_text(text: &str) -> bool {
     let t = text.trim();
@@ -225,6 +247,42 @@ pub type Result<T> = std::result::Result<T, ConvertError>;
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn test_strip_attribution_line() {
+        // 对齐 sub2api be4a4990 测试矩阵:仅剥前导归属行
+        const ATTR: &str = "x-anthropic-billing-header: cc_version=2.1.271.4bf;";
+        assert_eq!(strip_attribution_line(ATTR), "");
+        assert_eq!(strip_attribution_line(&format!("{ATTR}\n")), "");
+        assert_eq!(strip_attribution_line(&format!(" \t\n{ATTR}")), "");
+        assert_eq!(
+            strip_attribution_line(&format!("{ATTR}\nKeep these instructions.")),
+            "Keep these instructions."
+        );
+        // CRLF 算一个行尾;CR 单独也算
+        assert_eq!(
+            strip_attribution_line(&format!("{ATTR}\r\n  Keep indentation.")),
+            "  Keep indentation."
+        );
+        assert_eq!(
+            strip_attribution_line(&format!("{ATTR}\rKeep these instructions.")),
+            "Keep these instructions."
+        );
+        // 非前导出现的归属字面量不动
+        let mid = format!("Explain this metadata: {ATTR}");
+        assert_eq!(strip_attribution_line(&mid), mid);
+        let later = format!("Example:\n{ATTR}");
+        assert_eq!(strip_attribution_line(&later), later);
+        // 无冒号前缀不匹配;相邻字段名不算
+        assert_eq!(
+            strip_attribution_line("x-anthropic-billing-header keep"),
+            "x-anthropic-billing-header keep"
+        );
+        assert_eq!(
+            strip_attribution_line("x-anthropic-billing-header-extra: keep"),
+            "x-anthropic-billing-header-extra: keep"
+        );
+    }
 
     #[test]
     fn test_has_unsupported_unicode_property_escape() {
