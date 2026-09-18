@@ -66,13 +66,13 @@ Anthropic 推理内容。目标协议会映射为 `reasoning_effort`、reasoning
 ## 缓存稳定化
 
 **归一化**
-对请求进行确定性变换,目标是上游 prompt cache,不保存本地模型响应。完整流程会稳定工具顺序、schema、历史 reminder、工具参数键序、列表和尾部空白,并处理易变日期。
+对请求进行确定性变换，目标是上游 prompt cache，不保存本地模型响应。完整流程会稳定工具顺序、schema、历史 reminder、工具参数键序、列表和尾部空白，并处理易变日期。
 
 **pretransform / post-transform**
-转换前在 Anthropic body 上执行的归一化,以及 OpenAI 转换后在目标 body 上执行的归一化。Gemini 和 Antigravity 不运行 post-transform。
+转换前在 Anthropic body 上执行的归一化，以及 OpenAI 转换后在目标 body 上执行的归一化。Gemini 和 Antigravity 不运行 post-transform。
 
 **prompt_cache_key**
-OpenAI Chat 或 Responses 的 provider 级缓存桶标识。来自 Claude Code 会话 ID,不覆盖既有非空值;Chat+Grok 不注入。
+OpenAI Chat 或 Responses 的 provider 级缓存桶标识。来自 Claude Code 会话 ID，不覆盖既有非空值；Chat+Grok 不注入。
 
 **drift**
 同一会话中 system、tools 或早期消息结构哈希的变化。检测器记录告警，不改变 body。

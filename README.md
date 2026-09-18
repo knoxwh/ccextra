@@ -1,22 +1,46 @@
+<div align="center">
+
 # ccextra
 
-[![License: MIT](https://img.shields.io/badge/License-MIT-blue.svg)](LICENSE)
-![Rust](https://img.shields.io/badge/rust-1.75%2B-orange.svg)
-![Version](https://img.shields.io/badge/version-0.2.0-green.svg)
+<p align="center">
+  <strong>The Intelligent Upstream Proxy for Claude Code.</strong><br>
+  多协议智能路由 · 确定性缓存归一化 · 零损耗直通转发
+</p>
 
-**中文** | **[English](README.en.md)**
+<p align="center">
+  <a href="LICENSE"><img src="https://img.shields.io/badge/License-MIT-black.svg?style=flat-square" alt="License"></a>
+  <a href="Cargo.toml"><img src="https://img.shields.io/badge/Rust-1.75+-black.svg?style=flat-square&logo=rust" alt="Rust"></a>
+  <img src="https://img.shields.io/badge/Version-0.2.0-black.svg?style=flat-square" alt="Version">
+</p>
 
-单进程 Rust 代理：把 Claude Code 的 Anthropic Messages 请求路由、转换并转发到多个上游。
+<p align="center">
+  <b>中文</b> • <a href="README.en.md">English</a>
+</p>
 
-## 特性
+<p align="center">
+  <a href="#核心特性">核心特性</a> •
+  <a href="#架构流向">架构流向</a> •
+  <a href="#协议矩阵">协议矩阵</a> •
+  <a href="#快速开始">快速开始</a> •
+  <a href="#配置参考">配置参考</a> •
+  <a href="docs/design.md">深入设计</a>
+</p>
 
-- **多协议上游**：Claude、OpenAI Chat、OpenAI Responses、Gemini、Antigravity 共用一个入口，按模型 alias 路由。
-- **Claude 直通**：`claude` provider 只替换 `model`，非 Claude 模型另清洗 system（计费指纹、Claude 身份与触发块）并按 `models.json` 把越档 effort 钳到支持档（或 `force_effort` 固定档），其余请求内容保持原样。
-- **确定性归一化**：稳定工具和 schema 顺序、历史 reminder、工具参数键序与尾部空白，减少跨轮序列化漂移，目标是提高上游 prompt cache 命中率。
-- **动态 provider**：xAI Grok 经 OAuth 注入 Responses provider；Antigravity 凭证后台加载并定时刷新模型。
-- **热重载**：`POST /reload` 替换 providers、payload、归一化、认证、代理、User-Agent 和 reasoning 注册表，无需重启。
+---
 
-## 架构
+</div>
+
+单进程 Rust 高性能代理：将 Claude Code 的 Anthropic Messages 请求无缝路由、转换并转发至多模态上游。
+
+## 核心特性
+
+- **多协议统一中枢**：Claude、OpenAI Chat、OpenAI Responses、Gemini、Antigravity 聚合单端口，按模型 alias 智能分发。
+- **透明直通与精准适配**：`claude` 仅换 `model`；非 Claude 模型自动剥离计费指纹与 Claude 触发段，按 `models.json` 钳制或锁定 (`force_effort`) 推理强度。
+- **确定性缓存优化**：冻结 Schema/工具顺序、历史 reminder、参数键序与尾部空白，消减跨轮会话漂移，最大化上游 Prompt Cache 命中率。
+- **动态凭证与生命周期**：xAI Grok OAuth 动态注入 Responses；Antigravity 凭证后台静默装载与定时轮换。
+- **零停机热重载**：`POST /reload` 毫秒级替换 providers、payload 规则、认证、代理与 reasoning 表。
+
+## 架构流向
 
 ```mermaid
 flowchart LR
@@ -29,37 +53,40 @@ flowchart LR
 
 一个进程监听一个端口。入站始终是 Anthropic 形状，出口统一还原为 Anthropic 响应（含 SSE）。详见[架构设计](docs/design.md)。
 
-## 支持的出站协议
+## 协议矩阵
 
-| `protocol` | 上游接口 | 说明 |
-| --- | --- | --- |
-| `claude` | Anthropic Messages | 仅替换 `model`（非 Claude 模型另清洗 system 并钳制越档 effort），其余请求内容保持原样。 |
-| `openai_chat` | Chat Completions | 转换 messages、工具、图片和 reasoning（支持 Kimi K2.8）。 |
-| `openai_responses` | Responses | 转换为 `instructions` 和 `input`，支持 reasoning replay 与 web_search 过滤。 |
-| `gemini` | Gemini GenerateContent | 使用 Gemini 内容、工具和 schema 形状。 |
-| `antigravity` | Cloud Code Assist | 使用 Gemini 形状并封装运输信封。 |
+| 协议标识 (`protocol`) | 上游目标形态 | 核心适配策略 |
+| :--- | :--- | :--- |
+| `claude` | Anthropic Messages | 极简透传：仅改 `model`；非 Claude 目标自动清洗 system 并钳制 effort。 |
+| `openai_chat` | Chat Completions | 结构映射：转换 messages、工具与图片；适配 Kimi K2.8 思考规范与温度守卫。 |
+| `openai_responses` | Responses | 深度适配：映射 `instructions` 与 `input`；支持 Reasoning Replay 与搜索域过滤。 |
+| `gemini` | Gemini GenerateContent | 原生转换：对齐 Gemini 内容、结构化工具与 schema。 |
+| `antigravity` | Cloud Code Assist | 企业信封：Gemini 格式封装运输信封；可选高性能连接池。 |
 
-xAI Grok 经 OAuth 自动注入 `openai_responses` provider，不是独立 `protocol`。
+> **提示**：xAI Grok 通过 OAuth 动态注册为 `openai_responses` provider，无需配置独立协议。
 
-## 快速开始
+## 快速上手
 
-### 前置条件
-
-- Rust 1.75 或更新版本
-- 至少一个上游 provider 的地址和 key（OAuth provider 除外）
+### 1. 编译与启动
 
 ```bash
+# 1. 编译 release 二进制
 cargo build --release
+
+# 2. 复制配置模板并调整
 cp config.example.yaml config.yaml
+
+# 3. 启动代理服务
 ./target/release/ccextra --config config.yaml
 ```
 
-### 配置示例
+### 2. 配置示例 (`config.yaml`)
 
 ```yaml
 server:
   host: "127.0.0.1"
   port: 8222
+
 providers:
   - name: upstream
     protocol: openai_responses
@@ -69,21 +96,24 @@ providers:
     models:
       - name: gpt-5.6-terra
         alias: gpt-5.6-terra
+
 normalize:
   enabled: true
   drift_detector: true
 ```
 
-### 接入 Claude Code
+### 3. 连接 Claude Code
+
+在终端中设置环境变量即可无缝接管：
 
 ```bash
 export ANTHROPIC_BASE_URL=http://127.0.0.1:8222
-export ANTHROPIC_AUTH_TOKEN=sk-ccextra-xxx # 配置 secret_key 时需要
+export ANTHROPIC_AUTH_TOKEN=sk-ccextra-xxx  # 配置 secret_key 时填写
 ```
 
-后台运行：`build.sh` 构建 release 并更新根目录 `./ccextra`，`start.sh`、`stop.sh`、`restart.sh` 管理进程。
+> **后台守护**：使用 `build.sh` 快速构建，配合 `start.sh`、`stop.sh`、`restart.sh` 实现后台管理。
 
-## 配置
+## 配置参考
 
 完整字段见 [config.example.yaml](config.example.yaml)。要点：
 
@@ -105,23 +135,25 @@ export ANTHROPIC_AUTH_TOKEN=sk-ccextra-xxx # 配置 secret_key 时需要
 
 </details>
 
-## 端点
+## API 端点
 
-| 端点 | 用途 |
-| --- | --- |
-| `POST /v1/messages` | 主请求入口。 |
-| `POST /v1/messages/count_tokens` | Claude 上游转发精确计数；其他协议返回该会话上轮响应记录的输入 token 数，未命中返回 0。 |
-| `GET /v1/models` | Anthropic 形状模型列表。 |
-| `GET /health` | 返回 `ok`。 |
-| `POST /reload` | 热重载配置。 |
+| 方法与端点 | 权限说明 | 功能描述 |
+| :--- | :--- | :--- |
+| `POST /v1/messages` | 需认证* | 核心消息交互入口，完美对齐 Anthropic 协议与 SSE 流式返回。 |
+| `POST /v1/messages/count_tokens` | 需认证* | 精确/会话估算 Token 计数（Claude 转发精确值，其他协议沿用上轮记录）。 |
+| `GET /v1/models` | 需认证* | 获取 Anthropic 格式的可用模型列表。 |
+| `GET /health` | 公开 | 节点探活接口，常驻返回 `ok`。 |
+| `POST /reload` | 公开 | 零停机热重载，即刻生效最新配置、路由与 Reasoning 映射。 |
 
-配置 `secret_key` 后，前三个 Anthropic 端点需要认证。
+> `*` 注：当配置 `secret_key` 时，带 `*` 的端点须携带 `x-api-key` 或 `Authorization: Bearer` 鉴权。
 
-## 运行行为
+## 运行机制
 
-请求依次经过认证、路由、归一化、协议转换、payload 覆盖、缓存 key 注入和上游发送。Claude 直通保留入站身份头，`anthropic-beta` 原样透传、缺失时不补。所有流式出口以 Anthropic SSE 返回，空闲 10 秒发送 `: keepalive`。
+请求自入站起，依次执行：**入口认证 ➔ 智能路由 ➔ 缓存归一化 ➔ 目标协议转换 ➔ Payload 覆写 ➔ Prompt Cache Key 注入 ➔ 上游重试与分发**。
 
-网络错误、429 和 5xx 在 3 秒总预算内指数退避重试，并受限地尊重 `Retry-After`；多 `base_url` 按顺序尝试。
+- **流式标准保障**：全流式路径输出标准 Anthropic SSE 事件流；内置 10 秒空闲保活机制（`: keepalive`）。
+- **稳健重试退避**：遭遇网络抖动、429 或 5xx/52x 错误时，在 3 秒总预算内执行指数退避重试，自动顺延多 `base_url` 回退通道。
+- **直通保真度**：Claude 协议完整保留客户端透传的身份头与 `anthropic-beta` 字段，杜绝非必要修改。
 
 ## OAuth 与运维
 
@@ -136,15 +168,23 @@ export ANTHROPIC_AUTH_TOKEN=sk-ccextra-xxx # 配置 secret_key 时需要
 
 Antigravity 凭证默认在配置文件旁 `.cache/antigravity`，xAI 在 `.cache/xai`。xAI 启动时自动发现；Antigravity 后台加载并每 3 小时刷新模型。改完配置调用 `POST /reload` 生效。
 
-## 开发
+## 开发与架构分层
 
 ```bash
+# 运行完整测试套件
 cargo test --workspace
+
+# 严格 Clippy 静态检查
 cargo clippy --workspace --all-targets -- -D warnings
 ```
 
-三个 crate：`ccextra-cli` 负责配置、CLI 和启动，`ccextra-server` 负责 HTTP、上游请求和 SSE，`ccextra-core` 存放路由、归一化和转换等纯逻辑。详见[架构设计](docs/design.md)和[术语表](docs/glossary.md)。
+清晰的三层解耦架构设计：
+- `ccextra-cli`：CLI 入口、启动生命周期与配置装载。
+- `ccextra-server`：HTTP 引擎、OAuth 流程、SSE 状态机与上游连接池。
+- `ccextra-core`：纯粹无 IO 的业务逻辑内核（路由算法、归一化引擎、协议转换器与 Reasoning 表）。
 
-## License
+详细设计说明请查阅 [架构设计 (design.md)](docs/design.md) 与 [领域术语表 (glossary.md)](docs/glossary.md)。
 
-[MIT](LICENSE)
+## 开源协议
+
+本项目采用 [MIT 许可证](LICENSE)。
