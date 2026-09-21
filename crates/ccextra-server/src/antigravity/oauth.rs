@@ -96,12 +96,16 @@ pub async fn exchange_code(
 }
 
 pub async fn fetch_user_email(client: &Client, access_token: &str) -> Result<String> {
+    fetch_user_email_at(client, access_token, USERINFO_ENDPOINT).await
+}
+
+async fn fetch_user_email_at(client: &Client, access_token: &str, url: &str) -> Result<String> {
     let token = access_token.trim();
     if token.is_empty() {
         return Err(anyhow!("antigravity userinfo: missing access token"));
     }
     let resp = client
-        .get(USERINFO_ENDPOINT)
+        .get(url)
         .header("Authorization", format!("Bearer {token}"))
         .header("User-Agent", super::constants::REQUEST_UA)
         .send()
@@ -109,10 +113,14 @@ pub async fn fetch_user_email(client: &Client, access_token: &str) -> Result<Str
         .context("antigravity userinfo")?;
     let status = resp.status();
     if !status.is_success() {
-        let body = resp.text().await.unwrap_or_default();
+        // 错误正文有界读取(256 KiB);读取失败返回空,对齐原 unwrap_or_default
+        let body = crate::limits::read_error_text(resp).await;
         return Err(http_err("userinfo", status.as_u16(), &body));
     }
-    let info: UserInfo = resp.json().await.context("decode userinfo")?;
+    let bytes = crate::limits::read_success_body(resp)
+        .await
+        .context("decode userinfo")?;
+    let info: UserInfo = serde_json::from_slice(&bytes).context("decode userinfo")?;
     let email = info.email.trim().to_string();
     if email.is_empty() {
         return Err(anyhow!("antigravity userinfo: response missing email"));
@@ -146,13 +154,15 @@ pub async fn refresh_token(client: &Client, refresh: &str) -> Result<TokenRespon
 async fn decode_token(resp: reqwest::Response, what: &str) -> Result<TokenResponse> {
     let status = resp.status();
     if !status.is_success() {
-        let body = resp.text().await.unwrap_or_default();
+        // 错误正文有界读取(256 KiB);读取失败返回空,对齐原 unwrap_or_default
+        let body = crate::limits::read_error_text(resp).await;
         return Err(http_err(what, status.as_u16(), &body));
     }
-    let token: TokenResponse = resp
-        .json()
+    let bytes = crate::limits::read_success_body(resp)
         .await
         .with_context(|| format!("decode {what}"))?;
+    let token: TokenResponse =
+        serde_json::from_slice(&bytes).with_context(|| format!("decode {what}"))?;
     if token.access_token.trim().is_empty() {
         return Err(anyhow!("antigravity {what}: empty access token"));
     }
@@ -201,5 +211,86 @@ mod tests {
         http_client(Some("http://127.0.0.1:7897")).unwrap();
         http_client(Some("socks5://127.0.0.1:1080")).unwrap();
         assert!(http_client(Some("not-a-url")).is_err());
+    }
+
+    #[tokio::test]
+    async fn decode_token_body_limits() {
+        use crate::{
+            limits::SUCCESS_BODY_LIMIT,
+            test_support::{padded_json, response},
+        };
+        use axum::http::StatusCode;
+        let json = r#"{"access_token":"at","refresh_token":"rt","expires_in":3600}"#;
+        let token = decode_token(response(StatusCode::OK, json), "token exchange")
+            .await
+            .unwrap();
+        assert_eq!(
+            (token.access_token.as_str(), token.refresh_token.as_str()),
+            ("at", "rt")
+        );
+        for (status, len, expected) in [
+            (StatusCode::BAD_REQUEST, 300 * 1024, "已截断"),
+            (StatusCode::OK, SUCCESS_BODY_LIMIT + 1, "上限"),
+        ] {
+            let err = decode_token(response(status, padded_json(json, len)), "token exchange")
+                .await
+                .unwrap_err();
+            assert!(format!("{err:#}").contains(expected), "{err:#}");
+        }
+    }
+
+    #[tokio::test]
+    async fn userinfo_body_limits() {
+        use crate::{
+            limits::SUCCESS_BODY_LIMIT,
+            test_support::{padded_json, TestServer},
+        };
+        use axum::http::StatusCode;
+        let client = http_client(Some("direct")).unwrap();
+        for (status, len, expected) in [
+            (StatusCode::OK, 0, ""),
+            (StatusCode::OK, SUCCESS_BODY_LIMIT + 1, "上限"),
+            (StatusCode::BAD_REQUEST, 300 * 1024, "已截断"),
+        ] {
+            let server = TestServer::reply(
+                status,
+                padded_json(r#"{"email":" test@example.com "}"#, len),
+            )
+            .await;
+            let result = fetch_user_email_at(&client, "tok", &server.url).await;
+            if expected.is_empty() {
+                assert_eq!(result.unwrap(), "test@example.com");
+            } else {
+                let err = result.unwrap_err();
+                assert!(format!("{err:#}").contains(expected), "{err:#}");
+            }
+        }
+    }
+
+    #[tokio::test]
+    async fn oauth_clients_timeout_covers_body_read() {
+        use crate::{
+            limits::{read_success_body, BodyReadError},
+            test_support::{stalled_body, TestServer},
+        };
+        use std::time::Duration;
+        let server =
+            TestServer::spawn(axum::Router::new().fallback(|| async { stalled_body() })).await;
+        for client in [
+            http_client(Some("direct")).unwrap(),
+            crate::xai::oauth::http_client(Some("direct")).unwrap(),
+        ] {
+            // 收到响应头后才暂停时间,避免真实网络与自动时间推进竞争。
+            let resp = tokio::time::timeout(Duration::from_secs(5), client.get(&server.url).send())
+                .await
+                .unwrap()
+                .unwrap();
+            tokio::time::pause();
+            let start = tokio::time::Instant::now();
+            let err = read_success_body(resp).await.unwrap_err();
+            assert!(matches!(err, BodyReadError::Transport(ref e) if e.is_timeout()));
+            assert!((29..=31).contains(&start.elapsed().as_secs()));
+            tokio::time::resume();
+        }
     }
 }

@@ -153,6 +153,7 @@ Inbound requests execute sequentially: **Auth Verification ➔ Smart Routing ➔
 
 - **SSE Stream Integrity**: Emits compliant Anthropic SSE events on all streaming paths with an automatic 10-second heartbeat (`: keepalive`).
 - **Resilient Retry Budget**: Retries transient network failures, 429, and 5xx/52x errors with exponential backoff across a 3-second budget while cycling fallback URLs.
+- **Bounded Reads**: Non-stream response bodies are capped at 16 MiB (success) / 256 KiB (errors) with a 300-second read idle. Over-limit success bodies return 502 and stalls return 504; truncated or unreadable error bodies keep the upstream status code (429/401 are not rewritten).
 - **Header Fidelity**: Claude passthrough preserves original ingress identity headers and `anthropic-beta` without unsolicited additions.
 
 ## OAuth and operations

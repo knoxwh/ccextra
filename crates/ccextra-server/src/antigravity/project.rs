@@ -55,9 +55,18 @@ pub fn default_tier_id(load: &Value) -> String {
 
 pub async fn fetch_project_id(client: &Client, access_token: &str) -> Result<String> {
     let url = format!("{API_ENDPOINT}/{API_VERSION}:loadCodeAssist");
+    fetch_project_id_at(client, &url, access_token).await
+}
+
+/// 按给定端点获取 project id;URL 参数化便于接线测试
+pub(crate) async fn fetch_project_id_at(
+    client: &Client,
+    url: &str,
+    access_token: &str,
+) -> Result<String> {
     let body = json!({"metadata": {"ideType": "ANTIGRAVITY"}});
     let resp = client
-        .post(&url)
+        .post(url)
         .header("Authorization", format!("Bearer {access_token}"))
         .header("Accept", "*/*")
         .header("Content-Type", "application/json")
@@ -67,15 +76,19 @@ pub async fn fetch_project_id(client: &Client, access_token: &str) -> Result<Str
         .await
         .context("antigravity loadCodeAssist")?;
     let status = resp.status();
-    let bytes = resp.bytes().await.context("read loadCodeAssist")?;
+    // 有界读取:成功 16 MiB / 错误 256 KiB;30s 总超时由 client 覆盖
+    let body = crate::limits::read_body_by_status(resp)
+        .await
+        .context("read loadCodeAssist")?;
     if !status.is_success() {
         return Err(anyhow!(
-            "loadCodeAssist failed: status {}: {}",
+            "loadCodeAssist failed: status {}: {}{}",
             status.as_u16(),
-            String::from_utf8_lossy(&bytes).trim()
+            String::from_utf8_lossy(&body.bytes).trim(),
+            if body.truncated { "…(已截断)" } else { "" }
         ));
     }
-    let load: Value = serde_json::from_slice(&bytes).context("decode loadCodeAssist")?;
+    let load: Value = serde_json::from_slice(&body.bytes).context("decode loadCodeAssist")?;
     let project = extract_project(&load);
     if !project.is_empty() {
         return Ok(project);
@@ -91,6 +104,16 @@ pub async fn fetch_project_id(client: &Client, access_token: &str) -> Result<Str
 
 pub async fn onboard_user(client: &Client, access_token: &str, tier_id: &str) -> Result<String> {
     let url = format!("{DAILY_API_ENDPOINT}/{API_VERSION}:onboardUser");
+    onboard_user_at(client, &url, access_token, tier_id).await
+}
+
+/// 按给定端点执行 onboardUser 轮询;URL 参数化便于接线测试
+pub(crate) async fn onboard_user_at(
+    client: &Client,
+    url: &str,
+    access_token: &str,
+    tier_id: &str,
+) -> Result<String> {
     let body = json!({
         "tier_id": tier_id,
         "metadata": {
@@ -101,7 +124,7 @@ pub async fn onboard_user(client: &Client, access_token: &str, tier_id: &str) ->
     });
     for _attempt in 1..=ONBOARD_ATTEMPTS {
         let resp = client
-            .post(&url)
+            .post(url)
             .header("Authorization", format!("Bearer {access_token}"))
             .header("Accept", "*/*")
             .header("Content-Type", "application/json")
@@ -112,18 +135,25 @@ pub async fn onboard_user(client: &Client, access_token: &str, tier_id: &str) ->
             .await
             .context("antigravity onboardUser")?;
         let status = resp.status();
-        let bytes = resp.bytes().await.context("read onboardUser")?;
+        // 有界读取:成功 16 MiB / 错误 256 KiB;30s 总超时由 client 覆盖
+        let body = crate::limits::read_body_by_status(resp)
+            .await
+            .context("read onboardUser")?;
         if !status.is_success() {
-            let preview = String::from_utf8_lossy(&bytes);
+            let preview = String::from_utf8_lossy(&body.bytes);
             let preview = preview.trim();
             let preview = if preview.len() > 200 {
                 &preview[..200]
             } else {
                 preview
             };
-            return Err(anyhow!("onboardUser http {}: {preview}", status.as_u16()));
+            let note = if body.truncated { "…(已截断)" } else { "" };
+            return Err(anyhow!(
+                "onboardUser http {}: {preview}{note}",
+                status.as_u16()
+            ));
         }
-        let data: Value = serde_json::from_slice(&bytes).context("decode onboardUser")?;
+        let data: Value = serde_json::from_slice(&body.bytes).context("decode onboardUser")?;
         if data.get("done").and_then(Value::as_bool) == Some(true) {
             let project = data
                 .get("response")
@@ -175,5 +205,40 @@ mod tests {
         );
         assert_eq!(default_tier_id(&json!({"currentTier":{"id":"pro"}})), "pro");
         assert_eq!(default_tier_id(&json!({})), "free-tier");
+    }
+
+    #[tokio::test]
+    async fn project_and_onboard_body_limits() {
+        use crate::{
+            limits::SUCCESS_BODY_LIMIT,
+            test_support::{padded_json, TestServer},
+        };
+        use axum::http::StatusCode;
+        let client = crate::antigravity::oauth::http_client(Some("direct")).unwrap();
+        for onboard in [false, true] {
+            let json = if onboard {
+                r#"{"done":true,"response":{"projectId":"proj-1"}}"#
+            } else {
+                r#"{"cloudaicompanionProject":"proj-1"}"#
+            };
+            for (status, len, expected) in [
+                (StatusCode::OK, 0, ""),
+                (StatusCode::OK, SUCCESS_BODY_LIMIT + 1, "上限"),
+                (StatusCode::INTERNAL_SERVER_ERROR, 300 * 1024, "已截断"),
+            ] {
+                let server = TestServer::reply(status, padded_json(json, len)).await;
+                let result = if onboard {
+                    onboard_user_at(&client, &server.url, "tok", "free-tier").await
+                } else {
+                    fetch_project_id_at(&client, &server.url, "tok").await
+                };
+                if expected.is_empty() {
+                    assert_eq!(result.unwrap(), "proj-1");
+                } else {
+                    let err = result.unwrap_err();
+                    assert!(format!("{err:#}").contains(expected), "{err:#}");
+                }
+            }
+        }
     }
 }

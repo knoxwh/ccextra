@@ -28,7 +28,7 @@ pub async fn handle_count_tokens(
 ) -> Result<Response, AppError> {
     let secret = state.runtime.read().await.secret.clone();
     check_secret(&headers, &secret)?;
-    let bytes = to_bytes(body, 10 * 1024 * 1024)
+    let bytes = to_bytes(body, crate::limits::INBOUND_BODY_LIMIT)
         .await
         .map_err(|e| AppError::new(anyhow::anyhow!("读请求体失败: {e}")))?;
 
@@ -81,11 +81,28 @@ pub async fn handle_count_tokens(
             .map_err(|e| AppError::new(anyhow::anyhow!("上游请求失败: {e}")))?;
 
         let status = resp.status();
-        let body_bytes = resp
-            .bytes()
-            .await
-            .map_err(|e| AppError::new(anyhow::anyhow!("读上游响应失败: {e}")))?;
+        if status.is_success() {
+            // 成功 body 有界读取:16 MiB 上限 + 300s idle;
+            // 超限 502、停顿 504(Anthropic api_error),传输错误维持 500
+            let body_bytes = crate::limits::read_success_body_or_anthropic(resp).await?;
+            return Response::builder()
+                .status(status)
+                .header(header::CONTENT_TYPE, "application/json")
+                .body(Body::from(body_bytes))
+                .map_err(|e| AppError::new(anyhow::anyhow!("构造响应失败: {e}")));
+        }
 
+        // 错误 body 有界读取(256 KiB + 300s idle):截断或读取失败保留已知
+        // 上游状态(429/401 等不被改成 502/504/500),生成有界 Anthropic error;
+        // 未截断的错误 body 按原语义原样转发
+        let (body_bytes, truncated) =
+            crate::limits::read_error_body_or_anthropic(resp, status).await?;
+        if truncated {
+            return Err(AppError::with_status(
+                status,
+                "上游错误 body 超过 256 KiB,已截断",
+            ));
+        }
         return Response::builder()
             .status(status)
             .header(header::CONTENT_TYPE, "application/json")

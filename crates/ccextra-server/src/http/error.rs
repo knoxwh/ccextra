@@ -35,6 +35,14 @@ impl AppError {
         }
     }
 
+    /// 指定状态码构造(如上游 body 超限 502 / 停顿 504,保留上游状态)
+    pub fn with_status(status: StatusCode, msg: impl Into<String>) -> Self {
+        Self {
+            status,
+            err: anyhow::anyhow!(msg.into()),
+        }
+    }
+
     pub fn not_found(msg: impl Into<String>) -> Self {
         Self {
             status: StatusCode::NOT_FOUND,

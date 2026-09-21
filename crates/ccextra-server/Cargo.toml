@@ -23,6 +23,7 @@ tracing.workspace = true
 globset.workspace = true
 bcrypt.workspace = true
 base64.workspace = true
+lru = "0.12"
 
 time = { version = "0.3", features = ["formatting", "parsing", "std"] }
 getrandom = "0.2"
@@ -31,3 +32,5 @@ getrandom = "0.2"
 tower.workspace = true
 tempfile = "3"
 serde_yaml = "0.9"
+# start_paused 测试时钟(limits 停顿用例)
+tokio = { version = "1.35", features = ["test-util"] }

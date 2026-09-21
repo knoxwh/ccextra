@@ -7,4 +7,8 @@ pub mod sse;
 pub mod upstream;
 pub mod xai;
 
+mod limits;
+#[cfg(test)]
+mod test_support;
+
 pub use http::serve;

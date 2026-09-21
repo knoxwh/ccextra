@@ -103,18 +103,26 @@ pub fn validate_oauth_endpoint(raw_url: &str, field: &str) -> Result<String> {
 }
 
 pub async fn discover(client: &Client) -> Result<Discovery> {
+    discover_at(client, DISCOVERY_URL).await
+}
+
+async fn discover_at(client: &Client, url: &str) -> Result<Discovery> {
     let resp = client
-        .get(DISCOVERY_URL)
+        .get(url)
         .header("Accept", "application/json")
         .send()
         .await
         .context("xai discovery request")?;
     let status = resp.status();
     if !status.is_success() {
-        let body = resp.text().await.unwrap_or_default();
+        // 错误正文有界读取(256 KiB);读取失败返回空,对齐原 unwrap_or_default
+        let body = crate::limits::read_error_text(resp).await;
         return Err(anyhow!("xai discovery failed with status {status}: {body}"));
     }
-    let disco: Discovery = resp.json().await.context("xai discovery parse json")?;
+    let bytes = crate::limits::read_success_body(resp)
+        .await
+        .context("xai discovery parse json")?;
+    let disco: Discovery = serde_json::from_slice(&bytes).context("xai discovery parse json")?;
     let device_endpoint = validate_oauth_endpoint(
         &disco.device_authorization_endpoint,
         "device_authorization_endpoint",
@@ -128,6 +136,10 @@ pub async fn discover(client: &Client) -> Result<Discovery> {
 
 pub async fn start_device_flow(client: &Client) -> Result<DeviceCodeResponse> {
     let disco = discover(client).await?;
+    start_device_flow_at(client, disco).await
+}
+
+async fn start_device_flow_at(client: &Client, disco: Discovery) -> Result<DeviceCodeResponse> {
     let resp = client
         .post(&disco.device_authorization_endpoint)
         .header("Content-Type", "application/x-www-form-urlencoded")
@@ -138,15 +150,17 @@ pub async fn start_device_flow(client: &Client) -> Result<DeviceCodeResponse> {
         .context("xai device code request")?;
     let status = resp.status();
     if !status.is_success() {
-        let body = resp.text().await.unwrap_or_default();
+        // 错误正文有界读取(256 KiB);读取失败返回空,对齐原 unwrap_or_default
+        let body = crate::limits::read_error_text(resp).await;
         return Err(anyhow!(
             "xai device code request failed with status {status}: {body}"
         ));
     }
-    let mut dev: DeviceCodeResponse = resp
-        .json()
+    let bytes = crate::limits::read_success_body(resp)
         .await
         .context("xai parse device code response")?;
+    let mut dev: DeviceCodeResponse =
+        serde_json::from_slice(&bytes).context("xai parse device code response")?;
     if dev.device_code.trim().is_empty() {
         return Err(anyhow!("xai device code response missing device_code"));
     }
@@ -185,7 +199,17 @@ pub async fn poll_for_token(client: &Client, device: &DeviceCodeResponse) -> Res
             .await
             .context("xai poll device token request")?;
 
-        let text = resp.text().await.unwrap_or_default();
+        // 有界读取(成功 16 MiB / 错误 256 KiB):截断报告读取失败,
+        // 不得误当作 authorization_pending 或成功
+        let text = match crate::limits::read_body_by_status(resp).await {
+            Ok(body) if body.truncated => {
+                return Err(anyhow!(
+                    "xai poll token response body over limit, truncated"
+                ));
+            }
+            Ok(body) => String::from_utf8_lossy(&body.bytes).to_string(),
+            Err(e) => return Err(anyhow!("xai read poll token response failed: {e}")),
+        };
         let payload: TokenPollResponse = match serde_json::from_str(&text) {
             Ok(p) => p,
             Err(e) => return Err(anyhow!("xai parse poll token response failed: {e}: {text}")),
@@ -255,13 +279,15 @@ pub async fn refresh_token(
 
     let status = resp.status();
     if !status.is_success() {
-        let body = resp.text().await.unwrap_or_default();
+        // 错误正文有界读取(256 KiB);读取失败返回空,对齐原 unwrap_or_default
+        let body = crate::limits::read_error_text(resp).await;
         return Err(anyhow!("xai token refresh failed: status {status}: {body}"));
     }
-    let data: TokenData = resp
-        .json()
+    let bytes = crate::limits::read_success_body(resp)
         .await
         .context("xai decode refresh token response")?;
+    let data: TokenData =
+        serde_json::from_slice(&bytes).context("xai decode refresh token response")?;
     if data.access_token.trim().is_empty() {
         return Err(anyhow!("xai token refresh: empty access token in response"));
     }
@@ -278,5 +304,128 @@ mod tests {
         assert!(validate_oauth_endpoint("https://api.x.ai/v1", "token").is_ok());
         assert!(validate_oauth_endpoint("http://auth.x.ai/oauth2/token", "token").is_err());
         assert!(validate_oauth_endpoint("https://google.com/token", "token").is_err());
+    }
+
+    #[tokio::test]
+    async fn poll_body_limits_and_classification() {
+        use crate::test_support::{padded_json, TestServer};
+        use axum::http::StatusCode;
+        for (status, json, len, expected) in [
+            (StatusCode::OK, r#"{"access_token":"at"}"#, 0, ""),
+            (
+                StatusCode::BAD_REQUEST,
+                r#"{"error":"access_denied"}"#,
+                0,
+                "denied",
+            ),
+            (
+                StatusCode::BAD_REQUEST,
+                r#"{"error":"authorization_pending"}"#,
+                300 * 1024,
+                "truncated",
+            ),
+        ] {
+            let server = TestServer::reply(status, padded_json(json, len)).await;
+            let client = http_client(Some("direct")).unwrap();
+            let device = DeviceCodeResponse {
+                device_code: "dc".into(),
+                user_code: "uc".into(),
+                verification_uri: String::new(),
+                verification_uri_complete: String::new(),
+                expires_in: 600,
+                interval: 0,
+                token_endpoint: server.url.clone(),
+            };
+            // 只跳过首轮等待;网络交互恢复真实时间,错误继续轮询须在 2s 内失败。
+            tokio::time::pause();
+            let future = poll_for_token(&client, &device);
+            tokio::pin!(future);
+            assert!(futures::poll!(&mut future).is_pending());
+            tokio::time::advance(Duration::from_secs(5)).await;
+            tokio::time::resume();
+            let result = tokio::time::timeout(Duration::from_secs(2), future)
+                .await
+                .unwrap();
+            if expected.is_empty() {
+                assert_eq!(result.unwrap().access_token, "at");
+            } else {
+                let err = result.unwrap_err();
+                assert!(err.to_string().contains(expected), "{err}");
+            }
+        }
+    }
+
+    #[tokio::test]
+    async fn refresh_and_device_body_limits() {
+        use crate::{
+            limits::SUCCESS_BODY_LIMIT,
+            test_support::{padded_json, TestServer},
+        };
+        use axum::http::StatusCode;
+        let json =
+            r#"{"access_token":"at","refresh_token":"rt","device_code":"dc","user_code":"uc"}"#;
+        let client = http_client(Some("direct")).unwrap();
+        for (status, len, expected) in [
+            (StatusCode::OK, 0, ""),
+            (StatusCode::OK, SUCCESS_BODY_LIMIT + 1, "上限"),
+            (StatusCode::BAD_REQUEST, 300 * 1024, "已截断"),
+        ] {
+            let server = TestServer::reply(status, padded_json(json, len)).await;
+            for device in [false, true] {
+                let result = if device {
+                    start_device_flow_at(
+                        &client,
+                        Discovery {
+                            device_authorization_endpoint: server.url.clone(),
+                            token_endpoint: "https://auth.x.ai/oauth2/token".into(),
+                        },
+                    )
+                    .await
+                    .map(|data| {
+                        assert_eq!(data.device_code, "dc");
+                        assert_eq!(data.token_endpoint, "https://auth.x.ai/oauth2/token");
+                        data.user_code
+                    })
+                } else {
+                    refresh_token(&client, &server.url, "refresh-tok")
+                        .await
+                        .map(|data| data.access_token)
+                };
+                if expected.is_empty() {
+                    assert_eq!(result.unwrap(), if device { "uc" } else { "at" });
+                } else {
+                    let err = result.unwrap_err();
+                    assert!(format!("{err:#}").contains(expected), "{err:#}");
+                }
+            }
+        }
+    }
+
+    #[tokio::test]
+    async fn discover_body_limits() {
+        use crate::{
+            limits::SUCCESS_BODY_LIMIT,
+            test_support::{padded_json, TestServer},
+        };
+        use axum::http::StatusCode;
+        let json = r#"{"device_authorization_endpoint":"https://auth.x.ai/oauth2/device/code","token_endpoint":"https://auth.x.ai/oauth2/token"}"#;
+        let client = http_client(Some("direct")).unwrap();
+        for (status, len, expected) in [
+            (StatusCode::OK, 0, ""),
+            (StatusCode::OK, SUCCESS_BODY_LIMIT + 1, "上限"),
+            (StatusCode::BAD_REQUEST, 300 * 1024, "已截断"),
+        ] {
+            let server = TestServer::reply(status, padded_json(json, len)).await;
+            let result = discover_at(&client, &server.url).await;
+            if expected.is_empty() {
+                assert_eq!(
+                    result.unwrap().token_endpoint,
+                    "https://auth.x.ai/oauth2/token"
+                );
+            } else {
+                let err = result.unwrap_err();
+                assert!(format!("{err:#}").contains(expected), "{err:#}");
+            }
+        }
     }
 }

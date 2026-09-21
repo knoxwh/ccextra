@@ -1351,7 +1351,7 @@ async fn test_reload_clears_auth_cache() {
     let old_hash = bcrypt::hash("sk-old", 4).unwrap();
     let new_hash = bcrypt::hash("sk-new", 4).unwrap();
     let mut state = mock_state();
-    state.runtime.write().await.secret = Some(old_hash);
+    state.runtime.write().await.secret = Some(old_hash.clone());
     state.reload = reload_returning_secret(Some(new_hash));
     let app = app(state);
 
@@ -1365,6 +1365,10 @@ async fn test_reload_clears_auth_cache() {
     // 先命中一次,把 sk-old→true 写进 AUTH_CACHE
     let r = app.clone().oneshot(with_key("sk-old")).await.unwrap();
     assert_eq!(r.status(), StatusCode::OK);
+    assert!(
+        crate::http::auth::auth_cache_contains(&old_hash, "sk-old"),
+        "reload 前全局缓存应含旧 hash 条目"
+    );
 
     let reload = Request::builder()
         .uri("/reload")
@@ -1374,6 +1378,11 @@ async fn test_reload_clears_auth_cache() {
     assert_eq!(
         app.clone().oneshot(reload).await.unwrap().status(),
         StatusCode::OK
+    );
+    // reload 必须实际清掉该条目(删掉 handle_reload 的 clear 则此处失败)
+    assert!(
+        !crate::http::auth::auth_cache_contains(&old_hash, "sk-old"),
+        "reload 应清掉旧 hash 的缓存条目"
     );
 
     let stale = app.clone().oneshot(with_key("sk-old")).await.unwrap();
@@ -1743,6 +1752,129 @@ async fn test_count_tokens_relay_uses_fallback_user_agent() {
     assert_eq!(captured.header("anthropic-beta").as_deref(), Some("beta-a"));
     assert_eq!(captured.header_values("user-agent"), vec![TEST_CLAUDE_CLI]);
     assert!(!captured.has_header("x-api-key"));
+}
+
+// ── B1:非流 body 有界读取接线 ───────────────────────────────────────
+
+#[tokio::test]
+async fn non_stream_body_limits_and_passthrough() {
+    use crate::{
+        limits::SUCCESS_BODY_LIMIT,
+        test_support::{padded_json, TestServer},
+    };
+    for path in ["/v1/messages", "/v1/messages/count_tokens"] {
+        for (status, len) in [
+            (StatusCode::OK, 1024 * 1024),
+            (StatusCode::OK, SUCCESS_BODY_LIMIT + 1),
+            (StatusCode::UNAUTHORIZED, 300 * 1024),
+            (StatusCode::TOO_MANY_REQUESTS, 300 * 1024),
+            (StatusCode::INTERNAL_SERVER_ERROR, 300 * 1024),
+        ] {
+            // 截断前缀是合法 JSON,不能采用其中的结构化错误字段。
+            let json = if status.is_success() {
+                if path.ends_with("count_tokens") {
+                    r#"{"input_tokens":42}"#
+                } else {
+                    r#"{"id":"msg_1","type":"message","role":"assistant","content":[{"type":"text","text":"hello"}]}"#
+                }
+            } else {
+                r#"{"error":{"type":"rate_limit_error","message":"quota exceeded"}}"#
+            };
+            let payload = padded_json(json, len);
+            let server = TestServer::reply(status, payload.clone()).await;
+            let state = mock_state();
+            state.providers.write().await[0].set_base_url_for_test(server.url.clone());
+            let response = post_test_request(state, path, "test-opus").await;
+            let expected = if len > SUCCESS_BODY_LIMIT {
+                StatusCode::BAD_GATEWAY
+            } else {
+                status
+            };
+            assert_eq!(response.status(), expected, "{path} {status}");
+            let bytes = to_bytes(response.into_body(), SUCCESS_BODY_LIMIT)
+                .await
+                .unwrap();
+            if expected.is_success() {
+                assert_eq!(bytes, payload, "直通须逐字节一致");
+            } else {
+                let error: Value = serde_json::from_slice(&bytes).unwrap();
+                assert_eq!(
+                    error["error"]["type"],
+                    if path.ends_with("count_tokens") && status == StatusCode::UNAUTHORIZED {
+                        "authentication_error"
+                    } else {
+                        "api_error"
+                    }
+                );
+                if !status.is_success() {
+                    assert!(error["error"]["message"]
+                        .as_str()
+                        .unwrap()
+                        .contains("已截断"));
+                }
+            }
+        }
+    }
+}
+
+/// count_tokens 上游 429 响应 body 传输中断:保留 429,不升级为 500
+#[tokio::test]
+async fn test_count_tokens_error_body_transport_failure_preserves_429() {
+    // 裸 TCP:回 429 头 + 声明 100000 字节但只发部分,随后断开
+    let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let upstream_addr = listener.local_addr().unwrap();
+    let server = tokio::spawn(async move {
+        use tokio::io::{AsyncReadExt, AsyncWriteExt};
+        let (mut sock, _) = listener.accept().await.unwrap();
+        let mut buf = [0u8; 4096];
+        let mut seen = 0;
+        while seen < 4096 {
+            let n = sock.read(&mut buf).await.unwrap_or(0);
+            if n == 0 {
+                break;
+            }
+            seen += n;
+            if buf[..n].windows(4).any(|w| w == b"\r\n\r\n") {
+                break;
+            }
+        }
+        let head = "HTTP/1.1 429 Too Many Requests\r\ncontent-type: application/json\r\ncontent-length: 100000\r\n\r\n";
+        sock.write_all(head.as_bytes()).await.unwrap();
+        sock.write_all(&[b'e'; 64]).await.unwrap();
+        sock.shutdown().await.unwrap();
+    });
+
+    let state = mock_state();
+    state.providers.write().await[0].set_base_url_for_test(format!("http://{upstream_addr}"));
+    let app = app(state);
+    let request = Request::builder()
+        .uri("/v1/messages/count_tokens")
+        .method("POST")
+        .header("content-type", "application/json")
+        .body(Body::from(
+            json!({"model": "test-opus", "messages": []}).to_string(),
+        ))
+        .unwrap();
+    let response = app.oneshot(request).await.unwrap();
+    let status = response.status();
+    let body = to_bytes(response.into_body(), 1024).await.unwrap();
+    server.abort();
+
+    assert_eq!(
+        status,
+        StatusCode::TOO_MANY_REQUESTS,
+        "传输失败不得把 429 改成 500"
+    );
+    let v: Value = serde_json::from_slice(&body).unwrap();
+    assert_eq!(v["error"]["type"], "api_error");
+    assert!(
+        v["error"]["message"]
+            .as_str()
+            .unwrap()
+            .contains("读取上游错误响应失败"),
+        "消息应说明读取失败: {}",
+        v["error"]["message"]
+    );
 }
 
 #[tokio::test]
@@ -2357,4 +2489,47 @@ async fn test_upstream_persistent_503_exhausts_budget_returns_error_shape() {
         .unwrap();
     let v: Value = serde_json::from_slice(&bytes).unwrap();
     assert_eq!(v["type"], "error", "错误必须转 anthropic error 形状");
+}
+
+async fn post_test_request(state: AppState, path: &str, model: &str) -> axum::response::Response {
+    app(state)
+        .oneshot(
+            Request::builder()
+                .uri(path)
+                .method("POST")
+                .header("content-type", "application/json")
+                .body(Body::from(
+                    json!({"model": model, "max_tokens": 64, "stream": false,
+            "messages": [{"role": "user", "content": "hi"}]})
+                    .to_string(),
+                ))
+                .unwrap(),
+        )
+        .await
+        .unwrap()
+}
+
+#[tokio::test]
+async fn fallback_attempts_each_url_once() {
+    use crate::test_support::TestServer;
+    let good = TestServer::reply(StatusCode::OK,
+        r#"{"id":"c1","choices":[{"message":{"role":"assistant","content":"fallback ok"},"finish_reason":"stop"}],"usage":{"prompt_tokens":1,"completion_tokens":1}}"#).await;
+    let limited = TestServer::reply(StatusCode::TOO_MANY_REQUESTS, "rate limited").await;
+    for refused in [true, false] {
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let first = if refused {
+            format!("http://{}", listener.local_addr().unwrap())
+        } else {
+            limited.url.clone()
+        };
+        let state = mock_state();
+        let provider: ProviderConfig = serde_yaml::from_str(&format!(
+            "name: fallback\nprotocol: openai_chat\nbase_url: [{first}, {}]\nkey: sk-test\nproxy_url: direct\nmodels:\n  - name: gpt-4\n    alias: fallback\n", good.url)).unwrap();
+        state.providers.write().await.push(provider);
+        let attempts = state.runtime.read().await.upstream.attempts.clone();
+        drop(listener);
+        let response = post_test_request(state, "/v1/messages", "fallback").await;
+        assert_eq!(response.status(), StatusCode::OK);
+        assert_eq!(*attempts.lock().unwrap(), [first, good.url.clone()]);
+    }
 }

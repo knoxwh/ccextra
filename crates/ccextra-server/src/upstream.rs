@@ -19,6 +19,7 @@ const CONNECT_TIMEOUT: Duration = Duration::from_secs(10);
 const SEND_TIMEOUT: Duration = Duration::from_secs(300);
 
 /// 上游请求结果
+#[derive(Debug)]
 pub struct UpstreamResponse {
     pub status: reqwest::StatusCode,
     pub body: reqwest::Response,
@@ -277,6 +278,8 @@ pub struct UpstreamClient {
     clients: std::sync::Arc<Mutex<HashMap<(String, bool), Client>>>,
     /// Antigravity 连接池设置(短连接默认,对齐 CPA antigravity.executor)
     ant_pool: AntigravityPoolSettings,
+    #[cfg(test)]
+    pub(crate) attempts: std::sync::Arc<Mutex<Vec<String>>>,
 }
 
 impl UpstreamClient {
@@ -292,6 +295,8 @@ impl UpstreamClient {
             global_proxy,
             clients: std::sync::Arc::new(Mutex::new(HashMap::new())),
             ant_pool: AntigravityPoolSettings::resolve(ant_cfg),
+            #[cfg(test)]
+            attempts: Default::default(),
         }
     }
 
@@ -408,7 +413,7 @@ impl UpstreamClient {
         {
             Ok(resp) => Ok(resp),
             Err(e) if is_stale_connection(&e) => {
-                tracing::warn!(error = %e, "上游连接失效,换新连接重试一次");
+                tracing::warn!(error = %e, "上游连接失效,重试一次");
                 self.request_once(
                     base_url,
                     api_key,
@@ -443,6 +448,8 @@ impl UpstreamClient {
         user_agents: &crate::http::UserAgentSet,
         inbound_user_agent: Option<&str>,
     ) -> anyhow::Result<UpstreamResponse> {
+        #[cfg(test)]
+        self.attempts.lock().unwrap().push(base_url.to_owned());
         let proxy_key = self.resolve_proxy(provider_proxy);
         let client = self.client_for(&proxy_key, protocol)?;
 
@@ -530,21 +537,34 @@ pub(crate) async fn send_with_timeout(
     }
 }
 
-/// 死连接:立刻换连接再试,不耗 3s 重试预算。
+/// 连接失效:立即额外尝试一次,不耗 3s 重试预算。
 /// send() 的 300s 超时不走这里,避免再挂 300s。
+/// 普通建连失败/建连超时不是死连接:不得进入内部快速重试(否则单 URL
+/// 建连超时被放大成约 20s),交给外层 URL fallback 与退避预算。
 fn is_stale_connection(err: &anyhow::Error) -> bool {
-    if let Some(e) = err.downcast_ref::<reqwest::Error>() {
-        if e.is_connect() || e.is_timeout() {
-            return true;
-        }
+    let (is_connect, is_timeout) = match err.downcast_ref::<reqwest::Error>() {
+        Some(e) => (e.is_connect(), e.is_timeout()),
+        None => (false, false),
+    };
+    stale_by_classification(is_connect, is_timeout, err)
+}
+
+/// 分类优先级:显式 connect/timeout 标志先判——建连失败/建连超时一律非
+/// stale,即使消息含 reset 字样;其余沿错误链匹配复用连接死亡特征。
+/// reqwest 的 Display 不含 source,须遍历整条错误链找 hyper/io 层消息。
+fn stale_by_classification(is_connect: bool, is_timeout: bool, err: &anyhow::Error) -> bool {
+    if is_connect || is_timeout {
+        return false;
     }
-    let msg = err.to_string().to_ascii_lowercase();
-    msg.contains("connection reset")
-        || msg.contains("broken pipe")
-        || msg.contains("connection closed")
-        || msg.contains("error 54")
-        || msg.contains("error 32")
-        || msg.contains("error 104")
+    err.chain().any(|cause| {
+        let msg = cause.to_string().to_ascii_lowercase();
+        msg.contains("connection reset")
+            || msg.contains("broken pipe")
+            || msg.contains("connection closed")
+            || msg.contains("error 54")
+            || msg.contains("error 32")
+            || msg.contains("error 104")
+    })
 }
 
 impl Default for UpstreamClient {
@@ -872,6 +892,132 @@ mod tests {
             "send 超时不得立刻再挂 300s"
         );
         assert!(!is_stale_connection(&anyhow::anyhow!("invalid api key")));
+    }
+
+    // ── B4:死连接重试分类 ─────────────────────────────────────────────
+
+    #[test]
+    fn test_stale_classification_flags_beat_string_match() {
+        // 建连失败/建连超时标志优先:即使消息含 reset 字样也不算 stale
+        assert!(!stale_by_classification(
+            true,
+            false,
+            &anyhow::anyhow!("connection reset by peer")
+        ));
+        assert!(!stale_by_classification(
+            false,
+            true,
+            &anyhow::anyhow!("connection reset by peer")
+        ));
+        // 无标志时按消息判 stale
+        assert!(stale_by_classification(
+            false,
+            false,
+            &anyhow::anyhow!("connection reset by peer")
+        ));
+        // 错误链深层消息也要能匹配(reqwest Display 不含 source)
+        let chained = anyhow::anyhow!("connection closed before message completed")
+            .context("error sending request");
+        assert!(stale_by_classification(false, false, &chained));
+    }
+
+    fn mock_user_agents() -> crate::http::UserAgentSet {
+        crate::http::UserAgentSet {
+            claude_cli: std::sync::Arc::new("claude-cli/2.1.258".into()),
+            codex_tui: std::sync::Arc::new("codex_cli_rs/0.153.3".into()),
+            grok_version: std::sync::Arc::new("1.0.5".into()),
+            antigravity: std::sync::Arc::new("antigravity/hub/2.10.0".into()),
+        }
+    }
+
+    async fn send_test_request(
+        client: &UpstreamClient,
+        addr: std::net::SocketAddr,
+        user_agents: &crate::http::UserAgentSet,
+    ) -> anyhow::Result<crate::upstream::UpstreamResponse> {
+        let body = serde_json::json!({"model": "gpt-4", "messages": []});
+        client
+            .request(
+                &format!("http://{addr}"),
+                "sk-test",
+                Protocol::OpenAiChat,
+                None,
+                &body,
+                false,
+                None,
+                None,
+                &axum::http::HeaderMap::new(),
+                user_agents,
+                None,
+            )
+            .await
+    }
+
+    #[tokio::test]
+    async fn connect_and_timeout_do_not_retry() {
+        for timeout in [false, true] {
+            let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+            let addr = listener.local_addr().unwrap();
+            // 保留监听端口但不返回响应,产生真实 reqwest timeout。
+            let _listener = if timeout {
+                Some(listener)
+            } else {
+                drop(listener);
+                None
+            };
+            let client = UpstreamClient::new(None);
+            client.clients.lock().unwrap().insert(
+                ("direct".into(), false),
+                Client::builder()
+                    .no_proxy()
+                    .timeout(std::time::Duration::from_millis(100))
+                    .build()
+                    .unwrap(),
+            );
+            let err = send_test_request(&client, addr, &mock_user_agents())
+                .await
+                .unwrap_err();
+            let transport = err.downcast_ref::<reqwest::Error>().unwrap();
+            assert_eq!(transport.is_timeout(), timeout);
+            if !timeout {
+                assert!(transport.is_connect());
+            }
+            assert!(!is_stale_connection(&err));
+            assert_eq!(*client.attempts.lock().unwrap(), [format!("http://{addr}")]);
+        }
+    }
+
+    #[tokio::test]
+    async fn stale_connection_retries_at_most_once() {
+        use tokio::io::AsyncReadExt;
+        for recover in [false, true] {
+            let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+            let addr = listener.local_addr().unwrap();
+            let server = tokio::spawn(async move {
+                for _ in 0..if recover { 1 } else { 2 } {
+                    let (mut socket, _) = listener.accept().await.unwrap();
+                    let _ = socket.read(&mut [0; 4096]).await.unwrap();
+                }
+                if recover {
+                    axum::serve(listener, axum::Router::new().fallback(|| async { "ok" }))
+                        .await
+                        .unwrap();
+                }
+            });
+            let client = UpstreamClient::new(None);
+            let result = tokio::time::timeout(
+                std::time::Duration::from_secs(5),
+                send_test_request(&client, addr, &mock_user_agents()),
+            )
+            .await;
+            server.abort();
+            let result = result.expect("重试必须有界完成");
+            assert_eq!(result.is_ok(), recover);
+            assert_eq!(
+                *client.attempts.lock().unwrap(),
+                vec![format!("http://{addr}"); 2]
+            );
+        }
     }
 
     #[test]

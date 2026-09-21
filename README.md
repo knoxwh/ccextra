@@ -153,6 +153,7 @@ export ANTHROPIC_AUTH_TOKEN=sk-ccextra-xxx  # 配置 secret_key 时填写
 
 - **流式标准保障**：全流式路径输出标准 Anthropic SSE 事件流；内置 10 秒空闲保活机制（`: keepalive`）。
 - **稳健重试退避**：遭遇网络抖动、429 或 5xx/52x 错误时，在 3 秒总预算内执行指数退避重试，自动顺延多 `base_url` 回退通道。
+- **有界读取**：非流响应 body 限制为成功 16 MiB / 错误 256 KiB，读取停顿 300 秒。成功 body 超限返回 502、停顿返回 504；错误 body 截断或读取失败时保留上游状态码（429/401 不被改写）。
 - **直通保真度**：Claude 协议完整保留客户端透传的身份头与 `anthropic-beta` 字段，杜绝非必要修改。
 
 ## OAuth 与运维

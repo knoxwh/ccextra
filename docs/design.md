@@ -86,7 +86,9 @@ Anthropic `system` 成为 system message；o 系列（`o1-mini`/`o1-preview` 除
 
 ## 传输与可靠性
 
-`UpstreamClient` 按最终代理地址缓存 `reqwest::Client`。请求使用协议对应 URL、认证和 User-Agent：Gemini 使用 `x-goog-api-key`，其他协议使用 Bearer；Responses 的 GPT 请求带 Codex 会话头，Grok 请求带 CLI 身份头和会话亲和 `x-grok-conv-id`。连接池空闲 90s（对齐 grok；300s 是流 chunk 空闲，不是池寿命）。`send()` 等到响应头最多 300s。流式路径在转换前对上游 `stream.next()` 套 300s chunk idle，超时发 Anthropic error，不套 `Client::timeout` 掐整条 SSE。死连接立刻换新连接再试一次，不计入 3 秒预算。`build()` 失败返回错误，不回落到默认 Client。
+`UpstreamClient` 按最终代理地址缓存 `reqwest::Client`。请求使用协议对应 URL、认证和 User-Agent：Gemini 使用 `x-goog-api-key`，其他协议使用 Bearer；Responses 的 GPT 请求带 Codex 会话头，Grok 请求带 CLI 身份头和会话亲和 `x-grok-conv-id`。连接池空闲 90s（对齐 grok；300s 是流 chunk 空闲，不是池寿命）。`send()` 等到响应头最多 300s。流式路径在转换前对上游 `stream.next()` 套 300s chunk idle，超时发 Anthropic error，不套 `Client::timeout` 掐整条 SSE。复用连接死亡（reset/broken pipe/提前关闭）立刻重试一次，不计入 3 秒预算；普通建连失败/建连超时不属于死连接，交给 URL 回退与退避预算，避免单 URL 建连超时被内部重试放大。`build()` 失败返回错误，不回落到默认 Client。
+
+非流响应 body 有界读取：成功 body 上限 16 MiB（恰好上限可读，多 1 字节拒绝），错误 body 最多保留 256 KiB（超出停止读取并标记截断，截断前缀不当作完整 JSON 解析）；读取停顿与流 chunk idle 共用 300s，每次非空数据后重置，空 chunk 不续期。成功 body 超限返回 502、停顿返回 504（Anthropic `api_error`）；错误 body 截断或读取失败保留已知上游状态（429/401 不被改写），生成有界 Anthropic error，不重新获得重试预算。OAuth/project/model 路径同样有界，保留各自 30s 请求总超时。
 
 网络错误、429、5xx 和 Cloudflare 52x 可重试。退避从 300ms 开始，单次最多 1.5 秒，所有重试共享 3 秒预算；`Retry-After` 只在该预算内生效。流式 OpenAI 请求声明 `Accept: text/event-stream` 和 `Cache-Control: no-cache`。
 
@@ -114,7 +116,7 @@ Antigravity 上游默认短连接：空闲连接在响应结束后立即关闭�
 
 运行时配置、providers 和 payload 使用独立 `RwLock`。reasoning 注册表放在 `RuntimeConfig`，随 `/reload` 整块替换。请求先复制快照并在网络 `await` 前释放读锁；热重载不是跨三把锁的原子事务，因此极短窗口内请求可能看到混合快照。
 
-`secret_key` 明文会写回 bcrypt；验证结果最多缓存 1024 项，重载时清空。`logging.request_body` 保存最终出站请求的诊断数据，敏感入站头会脱敏。归一化只在能够安全处理时改变 body，避免优化本身阻断请求；转换失败由 HTTP 层返回 Anthropic error。
+`secret_key` 明文会写回 bcrypt；验证结果缓存以 (bcrypt hash, key) 为键，换 secret 后旧结果不可命中，最多 1024 项，满时淘汰最久未访问条目（不再整体清空），重载时清空。`logging.request_body` 保存最终出站请求的诊断数据，敏感入站头会脱敏。归一化只在能够安全处理时改变 body，避免优化本身阻断请求；转换失败由 HTTP 层返回 Anthropic error。
 
 ## 验证
 

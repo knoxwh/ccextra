@@ -259,7 +259,7 @@ pub async fn handle_messages(
         )
     };
     check_secret(&headers, &secret)?;
-    let bytes = to_bytes(body, 10 * 1024 * 1024)
+    let bytes = to_bytes(body, crate::limits::INBOUND_BODY_LIMIT)
         .await
         .map_err(|e| AppError::new(anyhow::anyhow!("读请求体失败: {e}")))?;
     if log_request_body {
@@ -884,12 +884,18 @@ pub async fn handle_messages(
     // grok "Could not decrypt":剥离 reasoning.encrypted_content 再请求一次。
     if !status.is_success() {
         let failed = upstream.take().expect("上游响应应存在");
-        let err_bytes = failed.body.bytes().await?;
+        // 错误 body 有界读取:256 KiB 上限 + 300s idle;失败保留已知上游状态。
+        // 截断标志传到调用层:截断前缀不得触发依赖其字段的恢复,也不得
+        // 交给完整 JSON 解析
+        let (err_bytes, err_truncated) =
+            crate::limits::read_error_body_or_anthropic(failed.body, status).await?;
         let mut final_status = status;
         let mut final_bytes = err_bytes;
+        let mut final_truncated = err_truncated;
         let mut retried_ok = false;
 
-        if (status.as_u16() == 400 || status.as_u16() == 422)
+        if !final_truncated
+            && (status.as_u16() == 400 || status.as_u16() == 422)
             && matches!(route.protocol, Protocol::OpenAiResponses)
             && is_thinking_signature_invalid(&final_bytes)
             && trim_encrypted_reasoning_items(&mut body_json)
@@ -925,15 +931,34 @@ pub async fn handle_messages(
                 upstream = Some(retry);
                 retried_ok = true;
             } else {
-                final_bytes = retry.body.bytes().await?;
+                let (bytes, truncated) =
+                    crate::limits::read_error_body_or_anthropic(retry.body, final_status).await?;
+                final_bytes = bytes;
+                final_truncated = truncated;
             }
         }
 
         if !retried_ok {
+            // 截断的错误 body 不交给完整 JSON 解析:直接生成有界 Anthropic error
+            let body = if final_truncated {
+                serde_json::to_vec(&json!({
+                    "type": "error",
+                    "error": {
+                        "type": "api_error",
+                        "message": format!(
+                            "上游错误 body 超过 256 KiB 上限,已截断(status {})",
+                            final_status.as_u16()
+                        )
+                    }
+                }))
+                .unwrap_or_default()
+            } else {
+                to_anthropic_error(&final_bytes)
+            };
             return Response::builder()
                 .status(final_status)
                 .header(header::CONTENT_TYPE, "application/json")
-                .body(Body::from(to_anthropic_error(&final_bytes)))
+                .body(Body::from(body))
                 .map_err(|e| AppError::new(anyhow::anyhow!("构造错误响应失败: {e}")));
         }
     }
@@ -964,7 +989,8 @@ pub async fn handle_messages(
         // 非流:上游 JSON 转回 Anthropic messages 形状(Claude Code 的
         // 标题生成 / /compact 回退等非流式请求;claude 直通已是 Anthropic 形状)。
         let upstream = upstream.take().expect("上游响应应存在");
-        let body_bytes = upstream.body.bytes().await?;
+        // 成功 body 有界读取:16 MiB 上限 + 300s idle(超限 502 / 停顿 504)
+        let body_bytes = crate::limits::read_success_body_or_anthropic(upstream.body).await?;
         // 非流 reasoning replay 提取:
         // - responses:REST 顶层 Response(object=response)同样提取 replay 项
         // - antigravity:{"response": {...}} 信封内层提取(对齐 CPA
