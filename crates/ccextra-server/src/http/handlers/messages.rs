@@ -232,40 +232,42 @@ fn prepend_sse_frame(first: Result<Bytes, std::io::Error>, rest: SseStreamPin) -
     Box::pin(futures::stream::once(async move { first }).chain(rest))
 }
 
-pub async fn handle_messages(
-    State(state): State<AppState>,
-    headers: HeaderMap,
-    body: Body,
-) -> Result<Response, AppError> {
-    // 一次性 clone 运行时快照值后立即释放读锁,避免跨 await 持锁阻塞 /reload
-    let (
-        secret,
-        log_request_body,
-        normalize_enabled,
-        normalize_drift_detector,
-        upstream_client,
-        user_agents,
-        thinking_registry,
-    ) = {
-        let rt = state.runtime.read().await;
-        (
-            rt.secret.clone(),
-            rt.logging.request_body,
-            rt.normalize.enabled,
-            rt.normalize.drift_detector,
-            rt.upstream.clone(),
-            rt.user_agents.clone(),
-            rt.thinking_registry.clone(),
-        )
-    };
-    check_secret(&headers, &secret)?;
-    let bytes = to_bytes(body, crate::limits::INBOUND_BODY_LIMIT)
-        .await
-        .map_err(|e| AppError::new(anyhow::anyhow!("读请求体失败: {e}")))?;
+pub(crate) struct PreparedMessageRequest {
+    pub route: ccextra_core::route::RouteDecision,
+    pub body_json: Value,
+    pub is_stream: bool,
+    pub upstream_base_urls: Vec<String>,
+    pub upstream_key: String,
+    pub upstream_proxy: Option<String>,
+    pub session_id: Option<String>,
+    pub thread_id: Option<String>,
+    pub extra_headers: HeaderMap,
+    pub inbound_user_agent: Option<String>,
+    pub estimated_input_tokens: Option<usize>,
+    pub tool_names: Option<Arc<HashMap<String, String>>>,
+    pub replay_scope: Option<(crate::sse::replay_cache::ReplayCache, String, String)>,
+    pub signature_model: Option<Arc<str>>,
+}
+
+pub(crate) struct ExecutedUpstream {
+    pub status: axum::http::StatusCode,
+    pub upstream: Option<UpstreamResponse>,
+    pub preloaded_stream: Option<SseStreamPin>,
+}
+
+pub(crate) async fn prepare_message_request(
+    state: &AppState,
+    headers: &HeaderMap,
+    body_bytes: &[u8],
+    normalize_enabled: bool,
+    normalize_drift_detector: bool,
+    log_request_body: bool,
+    thinking_registry: &[ccextra_core::thinking::ModelCapability],
+) -> Result<PreparedMessageRequest, AppError> {
     if log_request_body {
-        tracing::debug!("请求体: {}", String::from_utf8_lossy(&bytes));
+        tracing::debug!("请求体: {}", String::from_utf8_lossy(body_bytes));
     }
-    let mut body_json: Value = serde_json::from_slice(&bytes)
+    let mut body_json: Value = serde_json::from_slice(body_bytes)
         .map_err(|e| AppError::bad_request(format!("请求体 JSON 解析失败: {e}")))?;
 
     // 1. 入站 model(复制为 String,避免借用 body_json 阻碍后续可变借用)
@@ -281,9 +283,6 @@ pub async fn handle_messages(
     let payload_rules = state.payload_rules.read().await;
 
     // 3. 归一化第一遍(按协议:claude 直通全量 / openai 转换前精简)
-    // 对齐:claude 直通走 /v1/messages(全量),openai 走转换前
-    // 精简子集(跳过 dateline 归一化 / volatile 告警 / drift——dateline 和
-    // drift 在转换后 openai handler 处理;cache_control 由转换器丢弃)
     if normalize_enabled {
         match route.protocol {
             Protocol::Claude => {
@@ -291,7 +290,7 @@ pub async fn handle_messages(
                 tracing::debug!(?counts, "normalize_anthropic_full");
                 observe_drift_for(
                     &state.drift,
-                    &headers,
+                    headers,
                     &body_json,
                     DriftApiKind::Anthropic,
                     normalize_drift_detector,
@@ -305,27 +304,17 @@ pub async fn handle_messages(
     }
 
     // 4. 协议转换(含目标侧归一化)
-    // stream 缺省对齐 Anthropic API 语义(false 非流):Claude Code 非流重试
-    // 不带 stream 字段,按 true 会把上游 SSE 流回给期望 JSON 的客户端。
     let is_stream = body_json
         .get("stream")
         .and_then(|v| v.as_bool())
         .unwrap_or(false);
-    // Claude Code 会话 ID 须在转换前提取(转换后 metadata 被丢弃),供 prompt_cache_key 用
-    let cc_session = extract_claude_code_session(&headers, &body_json);
-    // openai 转换器重建 body,丢未知顶层字段;入站非空 prompt_cache_key 转换后原样写回
+    let cc_session = extract_claude_code_session(headers, &body_json);
     let inbound_prompt_cache_key = body_json
         .get("prompt_cache_key")
         .and_then(|v| v.as_str())
         .filter(|s| !s.trim().is_empty())
         .map(str::to_string);
 
-    // 流式 SSE message_start 占位 input_tokens(对齐 ClaudeInputTokenState)。
-    // 多数上游流中不带 usage(chat 只在最后 chunk 带,responses 只在流尾),
-    // message_start 又必须第一帧发,故用估算占位,让 cc context 过程中接近
-    // 真实而非跳 1;流尾 message_delta 以真实 usage 覆盖。claude 直通不经
-    // 状态机、非流式不进 SSE,均传 None。
-    // 注意:非 Claude 协议 count_tokens 已改用缓存,此处从缓存读上轮真实值。
     let estimated_input_tokens = if !is_stream || matches!(route.protocol, Protocol::Claude) {
         None
     } else {
@@ -335,24 +324,19 @@ pub async fn handle_messages(
             .or(Some(0))
     };
 
-    // 工具名还原表(short→original),responses 转换侧产出,供流式/非流式响应还原
     let mut tool_names: Option<Arc<HashMap<String, String>>> = None;
     let mut request_fingerprint = String::new();
 
     match route.protocol {
         Protocol::Claude => {
             convert_passthrough(&mut body_json, &route.upstream_model)?;
-            // 非 Claude 模型的 system 清洗(剥离计费指纹、Claude 身份与触发块;
-            // `*claude*` 模型保持逐字节直通)
             if sanitize_passthrough_prompt(&mut body_json, &route.upstream_model) {
                 tracing::debug!(
                     model = %route.upstream_model,
                     "claude 直通 system 已清洗"
                 );
             }
-            // 非 Claude 模型的越档 effort 钳制(百炼等上游对越档值 400);
-            // `*claude*` 模型与 thinking disabled 跳过,值不变不写回
-            if clamp_passthrough_effort(&mut body_json, &route.upstream_model, &thinking_registry) {
+            if clamp_passthrough_effort(&mut body_json, &route.upstream_model, thinking_registry) {
                 tracing::debug!(
                     model = %route.upstream_model,
                     "claude 直通 effort 已钳制到模型支持档"
@@ -360,12 +344,12 @@ pub async fn handle_messages(
             }
         }
         Protocol::OpenAiChat => {
-            convert_to_openai_chat_with(&mut body_json, &route.upstream_model, &thinking_registry)?;
+            convert_to_openai_chat_with(&mut body_json, &route.upstream_model, thinking_registry)?;
             if normalize_enabled {
                 normalize_target_post(&mut body_json, TargetShape::OpenAiChat);
                 observe_drift_for(
                     &state.drift,
-                    &headers,
+                    headers,
                     &body_json,
                     DriftApiKind::OpenAiChat,
                     normalize_drift_detector,
@@ -373,27 +357,16 @@ pub async fn handle_messages(
             }
         }
         Protocol::OpenAiResponses => {
-            // reverse map:short→original(超长工具名缩短后,响应侧还原原名)
             let rev = convert_to_openai_responses_with(
                 &mut body_json,
                 &route.upstream_model,
-                &thinking_registry,
+                thinking_registry,
             )?;
             if !rev.is_empty() {
                 tool_names = Some(Arc::new(rev));
             }
-            // reasoning replay 注入(对齐 CPA applyCodexReasoningReplayCacheRequired:
-            // responses 协议的 reasoning 是服务器端状态,store=false 时上游不保留,
-            // 须回放上一轮 encrypted_content,否则模型丢失决策记忆重复发相同工具
-            // 调用。CPA codexReasoningReplayEnabledForSource 只判断来源协议
-            // FormatClaude,不限模型;ccextra 入站协议恒为 anthropic,故 responses
-            // 协议全部启用)。缓存 key = "{model}:{session}"(对齐
-            // xaiReasoningReplayCacheKey / codexReasoningReplayScope 的
-            // model+session 连续性边界)。
             if let Some(sess) = cc_session.as_deref() {
                 let key = format!("{}:{}", route.upstream_model, sess);
-                // grok 上游无加密信封时保留明文 reasoning 回放
-                // (对齐 grok-build 官方行为,其余上游维持仅加密回放)
                 if state.replay_cache.apply_to_body(
                     &key,
                     &mut body_json,
@@ -405,7 +378,6 @@ pub async fn handle_messages(
                         "reasoning replay 已注入"
                     );
                 }
-                // 注入后计算 input 前缀指纹(marker 锚定用)
                 request_fingerprint =
                     ccextra_core::convert::compute_input_prefix_fingerprint(&body_json);
             }
@@ -418,7 +390,7 @@ pub async fn handle_messages(
                 &body_json,
                 &route.upstream_model,
                 ccextra_core::convert::gemini::SchemaFlavor::Gemini,
-                &thinking_registry,
+                thinking_registry,
             );
             body_json = gemini_body;
             if !short_to_original.is_empty() {
@@ -426,8 +398,6 @@ pub async fn handle_messages(
             }
         }
         Protocol::Antigravity => {
-            // Antigravity 使用包裹后的 Gemini 格式
-            // 从 provider metadata 中提取 project_id
             let project_id = {
                 let provider = find_provider(&providers, &route.provider);
                 provider
@@ -440,17 +410,13 @@ pub async fn handle_messages(
                 &body_json,
                 &route.upstream_model,
                 project_id,
-                &thinking_registry,
+                thinking_registry,
             );
             body_json = antigravity_body;
             if !short_to_original.is_empty() {
                 tool_names = Some(Arc::new(short_to_original));
             }
 
-            // reasoning replay 注入(对齐 CPA prepareAntigravityGeminiReasoningReplayPayload:
-            // antigravity gemini/flash/agent 模型启用 replay,claude 模型不启用;入站协议
-            // 恒为 anthropic,符合 CPA 对 sourceFormat 的判断。信封里的 request 字段才是
-            // Gemini 格式,注入目标是信封内层的 request.contents)。
             if ccextra_core::antigravity_uses_reasoning_replay(&route.upstream_model) {
                 if let Some(sess) = cc_session.as_deref() {
                     let key = format!("{}:{}", route.upstream_model, sess);
@@ -468,7 +434,6 @@ pub async fn handle_messages(
         }
     }
 
-    // openai 转换丢顶层未知字段;payload 前写回,payload 仍可覆盖
     if matches!(
         route.protocol,
         Protocol::OpenAiChat | Protocol::OpenAiResponses
@@ -478,26 +443,22 @@ pub async fn handle_messages(
         }
     }
 
-    // 5. payload 参数覆盖(转换后注入;claude 直通需显式 protocol 才生效)
+    // 5. payload 参数覆盖
     apply_payload_overrides(&mut body_json, &model, route.protocol, &payload_rules);
 
-    // grok 判定与缓存闸门跟出站 model:payload 可把 gpt-* 改成 grok-*
-    // OpenAI payload 若把 model 置空/改成非字符串,回写路由模型,保证 body 与头部判定一致。
     let outbound_model =
         resolve_outbound_model(&mut body_json, &route.upstream_model, route.protocol);
 
     if normalize_enabled && matches!(route.protocol, Protocol::OpenAiResponses) {
-        // drift 必须看到最终 Responses body,避免大工具输出参与前缀哈希。
         observe_drift_for(
             &state.drift,
-            &headers,
+            headers,
             &body_json,
             DriftApiKind::OpenAiResponses,
             normalize_drift_detector,
         );
     }
 
-    // GPT/Codex 在最终 model 与 payload 落定后校验 reasoning 回放信封。
     if matches!(route.protocol, Protocol::OpenAiResponses) && is_gpt_model(&outbound_model) {
         if let Some(obj) = body_json.as_object_mut() {
             for key in [
@@ -514,17 +475,14 @@ pub async fn handle_messages(
         }
     }
 
-    // 6. 对齐 StripPromptCacheRetention:openai 上游拒绝 prompt_cache_retention
-    // (HTTP 400 "Unsupported parameter: prompt_cache_retention"),claude 直通保留
+    // 6. 对齐 StripPromptCacheRetention
     if !matches!(route.protocol, Protocol::Claude) {
         body_json
             .as_object_mut()
             .map(|m| m.remove("prompt_cache_retention"));
     }
 
-    // 7. 上游请求
-    // 从配置中 clone 出上游所需字段后立即释放两把读锁,避免整个上游请求
-    // (慢上游/长连接建立)期间持锁,防止 /reload 写锁被无限期阻塞。
+    // 7. 上游连接参数提取并释放读锁
     let (
         upstream_base_urls,
         mut upstream_key,
@@ -567,7 +525,7 @@ pub async fn handle_messages(
     drop(payload_rules);
     drop(providers);
 
-    // Antigravity 协议运行时 token 校验与自动刷新（对齐 CLIProxyAPI ensureAccessToken）
+    // Antigravity 运行时 token 校验与自动刷新
     if let Some((auth_dir_str, email)) = antigravity_refresh {
         let auth_dir = std::path::Path::new(&auth_dir_str);
         match crate::antigravity::ensure_credential_fresh(
@@ -600,15 +558,14 @@ pub async fn handle_messages(
         }
     }
 
-    // prompt_cache_key 注入(provider 级开关;仅 openai;chat+grok 跳过,对齐 grok-build)
+    // prompt_cache_key 注入
     if should_inject_prompt_cache_key(provider_prompt_cache_key, route.protocol, &outbound_model)
         && inject_prompt_cache_key(&mut body_json, cc_session.as_deref())
     {
         tracing::debug!("prompt_cache_key 已注入");
     }
 
-    // 诊断:request_body 开启时落盘请求信息(headers + body),供逐轮 diff。
-    // 文件名按会话+时间+序号。
+    // 诊断落盘
     let sess = cc_session
         .as_deref()
         .map(|s| s.chars().take(8).collect::<String>())
@@ -627,7 +584,7 @@ pub async fn handle_messages(
     if log_request_body {
         let _ = std::fs::create_dir_all("logs");
         let dump_obj = json!({
-            "inbound_headers": inbound_headers_json(&headers),
+            "inbound_headers": inbound_headers_json(headers),
             "upstream_body": body_json,
         });
         let path = format!("logs/upstream_request_{log_stem}.json");
@@ -640,33 +597,25 @@ pub async fn handle_messages(
     }
 
     let inbound_user_agent = if matches!(route.protocol, Protocol::Claude) {
-        claude_inbound_user_agent(&headers)
+        claude_inbound_user_agent(headers)
     } else {
         None
     };
     let extra_headers = if matches!(route.protocol, Protocol::Claude) {
-        claude_relay_headers(&headers)
+        claude_relay_headers(headers)
     } else {
         HeaderMap::new()
     };
 
-    // responses 协议:session-id/thread-id 头(对齐 Codex 官方客户端)
-    // - session-id:会话级 UUID(整会话稳定,与 prompt_cache_key 解耦)
-    // - thread-id:线程级 UUID(对齐上游请求关联/日志追踪)
-    // grok 模型(chat/responses):session_id 用于 x-grok-conv-id 会话路由
     let is_grok = is_grok_model(&outbound_model);
     let (session_id, thread_id) = if matches!(route.protocol, Protocol::OpenAiResponses) {
-        (cc_session.as_deref(), extract_claude_code_thread(&headers))
+        (cc_session.as_deref(), extract_claude_code_thread(headers))
     } else if is_grok && matches!(route.protocol, Protocol::OpenAiChat) {
         (cc_session.as_deref(), None)
     } else {
         (None, None)
     };
-    // reasoning replay 提取条件:
-    // - responses 协议 + 有会话身份;key 为 "{model}:{session}",对齐 CPA
-    //   codexReasoningReplayEnabledForSource 只判断来源协议不限模型
-    // - antigravity 协议 + gemini/flash/agent 模型 + 有会话身份;对齐 CPA
-    //   antigravityUsesReasoningReplayCache 的模型过滤(claude 不启用)
+
     let replay_scope = if matches!(route.protocol, Protocol::OpenAiResponses) {
         session_id.map(|s| {
             (
@@ -688,53 +637,66 @@ pub async fn handle_messages(
     } else {
         None
     };
-    tracing::debug!(
-        session_id = ?session_id,
-        thread_id = ?thread_id,
-        cc_session = ?cc_session,
-        is_grok = is_grok,
-        protocol = ?route.protocol,
-        "会话 ID 派发"
-    );
 
-    // 多 base_url 回退(对齐 CPA antigravity executor:网络错误、429 切下一个 URL)
-    // 外层统一退避重试:网络错误 / 429 / 5xx 按指数退避(尊重 Retry-After)
-    // 重试整个轮换过程;4xx 客户端错误不重试(对齐通用网关)。总预算
-    // RETRY_TOTAL_BUDGET 封顶,避免客户端长时间悬挂。预算耗尽时把最后一次
-    // 失败响应原样交给下方错误转换路径。
+    let signature_model: Option<Arc<str>> = matches!(route.protocol, Protocol::Antigravity)
+        .then(|| Arc::from(route.upstream_model.as_str()));
+
+    Ok(PreparedMessageRequest {
+        route,
+        body_json,
+        is_stream,
+        upstream_base_urls,
+        upstream_key,
+        upstream_proxy,
+        session_id: session_id.map(str::to_string),
+        thread_id,
+        extra_headers,
+        inbound_user_agent: inbound_user_agent.map(str::to_string),
+        estimated_input_tokens,
+        tool_names,
+        replay_scope,
+        signature_model,
+    })
+}
+
+pub(crate) async fn execute_upstream_request(
+    prepared: &mut PreparedMessageRequest,
+    upstream_client: &crate::upstream::UpstreamClient,
+    user_agents: &crate::http::UserAgentSet,
+) -> Result<ExecutedUpstream, AppError> {
     let mut upstream: Option<UpstreamResponse> = None;
     let mut last_fail: Option<UpstreamResponse> = None;
     let mut last_err = None;
     let retry_started_at = std::time::Instant::now();
     let mut attempt: u32 = 0;
     loop {
-        // 单轮:按序尝试各 base_url,首个「可接受响应」即用
-        // (429 且还有下一个 URL 时换下一个立即试,不耗退避预算)
         enum Out {
             Ok(UpstreamResponse),
             Fail(UpstreamResponse),
             Net(anyhow::Error),
         }
         let outcome = 'round: {
-            for (idx, base_url) in upstream_base_urls.iter().enumerate() {
+            for (idx, base_url) in prepared.upstream_base_urls.iter().enumerate() {
                 match upstream_client
                     .request(
                         base_url,
-                        &upstream_key,
-                        route.protocol,
-                        upstream_proxy.as_deref(),
-                        &body_json,
-                        is_stream,
-                        session_id,
-                        thread_id.as_deref(),
-                        &extra_headers,
-                        &user_agents,
-                        inbound_user_agent,
+                        &prepared.upstream_key,
+                        prepared.route.protocol,
+                        prepared.upstream_proxy.as_deref(),
+                        &prepared.body_json,
+                        prepared.is_stream,
+                        prepared.session_id.as_deref(),
+                        prepared.thread_id.as_deref(),
+                        &prepared.extra_headers,
+                        user_agents,
+                        prepared.inbound_user_agent.as_deref(),
                     )
                     .await
                 {
                     Ok(resp) => {
-                        if resp.status.as_u16() == 429 && idx + 1 < upstream_base_urls.len() {
+                        if resp.status.as_u16() == 429
+                            && idx + 1 < prepared.upstream_base_urls.len()
+                        {
                             tracing::debug!("上游 429,回退到下一个 base_url: {}", base_url);
                             continue;
                         }
@@ -744,7 +706,7 @@ pub async fn handle_messages(
                         break 'round Out::Fail(resp);
                     }
                     Err(e) => {
-                        if idx + 1 < upstream_base_urls.len() {
+                        if idx + 1 < prepared.upstream_base_urls.len() {
                             tracing::debug!("上游请求错误,回退到下一个 base_url: {}", base_url);
                             continue;
                         }
@@ -785,7 +747,6 @@ pub async fn handle_messages(
                 }
             }
             Out::Fail(resp) => {
-                // 4xx(400/401/403 等):客户端参数类错误,重试无意义
                 last_fail = Some(resp);
                 break;
             }
@@ -800,6 +761,7 @@ pub async fn handle_messages(
             }
         }
     }
+
     let mut upstream = match upstream {
         Some(u) => Some(u),
         None => match (last_fail, last_err) {
@@ -811,16 +773,9 @@ pub async fn handle_messages(
     let mut status = upstream.as_ref().expect("上游响应应存在").status;
     let mut preloaded_stream = None;
 
-    // antigravity 响应侧 thoughtSignature 归一化需上游模型名(对齐 CPA 取请求 model);
-    // plain gemini 原样透传,其余协议不参与。
-    let signature_model: Option<Arc<str>> = matches!(route.protocol, Protocol::Antigravity)
-        .then(|| Arc::from(route.upstream_model.as_str()));
-
-    // OpenAI 流在首个 Anthropic SSE 帧前失败时，尚未向客户端输出，可重试一次。
-    // 已取得首帧后立即放行，后续流保持实时转发，不缓冲完整响应。
-    if is_stream
+    if prepared.is_stream
         && matches!(
-            route.protocol,
+            prepared.route.protocol,
             Protocol::OpenAiChat | Protocol::OpenAiResponses
         )
         && status.is_success()
@@ -829,12 +784,12 @@ pub async fn handle_messages(
             let current = upstream.take().expect("上游响应应存在");
             status = current.status;
             let mut out = relay_with_replay_tap(
-                route.protocol,
+                prepared.route.protocol,
                 current.body.bytes_stream(),
-                estimated_input_tokens,
-                tool_names.clone(),
-                replay_scope.clone(),
-                signature_model.clone(),
+                prepared.estimated_input_tokens,
+                prepared.tool_names.clone(),
+                prepared.replay_scope.clone(),
+                prepared.signature_model.clone(),
             );
             let first = out.next().await;
             let retry = match &first {
@@ -843,27 +798,11 @@ pub async fn handle_messages(
             };
             if retry && attempt == 0 {
                 tracing::warn!(
-                    protocol = ?route.protocol,
+                    protocol = ?prepared.route.protocol,
                     retry_attempt = attempt + 1,
                     "首帧转换失败，重试上游请求"
                 );
-                upstream = Some(
-                    upstream_client
-                        .request(
-                            &upstream_base_urls[0],
-                            &upstream_key,
-                            route.protocol,
-                            upstream_proxy.as_deref(),
-                            &body_json,
-                            is_stream,
-                            session_id,
-                            thread_id.as_deref(),
-                            &extra_headers,
-                            &user_agents,
-                            inbound_user_agent,
-                        )
-                        .await?,
-                );
+                upstream = Some(prepared.send_retry(upstream_client, user_agents).await?);
                 status = upstream.as_ref().expect("上游响应应存在").status;
                 if !status.is_success() {
                     break;
@@ -878,15 +817,25 @@ pub async fn handle_messages(
         }
     }
 
+    Ok(ExecutedUpstream {
+        status,
+        upstream,
+        preloaded_stream,
+    })
+}
+
+pub(crate) async fn deliver_response(
+    state: &AppState,
+    prepared: &mut PreparedMessageRequest,
+    mut executed: ExecutedUpstream,
+    upstream_client: &crate::upstream::UpstreamClient,
+    user_agents: &crate::http::UserAgentSet,
+) -> Result<Response, AppError> {
+    let mut status = executed.status;
+
     // 上游错误:转 anthropic error 形状
-    // (OpenAI 的 {"error":{...}} 直接透传客户端不认,对齐 WriteErrorResponse)
-    // Responses 400 + invalid_encrypted_content / thinking signature invalid /
-    // grok "Could not decrypt":剥离 reasoning.encrypted_content 再请求一次。
     if !status.is_success() {
-        let failed = upstream.take().expect("上游响应应存在");
-        // 错误 body 有界读取:256 KiB 上限 + 300s idle;失败保留已知上游状态。
-        // 截断标志传到调用层:截断前缀不得触发依赖其字段的恢复,也不得
-        // 交给完整 JSON 解析
+        let failed = executed.upstream.take().expect("上游响应应存在");
         let (err_bytes, err_truncated) =
             crate::limits::read_error_body_or_anthropic(failed.body, status).await?;
         let mut final_status = status;
@@ -896,39 +845,22 @@ pub async fn handle_messages(
 
         if !final_truncated
             && (status.as_u16() == 400 || status.as_u16() == 422)
-            && matches!(route.protocol, Protocol::OpenAiResponses)
+            && matches!(prepared.route.protocol, Protocol::OpenAiResponses)
             && is_thinking_signature_invalid(&final_bytes)
-            && trim_encrypted_reasoning_items(&mut body_json)
+            && trim_encrypted_reasoning_items(&mut prepared.body_json)
         {
             tracing::warn!(
-                protocol = ?route.protocol,
+                protocol = ?prepared.route.protocol,
                 "invalid_encrypted_content,剥离 reasoning 后重试一次"
             );
-            // 缓存的 replay 项含同一无效 encrypted_content,一并清掉
-            // (对齐 clearCodexReasoningReplayOnInvalidSignature:
-            // 签名被上游拒绝后不得下轮再注入)
-            if let Some((cache, key, _)) = replay_scope.as_ref() {
+            if let Some((cache, key, _)) = prepared.replay_scope.as_ref() {
                 cache.invalidate(key);
             }
-            let retry = upstream_client
-                .request(
-                    &upstream_base_urls[0],
-                    &upstream_key,
-                    route.protocol,
-                    upstream_proxy.as_deref(),
-                    &body_json,
-                    is_stream,
-                    session_id,
-                    thread_id.as_deref(),
-                    &extra_headers,
-                    &user_agents,
-                    inbound_user_agent,
-                )
-                .await?;
+            let retry = prepared.send_retry(upstream_client, user_agents).await?;
             final_status = retry.status;
             if retry.status.is_success() {
                 status = retry.status;
-                upstream = Some(retry);
+                executed.upstream = Some(retry);
                 retried_ok = true;
             } else {
                 let (bytes, truncated) =
@@ -939,7 +871,6 @@ pub async fn handle_messages(
         }
 
         if !retried_ok {
-            // 截断的错误 body 不交给完整 JSON 解析:直接生成有界 Anthropic error
             let body = if final_truncated {
                 serde_json::to_vec(&json!({
                     "type": "error",
@@ -963,20 +894,19 @@ pub async fn handle_messages(
         }
     }
 
-    // 7. 响应转换
-    if is_stream {
-        // 流式:claude 直通字节转发;转换路径走 SSE 状态机。
-        let out = if let Some(out) = preloaded_stream {
+    // 响应转换
+    if prepared.is_stream {
+        let out = if let Some(out) = executed.preloaded_stream {
             out
         } else {
-            let upstream = upstream.take().expect("上游响应应存在");
+            let upstream = executed.upstream.take().expect("上游响应应存在");
             relay_with_replay_tap(
-                route.protocol,
+                prepared.route.protocol,
                 upstream.body.bytes_stream(),
-                estimated_input_tokens,
-                tool_names,
-                replay_scope,
-                signature_model.clone(),
+                prepared.estimated_input_tokens,
+                prepared.tool_names.clone(),
+                prepared.replay_scope.clone(),
+                prepared.signature_model.clone(),
             )
         };
         Ok(Response::builder()
@@ -986,27 +916,18 @@ pub async fn handle_messages(
             .body(Body::from_stream(out))
             .map_err(|e| AppError::new(anyhow::anyhow!("构造流式响应失败: {e}")))?)
     } else {
-        // 非流:上游 JSON 转回 Anthropic messages 形状(Claude Code 的
-        // 标题生成 / /compact 回退等非流式请求;claude 直通已是 Anthropic 形状)。
-        let upstream = upstream.take().expect("上游响应应存在");
-        // 成功 body 有界读取:16 MiB 上限 + 300s idle(超限 502 / 停顿 504)
+        let upstream = executed.upstream.take().expect("上游响应应存在");
         let body_bytes = crate::limits::read_success_body_or_anthropic(upstream.body).await?;
-        // 非流 reasoning replay 提取:
-        // - responses:REST 顶层 Response(object=response)同样提取 replay 项
-        // - antigravity:{"response": {...}} 信封内层提取(对齐 CPA
-        //   cacheAntigravityReasoningReplayFromResponse 从响应 body 提取)
-        if let Some((cache, key, fingerprint)) = replay_scope.as_ref() {
+        if let Some((cache, key, fingerprint)) = prepared.replay_scope.as_ref() {
             if let Ok(v) = serde_json::from_slice::<Value>(&body_bytes) {
-                match route.protocol {
+                match prepared.route.protocol {
                     Protocol::OpenAiResponses => {
                         if v.get("object").and_then(|o| o.as_str()) == Some("response") {
-                            // 包一层 completed 形状复用提取逻辑
                             let wrapped = json!({"response": v});
                             cache.store_from_completed(key, &wrapped, fingerprint);
                         }
                     }
                     Protocol::Antigravity => {
-                        // 信封内层 response 字段可能包含 candidates 和 reasoning 签名
                         if let Some(inner) = v.get("response") {
                             let wrapped = json!({"response": inner});
                             cache.store_from_completed(key, &wrapped, fingerprint);
@@ -1018,9 +939,8 @@ pub async fn handle_messages(
         }
         let converted = match serde_json::from_slice::<Value>(&body_bytes) {
             Ok(v) => {
-                // 提取真实 usage.input_tokens 写入缓存(非流式路径)
-                if let Some(sid) = session_id {
-                    let input_tokens = match route.protocol {
+                if let Some(sid) = prepared.session_id.as_deref() {
+                    let input_tokens = match prepared.route.protocol {
                         Protocol::OpenAiChat => {
                             v.pointer("/usage/prompt_tokens").and_then(|t| t.as_i64())
                         }
@@ -1028,8 +948,7 @@ pub async fn handle_messages(
                             v.pointer("/usage/input_tokens").and_then(|t| t.as_i64())
                         }
                         Protocol::Gemini | Protocol::Antigravity => {
-                            // Antigravity 信封内层
-                            let inner = if route.protocol == Protocol::Antigravity {
+                            let inner = if prepared.route.protocol == Protocol::Antigravity {
                                 v.get("response").unwrap_or(&v)
                             } else {
                                 &v
@@ -1049,23 +968,22 @@ pub async fn handle_messages(
                         }
                     }
                 }
-                match route.protocol {
+                match prepared.route.protocol {
                     Protocol::Claude => None,
                     Protocol::OpenAiChat => crate::sse::non_stream::openai_chat_to_anthropic(&v),
-                    Protocol::OpenAiResponses => {
-                        crate::sse::non_stream::responses_to_anthropic(&v, tool_names.as_deref())
-                    }
+                    Protocol::OpenAiResponses => crate::sse::non_stream::responses_to_anthropic(
+                        &v,
+                        prepared.tool_names.as_deref(),
+                    ),
                     Protocol::Gemini => {
                         use ccextra_core::convert::convert_gemini_response;
                         Some(convert_gemini_response(
                             &v,
-                            tool_names.as_deref().unwrap_or(&HashMap::new()),
+                            prepared.tool_names.as_deref().unwrap_or(&HashMap::new()),
                             None,
                         ))
                     }
                     Protocol::Antigravity => {
-                        // Antigravity 响应为 {"response": {...gemini...}} 信封,先解包;
-                        // usageMetadata/cpaUsageMetadata 可能位于信封根或内层。
                         use ccextra_core::convert::convert_gemini_response;
                         let mut inner = v.get("response").cloned().unwrap_or_else(|| v.clone());
                         if inner.get("usageMetadata").is_none() {
@@ -1080,8 +998,8 @@ pub async fn handle_messages(
                         }
                         Some(convert_gemini_response(
                             &inner,
-                            tool_names.as_deref().unwrap_or(&HashMap::new()),
-                            Some(route.upstream_model.as_str()),
+                            prepared.tool_names.as_deref().unwrap_or(&HashMap::new()),
+                            Some(prepared.route.upstream_model.as_str()),
                         ))
                     }
                 }
@@ -1098,4 +1016,82 @@ pub async fn handle_messages(
             .body(Body::from(payload))
             .map_err(|e| AppError::new(anyhow::anyhow!("构造响应失败: {e}")))?)
     }
+}
+
+impl PreparedMessageRequest {
+    async fn send_retry(
+        &self,
+        client: &crate::upstream::UpstreamClient,
+        user_agents: &crate::http::UserAgentSet,
+    ) -> anyhow::Result<UpstreamResponse> {
+        client
+            .request(
+                &self.upstream_base_urls[0],
+                &self.upstream_key,
+                self.route.protocol,
+                self.upstream_proxy.as_deref(),
+                &self.body_json,
+                self.is_stream,
+                self.session_id.as_deref(),
+                self.thread_id.as_deref(),
+                &self.extra_headers,
+                user_agents,
+                self.inbound_user_agent.as_deref(),
+            )
+            .await
+    }
+}
+
+pub async fn handle_messages(
+    State(state): State<AppState>,
+    headers: HeaderMap,
+    body: Body,
+) -> Result<Response, AppError> {
+    // 一次性 clone 运行时快照值后立即释放读锁,避免跨 await 持锁阻塞 /reload
+    let (
+        secret,
+        log_request_body,
+        normalize_enabled,
+        normalize_drift_detector,
+        upstream_client,
+        user_agents,
+        thinking_registry,
+    ) = {
+        let rt = state.runtime.read().await;
+        (
+            rt.secret.clone(),
+            rt.logging.request_body,
+            rt.normalize.enabled,
+            rt.normalize.drift_detector,
+            rt.upstream.clone(),
+            rt.user_agents.clone(),
+            rt.thinking_registry.clone(),
+        )
+    };
+    check_secret(&headers, &secret)?;
+    let bytes = to_bytes(body, crate::limits::INBOUND_BODY_LIMIT)
+        .await
+        .map_err(|e| AppError::new(anyhow::anyhow!("读请求体失败: {e}")))?;
+
+    let mut prepared = prepare_message_request(
+        &state,
+        &headers,
+        &bytes,
+        normalize_enabled,
+        normalize_drift_detector,
+        log_request_body,
+        &thinking_registry,
+    )
+    .await?;
+
+    let executed = execute_upstream_request(&mut prepared, &upstream_client, &user_agents).await?;
+
+    deliver_response(
+        &state,
+        &mut prepared,
+        executed,
+        &upstream_client,
+        &user_agents,
+    )
+    .await
 }
