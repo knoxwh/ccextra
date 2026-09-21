@@ -129,7 +129,8 @@ See [config.example.yaml](config.example.yaml) for every field. Key points:
 
 - `user_agents` overrides Claude, Codex, Grok, and Antigravity identifiers.
 - `logging.request_body` writes diagnostic requests under `logs/`.
-- `POST /reload` reloads providers, payload, normalization, auth, proxy, User-Agent, and the reasoning registry; restart for `logging.level` changes.
+- `POST /reload` validates and atomically publishes providers, payload, normalization, auth, proxy, User-Agent, the reasoning registry, and background refresh settings. Existing requests keep their snapshot; new requests use the new snapshot. Concurrent reloads serialize loading and publication; load or validation failures leave the snapshot and version unchanged. Restart for `logging.level` changes.
+- Background refresh uses the last successfully published static configuration, credential directories, and proxy, without reading config file edits awaiting reload. Stale refresh results are discarded; an empty Antigravity result preserves the entire provider set. Explicit reload applies removals, disabled credentials, and directory changes without restoring old dynamic providers; dynamic loaders retain their existing behavior of skipping unavailable credentials.
 - `antigravity.connection-pool` controls the Antigravity upstream connection pool: short connections by default; with `enabled: true`, idle connections are kept per `idle-conn-timeout` (default 30s, capped at 210s) and `max-idle-conns-per-host` (default 2, capped at 100).
 - Edits to `models.json` take effect after `POST /reload`; no rebuild needed.
 

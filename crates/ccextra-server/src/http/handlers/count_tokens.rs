@@ -26,8 +26,11 @@ pub async fn handle_count_tokens(
     headers: HeaderMap,
     body: Body,
 ) -> Result<Response, AppError> {
-    let secret = state.runtime.read().await.secret.clone();
-    check_secret(&headers, &secret)?;
+    let snapshot = std::sync::Arc::clone(&*state.config.read().await);
+    let providers = &snapshot.providers;
+    let upstream_client = &snapshot.runtime.upstream;
+    let user_agents = &snapshot.runtime.user_agents;
+    check_secret(&headers, &snapshot.runtime.secret)?;
     let bytes = to_bytes(body, crate::limits::INBOUND_BODY_LIMIT)
         .await
         .map_err(|e| AppError::new(anyhow::anyhow!("读请求体失败: {e}")))?;
@@ -41,22 +44,16 @@ pub async fn handle_count_tokens(
         .ok_or_else(|| AppError::new(anyhow::anyhow!("缺少 model 字段")))?;
 
     // 路由判定
-    let providers = state.providers.read().await;
-    let route = resolve_route(model, &providers)
+    let route = resolve_route(model, providers)
         .map_err(|e| AppError::new(anyhow::anyhow!("路由失败: {e}")))?;
 
     // Claude 协议:转发上游
     if route.protocol == Protocol::Claude {
-        let provider = find_provider(&providers, &route.provider)
+        let provider = find_provider(providers, &route.provider)
             .ok_or_else(|| AppError::new(anyhow::anyhow!("provider 未找到")))?;
         let base_url = provider.base_urls()[0].clone(); // 取首个 URL（count_tokens 无需回退）
         let key = provider.key.clone();
         let proxy_url = provider.proxy_url.clone();
-        let (upstream_client, user_agents) = {
-            let runtime = state.runtime.read().await;
-            (runtime.upstream.clone(), runtime.user_agents.clone())
-        };
-        drop(providers); // 释放读锁
 
         let url = format!(
             "{}/v1/messages/count_tokens",

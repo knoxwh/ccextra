@@ -259,11 +259,13 @@ pub(crate) async fn prepare_message_request(
     state: &AppState,
     headers: &HeaderMap,
     body_bytes: &[u8],
-    normalize_enabled: bool,
-    normalize_drift_detector: bool,
-    log_request_body: bool,
-    thinking_registry: &[ccextra_core::thinking::ModelCapability],
+    config_snapshot: &crate::http::ConfigSnapshot,
 ) -> Result<PreparedMessageRequest, AppError> {
+    let normalize_enabled = config_snapshot.runtime.normalize.enabled;
+    let normalize_drift_detector = config_snapshot.runtime.normalize.drift_detector;
+    let log_request_body = config_snapshot.runtime.logging.request_body;
+    let thinking_registry = &config_snapshot.runtime.thinking_registry;
+
     if log_request_body {
         tracing::debug!("请求体: {}", String::from_utf8_lossy(body_bytes));
     }
@@ -277,10 +279,10 @@ pub(crate) async fn prepare_message_request(
         .ok_or_else(|| AppError::bad_request("缺少 model 字段"))?
         .to_string();
 
-    // 2. 路由决策(先定协议,再选归一化模式;对齐 按目标协议分流)
-    let providers = state.providers.read().await;
-    let route = resolve_route(&model, &providers)?;
-    let payload_rules = state.payload_rules.read().await;
+    // 2. 路由决策(基于不可变配置快照,无须持锁)
+    let providers = &config_snapshot.providers;
+    let route = resolve_route(&model, providers)?;
+    let payload_rules = &config_snapshot.payload_rules;
 
     // 3. 归一化第一遍(按协议:claude 直通全量 / openai 转换前精简)
     if normalize_enabled {
@@ -399,7 +401,7 @@ pub(crate) async fn prepare_message_request(
         }
         Protocol::Antigravity => {
             let project_id = {
-                let provider = find_provider(&providers, &route.provider);
+                let provider = find_provider(providers, &route.provider);
                 provider
                     .and_then(|p| p.metadata.as_ref())
                     .and_then(|m| m.get("project_id"))
@@ -444,7 +446,7 @@ pub(crate) async fn prepare_message_request(
     }
 
     // 5. payload 参数覆盖
-    apply_payload_overrides(&mut body_json, &model, route.protocol, &payload_rules);
+    apply_payload_overrides(&mut body_json, &model, route.protocol, payload_rules);
 
     let outbound_model =
         resolve_outbound_model(&mut body_json, &route.upstream_model, route.protocol);
@@ -491,7 +493,7 @@ pub(crate) async fn prepare_message_request(
         antigravity_refresh,
         xai_refresh,
     ) = {
-        let provider = find_provider(&providers, &route.provider)
+        let provider = find_provider(providers, &route.provider)
             .ok_or_else(|| AppError::new(anyhow::anyhow!("provider 未找到: {}", route.provider)))?;
         let meta = provider.metadata.as_ref();
         let antigravity_refresh = if matches!(route.protocol, Protocol::Antigravity) {
@@ -522,8 +524,6 @@ pub(crate) async fn prepare_message_request(
             xai_refresh,
         )
     };
-    drop(payload_rules);
-    drop(providers);
 
     // Antigravity 运行时 token 校验与自动刷新
     if let Some((auth_dir_str, email)) = antigravity_refresh {
@@ -1047,51 +1047,29 @@ pub async fn handle_messages(
     headers: HeaderMap,
     body: Body,
 ) -> Result<Response, AppError> {
-    // 一次性 clone 运行时快照值后立即释放读锁,避免跨 await 持锁阻塞 /reload
-    let (
-        secret,
-        log_request_body,
-        normalize_enabled,
-        normalize_drift_detector,
-        upstream_client,
-        user_agents,
-        thinking_registry,
-    ) = {
-        let rt = state.runtime.read().await;
-        (
-            rt.secret.clone(),
-            rt.logging.request_body,
-            rt.normalize.enabled,
-            rt.normalize.drift_detector,
-            rt.upstream.clone(),
-            rt.user_agents.clone(),
-            rt.thinking_registry.clone(),
-        )
-    };
-    check_secret(&headers, &secret)?;
+    // 只取得一次快照；认证、转换和响应交付始终使用同一版本。
+    let effective_snapshot = Arc::clone(&*state.config.read().await);
+    check_secret(&headers, &effective_snapshot.runtime.secret)?;
     let bytes = to_bytes(body, crate::limits::INBOUND_BODY_LIMIT)
         .await
         .map_err(|e| AppError::new(anyhow::anyhow!("读请求体失败: {e}")))?;
 
-    let mut prepared = prepare_message_request(
-        &state,
-        &headers,
-        &bytes,
-        normalize_enabled,
-        normalize_drift_detector,
-        log_request_body,
-        &thinking_registry,
+    let mut prepared =
+        prepare_message_request(&state, &headers, &bytes, &effective_snapshot).await?;
+
+    let executed = execute_upstream_request(
+        &mut prepared,
+        &effective_snapshot.runtime.upstream,
+        &effective_snapshot.runtime.user_agents,
     )
     .await?;
-
-    let executed = execute_upstream_request(&mut prepared, &upstream_client, &user_agents).await?;
 
     deliver_response(
         &state,
         &mut prepared,
         executed,
-        &upstream_client,
-        &user_agents,
+        &effective_snapshot.runtime.upstream,
+        &effective_snapshot.runtime.user_agents,
     )
     .await
 }

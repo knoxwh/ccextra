@@ -6,7 +6,10 @@ use ccextra_server::antigravity::{
     list as list_antigravity, resolve_auth_dir as resolve_antigravity_auth_dir,
     run_login as run_antigravity_login, LoginOptions as AntigravityLoginOptions,
 };
-use ccextra_server::http::{AppState, ReloadData, RuntimeConfig, UserAgentSet};
+use ccextra_server::http::{
+    publish_refreshed_providers, AppState, ConfigSnapshot, ProviderRefreshConfig, ReloadData,
+    RuntimeConfig, UserAgentSet,
+};
 use ccextra_server::serve;
 use ccextra_server::upstream::UpstreamClient;
 use ccextra_server::xai::{
@@ -135,6 +138,8 @@ async fn main() -> Result<()> {
 
     tracing::info!("配置加载成功: {} providers", config.providers.len());
 
+    let refresh = provider_refresh_config(&cli.config, &config);
+
     // 动态加载 xAI providers
     let xai_auth_dir = pin_auth_dir(
         &cli.config,
@@ -164,6 +169,7 @@ async fn main() -> Result<()> {
         let config_path = config_path.clone();
         Box::pin(async move {
             let cfg = Config::load(&config_path)?;
+            let refresh = provider_refresh_config(&config_path, &cfg);
 
             // 重载时重新解析 auth_dir 并加载动态 providers
             let antigravity_auth_dir = pin_auth_dir(&config_path, cfg.auth_dir.as_deref(), resolve_antigravity_auth_dir);
@@ -196,29 +202,37 @@ async fn main() -> Result<()> {
                 antigravity: cfg.antigravity,
                 user_agents,
                 thinking_registry,
+                refresh,
             })
         })
     });
 
     let user_agents = build_user_agents(config.user_agents.as_ref());
     let thinking_registry = load_thinking_registry(&cli.config, config.models_file.as_deref())?;
-    // 后台注入任务需要的全局代理(与 UpstreamClient 各持一份)
-    let injection_proxy = config.server.proxy_url.clone();
+
+    let runtime = RuntimeConfig {
+        normalize: config.normalize,
+        logging: config.logging,
+        secret: config.secret_key,
+        upstream: UpstreamClient::with_ant_pool(
+            config.server.proxy_url,
+            config.antigravity.as_ref(),
+        ),
+        user_agents,
+        thinking_registry,
+    };
+    let payload_rules = config.payload.unwrap_or_default();
+    let config_snapshot = Arc::new(ConfigSnapshot {
+        version: 1,
+        providers: all_providers,
+        payload_rules,
+        runtime,
+        refresh,
+    });
 
     let state = AppState {
-        providers: Arc::new(RwLock::new(all_providers)),
-        payload_rules: Arc::new(RwLock::new(config.payload.unwrap_or_default())),
-        runtime: Arc::new(RwLock::new(RuntimeConfig {
-            normalize: config.normalize,
-            logging: config.logging,
-            secret: config.secret_key,
-            upstream: UpstreamClient::with_ant_pool(
-                config.server.proxy_url,
-                config.antigravity.as_ref(),
-            ),
-            user_agents,
-            thinking_registry,
-        })),
+        config: Arc::new(RwLock::new(config_snapshot)),
+        reload_lock: Arc::new(tokio::sync::Mutex::new(())),
         reload,
         drift: DriftState::new(1000),
         replay_cache: ccextra_server::sse::replay_cache::ReplayCache::new(
@@ -232,16 +246,7 @@ async fn main() -> Result<()> {
 
     // Antigravity 后台注入(对齐 CPA 启动模式:listening 不等在线模型列表;
     // 任务内部立即拉取一次,成功替换 providers,失败保旧等下轮)
-    tokio::spawn(run_antigravity_injection(
-        cli.config.clone(),
-        state.providers.clone(),
-        pin_auth_dir(
-            &cli.config,
-            config.auth_dir.as_deref(),
-            resolve_antigravity_auth_dir,
-        ),
-        injection_proxy,
-    ));
+    tokio::spawn(run_antigravity_injection(state.config.clone()));
 
     // 启动 HTTP 服务
     let addr = format!("{}:{}", config.server.host, config.server.port);
@@ -333,32 +338,63 @@ where
     }
 }
 
-/// 读取配置文件构建「静态配置 + xAI」provider 集合(不含 Antigravity)。
-/// 启动与后台周期刷新共用;/reload 仍走完整 ReloadData 闭包
-async fn build_provider_set(config_path: &str) -> anyhow::Result<Vec<ProviderConfig>> {
-    let cfg = Config::load(config_path)?;
-    let mut set = merge_providers(cfg.providers, Vec::new());
-    let dir = pin_auth_dir(
-        config_path,
-        cfg.xai_auth_dir.as_deref(),
-        resolve_xai_auth_dir,
-    );
-    set = merge_providers(
-        set,
-        ccextra_server::xai::load_xai_providers(&dir, cfg.server.proxy_url.as_deref()).await,
-    );
-    Ok(set)
+/// 刷新参数随成功发布的配置一起更新,相对目录始终相对配置文件解析。
+fn provider_refresh_config(config_path: &str, config: &Config) -> ProviderRefreshConfig {
+    ProviderRefreshConfig {
+        auth_dir: Some(pin_auth_dir(
+            config_path,
+            config.auth_dir.as_deref(),
+            resolve_antigravity_auth_dir,
+        )),
+        xai_auth_dir: Some(pin_auth_dir(
+            config_path,
+            config.xai_auth_dir.as_deref(),
+            resolve_xai_auth_dir,
+        )),
+        proxy_url: config.server.proxy_url.clone(),
+        static_providers: config.providers.clone(),
+    }
 }
 
-/// Antigravity 注入任务(对齐 CPA StartModelsUpdater:启动即拉取、
-/// 成功注入后每 3 小时刷新一次;失败保持现有数据等下一轮)。
-/// 每轮都从配置文件现读集合再叠加最新模型列表,凭证增删自动生效
-async fn run_antigravity_injection(
-    config_path: String,
-    providers: std::sync::Arc<tokio::sync::RwLock<Vec<ProviderConfig>>>,
-    auth_dir: std::path::PathBuf,
-    proxy_url: Option<String>,
-) {
+/// 动态拉取失败时保留整个已发布集合;静态配置仅由成功的 reload 更新。
+async fn load_refreshed_providers(refresh: ProviderRefreshConfig) -> Option<Vec<ProviderConfig>> {
+    let auth_dir = refresh.auth_dir.as_ref()?;
+    let xai = if let Some(dir) = refresh.xai_auth_dir.as_ref() {
+        ccextra_server::xai::load_xai_providers(dir, refresh.proxy_url.as_deref()).await
+    } else {
+        Vec::new()
+    };
+    let injected = ccextra_server::antigravity::load_antigravity_providers(
+        auth_dir,
+        refresh.proxy_url.as_deref(),
+    )
+    .await;
+    if injected.is_empty() {
+        tracing::warn!("Antigravity 无可用模型/provider,保持现有数据");
+        return None;
+    }
+    let set = merge_providers(refresh.static_providers, xai);
+    Some(merge_providers(set, injected))
+}
+
+async fn refresh_providers<F, Fut>(
+    config: &Arc<RwLock<Arc<ConfigSnapshot>>>,
+    load: F,
+) -> anyhow::Result<bool>
+where
+    F: FnOnce(ProviderRefreshConfig) -> Fut,
+    Fut: std::future::Future<Output = Option<Vec<ProviderConfig>>>,
+{
+    let snapshot = config.read().await.clone();
+    let Some(providers) = load(snapshot.refresh.clone()).await else {
+        return Ok(false);
+    };
+    publish_refreshed_providers(config, snapshot.version, providers).await
+}
+
+/// Antigravity 注入任务:启动即拉取,成功注入后每 3 小时刷新;失败保旧。
+/// 每轮从当前快照获取参数,不发布尚未成功 reload 的磁盘配置。
+async fn run_antigravity_injection(config: Arc<RwLock<Arc<ConfigSnapshot>>>) {
     /// 刷新周期(对齐 CPA modelsRefreshInterval = 3h)
     const REFRESH_INTERVAL: std::time::Duration = std::time::Duration::from_secs(3 * 3600);
 
@@ -368,34 +404,17 @@ async fn run_antigravity_injection(
     let mut ready = false;
     loop {
         ticker.tick().await;
-        // 每轮从配置文件现读集合再叠加最新模型列表,凭证增删自动生效
-        let set = match build_provider_set(&config_path).await {
-            Ok(s) => s,
-            Err(e) => {
-                tracing::warn!("构建 provider 集合失败,保持现有数据: {e}");
-                continue;
+        match refresh_providers(&config, load_refreshed_providers).await {
+            Ok(true) => {
+                if ready {
+                    tracing::info!("Antigravity 周期刷新完成");
+                } else {
+                    ready = true;
+                    tracing::info!("Antigravity providers 已就绪");
+                }
             }
-        };
-        let injected = ccextra_server::antigravity::load_antigravity_providers(
-            &auth_dir,
-            proxy_url.as_deref(),
-        )
-        .await;
-        if injected.is_empty() {
-            // 保旧语义(CPA keeping current data):不清空现有路由,等下轮重试
-            tracing::warn!("Antigravity 无可用模型/provider,保持现有数据");
-            continue;
-        }
-        let merged = merge_providers(set, injected);
-        // 对齐 CPA detectChangedProviders:内容无变化不换锁写、不发通知
-        if !ready || *providers.read().await != merged {
-            *providers.write().await = merged;
-            if ready {
-                tracing::info!("Antigravity 周期刷新完成");
-            } else {
-                ready = true;
-                tracing::info!("Antigravity providers 已就绪");
-            }
+            Ok(false) => {}
+            Err(error) => tracing::warn!("provider 刷新校验失败,保持现有数据: {error}"),
         }
     }
 }
@@ -577,11 +596,152 @@ fn build_user_agents(config: Option<&config::UserAgents>) -> UserAgentSet {
 
 #[cfg(test)]
 mod tests {
-    use super::{load_thinking_registry, pin_auth_dir, pin_path};
+    use super::{
+        build_user_agents, load_refreshed_providers, load_thinking_registry, pin_auth_dir,
+        pin_path, provider_refresh_config, refresh_providers, Arc, Config, ProviderConfig,
+        RuntimeConfig, RwLock, UpstreamClient,
+    };
     use ccextra_server::antigravity::resolve_auth_dir as resolve_antigravity_auth_dir;
     use ccextra_server::xai::resolve_auth_dir as resolve_xai_auth_dir;
     use std::io::Write;
     use std::path::PathBuf;
+
+    fn refresh_state() -> Arc<RwLock<Arc<ccextra_server::http::ConfigSnapshot>>> {
+        use ccextra_server::http::{ConfigSnapshot, LoggingConfig, NormalizeConfig};
+        Arc::new(RwLock::new(Arc::new(ConfigSnapshot {
+            version: 1,
+            providers: vec![],
+            payload_rules: vec![],
+            runtime: RuntimeConfig {
+                normalize: NormalizeConfig {
+                    enabled: false,
+                    drift_detector: false,
+                },
+                logging: LoggingConfig {
+                    level: "info".into(),
+                    request_body: false,
+                },
+                secret: None,
+                upstream: UpstreamClient::new(None),
+                user_agents: build_user_agents(None),
+                thinking_registry: Arc::new(vec![]),
+            },
+            refresh: Default::default(),
+        })))
+    }
+
+    #[tokio::test]
+    async fn refresh_uses_latest_published_parameters() {
+        let state = refresh_state();
+        {
+            let mut current = state.write().await;
+            let snapshot = Arc::make_mut(&mut current);
+            snapshot.version = 2;
+            snapshot.refresh.auth_dir = Some(PathBuf::from("/new/antigravity"));
+            snapshot.refresh.xai_auth_dir = Some(PathBuf::from("/new/xai"));
+            snapshot.refresh.proxy_url = Some("http://new-proxy:8080".into());
+        }
+        let published = refresh_providers(&state, |refresh| async move {
+            assert_eq!(refresh.auth_dir, Some(PathBuf::from("/new/antigravity")));
+            assert_eq!(refresh.xai_auth_dir, Some(PathBuf::from("/new/xai")));
+            assert_eq!(refresh.proxy_url.as_deref(), Some("http://new-proxy:8080"));
+            Some(vec![ProviderConfig::new(
+                "new-account".into(),
+                ccextra_core::route::Protocol::Antigravity,
+                vec!["https://example.invalid".into()],
+                "fixture-key".into(),
+                None,
+                false,
+                vec![],
+            )])
+        })
+        .await
+        .unwrap();
+        assert!(published);
+        assert_eq!(state.read().await.providers[0].name, "new-account");
+    }
+
+    #[tokio::test]
+    async fn refresh_failure_keeps_entire_published_snapshot() {
+        let state = refresh_state();
+        let directory = tempfile::tempdir().unwrap();
+        {
+            let mut current = state.write().await;
+            let snapshot = Arc::make_mut(&mut current);
+            snapshot.refresh.auth_dir = Some(directory.path().join("antigravity"));
+            snapshot.refresh.xai_auth_dir = Some(directory.path().join("xai"));
+        }
+        let before = state.read().await.clone();
+        assert!(!refresh_providers(&state, load_refreshed_providers)
+            .await
+            .unwrap());
+        assert!(Arc::ptr_eq(&before, &*state.read().await));
+    }
+
+    #[tokio::test]
+    async fn refresh_discards_result_after_new_configuration_is_published() {
+        let state = refresh_state();
+        let published = refresh_providers(&state, |_| async {
+            let mut current = state.write().await;
+            let snapshot = Arc::make_mut(&mut current);
+            snapshot.version = 2;
+            snapshot.refresh.auth_dir = Some(PathBuf::from("/new/antigravity"));
+            Some(vec![ProviderConfig::new(
+                "old-account".into(),
+                ccextra_core::route::Protocol::Antigravity,
+                vec!["https://example.invalid".into()],
+                "fixture-key".into(),
+                None,
+                false,
+                vec![],
+            )])
+        })
+        .await
+        .unwrap();
+        assert!(!published);
+        let snapshot = state.read().await;
+        assert_eq!(snapshot.version, 2);
+        assert!(snapshot.providers.is_empty());
+        assert_eq!(
+            snapshot.refresh.auth_dir,
+            Some(PathBuf::from("/new/antigravity"))
+        );
+    }
+
+    #[test]
+    fn refresh_parameters_pin_dirs_and_retain_static_providers() {
+        let config: Config = serde_yaml::from_str(
+            r#"
+server:
+  host: 127.0.0.1
+  port: 8222
+  proxy_url: http://new-proxy:8080
+providers:
+  - name: static-provider
+    protocol: claude
+    base_url: https://example.invalid
+    key: fixture-key
+    models: []
+normalize: { enabled: false, drift_detector: false }
+logging: { level: info, request_body: false }
+auth_dir: new-antigravity
+xai_auth_dir: new-xai
+"#,
+        )
+        .unwrap();
+        let refresh = provider_refresh_config("/tmp/project/config.yaml", &config);
+        assert_eq!(
+            refresh.auth_dir,
+            Some(PathBuf::from("/tmp/project/new-antigravity"))
+        );
+        assert_eq!(
+            refresh.xai_auth_dir,
+            Some(PathBuf::from("/tmp/project/new-xai"))
+        );
+        assert_eq!(refresh.proxy_url.as_deref(), Some("http://new-proxy:8080"));
+        assert_eq!(refresh.static_providers.len(), 1);
+        assert_eq!(refresh.static_providers[0].name, "static-provider");
+    }
 
     #[test]
     fn pin_default_next_to_config() {

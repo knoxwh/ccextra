@@ -33,10 +33,9 @@ pub async fn handle_models(
     State(state): State<AppState>,
     headers: HeaderMap,
 ) -> Result<Response, AppError> {
-    let secret = state.runtime.read().await.secret.clone();
-    check_secret(&headers, &secret)?;
-    let providers = state.providers.read().await;
-    let body = build_models_list(&providers);
+    let snapshot = std::sync::Arc::clone(&*state.config.read().await);
+    check_secret(&headers, &snapshot.runtime.secret)?;
+    let body = build_models_list(&snapshot.providers);
     Response::builder()
         .status(StatusCode::OK)
         .header(header::CONTENT_TYPE, "application/json")

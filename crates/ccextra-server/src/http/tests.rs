@@ -11,6 +11,8 @@ use std::sync::{Arc, Mutex as StdMutex};
 use tokio::sync::RwLock;
 use tower::util::ServiceExt;
 
+mod snapshot;
+
 // 测试用默认 User-Agent 值
 const TEST_CLAUDE_CLI: &str = "claude-cli/2.1.258";
 const TEST_CODEX_TUI: &str = "codex_cli_rs/0.153.3 (Mac OS 26.6.2; arm64)";
@@ -271,23 +273,30 @@ fn mock_state() -> AppState {
       alias: test-gpt
 "#;
     let providers: Vec<ProviderConfig> = serde_yaml::from_str(providers_yaml).unwrap();
+    let runtime = RuntimeConfig {
+        normalize: NormalizeConfig {
+            enabled: false,
+            drift_detector: false,
+        },
+        logging: LoggingConfig {
+            level: "info".into(),
+            request_body: false,
+        },
+        secret: None,
+        upstream: UpstreamClient::new(None),
+        user_agents: test_user_agents(),
+        thinking_registry: Arc::new(vec![]),
+    };
+    let config_snapshot = Arc::new(ConfigSnapshot {
+        version: 1,
+        providers,
+        payload_rules: vec![],
+        runtime,
+        refresh: ProviderRefreshConfig::default(),
+    });
     AppState {
-        providers: Arc::new(RwLock::new(providers)),
-        payload_rules: Arc::new(RwLock::new(vec![])),
-        runtime: Arc::new(RwLock::new(RuntimeConfig {
-            normalize: NormalizeConfig {
-                enabled: false,
-                drift_detector: false,
-            },
-            logging: LoggingConfig {
-                level: "info".into(),
-                request_body: false,
-            },
-            secret: None,
-            upstream: UpstreamClient::new(None),
-            user_agents: test_user_agents(),
-            thinking_registry: Arc::new(vec![]),
-        })),
+        config: Arc::new(RwLock::new(config_snapshot)),
+        reload_lock: Arc::new(tokio::sync::Mutex::new(())),
         reload: reload_returning_secret(None),
         drift: DriftState::new(1000),
         replay_cache: crate::sse::replay_cache::ReplayCache::new(
@@ -348,7 +357,9 @@ models:
         upstream_addr
     );
     let provider: ProviderConfig = serde_yaml::from_str(&provider_yaml).unwrap();
-    state.providers.write().await.push(provider);
+    Arc::make_mut(&mut *state.config.write().await)
+        .providers
+        .push(provider);
     let app = app(state);
     let request = Request::builder()
         .uri("/v1/messages")
@@ -422,13 +433,16 @@ async fn test_claude_passthrough_clamps_effort_before_upstream() {
         upstream_addr
     );
     let providers: Vec<ProviderConfig> = serde_yaml::from_str(&providers_yaml).unwrap();
-    state.providers.write().await.extend(providers);
-    state.runtime.write().await.thinking_registry =
-        Arc::new(vec![ccextra_core::thinking::ModelCapability {
-            id: "glm-5.3".into(),
-            reasoning_levels: vec!["low".into(), "high".into(), "max".into()],
-            force_effort: None,
-        }]);
+    Arc::make_mut(&mut *state.config.write().await)
+        .providers
+        .extend(providers);
+    Arc::make_mut(&mut *state.config.write().await)
+        .runtime
+        .thinking_registry = Arc::new(vec![ccextra_core::thinking::ModelCapability {
+        id: "glm-5.3".into(),
+        reasoning_levels: vec!["low".into(), "high".into(), "max".into()],
+        force_effort: None,
+    }]);
     let app = app(state);
 
     // 非 Claude 模型:medium 越档,钳到 low(与 low/high 等距,tie 取低)
@@ -574,7 +588,9 @@ models:
         upstream_addr
     );
     let provider: ProviderConfig = serde_yaml::from_str(&provider_yaml).unwrap();
-    state.providers.write().await.push(provider);
+    Arc::make_mut(&mut *state.config.write().await)
+        .providers
+        .push(provider);
     let app = app(state);
     let request = Request::builder()
         .uri("/v1/messages")
@@ -661,7 +677,9 @@ async fn test_openai_responses_retries_valid_encrypted_content_after_upstream_re
             upstream_addr
         ))
         .unwrap();
-    state.providers.write().await.push(provider);
+    Arc::make_mut(&mut *state.config.write().await)
+        .providers
+        .push(provider);
     let app = app(state);
     let request = Request::builder()
             .uri("/v1/messages")
@@ -723,7 +741,9 @@ async fn test_openai_responses_retries_on_422_invalid_encrypted_content() {
             upstream_addr
         ))
         .unwrap();
-    state.providers.write().await.push(provider);
+    Arc::make_mut(&mut *state.config.write().await)
+        .providers
+        .push(provider);
     let app = app(state);
     let request = Request::builder()
             .uri("/v1/messages")
@@ -794,22 +814,26 @@ models:
         upstream_addr
     ))
     .unwrap();
-    state.providers.write().await.push(provider);
-    state.payload_rules.write().await.push(PayloadRule {
-        models: vec!["test-responses-final".into()],
-        protocol: Some(Protocol::OpenAiResponses),
-        params: json!({
-            "previous_response_id": "resp_previous",
-            "generate": true,
-            "safety_identifier": "safe-id",
-            "stream_options": {"include_usage": true},
-            "prompt_cache_retention": "24h",
-            "temperature": 0.1
-        })
-        .as_object()
-        .unwrap()
-        .clone(),
-    });
+    Arc::make_mut(&mut *state.config.write().await)
+        .providers
+        .push(provider);
+    Arc::make_mut(&mut *state.config.write().await)
+        .payload_rules
+        .push(PayloadRule {
+            models: vec!["test-responses-final".into()],
+            protocol: Some(Protocol::OpenAiResponses),
+            params: json!({
+                "previous_response_id": "resp_previous",
+                "generate": true,
+                "safety_identifier": "safe-id",
+                "stream_options": {"include_usage": true},
+                "prompt_cache_retention": "24h",
+                "temperature": 0.1
+            })
+            .as_object()
+            .unwrap()
+            .clone(),
+        });
     let app = app(state);
     let request = Request::builder()
         .uri("/v1/messages")
@@ -1230,7 +1254,9 @@ fn test_api_key_extraction() {
 #[tokio::test]
 async fn test_models_requires_secret() {
     let state = mock_state();
-    state.runtime.write().await.secret = Some("s3cret".into());
+    Arc::make_mut(&mut *state.config.write().await)
+        .runtime
+        .secret = Some("s3cret".into());
     let app = app(state);
     // 无 key → 401
     let req = Request::builder()
@@ -1255,6 +1281,7 @@ fn reload_returning_secret(secret: Option<String>) -> ReloadFn {
         let secret = secret.clone();
         Box::pin(async move {
             Ok(ReloadData {
+                refresh: ProviderRefreshConfig::default(),
                 providers: vec![],
                 payload_rules: vec![],
                 normalize: NormalizeConfig {
@@ -1280,7 +1307,7 @@ fn reload_returning_secret(secret: Option<String>) -> ReloadFn {
 #[tokio::test]
 async fn test_reload_applies_new_secret() {
     let mut state = mock_state();
-    assert!(state.runtime.read().await.secret.is_none());
+    assert!(state.config.read().await.runtime.secret.is_none());
     state.reload = reload_returning_secret(Some("sk-after-reload".into()));
     let app = app(state);
 
@@ -1322,7 +1349,9 @@ async fn test_reload_clears_auth_cache() {
     let old_hash = bcrypt::hash("sk-old", 4).unwrap();
     let new_hash = bcrypt::hash("sk-new", 4).unwrap();
     let mut state = mock_state();
-    state.runtime.write().await.secret = Some(old_hash.clone());
+    Arc::make_mut(&mut *state.config.write().await)
+        .runtime
+        .secret = Some(old_hash.clone());
     state.reload = reload_returning_secret(Some(new_hash));
     let app = app(state);
 
@@ -1373,6 +1402,7 @@ async fn test_reload_applies_normalize_and_proxy() {
     state.reload = Arc::new(|| {
         Box::pin(async {
             Ok(ReloadData {
+                refresh: ProviderRefreshConfig::default(),
                 providers: vec![],
                 payload_rules: vec![],
                 normalize: NormalizeConfig {
@@ -1391,7 +1421,7 @@ async fn test_reload_applies_normalize_and_proxy() {
             })
         })
     });
-    let runtime = state.runtime.clone();
+    let config = state.config.clone();
     let req = Request::builder()
         .uri("/reload")
         .method("POST")
@@ -1402,7 +1432,8 @@ async fn test_reload_applies_normalize_and_proxy() {
         StatusCode::OK
     );
 
-    let rt = runtime.read().await;
+    let snapshot = config.read().await;
+    let rt = &snapshot.runtime;
     assert!(rt.normalize.enabled, "normalize 应随 /reload 更新");
     assert!(rt.normalize.drift_detector);
     assert!(rt.logging.request_body, "logging 应随 /reload 更新");
@@ -1454,7 +1485,8 @@ async fn test_reload_completes_while_request_inflight() {
 
     let mut state = mock_state();
     // 让 test-claude 指向慢 mock
-    state.providers.write().await[0].set_base_url_for_test(format!("http://{addr}"));
+    Arc::make_mut(&mut *state.config.write().await).providers[0]
+        .set_base_url_for_test(format!("http://{addr}"));
 
     state.reload = reload_returning_secret(None);
 
@@ -1509,6 +1541,67 @@ async fn test_reload_completes_while_request_inflight() {
     })
     .await
     .expect("释放上游后请求必须完成");
+}
+
+#[tokio::test]
+async fn test_config_snapshot_is_the_only_request_configuration() {
+    let state = mock_state();
+    {
+        let mut config = state.config.write().await;
+        let snapshot = Arc::make_mut(&mut config);
+        snapshot.providers.clear();
+        snapshot.runtime.secret = Some("snapshot-key".into());
+    }
+    let response = app(state)
+        .oneshot(
+            Request::builder()
+                .uri("/v1/models")
+                .header("x-api-key", "snapshot-key")
+                .body(Body::empty())
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(response.status(), StatusCode::OK);
+    let body = to_bytes(response.into_body(), usize::MAX).await.unwrap();
+    let body: Value = serde_json::from_slice(&body).unwrap();
+    assert_eq!(body["data"], json!([]), "删除的 provider 不得从旧镜像复活");
+}
+
+/// 实际 reload 完成后，旧后台结果不得恢复已删除的 provider。
+#[tokio::test]
+async fn test_config_snapshot_version_guards_against_stale_injection() {
+    let state = mock_state();
+    let old = Arc::clone(&*state.config.read().await);
+    let (ready_tx, ready_rx) = tokio::sync::oneshot::channel();
+    let (release_tx, release_rx) = tokio::sync::oneshot::channel();
+    let config = state.config.clone();
+    let mut tasks = tokio::task::JoinSet::new();
+    tasks.spawn(async move {
+        ready_tx.send(()).unwrap();
+        release_rx.await.unwrap();
+        publish_refreshed_providers(&config, old.version, old.providers.clone())
+            .await
+            .unwrap()
+    });
+    tokio::time::timeout(std::time::Duration::from_secs(2), ready_rx)
+        .await
+        .unwrap()
+        .unwrap();
+    handle_reload(axum::extract::State(state.clone()))
+        .await
+        .unwrap();
+    release_tx.send(()).unwrap();
+    assert!(
+        !tokio::time::timeout(std::time::Duration::from_secs(2), tasks.join_next())
+            .await
+            .unwrap()
+            .unwrap()
+            .unwrap()
+    );
+    let current = state.config.read().await;
+    assert_eq!(current.version, 2);
+    assert!(current.providers.is_empty());
 }
 
 // ── to_anthropic_error 上游错误透传 ─────────────────────────────────
@@ -1572,7 +1665,8 @@ async fn test_claude_relay_forwards_headers_and_overrides_auth() {
     let (server, captured) = spawn_captured_server("/v1/messages", StatusCode::OK, "{}").await;
 
     let state = mock_state();
-    state.providers.write().await[0].set_base_url_for_test(server.url.clone());
+    Arc::make_mut(&mut *state.config.write().await).providers[0]
+        .set_base_url_for_test(server.url.clone());
     let app = app(state);
     let request = Request::builder()
         .uri("/v1/messages")
@@ -1630,7 +1724,8 @@ async fn test_count_tokens_relay_uses_fallback_user_agent() {
     .await;
 
     let state = mock_state();
-    state.providers.write().await[0].set_base_url_for_test(server.url.clone());
+    Arc::make_mut(&mut *state.config.write().await).providers[0]
+        .set_base_url_for_test(server.url.clone());
     let app = app(state);
     let request = Request::builder()
         .uri("/v1/messages/count_tokens")
@@ -1691,7 +1786,8 @@ async fn non_stream_body_limits_and_passthrough() {
             let payload = padded_json(json, len);
             let server = TestServer::reply(status, payload.clone()).await;
             let state = mock_state();
-            state.providers.write().await[0].set_base_url_for_test(server.url.clone());
+            Arc::make_mut(&mut *state.config.write().await).providers[0]
+                .set_base_url_for_test(server.url.clone());
             let response = post_test_request(state, path, "test-opus").await;
             let expected = if len > SUCCESS_BODY_LIMIT {
                 StatusCode::BAD_GATEWAY
@@ -1753,7 +1849,8 @@ async fn test_count_tokens_error_body_transport_failure_preserves_429() {
     });
 
     let state = mock_state();
-    state.providers.write().await[0].set_base_url_for_test(format!("http://{upstream_addr}"));
+    Arc::make_mut(&mut *state.config.write().await).providers[0]
+        .set_base_url_for_test(format!("http://{upstream_addr}"));
     let app = app(state);
     let request = Request::builder()
         .uri("/v1/messages/count_tokens")
@@ -1820,7 +1917,9 @@ models:
         server.url
     );
     let provider: ProviderConfig = serde_yaml::from_str(&provider_yaml).unwrap();
-    state.providers.write().await.push(provider);
+    Arc::make_mut(&mut *state.config.write().await)
+        .providers
+        .push(provider);
     let app = app(state);
     let request = Request::builder()
         .uri("/v1/messages")
@@ -1916,7 +2015,9 @@ models:
         server.url
     );
     let provider: ProviderConfig = serde_yaml::from_str(&provider_yaml).unwrap();
-    state.providers.write().await.push(provider);
+    Arc::make_mut(&mut *state.config.write().await)
+        .providers
+        .push(provider);
     let app = app(state);
     let request = Request::builder()
         .uri("/v1/messages")
@@ -1993,14 +2094,18 @@ models:
         server.url
     );
     let provider: ProviderConfig = serde_yaml::from_str(&provider_yaml).unwrap();
-    state.providers.write().await.push(provider);
+    Arc::make_mut(&mut *state.config.write().await)
+        .providers
+        .push(provider);
     let mut params = serde_json::Map::new();
     params.insert("model".into(), json!("grok-4.6"));
-    state.payload_rules.write().await.push(PayloadRule {
-        models: vec!["test-gpt-to-grok".into()],
-        protocol: Some(Protocol::OpenAiChat),
-        params,
-    });
+    Arc::make_mut(&mut *state.config.write().await)
+        .payload_rules
+        .push(PayloadRule {
+            models: vec!["test-gpt-to-grok".into()],
+            protocol: Some(Protocol::OpenAiChat),
+            params,
+        });
     let app = app(state);
     let request = Request::builder()
         .uri("/v1/messages")
@@ -2076,7 +2181,9 @@ models:
         server.url
     );
     let provider: ProviderConfig = serde_yaml::from_str(&provider_yaml).unwrap();
-    state.providers.write().await.push(provider);
+    Arc::make_mut(&mut *state.config.write().await)
+        .providers
+        .push(provider);
     let app = app(state);
     let request = Request::builder()
         .uri("/v1/messages")
@@ -2138,7 +2245,9 @@ models:
         server.url
     );
     let provider: ProviderConfig = serde_yaml::from_str(&provider_yaml).unwrap();
-    state.providers.write().await.push(provider);
+    Arc::make_mut(&mut *state.config.write().await)
+        .providers
+        .push(provider);
     let app = app(state);
     let request = Request::builder()
         .uri("/v1/messages")
@@ -2246,7 +2355,9 @@ async fn test_upstream_500_retries_with_backoff_then_succeeds() {
             upstream_addr
         ))
         .unwrap();
-    state.providers.write().await.push(provider);
+    Arc::make_mut(&mut *state.config.write().await)
+        .providers
+        .push(provider);
     let app = app(state);
     let request = Request::builder()
         .uri("/v1/messages")
@@ -2291,7 +2402,9 @@ async fn test_upstream_persistent_503_exhausts_budget_returns_error_shape() {
             upstream_addr
         ))
         .unwrap();
-    state.providers.write().await.push(provider);
+    Arc::make_mut(&mut *state.config.write().await)
+        .providers
+        .push(provider);
     let app = app(state);
     let request = Request::builder()
         .uri("/v1/messages")
@@ -2353,8 +2466,10 @@ async fn fallback_attempts_each_url_once() {
         let state = mock_state();
         let provider: ProviderConfig = serde_yaml::from_str(&format!(
             "name: fallback\nprotocol: openai_chat\nbase_url: [{first}, {}]\nkey: sk-test\nproxy_url: direct\nmodels:\n  - name: gpt-4\n    alias: fallback\n", good.url)).unwrap();
-        state.providers.write().await.push(provider);
-        let attempts = state.runtime.read().await.upstream.attempts.clone();
+        Arc::make_mut(&mut *state.config.write().await)
+            .providers
+            .push(provider);
+        let attempts = state.config.read().await.runtime.upstream.attempts.clone();
         drop(listener);
         let response = post_test_request(state, "/v1/messages", "fallback").await;
         assert_eq!(response.status(), StatusCode::OK);

@@ -39,6 +39,7 @@ pub type ReloadFn =
 
 /// /reload 可替换的运行时配置。整块写锁替换,单个字段不单独加锁。
 /// 注意 `logging.level` 不生效:EnvFilter 仅启动装载一次(见 cli/main.rs)。
+#[derive(Clone)]
 pub struct RuntimeConfig {
     pub normalize: NormalizeConfig,
     pub logging: LoggingConfig,
@@ -64,6 +65,7 @@ pub struct UserAgentSet {
 
 /// 热重载结果:闭包重读配置文件,返回新配置
 pub struct ReloadData {
+    pub refresh: ProviderRefreshConfig,
     pub providers: Vec<ProviderConfig>,
     pub payload_rules: Vec<PayloadRule>,
     pub normalize: NormalizeConfig,
@@ -77,11 +79,30 @@ pub struct ReloadData {
     pub thinking_registry: Arc<Vec<ccextra_core::thinking::ModelCapability>>,
 }
 
+/// 当前生效配置的后台刷新输入，目录在 CLI 中解析为相对配置文件的路径。
+#[derive(Clone, Default)]
+pub struct ProviderRefreshConfig {
+    pub auth_dir: Option<std::path::PathBuf>,
+    pub xai_auth_dir: Option<std::path::PathBuf>,
+    pub proxy_url: Option<String>,
+    pub static_providers: Vec<ProviderConfig>,
+}
+
+/// 统一不可变配置快照(对齐阶段 D 规格)
+#[derive(Clone)]
+pub struct ConfigSnapshot {
+    pub version: u64,
+    pub providers: Vec<ProviderConfig>,
+    pub payload_rules: Vec<PayloadRule>,
+    pub runtime: RuntimeConfig,
+    pub refresh: ProviderRefreshConfig,
+}
+
 #[derive(Clone)]
 pub struct AppState {
-    pub providers: Arc<RwLock<Vec<ProviderConfig>>>,
-    pub payload_rules: Arc<RwLock<Vec<PayloadRule>>>,
-    pub runtime: Arc<RwLock<RuntimeConfig>>,
+    pub config: Arc<RwLock<Arc<ConfigSnapshot>>>,
+    /// 串行化 reload 加载和发布，不阻塞请求读取快照。
+    pub reload_lock: Arc<tokio::sync::Mutex<()>>,
     /// 重读配置文件的闭包(由 cli 构造,捕获 config 路径)
     pub reload: ReloadFn,
     /// drift 观测状态(会话 → 上次结构哈希;按 openai/anthropic handler 分桶)
@@ -116,6 +137,27 @@ pub struct LoggingConfig {
 
 async fn health_check() -> &'static str {
     "ok"
+}
+
+pub async fn publish_refreshed_providers(
+    config: &Arc<RwLock<Arc<ConfigSnapshot>>>,
+    expected_version: u64,
+    providers: Vec<ProviderConfig>,
+) -> anyhow::Result<bool> {
+    ccextra_core::route::validate_providers(&providers)?;
+    let mut guard = config.write().await;
+    if guard.version != expected_version || guard.providers == providers {
+        return Ok(false);
+    }
+    let next_version = guard.version.wrapping_add(1);
+    *guard = Arc::new(ConfigSnapshot {
+        version: next_version,
+        providers,
+        payload_rules: guard.payload_rules.clone(),
+        runtime: guard.runtime.clone(),
+        refresh: guard.refresh.clone(),
+    });
+    Ok(true)
 }
 
 pub fn app(state: AppState) -> Router {

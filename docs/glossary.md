@@ -122,7 +122,10 @@ Gemini 函数调用模式。Antigravity Claude 模型强制使用；Gemini 直�
 由保存的 Antigravity 或 xAI 凭证生成的运行时 provider。Antigravity 后台刷新模型，xAI 在启动和重载时扫描、刷新凭证。
 
 **热重载**
-`POST /reload` 重读配置并替换多份运行时状态。锁独立更新，因此并发请求可能短暂看到不同版本的 providers 和其他配置。
+`POST /reload` 串行加载、校验后原子替换统一不可变配置快照；失败不改变已生效版本。旧请求保留旧快照，新请求取得新快照。后台刷新绑定版本，过期结果丢弃；后续轮次使用最新已发布的静态配置、目录及代理。
+
+**配置快照**
+包含 providers、payload、运行时配置和后台刷新参数的不可变 `Arc`。请求入口一次获取，发布只在短暂写锁内替换。后台 Antigravity 空结果保留整个 provider 集合；显式 reload 优先应用删除、禁用及目录切换，不从旧快照恢复动态 provider。
 
 **诊断落盘**
 `logging.request_body: true` 时保存最终出站请求，便于检查缓存和转换问题；敏感入站认证头会脱敏。
