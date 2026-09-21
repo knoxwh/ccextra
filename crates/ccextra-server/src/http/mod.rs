@@ -3,6 +3,7 @@ pub mod claude_relay;
 pub mod error;
 pub mod handlers;
 pub mod retry;
+pub mod session_tokens;
 
 use axum::{
     routing::{get, post},
@@ -11,7 +12,6 @@ use axum::{
 use ccextra_core::cache_stabilization::drift_detector::DriftState;
 use ccextra_core::route::{Protocol, ProviderConfig};
 use serde_json::Value;
-use std::collections::HashMap;
 use std::future::Future;
 use std::pin::Pin;
 use std::sync::Arc;
@@ -90,7 +90,7 @@ pub struct AppState {
     /// 对齐 CPA xai reasoning replay;server 层持有,core 无 IO)
     pub replay_cache: crate::sse::replay_cache::ReplayCache,
     /// session_id → 最新 input_tokens(避免非 Claude 上游 count_tokens 估算不准导致 context 跳动)
-    pub last_input_tokens: Arc<std::sync::Mutex<HashMap<String, usize>>>,
+    pub last_input_tokens: Arc<std::sync::Mutex<session_tokens::SessionTokenCache>>,
 }
 
 #[derive(Clone, Debug, serde::Deserialize)]

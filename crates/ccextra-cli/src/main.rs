@@ -225,7 +225,9 @@ async fn main() -> Result<()> {
             std::time::Duration::from_secs(3600),
             1024,
         ),
-        last_input_tokens: Arc::new(std::sync::Mutex::new(std::collections::HashMap::new())),
+        last_input_tokens: Arc::new(std::sync::Mutex::new(
+            ccextra_server::http::session_tokens::SessionTokenCache::new(),
+        )),
     };
 
     // Antigravity 后台注入(对齐 CPA 启动模式:listening 不等在线模型列表;

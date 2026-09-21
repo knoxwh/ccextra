@@ -114,7 +114,7 @@ pub async fn handle_count_tokens(
     let session = extract_claude_code_session(&headers, &body_json);
     let tokens = session
         .as_deref()
-        .and_then(|s| state.last_input_tokens.lock().ok()?.get(s).copied())
+        .and_then(|s| state.last_input_tokens.lock().ok()?.get(s))
         .unwrap_or(0);
 
     Response::builder()
