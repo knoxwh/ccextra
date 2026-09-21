@@ -274,6 +274,18 @@ pub fn convert_to_openai_chat_with(
         }
     }
 
+    // disable_parallel_tool_use → parallel_tool_calls: false
+    // (对齐 CPA 49eec664;Responses 路径已有同语义。不依赖工具存活,
+    // tool_choice 存在且显式关闭时即写入,OpenAI 默认开无需写 true)
+    if body
+        .get("tool_choice")
+        .and_then(|tc| tc.get("disable_parallel_tool_use"))
+        .and_then(|v| v.as_bool())
+        .unwrap_or(false)
+    {
+        openai.insert("parallel_tool_calls".into(), json!(false));
+    }
+
     // user 参数透传(一致)
     if let Some(user) = body.get("user") {
         openai.insert("user".into(), user.clone());
@@ -1657,6 +1669,29 @@ IMPORTANT: Assist with authorized security testing.
         });
         convert_to_openai_chat(&mut body4, "gpt").unwrap();
         assert!(body4.get("tool_choice").is_none());
+    }
+
+    #[test]
+    fn test_parallel_tool_calls_disabled() {
+        // 对齐 CPA 49eec664:disable_parallel_tool_use → parallel_tool_calls: false
+        let mut body = json!({
+            "model": "test",
+            "messages": [],
+            "tool_choice": {"type": "auto", "disable_parallel_tool_use": true},
+            "tools": [{"name": "f", "input_schema": {"type": "object"}}]
+        });
+        convert_to_openai_chat(&mut body, "gpt").unwrap();
+        assert_eq!(body["parallel_tool_calls"], false);
+
+        // 未显式关闭 → 不写(OpenAI 默认开)
+        let mut body2 = json!({
+            "model": "test",
+            "messages": [],
+            "tool_choice": {"type": "auto"},
+            "tools": [{"name": "f", "input_schema": {"type": "object"}}]
+        });
+        convert_to_openai_chat(&mut body2, "gpt").unwrap();
+        assert!(body2.get("parallel_tool_calls").is_none());
     }
 
     #[test]

@@ -23,12 +23,16 @@ struct CleanOptions {
     remove_gemini_metadata: bool,
     /// enum 值转 string 后强制 type=string(仅 Gemini)
     force_enum_string_type: bool,
+    /// Gemini 直连 parametersJsonSchema 载体:保留 additionalProperties 与
+    /// 标准约束关键字(对齐 CPA CleanJSONSchemaForGeminiJSONSchema / b532db9c)
+    preserve_json_schema_constraints: bool,
 }
 
 /// 占位 reason 属性的描述文本(对齐 CPA placeholderReasonDescription)
 const PLACEHOLDER_REASON_DESCRIPTION: &str = "Brief explanation of why you are calling this tool";
 
-/// Gemini 工具 schema 清洗(对齐 CleanJSONSchemaForGemini)
+/// Gemini 工具 schema 清洗(对齐 CleanJSONSchemaForGeminiJSONSchema:
+/// parametersJsonSchema 载体保留 additionalProperties 与标准约束)
 pub fn clean_json_schema_for_gemini(schema: &Value) -> Value {
     clean_json_schema(
         schema,
@@ -36,6 +40,7 @@ pub fn clean_json_schema_for_gemini(schema: &Value) -> Value {
             add_missing_array_items: true,
             remove_gemini_metadata: true,
             force_enum_string_type: true,
+            preserve_json_schema_constraints: true,
             ..Default::default()
         },
     )
@@ -81,8 +86,11 @@ fn clean_json_schema(schema: &Value, opts: CleanOptions) -> Value {
     convert_enum_values_to_strings(&mut s, opts.force_enum_string_type);
     add_enum_hints(&mut s);
     drop_ignored_enums_to_hints(&mut s, opts);
-    add_additional_properties_hints(&mut s);
-    move_constraints_to_description(&mut s, opts);
+    // 保留模式下 additionalProperties 与约束原样保留(对齐 CPA b532db9c)
+    if !opts.preserve_json_schema_constraints {
+        add_additional_properties_hints(&mut s);
+        move_constraints_to_description(&mut s, opts);
+    }
     if opts.antigravity_semantics {
         move_not_to_description(&mut s);
     }
@@ -786,9 +794,15 @@ fn flatten_type_arrays(schema: &mut Value, preserve_native_nullable: bool) {
 
 /// 对齐 CPA removeUnsupportedKeywords:删除不受支持的关键字与 x-* 扩展
 fn remove_unsupported_keywords(schema: &mut Value, opts: CleanOptions) {
-    let mut keywords: Vec<&str> = UNSUPPORTED_CONSTRAINTS.to_vec();
-    if opts.antigravity_semantics {
-        keywords.extend(["minimum", "maximum", "multipleOf"]);
+    let mut keywords: Vec<&str> = Vec::new();
+    // 保留模式下约束与 additionalProperties 原样保留(对齐 CPA b532db9c:
+    // preserveStandardConstraints 时 constraintKeywords 为空,additionalProperties 跳过删除)
+    if !opts.preserve_json_schema_constraints {
+        keywords.extend(UNSUPPORTED_CONSTRAINTS);
+        if opts.antigravity_semantics {
+            keywords.extend(["minimum", "maximum", "multipleOf"]);
+        }
+        keywords.push("additionalProperties");
     }
     keywords.extend([
         "$schema",
@@ -798,7 +812,6 @@ fn remove_unsupported_keywords(schema: &mut Value, opts: CleanOptions) {
         "$ref",
         "$id",
         "id",
-        "additionalProperties",
         "$anchor",
         "$vocabulary",
         "$dynamicRef",
@@ -814,6 +827,11 @@ fn remove_unsupported_keywords(schema: &mut Value, opts: CleanOptions) {
         "prefill",
         "deprecated",
         "encrypted",
+        // 对齐 CPA c93978c4:补充剥离不支持关键字
+        "additionalItems",
+        "unevaluatedProperties",
+        "unevaluatedItems",
+        "contentSchema",
     ]);
     if opts.antigravity_semantics {
         keywords.push("not");
@@ -1006,6 +1024,10 @@ fn add_empty_schema_placeholder(schema: &mut Value) {
 /// 2. 剥离 property 的 boolean required,提升到父级 required 数组
 /// 3. 工具 array 缺 items 时补 string items(对齐 CPA addMissingArrayItems)
 fn normalize_malformed_schema_objects(schema: Value, add_missing_array_items: bool) -> Value {
+    // 根节点布尔 true → 空对象 schema(对齐 CPA c93978c4;false 原样返回)
+    if schema == Value::Bool(true) {
+        return json!({});
+    }
     let Value::Object(root_map) = schema else {
         return schema;
     };
@@ -1025,6 +1047,10 @@ fn normalize_malformed_schema_objects(schema: Value, add_missing_array_items: bo
                 return Value::Object(wrapped);
             }
             return Value::Object(root_map);
+        }
+        // {"schema": true} → {"schema": {}}(对齐 CPA c93978c4)
+        if root_map.get("schema") == Some(&Value::Bool(true)) {
+            return json!({"schema": {}});
         }
     }
 
@@ -1140,6 +1166,11 @@ fn repair_schema_node(
     }
 
     // 3. 递归进 items/additionalProperties/patternProperties 等容器
+    // items 布尔 true → 空对象 schema(对齐 CPA c93978c4)
+    if clone.get("items") == Some(&Value::Bool(true)) {
+        clone.insert("items".to_string(), json!({}));
+        modified = true;
+    }
     if let Some(Value::Object(items)) = clone.remove("items") {
         let (repaired, items_mod) = repair_schema_node(items, add_missing_array_items);
         clone.insert("items".to_string(), Value::Object(repaired));
@@ -1182,6 +1213,12 @@ fn repair_schema_node(
         "contentSchema",
         "additionalItems",
     ] {
+        // 布尔 true 子 schema → 空对象(对齐 CPA c93978c4)
+        if clone.get(*key) == Some(&Value::Bool(true)) {
+            clone.insert(key.to_string(), json!({}));
+            modified = true;
+            continue;
+        }
         if let Some(Value::Object(sub_val)) = clone.remove(*key) {
             let (repaired, sub_mod) = repair_schema_node(sub_val, add_missing_array_items);
             clone.insert(key.to_string(), Value::Object(repaired));
@@ -1201,7 +1238,8 @@ fn repair_schema_node(
         }
     }
 
-    for key in &["$defs", "definitions", "dependentSchemas"] {
+    // dependencies 同为定义遍历关键字(对齐 CPA c93978c4)
+    for key in &["$defs", "definitions", "dependentSchemas", "dependencies"] {
         if let Some(Value::Object(defs_val)) = clone.remove(*key) {
             let mut repaired_defs = Map::new();
             let mut defs_modified = false;
@@ -1214,6 +1252,11 @@ fn repair_schema_node(
                         defs_modified = true;
                         modified = true;
                     }
+                } else if dv == Value::Bool(true) {
+                    // 布尔 true 定义 → 空对象(对齐 CPA c93978c4)
+                    repaired_defs.insert(dk, json!({}));
+                    defs_modified = true;
+                    modified = true;
                 } else {
                     repaired_defs.insert(dk, dv);
                 }
@@ -1239,6 +1282,12 @@ fn repair_property_map(
 
     for (k, v) in props {
         let Value::Object(mut child_map) = v else {
+            // 布尔 true 属性值 → 空对象(对齐 CPA c93978c4)
+            if v == Value::Bool(true) {
+                out.insert(k, json!({}));
+                modified = true;
+                continue;
+            }
             out.insert(k, v);
             continue;
         };
@@ -1274,6 +1323,10 @@ fn repair_schema_list(list: Vec<Value>, add_missing_array_items: bool) -> (Vec<V
             if item_mod {
                 list_modified = true;
             }
+        } else if item == Value::Bool(true) {
+            // 布尔 true 分支 → 空对象(对齐 CPA c93978c4)
+            repaired.push(json!({}));
+            list_modified = true;
         } else {
             repaired.push(item);
         }
@@ -1384,16 +1437,14 @@ mod tests {
         let out = clean_json_schema_for_gemini(&schema);
         assert!(out.get("title").is_none());
         assert!(out.get("$schema").is_none());
-        assert!(out.get("additionalProperties").is_none());
+        // 对齐 CPA b532db9c:Gemini 直连保留 additionalProperties,不再加提示
+        assert_eq!(out["additionalProperties"], json!(false));
         assert!(out.get("encrypted").is_none());
-        assert!(out["description"]
-            .as_str()
-            .unwrap()
-            .contains("No extra properties allowed"));
+        assert!(out.get("description").is_none());
         let p = &out["properties"]["p"];
-        assert!(p.get("format").is_none());
+        // format 属标准约束,保留(对齐 CPA b532db9c)
+        assert_eq!(p["format"], "date");
         assert!(p.get("nullable").is_none());
-        assert!(p["description"].as_str().unwrap().contains("format: date"));
     }
 
     #[test]
@@ -1566,11 +1617,11 @@ mod tests {
     }
 
     #[test]
-    fn test_gemini_keeps_additional_properties_hint_then_removes_key() {
+    fn test_gemini_keeps_additional_properties_schema_valued() {
         let schema = json!({"type": "object", "additionalProperties": {"type": "string"}});
         let out = clean_json_schema_for_gemini(&schema);
-        // 非 false 的 additionalProperties 无提示,仅删键
-        assert!(out.get("additionalProperties").is_none());
+        // 对齐 CPA b532db9c:schema 形态的 additionalProperties 原样保留
+        assert_eq!(out["additionalProperties"]["type"], "string");
         assert!(out.get("description").is_none());
     }
 
@@ -1702,14 +1753,140 @@ mod tests {
             "required": ["tags"],
             "additionalProperties": false
         });
+        // Antigravity 语义不变:contains 剥离搬提示
+        let out = clean_json_schema_for_antigravity(&input);
+        let tags = &out["properties"]["tags"];
+        assert!(tags.get("contains").is_none());
+        let desc = tags["description"].as_str().unwrap_or("");
+        assert!(desc.contains("contains"), "desc: {desc}");
+        // Gemini 直连保留标准约束(对齐 CPA b532db9c)
+        let out = clean_json_schema_for_gemini(&input);
+        let tags = &out["properties"]["tags"];
+        assert_eq!(tags["contains"]["enum"], json!(["x"]));
+        assert!(tags.get("description").is_none());
+    }
+
+    #[test]
+    fn test_gemini_preserves_constraints_and_additional_properties() {
+        // 对齐 CPA b532db9c(Issue #5959):parametersJsonSchema 载体保留
+        // additionalProperties 与 pattern/minLength/maxLength 等标准约束
+        let input = json!({
+            "$schema": "https://json-schema.org/draft/2020-12/schema",
+            "title": "SubmitTool",
+            "type": "object",
+            "additionalProperties": false,
+            "properties": {
+                "recipient": {
+                    "type": "string",
+                    "pattern": "^(alice|bob)$",
+                    "minLength": 3,
+                    "maxLength": 10
+                },
+                "nested": {
+                    "type": "object",
+                    "additionalProperties": false,
+                    "properties": {"tag": {"type": "string", "pattern": "^[a-z]+$"}}
+                },
+                "items_list": {
+                    "type": "array",
+                    "items": {"type": "string", "pattern": "^[0-9]+$"}
+                }
+            },
+            "required": ["recipient"]
+        });
+        let out = clean_json_schema_for_gemini(&input);
+        assert_eq!(out["additionalProperties"], json!(false));
+        assert_eq!(out["properties"]["recipient"]["pattern"], "^(alice|bob)$");
+        assert_eq!(out["properties"]["recipient"]["minLength"], 3);
+        assert_eq!(out["properties"]["recipient"]["maxLength"], 10);
+        assert_eq!(
+            out["properties"]["nested"]["additionalProperties"],
+            json!(false)
+        );
+        assert_eq!(
+            out["properties"]["nested"]["properties"]["tag"]["pattern"],
+            "^[a-z]+$"
+        );
+        assert_eq!(
+            out["properties"]["items_list"]["items"]["pattern"],
+            "^[0-9]+$"
+        );
+        // 元数据仍剥离
+        assert!(out.get("$schema").is_none());
+        assert!(out.get("title").is_none());
+        // 无约束提示
+        assert!(out.get("description").is_none());
+        assert!(out["properties"]["recipient"].get("description").is_none());
+    }
+
+    #[test]
+    fn test_boolean_true_subschemas_normalized_to_empty_object() {
+        // 对齐 CPA c93978c4:布尔 true 子 schema 归一化为 {}
+        let input = json!({
+            "type": "object",
+            "properties": {
+                "open": true,
+                "closed": {"type": "string"},
+                "list": {"type": "array", "items": true},
+                "branchy": {"anyOf": [true, {"type": "string"}]}
+            },
+            "$defs": {"free": true, "shaped": {"type": "number"}},
+            "dependencies": {"dep": true}
+        });
         for out in [
-            clean_json_schema_for_antigravity(&input),
             clean_json_schema_for_gemini(&input),
+            clean_json_schema_for_antigravity(&input),
         ] {
-            let tags = &out["properties"]["tags"];
-            assert!(tags.get("contains").is_none());
-            let desc = tags["description"].as_str().unwrap_or("");
-            assert!(desc.contains("contains"), "desc: {desc}");
+            assert_eq!(out["properties"]["open"], json!({}));
+            assert_eq!(out["properties"]["closed"]["type"], "string");
+            assert_eq!(out["properties"]["list"]["items"], json!({}));
+            // anyOf 布尔分支归一化后被展平,取最强对象分支
+            let branchy = &out["properties"]["branchy"];
+            assert!(branchy.get("anyOf").is_none());
+            assert_eq!(branchy["type"], "string");
+            // $defs 归一化发生在剥离前,最终输出仍剥离 $defs;
+            // dependencies 不剥离,布尔条目归一化可观测
+            assert!(out.get("$defs").is_none());
+            assert_eq!(out["dependencies"]["dep"], json!({}));
+        }
+    }
+
+    #[test]
+    fn test_root_boolean_true_normalized() {
+        // 根节点与包裹层布尔 true → {}
+        assert_eq!(clean_json_schema_for_gemini(&json!(true)), json!({}));
+        assert_eq!(
+            clean_json_schema_for_gemini(&json!({"schema": true})),
+            json!({"schema": {}})
+        );
+        // false 原样返回
+        assert_eq!(clean_json_schema_for_gemini(&json!(false)), json!(false));
+    }
+
+    #[test]
+    fn test_new_unsupported_keywords_stripped() {
+        // 对齐 CPA c93978c4:additionalItems/unevaluated*/contentSchema 剥离
+        let input = json!({
+            "type": "object",
+            "properties": {
+                "p": {
+                    "type": "array",
+                    "additionalItems": {"type": "string"},
+                    "unevaluatedProperties": {"type": "string"},
+                    "unevaluatedItems": {"type": "string"},
+                    "contentSchema": {"type": "string"}
+                }
+            }
+        });
+        for out in [
+            clean_json_schema_for_gemini(&input),
+            clean_json_schema_for_antigravity(&input),
+        ] {
+            let p = &out["properties"]["p"];
+            assert!(p.get("additionalItems").is_none());
+            assert!(p.get("unevaluatedProperties").is_none());
+            assert!(p.get("unevaluatedItems").is_none());
+            assert!(p.get("contentSchema").is_none());
         }
     }
 

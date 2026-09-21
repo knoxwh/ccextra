@@ -107,10 +107,10 @@ Gemini 请求的对话表示。`contents` 是回合数组，`parts` 可含 text�
 Antigravity 请求的外层对象，含 `model`、`request`、`project`、`requestId`、`requestType` 和 `userAgent`。实际 Gemini body 位于 `request`。
 
 **VALIDATED 工具模式**
-Antigravity Claude 模型使用的函数调用模式。其工具 schema 需要可验证的 object properties，因此清洗器会补必要占位字段。
+Gemini 函数调用模式。Antigravity Claude 模型强制使用；Gemini 直连在任一工具带 `strict: true` 且 tool_choice 为 auto/缺省时使用。其工具 schema 需要可验证的 object properties，因此清洗器会补必要占位字段。
 
 **schema 清洗**
-将 Anthropic `input_schema` 转成 Gemini 或 Antigravity 可接受 JSON Schema 的递归过程。它内联本地引用、移除不支持关键字、处理 enum 和 required，并为不同目标采用不同规则。
+将 Anthropic `input_schema` 转成 Gemini 或 Antigravity 可接受 JSON Schema 的递归过程。它内联本地引用、移除不支持关键字、归一化布尔 `true` 子 schema、处理 enum 和 required，并为不同目标采用不同规则；Gemini 直连保留 `additionalProperties` 与标准约束，Antigravity 搬入 description 提示。
 
 **OAuth 动态 provider**
 由保存的 Antigravity 或 xAI 凭证生成的运行时 provider。Antigravity 后台刷新模型，xAI 在启动和重载时扫描、刷新凭证。

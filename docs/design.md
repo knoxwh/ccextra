@@ -61,7 +61,7 @@ ccextra 将 Anthropic Messages 入口接到不同上游协议，同时尽量保�
 
 ### OpenAI Chat
 
-Anthropic `system` 成为 system message；o 系列（`o1-mini`/`o1-preview` 除外）、GPT-5 族、`gpt-6-astra` 及其日期快照改用 `developer`。这些模型把 `max_tokens` 改发为 `max_completion_tokens`；o 系列删除 `temperature`，GPT-5 仅在 `gpt-5.1`/`gpt-5.2`/`gpt-5.4` 无 reasoning 时保留采样，Astra 永不发 `temperature`/`top_p`。全量 `openai_chat` 模型剥除 Claude system triggers 与 prompt reminder。Kimi K2.8 模型（`kimi-k2.8`/`kimi-k2.8-code`）将 reasoning 映射为 `thinking.type`/`effort`，显式 `none` 绕过 clamp，并守卫 temperature（disabled 限 0.6，enabled/default 限 1.0）。用户、助手、图片、工具调用和工具结果转换为 Chat Completions 形状。`thinking` 映射为受模型能力限制的 `reasoning_effort` 或兼容的 reasoning 内容。无等价物的 Claude server-side web search 工具会删除。
+Anthropic `system` 成为 system message；o 系列（`o1-mini`/`o1-preview` 除外）、GPT-5 族、`gpt-6-astra` 及其日期快照改用 `developer`。这些模型把 `max_tokens` 改发为 `max_completion_tokens`；o 系列删除 `temperature`，GPT-5 仅在 `gpt-5.1`/`gpt-5.2`/`gpt-5.4` 无 reasoning 时保留采样，Astra 永不发 `temperature`/`top_p`。全量 `openai_chat` 模型剥除 Claude system triggers 与 prompt reminder。Kimi K2.8 模型（`kimi-k2.8`/`kimi-k2.8-code`）将 reasoning 映射为 `thinking.type`/`effort`，显式 `none` 绕过 clamp，并守卫 temperature（disabled 限 0.6，enabled/default 限 1.0）。用户、助手、图片、工具调用和工具结果转换为 Chat Completions 形状。`tool_choice.disable_parallel_tool_use` 映射为 `parallel_tool_calls: false`（未显式关闭不写，OpenAI 默认开）。`thinking` 映射为受模型能力限制的 `reasoning_effort` 或兼容的 reasoning 内容。无等价物的 Claude server-side web search 工具会删除。
 
 ### OpenAI Responses
 
@@ -69,7 +69,7 @@ Anthropic `system` 成为 system message；o 系列（`o1-mini`/`o1-preview` 除
 
 ### Gemini 与 Antigravity
 
-两条路径共享 Gemini `contents`、`parts`、`functionCall` 和 `functionResponse` 模型，剥离 Claude system triggers。工具 schema 会清理本地引用和不支持关键字，规范化 `responseJsonSchema` 为 `responseSchema`；工具结果强制字符串化为 `response.result`；user turn 尾部文本重排至 `functionResponse` 前。Gemini 使用 API key 和 Google 端点。Antigravity 额外套 `model`、`request`、`project`、`requestId` 等信封；Claude 模型使用 `VALIDATED` 工具模式，冲突工具名加 `external_` 前缀；`gemini-3.5-flash-lite` 限制 `max_completion_tokens` 上限为 65535。
+两条路径共享 Gemini `contents`、`parts`、`functionCall` 和 `functionResponse` 模型，剥离 Claude system triggers。工具 schema 会清理本地引用和不支持关键字（含 `additionalItems`/`unevaluated*`/`contentSchema`），布尔 `true` 子 schema 归一化为空对象；Gemini 直连的 `parametersJsonSchema` 保留 `additionalProperties` 与 `pattern`/`minLength` 等标准约束，Antigravity 仍搬入 description 提示。任一工具带 `strict: true` 且 tool_choice 为 auto/缺省时，Gemini 直连使用 `VALIDATED` 工具模式（Antigravity 的 `VALIDATED` 仅由 Claude 模型触发）。规范化 `responseJsonSchema` 为 `responseSchema`；工具结果强制字符串化为 `response.result`；user turn 尾部文本重排至 `functionResponse` 前。Gemini 使用 API key 和 Google 端点。Antigravity 额外套 `model`、`request`、`project`、`requestId` 等信封；Claude 模型使用 `VALIDATED` 工具模式，冲突工具名加 `external_` 前缀；`gemini-3.5-flash-lite` 限制 `max_completion_tokens` 上限为 65535。
 
 ### 各协议 System 提示词清洗差异矩阵
 

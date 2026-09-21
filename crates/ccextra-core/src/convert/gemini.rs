@@ -227,7 +227,20 @@ pub fn convert_to_gemini_with_registry(
     }
 
     // tool_choice(对齐 CPA:auto/none/any/tool,名称清洗后与声明一致)
-    if let Some(tool_choice) = body.get("tool_choice") {
+    // strict 工具触发 VALIDATED(对齐 CPA f247e2b0,仅 Gemini 直连;
+    // Antigravity 的 VALIDATED 由 claude 模型触发,不随 strict)
+    let has_strict_tool = flavor == SchemaFlavor::Gemini
+        && body
+            .get("tools")
+            .and_then(|t| t.as_array())
+            .map(|tools| {
+                tools
+                    .iter()
+                    .any(|t| t.get("strict") == Some(&Value::Bool(true)))
+            })
+            .unwrap_or(false);
+    let tool_choice = body.get("tool_choice").filter(|tc| !tc.is_null());
+    if let Some(tool_choice) = tool_choice {
         let (choice_type, choice_name) = match tool_choice {
             Value::Object(obj) => (
                 obj.get("type").and_then(|t| t.as_str()).unwrap_or(""),
@@ -238,7 +251,8 @@ pub fn convert_to_gemini_with_registry(
         };
         match choice_type {
             "auto" => {
-                gemini["toolConfig"]["functionCallingConfig"]["mode"] = serde_json::json!("AUTO");
+                let mode = if has_strict_tool { "VALIDATED" } else { "AUTO" };
+                gemini["toolConfig"]["functionCallingConfig"]["mode"] = serde_json::json!(mode);
             }
             "none" => {
                 gemini["toolConfig"]["functionCallingConfig"]["mode"] = serde_json::json!("NONE");
@@ -273,6 +287,9 @@ pub fn convert_to_gemini_with_registry(
             }
             _ => {}
         }
+    } else if has_strict_tool && gemini.get("tools").is_some() {
+        // 缺省/null tool_choice + strict 工具 → VALIDATED(对齐 CPA f247e2b0)
+        gemini["toolConfig"]["functionCallingConfig"]["mode"] = serde_json::json!("VALIDATED");
     }
 
     (gemini, short_to_original)
@@ -825,6 +842,68 @@ IMPORTANT: Assist with authorized security testing.
     }
 
     #[test]
+    fn test_strict_tool_maps_to_validated_mode() {
+        // 对齐 CPA f247e2b0:strict 工具 + auto/缺省 tool_choice → VALIDATED(仅 Gemini 直连)
+        let strict_base = |tc: Value| {
+            json!({
+                "model": "m", "max_tokens": 100,
+                "tool_choice": tc,
+                "tools": [{"name": "Read", "strict": true, "input_schema": {"type": "object"}}],
+                "messages": [{"role": "user", "content": "hi"}]
+            })
+        };
+
+        // 显式 auto + strict → VALIDATED
+        let (g, _) = convert_to_gemini(&strict_base(json!({"type": "auto"})), "m");
+        assert_eq!(
+            g["toolConfig"]["functionCallingConfig"]["mode"],
+            "VALIDATED"
+        );
+
+        // 缺省 tool_choice + strict → VALIDATED
+        let mut no_choice = strict_base(json!({"type": "auto"}));
+        no_choice.as_object_mut().unwrap().remove("tool_choice");
+        let (g, _) = convert_to_gemini(&no_choice, "m");
+        assert_eq!(
+            g["toolConfig"]["functionCallingConfig"]["mode"],
+            "VALIDATED"
+        );
+
+        // null tool_choice + strict → VALIDATED
+        let (g, _) = convert_to_gemini(&strict_base(Value::Null), "m");
+        assert_eq!(
+            g["toolConfig"]["functionCallingConfig"]["mode"],
+            "VALIDATED"
+        );
+
+        // none/any 不受 strict 影响
+        let (g, _) = convert_to_gemini(&strict_base(json!({"type": "none"})), "m");
+        assert_eq!(g["toolConfig"]["functionCallingConfig"]["mode"], "NONE");
+        let (g, _) = convert_to_gemini(&strict_base(json!({"type": "any"})), "m");
+        assert_eq!(g["toolConfig"]["functionCallingConfig"]["mode"], "ANY");
+
+        // strict:false → AUTO
+        let mut not_strict = strict_base(json!({"type": "auto"}));
+        not_strict["tools"][0]["strict"] = json!(false);
+        let (g, _) = convert_to_gemini(&not_strict, "m");
+        assert_eq!(g["toolConfig"]["functionCallingConfig"]["mode"], "AUTO");
+
+        // Antigravity 不随 strict 触发(VALIDATED 由 claude 模型决定)
+        let (g, _) = convert_to_gemini_with(
+            &strict_base(json!({"type": "auto"})),
+            "gemini-3.8-flash",
+            SchemaFlavor::Antigravity,
+        );
+        assert_eq!(g["toolConfig"]["functionCallingConfig"]["mode"], "AUTO");
+
+        // strict 不外泄进 functionDeclarations
+        let (g, _) = convert_to_gemini(&strict_base(json!({"type": "auto"})), "m");
+        assert!(g["tools"][0]["functionDeclarations"][0]
+            .get("strict")
+            .is_none());
+    }
+
+    #[test]
     fn test_convert_tool_definitions_uses_parameters_json_schema() {
         let tools = vec![json!({
             "name": "Read",
@@ -842,11 +921,9 @@ IMPORTANT: Assist with authorized security testing.
         assert_eq!(gemini_tools[0]["name"], "Read");
         // 对齐 CPA:parametersJsonSchema 承载,深度清洗后不转小写 type
         let schema = &gemini_tools[0]["parametersJsonSchema"];
-        assert!(schema.get("additionalProperties").is_none());
-        assert!(schema["description"]
-            .as_str()
-            .unwrap()
-            .contains("No extra properties allowed"));
+        // 对齐 CPA b532db9c:Gemini 直连保留 additionalProperties,不再加提示
+        assert_eq!(schema["additionalProperties"], json!(false));
+        assert!(schema.get("description").is_none());
         assert_eq!(schema["properties"]["path"]["type"], "STRING");
         assert!(gemini_tools[0].get("input_schema").is_none());
         assert!(gemini_tools[0].get("cache_control").is_none());
