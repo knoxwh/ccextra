@@ -1242,55 +1242,37 @@ IMPORTANT: Assist with authorized security testing.
         assert_eq!(body["messages"][2]["content"][0]["type"], "image_url");
     }
 
-    #[test]
-    fn test_tool_result_empty_string_fallback() {
-        let mut body = json!({
+    fn make_tool_result_body(content: serde_json::Value) -> serde_json::Value {
+        json!({
             "model": "test",
             "messages": [
                 {"role": "assistant", "content": [
                     {"type": "tool_use", "id": "t1", "name": "f", "input": {}}
                 ]},
                 {"role": "user", "content": [
-                    {"type": "tool_result", "tool_use_id": "t1", "content": ""}
+                    {"type": "tool_result", "tool_use_id": "t1", "content": content}
                 ]}
             ]
-        });
+        })
+    }
+
+    #[test]
+    fn test_tool_result_empty_string_fallback() {
+        let mut body = make_tool_result_body(json!(""));
         convert_to_openai_chat(&mut body, "gpt").unwrap();
         assert_eq!(body["messages"][1]["content"], "(no output)");
     }
 
     #[test]
     fn test_tool_result_empty_array_fallback() {
-        let mut body = json!({
-            "model": "test",
-            "messages": [
-                {"role": "assistant", "content": [
-                    {"type": "tool_use", "id": "t1", "name": "f", "input": {}}
-                ]},
-                {"role": "user", "content": [
-                    {"type": "tool_result", "tool_use_id": "t1", "content": []}
-                ]}
-            ]
-        });
+        let mut body = make_tool_result_body(json!([]));
         convert_to_openai_chat(&mut body, "gpt").unwrap();
         assert_eq!(body["messages"][1]["content"], "(no output)");
     }
 
     #[test]
     fn test_tool_result_whitespace_only_fallback() {
-        let mut body = json!({
-            "model": "test",
-            "messages": [
-                {"role": "assistant", "content": [
-                    {"type": "tool_use", "id": "t1", "name": "f", "input": {}}
-                ]},
-                {"role": "user", "content": [
-                    {"type": "tool_result", "tool_use_id": "t1", "content": [
-                        {"type": "text", "text": "  \n  "}
-                    ]}
-                ]}
-            ]
-        });
+        let mut body = make_tool_result_body(json!([{"type": "text", "text": "  \n  "}]));
         convert_to_openai_chat(&mut body, "gpt").unwrap();
         // 对齐 sub2api:文本过滤仅精确空串,纯空白保留原样
         assert_eq!(body["messages"][1]["content"], "  \n  ");

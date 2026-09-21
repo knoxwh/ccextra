@@ -847,38 +847,31 @@ mod tests {
     }
 
     #[test]
-    fn test_proxy_priority_provider_overrides_global() {
-        let client = UpstreamClient::new(Some("http://global-proxy:8080".into()));
-        let resolved = client.resolve_proxy(Some("http://provider-proxy:9090"));
-        assert_eq!(resolved, "http://provider-proxy:9090");
-    }
-
-    #[test]
-    fn test_proxy_priority_direct_overrides_global() {
-        let client = UpstreamClient::new(Some("http://global-proxy:8080".into()));
-        let resolved = client.resolve_proxy(Some("direct"));
-        assert_eq!(resolved, "direct");
-    }
-
-    #[test]
-    fn test_proxy_priority_empty_string_is_direct() {
-        let client = UpstreamClient::new(Some("http://global-proxy:8080".into()));
-        let resolved = client.resolve_proxy(Some(""));
-        assert_eq!(resolved, "direct");
-    }
-
-    #[test]
-    fn test_proxy_priority_none_uses_global() {
-        let client = UpstreamClient::new(Some("http://global-proxy:8080".into()));
-        let resolved = client.resolve_proxy(None);
-        assert_eq!(resolved, "http://global-proxy:8080");
-    }
-
-    #[test]
-    fn test_proxy_priority_none_and_no_global_is_direct() {
-        let client = UpstreamClient::new(None);
-        let resolved = client.resolve_proxy(None);
-        assert_eq!(resolved, "direct");
+    fn test_proxy_priority() {
+        // provider 覆盖 > 全局 > 直连
+        let cases = [
+            (
+                Some("http://global-proxy:8080"),
+                Some("http://provider-proxy:9090"),
+                "http://provider-proxy:9090",
+            ),
+            (Some("http://global-proxy:8080"), Some("direct"), "direct"),
+            (Some("http://global-proxy:8080"), Some(""), "direct"),
+            (
+                Some("http://global-proxy:8080"),
+                None,
+                "http://global-proxy:8080",
+            ),
+            (None, None, "direct"),
+        ];
+        for (global, provider, expected) in cases {
+            let client = UpstreamClient::new(global.map(Into::into));
+            assert_eq!(
+                client.resolve_proxy(provider),
+                expected,
+                "global={global:?}, provider={provider:?}"
+            );
+        }
     }
 
     #[test]

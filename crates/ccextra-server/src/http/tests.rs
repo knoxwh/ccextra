@@ -4,8 +4,6 @@ use crate::http::handlers::models::*;
 use crate::upstream::UpstreamClient;
 use axum::body::{to_bytes, Body};
 use axum::http::{header, HeaderMap, Request, StatusCode};
-use bytes::Bytes;
-use ccextra_core::prompt_cache::inject_prompt_cache_key;
 use ccextra_core::route::{Protocol, ProviderConfig};
 use serde_json::{json, Value};
 use std::sync::atomic::Ordering;
@@ -124,16 +122,6 @@ fn test_should_inject_prompt_cache_key_matrix() {
 }
 
 #[test]
-fn test_chat_grok_gate_preserves_existing_prompt_cache_key() {
-    // 闸门跳过,不调用 inject;已有非空 key 不剥
-    let mut body = json!({"model": "grok-4.6", "prompt_cache_key": "user-key"});
-    if should_inject_prompt_cache_key(true, Protocol::OpenAiChat, "grok-4.6") {
-        inject_prompt_cache_key(&mut body, Some("sess-abc"));
-    }
-    assert_eq!(body["prompt_cache_key"], "user-key");
-}
-
-#[test]
 fn test_openai_outbound_model_invalid_payload_falls_back_in_body() {
     for protocol in [Protocol::OpenAiChat, Protocol::OpenAiResponses] {
         for invalid in [
@@ -175,41 +163,7 @@ fn test_outbound_model_keeps_nonempty_payload_override() {
 }
 
 #[test]
-fn test_claude_relay_preserves_inbound_beta_verbatim() {
-    let headers = headers_with(&[("anthropic-beta", "custom-beta,custom-beta")]);
-    let out = claude_relay_headers(&headers);
-    assert!(relay_has_header_value(
-        &out,
-        "anthropic-beta",
-        "custom-beta,custom-beta"
-    ));
-}
-
-#[test]
-fn test_claude_relay_forwards_custom_headers_and_filters_transport_headers() {
-    let headers = headers_with(&[
-        ("x-custom-header", "custom-value"),
-        ("authorization", "Bearer inbound"),
-        ("x-api-key", "inbound-key"),
-        ("user-agent", "claude-code/inbound"),
-        ("connection", "keep-alive, x-remove-me"),
-        ("x-remove-me", "remove-me"),
-    ]);
-    let out = claude_relay_headers(&headers);
-    assert!(relay_has_header_value(
-        &out,
-        "x-custom-header",
-        "custom-value"
-    ));
-    assert!(!out.contains_key("authorization"));
-    assert!(!out.contains_key("x-api-key"));
-    assert!(!out.contains_key("user-agent"));
-    assert!(!out.contains_key("connection"));
-    assert!(!out.contains_key("x-remove-me"));
-}
-
-#[test]
-fn test_claude_relay_forwards_all_non_transport_headers() {
+fn test_claude_relay_header_filtering() {
     let headers = headers_with(&[
         ("x-custom-header", "custom-value"),
         ("anthropic-beta", "beta-a,beta-a"),
@@ -217,9 +171,10 @@ fn test_claude_relay_forwards_all_non_transport_headers() {
         ("authorization", "Bearer inbound"),
         ("host", "inbound.example"),
         ("content-length", "99"),
-        ("connection", "keep-alive"),
+        ("connection", "keep-alive, x-remove-me"),
         ("transfer-encoding", "chunked"),
         ("user-agent", "claude-code/inbound"),
+        ("x-remove-me", "remove-me"),
     ]);
     let out = claude_relay_headers(&headers);
     assert!(relay_has_header_value(
@@ -240,26 +195,40 @@ fn test_claude_relay_forwards_all_non_transport_headers() {
         "connection",
         "transfer-encoding",
         "user-agent",
+        "x-remove-me",
     ] {
         assert!(!out.contains_key(excluded), "{excluded}");
     }
 }
-#[test]
-fn test_claude_relay_beta_no_redact_when_display_present() {
-    let headers = headers_with(&[("anthropic-beta", "caller-beta")]);
-    let out = claude_relay_headers(&headers);
-    assert!(relay_has_header_value(
-        &out,
-        "anthropic-beta",
-        "caller-beta"
-    ));
-}
 
 #[test]
-fn test_claude_relay_beta_fast_mode() {
-    let headers = HeaderMap::new();
-    let out = claude_relay_headers(&headers);
-    assert!(!out.contains_key("anthropic-beta"));
+fn test_claude_relay_beta_matrix() {
+    // 矩阵覆盖:重合值保留、普通值保留、缺失不补
+    let cases: [(&[&str], Option<&str>); 3] = [
+        (
+            &["custom-beta,custom-beta"],
+            Some("custom-beta,custom-beta"),
+        ),
+        (&["caller-beta"], Some("caller-beta")),
+        (&[], None),
+    ];
+    for (input, expected) in cases {
+        let mut map = HeaderMap::new();
+        for val in input {
+            map.append(
+                axum::http::header::HeaderName::from_static("anthropic-beta"),
+                axum::http::HeaderValue::from_str(val).unwrap(),
+            );
+        }
+        let out = claude_relay_headers(&map);
+        match expected {
+            Some(exp) => assert!(
+                relay_has_header_value(&out, "anthropic-beta", exp),
+                "input={input:?}"
+            ),
+            None => assert!(!out.contains_key("anthropic-beta"), "input={input:?}"),
+        }
+    }
 }
 
 #[test]
@@ -1455,25 +1424,30 @@ async fn test_reload_endpoint() {
     assert!(resp.status() == StatusCode::OK || resp.status().is_server_error());
 }
 
-/// 验证 handle_messages 在上游请求期间不持有配置读锁:
-/// 慢上游(2s 延迟)进行中时,/reload 应能在 500ms 内完成。
+/// 上游等待释放信号时 reload 必须完成,不能依赖固定延迟制造并发窗口。
 #[tokio::test]
 async fn test_reload_completes_while_request_inflight() {
     use tokio::io::AsyncWriteExt;
     use tokio::net::TcpListener;
 
-    // 慢上游:接受连接后延迟 2s 才写响应头
+    // 两个信号分别确认请求到达和允许上游返回;失败退出时自动取消任务。
     let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
     let addr = listener.local_addr().unwrap();
-    tokio::spawn(async move {
-        if let Ok((mut sock, _)) = listener.accept().await {
-            tokio::time::sleep(std::time::Duration::from_secs(2)).await;
-            let _ = sock
-                    .write_all(
-                        b"HTTP/1.1 200 OK\r\ncontent-type: application/json\r\ncontent-length: 2\r\n\r\n{}",
-                    )
-                    .await;
-        }
+    let (req_tx, req_rx) = tokio::sync::oneshot::channel();
+    let (release_tx, release_rx) = tokio::sync::oneshot::channel();
+    let mut tasks = tokio::task::JoinSet::new();
+    tasks.spawn(async move {
+        use tokio::io::AsyncReadExt;
+        let (mut sock, _) = listener.accept().await.unwrap();
+        let mut buf = [0u8; 1024];
+        assert!(sock.read(&mut buf).await.unwrap() > 0);
+        req_tx.send(()).unwrap();
+        release_rx.await.expect("reload 完成前不得释放上游");
+        sock.write_all(
+            b"HTTP/1.1 200 OK\r\ncontent-type: application/json\r\ncontent-length: 2\r\n\r\n{}",
+        )
+        .await
+        .unwrap();
     });
 
     let mut state = mock_state();
@@ -1486,7 +1460,7 @@ async fn test_reload_completes_while_request_inflight() {
 
     // 发起进行中请求,不 await 完成
     let inflight_app = app.clone();
-    tokio::spawn(async move {
+    tasks.spawn(async move {
         let req = Request::builder()
             .uri("/v1/messages")
             .method("POST")
@@ -1500,11 +1474,15 @@ async fn test_reload_completes_while_request_inflight() {
                 .to_string(),
             ))
             .unwrap();
-        let _ = inflight_app.oneshot(req).await;
+        let response = inflight_app.oneshot(req).await.unwrap();
+        assert_eq!(response.status(), StatusCode::OK);
     });
 
-    // 等 handler 进入上游请求阶段(已过路由决策)
-    tokio::time::sleep(std::time::Duration::from_millis(300)).await;
+    // 收到请求后再发 reload;上游仍在等待释放信号。
+    tokio::time::timeout(std::time::Duration::from_secs(2), req_rx)
+        .await
+        .expect("等待上游收到请求超时")
+        .expect("channel 异常");
 
     // /reload 应在 500ms 内完成,不被上游请求的锁阻塞
     let reload_req = Request::builder()
@@ -1517,10 +1495,18 @@ async fn test_reload_completes_while_request_inflight() {
         app.oneshot(reload_req),
     )
     .await;
-    assert!(
-        result.is_ok(),
-        "/reload 超时:handle_messages 在上游请求期间仍持有配置读锁"
-    );
+    let response = result
+        .expect("/reload 超时:handle_messages 在上游请求期间仍持有配置读锁")
+        .unwrap();
+    assert_eq!(response.status(), StatusCode::OK);
+    release_tx.send(()).unwrap();
+    tokio::time::timeout(std::time::Duration::from_secs(2), async {
+        while let Some(result) = tasks.join_next().await {
+            result.unwrap();
+        }
+    })
+    .await
+    .expect("释放上游后请求必须完成");
 }
 
 // ── to_anthropic_error 上游错误透传 ─────────────────────────────────
@@ -1577,77 +1563,14 @@ fn upstream_error_unparseable_falls_back_to_raw() {
     assert_eq!(out["error"]["message"], "<html>502 bad gateway</html>");
 }
 
-#[derive(Clone, Default)]
-struct CapturedUpstream {
-    headers: Arc<StdMutex<Option<HeaderMap>>>,
-    body: Arc<StdMutex<Option<Value>>>,
-}
-
-impl CapturedUpstream {
-    fn record(&self, headers: HeaderMap, body: Bytes) {
-        *self.headers.lock().unwrap() = Some(headers);
-        *self.body.lock().unwrap() = serde_json::from_slice(&body).ok();
-    }
-    fn header(&self, name: &str) -> Option<String> {
-        self.headers.lock().unwrap().as_ref().and_then(|h| {
-            h.get(name)
-                .and_then(|v| v.to_str().ok())
-                .map(str::to_string)
-        })
-    }
-    fn header_values(&self, name: &str) -> Vec<String> {
-        self.headers
-            .lock()
-            .unwrap()
-            .as_ref()
-            .map(|headers| {
-                headers
-                    .get_all(name)
-                    .iter()
-                    .filter_map(|value| value.to_str().ok().map(str::to_string))
-                    .collect()
-            })
-            .unwrap_or_default()
-    }
-    fn has_header(&self, name: &str) -> bool {
-        self.headers
-            .lock()
-            .unwrap()
-            .as_ref()
-            .map(|h| h.contains_key(name))
-            .unwrap_or(false)
-    }
-    fn body(&self) -> Value {
-        self.body.lock().unwrap().clone().unwrap_or(json!({}))
-    }
-}
+use crate::test_support::spawn_captured_server;
 
 #[tokio::test]
 async fn test_claude_relay_forwards_headers_and_overrides_auth() {
-    let captured = CapturedUpstream::default();
-    let handler_cap = captured.clone();
-    let upstream = Router::new().route(
-        "/v1/messages",
-        post(move |headers: HeaderMap, body: Bytes| {
-            let captured = handler_cap.clone();
-            async move {
-                captured.record(headers, body);
-                (
-                    StatusCode::OK,
-                    [(header::CONTENT_TYPE, "application/json")],
-                    "{}",
-                )
-            }
-        }),
-    );
-    let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
-    let upstream_addr = listener.local_addr().unwrap();
-    let server = tokio::spawn(async move {
-        axum::serve(listener, upstream).await.unwrap();
-    });
+    let (server, captured) = spawn_captured_server("/v1/messages", StatusCode::OK, "{}").await;
 
     let state = mock_state();
-    state.providers.write().await[0].set_base_url_for_test(format!("http://{upstream_addr}"));
+    state.providers.write().await[0].set_base_url_for_test(server.url.clone());
     let app = app(state);
     let request = Request::builder()
         .uri("/v1/messages")
@@ -1672,7 +1595,6 @@ async fn test_claude_relay_forwards_headers_and_overrides_auth() {
         ))
         .unwrap();
     let response = app.oneshot(request).await.unwrap();
-    server.abort();
 
     assert_eq!(response.status(), StatusCode::OK);
     assert_eq!(
@@ -1698,30 +1620,15 @@ async fn test_claude_relay_forwards_headers_and_overrides_auth() {
 
 #[tokio::test]
 async fn test_count_tokens_relay_uses_fallback_user_agent() {
-    let captured = CapturedUpstream::default();
-    let handler_cap = captured.clone();
-    let upstream = Router::new().route(
+    let (server, captured) = spawn_captured_server(
         "/v1/messages/count_tokens",
-        post(move |headers: HeaderMap, body: Bytes| {
-            let captured = handler_cap.clone();
-            async move {
-                captured.record(headers, body);
-                (
-                    StatusCode::OK,
-                    [(header::CONTENT_TYPE, "application/json")],
-                    r#"{"input_tokens":123}"#,
-                )
-            }
-        }),
-    );
-    let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
-    let upstream_addr = listener.local_addr().unwrap();
-    let server = tokio::spawn(async move {
-        axum::serve(listener, upstream).await.unwrap();
-    });
+        StatusCode::OK,
+        r#"{"input_tokens":123}"#,
+    )
+    .await;
 
     let state = mock_state();
-    state.providers.write().await[0].set_base_url_for_test(format!("http://{upstream_addr}"));
+    state.providers.write().await[0].set_base_url_for_test(server.url.clone());
     let app = app(state);
     let request = Request::builder()
         .uri("/v1/messages/count_tokens")
@@ -1737,7 +1644,6 @@ async fn test_count_tokens_relay_uses_fallback_user_agent() {
     let response = app.oneshot(request).await.unwrap();
     let status = response.status();
     let body = to_bytes(response.into_body(), 1024).await.unwrap();
-    server.abort();
 
     assert_eq!(status, StatusCode::OK);
     assert_eq!(body, r#"{"input_tokens":123}"#);
@@ -1879,44 +1785,29 @@ async fn test_count_tokens_error_body_transport_failure_preserves_429() {
 
 #[tokio::test]
 async fn test_chat_grok_headers_and_skips_prompt_cache_key() {
-    let captured = CapturedUpstream::default();
-    let handler_cap = captured.clone();
-    let upstream = Router::new().route(
+    let (server, captured) = spawn_captured_server(
         "/chat/completions",
-        post(move |headers: HeaderMap, body: Bytes| {
-            let captured = handler_cap.clone();
-            async move {
-                captured.record(headers, body);
-                (
-                    StatusCode::OK,
-                    [(header::CONTENT_TYPE, "application/json")],
-                    json!({
-                        "id": "chatcmpl_grok",
-                        "model": "grok-4.6",
-                        "choices": [{
-                            "index": 0,
-                            "message": {"role": "assistant", "content": "ok"},
-                            "finish_reason": "stop"
-                        }],
-                        "usage": {"prompt_tokens": 1, "completion_tokens": 1}
-                    })
-                    .to_string(),
-                )
-            }
-        }),
-    );
-    let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
-    let upstream_addr = listener.local_addr().unwrap();
-    let server = tokio::spawn(async move {
-        axum::serve(listener, upstream).await.unwrap();
-    });
+        StatusCode::OK,
+        json!({
+            "id": "chatcmpl_grok",
+            "model": "grok-4.6",
+            "choices": [{
+                "index": 0,
+                "message": {"role": "assistant", "content": "ok"},
+                "finish_reason": "stop"
+            }],
+            "usage": {"prompt_tokens": 1, "completion_tokens": 1}
+        })
+        .to_string(),
+    )
+    .await;
 
     let state = mock_state();
     let provider_yaml = format!(
         r#"
 name: test-grok-chat
 protocol: openai_chat
-base_url: "http://{}"
+base_url: "{}"
 key: sk-test
 proxy_url: "direct"
 prompt_cache_key: true
@@ -1924,7 +1815,7 @@ models:
   - name: grok-4.6
     alias: test-grok-chat
 "#,
-        upstream_addr
+        server.url
     );
     let provider: ProviderConfig = serde_yaml::from_str(&provider_yaml).unwrap();
     state.providers.write().await.push(provider);
@@ -1946,7 +1837,6 @@ models:
         .unwrap();
     let response = app.oneshot(request).await.unwrap();
     let status = response.status();
-    server.abort();
 
     assert_eq!(status, StatusCode::OK);
     let ua = captured.header("user-agent").unwrap_or_default();
@@ -1989,46 +1879,31 @@ models:
 
 #[tokio::test]
 async fn test_responses_grok_still_injects_prompt_cache_key() {
-    let captured = CapturedUpstream::default();
-    let handler_cap = captured.clone();
-    let upstream = Router::new().route(
+    let (server, captured) = spawn_captured_server(
         "/responses",
-        post(move |headers: HeaderMap, body: Bytes| {
-            let captured = handler_cap.clone();
-            async move {
-                captured.record(headers, body);
-                (
-                    StatusCode::OK,
-                    [(header::CONTENT_TYPE, "application/json")],
-                    json!({
-                        "type": "response.completed",
-                        "response": {
-                            "id": "resp_grok",
-                            "model": "grok-4.6",
-                            "output": [{
-                                "type": "message",
-                                "content": [{"type": "output_text", "text": "ok"}]
-                            }],
-                            "usage": {"input_tokens": 1, "output_tokens": 1}
-                        }
-                    })
-                    .to_string(),
-                )
+        StatusCode::OK,
+        json!({
+            "type": "response.completed",
+            "response": {
+                "id": "resp_grok",
+                "model": "grok-4.6",
+                "output": [{
+                    "type": "message",
+                    "content": [{"type": "output_text", "text": "ok"}]
+                }],
+                "usage": {"input_tokens": 1, "output_tokens": 1}
             }
-        }),
-    );
-    let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
-    let upstream_addr = listener.local_addr().unwrap();
-    let server = tokio::spawn(async move {
-        axum::serve(listener, upstream).await.unwrap();
-    });
+        })
+        .to_string(),
+    )
+    .await;
 
     let state = mock_state();
     let provider_yaml = format!(
         r#"
 name: test-grok-responses
 protocol: openai_responses
-base_url: "http://{}"
+base_url: "{}"
 key: sk-test
 proxy_url: "direct"
 prompt_cache_key: true
@@ -2036,7 +1911,7 @@ models:
   - name: grok-4.6
     alias: test-grok-responses
 "#,
-        upstream_addr
+        server.url
     );
     let provider: ProviderConfig = serde_yaml::from_str(&provider_yaml).unwrap();
     state.providers.write().await.push(provider);
@@ -2058,7 +1933,6 @@ models:
         .unwrap();
     let response = app.oneshot(request).await.unwrap();
     let status = response.status();
-    server.abort();
 
     assert_eq!(status, StatusCode::OK);
     let ua = captured.header("user-agent").unwrap_or_default();
@@ -2084,44 +1958,29 @@ models:
 
 #[tokio::test]
 async fn test_chat_payload_override_gpt_to_grok_uses_outbound_model() {
-    let captured = CapturedUpstream::default();
-    let handler_cap = captured.clone();
-    let upstream = Router::new().route(
+    let (server, captured) = spawn_captured_server(
         "/chat/completions",
-        post(move |headers: HeaderMap, body: Bytes| {
-            let captured = handler_cap.clone();
-            async move {
-                captured.record(headers, body);
-                (
-                    StatusCode::OK,
-                    [(header::CONTENT_TYPE, "application/json")],
-                    json!({
-                        "id": "chatcmpl_override",
-                        "model": "grok-4.6",
-                        "choices": [{
-                            "index": 0,
-                            "message": {"role": "assistant", "content": "ok"},
-                            "finish_reason": "stop"
-                        }],
-                        "usage": {"prompt_tokens": 1, "completion_tokens": 1}
-                    })
-                    .to_string(),
-                )
-            }
-        }),
-    );
-    let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
-    let upstream_addr = listener.local_addr().unwrap();
-    let server = tokio::spawn(async move {
-        axum::serve(listener, upstream).await.unwrap();
-    });
+        StatusCode::OK,
+        json!({
+            "id": "chatcmpl_override",
+            "model": "grok-4.6",
+            "choices": [{
+                "index": 0,
+                "message": {"role": "assistant", "content": "ok"},
+                "finish_reason": "stop"
+            }],
+            "usage": {"prompt_tokens": 1, "completion_tokens": 1}
+        })
+        .to_string(),
+    )
+    .await;
 
     let state = mock_state();
     let provider_yaml = format!(
         r#"
 name: test-gpt-to-grok
 protocol: openai_chat
-base_url: "http://{}"
+base_url: "{}"
 key: sk-test
 proxy_url: "direct"
 prompt_cache_key: true
@@ -2129,7 +1988,7 @@ models:
   - name: gpt-4
     alias: test-gpt-to-grok
 "#,
-        upstream_addr
+        server.url
     );
     let provider: ProviderConfig = serde_yaml::from_str(&provider_yaml).unwrap();
     state.providers.write().await.push(provider);
@@ -2158,7 +2017,6 @@ models:
         .unwrap();
     let response = app.oneshot(request).await.unwrap();
     let status = response.status();
-    server.abort();
 
     assert_eq!(status, StatusCode::OK);
     assert_eq!(captured.body()["model"], "grok-4.6");
@@ -2183,44 +2041,29 @@ models:
 
 #[tokio::test]
 async fn test_chat_grok_preserves_inbound_prompt_cache_key() {
-    let captured = CapturedUpstream::default();
-    let handler_cap = captured.clone();
-    let upstream = Router::new().route(
+    let (server, captured) = spawn_captured_server(
         "/chat/completions",
-        post(move |headers: HeaderMap, body: Bytes| {
-            let captured = handler_cap.clone();
-            async move {
-                captured.record(headers, body);
-                (
-                    StatusCode::OK,
-                    [(header::CONTENT_TYPE, "application/json")],
-                    json!({
-                        "id": "chatcmpl_key",
-                        "model": "grok-4.6",
-                        "choices": [{
-                            "index": 0,
-                            "message": {"role": "assistant", "content": "ok"},
-                            "finish_reason": "stop"
-                        }],
-                        "usage": {"prompt_tokens": 1, "completion_tokens": 1}
-                    })
-                    .to_string(),
-                )
-            }
-        }),
-    );
-    let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
-    let upstream_addr = listener.local_addr().unwrap();
-    let server = tokio::spawn(async move {
-        axum::serve(listener, upstream).await.unwrap();
-    });
+        StatusCode::OK,
+        json!({
+            "id": "chatcmpl_key",
+            "model": "grok-4.6",
+            "choices": [{
+                "index": 0,
+                "message": {"role": "assistant", "content": "ok"},
+                "finish_reason": "stop"
+            }],
+            "usage": {"prompt_tokens": 1, "completion_tokens": 1}
+        })
+        .to_string(),
+    )
+    .await;
 
     let state = mock_state();
     let provider_yaml = format!(
         r#"
 name: test-grok-chat-key
 protocol: openai_chat
-base_url: "http://{}"
+base_url: "{}"
 key: sk-test
 proxy_url: "direct"
 prompt_cache_key: true
@@ -2228,7 +2071,7 @@ models:
   - name: grok-4.6
     alias: test-grok-chat-key
 "#,
-        upstream_addr
+        server.url
     );
     let provider: ProviderConfig = serde_yaml::from_str(&provider_yaml).unwrap();
     state.providers.write().await.push(provider);
@@ -2251,7 +2094,6 @@ models:
         .unwrap();
     let response = app.oneshot(request).await.unwrap();
     let status = response.status();
-    server.abort();
 
     assert_eq!(status, StatusCode::OK);
     assert_eq!(captured.body()["prompt_cache_key"], "user-key");
@@ -2259,46 +2101,31 @@ models:
 
 #[tokio::test]
 async fn test_responses_preserves_inbound_prompt_cache_key() {
-    let captured = CapturedUpstream::default();
-    let handler_cap = captured.clone();
-    let upstream = Router::new().route(
+    let (server, captured) = spawn_captured_server(
         "/responses",
-        post(move |headers: HeaderMap, body: Bytes| {
-            let captured = handler_cap.clone();
-            async move {
-                captured.record(headers, body);
-                (
-                    StatusCode::OK,
-                    [(header::CONTENT_TYPE, "application/json")],
-                    json!({
-                        "type": "response.completed",
-                        "response": {
-                            "id": "resp_key",
-                            "model": "grok-4.6",
-                            "output": [{
-                                "type": "message",
-                                "content": [{"type": "output_text", "text": "ok"}]
-                            }],
-                            "usage": {"input_tokens": 1, "output_tokens": 1}
-                        }
-                    })
-                    .to_string(),
-                )
+        StatusCode::OK,
+        json!({
+            "type": "response.completed",
+            "response": {
+                "id": "resp_key",
+                "model": "grok-4.6",
+                "output": [{
+                    "type": "message",
+                    "content": [{"type": "output_text", "text": "ok"}]
+                }],
+                "usage": {"input_tokens": 1, "output_tokens": 1}
             }
-        }),
-    );
-    let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
-    let upstream_addr = listener.local_addr().unwrap();
-    let server = tokio::spawn(async move {
-        axum::serve(listener, upstream).await.unwrap();
-    });
+        })
+        .to_string(),
+    )
+    .await;
 
     let state = mock_state();
     let provider_yaml = format!(
         r#"
 name: test-grok-responses-key
 protocol: openai_responses
-base_url: "http://{}"
+base_url: "{}"
 key: sk-test
 proxy_url: "direct"
 prompt_cache_key: true
@@ -2306,7 +2133,7 @@ models:
   - name: grok-4.6
     alias: test-grok-responses-key
 "#,
-        upstream_addr
+        server.url
     );
     let provider: ProviderConfig = serde_yaml::from_str(&provider_yaml).unwrap();
     state.providers.write().await.push(provider);
@@ -2329,7 +2156,6 @@ models:
         .unwrap();
     let response = app.oneshot(request).await.unwrap();
     let status = response.status();
-    server.abort();
 
     assert_eq!(status, StatusCode::OK);
     assert_eq!(

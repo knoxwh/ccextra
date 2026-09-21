@@ -53,3 +53,82 @@ pub(crate) fn stalled_body() -> Body {
             .chain(futures::stream::pending()),
     )
 }
+
+#[derive(Clone, Default)]
+pub(crate) struct CapturedUpstream {
+    pub headers: std::sync::Arc<std::sync::Mutex<Option<axum::http::HeaderMap>>>,
+    pub body: std::sync::Arc<std::sync::Mutex<Option<serde_json::Value>>>,
+}
+
+impl CapturedUpstream {
+    pub fn record(&self, headers: axum::http::HeaderMap, body: Bytes) {
+        *self.headers.lock().unwrap() = Some(headers);
+        *self.body.lock().unwrap() = serde_json::from_slice(&body).ok();
+    }
+
+    pub fn header(&self, name: &str) -> Option<String> {
+        self.headers.lock().unwrap().as_ref().and_then(|h| {
+            h.get(name)
+                .and_then(|v| v.to_str().ok())
+                .map(str::to_string)
+        })
+    }
+
+    pub fn header_values(&self, name: &str) -> Vec<String> {
+        self.headers
+            .lock()
+            .unwrap()
+            .as_ref()
+            .map(|headers| {
+                headers
+                    .get_all(name)
+                    .iter()
+                    .filter_map(|value| value.to_str().ok().map(str::to_string))
+                    .collect()
+            })
+            .unwrap_or_default()
+    }
+
+    pub fn has_header(&self, name: &str) -> bool {
+        self.headers
+            .lock()
+            .unwrap()
+            .as_ref()
+            .map(|h| h.contains_key(name))
+            .unwrap_or(false)
+    }
+
+    pub fn body(&self) -> serde_json::Value {
+        self.body
+            .lock()
+            .unwrap()
+            .clone()
+            .unwrap_or(serde_json::json!({}))
+    }
+}
+
+pub(crate) async fn spawn_captured_server(
+    route: &str,
+    status: StatusCode,
+    resp_body: impl Into<Bytes>,
+) -> (TestServer, CapturedUpstream) {
+    let captured = CapturedUpstream::default();
+    let cap = captured.clone();
+    let resp_body = resp_body.into();
+    let router = Router::new().route(
+        route,
+        axum::routing::post(move |headers: axum::http::HeaderMap, body: Bytes| {
+            let cap = cap.clone();
+            let resp_body = resp_body.clone();
+            async move {
+                cap.record(headers, body);
+                (
+                    status,
+                    [(axum::http::header::CONTENT_TYPE, "application/json")],
+                    resp_body,
+                )
+            }
+        }),
+    );
+    (TestServer::spawn(router).await, captured)
+}
