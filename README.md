@@ -3,8 +3,8 @@
 # ccextra
 
 <p align="center">
-  <strong>The Intelligent Upstream Proxy for Claude Code.</strong><br>
-  多协议智能路由 · 确定性缓存归一化 · 零损耗直通转发
+  <strong>在 Claude Code 中使用不同上游的模型。</strong><br>
+  一个本地端口，统一接入 Claude、OpenAI、Gemini 与 OAuth 上游。
 </p>
 
 <p align="center">
@@ -30,15 +30,15 @@
 
 </div>
 
-单进程 Rust 高性能代理：将 Claude Code 的 Anthropic Messages 请求无缝路由、转换并转发至多模态上游。
+单进程 Rust 代理。Claude Code 发送 Anthropic Messages 请求，ccextra 按模型别名选择上游，完成协议转换，再返回 Anthropic 格式的 JSON 或 SSE 响应。
 
 ## 核心特性
 
-- **多协议统一中枢**：Claude、OpenAI Chat、OpenAI Responses、Gemini、Antigravity 聚合单端口，按模型 alias 智能分发。
-- **透明直通与精准适配**：`claude` 仅换 `model`；非 Claude 模型自动剥离计费指纹与 Claude 触发段，按 `models.json` 钳制或锁定 (`force_effort`) 推理强度。
-- **确定性缓存优化**：冻结 Schema/工具顺序、历史 reminder、参数键序与尾部空白，消减跨轮会话漂移，最大化上游 Prompt Cache 命中率。
-- **动态凭证与生命周期**：xAI Grok OAuth 动态注入 Responses；Antigravity 凭证后台静默装载与定时轮换。
-- **零停机热重载**：`POST /reload` 毫秒级替换 providers、payload 规则、认证、代理与 reasoning 表。
+- **按模型切换上游**：五种协议共用一个端口，模型别名与实际模型名分开配置。
+- **请求内容稳定化**：归一化工具、schema 和历史内容，减少无意义的跨轮差异；实际缓存命中由上游决定。
+- **模型能力适配**：转换消息、工具调用与图片，按 `models.json` 调整支持的 reasoning 档位。
+- **OAuth 接入**：支持 Antigravity 与 xAI Grok 凭证加载、刷新和动态模型路由。
+- **配置热重载**：无需重启即可发布新配置；进行中的请求继续使用原快照。
 
 ## 架构流向
 
@@ -57,30 +57,25 @@ flowchart LR
 
 | 协议标识 (`protocol`) | 上游目标形态 | 核心适配策略 |
 | :--- | :--- | :--- |
-| `claude` | Anthropic Messages | 极简透传：仅改 `model`；非 Claude 目标自动清洗 system 并钳制 effort。 |
-| `openai_chat` | Chat Completions | 结构映射：转换 messages、工具与图片；适配 Kimi K2.8 思考规范与温度守卫。 |
-| `openai_responses` | Responses | 深度适配：映射 `instructions` 与 `input`；支持 Reasoning Replay 与搜索域过滤。 |
-| `gemini` | Gemini GenerateContent | 原生转换：对齐 Gemini 内容、结构化工具与 schema。 |
-| `antigravity` | Cloud Code Assist | 企业信封：Gemini 格式封装运输信封；可选高性能连接池。 |
+| `claude` | Anthropic Messages | 替换目标模型；非 Claude 模型额外清洗 system、调整 effort。响应正文直通。 |
+| `openai_chat` | Chat Completions | 转换消息、工具和图片；适配 Kimi K2.8 思考参数与温度约束。 |
+| `openai_responses` | Responses | 转换 `instructions` 与 `input`；支持 reasoning replay 和搜索域过滤。 |
+| `gemini` | Gemini GenerateContent | 转换内容块、工具结果和 schema。 |
+| `antigravity` | Cloud Code Assist | 封装 Gemini 请求，处理工具命名和模型输出上限；默认短连接。 |
 
 > **提示**：xAI Grok 通过 OAuth 动态注册为 `openai_responses` provider，无需配置独立协议。
 
-## 快速上手
+## 快速开始
 
-### 1. 编译与启动
+### 1. 编译
 
 ```bash
-# 1. 编译 release 二进制
 cargo build --release
-
-# 2. 复制配置模板并调整
-cp config.example.yaml config.yaml
-
-# 3. 启动代理服务
-./target/release/ccextra --config config.yaml
 ```
 
-### 2. 配置示例 (`config.yaml`)
+### 2. 配置上游
+
+复制 [配置模板](config.example.yaml) 后编辑，或将下面的最小示例保存为 `config.yaml`。替换 `base_url`、`key` 和 `models[].name`，模型名须由你的上游支持。
 
 ```yaml
 server:
@@ -94,24 +89,49 @@ providers:
     key: sk-xxx
     prompt_cache_key: true
     models:
-      - name: gpt-5.6-terra
-        alias: gpt-5.6-terra
+      - name: your-upstream-model
+        alias: coding
 
 normalize:
   enabled: true
   drift_detector: true
+
+logging:
+  level: info
+  request_body: false
+
+secret_key: "replace-with-your-local-key"
 ```
 
-### 3. 连接 Claude Code
+OpenAI 协议的 `base_url` 包含版本前缀（如 `/v1`），不要再附加 `/responses` 或 `/chat/completions`；Claude 协议不包含 `/v1`。
 
-在终端中设置环境变量即可无缝接管：
+### 3. 启动并连接
+
+启动代理：
+
+```bash
+./target/release/ccextra --config config.yaml
+```
+
+另开终端，将认证值换成配置中的本地 key。它与上游 `providers[].key` 分开使用：
 
 ```bash
 export ANTHROPIC_BASE_URL=http://127.0.0.1:8222
-export ANTHROPIC_AUTH_TOKEN=sk-ccextra-xxx  # 配置 secret_key 时填写
+export ANTHROPIC_AUTH_TOKEN=replace-with-your-local-key
+claude --model coding
 ```
 
-> **后台守护**：使用 `build.sh` 快速构建，配合 `start.sh`、`stop.sh`、`restart.sh` 实现后台管理。
+首次加载会将 `secret_key` 转为 bcrypt 并写回配置；客户端仍使用原始明文 key。
+
+检查服务和模型列表：
+
+```bash
+curl http://127.0.0.1:8222/health
+curl -H "Authorization: Bearer $ANTHROPIC_AUTH_TOKEN" \
+  http://127.0.0.1:8222/v1/models
+```
+
+需要后台运行时，使用 `build.sh` 和 `start.sh`、`stop.sh`、`restart.sh`。这些脚本使用根目录 `./ccextra`；`build.sh` 会更新该二进制。
 
 ## 配置参考
 
@@ -140,24 +160,31 @@ export ANTHROPIC_AUTH_TOKEN=sk-ccextra-xxx  # 配置 secret_key 时填写
 
 | 方法与端点 | 权限说明 | 功能描述 |
 | :--- | :--- | :--- |
-| `POST /v1/messages` | 需认证* | 核心消息交互入口，完美对齐 Anthropic 协议与 SSE 流式返回。 |
-| `POST /v1/messages/count_tokens` | 需认证* | 精确/会话估算 Token 计数（Claude 转发精确值，其他协议沿用上轮记录）。 |
+| `POST /v1/messages` | 需认证* | 接收 Anthropic Messages，返回 JSON 或 SSE。 |
+| `POST /v1/messages/count_tokens` | 需认证* | Claude 转发上游计数；其他协议读取会话记录，未命中返回 0。 |
 | `GET /v1/models` | 需认证* | 获取 Anthropic 格式的可用模型列表。 |
-| `GET /health` | 公开 | 节点探活接口，常驻返回 `ok`。 |
-| `POST /reload` | 公开 | 零停机热重载，即刻生效最新配置、路由与 Reasoning 映射。 |
+| `GET /health` | 公开 | 返回 `ok`，不检查上游是否可用。 |
+| `POST /reload` | 公开 | 加载、校验并发布新配置，无需重启。 |
 
 > `*` 注：当配置 `secret_key` 时，带 `*` 的端点须携带 `x-api-key` 或 `Authorization: Bearer` 鉴权。
 
 ## 运行机制
 
-请求自入站起，依次执行：**入口认证 ➔ 智能路由 ➔ 缓存归一化 ➔ 目标协议转换 ➔ Payload 覆写 ➔ Prompt Cache Key 注入 ➔ 上游重试与分发**。
+<details>
+<summary>请求处理、重试与资源边界</summary>
 
-- **流式标准保障**：全流式路径输出标准 Anthropic SSE 事件流；内置 10 秒空闲保活机制（`: keepalive`）。
-- **稳健重试退避**：遭遇网络抖动、429 或 5xx/52x 错误时，在 3 秒总预算内执行指数退避重试，自动顺延多 `base_url` 回退通道。
-- **有界读取**：非流响应 body 限制为成功 16 MiB / 错误 256 KiB，读取停顿 300 秒。成功 body 超限返回 502、停顿返回 504；错误 body 截断或读取失败时保留上游状态码（429/401 不被改写）。
-- **直通保真度**：Claude 协议完整保留客户端透传的身份头与 `anthropic-beta` 字段，杜绝非必要修改。
+请求经过入口认证、模型路由、归一化、协议转换和参数覆盖后发送上游。OpenAI 路径按配置注入 `prompt_cache_key`，Gemini 和 Antigravity 不运行 OpenAI 专用处理。
+
+- **流式响应**：Claude 正文字节直通，其他协议转换为 Anthropic SSE；所有流式路径使用 10 秒 `: keepalive`。
+- **重试**：网络错误、429 和 5xx/52x 使用共享的 3 秒退避预算，并支持多 `base_url` 回退。该预算不是请求总超时，不截断正常生成。
+- **读取边界**：非流成功正文上限 16 MiB，错误正文最多保留 256 KiB，读取 idle 为 300 秒。成功正文超限返回 502、停顿返回 504；错误正文读取异常保留已知状态，再按统一错误规则映射。OAuth、project 和模型读取仍保留 30 秒总超时。
+- **头透传**：Claude 保留允许透传的身份头，排除认证及连接管理等头；`anthropic-beta` 原样透传，缺失时不补。
+
+</details>
 
 ## OAuth 与运维
+
+按需登录上游，或查看已保存的凭证状态：
 
 ```bash
 ./ccextra antigravity-login
@@ -168,7 +195,15 @@ export ANTHROPIC_AUTH_TOKEN=sk-ccextra-xxx  # 配置 secret_key 时填写
 ./scripts/check_grok_quota.sh
 ```
 
-Antigravity 凭证默认在配置文件旁 `.cache/antigravity`，xAI 在 `.cache/xai`。xAI 启动时自动发现；Antigravity 后台加载并每 3 小时刷新模型。改完配置调用 `POST /reload` 生效。
+Antigravity 凭证默认在配置文件旁 `.cache/antigravity`，xAI 在 `.cache/xai`。xAI 启动时自动发现；Antigravity 后台加载并每 3 小时刷新模型。
+
+修改配置或需要立即重新加载凭证时：
+
+```bash
+curl -X POST http://127.0.0.1:8222/reload
+```
+
+加载或校验失败会保留原配置。刷新与删除规则见上方「进阶选项」。
 
 ## 开发与架构分层
 

@@ -3,8 +3,8 @@
 # ccextra
 
 <p align="center">
-  <strong>The Intelligent Upstream Proxy for Claude Code.</strong><br>
-  Multi-Protocol Routing · Deterministic Cache Normalization · Zero-Loss Passthrough
+  <strong>Use models from different providers in Claude Code.</strong><br>
+  One local endpoint for Claude, OpenAI, Gemini, and OAuth providers.
 </p>
 
 <p align="center">
@@ -30,15 +30,15 @@
 
 </div>
 
-Single-process Rust proxy that seamlessly routes, converts, and relays Claude Code Anthropic Messages requests to multi-vendor upstreams.
+A single-process Rust proxy. Claude Code sends Anthropic Messages requests; ccextra selects an upstream by model alias, translates the request, and returns Anthropic-format JSON or SSE responses.
 
 ## Key Features
 
-- **Unified Multi-Protocol Hub**: Claude, OpenAI Chat, OpenAI Responses, Gemini, and Antigravity share a single ingress endpoint, dynamically routed by model alias.
-- **Transparent Passthrough & Exact Adaptation**: `claude` routes swap only `model`; non-Claude models automatically strip billing attribution and Claude triggers, while clamping or pinning (`force_effort`) reasoning depth via `models.json`.
-- **Deterministic Cache Optimization**: Locks down schema/tool order, historical reminders, parameter key ordering, and whitespace to eliminate cross-turn drift and maximize upstream Prompt Cache hit rates.
-- **Dynamic Credentials Lifecycle**: Injects xAI Grok OAuth as Responses providers; quietly loads and refreshes Antigravity credentials on a background timer.
-- **Zero-Downtime Hot Reload**: `POST /reload` updates providers, payload rules, authentication, proxies, and reasoning tables in milliseconds without process restart.
+- **Route by model**: Five protocols share one endpoint. Configure client-facing aliases separately from upstream model names.
+- **Stable request content**: Normalize tools, schemas, and history to reduce incidental changes between turns. Actual cache hits depend on the upstream.
+- **Model adaptation**: Translate messages, tool calls, and images; adjust supported reasoning levels through `models.json`.
+- **OAuth providers**: Load and refresh Antigravity and xAI Grok credentials with dynamic model routing.
+- **Hot reload**: Publish configuration without restarting. In-flight requests keep their original snapshot.
 
 ## Architecture
 
@@ -57,30 +57,25 @@ One process listens on one port. Input is always Anthropic-shaped; every path re
 
 | Protocol (`protocol`) | Upstream API Target | Core Adaptation Strategy |
 | :--- | :--- | :--- |
-| `claude` | Anthropic Messages | Minimal passthrough: swaps only `model`; sanitizes system prompts and clamps effort for non-Claude targets. |
-| `openai_chat` | Chat Completions | Structural translation: converts messages, tools, images; supports Kimi K2.8 reasoning shapes and temperature guards. |
-| `openai_responses` | Responses | Deep integration: converts to `instructions` and `input`; supports reasoning replay and domain filtering for web search. |
-| `gemini` | Gemini GenerateContent | Native mapping: aligns content blocks, structured tools, and strict schema representations. |
-| `antigravity` | Cloud Code Assist | Secure transport: wraps Gemini payloads in Cloud Code envelopes; supports optional high-performance connection pooling. |
+| `claude` | Anthropic Messages | Replace the target model; also sanitize system content and adjust effort for non-Claude models. Response bodies pass through. |
+| `openai_chat` | Chat Completions | Translate messages, tools, and images; adapt Kimi K2.8 thinking parameters and temperature constraints. |
+| `openai_responses` | Responses | Map `instructions` and `input`; support reasoning replay and search domain filtering. |
+| `gemini` | Gemini GenerateContent | Translate content blocks, tool results, and schemas. |
+| `antigravity` | Cloud Code Assist | Wrap Gemini requests, adapt tool names and output limits; use short connections by default. |
 
 > **Note**: xAI Grok is automatically injected as an `openai_responses` provider via OAuth without requiring a distinct protocol.
 
 ## Quick Start
 
-### 1. Build & Run
+### 1. Build
 
 ```bash
-# 1. Build release binary
 cargo build --release
-
-# 2. Copy and configure template
-cp config.example.yaml config.yaml
-
-# 3. Start the proxy
-./target/release/ccextra --config config.yaml
 ```
 
-### 2. Configuration Example (`config.yaml`)
+### 2. Configure an upstream
+
+Copy and edit the [configuration template](config.example.yaml), or save the minimal example below as `config.yaml`. Replace `base_url`, `key`, and `models[].name` with values supported by your upstream.
 
 ```yaml
 server:
@@ -94,24 +89,49 @@ providers:
     key: sk-xxx
     prompt_cache_key: true
     models:
-      - name: gpt-5.6-terra
-        alias: gpt-5.6-terra
+      - name: your-upstream-model
+        alias: coding
 
 normalize:
   enabled: true
   drift_detector: true
+
+logging:
+  level: info
+  request_body: false
+
+secret_key: "replace-with-your-local-key"
 ```
 
-### 3. Connect Claude Code
+For OpenAI protocols, include the version prefix (such as `/v1`) in `base_url`, but not `/responses` or `/chat/completions`. For the Claude protocol, omit `/v1`.
 
-Configure environment variables in your terminal to route traffic:
+### 3. Start and connect
+
+Start the proxy:
+
+```bash
+./target/release/ccextra --config config.yaml
+```
+
+In another terminal, use the local key from your configuration. This key is separate from the upstream `providers[].key`:
 
 ```bash
 export ANTHROPIC_BASE_URL=http://127.0.0.1:8222
-export ANTHROPIC_AUTH_TOKEN=sk-ccextra-xxx  # required when secret_key is enabled
+export ANTHROPIC_AUTH_TOKEN=replace-with-your-local-key
+claude --model coding
 ```
 
-> **Background Management**: Use `build.sh` for fast compilation, paired with `start.sh`, `stop.sh`, and `restart.sh` for daemon control.
+On first load, `secret_key` is hashed with bcrypt and written back to the config. Clients continue to use the original plaintext key.
+
+Check the service and available models:
+
+```bash
+curl http://127.0.0.1:8222/health
+curl -H "Authorization: Bearer $ANTHROPIC_AUTH_TOKEN" \
+  http://127.0.0.1:8222/v1/models
+```
+
+For background operation, use `build.sh` with `start.sh`, `stop.sh`, and `restart.sh`. These scripts use the root-level `./ccextra` binary, which `build.sh` updates.
 
 ## Configuration
 
@@ -140,24 +160,31 @@ See [config.example.yaml](config.example.yaml) for every field. Key points:
 
 | Method & Endpoint | Auth Required* | Description |
 | :--- | :--- | :--- |
-| `POST /v1/messages` | Required* | Primary messaging entrypoint; fully aligns with Anthropic protocols and SSE streaming. |
-| `POST /v1/messages/count_tokens` | Required* | Exact or session-cached token counting (exact for Claude; cached counts for other protocols). |
-| `GET /v1/models` | Required* | Retrieves available models formatted in Anthropic JSON shape. |
-| `GET /health` | Public | Liveness probe returning `ok`. |
-| `POST /reload` | Public | Zero-downtime hot reload for configurations, routes, and reasoning tables. |
+| `POST /v1/messages` | Required* | Accept Anthropic Messages and return JSON or SSE. |
+| `POST /v1/messages/count_tokens` | Required* | Forward Claude counting upstream; use session records for other protocols, returning 0 on a miss. |
+| `GET /v1/models` | Required* | List available models in Anthropic format. |
+| `GET /health` | Public | Return `ok`; does not check upstream availability. |
+| `POST /reload` | Public | Load, validate, and publish configuration without restarting. |
 
 > `*` Note: When `secret_key` is set, endpoints marked with `*` require `x-api-key` or `Authorization: Bearer`.
 
 ## Runtime Pipeline
 
-Inbound requests execute sequentially: **Auth Verification ➔ Smart Routing ➔ Cache Normalization ➔ Protocol Translation ➔ Payload Overrides ➔ Prompt Cache Key Injection ➔ Upstream Relay & Backoff**.
+<details>
+<summary>Request processing, retries, and resource limits</summary>
 
-- **SSE Stream Integrity**: Emits compliant Anthropic SSE events on all streaming paths with an automatic 10-second heartbeat (`: keepalive`).
-- **Resilient Retry Budget**: Retries transient network failures, 429, and 5xx/52x errors with exponential backoff across a 3-second budget while cycling fallback URLs.
-- **Bounded Reads**: Non-stream response bodies are capped at 16 MiB (success) / 256 KiB (errors) with a 300-second read idle. Over-limit success bodies return 502 and stalls return 504; truncated or unreadable error bodies keep the upstream status code (429/401 are not rewritten).
-- **Header Fidelity**: Claude passthrough preserves original ingress identity headers and `anthropic-beta` without unsolicited additions.
+Requests pass through authentication, model routing, normalization, protocol conversion, and parameter overrides before reaching the upstream. OpenAI paths can inject `prompt_cache_key`; Gemini and Antigravity skip OpenAI-specific processing.
+
+- **Streaming**: Claude response bytes pass through; other protocols are converted to Anthropic SSE. All streaming paths use a 10-second `: keepalive`.
+- **Retries**: Network errors, 429, and 5xx/52x share a 3-second backoff budget with multiple `base_url` fallbacks. This is not a total request timeout and does not truncate normal generation.
+- **Read limits**: Non-stream success bodies are capped at 16 MiB, error bodies retain at most 256 KiB, and read idle is 300 seconds. Oversized success bodies return 502; stalls return 504. Error-body read failures retain the known status for normal error mapping. OAuth, project, and model reads retain their 30-second total timeout.
+- **Headers**: Claude forwards permitted identity headers while excluding authentication and connection-management headers. `anthropic-beta` passes through unchanged and is not added when absent.
+
+</details>
 
 ## OAuth and operations
+
+Log in to an upstream or inspect saved credential status:
 
 ```bash
 ./ccextra antigravity-login
@@ -168,7 +195,15 @@ Inbound requests execute sequentially: **Auth Verification ➔ Smart Routing ➔
 ./scripts/check_grok_quota.sh
 ```
 
-Antigravity credentials default to `.cache/antigravity` beside the config file; xAI defaults to `.cache/xai`. xAI loads at startup. Antigravity loads in background and refreshes models every three hours. Call `POST /reload` after config edits.
+Antigravity credentials default to `.cache/antigravity` beside the config file; xAI defaults to `.cache/xai`. xAI loads at startup. Antigravity loads in the background and refreshes models every three hours.
+
+After editing configuration, or to reload credentials immediately:
+
+```bash
+curl -X POST http://127.0.0.1:8222/reload
+```
+
+Configuration load or validation failures preserve the previous configuration. See “Advanced options” above for refresh and removal rules.
 
 ## Development & Architecture
 
