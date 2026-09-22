@@ -18,6 +18,7 @@ reqwest.workspace = true
 futures.workspace = true
 async-stream = "0.3"
 bytes.workspace = true
+zstd.workspace = true
 anyhow.workspace = true
 tracing.workspace = true
 globset.workspace = true

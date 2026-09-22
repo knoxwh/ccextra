@@ -63,7 +63,7 @@ One process listens on one port. Input is always Anthropic-shaped; every path re
 | `gemini` | Gemini GenerateContent | Translate content blocks, tool results, and schemas. |
 | `antigravity` | Cloud Code Assist | Wrap Gemini requests, adapt tool names and output limits; use short connections by default. |
 
-> **Note**: xAI Grok and Codex are automatically injected as `openai_responses` providers via OAuth without requiring a distinct protocol. Codex subscription requests carry the `Chatgpt-Account-Id` identity header automatically.
+> **Note**: xAI Grok and Codex are automatically injected as `openai_responses` providers via OAuth without requiring a distinct protocol. Codex subscription requests carry the `Chatgpt-Account-Id` identity header automatically, and request bodies are zstd-compressed (matching codex CLI defaults).
 
 ## Quick Start
 

@@ -112,7 +112,7 @@ Antigravity 上游默认短连接：空闲连接在响应结束后立即关闭�
 
 `xai-login` 使用 OAuth device flow。启动和配置重载扫描 xAI 凭证，必要时提前刷新 token，并为每份有效凭证注入一个 Responses provider。相对 `auth_dir`、`xai_auth_dir` 和 `models_file` 始终相对配置文件目录解析。缺省 `models.json` 与配置同目录。缺文件或模型未收录时不钳 effort；条目可设 `force_effort` 固定档（生效范围与钳制一致，值不钳制）；解析失败则启动或 `/reload` 报错。
 
-`codex-login` 使用 PKCE 浏览器授权（本地回调端口默认 1455）。凭证保存 `chatgpt_account_id` 与 `chatgpt_plan_type`（取自 ID token 的 `https://api.openai.com/auth` claim）。启动和配置重载扫描 Codex 凭证，token 提前 24 小时刷新（失败重试 3 次，`refresh_token_reused` 不重试），并为每份有效凭证注入一个 Responses provider，上游为 `https://chatgpt.com/backend-api/codex/responses`。请求时自动携带 `Chatgpt-Account-Id` 订阅身份头；静态 API key provider 无该 metadata 不发。`codex_auth_dir` 相对配置文件目录解析。
+`codex-login` 使用 PKCE 浏览器授权（本地回调端口默认 1455）。凭证保存 `chatgpt_account_id` 与 `chatgpt_plan_type`（取自 ID token 的 `https://api.openai.com/auth` claim）。启动和配置重载扫描 Codex 凭证，token 提前 24 小时刷新（失败重试 3 次，`refresh_token_reused` 不重试），并为每份有效凭证注入一个 Responses provider，上游为 `https://chatgpt.com/backend-api/codex/responses`。请求时自动携带 `Chatgpt-Account-Id` 订阅身份头，并对请求体做 zstd 压缩（level 3，对齐 codex CLI `enable_request_compression` 默认行为；压缩在序列化后执行一次，退避重试共享压缩字节）；静态 API key provider 无该 metadata 不发头也不压缩。`codex_auth_dir` 相对配置文件目录解析。
 
 ## 并发、安全与诊断
 

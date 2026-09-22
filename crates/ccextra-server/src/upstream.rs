@@ -39,6 +39,23 @@ fn stream_headers(protocol: Protocol, is_stream: bool) -> Vec<(&'static str, &'s
     ]
 }
 
+/// codex 订阅请求体 zstd 压缩(对齐 codex prepare_encoded_json:level 3,
+/// debug 记录压缩前后字节与耗时)。ccextra 的 codex extra_headers 由
+/// messages.rs 新建仅含 chatgpt-account-id,不存在 Content-Encoding
+/// 冲突路径,故省略 codex 的冲突报错守卫。
+fn compress_request_body(body: bytes::Bytes) -> anyhow::Result<bytes::Bytes> {
+    let started = std::time::Instant::now();
+    let compressed = zstd::stream::encode_all(&body[..], 3)
+        .map_err(|e| anyhow::anyhow!("zstd 压缩请求体失败: {e}"))?;
+    tracing::debug!(
+        pre_bytes = body.len(),
+        post_bytes = compressed.len(),
+        elapsed_ms = started.elapsed().as_millis() as u64,
+        "codex 请求体 zstd 压缩"
+    );
+    Ok(bytes::Bytes::from(compressed))
+}
+
 /// 按协议取上游请求路径
 ///
 /// 版本前缀约定(与 参考实现/OpenAI 一致):anthropic 协议 base_url 不含版本,路径带 /v1;
@@ -415,6 +432,14 @@ impl UpstreamClient {
         let body_bytes = bytes::Bytes::from(
             serde_json::to_vec(body).map_err(|e| anyhow::anyhow!("序列化请求体失败: {e}"))?,
         );
+        // 对齐 codex responses_request_compression:仅 codex OAuth 订阅请求
+        // (uses_codex_backend + openai provider 的等价标记 chatgpt-account-id)
+        // 压缩;压缩一次,stale 重试共享压缩字节(into_prepared 语义)
+        let body_bytes = if extra_headers.contains_key("chatgpt-account-id") {
+            compress_request_body(body_bytes)?
+        } else {
+            body_bytes
+        };
         let upstream_model = body.get("model").and_then(|v| v.as_str()).unwrap_or("");
         match self
             .request_once(
@@ -475,9 +500,9 @@ impl UpstreamClient {
         #[cfg(test)]
         self.attempts.lock().unwrap().push(base_url.to_owned());
         let proxy_key = self.resolve_proxy(provider_proxy);
-        // chatgpt-account-id 仅 Codex OAuth 订阅请求携带,作为禁 redirect 的判定标记
-        let no_redirect = extra_headers.contains_key("chatgpt-account-id");
-        let client = self.client_for(&proxy_key, protocol, no_redirect)?;
+        // chatgpt-account-id 仅 Codex OAuth 订阅请求携带:禁 redirect + zstd 压缩标记
+        let codex_subscription = extra_headers.contains_key("chatgpt-account-id");
+        let client = self.client_for(&proxy_key, protocol, codex_subscription)?;
 
         // Gemini 端点需要替换 {model} 占位符
         let endpoint = endpoint_path(protocol, is_stream);
@@ -542,6 +567,10 @@ impl UpstreamClient {
         }
         // 已编码字节直接发送(对齐 codex prepare_body_for_send:补 Content-Type,
         // Bytes clone 零拷贝);线上字节与 reqwest .json() 等价
+        // codex 订阅请求 body 已在 request() 内 zstd 压缩,声明编码
+        if codex_subscription {
+            req = req.header(reqwest::header::CONTENT_ENCODING, "zstd");
+        }
         let resp = send_with_timeout(
             req.header(reqwest::header::CONTENT_TYPE, "application/json")
                 .body(bytes::Bytes::clone(body)),

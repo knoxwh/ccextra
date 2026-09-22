@@ -35,6 +35,7 @@ reqwest = { version = "0.13", features = ["stream", "json", "socks", "http2", "f
 # Async
 futures = "0.3"
 bytes = "1.5"
+zstd = "0.13"
 
 # Error handling
 anyhow = "1.0"

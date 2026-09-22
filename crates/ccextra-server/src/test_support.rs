@@ -58,12 +58,15 @@ pub(crate) fn stalled_body() -> Body {
 pub(crate) struct CapturedUpstream {
     pub headers: std::sync::Arc<std::sync::Mutex<Option<axum::http::HeaderMap>>>,
     pub body: std::sync::Arc<std::sync::Mutex<Option<serde_json::Value>>>,
+    /// 原始字节(压缩断言用;JSON 解析失败时 body() 为空)
+    pub raw_body: std::sync::Arc<std::sync::Mutex<Option<Bytes>>>,
 }
 
 impl CapturedUpstream {
     pub fn record(&self, headers: axum::http::HeaderMap, body: Bytes) {
         *self.headers.lock().unwrap() = Some(headers);
         *self.body.lock().unwrap() = serde_json::from_slice(&body).ok();
+        *self.raw_body.lock().unwrap() = Some(body);
     }
 
     pub fn header(&self, name: &str) -> Option<String> {
