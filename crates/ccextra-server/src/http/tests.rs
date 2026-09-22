@@ -2298,15 +2298,16 @@ fn test_retry_delay_respects_retry_after_and_budget() {
     let started = std::time::Instant::now();
     let mut headers = reqwest::header::HeaderMap::new();
     headers.insert(reqwest::header::RETRY_AFTER, "5".parse().unwrap());
-    // 429: Retry-After 优先且封顶 1.5s
+    // 5xx 带 Retry-After: 钳位 1.5s 后 ±20% jitter
     let d = compute_retry_delay(
         0,
         started,
         &headers,
-        Some(reqwest::StatusCode::TOO_MANY_REQUESTS),
+        Some(reqwest::StatusCode::SERVICE_UNAVAILABLE),
     )
     .unwrap();
-    assert_eq!(d, std::time::Duration::from_millis(1500));
+    assert!(d >= std::time::Duration::from_millis(1200));
+    assert!(d <= std::time::Duration::from_millis(1800));
 
     // 无头: 基础 300ms 经 jitter 在 [240ms, 360ms] 范围
     let d2 = compute_retry_delay(0, started, &reqwest::header::HeaderMap::new(), None).unwrap();
@@ -2319,7 +2320,7 @@ fn test_retry_delay_respects_retry_after_and_budget() {
     assert!(compute_retry_delay(0, exhausted_start, &headers, None).is_none());
 }
 
-/// 上游 500:按退避重试后成功;429 带 Retry-After 的路径由同一分支覆盖。
+/// 上游 500:按退避重试后成功。
 #[tokio::test]
 async fn test_upstream_500_retries_with_backoff_then_succeeds() {
     let attempts = Arc::new(std::sync::atomic::AtomicUsize::new(0));
@@ -2376,6 +2377,74 @@ async fn test_upstream_500_retries_with_backoff_then_succeeds() {
 
     assert_eq!(response.status(), StatusCode::OK);
     assert_eq!(attempts.load(Ordering::SeqCst), 3);
+}
+
+/// 上游 429:不进退避重试(对齐 codex 传输层 retry_429: false),单次命中即返回;
+/// Retry-After 头透传给客户端,由客户端按上游声明退避。
+#[tokio::test]
+async fn test_upstream_429_fails_fast_passes_retry_after() {
+    let attempts = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+    let handler_attempts = Arc::clone(&attempts);
+    let upstream = Router::new().route(
+        "/chat/completions",
+        post(move || {
+            let attempts = Arc::clone(&handler_attempts);
+            async move {
+                attempts.fetch_add(1, Ordering::SeqCst);
+                (
+                    axum::http::StatusCode::TOO_MANY_REQUESTS,
+                    [
+                        (header::CONTENT_TYPE, "application/json"),
+                        (header::RETRY_AFTER, "7"),
+                    ],
+                    r#"{"error":{"type":"rate_limit_error","message":"rate limited"}}"#,
+                )
+            }
+        }),
+    );
+    let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let upstream_addr = listener.local_addr().unwrap();
+    let server = tokio::spawn(async move { axum::serve(listener, upstream).await.unwrap() });
+
+    let state = mock_state();
+    let provider: ProviderConfig = serde_yaml::from_str(&format!(
+            "name: test-429\nprotocol: openai_chat\nbase_url: http://{}\nkey: sk-test\nproxy_url: direct\nmodels:\n  - name: gpt-4\n    alias: test-429\n",
+            upstream_addr
+        ))
+        .unwrap();
+    Arc::make_mut(&mut *state.config.write().await)
+        .providers
+        .push(provider);
+    let app = app(state);
+    let request = Request::builder()
+        .uri("/v1/messages")
+        .method("POST")
+        .header("content-type", "application/json")
+        .body(Body::from(
+            serde_json::to_vec(&json!({
+                "model": "test-429", "max_tokens": 64, "stream": false,
+                "messages": [{"role": "user", "content": "hi"}]
+            }))
+            .unwrap(),
+        ))
+        .unwrap();
+    let response = app.oneshot(request).await.unwrap();
+    server.abort();
+
+    // 单次命中,无退避重试
+    assert_eq!(attempts.load(Ordering::SeqCst), 1);
+    assert_eq!(response.status(), StatusCode::TOO_MANY_REQUESTS);
+    assert_eq!(
+        response
+            .headers()
+            .get("retry-after")
+            .and_then(|v| v.to_str().ok()),
+        Some("7")
+    );
+    let body = axum::body::to_bytes(response.into_body(), 1024 * 1024).await.unwrap();
+    let err: serde_json::Value = serde_json::from_slice(&body).unwrap();
+    assert_eq!(err["type"], "error");
+    assert_eq!(err["error"]["type"], "rate_limit_error");
 }
 
 /// 上游持续 503 耗尽退避预算:末次错误响应转 anthropic error 返回,

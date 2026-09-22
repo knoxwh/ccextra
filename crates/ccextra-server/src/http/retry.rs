@@ -38,10 +38,11 @@ pub fn parse_retry_after(headers: &reqwest::header::HeaderMap) -> Option<Duratio
 }
 
 /// 第 attempt 次失败(0 起)后的等待时长:
-/// - 429: 完整尊重 Retry-After(对齐 grok/OpenAI rate limit)
 /// - 52x/5xx 等边缘错误: Retry-After 钳位到 30s 并加 +/-20% jitter 抖动
 /// - 其余/网络错误: base * 2^attempt 指数退避 + jitter
 /// - 总预算耗尽返回 None 不再重试。
+///
+/// 429 不进本函数:调用方对齐 codex 传输层 retry_429: false,快速失败交客户端退避。
 pub fn compute_retry_delay(
     attempt: u32,
     started_at: std::time::Instant,
@@ -53,7 +54,6 @@ pub fn compute_retry_delay(
         return None;
     }
 
-    let is_429 = status.map(|s| s.as_u16() == 429).unwrap_or(false);
     let is_cf_52x = status
         .map(|s| {
             let c = s.as_u16();
@@ -62,10 +62,7 @@ pub fn compute_retry_delay(
         .unwrap_or(false);
 
     let mut delay = if let Some(retry_after) = parse_retry_after(headers) {
-        if is_429 {
-            // 429 真实限流直接按上游声明等待
-            retry_after.min(RETRY_MAX_DELAY)
-        } else if is_cf_52x {
+        if is_cf_52x {
             // Cloudflare 52x 往往下发 60-120s，钳位到 30s + 抖动
             jitter_backoff(retry_after.min(CF_EDGE_MAX_RETRY_BACKOFF))
         } else {

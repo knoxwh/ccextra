@@ -176,7 +176,7 @@ See [config.example.yaml](config.example.yaml) for every field. Key points:
 Requests pass through authentication, model routing, normalization, protocol conversion, and parameter overrides before reaching the upstream. OpenAI paths can inject `prompt_cache_key`; Gemini and Antigravity skip OpenAI-specific processing.
 
 - **Streaming**: Claude response bytes pass through; other protocols are converted to Anthropic SSE. All streaming paths use a 10-second `: keepalive`.
-- **Retries**: Network errors, 429, and 5xx/52x share a 3-second backoff budget with multiple `base_url` fallbacks. This is not a total request timeout and does not truncate normal generation.
+- **Retries**: Network errors and 5xx/52x share a 3-second backoff budget with multiple `base_url` fallbacks. This is not a total request timeout and does not truncate normal generation. 429 is not retried (aligned with the codex transport layer `retry_429: false`); it fails fast and passes the upstream `Retry-After` header through so the client can back off as advised.
 - **Read limits**: Non-stream success bodies are capped at 16 MiB, error bodies retain at most 256 KiB, and read idle is 300 seconds. Oversized success bodies return 502; stalls return 504. Error-body read failures retain the known status for normal error mapping. OAuth, project, and model reads retain their 30-second total timeout.
 - **Headers**: Claude forwards permitted identity headers while excluding authentication and connection-management headers. `anthropic-beta` passes through unchanged and is not added when absent.
 

@@ -90,7 +90,7 @@ Anthropic `system` 成为 system message；o 系列（`o1-mini`/`o1-preview` 除
 
 非流响应 body 有界读取：成功 body 上限 16 MiB（恰好上限可读，多 1 字节拒绝），错误 body 最多保留 256 KiB（超出停止读取并标记截断，截断前缀不当作完整 JSON 解析）；读取停顿与流 chunk idle 共用 300s，每次非空数据后重置，空 chunk 不续期。成功 body 超限返回 502、停顿返回 504（Anthropic `api_error`）；错误 body 截断或读取失败保留已知上游状态（429/401 不被改写），生成有界 Anthropic error，不重新获得重试预算。OAuth/project/model 路径同样有界，保留各自 30s 请求总超时。
 
-网络错误、429、5xx 和 Cloudflare 52x 可重试。退避从 300ms 开始，单次最多 1.5 秒，所有重试共享 3 秒预算；`Retry-After` 只在该预算内生效。流式 OpenAI 请求声明 `Accept: text/event-stream` 和 `Cache-Control: no-cache`。
+网络错误、5xx 和 Cloudflare 52x 可重试。退避从 300ms 开始，单次最多 1.5 秒，所有重试共享 3 秒预算；`Retry-After` 只在该预算内生效。429 不进退避重试（对齐 codex 传输层 `retry_429: false`）：限流窗口远超预算，快速失败并把上游 `Retry-After` 头透传给客户端，由客户端按声明退避；多 `base_url` 回退不受影响。流式 OpenAI 请求声明 `Accept: text/event-stream` 和 `Cache-Control: no-cache`。
 
 ## 响应转发
 

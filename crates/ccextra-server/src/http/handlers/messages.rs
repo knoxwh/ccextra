@@ -32,7 +32,7 @@ use std::sync::Arc;
 use crate::http::auth::check_secret;
 use crate::http::claude_relay::{claude_inbound_user_agent, claude_relay_headers};
 use crate::http::error::{to_anthropic_error, AppError};
-use crate::http::retry::compute_retry_delay;
+use crate::http::retry::{compute_retry_delay, parse_retry_after};
 use crate::http::{AppState, PayloadRule};
 use crate::sse::replay_cache::StreamReplayExtractor;
 use crate::sse::SseStreamPin;
@@ -760,7 +760,9 @@ pub(crate) async fn execute_upstream_request(
                 upstream = Some(resp);
                 break;
             }
-            Out::Fail(resp) if resp.status.as_u16() == 429 || resp.status.is_server_error() => {
+            // 429 不进退避重试(对齐 codex 传输层 retry_429: false):
+            // 限流窗口远超 3s 预算,快速失败交客户端退避;多 base_url 回退不受影响
+            Out::Fail(resp) if resp.status.is_server_error() => {
                 let status = resp.status;
                 let wait = compute_retry_delay(
                     attempt,
@@ -875,6 +877,9 @@ pub(crate) async fn deliver_response(
     // 上游错误:转 anthropic error 形状
     if !status.is_success() {
         let failed = executed.upstream.take().expect("上游响应应存在");
+        // Retry-After 透传给客户端(对齐 codex 把 server retry advice 透出给上层):
+        // 429 快速失败后由客户端按上游声明退避,代理不代等
+        let mut retry_after = parse_retry_after(failed.body.headers());
         let (err_bytes, err_truncated) =
             crate::limits::read_error_body_or_anthropic(failed.body, status).await?;
         let mut final_status = status;
@@ -902,6 +907,7 @@ pub(crate) async fn deliver_response(
                 executed.upstream = Some(retry);
                 retried_ok = true;
             } else {
+                retry_after = parse_retry_after(retry.body.headers());
                 let (bytes, truncated) =
                     crate::limits::read_error_body_or_anthropic(retry.body, final_status).await?;
                 final_bytes = bytes;
@@ -925,9 +931,13 @@ pub(crate) async fn deliver_response(
             } else {
                 to_anthropic_error(&final_bytes)
             };
-            return Response::builder()
+            let mut builder = Response::builder()
                 .status(final_status)
-                .header(header::CONTENT_TYPE, "application/json")
+                .header(header::CONTENT_TYPE, "application/json");
+            if let Some(ra) = retry_after {
+                builder = builder.header("retry-after", ra.as_secs());
+            }
+            return builder
                 .body(Body::from(body))
                 .map_err(|e| AppError::new(anyhow::anyhow!("构造错误响应失败: {e}")));
         }
