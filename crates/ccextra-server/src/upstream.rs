@@ -410,13 +410,20 @@ impl UpstreamClient {
         user_agents: &crate::http::UserAgentSet,
         inbound_user_agent: Option<&str>,
     ) -> anyhow::Result<UpstreamResponse> {
+        // 对齐 codex EncodedJsonBody:一次序列化,Bytes 共享分配;
+        // stale-connection 重试复用同一份字节,不重复序列化
+        let body_bytes = bytes::Bytes::from(
+            serde_json::to_vec(body).map_err(|e| anyhow::anyhow!("序列化请求体失败: {e}"))?,
+        );
+        let upstream_model = body.get("model").and_then(|v| v.as_str()).unwrap_or("");
         match self
             .request_once(
                 base_url,
                 api_key,
                 protocol,
                 provider_proxy,
-                body,
+                &body_bytes,
+                upstream_model,
                 is_stream,
                 session_id,
                 thread_id,
@@ -434,7 +441,8 @@ impl UpstreamClient {
                     api_key,
                     protocol,
                     provider_proxy,
-                    body,
+                    &body_bytes,
+                    upstream_model,
                     is_stream,
                     session_id,
                     thread_id,
@@ -455,7 +463,8 @@ impl UpstreamClient {
         api_key: &str,
         protocol: Protocol,
         provider_proxy: Option<&str>,
-        body: &serde_json::Value,
+        body: &bytes::Bytes,
+        upstream_model: &str,
         is_stream: bool,
         session_id: Option<&str>,
         thread_id: Option<&str>,
@@ -469,8 +478,6 @@ impl UpstreamClient {
         // chatgpt-account-id 仅 Codex OAuth 订阅请求携带,作为禁 redirect 的判定标记
         let no_redirect = extra_headers.contains_key("chatgpt-account-id");
         let client = self.client_for(&proxy_key, protocol, no_redirect)?;
-
-        let upstream_model = body.get("model").and_then(|v| v.as_str()).unwrap_or("");
 
         // Gemini 端点需要替换 {model} 占位符
         let endpoint = endpoint_path(protocol, is_stream);
@@ -533,7 +540,13 @@ impl UpstreamClient {
         for (name, value) in extra_headers {
             req = req.header(name, value);
         }
-        let resp = send_with_timeout(req.json(body)).await?;
+        // 已编码字节直接发送(对齐 codex prepare_body_for_send:补 Content-Type,
+        // Bytes clone 零拷贝);线上字节与 reqwest .json() 等价
+        let resp = send_with_timeout(
+            req.header(reqwest::header::CONTENT_TYPE, "application/json")
+                .body(bytes::Bytes::clone(body)),
+        )
+        .await?;
 
         let status = resp.status();
         Ok(UpstreamResponse { status, body: resp })
