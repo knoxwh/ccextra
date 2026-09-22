@@ -7,7 +7,7 @@ AUTH_DIR="${BASE_DIR}/.cache/xai"
 DEFAULT_TOKEN_ENDPOINT="https://auth.x.ai/oauth2/token"
 CLIENT_ID="b1a00492-073a-47ea-816f-4c329264a828"
 CLI_CHAT_PROXY_BASE_URL="https://cli-chat-proxy.grok.com/v1"
-CLI_VERSION="0.2.114"
+CLI_VERSION="0.2.120"
 CLI_USER_AGENT="grok-pager/${CLI_VERSION} grok-shell/${CLI_VERSION} (macos; aarch64)"
 
 usage() {

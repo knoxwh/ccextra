@@ -195,6 +195,7 @@ curl -H "Authorization: Bearer $ANTHROPIC_AUTH_TOKEN" \
 ./ccextra codex-status
 ./scripts/check_antigravity_quota.sh
 ./scripts/check_grok_quota.sh
+./scripts/check_codex_quota.sh
 ```
 
 Antigravity 凭证默认在配置文件旁 `.cache/antigravity`，xAI 在 `.cache/xai`，Codex 在 `.cache/codex`。xAI 与 Codex 启动时自动发现；Antigravity 后台加载并每 3 小时刷新模型。Codex 登录使用 PKCE 浏览器授权（本地回调端口默认 1455，可用 `--callback-port` 覆盖），token 提前 24 小时刷新。

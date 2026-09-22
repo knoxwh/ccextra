@@ -195,6 +195,7 @@ Log in to an upstream or inspect saved credential status:
 ./ccextra codex-status
 ./scripts/check_antigravity_quota.sh
 ./scripts/check_grok_quota.sh
+./scripts/check_codex_quota.sh
 ```
 
 Antigravity credentials default to `.cache/antigravity` beside the config file; xAI defaults to `.cache/xai`; Codex defaults to `.cache/codex`. xAI and Codex load at startup. Antigravity loads in the background and refreshes models every three hours. Codex login uses PKCE browser authorization (local callback port defaults to 1455, override with `--callback-port`); tokens refresh 24 hours ahead of expiry.
