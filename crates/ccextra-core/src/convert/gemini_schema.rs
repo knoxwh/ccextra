@@ -108,6 +108,8 @@ fn clean_json_schema(schema: &Value, opts: CleanOptions) -> Value {
         remove_placeholder_fields(&mut s);
     }
     cleanup_required_fields(&mut s);
+    // Gemini protobuf 要求声明 items 的节点 type 为 ARRAY(对齐 CPA ffe6ad3c / Issue #6011)
+    sanitize_array_items(&mut s);
 
     // Phase 4: 空对象 schema 占位(Claude VALIDATED)
     if opts.add_placeholder {
@@ -737,11 +739,20 @@ fn flatten_type_arrays(schema: &mut Value, preserve_native_nullable: bool) {
                 }
             }
         }
-        let first = non_null
-            .first()
-            .cloned()
-            .unwrap_or_else(|| "string".to_string());
-        map.insert("type".into(), Value::String(first));
+        // 节点已声明 items 时优先 array,避免 union 展平后留下非 array type(对齐 CPA ffe6ad3c)
+        let first = if map.contains_key("items") && non_null.iter().any(|t| t == "array") {
+            "array".to_string()
+        } else {
+            non_null
+                .first()
+                .cloned()
+                .unwrap_or_else(|| "string".to_string())
+        };
+        map.insert("type".into(), Value::String(first.clone()));
+
+        if first != "array" && map.contains_key("items") {
+            map.shift_remove("items");
+        }
 
         if non_null.len() > 1 {
             append_hint(map, &format!("Accepts: {}", non_null.join(" | ")));
@@ -788,6 +799,48 @@ fn flatten_type_arrays(schema: &mut Value, preserve_native_nullable: bool) {
             }
         });
     }
+}
+
+/// 声明 items 的节点必须 type=array(对齐 CPA sanitizeArrayItems,ffe6ad3c / Issue #6011)。
+/// type 缺失推断 array;type 显式非 array 时剥 items。
+/// 后序遍历:先处理子节点,父节点剥 items 时子树已处理完。
+/// 属性名本身叫 "items" 时跳过(is_property_definition)。
+fn sanitize_array_items(schema: &mut Value) {
+    fn visit(value: &mut Value, path: &mut Vec<String>) {
+        let keys: Vec<String> = match value {
+            Value::Object(map) => map.keys().cloned().collect(),
+            Value::Array(arr) => (0..arr.len()).map(|i| i.to_string()).collect(),
+            _ => return,
+        };
+        for key in keys {
+            let child = match value {
+                Value::Object(map) => map.get_mut(&key),
+                Value::Array(arr) => key.parse::<usize>().ok().and_then(|i| arr.get_mut(i)),
+                _ => None,
+            };
+            if let Some(child) = child {
+                if matches!(child, Value::Object(_) | Value::Array(_)) {
+                    path.push(key);
+                    visit(child, path);
+                    path.pop();
+                }
+            }
+        }
+        let Value::Object(map) = value else {
+            return;
+        };
+        if !map.contains_key("items") || is_property_definition(path) {
+            return;
+        }
+        // gjson String():缺失/null/"" 都是空串,CPA 据此补 array;其它非 "array" 剥 items
+        if schema_type_string(map.get("type")).is_empty() {
+            map.insert("type".into(), Value::String("array".to_string()));
+        } else if schema_type_string(map.get("type")) != "array" {
+            map.shift_remove("items");
+        }
+    }
+
+    visit(schema, &mut Vec::new());
 }
 
 // --- Phase 3: 清理 ---
@@ -1156,13 +1209,17 @@ fn repair_schema_node(
         }
     }
 
-    // Gemini/Antigravity 拒无 items 的工具 array schema(对齐 CPA b5cde4ba)
-    if add_missing_array_items
-        && is_array_declared_type(clone.get("type"))
-        && !clone.contains_key("items")
-    {
-        clone.insert("items".to_string(), json!({"type": "string"}));
-        modified = true;
+    // Gemini/Antigravity 拒无 items 的工具 array schema,也拒 items 配非 array type
+    // (对齐 CPA b5cde4ba + ffe6ad3c)。显式非 array type 的 items 留给 sanitize_array_items 剥离。
+    if add_missing_array_items {
+        if is_array_declared_type(clone.get("type")) && !clone.contains_key("items") {
+            clone.insert("items".to_string(), json!({"type": "string"}));
+            modified = true;
+        } else if clone.contains_key("items") && schema_type_string(clone.get("type")).is_empty() {
+            // 对齐 CPA:type == nil || type == ""(含 JSON null 与 "")
+            clone.insert("type".to_string(), Value::String("array".to_string()));
+            modified = true;
+        }
     }
 
     // 3. 递归进 items/additionalProperties/patternProperties 等容器
@@ -1383,6 +1440,15 @@ fn is_non_object_declared_type(t: Option<&Value>) -> bool {
 }
 
 /// 对齐 CPA isArrayDeclaredType:type 为 "array" 或 type 列表含 "array"
+/// 对齐 gjson Result.String():缺失、null、"" 为空串;数组取 Raw(如 "[]")
+fn schema_type_string(t: Option<&Value>) -> String {
+    match t {
+        None | Some(Value::Null) => String::new(),
+        Some(Value::String(s)) => s.clone(),
+        Some(other) => other.to_string(),
+    }
+}
+
 fn is_array_declared_type(t: Option<&Value>) -> bool {
     match t {
         Some(Value::String(s)) => s == "array",
@@ -1915,6 +1981,109 @@ mod tests {
             clean_json_schema_for_gemini(&json!({"type": "array"})),
         ] {
             assert_eq!(out["items"]["type"], "string");
+        }
+    }
+
+    #[test]
+    fn test_items_require_array_type() {
+        // 对齐 CPA ffe6ad3c / TestCleanJSONSchema_ArrayItemsRequireArrayType_Issue6011
+        let missing_type = json!({
+            "type": "object",
+            "properties": {
+                "revision_reasons": {
+                    "type": "array",
+                    "items": {
+                        "type": "object",
+                        "properties": {
+                            "evidence_reference": {
+                                "description": "references to evidence",
+                                "items": {"type": "string"}
+                            }
+                        }
+                    }
+                }
+            }
+        });
+        let union_type = json!({
+            "type": "object",
+            "properties": {
+                "revision_reasons": {
+                    "type": "array",
+                    "items": {
+                        "type": "object",
+                        "properties": {
+                            "evidence_reference": {
+                                "type": ["string", "array"],
+                                "items": {"type": "string"}
+                            }
+                        }
+                    }
+                }
+            }
+        });
+        let non_array = json!({
+            "type": "object",
+            "properties": {
+                "label": {"type": "string", "items": {"type": "string"}},
+                "config": {
+                    "type": "object",
+                    "properties": {"key": {"type": "string"}},
+                    "items": {"type": "string"}
+                }
+            }
+        });
+        let named_items = json!({
+            "type": "object",
+            "properties": {"items": {"type": "string", "description": "a field named items"}}
+        });
+        let root_missing = json!({"items": {"type": "string"}});
+
+        for clean in [
+            clean_json_schema_for_gemini,
+            clean_json_schema_for_antigravity,
+        ] {
+            let out = clean(&missing_type);
+            let target =
+                &out["properties"]["revision_reasons"]["items"]["properties"]["evidence_reference"];
+            assert_eq!(target["type"], "array");
+            assert_eq!(target["items"]["type"], "string");
+
+            let out = clean(&union_type);
+            assert_eq!(
+                out["properties"]["revision_reasons"]["items"]["properties"]["evidence_reference"]
+                    ["type"],
+                "array"
+            );
+
+            let out = clean(&non_array);
+            assert!(out["properties"]["label"].get("items").is_none());
+            assert_eq!(out["properties"]["label"]["type"], "string");
+            assert!(out["properties"]["config"].get("items").is_none());
+
+            let out = clean(&named_items);
+            assert_eq!(out["properties"]["items"]["type"], "string");
+            assert!(out["properties"]["items"].get("items").is_none());
+
+            let out = clean(&root_missing);
+            assert_eq!(out["type"], "array");
+            assert_eq!(out["items"]["type"], "string");
+
+            let again = clean(&out);
+            assert_eq!(again, out);
+
+            // gjson String() 对 null 与 "" 都返回空串,CPA 补 array 而非剥 items
+            for input in [
+                json!({"type": null, "items": {"type": "string"}}),
+                json!({"type": "", "items": {"type": "string"}}),
+            ] {
+                let out = clean(&input);
+                assert_eq!(out["type"], "array");
+                assert_eq!(out["items"]["type"], "string");
+            }
+            // type: [] 的 gjson String() 是 "[]",非空,剥 items,type 保持空数组
+            let empty_list = clean(&json!({"type": [], "items": {"type": "string"}}));
+            assert!(empty_list.get("items").is_none());
+            assert_eq!(empty_list["type"], json!([]));
         }
     }
 }
