@@ -60,7 +60,7 @@ pub async fn handle_count_tokens(
             base_url.trim_end_matches('/')
         );
         let proxy_key = upstream_client.resolve_proxy(proxy_url.as_deref());
-        let client = upstream_client.client_for(&proxy_key, Protocol::Claude)?;
+        let client = upstream_client.client_for(&proxy_key, Protocol::Claude, false)?;
         let inbound_user_agent = claude_inbound_user_agent(&headers);
         let extra_headers = claude_relay_headers(&headers);
         let mut request = client

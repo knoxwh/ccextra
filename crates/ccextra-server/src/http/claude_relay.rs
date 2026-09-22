@@ -27,6 +27,8 @@ pub fn is_claude_relay_header_excluded(name: &str, connection_header_names: &[St
             name.as_str(),
             "authorization"
                 | "x-api-key"
+                // ccextra 出站订阅身份头,入站同名头不得透传或触发禁 redirect
+                | "chatgpt-account-id"
                 | "user-agent"
                 | "host"
                 | "content-length"

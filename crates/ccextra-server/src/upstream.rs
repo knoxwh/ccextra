@@ -271,11 +271,13 @@ fn parse_go_duration(raw: &str) -> anyhow::Result<Duration> {
     Ok(Duration::from_secs_f64(secs))
 }
 
+/// client 缓存键:(最终代理, 是否 antigravity, 是否禁 redirect)
+type ClientCacheKey = (String, bool, bool);
+
 #[derive(Clone)]
 pub struct UpstreamClient {
     global_proxy: Option<String>,
-    /// (最终代理, 是否 antigravity) → client
-    clients: std::sync::Arc<Mutex<HashMap<(String, bool), Client>>>,
+    clients: std::sync::Arc<Mutex<HashMap<ClientCacheKey, Client>>>,
     /// Antigravity 连接池设置(短连接默认,对齐 CPA antigravity.executor)
     ant_pool: AntigravityPoolSettings,
     #[cfg(test)]
@@ -321,10 +323,20 @@ impl UpstreamClient {
     /// 按最终代理 + 协议取(或构建)client
     ///
     /// Antigravity 连接池设置独立生效(对齐 CPA antigravity executor transport):
-    /// 缓存键为 (代理, 是否 antigravity) 元组,专属 transport 不影响其他协议共享池。
-    pub(crate) fn client_for(&self, proxy_key: &str, protocol: Protocol) -> anyhow::Result<Client> {
+    /// 缓存键为 (代理, 是否 antigravity, 是否禁 redirect) 元组,专属 transport 不影响其他协议共享池。
+    ///
+    /// `no_redirect`:Codex 订阅请求(带 chatgpt-account-id 头)禁跟随 redirect。
+    /// reqwest 跨 host redirect 只剥 Authorization/Cookie 类敏感头,自定义身份头
+    /// (chatgpt-account-id / Session-Id / Originator)会原样转发到重定向目标,
+    /// 泄漏订阅身份。对齐 codex CLI:带账号路由头的请求 redirect Policy::none()。
+    pub(crate) fn client_for(
+        &self,
+        proxy_key: &str,
+        protocol: Protocol,
+        no_redirect: bool,
+    ) -> anyhow::Result<Client> {
         let ant = matches!(protocol, Protocol::Antigravity);
-        let cache_key = (proxy_key.to_string(), ant);
+        let cache_key: ClientCacheKey = (proxy_key.to_string(), ant, no_redirect);
         let mut clients = self
             .clients
             .lock()
@@ -347,6 +359,9 @@ impl UpstreamClient {
             .http2_keep_alive_interval(std::time::Duration::from_secs(15))
             .http2_keep_alive_timeout(std::time::Duration::from_secs(5))
             .http2_keep_alive_while_idle(true);
+        if no_redirect {
+            builder = builder.redirect(reqwest::redirect::Policy::none());
+        }
         if ant {
             // Antigravity 专属池:默认短连接(不保留空闲连接,响应结束即关,
             // 不发 Connection: close);显式启用时按配置保留池
@@ -451,7 +466,9 @@ impl UpstreamClient {
         #[cfg(test)]
         self.attempts.lock().unwrap().push(base_url.to_owned());
         let proxy_key = self.resolve_proxy(provider_proxy);
-        let client = self.client_for(&proxy_key, protocol)?;
+        // chatgpt-account-id 仅 Codex OAuth 订阅请求携带,作为禁 redirect 的判定标记
+        let no_redirect = extra_headers.contains_key("chatgpt-account-id");
+        let client = self.client_for(&proxy_key, protocol, no_redirect)?;
 
         let upstream_model = body.get("model").and_then(|v| v.as_str()).unwrap_or("");
 
@@ -960,7 +977,7 @@ mod tests {
             };
             let client = UpstreamClient::new(None);
             client.clients.lock().unwrap().insert(
-                ("direct".into(), false),
+                ("direct".into(), false, false),
                 Client::builder()
                     .no_proxy()
                     .timeout(std::time::Duration::from_millis(100))
@@ -1013,15 +1030,135 @@ mod tests {
         }
     }
 
+    /// 307 上游 + Codex 订阅身份头:禁跟随,身份头不外泄到重定向目标
+    #[tokio::test]
+    async fn codex_identity_header_disables_redirect() {
+        use std::sync::atomic::{AtomicBool, Ordering};
+
+        let target_listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let target_addr = target_listener.local_addr().unwrap();
+        let target_hit = std::sync::Arc::new(AtomicBool::new(false));
+        let flag = std::sync::Arc::clone(&target_hit);
+        let target_server = tokio::spawn(async move {
+            let app = axum::Router::new().fallback(move || {
+                let flag = std::sync::Arc::clone(&flag);
+                async move {
+                    flag.store(true, Ordering::SeqCst);
+                    "ok"
+                }
+            });
+            axum::serve(target_listener, app).await.unwrap();
+        });
+
+        let source_listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let source_addr = source_listener.local_addr().unwrap();
+        let location = format!("http://{target_addr}/responses");
+        let source_server = tokio::spawn(async move {
+            let app = axum::Router::new().fallback(move || {
+                let location = location.clone();
+                async move { axum::response::Redirect::temporary(&location) }
+            });
+            axum::serve(source_listener, app).await.unwrap();
+        });
+
+        let client = UpstreamClient::new(None);
+        let mut extra = axum::http::HeaderMap::new();
+        extra.insert(
+            axum::http::HeaderName::from_static("chatgpt-account-id"),
+            "acct-123".parse().unwrap(),
+        );
+        let body = serde_json::json!({"model": "gpt-5.6-terra", "input": []});
+        let resp = client
+            .request(
+                &format!("http://{source_addr}"),
+                "codex-access-token",
+                Protocol::OpenAiResponses,
+                None,
+                &body,
+                false,
+                None,
+                None,
+                &extra,
+                &mock_user_agents(),
+                None,
+            )
+            .await
+            .unwrap();
+
+        // 307 原样返回,不跟随,重定向目标无请求
+        assert_eq!(resp.status.as_u16(), 307);
+        assert!(!target_hit.load(Ordering::SeqCst), "重定向目标不应收到请求");
+
+        source_server.abort();
+        target_server.abort();
+    }
+
+    /// 无 Codex 身份头:redirect 行为不变(默认跟随)
+    #[tokio::test]
+    async fn non_codex_request_follows_redirect() {
+        use std::sync::atomic::{AtomicBool, Ordering};
+
+        let target_listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let target_addr = target_listener.local_addr().unwrap();
+        let target_hit = std::sync::Arc::new(AtomicBool::new(false));
+        let flag = std::sync::Arc::clone(&target_hit);
+        let target_server = tokio::spawn(async move {
+            let app = axum::Router::new().fallback(move || {
+                let flag = std::sync::Arc::clone(&flag);
+                async move {
+                    flag.store(true, Ordering::SeqCst);
+                    "ok"
+                }
+            });
+            axum::serve(target_listener, app).await.unwrap();
+        });
+
+        let source_listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let source_addr = source_listener.local_addr().unwrap();
+        let location = format!("http://{target_addr}/responses");
+        let source_server = tokio::spawn(async move {
+            let app = axum::Router::new().fallback(move || {
+                let location = location.clone();
+                async move { axum::response::Redirect::temporary(&location) }
+            });
+            axum::serve(source_listener, app).await.unwrap();
+        });
+
+        let client = UpstreamClient::new(None);
+        let body = serde_json::json!({"model": "gpt-5.6-terra", "input": []});
+        let resp = client
+            .request(
+                &format!("http://{source_addr}"),
+                "sk-test",
+                Protocol::OpenAiResponses,
+                None,
+                &body,
+                false,
+                None,
+                None,
+                &axum::http::HeaderMap::new(),
+                &mock_user_agents(),
+                None,
+            )
+            .await
+            .unwrap();
+
+        assert_eq!(resp.status.as_u16(), 200);
+        assert!(target_hit.load(Ordering::SeqCst), "默认应跟随 redirect");
+
+        source_server.abort();
+        target_server.abort();
+    }
+
     #[test]
     fn test_client_caching() {
         let client = UpstreamClient::new(None);
-        let _c1 = client.client_for("direct", Protocol::OpenAiChat).unwrap();
-        let _c2 = client.client_for("direct", Protocol::OpenAiChat).unwrap();
+        let _c1 = client.client_for("direct", Protocol::OpenAiChat, false).unwrap();
+        let _c2 = client.client_for("direct", Protocol::OpenAiChat, false).unwrap();
         // 同一 proxy_key 应返回相同 client(Arc clone)
         // 通过计数验证缓存命中
         let count_before = client.clients.lock().unwrap().len();
-        let _c3 = client.client_for("direct", Protocol::OpenAiChat).unwrap();
+        let _c3 = client.client_for("direct", Protocol::OpenAiChat, false).unwrap();
         let count_after = client.clients.lock().unwrap().len();
         assert_eq!(count_before, count_after, "缓存应命中,不应重建 client");
     }
@@ -1029,12 +1166,12 @@ mod tests {
     #[test]
     fn test_client_different_proxies() {
         let client = UpstreamClient::new(None);
-        let _c1 = client.client_for("direct", Protocol::OpenAiChat).unwrap();
+        let _c1 = client.client_for("direct", Protocol::OpenAiChat, false).unwrap();
         let _c2 = client
-            .client_for("http://proxy1:8080", Protocol::OpenAiChat)
+            .client_for("http://proxy1:8080", Protocol::OpenAiChat, false)
             .unwrap();
         let _c3 = client
-            .client_for("http://proxy2:9090", Protocol::OpenAiChat)
+            .client_for("http://proxy2:9090", Protocol::OpenAiChat, false)
             .unwrap();
         assert_eq!(client.clients.lock().unwrap().len(), 3);
     }
@@ -1043,8 +1180,8 @@ mod tests {
     fn test_antigravity_short_connection_isolation() {
         // Antigravity 默认短连接:缓存键独立于其他协议(#ant 后缀)
         let client = UpstreamClient::new(None);
-        let _c1 = client.client_for("direct", Protocol::Antigravity).unwrap();
-        let _c2 = client.client_for("direct", Protocol::OpenAiChat).unwrap();
+        let _c1 = client.client_for("direct", Protocol::Antigravity, false).unwrap();
+        let _c2 = client.client_for("direct", Protocol::OpenAiChat, false).unwrap();
         assert_eq!(client.clients.lock().unwrap().len(), 2);
 
         // 默认(未启用连接池)解析为短连接
