@@ -24,6 +24,9 @@ pub struct Config {
     /// xAI 凭证目录(可选);默认配置文件旁 `.cache/xai`
     #[serde(default)]
     pub xai_auth_dir: Option<String>,
+    /// Codex 凭证目录(可选);默认配置文件旁 `.cache/codex`
+    #[serde(default)]
+    pub codex_auth_dir: Option<String>,
     /// Antigravity 连接池配置(可选);默认短连接
     #[serde(default)]
     pub antigravity: Option<AntigravityConfig>,

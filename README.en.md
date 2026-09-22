@@ -37,7 +37,7 @@ A single-process Rust proxy. Claude Code sends Anthropic Messages requests; ccex
 - **Route by model**: Five protocols share one endpoint. Configure client-facing aliases separately from upstream model names.
 - **Stable request content**: Normalize tools, schemas, and history to reduce incidental changes between turns. Actual cache hits depend on the upstream.
 - **Model adaptation**: Translate messages, tool calls, and images; adjust supported reasoning levels through `models.json`.
-- **OAuth providers**: Load and refresh Antigravity and xAI Grok credentials with dynamic model routing.
+- **OAuth providers**: Load and refresh Antigravity, xAI Grok, and Codex (OpenAI ChatGPT subscription) credentials with dynamic model routing.
 - **Hot reload**: Publish configuration without restarting. In-flight requests keep their original snapshot.
 
 ## Architecture
@@ -63,7 +63,7 @@ One process listens on one port. Input is always Anthropic-shaped; every path re
 | `gemini` | Gemini GenerateContent | Translate content blocks, tool results, and schemas. |
 | `antigravity` | Cloud Code Assist | Wrap Gemini requests, adapt tool names and output limits; use short connections by default. |
 
-> **Note**: xAI Grok is automatically injected as an `openai_responses` provider via OAuth without requiring a distinct protocol.
+> **Note**: xAI Grok and Codex are automatically injected as `openai_responses` providers via OAuth without requiring a distinct protocol. Codex subscription requests carry the `Chatgpt-Account-Id` identity header automatically.
 
 ## Quick Start
 
@@ -191,11 +191,13 @@ Log in to an upstream or inspect saved credential status:
 ./ccextra antigravity-status
 ./ccextra xai-login
 ./ccextra xai-status
+./ccextra codex-login
+./ccextra codex-status
 ./scripts/check_antigravity_quota.sh
 ./scripts/check_grok_quota.sh
 ```
 
-Antigravity credentials default to `.cache/antigravity` beside the config file; xAI defaults to `.cache/xai`. xAI loads at startup. Antigravity loads in the background and refreshes models every three hours.
+Antigravity credentials default to `.cache/antigravity` beside the config file; xAI defaults to `.cache/xai`; Codex defaults to `.cache/codex`. xAI and Codex load at startup. Antigravity loads in the background and refreshes models every three hours. Codex login uses PKCE browser authorization (local callback port defaults to 1455, override with `--callback-port`); tokens refresh 24 hours ahead of expiry.
 
 After editing configuration, or to reload credentials immediately:
 

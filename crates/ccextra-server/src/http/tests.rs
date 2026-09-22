@@ -2476,3 +2476,167 @@ async fn fallback_attempts_each_url_once() {
         assert_eq!(*attempts.lock().unwrap(), [first, good.url.clone()]);
     }
 }
+
+#[tokio::test]
+async fn test_codex_provider_sends_account_id_header() {
+    let (server, captured) = spawn_captured_server(
+        "/responses",
+        StatusCode::OK,
+        json!({
+            "type": "response.completed",
+            "response": {
+                "id": "resp_codex",
+                "model": "gpt-5.6-terra",
+                "output": [{
+                    "type": "message",
+                    "content": [{"type": "output_text", "text": "ok"}]
+                }],
+                "usage": {"input_tokens": 1, "output_tokens": 1}
+            }
+        })
+        .to_string(),
+    )
+    .await;
+
+    // fresh 凭证:运行时刷新直接命中,不触发网络
+    let dir = tempfile::tempdir().unwrap();
+    let cred = crate::codex::CodexCredential {
+        r#type: "codex".to_string(),
+        id_token: String::new(),
+        access_token: "codex-access-token".to_string(),
+        refresh_token: "codex-refresh-token".to_string(),
+        account_id: "acct-123".to_string(),
+        last_refresh: String::new(),
+        email: "user@example.com".to_string(),
+        plan_type: "pro".to_string(),
+        expired: "2999-01-01T00:00:00Z".to_string(),
+        disabled: false,
+    };
+    crate::codex::store::save(dir.path(), &cred).unwrap();
+
+    let state = mock_state();
+    let mut metadata = std::collections::HashMap::new();
+    metadata.insert(
+        "auth_dir".to_string(),
+        dir.path().to_string_lossy().to_string(),
+    );
+    metadata.insert("email".to_string(), "user@example.com".to_string());
+    metadata.insert("account_id".to_string(), "acct-123".to_string());
+    metadata.insert("provider_type".to_string(), "codex".to_string());
+    let provider = ProviderConfig::new(
+        "codex-user".to_string(),
+        Protocol::OpenAiResponses,
+        vec![server.url.clone()],
+        "stale-key".to_string(),
+        Some("direct".to_string()),
+        false,
+        vec![ccextra_core::route::ModelConfig {
+            name: "gpt-5.6-terra".to_string(),
+            alias: "codex-test".to_string(),
+            max_input_tokens: None,
+            max_tokens: None,
+        }],
+    )
+    .with_metadata(metadata);
+    Arc::make_mut(&mut *state.config.write().await)
+        .providers
+        .push(provider);
+    let app = app(state);
+    let request = Request::builder()
+        .uri("/v1/messages")
+        .method("POST")
+        .header("content-type", "application/json")
+        .body(Body::from(
+            serde_json::to_vec(&json!({
+                "model": "codex-test",
+                "max_tokens": 64,
+                "stream": false,
+                "messages": [{"role": "user", "content": "hi"}]
+            }))
+            .unwrap(),
+        ))
+        .unwrap();
+    let response = app.oneshot(request).await.unwrap();
+
+    assert_eq!(response.status(), StatusCode::OK);
+    assert_eq!(
+        captured.header("chatgpt-account-id").as_deref(),
+        Some("acct-123")
+    );
+    // 运行时刷新后 key 来自凭证而非静态 provider key
+    assert_eq!(
+        captured.header("authorization").as_deref(),
+        Some("Bearer codex-access-token")
+    );
+    assert_eq!(
+        captured.header("originator").as_deref(),
+        Some("codex_cli_rs")
+    );
+    let ua = captured.header("user-agent").unwrap_or_default();
+    assert!(ua.starts_with("codex_cli_rs/"), "UA 应为 codex CLI,实际 {ua}");
+}
+
+#[tokio::test]
+async fn test_static_gpt_provider_omits_account_id_header() {
+    let (server, captured) = spawn_captured_server(
+        "/responses",
+        StatusCode::OK,
+        json!({
+            "type": "response.completed",
+            "response": {
+                "id": "resp_static",
+                "model": "gpt-5.6-terra",
+                "output": [{
+                    "type": "message",
+                    "content": [{"type": "output_text", "text": "ok"}]
+                }],
+                "usage": {"input_tokens": 1, "output_tokens": 1}
+            }
+        })
+        .to_string(),
+    )
+    .await;
+
+    let state = mock_state();
+    let provider: ProviderConfig = serde_yaml::from_str(&format!(
+        r#"
+name: static-gpt
+protocol: openai_responses
+base_url: "{}"
+key: sk-static
+proxy_url: "direct"
+models:
+  - name: gpt-5.6-terra
+    alias: static-gpt-test
+"#,
+        server.url
+    ))
+    .unwrap();
+    Arc::make_mut(&mut *state.config.write().await)
+        .providers
+        .push(provider);
+    let app = app(state);
+    let request = Request::builder()
+        .uri("/v1/messages")
+        .method("POST")
+        .header("content-type", "application/json")
+        .body(Body::from(
+            serde_json::to_vec(&json!({
+                "model": "static-gpt-test",
+                "max_tokens": 64,
+                "stream": false,
+                "messages": [{"role": "user", "content": "hi"}]
+            }))
+            .unwrap(),
+        ))
+        .unwrap();
+    let response = app.oneshot(request).await.unwrap();
+
+    assert_eq!(response.status(), StatusCode::OK);
+    // API key 静态 provider 无 codex metadata,不发订阅身份头
+    assert!(!captured.has_header("chatgpt-account-id"));
+    assert_eq!(
+        captured.header("authorization").as_deref(),
+        Some("Bearer sk-static")
+    );
+}

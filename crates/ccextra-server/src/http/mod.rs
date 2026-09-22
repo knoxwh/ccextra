@@ -84,6 +84,7 @@ pub struct ReloadData {
 pub struct ProviderRefreshConfig {
     pub auth_dir: Option<std::path::PathBuf>,
     pub xai_auth_dir: Option<std::path::PathBuf>,
+    pub codex_auth_dir: Option<std::path::PathBuf>,
     pub proxy_url: Option<String>,
     pub static_providers: Vec<ProviderConfig>,
 }

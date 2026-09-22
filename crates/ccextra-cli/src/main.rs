@@ -6,6 +6,10 @@ use ccextra_server::antigravity::{
     list as list_antigravity, resolve_auth_dir as resolve_antigravity_auth_dir,
     run_login as run_antigravity_login, LoginOptions as AntigravityLoginOptions,
 };
+use ccextra_server::codex::{
+    list as list_codex, resolve_auth_dir as resolve_codex_auth_dir,
+    run_login as run_codex_login, CodexLoginOptions,
+};
 use ccextra_server::http::{
     publish_refreshed_providers, AppState, ConfigSnapshot, ProviderRefreshConfig, ReloadData,
     RuntimeConfig, UserAgentSet,
@@ -80,6 +84,26 @@ enum Commands {
         #[arg(long)]
         auth_dir: Option<String>,
     },
+    /// 浏览器 PKCE 登录 Codex (OpenAI ChatGPT 订阅) 并写入凭证
+    #[command(name = "codex-login")]
+    CodexLogin {
+        /// 凭证目录,默认配置文件旁 .cache/codex
+        #[arg(long)]
+        auth_dir: Option<String>,
+        /// 不自动打开浏览器,只打印 URL
+        #[arg(long)]
+        no_browser: bool,
+        /// 本地回调端口,默认 1455
+        #[arg(long)]
+        callback_port: Option<u16>,
+    },
+    /// 列出已保存的 Codex 凭证(不打印 token)
+    #[command(name = "codex-status")]
+    CodexStatus {
+        /// 凭证目录,默认配置文件旁 .cache/codex
+        #[arg(long)]
+        auth_dir: Option<String>,
+    },
 }
 
 #[tokio::main]
@@ -104,6 +128,16 @@ async fn main() -> Result<()> {
         }
         Some(Commands::XaiStatus { auth_dir }) => {
             return cmd_xai_status(&cli.config, auth_dir);
+        }
+        Some(Commands::CodexLogin {
+            auth_dir,
+            no_browser,
+            callback_port,
+        }) => {
+            return cmd_codex_login(&cli.config, auth_dir, no_browser, callback_port).await;
+        }
+        Some(Commands::CodexStatus { auth_dir }) => {
+            return cmd_codex_status(&cli.config, auth_dir);
         }
         None => {}
     }
@@ -153,11 +187,27 @@ async fn main() -> Result<()> {
         tracing::info!("动态加载 {} 个 xAI providers", xai_providers.len());
     }
 
+    // 动态加载 Codex providers
+    let codex_auth_dir = pin_auth_dir(
+        &cli.config,
+        config.codex_auth_dir.as_deref(),
+        resolve_codex_auth_dir,
+    );
+    let codex_providers = ccextra_server::codex::load_codex_providers(
+        &codex_auth_dir,
+        config.server.proxy_url.as_deref(),
+    )
+    .await;
+    if !codex_providers.is_empty() {
+        tracing::info!("动态加载 {} 个 Codex providers", codex_providers.len());
+    }
+
     // 合并配置文件 providers 和 xAI providers
     // Antigravity 模型列表需在线拉取(对齐 CPA 启动模式:已知数据先行、
     // 后台刷新、失败保旧),不阻塞监听 —— 转入 serve 之后的后台任务注入
     let mut all_providers = merge_providers(config.providers, Vec::new());
     all_providers = merge_providers(all_providers, xai_providers);
+    all_providers = merge_providers(all_providers, codex_providers);
 
     // 启动时验证配置
     ccextra_core::route::validate_providers(&all_providers)?;
@@ -186,8 +236,16 @@ async fn main() -> Result<()> {
             )
             .await;
 
+            let codex_auth_dir = pin_auth_dir(&config_path, cfg.codex_auth_dir.as_deref(), resolve_codex_auth_dir);
+            let codex_providers = ccextra_server::codex::load_codex_providers(
+                &codex_auth_dir,
+                cfg.server.proxy_url.as_deref(),
+            )
+            .await;
+
             let mut providers = merge_providers(cfg.providers, antigravity_providers);
             providers = merge_providers(providers, xai_providers);
+            providers = merge_providers(providers, codex_providers);
 
             let user_agents = build_user_agents(cfg.user_agents.as_ref());
             let thinking_registry = load_thinking_registry(&config_path, cfg.models_file.as_deref())?;
@@ -279,6 +337,15 @@ fn xai_auth_dir_from(config_path: &str, override_dir: Option<String>) -> PathBuf
     pin_auth_dir(config_path, raw.as_deref(), resolve_xai_auth_dir)
 }
 
+fn codex_auth_dir_from(config_path: &str, override_dir: Option<String>) -> PathBuf {
+    let raw = if let Some(dir) = override_dir {
+        Some(dir)
+    } else {
+        load_optional_config(config_path).and_then(|cfg| cfg.codex_auth_dir)
+    };
+    pin_auth_dir(config_path, raw.as_deref(), resolve_codex_auth_dir)
+}
+
 /// 读用户 models.json。缺文件 = 空表不钳;解析失败则启动/reload 报错。
 fn load_thinking_registry(
     config_path: &str,
@@ -351,6 +418,11 @@ fn provider_refresh_config(config_path: &str, config: &Config) -> ProviderRefres
             config.xai_auth_dir.as_deref(),
             resolve_xai_auth_dir,
         )),
+        codex_auth_dir: Some(pin_auth_dir(
+            config_path,
+            config.codex_auth_dir.as_deref(),
+            resolve_codex_auth_dir,
+        )),
         proxy_url: config.server.proxy_url.clone(),
         static_providers: config.providers.clone(),
     }
@@ -364,6 +436,11 @@ async fn load_refreshed_providers(refresh: ProviderRefreshConfig) -> Option<Vec<
     } else {
         Vec::new()
     };
+    let codex = if let Some(dir) = refresh.codex_auth_dir.as_ref() {
+        ccextra_server::codex::load_codex_providers(dir, refresh.proxy_url.as_deref()).await
+    } else {
+        Vec::new()
+    };
     let injected = ccextra_server::antigravity::load_antigravity_providers(
         auth_dir,
         refresh.proxy_url.as_deref(),
@@ -374,6 +451,7 @@ async fn load_refreshed_providers(refresh: ProviderRefreshConfig) -> Option<Vec<
         return None;
     }
     let set = merge_providers(refresh.static_providers, xai);
+    let set = merge_providers(set, codex);
     Some(merge_providers(set, injected))
 }
 
@@ -552,6 +630,70 @@ fn cmd_xai_status(config_path: &str, auth_dir: Option<String>) -> Result<()> {
         };
         println!(
             "{}  email={email}  sub={sub}  {status}  expired={}",
+            path.file_name().unwrap_or_default().to_string_lossy(),
+            if cred.expired.is_empty() {
+                "-"
+            } else {
+                cred.expired.as_str()
+            }
+        );
+    }
+    Ok(())
+}
+
+async fn cmd_codex_login(
+    config_path: &str,
+    auth_dir: Option<String>,
+    no_browser: bool,
+    callback_port: Option<u16>,
+) -> Result<()> {
+    let cfg = load_optional_config(config_path);
+    let proxy_url = cfg.as_ref().and_then(|c| c.server.proxy_url.clone());
+    let opts = CodexLoginOptions {
+        auth_dir: codex_auth_dir_from(config_path, auth_dir),
+        no_browser,
+        callback_port: callback_port
+            .unwrap_or(ccextra_server::codex::constants::DEFAULT_CALLBACK_PORT),
+        proxy_url,
+    };
+    run_codex_login(opts).await?;
+    Ok(())
+}
+
+fn cmd_codex_status(config_path: &str, auth_dir: Option<String>) -> Result<()> {
+    let dir = codex_auth_dir_from(config_path, auth_dir);
+    let now = SystemTime::now();
+    let entries = list_codex(&dir)?;
+    if entries.is_empty() {
+        println!("无 Codex 凭证: {}", dir.display());
+        return Ok(());
+    }
+    println!("auth_dir: {}", dir.display());
+    for (path, cred) in entries {
+        let status = if cred.disabled {
+            "disabled"
+        } else if cred.is_fresh(now, ccextra_server::codex::constants::REFRESH_SKEW_SECS) {
+            "fresh"
+        } else {
+            "stale"
+        };
+        let email = if cred.email.is_empty() {
+            "-"
+        } else {
+            cred.email.as_str()
+        };
+        let account = if cred.account_id.is_empty() {
+            "-"
+        } else {
+            cred.account_id.as_str()
+        };
+        let plan = if cred.plan_type.is_empty() {
+            "-"
+        } else {
+            cred.plan_type.as_str()
+        };
+        println!(
+            "{}  email={email}  account={account}  plan={plan}  {status}  expired={}",
             path.file_name().unwrap_or_default().to_string_lossy(),
             if cred.expired.is_empty() {
                 "-"

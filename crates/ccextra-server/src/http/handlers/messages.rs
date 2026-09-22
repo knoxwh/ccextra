@@ -492,6 +492,7 @@ pub(crate) async fn prepare_message_request(
         provider_prompt_cache_key,
         antigravity_refresh,
         xai_refresh,
+        codex_refresh,
     ) = {
         let provider = find_provider(providers, &route.provider)
             .ok_or_else(|| AppError::new(anyhow::anyhow!("provider 未找到: {}", route.provider)))?;
@@ -515,6 +516,14 @@ pub(crate) async fn prepare_message_request(
                 let sub = m.get("sub").cloned().unwrap_or_default();
                 Some((auth_dir, email, sub))
             });
+        let codex_refresh = meta
+            .filter(|m| m.get("provider_type").map(|s| s.as_str()) == Some("codex"))
+            .and_then(|m| {
+                let auth_dir = m.get("auth_dir")?.clone();
+                let email = m.get("email").cloned().unwrap_or_default();
+                let account_id = m.get("account_id").cloned().unwrap_or_default();
+                Some((auth_dir, email, account_id))
+            });
         (
             provider.base_urls().to_vec(),
             provider.key.clone(),
@@ -522,6 +531,7 @@ pub(crate) async fn prepare_message_request(
             provider.prompt_cache_key,
             antigravity_refresh,
             xai_refresh,
+            codex_refresh,
         )
     };
 
@@ -554,6 +564,28 @@ pub(crate) async fn prepare_message_request(
             }
             Err(e) => {
                 tracing::warn!(email = %email, sub = %sub, "xAI 凭证运行时刷新失败: {e}");
+            }
+        }
+    }
+
+    // Codex 运行时 token 校验与自动刷新;account_id 供 Chatgpt-Account-Id 头
+    let mut codex_account_id: Option<String> = None;
+    if let Some((auth_dir_str, email, account_id)) = codex_refresh {
+        let auth_dir = std::path::Path::new(&auth_dir_str);
+        let id = if !email.is_empty() { &email } else { &account_id };
+        match crate::codex::ensure_credential_fresh(auth_dir, id, upstream_proxy.as_deref()).await {
+            Ok(fresh_cred) => {
+                upstream_key = fresh_cred.access_token;
+                if !fresh_cred.account_id.is_empty() {
+                    codex_account_id = Some(fresh_cred.account_id);
+                }
+            }
+            Err(e) => {
+                tracing::warn!(email = %email, "Codex 凭证运行时刷新失败: {e}");
+                // 刷新失败仍用落盘 account_id 发请求
+                if !account_id.is_empty() {
+                    codex_account_id = Some(account_id);
+                }
             }
         }
     }
@@ -603,6 +635,13 @@ pub(crate) async fn prepare_message_request(
     };
     let extra_headers = if matches!(route.protocol, Protocol::Claude) {
         claude_relay_headers(headers)
+    } else if let Some(account_id) = codex_account_id.as_deref() {
+        // Codex 订阅身份头 (对齐 CPA: 仅 OAuth 账号发,API key provider 无 metadata 不发)
+        let mut map = HeaderMap::new();
+        if let Ok(value) = axum::http::HeaderValue::from_str(account_id) {
+            map.insert(axum::http::HeaderName::from_static("chatgpt-account-id"), value);
+        }
+        map
     } else {
         HeaderMap::new()
     };

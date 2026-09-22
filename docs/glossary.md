@@ -15,7 +15,7 @@
 | SSE | `text/event-stream` 响应格式；ccextra 将所有流式路径输出为 Anthropic SSE。 |
 | 非流响应 | `stream` 为 `false` 或缺失时的单个 JSON 响应。 |
 
-xAI Grok 不是 protocol。它使用 OAuth 凭证动态创建 `openai_responses` provider。
+xAI Grok 与 Codex 不是 protocol。它们使用 OAuth 凭证动态创建 `openai_responses` provider。
 
 ## 路由与配置
 
@@ -119,7 +119,7 @@ Gemini 函数调用模式。Antigravity Claude 模型强制使用；Gemini 直�
 将 Anthropic `input_schema` 转成 Gemini 或 Antigravity 可接受 JSON Schema 的递归过程。它内联本地引用、移除不支持关键字、归一化布尔 `true` 子 schema、处理 enum 和 required，并为不同目标采用不同规则；Gemini 直连保留 `additionalProperties` 与标准约束，Antigravity 搬入 description 提示。声明 `items` 但缺 `type` 的节点补 `type: array`；`type` 显式不是 `array` 时去掉 `items`。
 
 **OAuth 动态 provider**
-由保存的 Antigravity 或 xAI 凭证生成的运行时 provider。Antigravity 后台刷新模型，xAI 在启动和重载时扫描、刷新凭证。
+由保存的 Antigravity、xAI 或 Codex 凭证生成的运行时 provider。Antigravity 后台刷新模型，xAI 与 Codex 在启动和重载时扫描、刷新凭证。Codex 请求携带 `Chatgpt-Account-Id` 订阅身份头。
 
 **热重载**
 `POST /reload` 串行加载、校验后原子替换统一不可变配置快照；失败不改变已生效版本。旧请求保留旧快照，新请求取得新快照。后台刷新绑定版本，过期结果丢弃；后续轮次使用最新已发布的静态配置、目录及代理。

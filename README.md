@@ -37,7 +37,7 @@
 - **按模型切换上游**：五种协议共用一个端口，模型别名与实际模型名分开配置。
 - **请求内容稳定化**：归一化工具、schema 和历史内容，减少无意义的跨轮差异；实际缓存命中由上游决定。
 - **模型能力适配**：转换消息、工具调用与图片，按 `models.json` 调整支持的 reasoning 档位。
-- **OAuth 接入**：支持 Antigravity 与 xAI Grok 凭证加载、刷新和动态模型路由。
+- **OAuth 接入**：支持 Antigravity、xAI Grok 与 Codex（OpenAI ChatGPT 订阅）凭证加载、刷新和动态模型路由。
 - **配置热重载**：无需重启即可发布新配置；进行中的请求继续使用原快照。
 
 ## 架构流向
@@ -63,7 +63,7 @@ flowchart LR
 | `gemini` | Gemini GenerateContent | 转换内容块、工具结果和 schema。 |
 | `antigravity` | Cloud Code Assist | 封装 Gemini 请求，处理工具命名和模型输出上限；默认短连接。 |
 
-> **提示**：xAI Grok 通过 OAuth 动态注册为 `openai_responses` provider，无需配置独立协议。
+> **提示**：xAI Grok 与 Codex 均通过 OAuth 动态注册为 `openai_responses` provider，无需配置独立协议。Codex 订阅请求自动携带 `Chatgpt-Account-Id` 身份头。
 
 ## 快速开始
 
@@ -191,11 +191,13 @@ curl -H "Authorization: Bearer $ANTHROPIC_AUTH_TOKEN" \
 ./ccextra antigravity-status
 ./ccextra xai-login
 ./ccextra xai-status
+./ccextra codex-login
+./ccextra codex-status
 ./scripts/check_antigravity_quota.sh
 ./scripts/check_grok_quota.sh
 ```
 
-Antigravity 凭证默认在配置文件旁 `.cache/antigravity`，xAI 在 `.cache/xai`。xAI 启动时自动发现；Antigravity 后台加载并每 3 小时刷新模型。
+Antigravity 凭证默认在配置文件旁 `.cache/antigravity`，xAI 在 `.cache/xai`，Codex 在 `.cache/codex`。xAI 与 Codex 启动时自动发现；Antigravity 后台加载并每 3 小时刷新模型。Codex 登录使用 PKCE 浏览器授权（本地回调端口默认 1455，可用 `--callback-port` 覆盖），token 提前 24 小时刷新。
 
 修改配置或需要立即重新加载凭证时：
 
