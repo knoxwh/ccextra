@@ -15,8 +15,10 @@ use serde::Deserialize;
 /// 300s 是 grok/codex 的**流 chunk 空闲**，不是池寿命。
 const POOL_IDLE_TIMEOUT: Duration = Duration::from_secs(90);
 const CONNECT_TIMEOUT: Duration = Duration::from_secs(10);
-/// send() 上限(对齐 grok 流 idle 300s)。无 Client::timeout，避免掐整条 SSE。
-const SEND_TIMEOUT: Duration = Duration::from_secs(300);
+/// send() 上限(等到响应头)。60s:上游收连不回头时快速失败交客户端退避,
+/// 不让单请求占满 5 分钟;流式之后的 chunk idle 走 STREAM_IDLE_TIMEOUT。
+/// 无 Client::timeout,避免掐整条 SSE。
+const SEND_TIMEOUT: Duration = Duration::from_secs(60);
 
 /// 上游请求结果
 #[derive(Debug)]
