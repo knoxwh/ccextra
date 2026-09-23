@@ -244,6 +244,11 @@ where
             ) {
                 yield Ok(output);
             }
+            // 终态事件已完整下发后不再等上游 EOF(对齐 sub2api 277aa1411:
+            // finished 后事件本就被忽略,提前结束无语义差异)
+            if relay.finished {
+                break;
+            }
         }
 
         // flush 没有末尾空行的 SSE 事件。

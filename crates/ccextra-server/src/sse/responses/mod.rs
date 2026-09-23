@@ -84,6 +84,12 @@ where
                     yield Ok(out);
                 }
             }
+            // 终态事件已完整下发后不再等上游 EOF(对齐 sub2api 277aa1411:
+            // keep-alive/HTTP2 复用连接上上游可能拖延关流,空等只拉长尾延迟;
+            // finished 后事件本就被忽略,提前结束无语义差异)
+            if relay.finished {
+                break;
+            }
         }
         for ev in parser.finish() {
             for out in relay.process(&ev) {

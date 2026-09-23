@@ -272,6 +272,39 @@ mod tests {
         assert!(d4 < after, "顺序不得被心跳打乱: {frames:?}");
     }
 
+    #[tokio::test]
+    async fn relay_ends_at_terminal_event_without_upstream_eof() {
+        // 对齐 sub2api 277aa1411 回归:上游在终态事件后拖延关闭连接
+        // (keep-alive/HTTP2 复用上观测到 8~46s 不 EOF)。终态帧完整下发后
+        // relay 必须立即收尾,不得空等上游 EOF。
+        let responses_frames = "data: {\"type\":\"response.created\",\"response\":{\"id\":\"r1\",\"model\":\"gpt-5\"}}\n\n\
+             data: {\"type\":\"response.completed\",\"response\":{\"id\":\"r1\",\"output\":[],\"usage\":{\"input_tokens\":10,\"output_tokens\":5}}}\n\n";
+        let hanging: Pin<Box<dyn Stream<Item = Result<Bytes, reqwest::Error>> + Send>> = Box::pin(
+            futures::stream::once(async move { Ok(Bytes::from(responses_frames)) })
+                .chain(futures::stream::pending()),
+        );
+        let out = relay(Protocol::OpenAiResponses, hanging, None, None, None);
+        let drained = tokio::time::timeout(std::time::Duration::from_secs(2), drain(out))
+            .await
+            .expect("终态后不得等上游 EOF");
+        let joined = drained.join("");
+        assert!(joined.contains("event: message_stop"), "{joined}");
+
+        // Chat:finish_reason + usage 已到,无 [DONE] 且上游挂起
+        let chat_frames = "data: {\"choices\":[{\"delta\":{\"role\":\"assistant\",\"content\":\"hi\"},\"finish_reason\":null}]}\n\n\
+             data: {\"choices\":[{\"delta\":{},\"finish_reason\":\"stop\"}],\"usage\":{\"prompt_tokens\":10,\"completion_tokens\":5}}\n\n";
+        let hanging: Pin<Box<dyn Stream<Item = Result<Bytes, reqwest::Error>> + Send>> = Box::pin(
+            futures::stream::once(async move { Ok(Bytes::from(chat_frames)) })
+                .chain(futures::stream::pending()),
+        );
+        let out = relay(Protocol::OpenAiChat, hanging, None, None, None);
+        let drained = tokio::time::timeout(std::time::Duration::from_secs(2), drain(out))
+            .await
+            .expect("终态后不得等上游 EOF");
+        let joined = drained.join("");
+        assert!(joined.contains("event: message_stop"), "{joined}");
+    }
+
     #[test]
     fn test_extract_usage_chat_top_level() {
         let chunk = json!({
