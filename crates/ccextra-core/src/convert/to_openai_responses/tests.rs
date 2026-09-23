@@ -283,6 +283,32 @@ fn test_tool_schema_normalized() {
 }
 
 #[test]
+fn test_tool_schema_drops_null_required() {
+    let mut body = json!({
+        "messages": [],
+        "tools": [{
+            "name": "edit",
+            "input_schema": {
+                "type": "object",
+                "required": null,
+                "properties": {
+                    "nested": {"type": "object", "required": null, "properties": {}},
+                    "sample": {"type": "object", "default": {"required": null}}
+                }
+            }
+        }]
+    });
+    convert_to_openai_responses(&mut body, "test-model").unwrap();
+    let schema = &body["tools"][0]["parameters"];
+    assert!(schema.get("required").is_none());
+    assert!(schema["properties"]["nested"].get("required").is_none());
+    assert_eq!(
+        schema["properties"]["sample"]["default"]["required"],
+        json!(null)
+    );
+}
+
+#[test]
 fn test_tool_schema_union_non_object_simplified() {
     // xAI 拒收非 object-only 的 root union:整体简化为安全 schema(对齐 CPA)
     let mut body = json!({

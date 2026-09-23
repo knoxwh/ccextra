@@ -126,6 +126,10 @@ pub fn normalize_object_schema_properties(schema: serde_json::Value) -> serde_js
             if is_object_type && !map.contains_key("properties") {
                 map.insert("properties".into(), serde_json::json!({}));
             }
+            // 对齐 sub2api 1d640c40e:required:null 无效，删键而非替换成 []。
+            if map.get("required").is_some_and(Value::is_null) {
+                map.shift_remove("required");
+            }
             // 对齐 CPA e56abd56:剥离含 \p{...}/\P{...} 的 pattern
             // (Python re 编译报 bad escape \p,上游 schema 校验失败)
             if let Some(Value::String(p)) = map.get("pattern") {

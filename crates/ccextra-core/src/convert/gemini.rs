@@ -2,6 +2,9 @@
 
 use serde_json::Value;
 use std::collections::{HashMap, HashSet};
+use std::sync::OnceLock;
+
+use regex::Regex;
 
 use super::antigravity_tools::antigravity_tool_name_to_upstream;
 use super::gemini_schema::{clean_json_schema_for_gemini, clean_nested_schema_for_antigravity};
@@ -66,6 +69,13 @@ pub fn convert_to_gemini_with_registry(
         Some(Value::String(s)) => {
             // 先清洗,再过滤 ignorable 文本
             let cleaned = super::to_openai_responses::strip_claude_system_for_gemini(s);
+            let cleaned = if flavor == SchemaFlavor::Antigravity
+                && !upstream_model.to_lowercase().contains("claude")
+            {
+                neutralize_claude_identity(&cleaned)
+            } else {
+                cleaned
+            };
             if !cleaned.trim().is_empty() && !is_ignorable_system_text(&cleaned, upstream_model) {
                 system_parts.push(serde_json::json!({"text": cleaned.trim()}));
             }
@@ -77,6 +87,13 @@ pub fn convert_to_gemini_with_registry(
                 }
                 if let Some(text) = block.get("text").and_then(|t| t.as_str()) {
                     let cleaned = super::to_openai_responses::strip_claude_system_for_gemini(text);
+                    let cleaned = if flavor == SchemaFlavor::Antigravity
+                        && !upstream_model.to_lowercase().contains("claude")
+                    {
+                        neutralize_claude_identity(&cleaned)
+                    } else {
+                        cleaned
+                    };
                     if !cleaned.trim().is_empty()
                         && !is_ignorable_system_text(&cleaned, upstream_model)
                     {
@@ -293,6 +310,22 @@ pub fn convert_to_gemini_with_registry(
     }
 
     (gemini, short_to_original)
+}
+
+/// 对齐 sub2api dd292e3b0:仅中和 system 块开头的 Claude 身份句，保留后续指令。
+fn neutralize_claude_identity(text: &str) -> String {
+    static OPENER: OnceLock<Regex> = OnceLock::new();
+    let opener = OPENER.get_or_init(|| {
+        Regex::new(
+            r"(?i)^[ \t\r\n]*You are (?:a Claude agent, built on Anthropic'?s Claude Agent SDK|Claude Code, Anthropic'?s official CLI for Claude)\.?",
+        )
+        .unwrap()
+    });
+    if let Some(matched) = opener.find(text) {
+        format!("You are an AI agent.{}", &text[matched.end()..])
+    } else {
+        text.to_string()
+    }
 }
 
 /// 对齐 CPA registry models.json gemini 节 thinking.max(仅 Gemini 直连目标)

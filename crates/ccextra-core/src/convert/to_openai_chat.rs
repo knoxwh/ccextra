@@ -248,13 +248,14 @@ pub fn convert_to_openai_chat_with(
                 fn_obj["function"]["parameters"] =
                     super::normalize_object_schema_properties(schema.clone());
             }
-            // 严格上游(xAI/new-api)校验:object schema 有 properties 时必须带
-            // required 数组,缺失报 standard_violation "required: null is not
-            // of type array"。幂等,不改变已存在的 required。
+            // required 缺省时补空数组；显式 null 已在 schema 归一化中删除，须保持缺省。
             let params = &mut fn_obj["function"]["parameters"];
             if params.get("type").and_then(|v| v.as_str()) == Some("object")
                 && params.get("properties").is_some()
                 && params.get("required").is_none()
+                && !tool
+                    .pointer("/input_schema/required")
+                    .is_some_and(Value::is_null)
             {
                 params["required"] = json!([]);
             }
@@ -748,6 +749,32 @@ mod tests {
         convert_to_openai_chat(&mut body, "gpt-4").unwrap();
         assert_eq!(body["model"], "gpt-4");
         assert_eq!(body["messages"][0]["role"], "user");
+    }
+
+    #[test]
+    fn test_tool_schema_drops_null_required() {
+        let mut body = json!({
+            "messages": [],
+            "tools": [{
+                "name": "edit",
+                "input_schema": {
+                    "type": "object",
+                    "required": null,
+                    "properties": {
+                        "nested": {"type": "object", "required": null, "properties": {}},
+                        "sample": {"type": "object", "default": {"required": null}}
+                    }
+                }
+            }]
+        });
+        convert_to_openai_chat(&mut body, "gpt-4").unwrap();
+        let schema = &body["tools"][0]["function"]["parameters"];
+        assert!(schema.get("required").is_none());
+        assert!(schema["properties"]["nested"].get("required").is_none());
+        assert_eq!(
+            schema["properties"]["sample"]["default"]["required"],
+            json!(null)
+        );
     }
 
     #[test]

@@ -94,6 +94,9 @@ fn strip_dialect_keywords_from_schema(v: &mut Value) {
         Value::Object(map) => {
             map.remove("$schema");
             map.remove("$id");
+            if map.get("required").is_some_and(Value::is_null) {
+                map.shift_remove("required");
+            }
 
             // 对齐 CPA e56abd56:Python re 编译失败的 pattern 直接删
             if let Some(Value::String(p)) = map.get("pattern") {
