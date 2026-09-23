@@ -183,7 +183,8 @@ pub fn normalize_object_schema_properties(schema: serde_json::Value) -> serde_js
 }
 
 /// 对齐 CPA util.HasUnsupportedUnicodePropertyEscape:检测未转义的
-/// \p{...}/\P{...}(Python re 编译失败)。跳过被反斜杠转义的字符。
+/// \p{...}/\P{...}(Python re 编译失败)与八进制 NUL 转义 \0(严格上游
+/// 校验报 "is not a 'regex'",等价 \x00 拼写可接受)。跳过被反斜杠转义的字符。
 pub fn has_unsupported_unicode_property_escape(pattern: &str) -> bool {
     let b = pattern.as_bytes();
     let mut i = 0;
@@ -193,6 +194,10 @@ pub fn has_unsupported_unicode_property_escape(pattern: &str) -> bool {
             continue;
         }
         if i + 2 < b.len() && (b[i + 1] == b'p' || b[i + 1] == b'P') && b[i + 2] == b'{' {
+            return true;
+        }
+        // 对齐 CPA 320100ec:八进制 NUL 转义 \0 同样剥离
+        if i + 1 < b.len() && b[i + 1] == b'0' {
             return true;
         }
         i += 2; // 跳过反斜杠与其后一个字符
@@ -295,6 +300,10 @@ mod tests {
         // 无花括号的 \p 不算
         assert!(!has_unsupported_unicode_property_escape(r"\pL"));
         assert!(!has_unsupported_unicode_property_escape(r"^\d{4}-\d{2}$"));
+        // 对齐 CPA 320100ec:八进制 NUL \0 算,\x00 拼写与转义反斜杠不算
+        assert!(has_unsupported_unicode_property_escape("^[^\\0]*$"));
+        assert!(!has_unsupported_unicode_property_escape("^[^\\x00]*$"));
+        assert!(!has_unsupported_unicode_property_escape(r"\\0"));
     }
 
     #[test]
@@ -315,6 +324,33 @@ mod tests {
         assert!(out["properties"]["a"].get("pattern").is_none());
         assert_eq!(out["properties"]["b"]["pattern"], r"^\d+$");
         assert!(out["anyOf"][0].get("pattern").is_none());
+    }
+
+    #[test]
+    fn test_normalize_object_schema_properties_strips_octal_nul_pattern() {
+        // 对齐 CPA 320100ec / TestNormalizeCodexToolSchemas_StripsOctalNULPatternEscape:
+        // \0 pattern 剥离,\x00 拼写与普通 pattern 保留
+        let schema: serde_json::Value = serde_json::from_str(
+            r#"{
+                "type": "object",
+                "properties": {
+                    "file_paths": {
+                        "type": "array",
+                        "items": {"type": "string", "pattern": "^[^\\0]*$", "minLength": 1}
+                    },
+                    "asset_id": {"type": "string", "pattern": "^[0-9a-f]{32}$"},
+                    "hex_nul": {"type": "string", "pattern": "^[^\\x00]*$"}
+                }
+            }"#,
+        )
+        .unwrap();
+        let out = normalize_object_schema_properties(schema);
+        assert!(out["properties"]["file_paths"]["items"]
+            .get("pattern")
+            .is_none());
+        assert_eq!(out["properties"]["file_paths"]["items"]["minLength"], 1);
+        assert_eq!(out["properties"]["asset_id"]["pattern"], "^[0-9a-f]{32}$");
+        assert_eq!(out["properties"]["hex_nul"]["pattern"], "^[^\\x00]*$");
     }
 
     #[test]
