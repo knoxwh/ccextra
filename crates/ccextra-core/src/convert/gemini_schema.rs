@@ -833,9 +833,10 @@ fn sanitize_array_items(schema: &mut Value) {
             return;
         }
         // gjson String():缺失/null/"" 都是空串,CPA 据此补 array;其它非 "array" 剥 items
+        // (对齐 CPA 2eb8dd11:比较大小写不敏感,大写 ARRAY 保留 items)
         if schema_type_string(map.get("type")).is_empty() {
             map.insert("type".into(), Value::String("array".to_string()));
-        } else if schema_type_string(map.get("type")) != "array" {
+        } else if !schema_type_string(map.get("type")).eq_ignore_ascii_case("array") {
             map.shift_remove("items");
         }
     }
@@ -1431,9 +1432,14 @@ fn is_known_schema_keyword_or_extension(key: &str) -> bool {
 
 fn is_non_object_declared_type(t: Option<&Value>) -> bool {
     match t {
-        Some(Value::String(s)) => !s.is_empty() && s != "object",
+        // 对齐 CPA 2eb8dd11:object 判定大小写不敏感
+        Some(Value::String(s)) => !s.is_empty() && !s.eq_ignore_ascii_case("object"),
         Some(Value::Array(arr)) => {
-            !arr.is_empty() && !arr.iter().any(|item| item.as_str() == Some("object"))
+            !arr.is_empty()
+                && !arr.iter().any(|item| {
+                    item.as_str()
+                        .is_some_and(|s| s.eq_ignore_ascii_case("object"))
+                })
         }
         _ => false,
     }
@@ -1451,8 +1457,12 @@ fn schema_type_string(t: Option<&Value>) -> String {
 
 fn is_array_declared_type(t: Option<&Value>) -> bool {
     match t {
-        Some(Value::String(s)) => s == "array",
-        Some(Value::Array(arr)) => arr.iter().any(|item| item.as_str() == Some("array")),
+        // 对齐 CPA 2eb8dd11:array 判定大小写不敏感
+        Some(Value::String(s)) => s.eq_ignore_ascii_case("array"),
+        Some(Value::Array(arr)) => arr.iter().any(|item| {
+            item.as_str()
+                .is_some_and(|s| s.eq_ignore_ascii_case("array"))
+        }),
         _ => false,
     }
 }
@@ -2084,6 +2094,49 @@ mod tests {
             let empty_list = clean(&json!({"type": [], "items": {"type": "string"}}));
             assert!(empty_list.get("items").is_none());
             assert_eq!(empty_list["type"], json!([]));
+        }
+    }
+
+    #[test]
+    fn test_items_preserved_for_uppercase_array_type() {
+        // 对齐 CPA 2eb8dd11 / TestSanitizeArrayItems_PreservesItemsForUppercaseArrayType:
+        // 大写 ARRAY 声明保留 items,不再误剥
+        let input = json!({
+            "type": "OBJECT",
+            "properties": {
+                "summary": {"type": "STRING"},
+                "brands": {
+                    "type": "ARRAY",
+                    "items": {"type": "STRING"}
+                },
+                "catalog": {
+                    "type": "OBJECT",
+                    "properties": {
+                        "items": {
+                            "type": "ARRAY",
+                            "items": {
+                                "type": "OBJECT",
+                                "properties": {"id": {"type": "STRING"}}
+                            }
+                        }
+                    }
+                }
+            }
+        });
+        for clean in [
+            clean_json_schema_for_gemini,
+            clean_json_schema_for_antigravity,
+        ] {
+            let out = clean(&input);
+            assert!(
+                out["properties"]["brands"]["items"].is_object(),
+                "brands.items stripped: {out}"
+            );
+            assert_eq!(out["properties"]["brands"]["type"], "ARRAY");
+            assert!(
+                out["properties"]["catalog"]["properties"]["items"]["items"].is_object(),
+                "nested items stripped: {out}"
+            );
         }
     }
 }
