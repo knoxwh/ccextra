@@ -959,16 +959,6 @@ IMPORTANT: Assist with authorized security testing.
     }
 
     #[test]
-    fn test_empty_messages_array() {
-        let mut body = json!({
-            "model": "test",
-            "messages": []
-        });
-        convert_to_openai_chat(&mut body, "gpt").unwrap();
-        assert_eq!(body["messages"].as_array().unwrap().len(), 0);
-    }
-
-    #[test]
     fn test_empty_tools_array() {
         // 无存活工具时不写 tools 字段(对齐 sub2api `len(out.Tools) > 0`)
         let mut body = json!({
@@ -977,6 +967,7 @@ IMPORTANT: Assist with authorized security testing.
             "tools": []
         });
         convert_to_openai_chat(&mut body, "gpt").unwrap();
+        assert_eq!(body["messages"], json!([]));
         assert!(body.get("tools").is_none());
     }
 
@@ -1009,22 +1000,6 @@ IMPORTANT: Assist with authorized security testing.
         convert_to_openai_chat(&mut body2, "gpt").unwrap();
         assert!(body2.get("tools").is_none());
         assert!(body2.get("tool_choice").is_none());
-    }
-
-    #[test]
-    fn test_system_attribution_stripped() {
-        let mut body = json!({
-            "model": "test",
-            "system": [
-                {"type": "text", "text": "x-anthropic-billing-header: fp=abc123"},
-                {"type": "text", "text": "Real instructions"}
-            ],
-            "messages": []
-        });
-        convert_to_openai_chat(&mut body, "gpt").unwrap();
-        let content = body["messages"][0]["content"].as_array().unwrap();
-        assert_eq!(content.len(), 1);
-        assert_eq!(content[0]["text"], "Real instructions");
     }
 
     #[test]
@@ -1078,15 +1053,20 @@ IMPORTANT: Assist with authorized security testing.
     }
 
     #[test]
-    fn test_system_only_attribution_dropped() {
-        let mut body = json!({
-            "model": "test",
-            "system": "  x-anthropic-billing-header: fp=abc123",
-            "messages": [{"role": "user", "content": "hi"}]
-        });
-        convert_to_openai_chat(&mut body, "gpt").unwrap();
-        // system 消息不应存在,messages[0] 直接是 user
-        assert_eq!(body["messages"][0]["role"], "user");
+    fn test_system_omitted_when_all_filtered() {
+        for system in [
+            "  x-anthropic-billing-header: fp=abc123",
+            "You are Claude Code, Anthropic's official CLI for Claude.",
+        ] {
+            let mut body = json!({
+                "model": "test",
+                "system": system,
+                "messages": [{"role": "user", "content": "hi"}]
+            });
+            convert_to_openai_chat(&mut body, "gpt").unwrap();
+            assert_eq!(body["messages"].as_array().unwrap().len(), 1, "{system}");
+            assert_eq!(body["messages"][0]["role"], "user", "{system}");
+        }
     }
 
     #[test]
@@ -1105,18 +1085,6 @@ IMPORTANT: Assist with authorized security testing.
         let content = body["messages"][0]["content"].as_array().unwrap();
         assert_eq!(content.len(), 1);
         assert_eq!(content[0]["text"], "You are helpful");
-    }
-
-    #[test]
-    fn test_system_omitted_when_all_filtered() {
-        let mut body = json!({
-            "model": "test",
-            "system": "You are Claude Code, Anthropic's official CLI for Claude.",
-            "messages": [{"role": "user", "content": "hi"}]
-        });
-        convert_to_openai_chat(&mut body, "gpt").unwrap();
-        assert_eq!(body["messages"].as_array().unwrap().len(), 1);
-        assert_eq!(body["messages"][0]["role"], "user");
     }
 
     #[test]
@@ -1257,25 +1225,16 @@ IMPORTANT: Assist with authorized security testing.
     }
 
     #[test]
-    fn test_tool_result_empty_string_fallback() {
-        let mut body = make_tool_result_body(json!(""));
-        convert_to_openai_chat(&mut body, "gpt").unwrap();
-        assert_eq!(body["messages"][1]["content"], "(no output)");
-    }
-
-    #[test]
-    fn test_tool_result_empty_array_fallback() {
-        let mut body = make_tool_result_body(json!([]));
-        convert_to_openai_chat(&mut body, "gpt").unwrap();
-        assert_eq!(body["messages"][1]["content"], "(no output)");
-    }
-
-    #[test]
-    fn test_tool_result_whitespace_only_fallback() {
-        let mut body = make_tool_result_body(json!([{"type": "text", "text": "  \n  "}]));
-        convert_to_openai_chat(&mut body, "gpt").unwrap();
-        // 对齐 sub2api:文本过滤仅精确空串,纯空白保留原样
-        assert_eq!(body["messages"][1]["content"], "  \n  ");
+    fn test_tool_result_empty_and_whitespace_content() {
+        for (content, expected) in [
+            (json!(""), "(no output)"),
+            (json!([]), "(no output)"),
+            (json!([{"type": "text", "text": "  \n  "}]), "  \n  "),
+        ] {
+            let mut body = make_tool_result_body(content.clone());
+            convert_to_openai_chat(&mut body, "gpt").unwrap();
+            assert_eq!(body["messages"][1]["content"], expected, "{content}");
+        }
     }
 
     #[test]
@@ -1478,20 +1437,22 @@ IMPORTANT: Assist with authorized security testing.
     }
 
     #[test]
-    fn test_future_gpt_generation_keeps_default_fields() {
-        let mut body = json!({
-            "model": "test",
-            "system": "You are helpful",
-            "messages": [],
-            "max_tokens": 1024,
-            "temperature": 0.2,
-            "top_p": 0.8
-        });
-        convert_to_openai_chat(&mut body, "gpt-7").unwrap();
-        assert_eq!(body["max_tokens"], 1024);
-        assert_eq!(body["temperature"], 0.2);
-        assert!(body.get("top_p").is_none());
-        assert_eq!(body["messages"][0]["role"], "system");
+    fn test_unrecognized_gpt_models_keep_default_fields() {
+        for model in ["gpt-7", "gpt-6-astra-2026-99-03", "gpt-6-astra-pro"] {
+            let mut body = json!({
+                "model": "test",
+                "system": "You are helpful",
+                "messages": [],
+                "max_tokens": 1024,
+                "temperature": 0.2,
+                "top_p": 0.8
+            });
+            convert_to_openai_chat(&mut body, model).unwrap();
+            assert_eq!(body["max_tokens"], 1024, "{model}");
+            assert_eq!(body["temperature"], 0.2, "{model}");
+            assert!(body.get("top_p").is_none(), "{model}");
+            assert_eq!(body["messages"][0]["role"], "system", "{model}");
+        }
     }
 
     #[test]
@@ -1513,52 +1474,18 @@ IMPORTANT: Assist with authorized security testing.
     }
 
     #[test]
-    fn test_invalid_gpt6_astra_snapshot_keeps_default_fields() {
-        let mut body = json!({
-            "model": "test",
-            "system": "You are helpful",
-            "messages": [],
-            "max_tokens": 1024,
-            "temperature": 0.2,
-            "top_p": 0.8
-        });
-        convert_to_openai_chat(&mut body, "gpt-6-astra-2026-99-03").unwrap();
-        assert_eq!(body["max_tokens"], 1024);
-        assert_eq!(body["temperature"], 0.2);
-        assert!(body.get("top_p").is_none());
-        assert_eq!(body["messages"][0]["role"], "system");
-    }
-
-    #[test]
-    fn test_unknown_gpt6_astra_variant_keeps_default_fields() {
-        let mut body = json!({
-            "model": "test",
-            "system": "You are helpful",
-            "messages": [],
-            "max_tokens": 1024,
-            "temperature": 0.2,
-            "top_p": 0.8
-        });
-        convert_to_openai_chat(&mut body, "gpt-6-astra-pro").unwrap();
-        assert_eq!(body["max_tokens"], 1024);
-        assert_eq!(body["temperature"], 0.2);
-        assert!(body.get("top_p").is_none());
-        assert_eq!(body["messages"][0]["role"], "system");
-    }
-
-    #[test]
-    fn test_empty_string_content_dropped() {
-        // 空字符串 content 丢弃消息(一致)
-        let mut body = json!({
-            "model": "test",
-            "messages": [
-                {"role": "user", "content": ""},
-                {"role": "assistant", "content": ""}
-            ]
-        });
-        convert_to_openai_chat(&mut body, "gpt").unwrap();
-        let msgs = body["messages"].as_array().unwrap();
-        assert_eq!(msgs.len(), 0);
+    fn test_empty_message_content_dropped() {
+        for content in [json!(""), Value::Null, json!([])] {
+            let mut body = json!({
+                "model": "test",
+                "messages": [
+                    {"role": "user", "content": content},
+                    {"role": "assistant", "content": content}
+                ]
+            });
+            convert_to_openai_chat(&mut body, "gpt").unwrap();
+            assert_eq!(body["messages"], json!([]), "{content}");
+        }
     }
 
     #[test]
@@ -1579,36 +1506,6 @@ IMPORTANT: Assist with authorized security testing.
         assert_eq!(tools[0]["function"]["parameters"]["required"], json!([]));
         assert_eq!(tools[1]["function"]["parameters"]["required"], json!(["x"]));
         assert_eq!(tools[2]["function"]["parameters"]["required"], json!([]));
-    }
-
-    #[test]
-    fn test_null_content_dropped() {
-        // null content 丢弃消息(一致)
-        let mut body = json!({
-            "model": "test",
-            "messages": [
-                {"role": "user", "content": null},
-                {"role": "assistant", "content": null}
-            ]
-        });
-        convert_to_openai_chat(&mut body, "gpt").unwrap();
-        let msgs = body["messages"].as_array().unwrap();
-        assert_eq!(msgs.len(), 0);
-    }
-
-    #[test]
-    fn test_empty_array_content_no_message() {
-        // 空数组 content 无实际内容项 → 不输出消息(一致)
-        let mut body = json!({
-            "model": "test",
-            "messages": [
-                {"role": "user", "content": []},
-                {"role": "assistant", "content": []}
-            ]
-        });
-        convert_to_openai_chat(&mut body, "gpt").unwrap();
-        let msgs = body["messages"].as_array().unwrap();
-        assert_eq!(msgs.len(), 0);
     }
 
     #[test]

@@ -138,8 +138,7 @@ pub async fn exchange_code(
     let bytes = crate::limits::read_success_body(resp)
         .await
         .context("codex parse token response")?;
-    let data: TokenData =
-        serde_json::from_slice(&bytes).context("codex parse token response")?;
+    let data: TokenData = serde_json::from_slice(&bytes).context("codex parse token response")?;
     if data.access_token.trim().is_empty() {
         return Err(anyhow!(
             "codex token exchange: empty access token in response"
@@ -177,8 +176,7 @@ pub async fn refresh_token(client: &Client, refresh: &str) -> Result<TokenData> 
     let bytes = crate::limits::read_success_body(resp)
         .await
         .context("codex parse refresh response")?;
-    let data: TokenData =
-        serde_json::from_slice(&bytes).context("codex parse refresh response")?;
+    let data: TokenData = serde_json::from_slice(&bytes).context("codex parse refresh response")?;
     if data.access_token.trim().is_empty() {
         return Err(anyhow!(
             "codex token refresh: empty access token in response"

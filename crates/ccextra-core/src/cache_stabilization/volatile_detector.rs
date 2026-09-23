@@ -1056,37 +1056,20 @@ mod tests {
     // ─── 内联 ID 测试 ────────────────────────────────────────
 
     #[test]
-    fn detects_inline_id_req_prefix() {
-        let body = json!({
-            "system": "Request ref req-abc-12345 must be processed.",
-            "messages": [],
-        });
-        let findings = detect_volatile_content(&body, ApiKind::Anthropic);
-        let inline = findings.iter().find(|f| f.kind == VolatileKind::InlineId);
-        assert!(inline.is_some(), "should detect req- prefix inline ID");
-        assert!(inline.unwrap().sample.contains("req-abc-12345"));
-    }
-
-    #[test]
-    fn detects_inline_id_msg_prefix() {
-        let body = json!({
-            "system": "Previous message msg_12345abc referenced.",
-            "messages": [],
-        });
-        let findings = detect_volatile_content(&body, ApiKind::Anthropic);
-        let inline = findings.iter().find(|f| f.kind == VolatileKind::InlineId);
-        assert!(inline.is_some(), "should detect msg_ prefix inline ID");
-    }
-
-    #[test]
-    fn detects_inline_id_call_prefix() {
-        let body = json!({
-            "system": "Tool call call_abc123def456 returned.",
-            "messages": [],
-        });
-        let findings = detect_volatile_content(&body, ApiKind::Anthropic);
-        let inline = findings.iter().find(|f| f.kind == VolatileKind::InlineId);
-        assert!(inline.is_some(), "should detect call_ prefix inline ID");
+    fn detects_inline_id_prefixes() {
+        for (text, expected) in [
+            (
+                "Request ref req-abc-12345 must be processed.",
+                "req-abc-12345",
+            ),
+            ("Previous message msg_12345abc referenced.", "msg_12345abc"),
+            ("Tool call call_abc123def456 returned.", "call_abc123def456"),
+        ] {
+            let body = json!({"system": text, "messages": []});
+            let findings = detect_volatile_content(&body, ApiKind::Anthropic);
+            let inline = findings.iter().find(|f| f.kind == VolatileKind::InlineId);
+            assert_eq!(inline.map(|f| f.sample.as_str()), Some(expected), "{text}");
+        }
     }
 
     #[test]
@@ -1120,123 +1103,62 @@ mod tests {
     // ─── 仅日期测试 ────────────────────────────────────────
 
     #[test]
-    fn detects_date_only_dash_format() {
-        let body = json!({
-            "system": "Today is 2026-06-13. Be concise.",
-            "messages": [],
-        });
-        let findings = detect_volatile_content(&body, ApiKind::Anthropic);
-        let date = findings.iter().find(|f| f.kind == VolatileKind::DateOnly);
-        assert!(
-            date.is_some(),
-            "should detect YYYY-MM-DD date; got {:?}",
-            findings
-        );
-        assert_eq!(date.unwrap().sample, "2026-06-13");
-    }
-
-    #[test]
-    fn detects_date_only_slash_format() {
-        let body = json!({
-            "system": "Today's date is 2026/06/13.",
-            "messages": [],
-        });
-        let findings = detect_volatile_content(&body, ApiKind::Anthropic);
-        let date = findings.iter().find(|f| f.kind == VolatileKind::DateOnly);
-        assert!(
-            date.is_some(),
-            "should detect YYYY/MM/DD date; got {:?}",
-            findings
-        );
-    }
-
-    #[test]
-    fn date_only_does_not_match_full_iso8601() {
-        let body = json!({
-            "system": "Started at 2026-06-13T10:30:00Z.",
-            "messages": [],
-        });
-        let findings = detect_volatile_content(&body, ApiKind::Anthropic);
-        assert!(
-            findings.iter().all(|f| f.kind != VolatileKind::DateOnly),
-            "full ISO-8601 must not be flagged as DateOnly; got {:?}",
-            findings,
-        );
-        assert!(
-            findings.iter().any(|f| f.kind == VolatileKind::Timestamp),
-            "full ISO-8601 should be detected as Timestamp; got {:?}",
-            findings,
-        );
-    }
-
-    #[test]
-    fn date_only_does_not_match_space_separated_datetime() {
-        let body = json!({
-            "system": "Started at 2026-06-13 10:30:00.",
-            "messages": [],
-        });
-        let findings = detect_volatile_content(&body, ApiKind::Anthropic);
-        assert!(
-            findings.iter().all(|f| f.kind != VolatileKind::DateOnly),
-            "space-separated datetime must not be flagged as DateOnly; got {:?}",
-            findings,
-        );
-    }
-
-    #[test]
-    fn date_only_rejects_invalid_month() {
-        let body = json!({
-            "system": "Invalid 2026-13-01 date.",
-            "messages": [],
-        });
-        let findings = detect_volatile_content(&body, ApiKind::Anthropic);
-        assert!(
-            findings.iter().all(|f| f.kind != VolatileKind::DateOnly),
-            "month 13 must not be flagged as date; got {:?}",
-            findings,
-        );
-    }
-
-    #[test]
-    fn date_only_rejects_invalid_day() {
-        let body = json!({
-            "system": "Invalid 2026-06-32 date.",
-            "messages": [],
-        });
-        let findings = detect_volatile_content(&body, ApiKind::Anthropic);
-        assert!(
-            findings.iter().all(|f| f.kind != VolatileKind::DateOnly),
-            "day 32 must not be flagged as date; got {:?}",
-            findings,
-        );
+    fn date_only_detection_boundaries() {
+        for (text, expected) in [
+            ("Today is 2026-06-13. Be concise.", "2026-06-13"),
+            ("Today's date is 2026/06/13.", "2026/06/13"),
+        ] {
+            let body = json!({"system": text, "messages": []});
+            let findings = detect_volatile_content(&body, ApiKind::Anthropic);
+            let date = findings.iter().find(|f| f.kind == VolatileKind::DateOnly);
+            assert_eq!(date.map(|f| f.sample.as_str()), Some(expected), "{text}");
+        }
+        for (text, timestamp) in [
+            ("Started at 2026-06-13T10:30:00Z.", true),
+            ("Started at 2026-06-13 10:30:00.", false),
+            ("Invalid 2026-13-01 date.", false),
+            ("Invalid 2026-06-32 date.", false),
+        ] {
+            let body = json!({"system": text, "messages": []});
+            let findings = detect_volatile_content(&body, ApiKind::Anthropic);
+            assert!(
+                findings.iter().all(|f| f.kind != VolatileKind::DateOnly),
+                "{text}: {findings:?}"
+            );
+            if timestamp {
+                assert!(
+                    findings.iter().any(|f| f.kind == VolatileKind::Timestamp),
+                    "{text}: {findings:?}"
+                );
+            }
+        }
     }
 
     // ─── 客户端 dateline 归一化测试(对齐 sub2api anthropicfp)───
 
     #[test]
-    fn dateline_ascii_hyphen_is_identity() {
-        let mut body = json!({
-            "system": "Today's date is 2026-07-01.",
-            "messages": [],
-        });
-        let snapshot = body.clone();
-        let count = normalize_client_dateline(&mut body, ApiKind::Anthropic);
-        assert_eq!(count, 0, "canonical form must be identity");
-        assert_eq!(body, snapshot);
-    }
-
-    #[test]
-    fn dateline_ascii_slash_becomes_hyphen() {
-        let mut body = json!({
-            "system": "Today's date is 2026/07/01.",
-            "messages": [],
-        });
-        let count = normalize_client_dateline(&mut body, ApiKind::Anthropic);
-        assert_eq!(count, 1);
-        assert_eq!(
-            body.get("system").unwrap().as_str().unwrap(),
-            "Today's date is 2026-07-01."
-        );
+    fn dateline_ascii_separators_and_unrelated_prose() {
+        for (text, replacement) in [
+            ("Today's date is 2026-07-01.", None),
+            (
+                "Today's date is 2026/07/01.",
+                Some("Today's date is 2026-07-01."),
+            ),
+            ("Today's date is 2026-07/01.", None),
+            (
+                "Today is foo. His date is 2026-06-30. Log at 2026/06/13.",
+                None,
+            ),
+        ] {
+            let mut body = json!({"system": text, "messages": []});
+            let snapshot = body.clone();
+            let count = normalize_client_dateline(&mut body, ApiKind::Anthropic);
+            assert_eq!(count, usize::from(replacement.is_some()), "{text}");
+            assert_eq!(body["system"], replacement.unwrap_or(text), "{text}");
+            if replacement.is_none() {
+                assert_eq!(body, snapshot, "{text}");
+            }
+        }
     }
 
     #[test]
@@ -1259,32 +1181,6 @@ mod tests {
                 name
             );
         }
-    }
-
-    #[test]
-    fn dateline_mixed_separators_not_matched() {
-        // 与 sub2api 一致:两分隔符不一致的句子不匹配,原样保留
-        let mut body = json!({
-            "system": "Today's date is 2026-07/01.",
-            "messages": [],
-        });
-        let snapshot = body.clone();
-        let count = normalize_client_dateline(&mut body, ApiKind::Anthropic);
-        assert_eq!(count, 0);
-        assert_eq!(body, snapshot);
-    }
-
-    #[test]
-    fn dateline_prose_and_loose_dates_untouched() {
-        // 非指纹句式的日期(用户 prose、代码)不得改写
-        let mut body = json!({
-            "system": "Today is foo. His date is 2026-06-30. Log at 2026/06/13.",
-            "messages": [],
-        });
-        let snapshot = body.clone();
-        let count = normalize_client_dateline(&mut body, ApiKind::Anthropic);
-        assert_eq!(count, 0);
-        assert_eq!(body, snapshot);
     }
 
     #[test]

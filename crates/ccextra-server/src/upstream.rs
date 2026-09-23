@@ -1195,12 +1195,18 @@ mod tests {
     #[test]
     fn test_client_caching() {
         let client = UpstreamClient::new(None);
-        let _c1 = client.client_for("direct", Protocol::OpenAiChat, false).unwrap();
-        let _c2 = client.client_for("direct", Protocol::OpenAiChat, false).unwrap();
+        let _c1 = client
+            .client_for("direct", Protocol::OpenAiChat, false)
+            .unwrap();
+        let _c2 = client
+            .client_for("direct", Protocol::OpenAiChat, false)
+            .unwrap();
         // 同一 proxy_key 应返回相同 client(Arc clone)
         // 通过计数验证缓存命中
         let count_before = client.clients.lock().unwrap().len();
-        let _c3 = client.client_for("direct", Protocol::OpenAiChat, false).unwrap();
+        let _c3 = client
+            .client_for("direct", Protocol::OpenAiChat, false)
+            .unwrap();
         let count_after = client.clients.lock().unwrap().len();
         assert_eq!(count_before, count_after, "缓存应命中,不应重建 client");
     }
@@ -1208,7 +1214,9 @@ mod tests {
     #[test]
     fn test_client_different_proxies() {
         let client = UpstreamClient::new(None);
-        let _c1 = client.client_for("direct", Protocol::OpenAiChat, false).unwrap();
+        let _c1 = client
+            .client_for("direct", Protocol::OpenAiChat, false)
+            .unwrap();
         let _c2 = client
             .client_for("http://proxy1:8080", Protocol::OpenAiChat, false)
             .unwrap();
@@ -1222,8 +1230,12 @@ mod tests {
     fn test_antigravity_short_connection_isolation() {
         // Antigravity 默认短连接:缓存键独立于其他协议(#ant 后缀)
         let client = UpstreamClient::new(None);
-        let _c1 = client.client_for("direct", Protocol::Antigravity, false).unwrap();
-        let _c2 = client.client_for("direct", Protocol::OpenAiChat, false).unwrap();
+        let _c1 = client
+            .client_for("direct", Protocol::Antigravity, false)
+            .unwrap();
+        let _c2 = client
+            .client_for("direct", Protocol::OpenAiChat, false)
+            .unwrap();
         assert_eq!(client.clients.lock().unwrap().len(), 2);
 
         // 默认(未启用连接池)解析为短连接

@@ -352,45 +352,37 @@ mod tests {
         assert_eq!(serde_json::to_string(&claude_body).unwrap(), claude_before);
     }
 
-    /// 顶层 output_config.effort 越档:medium 与 low/high 等距,tie 取低
+    /// 顶层与嵌套 effort 越档时钳到最近级别,等距取低
     #[test]
-    fn test_clamp_top_level_output_config_effort() {
-        let mut body = json!({"output_config": {"effort": "medium"}});
-        assert!(clamp_passthrough_effort(&mut body, "glm-5.3", &registry()));
-        assert_eq!(body["output_config"]["effort"], "low");
+    fn test_clamp_effort_at_both_paths() {
+        for (mut body, path, expected) in [
+            (
+                json!({"output_config": {"effort": "medium"}}),
+                "/output_config/effort",
+                "low",
+            ),
+            (
+                json!({"thinking": {"type": "enabled", "output_config": {"effort": "xhigh"}}}),
+                "/thinking/output_config/effort",
+                "high",
+            ),
+        ] {
+            assert!(clamp_passthrough_effort(&mut body, "glm-5.3", &registry()));
+            assert_eq!(body.pointer(path).unwrap(), expected, "{path}");
+        }
     }
 
-    /// 嵌套 thinking.output_config.effort 越档:xhigh 与 high/max 等距,tie 取低
-    #[test]
-    fn test_clamp_nested_thinking_output_config_effort() {
-        let mut body =
-            json!({"thinking": {"type": "enabled", "output_config": {"effort": "xhigh"}}});
-        assert!(clamp_passthrough_effort(&mut body, "glm-5.3", &registry()));
-        assert_eq!(body["thinking"]["output_config"]["effort"], "high");
-    }
-
-    /// glob `*claude*`:注册表里有也不钳
+    /// glob `*claude*` 模型不钳制,匹配大小写不敏感
     #[test]
     fn test_claude_model_skipped() {
-        let mut body = json!({"output_config": {"effort": "medium"}});
-        assert!(!clamp_passthrough_effort(
-            &mut body,
-            "claude-opus-5",
-            &registry()
-        ));
-        assert_eq!(body["output_config"]["effort"], "medium");
-    }
-
-    /// 中转常见混合大小写写法同样跳过
-    #[test]
-    fn test_claude_model_case_insensitive_skip() {
-        let mut body = json!({"output_config": {"effort": "medium"}});
-        assert!(!clamp_passthrough_effort(
-            &mut body,
-            "US.Anthropic.CLAUDE-Sonnet-4",
-            &registry()
-        ));
-        assert_eq!(body["output_config"]["effort"], "medium");
+        for model in ["claude-opus-5", "US.Anthropic.CLAUDE-Sonnet-4"] {
+            let mut body = json!({"output_config": {"effort": "medium"}});
+            assert!(
+                !clamp_passthrough_effort(&mut body, model, &registry()),
+                "{model}"
+            );
+            assert_eq!(body["output_config"]["effort"], "medium", "{model}");
+        }
     }
 
     /// 注册表未命中 / 表为空:不钳
@@ -423,21 +415,17 @@ mod tests {
         assert!(body["thinking"].is_object());
     }
 
-    /// 仅 legacy budget_tokens、无显式 effort:不处理
+    /// 仅 legacy budget_tokens 或显式 disabled 时不钳制
     #[test]
-    fn test_budget_only_skipped() {
-        let mut body = json!({"thinking": {"type": "enabled", "budget_tokens": 30000}});
-        assert!(!clamp_passthrough_effort(&mut body, "glm-5.3", &registry()));
-        assert_eq!(body["thinking"]["budget_tokens"], 30000);
-    }
-
-    /// thinking 显式 disabled:上游不校验 effort(实测百炼忽略越档值)
-    #[test]
-    fn test_thinking_disabled_skipped() {
-        let mut body =
-            json!({"thinking": {"type": "disabled", "output_config": {"effort": "medium"}}});
-        assert!(!clamp_passthrough_effort(&mut body, "glm-5.3", &registry()));
-        assert_eq!(body["thinking"]["output_config"]["effort"], "medium");
+    fn test_thinking_without_active_effort_skipped() {
+        for mut body in [
+            json!({"thinking": {"type": "enabled", "budget_tokens": 30000}}),
+            json!({"thinking": {"type": "disabled", "output_config": {"effort": "medium"}}}),
+        ] {
+            let before = body.clone();
+            assert!(!clamp_passthrough_effort(&mut body, "glm-5.3", &registry()));
+            assert_eq!(body, before);
+        }
     }
 
     /// 非小写原值 HIGH:字符串不等,规范化为 high 写回

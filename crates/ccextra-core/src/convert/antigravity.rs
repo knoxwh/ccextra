@@ -342,45 +342,40 @@ mod tests {
     }
 
     #[test]
-    fn test_normalize_response_json_schema_camel_case() {
-        // 直接测试 normalize 函数，不依赖完整转换链
-        let mut request_obj = serde_json::Map::new();
-        let mut gc = serde_json::Map::new();
-        gc.insert(
-            "responseJsonSchema".to_string(),
-            json!({
-                "type": "object",
-                "properties": {"message": {"type": "string"}},
-                "required": ["message"]
-            }),
-        );
-        request_obj.insert("generationConfig".to_string(), Value::Object(gc));
-
-        normalize_generation_config_response_schema(&mut request_obj);
-
-        let gc = request_obj["generationConfig"].as_object().unwrap();
-        assert!(gc.get("responseJsonSchema").is_none());
-        assert_eq!(
-            gc["responseSchema"]["properties"]["message"]["type"],
-            "string"
-        );
-    }
-
-    #[test]
-    fn test_normalize_response_json_schema_snake_case() {
-        let mut request_obj = serde_json::Map::new();
-        let mut gc = serde_json::Map::new();
-        gc.insert(
-            "response_json_schema".to_string(),
-            json!({"type": "object", "properties": {"data": {"type": "string"}}}),
-        );
-        request_obj.insert("generationConfig".to_string(), Value::Object(gc));
-
-        normalize_generation_config_response_schema(&mut request_obj);
-
-        let gc = request_obj["generationConfig"].as_object().unwrap();
-        assert!(gc.get("response_json_schema").is_none());
-        assert_eq!(gc["responseSchema"]["properties"]["data"]["type"], "string");
+    fn test_normalize_response_json_schema_key_variants() {
+        for (container, schema_key, schema, property, expected_type) in [
+            (
+                "generationConfig",
+                "responseJsonSchema",
+                json!({"type": "object", "properties": {"message": {"type": "string"}}, "required": ["message"]}),
+                "message",
+                "string",
+            ),
+            (
+                "generationConfig",
+                "response_json_schema",
+                json!({"type": "object", "properties": {"data": {"type": "string"}}}),
+                "data",
+                "string",
+            ),
+            (
+                "generation_config",
+                "responseJsonSchema",
+                json!({"type": "object", "properties": {"x": {"type": "number"}}}),
+                "x",
+                "number",
+            ),
+        ] {
+            let mut request_obj = serde_json::Map::new();
+            request_obj.insert(container.to_string(), json!({schema_key: schema}));
+            normalize_generation_config_response_schema(&mut request_obj);
+            let gc = request_obj[container].as_object().unwrap();
+            assert!(gc.get(schema_key).is_none(), "{container}.{schema_key}");
+            assert_eq!(
+                gc["responseSchema"]["properties"][property]["type"],
+                expected_type
+            );
+        }
     }
 
     #[test]
@@ -405,22 +400,5 @@ mod tests {
         // responseSchema 保持原值（name 属性，不是 stale）
         assert_eq!(gc["responseSchema"]["properties"]["name"]["type"], "string");
         assert!(gc["responseSchema"]["properties"].get("stale").is_none());
-    }
-
-    #[test]
-    fn test_normalize_handles_generation_config_snake_case() {
-        let mut request_obj = serde_json::Map::new();
-        let mut gc = serde_json::Map::new();
-        gc.insert(
-            "responseJsonSchema".to_string(),
-            json!({"type": "object", "properties": {"x": {"type": "number"}}}),
-        );
-        request_obj.insert("generation_config".to_string(), Value::Object(gc));
-
-        normalize_generation_config_response_schema(&mut request_obj);
-
-        let gc = request_obj["generation_config"].as_object().unwrap();
-        assert!(gc.get("responseJsonSchema").is_none());
-        assert_eq!(gc["responseSchema"]["properties"]["x"]["type"], "number");
     }
 }

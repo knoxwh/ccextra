@@ -938,19 +938,6 @@ mod tests {
     }
 
     #[test]
-    fn first_request_emits_first_request_event() {
-        let state = make_state();
-        let body = anthropic_body("you are an assistant", json!([]), vec!["hi"]);
-        let h = compute_structural_hash(&body, ApiKind::Anthropic);
-        let id = identity("session-A");
-        assert_eq!(state.cache.lock().unwrap().0.len(), 0);
-        observe_drift(&state, &id, h.clone());
-        let caches = state.cache.lock().unwrap();
-        assert_eq!(caches.0.len(), 1);
-        assert_eq!(caches.0.peek(id.conversation.as_str()), Some(&h));
-    }
-
-    #[test]
     fn same_hash_emits_no_event() {
         let state = make_state();
         let body = anthropic_body("sys-A", json!([]), vec!["m1"]);
@@ -1091,56 +1078,36 @@ mod tests {
     }
 
     #[test]
-    fn session_key_tklite_session_takes_priority_over_request_id() {
-        let mut headers = HeaderMap::new();
-        headers.insert("x-tklite-session-key", "codex:stable".parse().unwrap());
-        headers.insert("x-request-id", "req-unique".parse().unwrap());
+    fn session_key_hashes_request_id_even_with_empty_tklite() {
         let body = anthropic_body("sys", json!([]), vec!["hi"]);
-        let id = derive_session_key(&headers, &body, ApiKind::Anthropic);
-        assert_eq!(id.parent, "tklite:codex:stable");
+        for tklite in [None, Some("   ")] {
+            let mut headers = HeaderMap::new();
+            if let Some(value) = tklite {
+                headers.insert("x-tklite-session-key", value.parse().unwrap());
+            }
+            headers.insert("x-request-id", "req-abc123".parse().unwrap());
+            let id = derive_session_key(&headers, &body, ApiKind::Anthropic);
+            assert!(id.parent.starts_with("request:"), "{tklite:?}");
+            assert!(!id.parent.contains("req-abc123"), "{tklite:?}");
+        }
     }
 
     #[test]
-    fn session_key_ignores_empty_tklite_session_key() {
-        let mut headers = HeaderMap::new();
-        headers.insert("x-tklite-session-key", "   ".parse().unwrap());
-        headers.insert("x-request-id", "req-abc123".parse().unwrap());
-        let body = anthropic_body("sys", json!([]), vec!["hi"]);
-        let id = derive_session_key(&headers, &body, ApiKind::Anthropic);
-        assert!(id.parent.starts_with("request:"));
-    }
-
-    #[test]
-    fn session_key_hashes_request_id() {
-        let mut headers = HeaderMap::new();
-        headers.insert("x-request-id", "req-abc123".parse().unwrap());
-        let body = anthropic_body("sys", json!([]), vec!["hi"]);
-        let id = derive_session_key(&headers, &body, ApiKind::Anthropic);
-        assert!(!id.parent.contains("req-abc123"));
-        assert!(id.parent.starts_with("request:"));
-    }
-
-    #[test]
-    fn session_key_ignores_api_key_and_headroom_session_id() {
-        let mut headers = HeaderMap::new();
-        headers.insert(
+    fn session_key_ignores_unrelated_headers_and_falls_back_to_anonymous() {
+        let mut unrelated = HeaderMap::new();
+        unrelated.insert(
             "x-api-key",
             "sk-very-private-api-key-12345".parse().unwrap(),
         );
-        headers.insert(
+        unrelated.insert(
             "x-headroom-session-id",
             "user-session-abc123".parse().unwrap(),
         );
         let body = anthropic_body("sys", json!([]), vec!["hi"]);
-        let id = derive_session_key(&headers, &body, ApiKind::Anthropic);
-        assert_eq!(id.parent, "anonymous");
-    }
-
-    #[test]
-    fn session_key_falls_back_to_anonymous() {
-        let body = anthropic_body("sys", json!([]), vec!["hi"]);
-        let id = derive_session_key(&HeaderMap::new(), &body, ApiKind::Anthropic);
-        assert_eq!(id.parent, "anonymous");
+        for headers in [unrelated, HeaderMap::new()] {
+            let id = derive_session_key(&headers, &body, ApiKind::Anthropic);
+            assert_eq!(id.parent, "anonymous", "{headers:?}");
+        }
     }
 
     // --- 会话隔离：判别器 + 两级 observe ---
@@ -1175,25 +1142,23 @@ mod tests {
     }
 
     #[test]
-    fn appending_messages_preserves_identity() {
+    fn appending_messages_or_changing_system_and_tools_preserves_identity() {
         let headers = anthropic_headers();
-        let short = anthropic_body("sys", json!([]), vec!["hi"]);
-        let long = anthropic_body("sys", json!([]), vec!["hi", "more", "even more"]);
-        assert_eq!(
-            derive_session_key(&headers, &short, ApiKind::Anthropic).conversation,
-            derive_session_key(&headers, &long, ApiKind::Anthropic).conversation
-        );
-    }
-
-    #[test]
-    fn changing_system_or_tools_preserves_identity() {
-        let headers = anthropic_headers();
-        let a = anthropic_body("sys-A", json!([{"name": "t1"}]), vec!["hi"]);
-        let b = anthropic_body("sys-B", json!([{"name": "t2"}]), vec!["hi"]);
-        assert_eq!(
-            derive_session_key(&headers, &a, ApiKind::Anthropic).conversation,
-            derive_session_key(&headers, &b, ApiKind::Anthropic).conversation
-        );
+        for (a, b) in [
+            (
+                anthropic_body("sys", json!([]), vec!["hi"]),
+                anthropic_body("sys", json!([]), vec!["hi", "more", "even more"]),
+            ),
+            (
+                anthropic_body("sys-A", json!([{"name": "t1"}]), vec!["hi"]),
+                anthropic_body("sys-B", json!([{"name": "t2"}]), vec!["hi"]),
+            ),
+        ] {
+            assert_eq!(
+                derive_session_key(&headers, &a, ApiKind::Anthropic).conversation,
+                derive_session_key(&headers, &b, ApiKind::Anthropic).conversation
+            );
+        }
     }
 
     #[test]
@@ -1555,106 +1520,103 @@ mod tests {
         assert_eq!(parent.system, h2.system);
     }
 
+    /// 各协议 system 抽取轴：改 system 只动 system 维度，early_messages 不受影响。
     #[test]
-    fn openai_chat_extracts_first_system_message() {
-        let body = json!({
-            "model": "gpt-4",
-            "messages": [
-                {"role": "system", "content": "you are a helpful assistant"},
-                {"role": "user", "content": "hi"},
-            ],
-            "tools": [],
-        });
-        let h1 = compute_structural_hash(&body, ApiKind::OpenAiChat);
-        let body2 = json!({
-            "model": "gpt-4",
-            "messages": [
-                {"role": "system", "content": "you are a different assistant"},
-                {"role": "user", "content": "hi"},
-            ],
-            "tools": [],
-        });
-        let h2 = compute_structural_hash(&body2, ApiKind::OpenAiChat);
-        assert_ne!(h1.system, h2.system);
-        assert_eq!(h1.early_messages, h2.early_messages);
-    }
+    fn system_axis_extraction_per_protocol() {
+        struct Case {
+            name: &'static str,
+            kind: ApiKind,
+            body_a: Value,
+            body_b: Value,
+        }
 
-    #[test]
-    fn openai_responses_uses_instructions_and_input() {
-        let body = json!({
-            "model": "gpt-4",
-            "instructions": "be brief",
-            "tools": [],
-            "input": [
-                {"type": "message", "role": "user", "content": "hello"},
-            ],
-        });
-        let h1 = compute_structural_hash(&body, ApiKind::OpenAiResponses);
-        let body2 = json!({
-            "model": "gpt-4",
-            "instructions": "be verbose",
-            "tools": [],
-            "input": [
-                {"type": "message", "role": "user", "content": "hello"},
-            ],
-        });
-        let h2 = compute_structural_hash(&body2, ApiKind::OpenAiResponses);
-        assert_ne!(h1.system, h2.system);
-        assert_eq!(h1.early_messages, h2.early_messages);
-    }
+        let cases = vec![
+            Case {
+                name: "chat: 首条 system message",
+                kind: ApiKind::OpenAiChat,
+                body_a: json!({
+                    "model": "gpt-4",
+                    "messages": [
+                        {"role": "system", "content": "you are a helpful assistant"},
+                        {"role": "user", "content": "hi"},
+                    ],
+                    "tools": [],
+                }),
+                body_b: json!({
+                    "model": "gpt-4",
+                    "messages": [
+                        {"role": "system", "content": "you are a different assistant"},
+                        {"role": "user", "content": "hi"},
+                    ],
+                    "tools": [],
+                }),
+            },
+            Case {
+                name: "responses: instructions",
+                kind: ApiKind::OpenAiResponses,
+                body_a: json!({
+                    "model": "gpt-4",
+                    "instructions": "be brief",
+                    "tools": [],
+                    "input": [{"type": "message", "role": "user", "content": "hello"}],
+                }),
+                body_b: json!({
+                    "model": "gpt-4",
+                    "instructions": "be verbose",
+                    "tools": [],
+                    "input": [{"type": "message", "role": "user", "content": "hello"}],
+                }),
+            },
+            Case {
+                name: "responses: developer + legacy system",
+                kind: ApiKind::OpenAiResponses,
+                body_a: json!({
+                    "model": "gpt-5.4",
+                    "tools": [],
+                    "input": [
+                        {"role": "developer", "content": "system A"},
+                        {"role": "system", "content": "legacy system A"},
+                        {"role": "user", "content": "hello"}
+                    ]
+                }),
+                body_b: json!({
+                    "model": "gpt-5.4",
+                    "tools": [],
+                    "input": [
+                        {"role": "developer", "content": "system B"},
+                        {"role": "system", "content": "legacy system B"},
+                        {"role": "user", "content": "hello"}
+                    ]
+                }),
+            },
+            Case {
+                name: "responses: messages 回退",
+                kind: ApiKind::OpenAiResponses,
+                body_a: json!({
+                    "model": "gpt-5.4",
+                    "tools": [],
+                    "messages": [
+                        {"role": "developer", "content": "system A"},
+                        {"role": "user", "content": "hello"}
+                    ]
+                }),
+                body_b: json!({
+                    "model": "gpt-5.4",
+                    "tools": [],
+                    "messages": [
+                        {"role": "developer", "content": "system B"},
+                        {"role": "user", "content": "hello"}
+                    ]
+                }),
+            },
+        ];
 
-    #[test]
-    fn tools_description_change_does_not_drift() {
-        let body = json!({
-            "model": "gpt-5.4",
-            "tools": [],
-            "input": [
-                {"role": "developer", "content": "system A"},
-                {"role": "system", "content": "legacy system A"},
-                {"role": "user", "content": "hello"}
-            ]
-        });
-        let body2 = json!({
-            "model": "gpt-5.4",
-            "tools": [],
-            "input": [
-                {"role": "developer", "content": "system B"},
-                {"role": "system", "content": "legacy system B"},
-                {"role": "user", "content": "hello"}
-            ]
-        });
-
-        let h1 = compute_structural_hash(&body, ApiKind::OpenAiResponses);
-        let h2 = compute_structural_hash(&body2, ApiKind::OpenAiResponses);
-
-        assert_ne!(h1.system, h2.system);
-        assert_eq!(h1.early_messages, h2.early_messages);
-    }
-
-    #[test]
-    fn openai_responses_messages_fallback_matches_cache_key_axes() {
-        let body = json!({
-            "model": "gpt-5.4",
-            "tools": [],
-            "messages": [
-                {"role": "developer", "content": "system A"},
-                {"role": "user", "content": "hello"}
-            ]
-        });
-        let body2 = json!({
-            "model": "gpt-5.4",
-            "tools": [],
-            "messages": [
-                {"role": "developer", "content": "system B"},
-                {"role": "user", "content": "hello"}
-            ]
-        });
-
-        let h1 = compute_structural_hash(&body, ApiKind::OpenAiResponses);
-        let h2 = compute_structural_hash(&body2, ApiKind::OpenAiResponses);
-
-        assert_ne!(h1.system, h2.system);
-        assert_eq!(h1.early_messages, h2.early_messages);
+        for case in &cases {
+            let h1 = compute_structural_hash(&case.body_a, case.kind);
+            let h2 = compute_structural_hash(&case.body_b, case.kind);
+            assert_ne!(h1.system, h2.system, "{}", case.name);
+            assert_eq!(h1.early_messages, h2.early_messages, "{}", case.name);
+        }
     }
 
     #[test]

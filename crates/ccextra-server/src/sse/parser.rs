@@ -108,12 +108,29 @@ mod tests {
     use super::*;
 
     #[test]
-    fn test_single_event() {
-        let mut p = SseParser::new();
-        let events = p.push(b"event: message_start\ndata: {\"id\":\"1\"}\n\n");
-        assert_eq!(events.len(), 1);
-        assert_eq!(events[0].event.as_deref(), Some("message_start"));
-        assert_eq!(events[0].data, "{\"id\":\"1\"}");
+    fn test_single_event_variants() {
+        for (input, event, data) in [
+            (
+                &b"event: message_start\ndata: {\"id\":\"1\"}\n\n"[..],
+                Some("message_start"),
+                "{\"id\":\"1\"}",
+            ),
+            (&b"data: a\ndata: b\n\n"[..], None, "a\nb"),
+            (&b"data: [DONE]\n\n"[..], None, "[DONE]"),
+            (
+                &b"event: test\r\ndata: content\r\n\r\n"[..],
+                Some("test"),
+                "content",
+            ),
+            (&b"event: ping\n\n"[..], Some("ping"), ""),
+            (&b"data: content\n\n"[..], None, "content"),
+            (&b": this is a comment\ndata: real\n\n"[..], None, "real"),
+        ] {
+            let events = SseParser::new().push(input);
+            assert_eq!(events.len(), 1, "{input:?}");
+            assert_eq!(events[0].event.as_deref(), event, "{input:?}");
+            assert_eq!(events[0].data, data, "{input:?}");
+        }
     }
 
     #[test]
@@ -133,63 +150,12 @@ mod tests {
     }
 
     #[test]
-    fn test_multi_line_data() {
-        let mut p = SseParser::new();
-        let events = p.push(b"data: a\ndata: b\n\n");
-        assert_eq!(events.len(), 1);
-        assert_eq!(events[0].data, "a\nb");
-    }
-
-    #[test]
-    fn test_done_marker() {
-        let mut p = SseParser::new();
-        let events = p.push(b"data: [DONE]\n\n");
-        assert_eq!(events.len(), 1);
-        assert_eq!(events[0].data, "[DONE]");
-    }
-
-    #[test]
     fn test_finish_flushes_trailing() {
         let mut p = SseParser::new();
         assert!(p.push(b"data: x").is_empty());
         let events = p.finish();
         assert_eq!(events.len(), 1);
         assert_eq!(events[0].data, "x");
-    }
-
-    #[test]
-    fn test_crlf_line_endings() {
-        let mut p = SseParser::new();
-        let events = p.push(b"event: test\r\ndata: content\r\n\r\n");
-        assert_eq!(events.len(), 1);
-        assert_eq!(events[0].event.as_deref(), Some("test"));
-        assert_eq!(events[0].data, "content");
-    }
-
-    #[test]
-    fn test_event_without_data() {
-        let mut p = SseParser::new();
-        let events = p.push(b"event: ping\n\n");
-        assert_eq!(events.len(), 1);
-        assert_eq!(events[0].event.as_deref(), Some("ping"));
-        assert_eq!(events[0].data, "");
-    }
-
-    #[test]
-    fn test_data_only_no_event() {
-        let mut p = SseParser::new();
-        let events = p.push(b"data: content\n\n");
-        assert_eq!(events.len(), 1);
-        assert_eq!(events[0].event, None);
-        assert_eq!(events[0].data, "content");
-    }
-
-    #[test]
-    fn test_comment_lines_ignored() {
-        let mut p = SseParser::new();
-        let events = p.push(b": this is a comment\ndata: real\n\n");
-        assert_eq!(events.len(), 1);
-        assert_eq!(events[0].data, "real");
     }
 
     #[test]

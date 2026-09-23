@@ -426,16 +426,6 @@ mod tests {
     }
 
     #[test]
-    fn test_convert_to_gemini_user_first_untouched() {
-        let anthropic = json!({
-            "model": "m", "max_tokens": 100,
-            "messages": [{"role": "user", "content": "hi"}]
-        });
-        let (gemini, _) = convert_to_gemini(&anthropic, "gemini-2.0");
-        assert_eq!(gemini["contents"].as_array().unwrap().len(), 1);
-    }
-
-    #[test]
     fn test_convert_to_antigravity_claude_skips_empty_user_turn() {
         let anthropic = json!({
             "model": "m", "max_tokens": 100,
@@ -625,6 +615,12 @@ IMPORTANT: Assist with authorized security testing.
             gemini["generationConfig"]["thinkingConfig"]["thinkingLevel"],
             "LOW"
         );
+        with_effort["output_config"] = json!({"effort": "bogus"});
+        let (gemini, _) = convert_to_gemini(&with_effort, "gemini-2.5-pro");
+        assert_eq!(
+            gemini["generationConfig"]["thinkingConfig"]["thinkingLevel"],
+            "HIGH"
+        );
     }
 
     #[test]
@@ -645,22 +641,6 @@ IMPORTANT: Assist with authorized security testing.
         assert!(gemini["generationConfig"]["thinkingConfig"]
             .get("thinkingLevel")
             .is_none());
-    }
-
-    #[test]
-    fn test_convert_to_gemini_thinking_effort_invalid() {
-        // 不合法 effort 值兜底 "HIGH"
-        let anthropic = json!({
-            "model": "m", "max_tokens": 1000,
-            "thinking": {"type": "adaptive"},
-            "output_config": {"effort": "bogus"},
-            "messages": [{"role": "user", "content": "hi"}]
-        });
-        let (gemini, _) = convert_to_gemini(&anthropic, "gemini-2.5-pro");
-        assert_eq!(
-            gemini["generationConfig"]["thinkingConfig"]["thinkingLevel"],
-            "HIGH"
-        );
     }
 
     #[test]

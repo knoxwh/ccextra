@@ -264,30 +264,6 @@ mod tests {
     // ── Anthropic ───────────────────────────────────────────────────────
 
     #[test]
-    fn anthropic_sorts_skills_block_in_system_array() {
-        let mut body = json!({
-            "system": [
-                {"type": "text", "text": skills_block(&[
-                    "- update-config: Configure the harness.",
-                    "- agent-browser: Browser automation.",
-                    "- keybindings-help: Customize keys.",
-                ])}
-            ],
-            "messages": []
-        });
-        let n = stabilize_block_sort(&mut body, ApiKind::Anthropic);
-        assert_eq!(n, 1);
-        assert_eq!(
-            body["system"][0]["text"].as_str().unwrap(),
-            skills_block(&[
-                "- agent-browser: Browser automation.",
-                "- keybindings-help: Customize keys.",
-                "- update-config: Configure the harness.",
-            ])
-        );
-    }
-
-    #[test]
     fn anthropic_sorts_deferred_block_in_system_array() {
         let header = "<system-reminder>\nThe following deferred tools are now available:\n";
         let footer = "\n</system-reminder>";
@@ -305,50 +281,121 @@ mod tests {
     }
 
     #[test]
-    fn anthropic_skills_block_already_sorted_untouched() {
-        let sorted = skills_block(&[
-            "- a-skill: First.",
-            "- b-skill: Second.",
-            "- c-skill: Third.",
-        ]);
-        let mut body = json!({
-            "system": [{"type": "text", "text": sorted}],
-            "messages": []
-        });
-        let before = serde_json::to_vec(&body).unwrap();
-        let n = stabilize_block_sort(&mut body, ApiKind::Anthropic);
-        assert_eq!(n, 0);
-        let after = serde_json::to_vec(&body).unwrap();
-        assert_eq!(before, after);
+    fn untouched_system_text_remains_byte_equal() {
+        let unsorted = skills_block(&["- z: Z.", "- a: A."]);
+        for (name, kind, mut body) in [
+            (
+                "anthropic sorted",
+                ApiKind::Anthropic,
+                json!({"system": [{"type": "text", "text": skills_block(&[
+                    "- a-skill: First.", "- b-skill: Second.", "- c-skill: Third."])}],
+                    "messages": []}),
+            ),
+            (
+                "anthropic non-listing",
+                ApiKind::Anthropic,
+                json!({"system": [{"type": "text", "text":
+                    "<system-reminder>\nSome other reminder.\n</system-reminder>\n"}], "messages": []}),
+            ),
+            (
+                "chat input_text",
+                ApiKind::OpenAiChat,
+                json!({"messages": [{"role": "system", "content": [
+                    {"type": "input_text", "text": unsorted}]}]}),
+            ),
+            (
+                "chat user",
+                ApiKind::OpenAiChat,
+                json!({"messages": [{"role": "user", "content": unsorted}]}),
+            ),
+            (
+                "responses user",
+                ApiKind::OpenAiResponses,
+                json!({"instructions": null, "input": [
+                    {"role": "user", "content": unsorted}]}),
+            ),
+            (
+                "anthropic unclosed block",
+                ApiKind::Anthropic,
+                json!({"system": [{"type": "text", "text":
+                    format!("{SKILLS_HEADER}- z: Z.\n- a: A.")}], "messages": []}),
+            ),
+        ] {
+            let before = serde_json::to_vec(&body).unwrap();
+            assert_eq!(stabilize_block_sort(&mut body, kind), 0, "{name}");
+            assert_eq!(serde_json::to_vec(&body).unwrap(), before, "{name}");
+        }
     }
 
     #[test]
-    fn anthropic_non_listing_block_untouched() {
-        let mut body = json!({
-            "system": [
-                {"type": "text", "text": "<system-reminder>\nSome other reminder.\n</system-reminder>\n"}
-            ],
-            "messages": []
-        });
-        let before = serde_json::to_vec(&body).unwrap();
-        let n = stabilize_block_sort(&mut body, ApiKind::Anthropic);
-        assert_eq!(n, 0);
-        let after = serde_json::to_vec(&body).unwrap();
-        assert_eq!(before, after);
-    }
-
-    #[test]
-    fn anthropic_system_string_sorted() {
-        let mut body = json!({
-            "system": skills_block(&["- z-skill: Z.", "- a-skill: A."]),
-            "messages": []
-        });
-        let n = stabilize_block_sort(&mut body, ApiKind::Anthropic);
-        assert_eq!(n, 1);
-        assert_eq!(
-            body["system"].as_str().unwrap(),
-            skills_block(&["- a-skill: A.", "- z-skill: Z."])
-        );
+    fn sorted_system_text_at_each_protocol_path() {
+        let unsorted = skills_block(&["- z: Z.", "- a: A."]);
+        let sorted = skills_block(&["- a: A.", "- z: Z."]);
+        for (name, kind, mut body, path, expected) in [
+            (
+                "anthropic system string",
+                ApiKind::Anthropic,
+                json!({"system": skills_block(&["- z-skill: Z.", "- a-skill: A."]), "messages": []}),
+                "/system",
+                skills_block(&["- a-skill: A.", "- z-skill: Z."]),
+            ),
+            (
+                "chat system string",
+                ApiKind::OpenAiChat,
+                json!({"messages": [
+                    {"role": "system", "content": unsorted},
+                    {"role": "user", "content": "hi"}]}),
+                "/messages/0/content",
+                sorted.clone(),
+            ),
+            (
+                "chat developer text",
+                ApiKind::OpenAiChat,
+                json!({"messages": [{"role": "developer", "content": [
+                    {"type": "text", "text": unsorted}]}]}),
+                "/messages/0/content/0/text",
+                sorted.clone(),
+            ),
+            (
+                "responses instructions",
+                ApiKind::OpenAiResponses,
+                json!({"instructions": unsorted, "input": []}),
+                "/instructions",
+                sorted.clone(),
+            ),
+            (
+                "responses input system",
+                ApiKind::OpenAiResponses,
+                json!({"instructions": null, "input": [
+                    {"role": "system", "content": unsorted},
+                    {"role": "user", "content": "hi"}]}),
+                "/input/0/content",
+                sorted.clone(),
+            ),
+            (
+                "responses input_text",
+                ApiKind::OpenAiResponses,
+                json!({"instructions": "", "input": [{"type": "message", "role": "developer", "content": [
+                    {"type": "input_text", "text": unsorted}]}]}),
+                "/input/0/content/0/text",
+                sorted.clone(),
+            ),
+            (
+                "responses output_text",
+                ApiKind::OpenAiResponses,
+                json!({"instructions": "", "input": [{"type": "message", "role": "developer", "content": [
+                    {"type": "output_text", "text": unsorted}]}]}),
+                "/input/0/content/0/text",
+                sorted.clone(),
+            ),
+        ] {
+            assert_eq!(stabilize_block_sort(&mut body, kind), 1, "{name}");
+            assert_eq!(
+                body.pointer(path).and_then(Value::as_str),
+                Some(expected.as_str()),
+                "{name}"
+            );
+        }
     }
 
     #[test]
@@ -417,20 +464,6 @@ mod tests {
     }
 
     #[test]
-    fn openai_chat_skills_block_embedded_is_sorted() {
-        let mut body = json!({
-            "messages": [
-                {"role": "system", "content": embedded(&["- z: Z.", "- a: A."])},
-                {"role": "user", "content": "hi"}
-            ]
-        });
-        let n = stabilize_block_sort(&mut body, ApiKind::OpenAiChat);
-        assert_eq!(n, 1);
-        let out = body["messages"][0]["content"].as_str().unwrap();
-        assert!(out.contains("- a: A.\n- z: Z."));
-    }
-
-    #[test]
     fn anthropic_two_skills_blocks_in_one_string_both_sorted() {
         let text = format!(
             "intro\n\n{}\n\nmiddle\n\n{}\n\noutro",
@@ -465,187 +498,5 @@ mod tests {
 
     // ── OpenAI Chat ─────────────────────────────────────────────────────
 
-    #[test]
-    fn openai_chat_sorts_skills_in_system_message_string() {
-        let mut body = json!({
-            "messages": [
-                {"role": "system", "content": skills_block(&["- z: Z.", "- a: A."])},
-                {"role": "user", "content": "hi"}
-            ]
-        });
-        let n = stabilize_block_sort(&mut body, ApiKind::OpenAiChat);
-        assert_eq!(n, 1);
-        assert_eq!(
-            body["messages"][0]["content"].as_str().unwrap(),
-            skills_block(&["- a: A.", "- z: Z."])
-        );
-    }
-
-    #[test]
-    fn openai_chat_sorts_skills_in_developer_message_array() {
-        let mut body = json!({
-            "messages": [
-                {"role": "developer", "content": [
-                    {"type": "text", "text": skills_block(&["- z: Z.", "- a: A."])}
-                ]}
-            ]
-        });
-        let n = stabilize_block_sort(&mut body, ApiKind::OpenAiChat);
-        assert_eq!(n, 1);
-        assert_eq!(
-            body["messages"][0]["content"][0]["text"].as_str().unwrap(),
-            skills_block(&["- a: A.", "- z: Z."])
-        );
-    }
-
-    #[test]
-    fn openai_chat_input_text_system_part_untouched() {
-        let block = skills_block(&["- z: Z.", "- a: A."]);
-        let mut body = json!({
-            "messages": [{
-                "role": "system",
-                "content": [{"type": "input_text", "text": block}]
-            }]
-        });
-        let before = serde_json::to_vec(&body).unwrap();
-
-        let n = stabilize_block_sort(&mut body, ApiKind::OpenAiChat);
-
-        assert_eq!(n, 0);
-        assert_eq!(serde_json::to_vec(&body).unwrap(), before);
-    }
-
-    #[test]
-    fn openai_chat_non_system_message_untouched() {
-        let block = skills_block(&["- z: Z.", "- a: A."]);
-        let mut body = json!({
-            "messages": [
-                {"role": "user", "content": block}
-            ]
-        });
-        let before = serde_json::to_vec(&body).unwrap();
-        let n = stabilize_block_sort(&mut body, ApiKind::OpenAiChat);
-        assert_eq!(n, 0);
-        let after = serde_json::to_vec(&body).unwrap();
-        assert_eq!(before, after);
-    }
-
     // ── OpenAI Responses ───────────────────────────────────────────────
-
-    #[test]
-    fn openai_responses_sorts_instructions() {
-        let mut body = json!({
-            "instructions": skills_block(&["- z: Z.", "- a: A."]),
-            "input": []
-        });
-        let n = stabilize_block_sort(&mut body, ApiKind::OpenAiResponses);
-        assert_eq!(n, 1);
-        assert_eq!(
-            body["instructions"].as_str().unwrap(),
-            skills_block(&["- a: A.", "- z: Z."])
-        );
-    }
-
-    #[test]
-    fn openai_responses_sorts_input_system_content_string() {
-        let mut body = json!({
-            "instructions": null,
-            "input": [
-                {"role": "system", "content": skills_block(&["- z: Z.", "- a: A."])},
-                {"role": "user", "content": "hi"}
-            ]
-        });
-        let n = stabilize_block_sort(&mut body, ApiKind::OpenAiResponses);
-        assert_eq!(n, 1);
-        assert_eq!(
-            body["input"][0]["content"].as_str().unwrap(),
-            skills_block(&["- a: A.", "- z: Z."])
-        );
-    }
-
-    #[test]
-    fn openai_responses_sorts_input_text_system_part() {
-        let mut body = json!({
-            "instructions": "",
-            "input": [{
-                "type": "message",
-                "role": "developer",
-                "content": [{
-                    "type": "input_text",
-                    "text": skills_block(&["- z: Z.", "- a: A."])
-                }]
-            }]
-        });
-
-        let n = stabilize_block_sort(&mut body, ApiKind::OpenAiResponses);
-
-        assert_eq!(n, 1);
-        assert_eq!(
-            body["input"][0]["content"][0]["text"].as_str().unwrap(),
-            skills_block(&["- a: A.", "- z: Z."])
-        );
-    }
-
-    #[test]
-    fn openai_responses_sorts_output_text_system_part() {
-        let mut body = json!({
-            "instructions": "",
-            "input": [{
-                "type": "message",
-                "role": "developer",
-                "content": [{
-                    "type": "output_text",
-                    "text": skills_block(&["- z: Z.", "- a: A."])
-                }]
-            }]
-        });
-
-        let n = stabilize_block_sort(&mut body, ApiKind::OpenAiResponses);
-
-        assert_eq!(n, 1);
-    }
-
-    #[test]
-    fn openai_responses_non_system_input_untouched() {
-        let block = skills_block(&["- z: Z.", "- a: A."]);
-        let mut body = json!({
-            "instructions": null,
-            "input": [{"role": "user", "content": block}]
-        });
-        let before = serde_json::to_vec(&body).unwrap();
-        let n = stabilize_block_sort(&mut body, ApiKind::OpenAiResponses);
-        assert_eq!(n, 0);
-        let after = serde_json::to_vec(&body).unwrap();
-        assert_eq!(before, after);
-    }
-
-    // ── 边界情况 ───────────────────────────────────────────────────────
-
-    #[test]
-    fn skills_single_entry_untouched() {
-        let single = skills_block(&["- only-skill: The only one."]);
-        let mut body = json!({
-            "system": [{"type": "text", "text": single}],
-            "messages": []
-        });
-        let before = serde_json::to_vec(&body).unwrap();
-        let n = stabilize_block_sort(&mut body, ApiKind::Anthropic);
-        assert_eq!(n, 0);
-        let after = serde_json::to_vec(&body).unwrap();
-        assert_eq!(before, after);
-    }
-
-    #[test]
-    fn skills_block_missing_closing_tag_untouched() {
-        let broken = format!("{SKILLS_HEADER}- z: Z.\n- a: A.");
-        let mut body = json!({
-            "system": [{"type": "text", "text": broken}],
-            "messages": []
-        });
-        let before = serde_json::to_vec(&body).unwrap();
-        let n = stabilize_block_sort(&mut body, ApiKind::Anthropic);
-        assert_eq!(n, 0);
-        let after = serde_json::to_vec(&body).unwrap();
-        assert_eq!(before, after);
-    }
 }

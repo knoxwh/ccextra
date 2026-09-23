@@ -271,104 +271,66 @@ mod tests {
     }
 
     #[test]
-    fn test_resolve_effort_enabled_budget() {
-        let t = json!({"type": "enabled", "budget_tokens": 2000});
-        assert_eq!(resolve_effort(&t), Some("medium"));
+    fn test_resolve_effort_modes() {
+        for (thinking, expected) in [
+            (
+                json!({"type": "enabled", "budget_tokens": 2000}),
+                Some("medium"),
+            ),
+            (
+                json!({"type": "enabled", "budget_tokens": -1}),
+                Some("auto"),
+            ),
+            (json!({"type": "disabled"}), Some("none")),
+            (
+                json!({"type": "adaptive", "output_config": {"effort": "high"}}),
+                Some("high"),
+            ),
+            (json!({"type": "adaptive"}), Some("xhigh")),
+            (json!({"type": "bogus"}), None),
+        ] {
+            assert_eq!(resolve_effort(&thinking), expected, "{thinking}");
+        }
     }
 
     #[test]
-    fn test_resolve_effort_enabled_auto_budget() {
-        // enabled + budget=-1 → budget_to_level(-1)=Auto
-        let t = json!({"type": "enabled", "budget_tokens": -1});
-        assert_eq!(resolve_effort(&t), Some("auto"));
+    fn test_resolve_effort_from_body_precedence() {
+        for (body, expected) in [
+            (
+                json!({"thinking": {"type": "adaptive"}, "output_config": {"effort": "max"}}),
+                Some("max"),
+            ),
+            (
+                json!({"thinking": {"type": "adaptive", "output_config": {"effort": "high"}}}),
+                Some("high"),
+            ),
+            (
+                json!({"thinking": {"type": "enabled", "budget_tokens": 8192}}),
+                Some("medium"),
+            ),
+            (
+                json!({"thinking": {"type": "disabled"}, "output_config": {"effort": "max"}}),
+                Some("none"),
+            ),
+            (json!({"model": "x"}), None),
+            (
+                json!({"thinking": {"type": "adaptive", "output_config": {"effort": "high"}}, "output_config": {"effort": "bogus"}}),
+                Some("high"),
+            ),
+        ] {
+            assert_eq!(resolve_effort_from_body(&body), expected, "{body}");
+        }
     }
 
     #[test]
-    fn test_resolve_effort_disabled_none() {
-        let t = json!({"type": "disabled"});
-        assert_eq!(resolve_effort(&t), Some("none"));
-    }
-
-    #[test]
-    fn test_resolve_effort_adaptive_uses_output_config() {
-        let t = json!({"type": "adaptive", "output_config": {"effort": "high"}});
-        assert_eq!(resolve_effort(&t), Some("high"));
-    }
-
-    #[test]
-    fn test_resolve_effort_adaptive_defaults_xhigh() {
-        let t = json!({"type": "adaptive"});
-        assert_eq!(resolve_effort(&t), Some("xhigh"));
-    }
-
-    #[test]
-    fn test_resolve_effort_unknown_type() {
-        let t = json!({"type": "bogus"});
-        assert_eq!(resolve_effort(&t), None);
-    }
-
-    #[test]
-    fn test_resolve_effort_from_body_prefers_top_level_output_config() {
-        // Claude Code 2.1+:thinking 只含 type,effort 在顶层 output_config
-        let b = json!({
-            "thinking": {"type": "adaptive"},
-            "output_config": {"effort": "max"}
-        });
-        assert_eq!(resolve_effort_from_body(&b), Some("max"));
-    }
-
-    #[test]
-    fn test_resolve_effort_from_body_falls_back_to_thinking_effort() {
-        // legacy:effort 内嵌 thinking.output_config
-        let b = json!({
-            "thinking": {"type": "adaptive", "output_config": {"effort": "high"}}
-        });
-        assert_eq!(resolve_effort_from_body(&b), Some("high"));
-    }
-
-    #[test]
-    fn test_resolve_effort_from_body_falls_back_to_budget() {
-        let b = json!({
-            "thinking": {"type": "enabled", "budget_tokens": 8192}
-        });
-        assert_eq!(resolve_effort_from_body(&b), Some("medium"));
-    }
-
-    #[test]
-    fn test_resolve_effort_from_body_disabled_wins() {
-        // 顶层残留 effort 不覆盖 disabled
-        let b = json!({
-            "thinking": {"type": "disabled"},
-            "output_config": {"effort": "max"}
-        });
-        assert_eq!(resolve_effort_from_body(&b), Some("none"));
-    }
-
-    #[test]
-    fn test_resolve_effort_from_body_no_thinking_none() {
-        let b = json!({"model": "x"});
-        assert_eq!(resolve_effort_from_body(&b), None);
-    }
-
-    #[test]
-    fn test_resolve_effort_from_body_invalid_effort_falls_back() {
-        // 顶层 effort 非法 → 回退 thinking 分支
-        let b = json!({
-            "thinking": {"type": "adaptive", "output_config": {"effort": "high"}},
-            "output_config": {"effort": "bogus"}
-        });
-        assert_eq!(resolve_effort_from_body(&b), Some("high"));
-    }
-
-    #[test]
-    fn test_clamp_effort_no_limit() {
-        assert_eq!(clamp_effort("max", "unknown-model", &[]), "max");
-        assert_eq!(clamp_effort("xhigh", "unknown-model", &[]), "xhigh");
-    }
-
-    #[test]
-    fn test_clamp_effort_invalid_effort_passthrough() {
-        assert_eq!(clamp_effort("bogus", "any-model", &[]), "bogus");
+    fn test_clamp_effort_without_supported_model() {
+        for (effort, model) in [
+            ("max", "unknown-model"),
+            ("xhigh", "unknown-model"),
+            ("bogus", "any-model"),
+        ] {
+            assert_eq!(clamp_effort(effort, model, &[]), effort);
+        }
     }
 
     #[test]
@@ -476,78 +438,53 @@ mod tests {
     }
 
     #[test]
-    fn test_clamp_effort_registry_glm51() {
+    fn test_clamp_effort_registry_models() {
         let reg = mock_registry();
-        assert_eq!(clamp_effort("max", "glm-5.1", &reg), "xhigh");
-        assert_eq!(clamp_effort("xhigh", "glm-5.1", &reg), "xhigh");
-        assert_eq!(clamp_effort("high", "glm-5.1", &reg), "high");
+        for (effort, model, expected) in [
+            ("max", "glm-5.1", "xhigh"),
+            ("xhigh", "glm-5.1", "xhigh"),
+            ("high", "glm-5.1", "high"),
+            ("max", "glm-5.2", "max"),
+            ("xhigh", "glm-5.2", "high"),
+            ("max", "gpt-5.6-terra", "xhigh"),
+            ("max", "gpt-5.6-sol", "xhigh"),
+            ("max", "grok-4.6", "xhigh"),
+            ("xhigh", "grok-4.6", "xhigh"),
+            ("high", "grok-4.6", "high"),
+            ("medium", "grok-4.6", "medium"),
+            ("max", "kimi-k3", "max"),
+            ("xhigh", "kimi-k3", "high"),
+            ("medium", "kimi-k3", "low"),
+            ("high", "kimi-k3", "high"),
+            ("max", "GLM-5.1", "xhigh"),
+            ("xhigh", "Kimi-K3", "high"),
+            ("max", "gemini-3.8-flash-high", "high"),
+            ("medium", "gemini-3.8-flash-high", "high"),
+        ] {
+            assert_eq!(
+                clamp_effort(effort, model, &reg),
+                expected,
+                "{model}: {effort}"
+            );
+        }
     }
 
     #[test]
-    fn test_clamp_effort_registry_glm52() {
-        let reg = mock_registry();
-        assert_eq!(clamp_effort("max", "glm-5.2", &reg), "max");
-        assert_eq!(clamp_effort("xhigh", "glm-5.2", &reg), "high");
-    }
-
-    #[test]
-    fn test_clamp_effort_registry_gpt56() {
-        let reg = mock_registry();
-        assert_eq!(clamp_effort("max", "gpt-5.6-terra", &reg), "xhigh");
-        assert_eq!(clamp_effort("max", "gpt-5.6-sol", &reg), "xhigh");
-    }
-
-    #[test]
-    fn test_clamp_effort_registry_grok46() {
-        let reg = mock_registry();
-        assert_eq!(clamp_effort("max", "grok-4.6", &reg), "xhigh");
-        assert_eq!(clamp_effort("xhigh", "grok-4.6", &reg), "xhigh");
-        assert_eq!(clamp_effort("high", "grok-4.6", &reg), "high");
-        assert_eq!(clamp_effort("medium", "grok-4.6", &reg), "medium");
-    }
-
-    #[test]
-    fn test_clamp_effort_registry_kimi() {
-        let reg = mock_registry();
-        assert_eq!(clamp_effort("max", "kimi-k3", &reg), "max");
-        assert_eq!(clamp_effort("xhigh", "kimi-k3", &reg), "high");
-        assert_eq!(clamp_effort("medium", "kimi-k3", &reg), "low");
-        assert_eq!(clamp_effort("high", "kimi-k3", &reg), "high");
-    }
-
-    #[test]
-    fn test_clamp_effort_registry_case_insensitive() {
-        let reg = mock_registry();
-        assert_eq!(clamp_effort("max", "GLM-5.1", &reg), "xhigh");
-        assert_eq!(clamp_effort("xhigh", "Kimi-K3", &reg), "high");
-    }
-
-    #[test]
-    fn test_clamp_effort_registry_gemini_flash_sku() {
-        let reg = mock_registry();
-        assert_eq!(clamp_effort("max", "gemini-3.8-flash-high", &reg), "high");
-        assert_eq!(
-            clamp_effort("medium", "gemini-3.8-flash-high", &reg),
-            "high"
-        );
-    }
-
-    #[test]
-    fn test_clamp_to_nearest_exact_match() {
-        let supported = vec![Level::Low, Level::Medium, Level::High];
-        assert_eq!(clamp_to_nearest(Level::Medium, &supported), Level::Medium);
-    }
-
-    #[test]
-    fn test_clamp_to_nearest_downgrade() {
-        let supported = vec![Level::Low, Level::Medium, Level::High, Level::XHigh];
-        assert_eq!(clamp_to_nearest(Level::Max, &supported), Level::XHigh);
-    }
-
-    #[test]
-    fn test_clamp_to_nearest_tie_prefers_lower() {
-        let supported = vec![Level::Low, Level::High];
-        // medium 距离 low/high 都是 1,取低
-        assert_eq!(clamp_to_nearest(Level::Medium, &supported), Level::Low);
+    fn test_clamp_to_nearest_cases() {
+        for (effort, supported, expected) in [
+            (
+                Level::Medium,
+                &[Level::Low, Level::Medium, Level::High][..],
+                Level::Medium,
+            ),
+            (
+                Level::Max,
+                &[Level::Low, Level::Medium, Level::High, Level::XHigh][..],
+                Level::XHigh,
+            ),
+            (Level::Medium, &[Level::Low, Level::High][..], Level::Low),
+        ] {
+            assert_eq!(clamp_to_nearest(effort, supported), expected);
+        }
     }
 }

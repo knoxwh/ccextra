@@ -138,88 +138,30 @@ mod tests {
     use super::fix_json_quotes;
 
     #[test]
-    fn test_single_quotes_converted() {
-        // 对齐 CLIProxyAPI FixJSON 示例
-        assert_eq!(
-            fix_json_quotes("{'a': 1, 'b': '2'}"),
-            r#"{"a": 1, "b": "2"}"#
-        );
-    }
-
-    #[test]
-    fn test_double_quote_inside_single_escaped() {
-        // 单引号内的双引号转义(\" 保留)
-        assert_eq!(
-            fix_json_quotes(r#"{"t": 'He said "hi"'}"#),
-            r#"{"t": "He said \"hi\""}"#
-        );
-    }
-
-    #[test]
-    fn test_valid_json_untouched() {
-        // 合法 JSON 零副作用
-        let input = r#"{"city": "beijing", "n": 42, "arr": [1, 2]}"#;
-        assert_eq!(fix_json_quotes(input), input);
-    }
-
-    #[test]
-    fn test_escaped_quote_in_double_untouched() {
-        // 双引号内转义引号不误关
-        let input = r#"{"t": "say \"hi\""}"#;
-        assert_eq!(fix_json_quotes(input), input);
-    }
-
-    #[test]
-    fn test_common_escapes_preserved() {
-        // \n \r \t \b \f \\ 原样
-        let input = r#"{'a': 'x\ny\tz', 'b': 'c\\d'}"#;
-        assert_eq!(fix_json_quotes(input), r#"{"a": "x\ny\tz", "b": "c\\d"}"#);
-    }
-
-    #[test]
-    fn test_single_quote_escape() {
-        // \' 变字面 '(双引号内无需转义)
-        assert_eq!(fix_json_quotes(r#"{'a': 'it\'s'}"#), r#"{"a": "it's"}"#);
-    }
-
-    #[test]
-    fn test_unicode_escape_forwarded() {
-        // 非 ASCII 内容透传
-        assert_eq!(fix_json_quotes(r#"{'a': '中文'}"#), r#"{"a": "中文"}"#);
-    }
-
-    #[test]
-    fn test_unicode_escape_short_hex() {
-        // \u 后 hex 不足 4 位:透传已有的,剩余原样
-        assert_eq!(fix_json_quotes(r#"{'a': '\u12z'}"#), r#"{"a": "\u12z"}"#);
-    }
-
-    #[test]
-    fn test_double_backslash_quote_untouched() {
-        // 双反斜杠 + 引号(合法 JSON,字符串值含反斜杠+引号):不外推转义状态
-        let input = r#"{"x": "a\\\"b"}"#;
-        assert_eq!(fix_json_quotes(input), input);
-    }
-
-    #[test]
-    fn test_mixed_quote_strings() {
-        // 双引号串内单引号不动;单引号串内双引号转义
-        assert_eq!(
-            fix_json_quotes(r#"["it's", 'say "hi"']"#),
-            r#"["it's", "say \"hi\""]"#
-        );
-    }
-
-    #[test]
-    fn test_unclosed_single_quote_closed() {
-        // 输入在单引号内结束 → 补闭合双引号(括号原样,只补引号)
-        assert_eq!(fix_json_quotes("{'a': 'abc"), r#"{"a": "abc""#);
-    }
-
-    #[test]
-    fn test_empty_and_asides_untouched() {
-        assert_eq!(fix_json_quotes(""), "");
-        assert_eq!(fix_json_quotes("plain text"), "plain text");
-        assert_eq!(fix_json_quotes("{}"), "{}");
+    fn test_fix_json_quotes_cases() {
+        for (input, expected) in [
+            ("{'a': 1, 'b': '2'}", r#"{"a": 1, "b": "2"}"#),
+            (r#"{"t": 'He said "hi"'}"#, r#"{"t": "He said \"hi\""}"#),
+            (
+                r#"{"city": "beijing", "n": 42, "arr": [1, 2]}"#,
+                r#"{"city": "beijing", "n": 42, "arr": [1, 2]}"#,
+            ),
+            (r#"{"t": "say \"hi\""}"#, r#"{"t": "say \"hi\""}"#),
+            (
+                r#"{'a': 'x\ny\tz', 'b': 'c\\d'}"#,
+                r#"{"a": "x\ny\tz", "b": "c\\d"}"#,
+            ),
+            (r#"{'a': 'it\'s'}"#, r#"{"a": "it's"}"#),
+            (r#"{'a': '中文'}"#, r#"{"a": "中文"}"#),
+            (r#"{'a': '\u12z'}"#, r#"{"a": "\u12z"}"#),
+            (r#"{"x": "a\\\"b"}"#, r#"{"x": "a\\\"b"}"#),
+            (r#"["it's", 'say "hi"']"#, r#"["it's", "say \"hi\""]"#),
+            ("{'a': 'abc", r#"{"a": "abc""#),
+            ("", ""),
+            ("plain text", "plain text"),
+            ("{}", "{}"),
+        ] {
+            assert_eq!(fix_json_quotes(input), expected, "{input}");
+        }
     }
 }

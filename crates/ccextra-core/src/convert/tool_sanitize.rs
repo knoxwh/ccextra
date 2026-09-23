@@ -101,40 +101,17 @@ mod tests {
     use super::*;
 
     #[test]
-    fn test_sanitize_simple() {
-        assert_eq!(sanitize_function_name("Read"), "Read");
-    }
-
-    #[test]
-    fn test_sanitize_keeps_dash_dot_colon() {
-        // 对齐 CPA:. : - 保留,不替换
-        assert_eq!(
-            sanitize_function_name("mcp__context7__query-docs"),
-            "mcp__context7__query-docs"
-        );
-    }
-
-    #[test]
-    fn test_sanitize_special_chars() {
-        assert_eq!(sanitize_function_name("my tool/name"), "my_tool_name");
-    }
-
-    #[test]
-    fn test_sanitize_unicode_replaced() {
-        // Unicode 字母不允许(Gemini 函数名仅 ASCII)
-        assert_eq!(sanitize_function_name("工具x"), "__x");
-    }
-
-    #[test]
-    fn test_sanitize_leading_digit() {
-        // 首字符为数字:截断后前置 "_"(对齐 CPA)
-        assert_eq!(sanitize_function_name("1tool"), "_1tool");
-    }
-
-    #[test]
-    fn test_sanitize_truncate() {
-        let long_name = "a".repeat(100);
-        assert_eq!(sanitize_function_name(&long_name), "a".repeat(64));
+    fn test_sanitize_function_name_cases() {
+        for (name, expected) in [
+            ("Read", "Read"),
+            ("mcp__context7__query-docs", "mcp__context7__query-docs"),
+            ("my tool/name", "my_tool_name"),
+            ("工具x", "__x"),
+            ("1tool", "_1tool"),
+        ] {
+            assert_eq!(sanitize_function_name(name), expected, "{name}");
+        }
+        assert_eq!(sanitize_function_name(&"a".repeat(100)), "a".repeat(64));
     }
 
     #[test]

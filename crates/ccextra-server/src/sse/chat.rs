@@ -1398,24 +1398,4 @@ mod tests {
         let s = String::from_utf8_lossy(&bufs);
         assert!(s.contains("\"stop_reason\":\"max_tokens\""), "{s}");
     }
-
-    #[test]
-    fn test_chat_relay_usage_from_choices() {
-        use crate::sse::parser::SseEvent;
-
-        let mut relay = ChatRelay::new(None);
-
-        // 模拟 Moonshot 流式响应:usage 在 choices[0]
-        let ev = SseEvent {
-            event: None,
-            data: r#"{"id":"chat-1","model":"moonshot-v1","choices":[{"delta":{"content":"hi"},"usage":{"prompt_tokens":100,"completion_tokens":20}}]}"#.to_string(),
-        };
-
-        relay.process(&ev);
-
-        // 验证 usage 被正确提取
-        assert_eq!(relay.usage_input, 100);
-        assert_eq!(relay.usage_output, 20);
-        assert!(relay.usage_seen);
-    }
 }

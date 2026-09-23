@@ -182,8 +182,7 @@ mod tests {
     fn test_parse_jwt_identity() {
         let payload = r#"{"email":"test@example.com","https://api.openai.com/auth":{"chatgpt_account_id":"acct-123","chatgpt_plan_type":"pro"}}"#;
         use base64::Engine;
-        let encoded =
-            base64::engine::general_purpose::URL_SAFE_NO_PAD.encode(payload.as_bytes());
+        let encoded = base64::engine::general_purpose::URL_SAFE_NO_PAD.encode(payload.as_bytes());
         let token = format!("header.{}.sig", encoded);
         let (email, account_id, plan_type) = parse_jwt_identity(&token);
         assert_eq!(email, "test@example.com");

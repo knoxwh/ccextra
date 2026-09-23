@@ -611,17 +611,22 @@ mod tests {
 
     #[test]
     fn test_convert_messages_thinking_dropped() {
-        let messages = vec![json!({
-            "role": "assistant",
-            "content": [
+        for content in [
+            json!([
                 {"type": "thinking", "thinking": "Let me think..."},
                 {"type": "text", "text": "answer"}
-            ]
-        })];
-        let contents = convert_messages(&messages, &HashMap::new(), false, "gemini-2.0");
-        let parts = contents[0]["parts"].as_array().unwrap();
-        assert_eq!(parts.len(), 1);
-        assert_eq!(parts[0]["text"], "answer");
+            ]),
+            json!([
+                {"type": "thinking", "thinking": "t1", "signature": "gAAAA-gpt"},
+                {"type": "text", "text": "answer"}
+            ]),
+        ] {
+            let messages = vec![json!({"role": "assistant", "content": content})];
+            let contents = convert_messages(&messages, &HashMap::new(), false, "gemini-2.0");
+            let parts = contents[0]["parts"].as_array().unwrap();
+            assert_eq!(parts.len(), 1, "{content}");
+            assert_eq!(parts[0]["text"], "answer", "{content}");
+        }
     }
 
     #[test]
@@ -826,22 +831,6 @@ mod tests {
     }
 
     #[test]
-    fn test_thinking_signature_compatibility_gemini() {
-        // Gemini 目标丢弃所有 thinking 块(antigravity=false)
-        let messages = vec![json!({
-            "role": "assistant",
-            "content": [
-                {"type": "thinking", "thinking": "t1", "signature": "gAAAA-gpt"},
-                {"type": "text", "text": "answer"}
-            ]
-        })];
-        let contents = convert_messages(&messages, &HashMap::new(), false, "gemini-2.0");
-        let parts = contents[0]["parts"].as_array().unwrap();
-        assert_eq!(parts.len(), 1);
-        assert_eq!(parts[0]["text"], "answer");
-    }
-
-    #[test]
     fn test_thinking_signature_compatibility_claude() {
         // Claude 目标:原生 E 形签名通过严格校验并归一化为上游 R 形;GPT 签名丢弃
         use super::super::signature::fixtures::{claude_native_default, claude_upstream_signature};
@@ -891,45 +880,34 @@ mod tests {
 
     #[test]
     fn test_tool_result_preserves_json_as_string() {
-        // 对齐 CPA 9d0a60bf:tool result 对象/数组必须序列化为字符串
-        let messages = vec![json!({
-            "role": "user",
-            "content": [{
-                "type": "tool_result",
-                "tool_use_id": "read_file-1",
-                "content": {"key": "value", "items": [1, 2, 3]}
-            }]
-        })];
-        let contents = convert_messages(&messages, &HashMap::new(), false, "gemini-2.0");
-        let result = &contents[0]["parts"][0]["functionResponse"]["response"]["result"];
-        let result_str = result.as_str().unwrap();
-        // 验证是字符串且包含预期内容(serde_json 键序不固定)
-        assert!(result_str.starts_with('{'));
-        assert!(result_str.contains(r#""key":"value""#));
-        assert!(result_str.contains(r#""items":[1,2,3]"#));
-    }
-
-    #[test]
-    fn test_tool_result_array_content_stringified() {
-        // 对齐 CPA 9d0a60bf:多个非图块序列化为 JSON 字符串
-        let messages = vec![json!({
-            "role": "user",
-            "content": [{
-                "type": "tool_result",
-                "tool_use_id": "lookup-1",
-                "content": [
+        for (id, content, prefix, fragments) in [
+            (
+                "read_file-1",
+                json!({"key": "value", "items": [1, 2, 3]}),
+                '{',
+                [r#""key":"value""#, r#""items":[1,2,3]"#],
+            ),
+            (
+                "lookup-1",
+                json!([
                     {"type": "text", "text": "first"},
                     {"type": "text", "text": "second"}
-                ]
-            }]
-        })];
-        let contents = convert_messages(&messages, &HashMap::new(), false, "gemini-2.0");
-        let result = &contents[0]["parts"][0]["functionResponse"]["response"]["result"];
-        let result_str = result.as_str().unwrap();
-        // 数组序列化为字符串
-        assert!(result_str.starts_with('['));
-        assert!(result_str.contains(r#""text":"first""#));
-        assert!(result_str.contains(r#""text":"second""#));
+                ]),
+                '[',
+                [r#""text":"first""#, r#""text":"second""#],
+            ),
+        ] {
+            let messages = vec![json!({"role": "user", "content": [
+                {"type": "tool_result", "tool_use_id": id, "content": content}
+            ]})];
+            let contents = convert_messages(&messages, &HashMap::new(), false, "gemini-2.0");
+            let result = &contents[0]["parts"][0]["functionResponse"]["response"]["result"];
+            let result_str = result.as_str().unwrap();
+            assert!(result_str.starts_with(prefix), "{id}");
+            for fragment in fragments {
+                assert!(result_str.contains(fragment), "{id}: {fragment}");
+            }
+        }
     }
 
     #[test]

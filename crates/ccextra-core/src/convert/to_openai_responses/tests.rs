@@ -69,19 +69,6 @@ fn test_gpt_without_system_no_developer_message() {
 }
 
 #[test]
-fn test_non_gpt_no_adapter_block() {
-    // 非 gpt/grok 上游不注入 adapter block
-    let mut body = json!({
-        "model": "test",
-        "system": "You are helpful",
-        "messages": []
-    });
-    convert_to_openai_responses(&mut body, "claude-opus-5").unwrap();
-    assert_eq!(body["instructions"], "You are helpful");
-    assert_eq!(body["input"].as_array().unwrap().len(), 0);
-}
-
-#[test]
 fn test_grok_system_and_adapter_go_to_developer_message() {
     // Grok 线将 adapter + 清洗后的 system 作为 developer 输入，instructions 留空。
     let mut body = json!({
@@ -155,23 +142,6 @@ fn test_gpt6_astra_match() {
 }
 
 #[test]
-fn test_system_array_blocks_merged_to_instructions() {
-    // system blocks 合并到 instructions 字段(对齐 codex base_instructions)
-    let mut body = json!({
-        "model": "test",
-        "system": [
-            {"type": "text", "text": "Block 1"},
-            {"type": "text", "text": "Block 2"}
-        ],
-        "messages": []
-    });
-    convert_to_openai_responses(&mut body, "test-model").unwrap();
-    assert_eq!(body["instructions"], "Block 1\n\nBlock 2");
-    // input 应该为空（没有 developer message）
-    assert_eq!(body["input"].as_array().unwrap().len(), 0);
-}
-
-#[test]
 fn test_system_attribution_and_claude_identity_stripped() {
     let mut body = json!({
         "model": "test",
@@ -225,34 +195,21 @@ fn test_claude_target_keeps_claude_identity() {
 }
 
 #[test]
-fn test_system_whitespace_only_blocks_dropped() {
+fn test_system_blocks_trimmed_and_blanks_dropped() {
+    // 每个块先 trim,空白块丢弃,再用 \n\n 连接
     let mut body = json!({
         "model": "test",
         "system": [
+            {"type": "text", "text": "  Block 1  "},
             {"type": "text", "text": "  \n  "},
-            {"type": "text", "text": "Content"},
+            {"type": "text", "text": "\n\nBlock 2\n"},
             {"type": "text", "text": ""},
         ],
         "messages": []
     });
     convert_to_openai_responses(&mut body, "test-model").unwrap();
-    // 纯空白块被 trim 后丢弃
-    assert_eq!(body["instructions"], "Content");
-}
-
-#[test]
-fn test_system_blocks_trimmed_before_join() {
-    let mut body = json!({
-        "model": "test",
-        "system": [
-            {"type": "text", "text": "  Block 1  "},
-            {"type": "text", "text": "\n\nBlock 2\n"},
-        ],
-        "messages": []
-    });
-    convert_to_openai_responses(&mut body, "test-model").unwrap();
-    // 每个块先 trim 再用 \n\n 连接
     assert_eq!(body["instructions"], "Block 1\n\nBlock 2");
+    assert_eq!(body["input"], json!([]));
 }
 
 #[test]
@@ -834,29 +791,57 @@ fn test_is_thinking_signature_invalid() {
 }
 
 #[test]
-fn test_redacted_thinking_grok_model_skipped() {
-    // grok 不回放 redacted_thinking(对齐 grok-build parse-only 丢弃)
-    let mut body = json!({
-        "model": "test",
-        "messages": [
-            {"role": "assistant", "content": [
-                {"type": "redacted_thinking", "data": "opaque_payload_xyz"}
-            ]}
-        ]
-    });
-    convert_to_openai_responses(&mut body, "grok-3").unwrap();
-    let input = body["input"].as_array().unwrap();
-    // grok 注入 developer message，redacted_thinking 被丢弃后只剩 developer
-    assert_eq!(input.len(), 1);
-    assert_eq!(input[0]["role"], "developer");
+fn test_redacted_thinking_ignored_across_models_and_roles() {
+    for (model, role, data) in [
+        ("grok-3", "assistant", "opaque_payload_xyz"),
+        ("gpt-5", "assistant", "opaque_payload_xyz"),
+        ("gpt-5", "user", "should_ignore"),
+    ] {
+        let mut body = json!({
+            "model": "test",
+            "messages": [{"role": role, "content": [
+                {"type": "redacted_thinking", "data": data}
+            ]}]
+        });
+        convert_to_openai_responses(&mut body, model).unwrap();
+        let input = body["input"].as_array().unwrap();
+        assert_eq!(input.len(), 1, "{model}: {role}");
+        assert_eq!(input[0]["role"], "developer", "{model}: {role}");
+    }
 }
 
 #[test]
-fn test_reasoning_effort_default_medium() {
-    // 无 thinking → 默认 medium(对齐 reasoningEffort 初值)
-    let mut body = json!({"model": "test", "messages": []});
-    convert_to_openai_responses(&mut body, "test-model").unwrap();
-    assert_eq!(body["reasoning"]["effort"], "medium");
+fn test_reasoning_effort_defaults_and_explicit_values() {
+    for (model, mut body, expected) in [
+        (
+            "test-model",
+            json!({"model": "test", "messages": []}),
+            "medium",
+        ),
+        (
+            "gpt-5.4",
+            json!({"model": "test", "messages": []}),
+            "medium",
+        ),
+        (
+            "test-model",
+            json!({"model": "test", "messages": [], "thinking": {"type": "enabled", "budget_tokens": 8192}}),
+            "medium",
+        ),
+        (
+            "test-model",
+            json!({"model": "test", "messages": [], "thinking": {"type": "adaptive", "output_config": {"effort": "high"}}}),
+            "high",
+        ),
+        (
+            "gpt-5.6-terra",
+            json!({"model": "test", "messages": [], "output_config": {"effort": "high"}}),
+            "high",
+        ),
+    ] {
+        convert_to_openai_responses(&mut body, model).unwrap();
+        assert_eq!(body["reasoning"]["effort"], expected, "{model}");
+    }
 }
 
 #[test]
@@ -897,14 +882,6 @@ fn test_gpt6_astra_effort_handling() {
 }
 
 #[test]
-fn test_non_astra_gpt_default_effort_medium() {
-    // 锁在 GPT 模型上:误把 is_gpt6_astra 写成 is_gpt_upstream 时,gpt-5.4 会变 low
-    let mut body = json!({"model": "test", "messages": []});
-    convert_to_openai_responses(&mut body, "gpt-5.4").unwrap();
-    assert_eq!(body["reasoning"]["effort"], "medium");
-}
-
-#[test]
 fn test_force_effort_overrides_inbound_and_default() {
     // force_effort 固定档:显式 effort 与默认 effort 均改写为固定值
     let registry = vec![crate::thinking::ModelCapability {
@@ -923,28 +900,6 @@ fn test_force_effort_overrides_inbound_and_default() {
     let mut no_effort = json!({"model": "test", "messages": []});
     convert_to_openai_responses_with(&mut no_effort, "gpt-6-astra", &registry).unwrap();
     assert_eq!(no_effort["reasoning"]["effort"], "low");
-}
-
-#[test]
-fn test_thinking_effort_mapping() {
-    let mut body = json!({
-        "model": "test",
-        "thinking": {"type": "enabled", "budget_tokens": 8192},
-        "messages": []
-    });
-    convert_to_openai_responses(&mut body, "test-model").unwrap();
-    assert_eq!(body["reasoning"]["effort"], "medium");
-}
-
-#[test]
-fn test_adaptive_effort_uses_output_config() {
-    let mut body = json!({
-        "model": "test",
-        "thinking": {"type": "adaptive", "output_config": {"effort": "high"}},
-        "messages": []
-    });
-    convert_to_openai_responses(&mut body, "test-model").unwrap();
-    assert_eq!(body["reasoning"]["effort"], "high");
 }
 
 #[test]
@@ -1255,18 +1210,21 @@ fn test_grok_upstream_still_injects_grok_adapter() {
 
 #[test]
 fn test_non_adapter_upstream_uses_instructions() {
-    // 非 adapter 上游(glm/deepseek)保持 system → instructions
-    let mut body = json!({
-        "model": "test",
-        "system": "System prompt",
-        "messages": [{"role": "user", "content": "test"}]
-    });
-    convert_to_openai_responses(&mut body, "glm-5.1").unwrap();
+    // 非 adapter 上游(glm/deepseek/claude)保持 system → instructions,不注入 developer 块
+    for model in ["glm-5.1", "claude-opus-5"] {
+        let mut body = json!({
+            "model": "test",
+            "system": "System prompt",
+            "messages": [{"role": "user", "content": "test"}]
+        });
+        convert_to_openai_responses(&mut body, model).unwrap();
 
-    assert_eq!(body["instructions"], "System prompt");
-    let input = body["input"].as_array().unwrap();
-    // 首条消息应该是 user,不是 developer
-    assert_eq!(input[0]["role"], "user");
+        assert_eq!(body["instructions"], "System prompt", "{model}");
+        let input = body["input"].as_array().unwrap();
+        // 首条消息应该是 user,不是 developer
+        assert_eq!(input[0]["role"], "user", "{model}");
+        assert_eq!(input.len(), 1, "{model}");
+    }
 }
 
 #[test]
@@ -1300,53 +1258,28 @@ fn test_gpt_upstream_injects_text_verbosity_low() {
 #[test]
 fn test_max_effort_downgraded_to_xhigh() {
     // glm-5.1 注册表支持到 xhigh,max 自动降级
-    let mut body = json!({
-        "model": "test",
-        "output_config": {"effort": "max"},
-        "thinking": {"type": "adaptive"},
-        "messages": []
-    });
-    convert_to_openai_responses_with(&mut body, "glm-5.1", &glm51_registry()).unwrap();
-    assert_eq!(body["reasoning"]["effort"], "xhigh");
-}
-
-#[test]
-fn test_service_tier_from_speed() {
-    let mut body = json!({"model": "test", "messages": [], "speed": "fast"});
-    convert_to_openai_responses(&mut body, "test-model").unwrap();
-    assert_eq!(body["service_tier"], "priority");
+    for adaptive in [true, false] {
+        let mut body = json!({
+            "model": "test",
+            "output_config": {"effort": "max"},
+            "messages": []
+        });
+        if adaptive {
+            body["thinking"] = json!({"type": "adaptive"});
+        }
+        convert_to_openai_responses_with(&mut body, "glm-5.1", &glm51_registry()).unwrap();
+        assert_eq!(body["reasoning"]["effort"], "xhigh", "adaptive={adaptive}");
+    }
 }
 
 #[test]
 fn test_service_tier_fast_is_priority() {
-    let mut body = json!({"model": "test", "messages": [], "service_tier": "fast"});
-    convert_to_openai_responses(&mut body, "gpt-5.6-terra").unwrap();
-    assert_eq!(body["service_tier"], "priority");
-}
-
-#[test]
-fn test_effort_preserved_from_body() {
-    // 保留入站 effort(output_config.effort 显式 high),对齐 codex compact.rs:704
-    // 保留 turn_context.reasoning_effort,不因 compact 或其他路径强制覆盖
-    let mut body = json!({
-        "model": "test",
-        "messages": [],
-        "output_config": {"effort": "high"}
-    });
-    convert_to_openai_responses(&mut body, "gpt-5.6-terra").unwrap();
-    assert_eq!(body["reasoning"]["effort"], "high");
-}
-
-#[test]
-fn test_effort_clamped_to_model() {
-    // 超出模型支持上限时钳制到最近级别(glm-5.1 最高 xhigh,max 降为 xhigh)
-    let mut body = json!({
-        "model": "test",
-        "messages": [],
-        "output_config": {"effort": "max"}
-    });
-    convert_to_openai_responses_with(&mut body, "glm-5.1", &glm51_registry()).unwrap();
-    assert_eq!(body["reasoning"]["effort"], "xhigh");
+    for (field, model) in [("speed", "test-model"), ("service_tier", "gpt-5.6-terra")] {
+        let mut body = json!({"model": "test", "messages": []});
+        body[field] = json!("fast");
+        convert_to_openai_responses(&mut body, model).unwrap();
+        assert_eq!(body["service_tier"], "priority", "{field}: {model}");
+    }
 }
 
 #[test]
@@ -1837,44 +1770,14 @@ fn test_long_call_id_shortened() {
 }
 
 #[test]
-fn test_empty_and_null_messages_dropped() {
+fn test_empty_message_content_dropped() {
     let mut body = json!({
         "model": "test",
         "messages": [
             {"role": "user", "content": null},
             {"role": "user"},
-            {"role": "user", "content": "keep"}
-        ]
-    });
-    convert_to_openai_responses(&mut body, "test-model").unwrap();
-    let input = body["input"].as_array().unwrap();
-    assert_eq!(input.len(), 1);
-    assert_eq!(input[0]["content"][0]["text"], "keep");
-}
-
-#[test]
-fn test_empty_string_content_dropped_in_responses() {
-    // 对齐 extractStandardInputTextContent:空串不产出 message item
-    let mut body = json!({
-        "model": "test",
-        "messages": [
             {"role": "user", "content": ""},
             {"role": "assistant", "content": ""},
-            {"role": "user", "content": "real"}
-        ]
-    });
-    convert_to_openai_responses(&mut body, "test-model").unwrap();
-    let input = body["input"].as_array().unwrap();
-    assert_eq!(input.len(), 1, "空串 message 应被跳过");
-    assert_eq!(input[0]["content"][0]["text"], "real");
-}
-
-#[test]
-fn test_empty_array_content_no_output() {
-    // 空 content 数组 → 经 flush_message 检查后无 item 产出
-    let mut body = json!({
-        "model": "test",
-        "messages": [
             {"role": "user", "content": []},
             {"role": "user", "content": "keep"}
         ]
@@ -1903,24 +1806,6 @@ fn test_message_flushed_before_function_call() {
 }
 
 #[test]
-fn test_redacted_thinking_non_grok_skipped() {
-    // 非 grok 同样不回放 redacted_thinking(对齐 grok-build parse-only 丢弃)
-    let mut body = json!({
-        "model": "test",
-        "messages": [
-            {"role": "assistant", "content": [
-                {"type": "redacted_thinking", "data": "opaque_payload_xyz"}
-            ]}
-        ]
-    });
-    convert_to_openai_responses(&mut body, "gpt-5").unwrap();
-    let input = body["input"].as_array().unwrap();
-    // 只有 developer message (adapter)
-    assert_eq!(input.len(), 1);
-    assert_eq!(input[0]["role"], "developer");
-}
-
-#[test]
 fn test_redacted_thinking_empty_data_skipped() {
     // redacted_thinking 块跳过后,后续 text 块仍正常处理为 message
     let mut body = json!({
@@ -1937,24 +1822,6 @@ fn test_redacted_thinking_empty_data_skipped() {
     assert_eq!(body["input"].as_array().unwrap().len(), 2);
     assert_eq!(body["input"][1]["type"], "message");
     assert_eq!(body["input"][1]["content"][0]["text"], "result");
-}
-
-#[test]
-fn test_redacted_thinking_user_role_ignored() {
-    // user 角色的 redacted_thinking 块应被忽略（只处理 assistant）
-    let mut body = json!({
-        "model": "test",
-        "messages": [
-            {"role": "user", "content": [
-                {"type": "redacted_thinking", "data": "should_ignore"}
-            ]}
-        ]
-    });
-    convert_to_openai_responses(&mut body, "gpt-5").unwrap();
-    let input = body["input"].as_array().unwrap();
-    // 只有 developer message
-    assert_eq!(input.len(), 1);
-    assert_eq!(input[0]["role"], "developer");
 }
 
 #[test]

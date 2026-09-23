@@ -120,31 +120,18 @@ mod tests {
 
     #[test]
     fn test_trim_leading_separators() {
-        // 对齐 CPA:截断后**开头**的分隔符被清除
-        // 构造截断后以 _ 开头的场景：名字以 _ 开头且超长
-        let name = "_".to_string() + &"tool_name_".repeat(10);
-        let short = shorten_name_if_needed(&name);
-        assert!(!short.starts_with('_'));
-        assert!(short.len() <= 64);
-    }
-
-    #[test]
-    fn test_trim_leading_hyphens() {
-        // 构造截断后以 - 开头的场景：名字以 - 开头且超长
-        let name = "--tool-name-".repeat(10);
-        let short = shorten_name_if_needed(&name);
-        assert!(!short.starts_with('-'));
-        assert!(short.len() <= 64);
-    }
-
-    #[test]
-    fn test_trim_mixed_leading_separators() {
-        // 混合前导分隔符：名字以 _- 混合开头
-        let name = "_-_-".to_string() + &"x".repeat(70);
-        let short = shorten_name_if_needed(&name);
-        assert!(!short.starts_with('_'));
-        assert!(!short.starts_with('-'));
-        assert_eq!(short, "x".repeat(60)); // 截断前64 = "_-_-" + 60个x，trim后剩60个x
+        for (name, expected) in [
+            ("_".to_string() + &"tool_name_".repeat(10), None),
+            ("--tool-name-".repeat(10), None),
+            ("_-_-".to_string() + &"x".repeat(70), Some("x".repeat(60))),
+        ] {
+            let short = shorten_name_if_needed(&name);
+            assert!(!short.starts_with(['_', '-']), "{name}");
+            assert!(short.len() <= 64, "{name}");
+            if let Some(expected) = expected {
+                assert_eq!(short, expected);
+            }
+        }
     }
 
     #[test]

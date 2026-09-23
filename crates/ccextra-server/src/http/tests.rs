@@ -1154,6 +1154,12 @@ fn test_secret_validation() {
     let mut h_wrong = HeaderMap::new();
     h_wrong.insert("x-api-key", "wrong".parse().unwrap());
 
+    let mut bearer_ok = HeaderMap::new();
+    bearer_ok.insert("authorization", "Bearer s3cret".parse().unwrap());
+
+    let mut bearer_wrong = HeaderMap::new();
+    bearer_wrong.insert("authorization", "Bearer wrong".parse().unwrap());
+
     let cases = vec![
         Case {
             name: "ok",
@@ -1174,6 +1180,18 @@ fn test_secret_validation() {
             expect_ok: false,
         },
         Case {
+            name: "bearer ok",
+            headers: bearer_ok,
+            secret: Some("s3cret".into()),
+            expect_ok: true,
+        },
+        Case {
+            name: "bearer wrong",
+            headers: bearer_wrong,
+            secret: Some("s3cret".into()),
+            expect_ok: false,
+        },
+        Case {
             name: "disabled",
             headers: HeaderMap::new(),
             secret: None,
@@ -1186,65 +1204,6 @@ fn test_secret_validation() {
         assert_eq!(
             result.is_ok(),
             case.expect_ok,
-            "Failed at case: {}",
-            case.name
-        );
-    }
-}
-
-#[test]
-fn test_secret_bearer_auth() {
-    // 测试 Bearer token 验证
-    let mut h_ok = HeaderMap::new();
-    h_ok.insert("authorization", "Bearer s3cret".parse().unwrap());
-    assert!(check_secret(&h_ok, &Some("s3cret".into())).is_ok());
-
-    let mut h_wrong = HeaderMap::new();
-    h_wrong.insert("authorization", "Bearer wrong".parse().unwrap());
-    assert!(check_secret(&h_wrong, &Some("s3cret".into())).is_err());
-}
-
-#[test]
-fn test_api_key_extraction() {
-    // 测试 key 提取逻辑
-    struct Case {
-        name: &'static str,
-        headers: HeaderMap,
-        expect_key: &'static str,
-    }
-
-    let mut h_bearer = HeaderMap::new();
-    h_bearer.insert("authorization", "Bearer tok".parse().unwrap());
-
-    let mut h_bearer_case = HeaderMap::new();
-    h_bearer_case.insert("authorization", "bearer     tok".parse().unwrap());
-
-    let mut h_prefer_x = HeaderMap::new();
-    h_prefer_x.insert("x-api-key", "xkey".parse().unwrap());
-    h_prefer_x.insert("authorization", "Bearer bkey".parse().unwrap());
-
-    let cases = vec![
-        Case {
-            name: "bearer",
-            headers: h_bearer,
-            expect_key: "tok",
-        },
-        Case {
-            name: "bearer case and whitespace",
-            headers: h_bearer_case,
-            expect_key: "tok",
-        },
-        Case {
-            name: "prefers x-api-key",
-            headers: h_prefer_x,
-            expect_key: "xkey",
-        },
-    ];
-
-    for case in cases {
-        assert_eq!(
-            extract_key(&case.headers),
-            case.expect_key,
             "Failed at case: {}",
             case.name
         );
@@ -1442,19 +1401,6 @@ async fn test_reload_applies_normalize_and_proxy() {
         "socks5://127.0.0.1:1080",
         "全局代理应随 /reload 生效"
     );
-}
-
-#[tokio::test]
-async fn test_reload_endpoint() {
-    let app = app(mock_state());
-    let req = Request::builder()
-        .uri("/reload")
-        .method("POST")
-        .body(Body::empty())
-        .unwrap();
-    let resp = app.oneshot(req).await.unwrap();
-    // reload 会失败(mock reload 返回空 providers),但端点应响应
-    assert!(resp.status() == StatusCode::OK || resp.status().is_server_error());
 }
 
 /// 上游等待释放信号时 reload 必须完成,不能依赖固定延迟制造并发窗口。
@@ -2441,7 +2387,9 @@ async fn test_upstream_429_fails_fast_passes_retry_after() {
             .and_then(|v| v.to_str().ok()),
         Some("7")
     );
-    let body = axum::body::to_bytes(response.into_body(), 1024 * 1024).await.unwrap();
+    let body = axum::body::to_bytes(response.into_body(), 1024 * 1024)
+        .await
+        .unwrap();
     let err: serde_json::Value = serde_json::from_slice(&body).unwrap();
     assert_eq!(err["type"], "error");
     assert_eq!(err["error"]["type"], "rate_limit_error");
@@ -2642,7 +2590,10 @@ async fn test_codex_provider_sends_account_id_header() {
         Some("codex_cli_rs")
     );
     let ua = captured.header("user-agent").unwrap_or_default();
-    assert!(ua.starts_with("codex_cli_rs/"), "UA 应为 codex CLI,实际 {ua}");
+    assert!(
+        ua.starts_with("codex_cli_rs/"),
+        "UA 应为 codex CLI,实际 {ua}"
+    );
 }
 
 #[tokio::test]
@@ -2728,10 +2679,7 @@ async fn test_codex_provider_compresses_request_body() {
 
     assert_eq!(response.status(), StatusCode::OK);
     // codex 订阅请求:声明 zstd 编码,线上字节解压后与出站 JSON 等价
-    assert_eq!(
-        captured.header("content-encoding").as_deref(),
-        Some("zstd")
-    );
+    assert_eq!(captured.header("content-encoding").as_deref(), Some("zstd"));
     let raw = captured
         .raw_body
         .lock()

@@ -572,7 +572,11 @@ pub(crate) async fn prepare_message_request(
     let mut codex_account_id: Option<String> = None;
     if let Some((auth_dir_str, email, account_id)) = codex_refresh {
         let auth_dir = std::path::Path::new(&auth_dir_str);
-        let id = if !email.is_empty() { &email } else { &account_id };
+        let id = if !email.is_empty() {
+            &email
+        } else {
+            &account_id
+        };
         match crate::codex::ensure_credential_fresh(auth_dir, id, upstream_proxy.as_deref()).await {
             Ok(fresh_cred) => {
                 upstream_key = fresh_cred.access_token;
@@ -639,7 +643,10 @@ pub(crate) async fn prepare_message_request(
         // Codex 订阅身份头 (对齐 CPA: 仅 OAuth 账号发,API key provider 无 metadata 不发)
         let mut map = HeaderMap::new();
         if let Ok(value) = axum::http::HeaderValue::from_str(account_id) {
-            map.insert(axum::http::HeaderName::from_static("chatgpt-account-id"), value);
+            map.insert(
+                axum::http::HeaderName::from_static("chatgpt-account-id"),
+                value,
+            );
         }
         map
     } else {

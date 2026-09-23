@@ -71,7 +71,9 @@ pub async fn refresh_if_needed(
 
 /// `refresh_token_reused` 属不可恢复错误,直接失败 (对齐 CPA isNonRetryableRefreshErr)
 fn is_non_retryable_refresh_err(err: &anyhow::Error) -> bool {
-    err.to_string().to_ascii_lowercase().contains("refresh_token_reused")
+    err.to_string()
+        .to_ascii_lowercase()
+        .contains("refresh_token_reused")
 }
 
 /// 运行时获取新鲜凭证 (单飞锁 + Double-Check + 自动落盘)

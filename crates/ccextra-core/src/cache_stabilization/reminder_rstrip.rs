@@ -170,23 +170,6 @@ mod tests {
     // ── Anthropic ───────────────────────────────────────────────────────
 
     #[test]
-    fn anthropic_strips_trailing_newline_after_reminder_in_message() {
-        let mut body = json!({
-            "system": "You are helpful.",
-            "messages": [{
-                "role": "user",
-                "content": [
-                    {"type": "text", "text": "Allowed\n</system-reminder>\n"}
-                ]
-            }]
-        });
-        let n = normalize_reminder_trailing_whitespace(&mut body, ApiKind::Anthropic);
-        assert_eq!(n, 1);
-        let text = body["messages"][0]["content"][0]["text"].as_str().unwrap();
-        assert_eq!(text, "Allowed\n</system-reminder>");
-    }
-
-    #[test]
     fn anthropic_collapses_multiple_blank_lines_before_marker() {
         let mut body = json!({
             "system": [],
@@ -204,108 +187,162 @@ mod tests {
     }
 
     #[test]
-    fn anthropic_no_marker_untouched() {
-        let mut body = json!({
-            "system": "You are helpful.\n",
-            "messages": [{
-                "role": "user",
-                "content": [
-                    {"type": "text", "text": "just user text\n\n"}
-                ]
-            }]
-        });
-        let before = serde_json::to_vec(&body).unwrap();
-        let n = normalize_reminder_trailing_whitespace(&mut body, ApiKind::Anthropic);
-        assert_eq!(n, 0);
-        let after = serde_json::to_vec(&body).unwrap();
-        assert_eq!(before, after, "no-marker body must be byte-equal");
+    fn untouched_bodies_remain_byte_equal() {
+        for (name, kind, mut body) in [
+            (
+                "anthropic no marker",
+                ApiKind::Anthropic,
+                json!({"system": "You are helpful.\n", "messages": [{
+                    "role": "user", "content": [{"type": "text", "text": "just user text\n\n"}]
+                }]}),
+            ),
+            (
+                "anthropic already normalized",
+                ApiKind::Anthropic,
+                json!({"system": [], "messages": [{
+                    "role": "user", "content": [{"type": "text", "text": "Allowed\n</system-reminder>"}]
+                }]}),
+            ),
+            (
+                "anthropic middle marker",
+                ApiKind::Anthropic,
+                json!({"system": [], "messages": [{
+                    "role": "user", "content": [{"type": "text", "text": "</system-reminder>\nmore text"}]
+                }]}),
+            ),
+            (
+                "anthropic tool result",
+                ApiKind::Anthropic,
+                json!({"system": [], "messages": [{
+                    "role": "user", "content": [{"type": "tool_result", "content": "output\n</system-reminder>\n"}]
+                }]}),
+            ),
+            (
+                "chat no marker",
+                ApiKind::OpenAiChat,
+                json!({"messages": [
+                    {"role": "system", "content": "no marker here\n"},
+                    {"role": "user", "content": "plain\n\n"}
+                ]}),
+            ),
+            (
+                "responses no marker",
+                ApiKind::OpenAiResponses,
+                json!({"instructions": "no marker\n", "input": [
+                    {"role": "user", "content": "plain\n"}
+                ]}),
+            ),
+            (
+                "anthropic non-text blocks",
+                ApiKind::Anthropic,
+                json!({"system": [], "messages": [{"role": "user", "content": [
+                    {"type": "image", "source": {"data": "abc\n</system-reminder>\n"}},
+                    {"type": "tool_use", "name": "x", "input": {"k": "v\n</system-reminder>\n"}}
+                ]}]}),
+            ),
+        ] {
+            let before = serde_json::to_vec(&body).unwrap();
+            assert_eq!(
+                normalize_reminder_trailing_whitespace(&mut body, kind),
+                0,
+                "{name}"
+            );
+            assert_eq!(serde_json::to_vec(&body).unwrap(), before, "{name}");
+        }
     }
 
     #[test]
-    fn anthropic_marker_without_trailing_untouched() {
-        let mut body = json!({
-            "system": [],
-            "messages": [{
-                "role": "user",
-                "content": [
-                    {"type": "text", "text": "Allowed\n</system-reminder>"}
-                ]
-            }]
-        });
-        let before = serde_json::to_vec(&body).unwrap();
-        let n = normalize_reminder_trailing_whitespace(&mut body, ApiKind::Anthropic);
-        assert_eq!(n, 0);
-        let after = serde_json::to_vec(&body).unwrap();
-        assert_eq!(before, after);
-    }
-
-    #[test]
-    fn anthropic_normalizes_system_string() {
-        let mut body = json!({
-            "system": "preamble\n</system-reminder>\n",
-            "messages": []
-        });
-        let n = normalize_reminder_trailing_whitespace(&mut body, ApiKind::Anthropic);
-        assert_eq!(n, 1);
-        assert_eq!(
-            body["system"].as_str().unwrap(),
-            "preamble\n</system-reminder>"
-        );
-    }
-
-    #[test]
-    fn anthropic_normalizes_system_array_text_block() {
-        let mut body = json!({
-            "system": [
-                {"type": "text", "text": "preamble\n</system-reminder>\n"}
-            ],
-            "messages": []
-        });
-        let n = normalize_reminder_trailing_whitespace(&mut body, ApiKind::Anthropic);
-        assert_eq!(n, 1);
-        assert_eq!(
-            body["system"][0]["text"].as_str().unwrap(),
-            "preamble\n</system-reminder>"
-        );
-    }
-
-    #[test]
-    fn anthropic_only_trailing_marker_normalized_mid_marker_untouched() {
-        // 内容中间的标记（不在尾部）不会被 $ 锚定匹配到。
-        let mut body = json!({
-            "system": [],
-            "messages": [{
-                "role": "user",
-                "content": [
-                    {"type": "text", "text": "</system-reminder>\nmore text"}
-                ]
-            }]
-        });
-        let before = serde_json::to_vec(&body).unwrap();
-        let n = normalize_reminder_trailing_whitespace(&mut body, ApiKind::Anthropic);
-        assert_eq!(n, 0);
-        let after = serde_json::to_vec(&body).unwrap();
-        assert_eq!(before, after);
-    }
-
-    #[test]
-    fn anthropic_tool_result_content_not_touched() {
-        // 携带 smooshed reminder 的 tool_result.content 字符串在此处不会被规范化
-        // （smoosh-split 被推迟处理）。
-        let mut body = json!({
-            "system": [],
-            "messages": [{
-                "role": "user",
-                "content": [
-                    {"type": "tool_result", "content": "output\n</system-reminder>\n"}
-                ]
-            }]
-        });
-        let before = serde_json::to_vec(&body).unwrap();
-        let n = normalize_reminder_trailing_whitespace(&mut body, ApiKind::Anthropic);
-        assert_eq!(n, 0);
-        let after = serde_json::to_vec(&body).unwrap();
-        assert_eq!(before, after);
+    fn normalizes_text_at_each_protocol_path() {
+        for (name, kind, mut body, path, expected) in [
+            (
+                "anthropic system string",
+                ApiKind::Anthropic,
+                json!({"system": "preamble\n</system-reminder>\n", "messages": []}),
+                "/system",
+                "preamble\n</system-reminder>",
+            ),
+            (
+                "anthropic system array",
+                ApiKind::Anthropic,
+                json!({"system": [{"type": "text", "text": "preamble\n</system-reminder>\n"}], "messages": []}),
+                "/system/0/text",
+                "preamble\n</system-reminder>",
+            ),
+            (
+                "chat content array",
+                ApiKind::OpenAiChat,
+                json!({"messages": [{"role": "user", "content": [
+                    {"type": "text", "text": "Allowed\n</system-reminder>\n"}]}]}),
+                "/messages/0/content/0/text",
+                "Allowed\n</system-reminder>",
+            ),
+            (
+                "chat content string",
+                ApiKind::OpenAiChat,
+                json!({"messages": [{"role": "user", "content": "Allowed\n</system-reminder>\n"}]}),
+                "/messages/0/content",
+                "Allowed\n</system-reminder>",
+            ),
+            (
+                "responses instructions",
+                ApiKind::OpenAiResponses,
+                json!({"instructions": "preamble\n</system-reminder>\n", "input": []}),
+                "/instructions",
+                "preamble\n</system-reminder>",
+            ),
+            (
+                "responses input text array",
+                ApiKind::OpenAiResponses,
+                json!({"instructions": "", "input": [{"role": "user", "content": [
+                    {"type": "text", "text": "Allowed\n</system-reminder>\n"}]}]}),
+                "/input/0/content/0/text",
+                "Allowed\n</system-reminder>",
+            ),
+            (
+                "responses input system string",
+                ApiKind::OpenAiResponses,
+                json!({"instructions": null, "input": [
+                    {"role": "system", "content": "p\n</system-reminder>\n"},
+                    {"role": "user", "content": "hi"}]}),
+                "/input/0/content",
+                "p\n</system-reminder>",
+            ),
+            (
+                "responses messages fallback",
+                ApiKind::OpenAiResponses,
+                json!({"instructions": null, "messages": [
+                    {"role": "user", "content": "Allowed\n</system-reminder>\n"}]}),
+                "/messages/0/content",
+                "Allowed\n</system-reminder>",
+            ),
+            (
+                "responses input_text",
+                ApiKind::OpenAiResponses,
+                json!({"instructions": null, "input": [{"role": "user", "content": [
+                    {"type": "input_text", "text": "Allowed\n</system-reminder>\n"}]}]}),
+                "/input/0/content/0/text",
+                "Allowed\n</system-reminder>",
+            ),
+            (
+                "responses output_text",
+                ApiKind::OpenAiResponses,
+                json!({"instructions": null, "input": [{"role": "assistant", "content": [
+                    {"type": "output_text", "text": "p\n</system-reminder>\n"}]}]}),
+                "/input/0/content/0/text",
+                "p\n</system-reminder>",
+            ),
+        ] {
+            assert_eq!(
+                normalize_reminder_trailing_whitespace(&mut body, kind),
+                1,
+                "{name}"
+            );
+            assert_eq!(
+                body.pointer(path).and_then(Value::as_str),
+                Some(expected),
+                "{name}"
+            );
+        }
     }
 
     #[test]
@@ -356,172 +393,7 @@ mod tests {
 
     // ── OpenAI Chat ─────────────────────────────────────────────────────
 
-    #[test]
-    fn openai_chat_strips_trailing_in_user_content_array() {
-        let mut body = json!({
-            "messages": [{
-                "role": "user",
-                "content": [
-                    {"type": "text", "text": "Allowed\n</system-reminder>\n"}
-                ]
-            }]
-        });
-        let n = normalize_reminder_trailing_whitespace(&mut body, ApiKind::OpenAiChat);
-        assert_eq!(n, 1);
-        assert_eq!(
-            body["messages"][0]["content"][0]["text"].as_str().unwrap(),
-            "Allowed\n</system-reminder>"
-        );
-    }
-
-    #[test]
-    fn openai_chat_strips_trailing_in_user_content_string() {
-        let mut body = json!({
-            "messages": [{
-                "role": "user",
-                "content": "Allowed\n</system-reminder>\n"
-            }]
-        });
-        let n = normalize_reminder_trailing_whitespace(&mut body, ApiKind::OpenAiChat);
-        assert_eq!(n, 1);
-        assert_eq!(
-            body["messages"][0]["content"].as_str().unwrap(),
-            "Allowed\n</system-reminder>"
-        );
-    }
-
-    #[test]
-    fn openai_chat_strips_trailing_in_system_message_string() {
-        let mut body = json!({
-            "messages": [
-                {"role": "system", "content": "preamble\n</system-reminder>\n"},
-                {"role": "user", "content": "hi"}
-            ]
-        });
-        let n = normalize_reminder_trailing_whitespace(&mut body, ApiKind::OpenAiChat);
-        assert_eq!(n, 1);
-        assert_eq!(
-            body["messages"][0]["content"].as_str().unwrap(),
-            "preamble\n</system-reminder>"
-        );
-    }
-
-    #[test]
-    fn openai_chat_strips_trailing_in_developer_message_array() {
-        let mut body = json!({
-            "messages": [
-                {"role": "developer", "content": [
-                    {"type": "text", "text": "p\n</system-reminder>\n"}
-                ]}
-            ]
-        });
-        let n = normalize_reminder_trailing_whitespace(&mut body, ApiKind::OpenAiChat);
-        assert_eq!(n, 1);
-        assert_eq!(
-            body["messages"][0]["content"][0]["text"].as_str().unwrap(),
-            "p\n</system-reminder>"
-        );
-    }
-
-    #[test]
-    fn openai_chat_no_marker_untouched() {
-        let mut body = json!({
-            "messages": [
-                {"role": "system", "content": "no marker here\n"},
-                {"role": "user", "content": "plain\n\n"}
-            ]
-        });
-        let before = serde_json::to_vec(&body).unwrap();
-        let n = normalize_reminder_trailing_whitespace(&mut body, ApiKind::OpenAiChat);
-        assert_eq!(n, 0);
-        let after = serde_json::to_vec(&body).unwrap();
-        assert_eq!(before, after);
-    }
-
     // ── OpenAI Responses ───────────────────────────────────────────────
-
-    #[test]
-    fn openai_responses_strips_trailing_in_instructions() {
-        let mut body = json!({
-            "instructions": "preamble\n</system-reminder>\n",
-            "input": []
-        });
-        let n = normalize_reminder_trailing_whitespace(&mut body, ApiKind::OpenAiResponses);
-        assert_eq!(n, 1);
-        assert_eq!(
-            body["instructions"].as_str().unwrap(),
-            "preamble\n</system-reminder>"
-        );
-    }
-
-    #[test]
-    fn openai_responses_strips_trailing_in_input_user_content_array() {
-        let mut body = json!({
-            "instructions": "",
-            "input": [{
-                "role": "user",
-                "content": [
-                    {"type": "text", "text": "Allowed\n</system-reminder>\n"}
-                ]
-            }]
-        });
-        let n = normalize_reminder_trailing_whitespace(&mut body, ApiKind::OpenAiResponses);
-        assert_eq!(n, 1);
-        assert_eq!(
-            body["input"][0]["content"][0]["text"].as_str().unwrap(),
-            "Allowed\n</system-reminder>"
-        );
-    }
-
-    #[test]
-    fn openai_responses_strips_trailing_in_input_system_content_string() {
-        let mut body = json!({
-            "instructions": null,
-            "input": [
-                {"role": "system", "content": "p\n</system-reminder>\n"},
-                {"role": "user", "content": "hi"}
-            ]
-        });
-        let n = normalize_reminder_trailing_whitespace(&mut body, ApiKind::OpenAiResponses);
-        assert_eq!(n, 1);
-        assert_eq!(
-            body["input"][0]["content"].as_str().unwrap(),
-            "p\n</system-reminder>"
-        );
-    }
-
-    #[test]
-    fn openai_responses_no_marker_untouched() {
-        let mut body = json!({
-            "instructions": "no marker\n",
-            "input": [{"role": "user", "content": "plain\n"}]
-        });
-        let before = serde_json::to_vec(&body).unwrap();
-        let n = normalize_reminder_trailing_whitespace(&mut body, ApiKind::OpenAiResponses);
-        assert_eq!(n, 0);
-        let after = serde_json::to_vec(&body).unwrap();
-        assert_eq!(before, after);
-    }
-
-    #[test]
-    fn openai_responses_falls_back_to_messages_when_no_input() {
-        // 有些客户端以 `messages` 而非规范键 `input` 发送 Responses 形态的 body。
-        // drift_detector::messages_array 处理这一回退；rstrip 也必须这样做，
-        // 否则会静默跳过所有消息。
-        let mut body = json!({
-            "instructions": null,
-            "messages": [{
-                "role": "user",
-                "content": "Allowed\n</system-reminder>\n"
-            }]
-        });
-        let n = normalize_reminder_trailing_whitespace(&mut body, ApiKind::OpenAiResponses);
-        assert_eq!(n, 1);
-        assert_eq!(
-            body["messages"][0]["content"].as_str().unwrap(),
-            "Allowed\n</system-reminder>"
-        );
-    }
 
     #[test]
     fn openai_responses_normalizes_both_input_and_messages_when_both_present() {
@@ -547,67 +419,6 @@ mod tests {
     }
 
     // ── 回归：来自最大努力审查的发现 ───────────────────────────────
-
-    #[test]
-    fn anthropic_string_content_normalized() {
-        // Anthropic 用户消息采用字符串形式的 content（非数组）。
-        // drift_detector 对整个消息做哈希，因此字符串 content 是真正的
-        // drift 目标——不能被跳过。
-        let mut body = json!({
-            "system": [],
-            "messages": [{
-                "role": "user",
-                "content": "Allowed\n</system-reminder>\n"
-            }]
-        });
-        let n = normalize_reminder_trailing_whitespace(&mut body, ApiKind::Anthropic);
-        assert_eq!(n, 1);
-        assert_eq!(
-            body["messages"][0]["content"].as_str().unwrap(),
-            "Allowed\n</system-reminder>"
-        );
-    }
-
-    #[test]
-    fn openai_responses_input_text_part_normalized() {
-        // Responses API 的 input parts 使用 "input_text" 类型，而非 "text"。
-        // 若不接受 input_text，Responses 路径会跳过每个 part。
-        let mut body = json!({
-            "instructions": null,
-            "input": [{
-                "role": "user",
-                "content": [
-                    {"type": "input_text", "text": "Allowed\n</system-reminder>\n"}
-                ]
-            }]
-        });
-        let n = normalize_reminder_trailing_whitespace(&mut body, ApiKind::OpenAiResponses);
-        assert_eq!(n, 1);
-        assert_eq!(
-            body["input"][0]["content"][0]["text"].as_str().unwrap(),
-            "Allowed\n</system-reminder>"
-        );
-    }
-
-    #[test]
-    fn openai_responses_output_text_part_normalized() {
-        // 助手输出 parts 使用 "output_text" 类型。
-        let mut body = json!({
-            "instructions": null,
-            "input": [{
-                "role": "assistant",
-                "content": [
-                    {"type": "output_text", "text": "p\n</system-reminder>\n"}
-                ]
-            }]
-        });
-        let n = normalize_reminder_trailing_whitespace(&mut body, ApiKind::OpenAiResponses);
-        assert_eq!(n, 1);
-        assert_eq!(
-            body["input"][0]["content"][0]["text"].as_str().unwrap(),
-            "p\n</system-reminder>"
-        );
-    }
 
     #[test]
     fn openai_chat_role_tool_content_not_touched() {
@@ -654,24 +465,5 @@ mod tests {
         let text = body["messages"][0]["content"][0]["text"].as_str().unwrap();
         // 中间的标记不动；尾部的被折叠。
         assert_eq!(text, "</system-reminder>\nmid\n</system-reminder>");
-    }
-
-    #[test]
-    fn non_text_block_types_untouched() {
-        let mut body = json!({
-            "system": [],
-            "messages": [{
-                "role": "user",
-                "content": [
-                    {"type": "image", "source": {"data": "abc\n</system-reminder>\n"}},
-                    {"type": "tool_use", "name": "x", "input": {"k": "v\n</system-reminder>\n"}}
-                ]
-            }]
-        });
-        let before = serde_json::to_vec(&body).unwrap();
-        let n = normalize_reminder_trailing_whitespace(&mut body, ApiKind::Anthropic);
-        assert_eq!(n, 0);
-        let after = serde_json::to_vec(&body).unwrap();
-        assert_eq!(before, after);
     }
 }
