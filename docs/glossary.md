@@ -21,7 +21,7 @@ xAI Grok 与 Codex 不是 protocol。它们使用 OAuth 凭证动态创建 `open
 ## 路由与配置
 
 **provider**
-一个上游连接定义，含 `name`、`protocol`、`base_url`、`key`、可选代理和 models。`base_url` 可按顺序列出多个地址。
+一个上游连接定义，含 `name`、`protocol`、`base_url`、`key`、可选代理和 models。`base_url` 可按顺序列出多个地址，至少一个；空列表在请求时被拒绝。
 
 **model alias**
 客户端发送的模型名。路由先按 alias 匹配，再按真实上游模型名匹配。alias 全局唯一。
@@ -98,20 +98,20 @@ OpenAI Chat 或 Responses 的 provider 级缓存桶标识。来自 Claude Code �
 **UpstreamClient**
 按最终代理地址缓存 `reqwest::Client` 的发送器。它选择协议端点、认证、User-Agent、Grok 会话头和流式头。
 
-**重试预算**
-网络错误、5xx 和 52x 的共享退避窗口。当前总预算为 3 秒，初始退避为 300ms，单次最多 1.5 秒；429 不退避重试，透传 `Retry-After` 交客户端处理。
+**重试与回退**
+messages 路径不做本地退避：429/5xx（含 52x）与网络错误在同轮内轮转多 `base_url`，耗尽后快速失败，把末次上游错误返给客户端，透传 `Retry-After`，退避重试交客户端（如 Claude Code）。流式首帧 error 内部重试一次，仍失败返回 502，不提交 200。Cursor 路径保留 3 秒退避预算（初始 300ms，单次最多 1.5 秒）。
 
 **有界读取**
 非流响应 body 的统一读取边界：成功 body 16 MiB（恰好上限可读，多 1 字节拒绝），错误 body 256 KiB（超出停止读取并标记截断，截断前缀不当作完整 JSON 解析）；读取停顿与流 chunk idle 共用 180s，每次非空数据后重置。成功 body 超限返回 502、停顿返回 504；错误 body 截断或读取失败保留上游状态码（429/401 不被改写）；OAuth/project/model 保留各自 30s 请求总超时。
 
 **死连接**
-复用池中已失效的连接（reset/broken pipe/提前关闭）。立刻重试一次，不计入 3 秒预算；普通建连失败/建连超时不属于死连接，交给 URL 回退与退避预算。
+复用池中已失效的连接（reset/broken pipe/提前关闭）。立刻重试一次；普通建连失败/建连超时不属于死连接，交给 URL 回退，避免单 URL 建连超时被内部重试放大。
 
 **relay 状态机**
 将 OpenAI 或 Gemini 风格 SSE 转成 Anthropic `message_start`、content block、delta 和终态事件的状态机。终态后忽略后续上游事件。
 
 **keepalive**
-流式输出空闲 10 秒后发送的 `: keepalive\n\n` SSE 注释，防止中间网络层关闭空闲连接。上游流本身另有 180s chunk idle（当前服务设置）；超时发 Anthropic error，不是心跳。
+流式输出空闲 10 秒后发送的 `: keepalive\n\n` SSE 注释，防止中间网络层关闭空闲连接。上游流本身另有 180s chunk idle（当前服务设置）；超时发 Anthropic error，不是心跳。首帧预读阶段跳过心跳帧，不当作首帧成功。
 
 **reasoning replay**
 Responses 上游不保留完整会话时，服务端按模型和会话保存兼容 reasoning 回合，并在下一请求锚定插入。仅可安全回放的内容会进入请求。

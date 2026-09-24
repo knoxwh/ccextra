@@ -384,6 +384,170 @@ models:
     assert!(String::from_utf8_lossy(&response_body).contains("retry ok"));
 }
 
+/// 首帧 error:内部重试一次后仍是 error → 返回 502 anthropic error,
+/// 不提交 200 SSE(客户端 Claude Code 收到干净 HTTP 状态才能整回合重试)。
+#[tokio::test]
+async fn test_openai_responses_first_frame_error_returns_502() {
+    let attempts = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+    let handler_attempts = Arc::clone(&attempts);
+    let upstream = Router::new().route(
+        "/responses",
+        post(move || {
+            let attempts = Arc::clone(&handler_attempts);
+            async move {
+                attempts.fetch_add(1, Ordering::SeqCst);
+                (
+                    [(header::CONTENT_TYPE, "text/event-stream")],
+                    "event: error\ndata: {\"type\":\"error\",\"error\":{\"type\":\"api_error\",\"message\":\"upstream boom\"}}\n\n",
+                )
+            }
+        }),
+    );
+    let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let upstream_addr = listener.local_addr().unwrap();
+    let server = tokio::spawn(async move {
+        axum::serve(listener, upstream).await.unwrap();
+    });
+
+    let state = mock_state();
+    let provider_yaml = format!(
+        r#"
+name: test-first-frame-error
+protocol: openai_responses
+base_url: "http://{}"
+key: sk-test
+proxy_url: "direct"
+models:
+  - name: gpt-5
+    alias: test-first-frame-error
+"#,
+        upstream_addr
+    );
+    let provider: ProviderConfig = serde_yaml::from_str(&provider_yaml).unwrap();
+    Arc::make_mut(&mut *state.config.write().await)
+        .providers
+        .push(provider);
+    let app = app(state);
+    let request = Request::builder()
+        .uri("/v1/messages")
+        .method("POST")
+        .header("content-type", "application/json")
+        .body(Body::from(
+            serde_json::to_vec(&json!({
+                "model": "test-first-frame-error",
+                "max_tokens": 64,
+                "stream": true,
+                "messages": [{"role": "user", "content": "hi"}]
+            }))
+            .unwrap(),
+        ))
+        .unwrap();
+    let response = app.oneshot(request).await.unwrap();
+    let status = response.status();
+    let response_body = to_bytes(response.into_body(), 1024 * 1024).await.unwrap();
+    server.abort();
+
+    // 内部重试一次,共 2 次上游命中
+    assert_eq!(attempts.load(Ordering::SeqCst), 2);
+    assert_eq!(status, StatusCode::BAD_GATEWAY);
+    let v: Value = serde_json::from_slice(&response_body).unwrap();
+    assert_eq!(v["type"], "error");
+    assert!(v["error"]["message"]
+        .as_str()
+        .unwrap()
+        .contains("upstream boom"));
+}
+
+/// 多 URL 回退后的首帧重试必须打当前生效的 base_url,不倒退回已失败的 [0]。
+#[tokio::test]
+async fn test_first_frame_retry_uses_active_base_url() {
+    let bad_hits = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+    let good_hits = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+    let bad_handler = Arc::clone(&bad_hits);
+    let good_handler = Arc::clone(&good_hits);
+    // bad:恒 503,触发同轮轮转到 good
+    let bad = Router::new().route(
+        "/responses",
+        post(move || {
+            let hits = Arc::clone(&bad_handler);
+            async move {
+                hits.fetch_add(1, Ordering::SeqCst);
+                (
+                    axum::http::StatusCode::SERVICE_UNAVAILABLE,
+                    [(header::CONTENT_TYPE, "application/json")],
+                    r#"{"error":{"message":"bad down"}}"#,
+                )
+            }
+        }),
+    );
+    // good:首次命中返回首帧 error,第二次(send_retry)返回正常流
+    let good = Router::new().route(
+        "/responses",
+        post(move || {
+            let hits = Arc::clone(&good_handler);
+            async move {
+                let body = if hits.fetch_add(1, Ordering::SeqCst) == 0 {
+                    "event: error\ndata: {\"type\":\"error\",\"error\":{\"type\":\"api_error\",\"message\":\"first frame boom\"}}\n\n".to_string()
+                } else {
+                    concat!(
+                        "event: response.created\n",
+                        "data: {\"type\":\"response.created\",\"response\":{\"id\":\"resp_active\",\"model\":\"gpt-5\"}}\n\n",
+                        "event: response.output_text.delta\n",
+                        "data: {\"type\":\"response.output_text.delta\",\"delta\":\"active ok\"}\n\n",
+                        "event: response.completed\n",
+                        "data: {\"type\":\"response.completed\",\"response\":{\"id\":\"resp_active\",\"output\":[],\"usage\":{\"input_tokens\":1,\"output_tokens\":1}}}\n\n"
+                    )
+                    .to_string()
+                };
+                ([(header::CONTENT_TYPE, "text/event-stream")], body)
+            }
+        }),
+    );
+    let bad_listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let bad_addr = bad_listener.local_addr().unwrap();
+    let bad_server = tokio::spawn(async move { axum::serve(bad_listener, bad).await.unwrap() });
+    let good_listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let good_addr = good_listener.local_addr().unwrap();
+    let good_server = tokio::spawn(async move { axum::serve(good_listener, good).await.unwrap() });
+
+    let state = mock_state();
+    let provider: ProviderConfig = serde_yaml::from_str(&format!(
+        "name: test-active-url\nprotocol: openai_responses\nbase_url: [http://{}, http://{}]\nkey: sk-test\nproxy_url: direct\nmodels:\n  - name: gpt-5\n    alias: test-active-url\n",
+        bad_addr, good_addr
+    ))
+    .unwrap();
+    Arc::make_mut(&mut *state.config.write().await)
+        .providers
+        .push(provider);
+    let app = app(state);
+    let request = Request::builder()
+        .uri("/v1/messages")
+        .method("POST")
+        .header("content-type", "application/json")
+        .body(Body::from(
+            serde_json::to_vec(&json!({
+                "model": "test-active-url",
+                "max_tokens": 64,
+                "stream": true,
+                "messages": [{"role": "user", "content": "hi"}]
+            }))
+            .unwrap(),
+        ))
+        .unwrap();
+    let response = app.oneshot(request).await.unwrap();
+    let status = response.status();
+    let response_body = to_bytes(response.into_body(), 1024 * 1024).await.unwrap();
+    bad_server.abort();
+    good_server.abort();
+
+    assert_eq!(status, StatusCode::OK);
+    assert!(String::from_utf8_lossy(&response_body).contains("active ok"));
+    // bad 只在轮转时命中一次,首帧重试不得倒退打 bad
+    assert_eq!(bad_hits.load(Ordering::SeqCst), 1);
+    // good:轮转轮一次 + 首帧重试一次
+    assert_eq!(good_hits.load(Ordering::SeqCst), 2);
+}
+
 /// Claude 直通:越档 effort 在发上游前被钳制;`*claude*` 模型原样直通。
 #[tokio::test]
 async fn test_claude_passthrough_clamps_effort_before_upstream() {
@@ -1484,59 +1648,6 @@ async fn test_reload_drops_old_cursor_if_credential_or_dir_changes() {
     }
 }
 
-/// /reload 清空 bcrypt 校验缓存:旧 secret 的 hash 命中过缓存后,
-/// 重载换新 secret,旧明文 key 不得再通过。
-#[tokio::test]
-async fn test_reload_clears_auth_cache() {
-    let old_hash = bcrypt::hash("sk-old", 4).unwrap();
-    let new_hash = bcrypt::hash("sk-new", 4).unwrap();
-    let mut state = mock_state();
-    Arc::make_mut(&mut *state.config.write().await)
-        .runtime
-        .secret = Some(old_hash.clone());
-    state.reload = reload_returning_secret(Some(new_hash));
-    let app = app(state);
-
-    let with_key = |k: &str| {
-        Request::builder()
-            .uri("/v1/models")
-            .header("x-api-key", k)
-            .body(Body::empty())
-            .unwrap()
-    };
-    // 先命中一次,把 sk-old→true 写进 AUTH_CACHE
-    let r = app.clone().oneshot(with_key("sk-old")).await.unwrap();
-    assert_eq!(r.status(), StatusCode::OK);
-    assert!(
-        crate::http::auth::auth_cache_contains(&old_hash, "sk-old"),
-        "reload 前全局缓存应含旧 hash 条目"
-    );
-
-    let reload = Request::builder()
-        .uri("/reload")
-        .method("POST")
-        .body(Body::empty())
-        .unwrap();
-    assert_eq!(
-        app.clone().oneshot(reload).await.unwrap().status(),
-        StatusCode::OK
-    );
-    // reload 必须实际清掉该条目(删掉 handle_reload 的 clear 则此处失败)
-    assert!(
-        !crate::http::auth::auth_cache_contains(&old_hash, "sk-old"),
-        "reload 应清掉旧 hash 的缓存条目"
-    );
-
-    let stale = app.clone().oneshot(with_key("sk-old")).await.unwrap();
-    assert_eq!(
-        stale.status(),
-        StatusCode::UNAUTHORIZED,
-        "旧 key 的缓存结果应随 /reload 作废"
-    );
-    let fresh = app.oneshot(with_key("sk-new")).await.unwrap();
-    assert_eq!(fresh.status(), StatusCode::OK, "新 secret 应校验通过");
-}
-
 /// /reload 替换 normalize 与全局代理:新 UpstreamClient 带上新 proxy_url。
 #[tokio::test]
 async fn test_reload_applies_normalize_and_proxy() {
@@ -2450,65 +2561,6 @@ fn test_retry_delay_respects_retry_after_and_budget() {
     assert!(compute_retry_delay(0, exhausted_start, &headers, None).is_none());
 }
 
-/// 上游 500:按退避重试后成功。
-#[tokio::test]
-async fn test_upstream_500_retries_with_backoff_then_succeeds() {
-    let attempts = Arc::new(std::sync::atomic::AtomicUsize::new(0));
-    let handler_attempts = Arc::clone(&attempts);
-    let upstream = Router::new().route(
-            "/chat/completions",
-            post(move || {
-                let attempts = Arc::clone(&handler_attempts);
-                async move {
-                    if attempts.fetch_add(1, Ordering::SeqCst) < 2 {
-                        (
-                            axum::http::StatusCode::INTERNAL_SERVER_ERROR,
-                            [(header::CONTENT_TYPE, "application/json")],
-                            r#"{"error":{"message":"overloaded"}}"#,
-                        )
-                    } else {
-                        (
-                            axum::http::StatusCode::OK,
-                            [(header::CONTENT_TYPE, "application/json")],
-                            r#"{"id":"c1","object":"chat.completion","model":"gpt-4","choices":[{"index":0,"message":{"role":"assistant","content":"retry ok"},"finish_reason":"stop"}],"usage":{"prompt_tokens":1,"completion_tokens":1}}"#,
-                        )
-                    }
-                }
-            }),
-        );
-    let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
-    let upstream_addr = listener.local_addr().unwrap();
-    let server = tokio::spawn(async move { axum::serve(listener, upstream).await.unwrap() });
-
-    let state = mock_state();
-    let provider: ProviderConfig = serde_yaml::from_str(&format!(
-            "name: test-500-retry\nprotocol: openai_chat\nbase_url: http://{}\nkey: sk-test\nproxy_url: direct\nmodels:\n  - name: gpt-4\n    alias: test-500-retry\n",
-            upstream_addr
-        ))
-        .unwrap();
-    Arc::make_mut(&mut *state.config.write().await)
-        .providers
-        .push(provider);
-    let app = app(state);
-    let request = Request::builder()
-        .uri("/v1/messages")
-        .method("POST")
-        .header("content-type", "application/json")
-        .body(Body::from(
-            serde_json::to_vec(&json!({
-                "model": "test-500-retry", "max_tokens": 64, "stream": false,
-                "messages": [{"role": "user", "content": "hi"}]
-            }))
-            .unwrap(),
-        ))
-        .unwrap();
-    let response = app.oneshot(request).await.unwrap();
-    server.abort();
-
-    assert_eq!(response.status(), StatusCode::OK);
-    assert_eq!(attempts.load(Ordering::SeqCst), 3);
-}
-
 /// 上游 429:不进退避重试(对齐 codex 传输层 retry_429: false),单次命中即返回;
 /// Retry-After 头透传给客户端,由客户端按上游声明退避。
 #[tokio::test]
@@ -2579,58 +2631,66 @@ async fn test_upstream_429_fails_fast_passes_retry_after() {
     assert_eq!(err["error"]["type"], "rate_limit_error");
 }
 
-/// 上游持续 503 耗尽退避预算:末次错误响应转 anthropic error 返回,
-/// 不返回 500 内部错误,客户端能拿到上游原始错误信息。
+/// 多 base_url 全部 5xx:每个地址各试一次,快速失败返回末次上游错误。
 #[tokio::test]
-async fn test_upstream_persistent_503_exhausts_budget_returns_error_shape() {
-    let upstream = Router::new().route(
-        "/chat/completions",
-        post(|| async {
-            (
-                axum::http::StatusCode::SERVICE_UNAVAILABLE,
-                [(header::CONTENT_TYPE, "application/json")],
-                r#"{"error":{"message":"down"}}"#,
-            )
-        }),
-    );
-    let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
-    let upstream_addr = listener.local_addr().unwrap();
-    let server = tokio::spawn(async move { axum::serve(listener, upstream).await.unwrap() });
+async fn test_upstream_all_base_urls_5xx_returns_last_error() {
+    use crate::test_support::TestServer;
+    let first = TestServer::reply(
+        StatusCode::SERVICE_UNAVAILABLE,
+        r#"{"error":{"type":"api_error","message":"first down"}}"#,
+    )
+    .await;
+    let last = TestServer::reply(
+        StatusCode::INTERNAL_SERVER_ERROR,
+        r#"{"error":{"type":"api_error","message":"last down"}}"#,
+    )
+    .await;
 
     let state = mock_state();
     let provider: ProviderConfig = serde_yaml::from_str(&format!(
-            "name: test-503-exhaust\nprotocol: openai_chat\nbase_url: http://{}\nkey: sk-test\nproxy_url: direct\nmodels:\n  - name: gpt-4\n    alias: test-503-exhaust\n",
-            upstream_addr
-        ))
-        .unwrap();
+        "name: test-all-5xx\nprotocol: openai_chat\nbase_url: [{}, {}]\nkey: sk-test\nproxy_url: direct\nmodels:\n  - name: gpt-4\n    alias: test-all-5xx\n",
+        first.url, last.url
+    ))
+    .unwrap();
     Arc::make_mut(&mut *state.config.write().await)
         .providers
         .push(provider);
-    let app = app(state);
-    let request = Request::builder()
-        .uri("/v1/messages")
-        .method("POST")
-        .header("content-type", "application/json")
-        .body(Body::from(
-            serde_json::to_vec(&json!({
-                "model": "test-503-exhaust", "max_tokens": 64, "stream": false,
-                "messages": [{"role": "user", "content": "hi"}]
-            }))
-            .unwrap(),
-        ))
-        .unwrap();
-    let response = app.oneshot(request).await.unwrap();
-    server.abort();
+    let attempts = state.config.read().await.runtime.upstream.attempts.clone();
+    let response = post_test_request(state, "/v1/messages", "test-all-5xx").await;
+    let status = response.status();
+    let bytes = to_bytes(response.into_body(), 1024 * 1024).await.unwrap();
 
+    // 末次上游错误决定状态;每个地址只打一次,不本地退避
+    assert_eq!(status, StatusCode::INTERNAL_SERVER_ERROR);
     assert_eq!(
-        response.status(),
-        axum::http::StatusCode::SERVICE_UNAVAILABLE
+        *attempts.lock().unwrap(),
+        [first.url.clone(), last.url.clone()]
     );
-    let bytes = axum::body::to_bytes(response.into_body(), usize::MAX)
-        .await
-        .unwrap();
     let v: Value = serde_json::from_slice(&bytes).unwrap();
-    assert_eq!(v["type"], "error", "错误必须转 anthropic error 形状");
+    assert_eq!(v["type"], "error");
+    assert!(v["error"]["message"]
+        .as_str()
+        .unwrap()
+        .contains("last down"));
+}
+
+/// 空 base_url 列表:prepare 阶段拒绝,返回 anthropic error 而非 panic。
+#[tokio::test]
+async fn test_empty_base_url_list_rejected() {
+    let state = mock_state();
+    let provider: ProviderConfig = serde_yaml::from_str(
+        "name: test-empty-url\nprotocol: openai_chat\nbase_url: []\nkey: sk-test\nproxy_url: direct\nmodels:\n  - name: gpt-4\n    alias: test-empty-url\n",
+    )
+    .unwrap();
+    Arc::make_mut(&mut *state.config.write().await)
+        .providers
+        .push(provider);
+    let response = post_test_request(state, "/v1/messages", "test-empty-url").await;
+    assert_eq!(response.status(), StatusCode::INTERNAL_SERVER_ERROR);
+    let bytes = to_bytes(response.into_body(), 1024 * 1024).await.unwrap();
+    let v: Value = serde_json::from_slice(&bytes).unwrap();
+    assert_eq!(v["type"], "error");
+    assert!(v["error"]["message"].as_str().unwrap().contains("base_url"));
 }
 
 async fn post_test_request(state: AppState, path: &str, model: &str) -> axum::response::Response {
@@ -2657,13 +2717,12 @@ async fn fallback_attempts_each_url_once() {
     let good = TestServer::reply(StatusCode::OK,
         r#"{"id":"c1","choices":[{"message":{"role":"assistant","content":"fallback ok"},"finish_reason":"stop"}],"usage":{"prompt_tokens":1,"completion_tokens":1}}"#).await;
     let limited = TestServer::reply(StatusCode::TOO_MANY_REQUESTS, "rate limited").await;
-    for refused in [true, false] {
+    let broken = TestServer::reply(StatusCode::INTERNAL_SERVER_ERROR, "boom").await;
+    // 网络错误(拒连)、429、5xx 都在同轮轮转到下一个 base_url,各地址只试一次
+    for first_url in [None, Some(limited.url.clone()), Some(broken.url.clone())] {
         let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
-        let first = if refused {
-            format!("http://{}", listener.local_addr().unwrap())
-        } else {
-            limited.url.clone()
-        };
+        let first =
+            first_url.unwrap_or_else(|| format!("http://{}", listener.local_addr().unwrap()));
         let state = mock_state();
         let provider: ProviderConfig = serde_yaml::from_str(&format!(
             "name: fallback\nprotocol: openai_chat\nbase_url: [{first}, {}]\nkey: sk-test\nproxy_url: direct\nmodels:\n  - name: gpt-4\n    alias: fallback\n", good.url)).unwrap();

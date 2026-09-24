@@ -32,7 +32,7 @@ use std::sync::Arc;
 use crate::http::auth::check_secret;
 use crate::http::claude_relay::{claude_inbound_user_agent, claude_relay_headers};
 use crate::http::error::{to_anthropic_error, AppError};
-use crate::http::retry::{compute_retry_delay, parse_retry_after};
+use crate::http::retry::parse_retry_after;
 use crate::http::{AppState, PayloadRule};
 use crate::sse::replay_cache::StreamReplayExtractor;
 use crate::sse::SseStreamPin;
@@ -228,6 +228,37 @@ fn is_initial_sse_error(frame: &Bytes) -> bool {
     frame.starts_with(b"event: error\n")
 }
 
+/// SSE 注释行帧(如心跳 `: keepalive\n\n`):保活占位,无业务语义。
+fn is_sse_comment_frame(frame: &Bytes) -> bool {
+    frame.starts_with(b":")
+}
+
+/// 跳过心跳注释帧,等到首个业务帧(或 error/EOF)。
+/// 心跳由 `with_idle_keepalive` 注入;首帧前触发时会骗过首帧错误检测,
+/// 提前提交 200 丧失重试窗口(codex/grok 的 eventsource 同样丢弃注释帧)。
+async fn next_business_frame(out: &mut SseStreamPin) -> Option<Result<Bytes, std::io::Error>> {
+    loop {
+        match out.next().await {
+            Some(Ok(frame)) if is_sse_comment_frame(&frame) => continue,
+            other => return other,
+        }
+    }
+}
+
+/// 从首帧 error 事件提取 error.message(提取失败回退原始文本)。
+fn initial_sse_error_message(frame: &Bytes) -> String {
+    let text = String::from_utf8_lossy(frame);
+    text.lines()
+        .find_map(|line| line.strip_prefix("data: "))
+        .and_then(|data| serde_json::from_str::<Value>(data).ok())
+        .and_then(|v| {
+            v.pointer("/error/message")
+                .and_then(|m| m.as_str())
+                .map(String::from)
+        })
+        .unwrap_or_else(|| text.trim().to_string())
+}
+
 fn prepend_sse_frame(first: Result<Bytes, std::io::Error>, rest: SseStreamPin) -> SseStreamPin {
     Box::pin(futures::stream::once(async move { first }).chain(rest))
 }
@@ -237,6 +268,8 @@ pub(crate) struct PreparedMessageRequest {
     pub body_json: Value,
     pub is_stream: bool,
     pub upstream_base_urls: Vec<String>,
+    /// 本轮实际生效的 base_url(多 URL 轮转后记录;内部重试用它,不倒退回 [0])
+    pub active_base_url: Option<String>,
     pub upstream_key: String,
     pub upstream_proxy: Option<String>,
     pub session_id: Option<String>,
@@ -535,6 +568,13 @@ pub(crate) async fn prepare_message_request(
             codex_refresh,
         )
     };
+    // 空 base_url 列表会让轮转循环与内部重试越界,提前拒绝
+    if upstream_base_urls.is_empty() {
+        return Err(AppError::new(anyhow::anyhow!(
+            "provider {} 未配置 base_url",
+            route.provider
+        )));
+    }
 
     // Antigravity 运行时 token 校验与自动刷新
     if let Some((auth_dir_str, email)) = antigravity_refresh {
@@ -695,6 +735,7 @@ pub(crate) async fn prepare_message_request(
         body_json,
         is_stream,
         upstream_base_urls,
+        active_base_url: None,
         upstream_key,
         upstream_proxy,
         session_id: session_id.map(str::to_string),
@@ -713,113 +754,67 @@ pub(crate) async fn execute_upstream_request(
     upstream_client: &crate::upstream::UpstreamClient,
     user_agents: &crate::http::UserAgentSet,
 ) -> Result<ExecutedUpstream, AppError> {
-    let mut upstream: Option<UpstreamResponse> = None;
-    let mut last_fail: Option<UpstreamResponse> = None;
-    let mut last_err = None;
-    let retry_started_at = std::time::Instant::now();
-    let mut attempt: u32 = 0;
-    loop {
-        enum Out {
-            Ok(UpstreamResponse),
-            Fail(UpstreamResponse),
-            Net(anyhow::Error),
-        }
-        let outcome = 'round: {
-            for (idx, base_url) in prepared.upstream_base_urls.iter().enumerate() {
-                match upstream_client
-                    .request(
-                        base_url,
-                        &prepared.upstream_key,
-                        prepared.route.protocol,
-                        prepared.upstream_proxy.as_deref(),
-                        &prepared.body_json,
-                        prepared.is_stream,
-                        prepared.session_id.as_deref(),
-                        prepared.thread_id.as_deref(),
-                        &prepared.extra_headers,
-                        user_agents,
-                        prepared.inbound_user_agent.as_deref(),
-                    )
-                    .await
-                {
-                    Ok(resp) => {
-                        if resp.status.as_u16() == 429
-                            && idx + 1 < prepared.upstream_base_urls.len()
-                        {
-                            tracing::debug!("上游 429,回退到下一个 base_url: {}", base_url);
-                            continue;
-                        }
-                        if resp.status.is_success() {
-                            break 'round Out::Ok(resp);
-                        }
-                        break 'round Out::Fail(resp);
-                    }
-                    Err(e) => {
-                        if idx + 1 < prepared.upstream_base_urls.len() {
-                            tracing::debug!("上游请求错误,回退到下一个 base_url: {}", base_url);
-                            continue;
-                        }
-                        break 'round Out::Net(e);
-                    }
-                }
-            }
-            unreachable!("base_urls 非空,循环内必 return/break")
-        };
-        match outcome {
-            Out::Ok(resp) => {
-                upstream = Some(resp);
-                break;
-            }
-            // 429 不进退避重试(对齐 codex 传输层 retry_429: false):
-            // 限流窗口远超 3s 预算,快速失败交客户端退避;多 base_url 回退不受影响
-            Out::Fail(resp) if resp.status.is_server_error() => {
-                let status = resp.status;
-                let wait = compute_retry_delay(
-                    attempt,
-                    retry_started_at,
-                    resp.body.headers(),
-                    Some(status),
-                );
-                attempt += 1;
-                match wait {
-                    Some(d) => {
-                        tracing::warn!(
-                            status = status.as_u16(),
-                            attempt,
-                            delay_ms = d.as_millis() as u64,
-                            "上游可重试失败,退避后重试"
-                        );
-                        tokio::time::sleep(d).await;
-                    }
-                    None => {
-                        last_fail = Some(resp);
-                        break;
-                    }
-                }
-            }
-            Out::Fail(resp) => {
-                last_fail = Some(resp);
-                break;
-            }
-            Out::Net(e) => {
-                last_err = Some(e);
-                let wait = compute_retry_delay(attempt, retry_started_at, &HeaderMap::new(), None);
-                attempt += 1;
-                match wait {
-                    Some(d) => tokio::time::sleep(d).await,
-                    None => break,
-                }
-            }
-        }
+    // 单轮请求:429/5xx/网络错误在同轮内轮转多 base_url,耗尽后快速失败,
+    // 末次上游错误原样返给客户端(Claude Code 自带退避重试,代理不代等)
+    enum Out {
+        Ok(UpstreamResponse),
+        Fail(UpstreamResponse),
+        Net(anyhow::Error),
     }
-
-    let mut upstream = match upstream {
-        Some(u) => Some(u),
-        None => match (last_fail, last_err) {
-            (Some(f), _) => Some(f),
-            (None, Some(e)) => return Err(e.into()),
-            (None, None) => None,
-        },
+    let mut active_base_url: Option<String> = None;
+    let outcome = 'round: {
+        for (idx, base_url) in prepared.upstream_base_urls.iter().enumerate() {
+            let has_next = idx + 1 < prepared.upstream_base_urls.len();
+            match upstream_client
+                .request(
+                    base_url,
+                    &prepared.upstream_key,
+                    prepared.route.protocol,
+                    prepared.upstream_proxy.as_deref(),
+                    &prepared.body_json,
+                    prepared.is_stream,
+                    prepared.session_id.as_deref(),
+                    prepared.thread_id.as_deref(),
+                    &prepared.extra_headers,
+                    user_agents,
+                    prepared.inbound_user_agent.as_deref(),
+                )
+                .await
+            {
+                Ok(resp) => {
+                    let status = resp.status;
+                    // 429/5xx 轮转下一 base_url(429 对齐 codex retry_429: false 不本地重试,
+                    // 5xx 此前直接放弃回退,现与网络错误同等对待)
+                    if (status.as_u16() == 429 || status.is_server_error()) && has_next {
+                        tracing::debug!(
+                            status = status.as_u16(),
+                            "上游可重试失败,回退到下一个 base_url: {}",
+                            base_url
+                        );
+                        continue;
+                    }
+                    active_base_url = Some(base_url.clone());
+                    if status.is_success() {
+                        break 'round Out::Ok(resp);
+                    }
+                    break 'round Out::Fail(resp);
+                }
+                Err(e) => {
+                    if has_next {
+                        tracing::debug!("上游请求错误,回退到下一个 base_url: {}", base_url);
+                        continue;
+                    }
+                    break 'round Out::Net(e);
+                }
+            }
+        }
+        unreachable!("base_urls 非空,循环内必 return/break")
+    };
+    prepared.active_base_url = active_base_url;
+    let mut upstream = match outcome {
+        Out::Ok(resp) | Out::Fail(resp) => Some(resp),
+        // 网络错误已轮转完全部 base_url:直接返给客户端,不本地退避重试
+        Out::Net(e) => return Err(e.into()),
     };
     let mut status = upstream.as_ref().expect("上游响应应存在").status;
     let mut preloaded_stream = None;
@@ -842,27 +837,38 @@ pub(crate) async fn execute_upstream_request(
                 prepared.replay_scope.clone(),
                 prepared.signature_model.clone(),
             );
-            let first = out.next().await;
-            let retry = match &first {
+            // 首帧只认业务帧:跳过心跳注释帧,防 keepalive 骗过错误检测提前提交 200
+            let first = next_business_frame(&mut out).await;
+            let bad = match &first {
                 Some(Ok(frame)) => is_initial_sse_error(frame),
                 Some(Err(_)) | None => true,
             };
-            if retry && attempt == 0 {
-                tracing::warn!(
-                    protocol = ?prepared.route.protocol,
-                    retry_attempt = attempt + 1,
-                    "首帧转换失败，重试上游请求"
-                );
-                upstream = Some(prepared.send_retry(upstream_client, user_agents).await?);
-                status = upstream.as_ref().expect("上游响应应存在").status;
-                if !status.is_success() {
-                    break;
+            if bad {
+                if attempt == 0 {
+                    tracing::warn!(
+                        protocol = ?prepared.route.protocol,
+                        retry_attempt = attempt + 1,
+                        "首帧转换失败，重试上游请求"
+                    );
+                    upstream = Some(prepared.send_retry(upstream_client, user_agents).await?);
+                    status = upstream.as_ref().expect("上游响应应存在").status;
+                    if !status.is_success() {
+                        break;
+                    }
+                    continue;
                 }
-                continue;
+                // 二次仍失败:不提交 200,转 502 HTTP 错误交客户端整回合重试
+                let msg = match &first {
+                    Some(Ok(frame)) => initial_sse_error_message(frame),
+                    Some(Err(e)) => e.to_string(),
+                    None => "上游流在首帧前结束".to_string(),
+                };
+                return Err(AppError::with_status(
+                    axum::http::StatusCode::BAD_GATEWAY,
+                    format!("上游首帧失败: {msg}"),
+                ));
             }
-            let Some(first) = first else {
-                return Err(AppError::new(anyhow::anyhow!("上游流在首帧前结束")));
-            };
+            let first = first.expect("bad 为 false 时必有首帧");
             preloaded_stream = Some(prepend_sse_frame(first, out));
             break;
         }
@@ -1085,7 +1091,9 @@ impl PreparedMessageRequest {
     ) -> anyhow::Result<UpstreamResponse> {
         client
             .request(
-                &self.upstream_base_urls[0],
+                self.active_base_url
+                    .as_deref()
+                    .unwrap_or(&self.upstream_base_urls[0]),
                 &self.upstream_key,
                 self.route.protocol,
                 self.upstream_proxy.as_deref(),
@@ -1135,4 +1143,51 @@ pub async fn handle_messages(
         &effective_snapshot.runtime.user_agents,
     )
     .await
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use futures::stream;
+
+    fn frame(s: &str) -> Result<Bytes, std::io::Error> {
+        Ok(Bytes::from(s.to_string()))
+    }
+
+    fn pinned(frames: Vec<Result<Bytes, std::io::Error>>) -> SseStreamPin {
+        Box::pin(stream::iter(frames))
+    }
+
+    /// 多个心跳后到达 error 帧:心跳全部跳过,仍被首帧错误检测识别,message 可提取。
+    #[tokio::test]
+    async fn next_business_frame_returns_error_frame_after_keepalive() {
+        let mut out = pinned(vec![
+            frame(": keepalive\n\n"),
+            frame(": keepalive\n\n"),
+            frame(
+                "event: error\ndata: {\"type\":\"error\",\"error\":{\"type\":\"api_error\",\"message\":\"boom\"}}\n\n",
+            ),
+        ]);
+        let first = next_business_frame(&mut out).await.unwrap().unwrap();
+        assert!(is_initial_sse_error(&first));
+        assert_eq!(initial_sse_error_message(&first), "boom");
+    }
+
+    /// 只有心跳后 EOF:返回 None(触发重试/502 路径),不把心跳当首帧。
+    #[tokio::test]
+    async fn next_business_frame_keepalive_then_eof_is_none() {
+        let mut out = pinned(vec![frame(": keepalive\n\n")]);
+        assert!(next_business_frame(&mut out).await.is_none());
+    }
+
+    /// error 帧 data 非法 JSON 时回退原始文本,不 panic。
+    #[test]
+    fn initial_sse_error_message_falls_back_to_raw_text() {
+        let f = Bytes::from("event: error\ndata: not-json\n\n");
+        assert!(is_initial_sse_error(&f));
+        assert_eq!(
+            initial_sse_error_message(&f),
+            "event: error\ndata: not-json"
+        );
+    }
 }

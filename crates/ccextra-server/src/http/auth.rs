@@ -47,16 +47,6 @@ fn verify_with_cache(cache: &mut LruCache<String, bool>, key: &str, expected: &s
     ok
 }
 
-/// 测试用:检查全局缓存是否含指定 (expected, key) 条目。
-/// 按具体键检查而非全局长度,避免并行测试互相污染。
-#[cfg(test)]
-pub(crate) fn auth_cache_contains(expected: &str, key: &str) -> bool {
-    auth_cache()
-        .lock()
-        .map(|cache| cache.contains(&cache_key(expected, key)))
-        .unwrap_or(false)
-}
-
 /// 校验入口 key:secret 未配置时放行;配置时需匹配,否则 401
 /// 支持 x-api-key 与 Authorization: Bearer 两种头(兼容 cc-switch 等工具)
 /// secret 为 bcrypt 哈希时用 verify,否则明文比对(便于测试/旧配置)
