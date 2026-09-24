@@ -82,6 +82,7 @@ fn endpoint_path(protocol: Protocol, is_stream: bool) -> String {
                 "/v1internal:generateContent".to_string()
             }
         }
+        Protocol::Cursor => "/agent.v1.AgentService/Run".to_string(),
     }
 }
 

@@ -20,7 +20,7 @@ use ccextra_core::normalize::{
     normalize_anthropic_full, normalize_anthropic_pretransform, normalize_target_post, TargetShape,
 };
 use ccextra_core::prompt_cache::inject_prompt_cache_key;
-use ccextra_core::route::{resolve_route, Protocol, ProviderConfig};
+use ccextra_core::route::{resolve_route_with_body, Protocol, ProviderConfig};
 use ccextra_core::session::{extract_claude_code_session, extract_claude_code_thread};
 use futures::StreamExt;
 use globset::Glob;
@@ -281,7 +281,7 @@ pub(crate) async fn prepare_message_request(
 
     // 2. 路由决策(基于不可变配置快照,无须持锁)
     let providers = &config_snapshot.providers;
-    let route = resolve_route(&model, providers)?;
+    let route = resolve_route_with_body(&model, &body_json, providers)?;
     let payload_rules = &config_snapshot.payload_rules;
 
     // 3. 归一化第一遍(按协议:claude 直通全量 / openai 转换前精简)
@@ -434,6 +434,7 @@ pub(crate) async fn prepare_message_request(
                 }
             }
         }
+        Protocol::Cursor => {}
     }
 
     if matches!(
@@ -656,7 +657,9 @@ pub(crate) async fn prepare_message_request(
     let is_grok = is_grok_model(&outbound_model);
     let (session_id, thread_id) = if matches!(route.protocol, Protocol::OpenAiResponses) {
         (cc_session.as_deref(), extract_claude_code_thread(headers))
-    } else if is_grok && matches!(route.protocol, Protocol::OpenAiChat) {
+    } else if matches!(route.protocol, Protocol::Cursor)
+        || is_grok && matches!(route.protocol, Protocol::OpenAiChat)
+    {
         (cc_session.as_deref(), None)
     } else {
         (None, None)
@@ -1013,7 +1016,7 @@ pub(crate) async fn deliver_response(
                                 .pointer("/usageMetadata/promptTokenCount")
                                 .and_then(|t| t.as_i64())
                         }
-                        Protocol::Claude => None,
+                        Protocol::Claude | Protocol::Cursor => None,
                     };
                     if let Some(tokens) = input_tokens {
                         if tokens > 0 {
@@ -1025,7 +1028,7 @@ pub(crate) async fn deliver_response(
                     }
                 }
                 match prepared.route.protocol {
-                    Protocol::Claude => None,
+                    Protocol::Claude | Protocol::Cursor => None,
                     Protocol::OpenAiChat => crate::sse::non_stream::openai_chat_to_anthropic(&v),
                     Protocol::OpenAiResponses => crate::sse::non_stream::responses_to_anthropic(
                         &v,
@@ -1112,6 +1115,10 @@ pub async fn handle_messages(
 
     let mut prepared =
         prepare_message_request(&state, &headers, &bytes, &effective_snapshot).await?;
+
+    if prepared.route.protocol == Protocol::Cursor {
+        return crate::cursor::handler::handle_cursor(&state, &effective_snapshot, prepared).await;
+    }
 
     let executed = execute_upstream_request(
         &mut prepared,

@@ -27,6 +27,18 @@ pub struct Config {
     /// Codex 凭证目录(可选);默认配置文件旁 `.cache/codex`
     #[serde(default)]
     pub codex_auth_dir: Option<String>,
+    /// Cursor 凭证目录(可选);默认配置文件旁 `.cache/cursor`
+    #[serde(default)]
+    pub cursor_auth_dir: Option<String>,
+    /// Cursor API 地址(可选);默认 `https://api2.cursor.sh`
+    #[serde(default)]
+    pub cursor_base_url: Option<String>,
+    /// Cursor CLI client version(可选);使用内置默认值
+    #[serde(default)]
+    pub cursor_client_version: Option<String>,
+    /// `auto` 未被 Cursor 目录广告时的明确回退模型
+    #[serde(default)]
+    pub cursor_default_model: Option<String>,
     /// Antigravity 连接池配置(可选);默认短连接
     #[serde(default)]
     pub antigravity: Option<AntigravityConfig>,

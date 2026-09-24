@@ -2,6 +2,7 @@
 
 pub mod antigravity;
 pub mod codex;
+pub mod cursor;
 pub mod http;
 pub mod oauth;
 pub mod sse;

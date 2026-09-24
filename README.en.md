@@ -34,10 +34,10 @@ A single-process Rust proxy. Claude Code sends Anthropic Messages requests; ccex
 
 ## Key Features
 
-- **Route by model**: Five protocols share one endpoint. Configure client-facing aliases separately from upstream model names.
+- **Route by model**: Claude, OpenAI, Gemini, Antigravity, and Cursor share one endpoint. Client-facing aliases remain separate from upstream model names.
 - **Stable request content**: Normalize tools, schemas, and history to reduce incidental changes between turns. Actual cache hits depend on the upstream.
 - **Model adaptation**: Translate messages, tool calls, and images; adjust supported reasoning levels through `models.json`.
-- **OAuth providers**: Load and refresh Antigravity, xAI Grok, and Codex (OpenAI ChatGPT subscription) credentials with dynamic model routing.
+- **OAuth providers**: Load and refresh Antigravity, xAI Grok, Codex (OpenAI ChatGPT subscription), and Cursor credentials with dynamic model routing. Cursor uses a separate Connect-RPC Run path.
 - **Hot reload**: Publish configuration without restarting. In-flight requests keep their original snapshot.
 
 ## Architecture
@@ -49,6 +49,7 @@ flowchart LR
     P -->|openai_chat| B["Chat Completions"]
     P -->|openai_responses| C["Responses"]
     P -->|gemini / antigravity| D["Gemini GenerateContent"]
+    P -->|cursor| E["Connect-RPC Run"]
 ```
 
 One process listens on one port. Input is always Anthropic-shaped; every path returns Anthropic responses (including SSE). See [architecture](docs/design.md).
@@ -62,6 +63,7 @@ One process listens on one port. Input is always Anthropic-shaped; every path re
 | `openai_responses` | Responses | Map `instructions` and `input`; support reasoning replay and search domain filtering. |
 | `gemini` | Gemini GenerateContent | Translate content blocks, tool results, and schemas. |
 | `antigravity` | Cloud Code Assist | Wrap Gemini requests, adapt tool names and output limits; use short connections by default. |
+| `cursor` | Cursor AgentService/Run Connect-RPC | Single-credential OAuth, dynamic model catalog, bidirectional H2, Anthropic JSON/SSE mapping, and MCP continuation with a stable session. Live upstream compatibility remains unverified. |
 
 > **Note**: xAI Grok and Codex are automatically injected as `openai_responses` providers via OAuth without requiring a distinct protocol. Codex subscription requests carry the `Chatgpt-Account-Id` identity header automatically, and request bodies are zstd-compressed (matching codex CLI defaults).
 
@@ -142,7 +144,8 @@ See [config.example.yaml](config.example.yaml) for every field. Key points:
 - `secret_key` enables ingress authentication: plaintext keys become bcrypt hashes on load and are written back; requests accept `x-api-key` or `Authorization: Bearer`.
 - `payload` applies model-glob top-level overrides, optionally scoped by `protocol`.
 - `prompt_cache_key` applies only to OpenAI paths, uses Claude Code session ID, and never replaces a nonempty key.
-- `models_file` points at the reasoning-level table (default `models.json` next to the config; not tracked by git — copy [models.json.example](models.json.example) and edit as needed). Exact `id` match clamps inbound effort to the nearest supported level; missing file or unknown models leave effort unchanged. An entry may set `force_effort`: wherever clamping would apply, effort is rewritten to this fixed value (unclamped); native `*claude*` models and requests with thinking explicitly disabled are unaffected.
+- `models_file` points at the reasoning-level table (default `models.json` next to the config; not tracked by git — copy [models.json.example](models.json.example) and edit as needed). Exact `id` match clamps inbound effort to the nearest supported level; missing file or unknown models leave effort unchanged. An entry may set `force_effort`: wherever clamping would apply, effort is rewritten to this fixed value (unclamped); native `*claude*` models and requests with thinking explicitly disabled are unaffected. Cursor's dynamic catalog does not use `models_file`.
+- `cursor_auth_dir` defaults to `.cache/cursor` next to the config. `cursor_base_url` defaults to `https://api2.cursor.sh`; `cursor_client_version` defaults to `cli-2026.02.13-41ac335`. `cursor_default_model` specifies an advertised fallback only if the catalog does not advertise `auto`. Set these at the top level, not in `providers`; no static Cursor provider is needed.
 
 <details>
 <summary>Advanced options</summary>
@@ -194,12 +197,20 @@ Log in to an upstream or inspect saved credential status:
 ./ccextra xai-status
 ./ccextra codex-login
 ./ccextra codex-status
+./ccextra cursor-login
+./ccextra cursor-status
 ./scripts/check_antigravity_quota.sh
 ./scripts/check_grok_quota.sh
 ./scripts/check_codex_quota.sh
 ```
 
-Antigravity credentials default to `.cache/antigravity` beside the config file; xAI defaults to `.cache/xai`; Codex defaults to `.cache/codex`. xAI and Codex load at startup. Antigravity loads in the background and refreshes models every three hours. Codex login uses PKCE browser authorization (local callback port defaults to 1455, override with `--callback-port`); tokens refresh 24 hours ahead of expiry.
+Antigravity credentials default to `.cache/antigravity` next to the config; xAI uses `.cache/xai`, Codex `.cache/codex`, and Cursor `.cache/cursor`. xAI, Codex, and Cursor are discovered at startup; Cursor publishes models only after `GetUsableModels` succeeds. On a failed `/reload` discovery, it keeps the prior catalog only if the credential directory and account are unchanged; aliases from new static providers take priority. Background refresh failures keep the published catalog. Antigravity loads in the background and refreshes models every three hours. Codex login uses PKCE browser authorization (local callback port defaults to 1455, override with `--callback-port`); tokens refresh 24 hours ahead of expiry.
+
+Cursor login uses its own PKCE browser flow and polling; neither the Cursor IDE nor `cursor-agent` is required. Use `--no-browser` to open the login URL manually. Cursor tokens refresh 10 minutes ahead of expiry. Run uses a separate bidirectional HTTP/2 Connect-RPC path and maps text, thinking, and tool calls to Anthropic JSON/SSE. Local tests exist, but the implementation has not been validated against a live Cursor upstream; do not treat it as production-ready. Proxying a Cursor subscription may violate its terms of service and put the account at risk of suspension.
+
+With a stable Claude session ID, an MCP tool call keeps the upstream stream open; the next request matches text `tool_result` blocks by `tool_use_id`. All pending tool calls must have matching results. Idle streams expire after five minutes; raw checkpoints are bound to the credential and retained for 30 minutes. Without a stable session, or after the upstream stream expires, the full history and tool results are flattened into a new Run request. Image inputs, built-in exec tool execution, and Cursor CLI passthrough are unsupported; built-in tool requests receive a rejection.
+
+Cursor supports one credential. Run request DATA remains open; only a Connect JSON trailer with flags `0x02` ends the response, while premature EOF is an error. A 401 triggers one credential refresh and retry only before output; 429 is never retried. Server and transport errors back off within a three-second budget. Error responses forward `Retry-After` when supplied by the upstream.
 
 After editing configuration, or to reload credentials immediately:
 

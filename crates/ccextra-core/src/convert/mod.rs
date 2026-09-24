@@ -10,6 +10,7 @@ use thiserror::Error;
 
 pub mod antigravity;
 pub mod antigravity_tools;
+pub mod cursor;
 pub mod fix_json;
 pub mod gemini;
 pub mod gemini_response;

@@ -77,6 +77,9 @@ pub struct ReloadData {
     pub antigravity: Option<crate::upstream::AntigravityConfig>,
     pub user_agents: UserAgentSet,
     pub thinking_registry: Arc<Vec<ccextra_core::thinking::ModelCapability>>,
+    /// Cursor 目录拉取失败时为 true:仅在凭证目录和身份未变时携带旧 provider。
+    /// Ok(None) 表示配置主动移除,不携带。
+    pub cursor_load_failed: bool,
 }
 
 /// 当前生效配置的后台刷新输入，目录在 CLI 中解析为相对配置文件的路径。
@@ -85,6 +88,10 @@ pub struct ProviderRefreshConfig {
     pub auth_dir: Option<std::path::PathBuf>,
     pub xai_auth_dir: Option<std::path::PathBuf>,
     pub codex_auth_dir: Option<std::path::PathBuf>,
+    pub cursor_auth_dir: Option<std::path::PathBuf>,
+    pub cursor_base_url: Option<String>,
+    pub cursor_client_version: Option<String>,
+    pub cursor_default_model: Option<String>,
     pub proxy_url: Option<String>,
     pub static_providers: Vec<ProviderConfig>,
 }
@@ -111,6 +118,8 @@ pub struct AppState {
     /// reasoning replay 缓存(会话 → 上一轮 replay 项;responses+grok 用,
     /// 对齐 CPA xai reasoning replay;server 层持有,core 无 IO)
     pub replay_cache: crate::sse::replay_cache::ReplayCache,
+    /// Cursor 双向流会话和原始 checkpoint，由 server 运行时持有。
+    pub cursor_sessions: crate::cursor::session::CursorSessions,
     /// session_id → 最新 input_tokens(避免非 Claude 上游 count_tokens 估算不准导致 context 跳动)
     pub last_input_tokens: Arc<std::sync::Mutex<session_tokens::SessionTokenCache>>,
 }

@@ -76,6 +76,9 @@ impl From<RouteError> for AppError {
         match err {
             RouteError::ModelNotFound(_) => Self::not_found(err.to_string()),
             RouteError::AliasConflict(_) => Self::new(err),
+            RouteError::VariantUnavailable(_) | RouteError::InvalidOption(_) => {
+                Self::bad_request(err.to_string())
+            }
         }
     }
 }

@@ -71,6 +71,18 @@ Anthropic `system` 成为 system message；o 系列（`o1-mini`/`o1-preview` 除
 
 两条路径共享 Gemini `contents`、`parts`、`functionCall` 和 `functionResponse` 模型，剥离 Claude system triggers。Antigravity 另外将 system 块开头的 Claude Agent SDK/Claude Code 身份句改为 `You are an AI agent.`，保留句后指令；Gemini 直连不做此改写。工具 schema 会清理本地引用和不支持关键字（含 `additionalItems`/`unevaluated*`/`contentSchema`），布尔 `true` 子 schema 归一化为空对象；Gemini 直连的 `parametersJsonSchema` 保留 `additionalProperties` 与 `pattern`/`minLength` 等标准约束，Antigravity 仍搬入 description 提示。任一工具带 `strict: true` 且 tool_choice 为 auto/缺省时，Gemini 直连使用 `VALIDATED` 工具模式（Antigravity 的 `VALIDATED` 仅由 Claude 模型触发）。规范化 `responseJsonSchema` 为 `responseSchema`；工具结果强制字符串化为 `response.result`；user turn 尾部文本重排至 `functionResponse` 前。Gemini 使用 API key 和 Google 端点。Antigravity 额外套 `model`、`request`、`project`、`requestId` 等信封；Claude 模型使用 `VALIDATED` 工具模式，冲突工具名加 `external_` 前缀；`gemini-3.5-flash-lite` 限制 `max_completion_tokens` 上限为 65535。
 
+### Cursor
+
+Cursor 不是 `openai_responses` provider，而是独立 `cursor` 协议。`cursor-login` 生成 PKCE verifier/challenge 并轮询 `api2.cursor.sh/auth/poll`，保存单份 `cursor.json`；到期前 10 分钟通过 refresh token 换取新 access token。启动与 `/reload` 向 `GetUsableModels` 发送空的原始 protobuf 请求，成功后才发布动态 provider。目录失败时首次不发布；`/reload` 失败时仅原凭证目录和账号不变才携带旧目录，新静态模型别名优先；后台刷新失败保留已发布目录。`cursor_auth_dir`（默认配置文件旁 `.cache/cursor`）、`cursor_base_url`（默认 `https://api2.cursor.sh`）、`cursor_client_version`（默认 `cli-2026.02.13-41ac335`）、`cursor_default_model` 均为顶层配置。
+
+已实现纯逻辑的 family/variant 解析：精确 alias/name 优先；family 只选择模型目录已广告的 variant，支持 effort、thinking、fast；`-extra-high` 归一为 `xhigh`。目录没有 `auto` 时只能退回显式配置且已广告的 `cursor_default_model`。不使用 `models.json` 为 Cursor 猜测模型或 effort。请求转换将无 checkpoint 的历史和 system 摊平进 UserText；工具声明的 `input_schema` 编码为 protobuf `Value`。checkpoint 路径保持原始 bytes，避免丢失未知字段。
+
+Run 已接入独立双向 HTTP/2 Connect-RPC：请求 HEADERS/DATA 不半关，5 秒发送上游心跳；仅 flags `0x02` 的 JSON trailer 表示响应结束，提前 EOF 为错误。raw-wire 解码保留同帧多个顶层事件，KV、RequestContext 和内置 exec 在同一 H2 stream 回帧（内置工具统一拒绝）。文本、思考、token 与 MCP 调用映射为 Anthropic JSON/SSE，流式响应空闲时发送 10 秒 `: keepalive`。401 只在客户端无输出时刷新并重试一次；429 快速失败，5xx/传输错误共享 3 秒退避预算；错误响应透传可用的 `Retry-After`。
+
+有稳定会话 ID 时，`conversation_id` 绑定凭证身份；MCP 工具边界先结束 Anthropic 响应，驻留上游 H2 stream，下一轮按 `tool_call_id` 精确匹配所有文本工具结果，并使用保存的 `exec_msg_id` 与 `exec_id` 回帧。驻留会话闲置 5 分钟过期；checkpoint 原始 protobuf bytes 和 blob store 绑定凭证与 owner generation，保留 30 分钟，旧 owner 不得覆盖新状态。没有稳定会话、驻留流失效或凭证更换时不跨请求续接，冷路径将完整历史与工具结果展平为新请求。图片输入、内置 exec 执行、Cursor CLI passthrough 和多账号不在范围内。
+
+以上是当前代码路径与本地测试范围；尚未对真实 Cursor 上游验收。特别是 RequestContextResult 重新声明 MCP 工具的行为对齐 CLIProxyAPIPlus，OmniRoute 使用空 ack，真实服务兼容性仍需验证。
+
 ### 各协议 System 提示词清洗差异矩阵
 
 | 目标协议 / 模型 | 计费归属指纹 (`x-anthropic-billing-header`) | Claude 身份声明与品牌块 (`<identity>`) | 行为策略与冗长触发块 (`<rules>` / `<response_style>` 等) | 简洁样式触发块 (`# Output Style:` / `# Concise Style Active`) | 白名单段落 (`# Memory` / `# Environment` / `# Language` / CLAUDE.md) | 目标承载位置与行为适配块 |

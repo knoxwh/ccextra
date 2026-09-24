@@ -17,12 +17,19 @@ hex.workspace = true
 base64.workspace = true
 globset.workspace = true
 tracing.workspace = true
+prost.workspace = true
+prost-types.workspace = true
+flate2.workspace = true
 
 # cache_stabilization 与 session 依赖
 md-5 = "0.10"
 lru = "0.12"
 regex = "1"
 http = "1"
+
+[build-dependencies]
+prost-build.workspace = true
+protoc-bin-vendored.workspace = true
 
 [dev-dependencies]
 tracing-subscriber = { version = "0.3", default-features = false, features = ["fmt", "ansi"] }

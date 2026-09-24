@@ -37,6 +37,13 @@ futures = "0.3"
 bytes = "1.5"
 zstd = "0.13"
 
+# Cursor protobuf
+prost = "0.13"
+prost-types = "0.13"
+prost-build = "0.13"
+protoc-bin-vendored = "3"
+flate2 = "1"
+
 # Error handling
 anyhow = "1.0"
 thiserror = "2.0"

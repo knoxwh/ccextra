@@ -303,6 +303,7 @@ fn mock_state() -> AppState {
             std::time::Duration::from_secs(3600),
             1024,
         ),
+        cursor_sessions: crate::cursor::session::CursorSessions::default(),
         last_input_tokens: Arc::new(std::sync::Mutex::new(
             crate::http::session_tokens::SessionTokenCache::new(),
         )),
@@ -1256,6 +1257,7 @@ fn reload_returning_secret(secret: Option<String>) -> ReloadFn {
                 antigravity: None,
                 user_agents: test_user_agents(),
                 thinking_registry: Arc::new(vec![]),
+                cursor_load_failed: false,
             })
         })
     })
@@ -1299,6 +1301,187 @@ async fn test_reload_applies_new_secret() {
         .body(Body::empty())
         .unwrap();
     assert_eq!(app.oneshot(ok).await.unwrap().status(), StatusCode::OK);
+}
+
+async fn cursor_reload_state() -> (
+    AppState,
+    tempfile::TempDir,
+    crate::cursor::credential::CursorCredential,
+) {
+    let state = mock_state();
+    let dir = tempfile::tempdir().unwrap();
+    let credential = crate::cursor::credential::CursorCredential {
+        access_token: "sk-cursor".into(),
+        refresh_token: "refresh-cursor".into(),
+        sub: "account-a".into(),
+        expires_at: Some(i64::MAX),
+    };
+    crate::cursor::store::save(dir.path(), &credential).unwrap();
+    let cursor = serde_yaml::from_str::<ProviderConfig>(
+        "name: cursor\nprotocol: cursor\nbase_url: \"https://api2.cursor.sh\"\nkey: sk-cursor\nmodels:\n  - name: composer-2\n    alias: cursor-composer\n  - name: composer-fast\n    alias: cursor-fast\n",
+    )
+    .unwrap()
+    .with_metadata(
+        [
+            (
+                "credential_id".to_string(),
+                crate::cursor::provider::credential_fingerprint(&credential),
+            ),
+            ("auth_dir".to_string(), dir.path().to_string_lossy().into()),
+        ]
+        .into(),
+    );
+    Arc::make_mut(&mut *state.config.write().await)
+        .providers
+        .push(cursor);
+    (state, dir, credential)
+}
+
+fn failed_cursor_reload(auth_dir: std::path::PathBuf, providers: Vec<ProviderConfig>) -> ReloadFn {
+    Arc::new(move || {
+        let auth_dir = auth_dir.clone();
+        let providers = providers.clone();
+        Box::pin(async move {
+            Ok(ReloadData {
+                refresh: ProviderRefreshConfig {
+                    cursor_auth_dir: Some(auth_dir),
+                    ..Default::default()
+                },
+                providers,
+                payload_rules: vec![],
+                normalize: NormalizeConfig {
+                    enabled: false,
+                    drift_detector: false,
+                },
+                logging: LoggingConfig {
+                    level: "info".into(),
+                    request_body: false,
+                },
+                secret: None,
+                proxy_url: None,
+                antigravity: None,
+                user_agents: test_user_agents(),
+                thinking_registry: Arc::new(vec![]),
+                cursor_load_failed: true,
+            })
+        })
+    })
+}
+
+/// Cursor 目录拉取失败且凭证未变时保留旧目录;主动移除时不携带。
+#[tokio::test]
+async fn test_reload_carries_cursor_provider_on_fetch_failure() {
+    let (mut state, dir, credential) = cursor_reload_state().await;
+    state.reload = failed_cursor_reload(dir.path().to_path_buf(), vec![]);
+    let router = app(state.clone());
+    let reload = Request::builder()
+        .uri("/reload")
+        .method("POST")
+        .body(Body::empty())
+        .unwrap();
+    let resp = router.clone().oneshot(reload).await.unwrap();
+    assert_eq!(
+        resp.status(),
+        StatusCode::OK,
+        "Cursor 拉取失败不应阻断 reload"
+    );
+    {
+        let cfg = state.config.read().await;
+        let carried = cfg
+            .providers
+            .iter()
+            .find(|p| p.protocol == Protocol::Cursor)
+            .expect("应携带旧 Cursor provider");
+        assert_eq!(
+            carried.metadata.as_ref().unwrap()["credential_id"],
+            crate::cursor::provider::credential_fingerprint(&credential)
+        );
+    }
+
+    // 主动移除:标志 false 且新数据无 Cursor,不携带。
+    state.reload = reload_returning_secret(None);
+    let reload = Request::builder()
+        .uri("/reload")
+        .method("POST")
+        .body(Body::empty())
+        .unwrap();
+    let resp = app(state.clone()).oneshot(reload).await.unwrap();
+    assert_eq!(resp.status(), StatusCode::OK);
+    let cfg = state.config.read().await;
+    assert!(
+        cfg.providers.iter().all(|p| p.protocol != Protocol::Cursor),
+        "配置主动移除 Cursor 时不应携带"
+    );
+}
+
+#[tokio::test]
+async fn test_reload_prioritizes_static_alias_when_cursor_fetch_fails() {
+    let (mut state, dir, credential) = cursor_reload_state().await;
+    let replacement = serde_yaml::from_str::<ProviderConfig>(
+        "name: replacement\nprotocol: claude\nbase_url: \"https://example.com\"\nkey: sk-replacement\nmodels:\n  - name: custom\n    alias: cursor-composer\n",
+    )
+    .unwrap();
+    state.reload = failed_cursor_reload(dir.path().to_path_buf(), vec![replacement]);
+    let reload = Request::builder()
+        .uri("/reload")
+        .method("POST")
+        .body(Body::empty())
+        .unwrap();
+    assert_eq!(
+        app(state.clone()).oneshot(reload).await.unwrap().status(),
+        StatusCode::OK
+    );
+    let snapshot = state.config.read().await;
+    assert_eq!(snapshot.providers[0].models[0].alias, "cursor-composer");
+    let cursor = snapshot
+        .providers
+        .iter()
+        .find(|provider| provider.protocol == Protocol::Cursor)
+        .unwrap();
+    assert_eq!(cursor.models.len(), 1);
+    assert_eq!(cursor.models[0].alias, "cursor-fast");
+    assert_eq!(
+        cursor.metadata.as_ref().unwrap()["credential_id"],
+        crate::cursor::provider::credential_fingerprint(&credential)
+    );
+}
+
+#[tokio::test]
+async fn test_reload_drops_old_cursor_if_credential_or_dir_changes() {
+    for change_dir in [false, true] {
+        let (mut state, old_dir, mut credential) = cursor_reload_state().await;
+        let old_identity = crate::cursor::provider::credential_fingerprint(&credential);
+        let generation = state.cursor_sessions.begin("conv", &old_identity);
+        let cancelled = state
+            .cursor_sessions
+            .cancellation("conv", &old_identity, generation)
+            .unwrap();
+        let new_dir = tempfile::tempdir().unwrap();
+        let auth_dir = if change_dir {
+            crate::cursor::store::save(new_dir.path(), &credential).unwrap();
+            new_dir.path().to_path_buf()
+        } else {
+            credential.sub = "account-b".into();
+            crate::cursor::store::save(old_dir.path(), &credential).unwrap();
+            old_dir.path().to_path_buf()
+        };
+        state.reload = failed_cursor_reload(auth_dir, vec![]);
+        let reload = Request::builder()
+            .uri("/reload")
+            .method("POST")
+            .body(Body::empty())
+            .unwrap();
+        let response = app(state.clone()).oneshot(reload).await.unwrap();
+        assert_eq!(response.status(), StatusCode::OK);
+        assert!(state
+            .config
+            .read()
+            .await
+            .providers
+            .iter()
+            .all(|provider| provider.protocol != Protocol::Cursor));
+        assert!(*cancelled.borrow());
+    }
 }
 
 /// /reload 清空 bcrypt 校验缓存:旧 secret 的 hash 命中过缓存后,
@@ -1377,6 +1560,7 @@ async fn test_reload_applies_normalize_and_proxy() {
                 antigravity: None,
                 user_agents: test_user_agents(),
                 thinking_registry: Arc::new(vec![]),
+                cursor_load_failed: false,
             })
         })
     });
