@@ -79,7 +79,7 @@ pub async fn handle_count_tokens(
 
         let status = resp.status();
         if status.is_success() {
-            // 成功 body 有界读取:16 MiB 上限 + 120s idle;
+            // 成功 body 有界读取:16 MiB 上限 + 180s idle;
             // 超限 502、停顿 504(Anthropic api_error),传输错误维持 500
             let body_bytes = crate::limits::read_success_body_or_anthropic(resp).await?;
             return Response::builder()
@@ -89,7 +89,7 @@ pub async fn handle_count_tokens(
                 .map_err(|e| AppError::new(anyhow::anyhow!("构造响应失败: {e}")));
         }
 
-        // 错误 body 有界读取(256 KiB + 120s idle):截断或读取失败保留已知
+        // 错误 body 有界读取(256 KiB + 180s idle):截断或读取失败保留已知
         // 上游状态(429/401 等不被改成 502/504/500),生成有界 Anthropic error;
         // 未截断的错误 body 按原语义原样转发
         let (body_bytes, truncated) =

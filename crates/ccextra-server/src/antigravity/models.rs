@@ -69,7 +69,7 @@ pub(crate) async fn fetch_models_from(
                 continue;
             }
 
-            // 有界读取:成功 16 MiB + 120s idle;读取/超限失败按原语义 continue
+            // 有界读取:成功 16 MiB + 180s idle;读取/超限失败按原语义 continue
             let bytes = match crate::limits::read_success_body(resp).await {
                 Ok(b) => b,
                 Err(e) => {

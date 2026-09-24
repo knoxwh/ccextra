@@ -87,9 +87,9 @@ Anthropic `system` 成为 system message；o 系列（`o1-mini`/`o1-preview` 除
 
 ## 传输与可靠性
 
-`UpstreamClient` 按最终代理地址缓存 `reqwest::Client`。请求使用协议对应 URL、认证和 User-Agent：Gemini 使用 `x-goog-api-key`，其他协议使用 Bearer；Responses 的 GPT 请求带 Codex 会话头，Grok 请求带 CLI 身份头和会话亲和 `x-grok-conv-id`。连接池空闲 90s（对齐 grok；流 chunk idle 为服务当前设置 120s，不是池寿命）。`send()` 等到响应头最多 60s。流式路径在转换前对上游 `stream.next()` 套 120s chunk idle，超时发 Anthropic error，不套 `Client::timeout` 掐整条 SSE。复用连接死亡（reset/broken pipe/提前关闭）立刻重试一次，不计入 3 秒预算；普通建连失败/建连超时不属于死连接，交给 URL 回退与退避预算，避免单 URL 建连超时被内部重试放大。`build()` 失败返回错误，不回落到默认 Client。
+`UpstreamClient` 按最终代理地址缓存 `reqwest::Client`。请求使用协议对应 URL、认证和 User-Agent：Gemini 使用 `x-goog-api-key`，其他协议使用 Bearer；Responses 的 GPT 请求带 Codex 会话头，Grok 请求带 CLI 身份头和会话亲和 `x-grok-conv-id`。连接池空闲 90s（对齐 grok；流 chunk idle 为服务当前设置 180s，不是池寿命）。`send()` 等到响应头最多 60s。流式路径在转换前对上游 `stream.next()` 套 180s chunk idle，超时发 Anthropic error，不套 `Client::timeout` 掐整条 SSE。复用连接死亡（reset/broken pipe/提前关闭）立刻重试一次，不计入 3 秒预算；普通建连失败/建连超时不属于死连接，交给 URL 回退与退避预算，避免单 URL 建连超时被内部重试放大。`build()` 失败返回错误，不回落到默认 Client。
 
-非流响应 body 有界读取：成功 body 上限 16 MiB（恰好上限可读，多 1 字节拒绝），错误 body 最多保留 256 KiB（超出停止读取并标记截断，截断前缀不当作完整 JSON 解析）；读取停顿与流 chunk idle 共用 120s，每次非空数据后重置，空 chunk 不续期。成功 body 超限返回 502、停顿返回 504（Anthropic `api_error`）；错误 body 截断或读取失败保留已知上游状态（429/401 不被改写），生成有界 Anthropic error，不重新获得重试预算。OAuth/project/model 路径同样有界，保留各自 30s 请求总超时。
+非流响应 body 有界读取：成功 body 上限 16 MiB（恰好上限可读，多 1 字节拒绝），错误 body 最多保留 256 KiB（超出停止读取并标记截断，截断前缀不当作完整 JSON 解析）；读取停顿与流 chunk idle 共用 180s，每次非空数据后重置，空 chunk 不续期。成功 body 超限返回 502、停顿返回 504（Anthropic `api_error`）；错误 body 截断或读取失败保留已知上游状态（429/401 不被改写），生成有界 Anthropic error，不重新获得重试预算。OAuth/project/model 路径同样有界，保留各自 30s 请求总超时。
 
 网络错误、5xx 和 Cloudflare 52x 可重试。退避从 300ms 开始，单次最多 1.5 秒，所有重试共享 3 秒预算；`Retry-After` 只在该预算内生效。429 不进退避重试（对齐 codex 传输层 `retry_429: false`）：限流窗口远超预算，快速失败并把上游 `Retry-After` 头透传给客户端，由客户端按声明退避；多 `base_url` 回退不受影响。流式 OpenAI 请求声明 `Accept: text/event-stream` 和 `Cache-Control: no-cache`。
 
@@ -97,7 +97,7 @@ Anthropic `system` 成为 system message；o 系列（`o1-mini`/`o1-preview` 除
 
 Claude 响应字节直通。OpenAI Chat、OpenAI Responses、Gemini 和 Antigravity 分别由状态机转换为 Anthropic SSE。状态机维护 content block、thinking、工具调用、usage（含 `output_tokens_details.reasoning_tokens`）和终态，避免上游事件交错破坏 Anthropic 事件顺序。Chat 状态机在工具块未关闭前缓存交错文本与思考并在 finalize 时按序输出。Responses 上游未输出 `output_text.delta` 时从 `response.completed` 恢复 terminal 文本；0 token 的 `response.incomplete` 会直接抛出错误。Gemini 保持活跃思考块跨空文本片段不中断。
 
-OpenAI 首帧错误允许重试一次；已输出首帧后的错误、未满足终态的 EOF、空 Gemini 风格流、读取错误和上游 120s chunk idle 产生结构化 Anthropic error，而不是裸断开。终态事件（含 `message_stop`）完整下发后立即结束流并关闭上游连接，不等上游 EOF（上游在 keep-alive/HTTP2 复用连接上可能拖延关流）。每条流式路径统一包裹 10 秒空闲心跳 `: keepalive\n\n`。非流 Claude 直通；其他路径转换为 Anthropic JSON，无法转换时保留上游原始 body。
+OpenAI 首帧错误允许重试一次；已输出首帧后的错误、未满足终态的 EOF、空 Gemini 风格流、读取错误和上游 180s chunk idle 产生结构化 Anthropic error，而不是裸断开。终态事件（含 `message_stop`）完整下发后立即结束流并关闭上游连接，不等上游 EOF（上游在 keep-alive/HTTP2 复用连接上可能拖延关流）。每条流式路径统一包裹 10 秒空闲心跳 `: keepalive\n\n`。非流 Claude 直通；其他路径转换为 Anthropic JSON，无法转换时保留上游原始 body。
 
 ## 会话、缓存与 reasoning
 

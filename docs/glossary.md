@@ -89,7 +89,7 @@ OpenAI Chat 或 Responses 的 provider 级缓存桶标识。来自 Claude Code �
 网络错误、429、5xx 和 52x 可重试的总等待窗口。当前总预算为 3 秒，初始退避为 300ms，单次最多 1.5 秒。
 
 **有界读取**
-非流响应 body 的统一读取边界：成功 body 16 MiB（恰好上限可读，多 1 字节拒绝），错误 body 256 KiB（超出停止读取并标记截断，截断前缀不当作完整 JSON 解析）；读取停顿与流 chunk idle 共用 120s，每次非空数据后重置。成功 body 超限返回 502、停顿返回 504；错误 body 截断或读取失败保留上游状态码（429/401 不被改写）；OAuth/project/model 保留各自 30s 请求总超时。
+非流响应 body 的统一读取边界：成功 body 16 MiB（恰好上限可读，多 1 字节拒绝），错误 body 256 KiB（超出停止读取并标记截断，截断前缀不当作完整 JSON 解析）；读取停顿与流 chunk idle 共用 180s，每次非空数据后重置。成功 body 超限返回 502、停顿返回 504；错误 body 截断或读取失败保留上游状态码（429/401 不被改写）；OAuth/project/model 保留各自 30s 请求总超时。
 
 **死连接**
 复用池中已失效的连接（reset/broken pipe/提前关闭）。立刻重试一次，不计入 3 秒预算；普通建连失败/建连超时不属于死连接，交给 URL 回退与退避预算。
@@ -98,7 +98,7 @@ OpenAI Chat 或 Responses 的 provider 级缓存桶标识。来自 Claude Code �
 将 OpenAI 或 Gemini 风格 SSE 转成 Anthropic `message_start`、content block、delta 和终态事件的状态机。终态后忽略后续上游事件。
 
 **keepalive**
-流式输出空闲 10 秒后发送的 `: keepalive\n\n` SSE 注释，防止中间网络层关闭空闲连接。上游流本身另有 120s chunk idle（当前服务设置）；超时发 Anthropic error，不是心跳。
+流式输出空闲 10 秒后发送的 `: keepalive\n\n` SSE 注释，防止中间网络层关闭空闲连接。上游流本身另有 180s chunk idle（当前服务设置）；超时发 Anthropic error，不是心跳。
 
 **reasoning replay**
 Responses 上游不保留完整会话时，服务端按模型和会话保存兼容 reasoning 回合，并在下一请求锚定插入。仅可安全回放的内容会进入请求。

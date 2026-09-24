@@ -12,7 +12,7 @@ use reqwest::Client;
 use serde::Deserialize;
 
 /// 连接池空闲淘汰(对齐 grok `GROK_POOL_IDLE_TIMEOUT_SECS` 默认 90s)。
-/// 当前服务流 chunk idle 为 120s,不是池寿命。
+/// 当前服务流 chunk idle 为 180s,不是池寿命。
 const POOL_IDLE_TIMEOUT: Duration = Duration::from_secs(90);
 const CONNECT_TIMEOUT: Duration = Duration::from_secs(10);
 /// send() 上限(等到响应头)。60s:上游收连不回头时快速失败交客户端退避;
@@ -366,7 +366,7 @@ impl UpstreamClient {
         let mut builder = Client::builder()
             // 限制单个 host 最大空闲连接数，防毒化池
             .pool_max_idle_per_host(4)
-            // 池空闲 90s(对齐 grok);流 chunk idle 为服务当前设置 120s,不是池寿命。
+            // 池空闲 90s(对齐 grok);流 chunk idle 为服务当前设置 180s,不是池寿命。
             .pool_idle_timeout(POOL_IDLE_TIMEOUT)
             // 建连超时 10s，防 DNS/TLS 握手卡死
             .connect_timeout(CONNECT_TIMEOUT)

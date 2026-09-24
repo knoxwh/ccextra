@@ -275,7 +275,7 @@ mod tests {
         assert!(matches!(err, BodyReadError::Idle));
     }
 
-    /// 空 chunk 不续期:100s 时收到空 chunk,deadline 仍从起点算(120s 而非 220s)
+    /// 空 chunk 不续期:100s 时收到空 chunk,deadline 仍从起点算(180s 而非 280s)
     #[tokio::test(start_paused = true)]
     async fn empty_chunk_does_not_renew_idle_deadline() {
         let stream = futures::stream::unfold((), |()| async {
@@ -290,7 +290,7 @@ mod tests {
         assert!(matches!(err, BodyReadError::Idle));
         let elapsed = start.elapsed();
         assert!(
-            elapsed < std::time::Duration::from_secs(150),
+            elapsed < std::time::Duration::from_secs(210),
             "空 chunk 不得续期(实际 {elapsed:?})"
         );
     }

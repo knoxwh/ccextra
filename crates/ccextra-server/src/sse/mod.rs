@@ -37,10 +37,10 @@ pub type SseStreamPin = Pin<Box<dyn Stream<Item = Result<Bytes, io::Error>> + Se
 /// eventsource 解析层直接忽略,不进入客户端事件流,任何协议下游都可见字节。
 const KEEPALIVE_INTERVAL: Duration = Duration::from_secs(10);
 const KEEPALIVE_FRAME: &str = ": keepalive\n\n";
-/// 上游流 chunk 空闲上限(当前默认 120s)。
+/// 上游流 chunk 空闲上限(当前默认 180s)。
 /// 必须包在转换前的上游 stream.next(),不能包 keepalive 之后。
-pub(crate) const STREAM_IDLE_TIMEOUT: Duration = Duration::from_secs(120);
-pub(crate) const STREAM_IDLE_MESSAGE: &str = "upstream stream idle timeout (120s)";
+pub(crate) const STREAM_IDLE_TIMEOUT: Duration = Duration::from_secs(180);
+pub(crate) const STREAM_IDLE_MESSAGE: &str = "upstream stream idle timeout (180s)";
 
 /// 等到下一上游 chunk;超时返回 Idle。
 pub(crate) async fn next_upstream_chunk<S>(
@@ -273,19 +273,19 @@ mod tests {
     }
 
     #[tokio::test(start_paused = true)]
-    async fn upstream_chunk_idle_timeout_is_two_minutes() {
+    async fn upstream_chunk_idle_timeout_is_three_minutes() {
         let mut stream = Box::pin(futures::stream::pending::<Result<Bytes, reqwest::Error>>());
         let pending = next_upstream_chunk(&mut stream);
         tokio::pin!(pending);
 
         tokio::select! {
             result = &mut pending => panic!("上游 chunk 提前结束: {result:?}"),
-            _ = tokio::time::sleep(Duration::from_secs(119)) => {}
+            _ = tokio::time::sleep(Duration::from_secs(179)) => {}
         }
         tokio::time::advance(Duration::from_secs(1)).await;
         assert!(matches!(
             pending.await,
-            Err("upstream stream idle timeout (120s)")
+            Err("upstream stream idle timeout (180s)")
         ));
     }
 
