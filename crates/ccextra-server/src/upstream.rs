@@ -12,11 +12,11 @@ use reqwest::Client;
 use serde::Deserialize;
 
 /// 连接池空闲淘汰(对齐 grok `GROK_POOL_IDLE_TIMEOUT_SECS` 默认 90s)。
-/// 300s 是 grok/codex 的**流 chunk 空闲**，不是池寿命。
+/// 当前服务流 chunk idle 为 120s,不是池寿命。
 const POOL_IDLE_TIMEOUT: Duration = Duration::from_secs(90);
 const CONNECT_TIMEOUT: Duration = Duration::from_secs(10);
-/// send() 上限(等到响应头)。60s:上游收连不回头时快速失败交客户端退避,
-/// 不让单请求占满 5 分钟;流式之后的 chunk idle 走 STREAM_IDLE_TIMEOUT。
+/// send() 上限(等到响应头)。60s:上游收连不回头时快速失败交客户端退避;
+/// 流式之后的 chunk idle 走 STREAM_IDLE_TIMEOUT。
 /// 无 Client::timeout,避免掐整条 SSE。
 const SEND_TIMEOUT: Duration = Duration::from_secs(60);
 
@@ -366,7 +366,7 @@ impl UpstreamClient {
         let mut builder = Client::builder()
             // 限制单个 host 最大空闲连接数，防毒化池
             .pool_max_idle_per_host(4)
-            // 池空闲 90s(对齐 grok);300s 是流 chunk idle，不是池寿命。
+            // 池空闲 90s(对齐 grok);流 chunk idle 为服务当前设置 120s,不是池寿命。
             .pool_idle_timeout(POOL_IDLE_TIMEOUT)
             // 建连超时 10s，防 DNS/TLS 握手卡死
             .connect_timeout(CONNECT_TIMEOUT)
@@ -599,7 +599,7 @@ pub(crate) async fn send_with_timeout(
 }
 
 /// 连接失效:立即额外尝试一次,不耗 3s 重试预算。
-/// send() 的 300s 超时不走这里,避免再挂 300s。
+/// send() 超时不走这里,避免重复等待。
 /// 普通建连失败/建连超时不是死连接:不得进入内部快速重试(否则单 URL
 /// 建连超时被放大成约 20s),交给外层 URL fallback 与退避预算。
 fn is_stale_connection(err: &anyhow::Error) -> bool {
@@ -942,8 +942,8 @@ mod tests {
         )));
         assert!(is_stale_connection(&anyhow::anyhow!("Broken pipe")));
         assert!(
-            !is_stale_connection(&anyhow::anyhow!("上游请求超时 (300s)")),
-            "send 超时不得立刻再挂 300s"
+            !is_stale_connection(&anyhow::anyhow!("上游请求超时 (60s)")),
+            "send 超时不得进入死连接重试"
         );
         assert!(!is_stale_connection(&anyhow::anyhow!("invalid api key")));
     }
