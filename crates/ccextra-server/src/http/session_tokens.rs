@@ -6,6 +6,61 @@ const TTL: Duration = Duration::from_secs(30 * 60);
 
 type Entry = (usize, Instant, u64);
 
+pub(crate) type TokenCacheScope = (std::sync::Arc<std::sync::Mutex<SessionTokenCache>>, String);
+
+/// 从上游原始 SSE 提取真实输入用量，不把转换后的占位值写回缓存。
+pub(crate) fn tap_input_tokens<S>(
+    stream: S,
+    protocol: ccextra_core::route::Protocol,
+    scope: Option<TokenCacheScope>,
+) -> impl futures::Stream<Item = Result<bytes::Bytes, reqwest::Error>> + Send
+where
+    S: futures::Stream<Item = Result<bytes::Bytes, reqwest::Error>> + Send,
+{
+    use ccextra_core::route::Protocol;
+    use futures::StreamExt;
+    let mut parser = crate::sse::parser::SseParser::new();
+    async_stream::stream! {
+        futures::pin_mut!(stream);
+        loop {
+            let chunk = stream.next().await;
+            if let Some((cache, session)) = scope.as_ref() {
+                let events = match &chunk {
+                    Some(Ok(bytes)) => parser.push(bytes),
+                    None => parser.finish(),
+                    Some(Err(_)) => Vec::new(),
+                };
+                for event in events {
+                    let Ok(value) = serde_json::from_str::<serde_json::Value>(&event.data) else {
+                        continue;
+                    };
+                    let tokens = match protocol {
+                        Protocol::OpenAiChat => value.pointer("/usage/prompt_tokens")
+                            .or_else(|| value.pointer("/choices/0/usage/prompt_tokens")),
+                        Protocol::OpenAiResponses => value.pointer("/response/usage/input_tokens"),
+                        Protocol::Gemini | Protocol::Antigravity => value.pointer("/response/usageMetadata/promptTokenCount")
+                            .or_else(|| value.pointer("/response/cpaUsageMetadata/promptTokenCount"))
+                            .or_else(|| value.pointer("/usageMetadata/promptTokenCount"))
+                            .or_else(|| value.pointer("/cpaUsageMetadata/promptTokenCount")),
+                        Protocol::Claude | Protocol::Cursor => None,
+                    }.and_then(serde_json::Value::as_u64)
+                        .and_then(|tokens| usize::try_from(tokens).ok())
+                        .filter(|tokens| *tokens > 0);
+                    if let Some(tokens) = tokens {
+                        if let Ok(mut cache) = cache.lock() {
+                            cache.insert(session.clone(), tokens);
+                        }
+                    }
+                }
+            }
+            match chunk {
+                Some(chunk) => yield chunk,
+                None => break,
+            }
+        }
+    }
+}
+
 pub struct SessionTokenCache {
     entries: HashMap<String, Entry>,
     next_sequence: u64,

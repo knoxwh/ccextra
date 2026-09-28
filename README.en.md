@@ -164,7 +164,7 @@ See [config.example.yaml](config.example.yaml) for every field. Key points:
 | Method & Endpoint | Auth Required* | Description |
 | :--- | :--- | :--- |
 | `POST /v1/messages` | Required* | Accept Anthropic Messages and return JSON or SSE. |
-| `POST /v1/messages/count_tokens` | Required* | Forward Claude counting upstream; use session records for other protocols, returning 0 on a miss. |
+| `POST /v1/messages/count_tokens` | Required* | Forward Claude counting upstream; use session records for other protocols, returning 0 on a miss. Real streaming input usage from Chat/Responses/Gemini/Antigravity also updates these records; missing or zero values preserve the previous value. |
 | `GET /v1/models` | Required* | List available models in Anthropic format. |
 | `GET /health` | Public | Return `ok`; does not check upstream availability. |
 | `POST /reload` | Public | Load, validate, and publish configuration without restarting. |
@@ -208,7 +208,9 @@ Antigravity credentials default to `.cache/antigravity` next to the config; xAI 
 
 Cursor login uses its own PKCE browser flow and polling; neither the Cursor IDE nor `cursor-agent` is required. Use `--no-browser` to open the login URL manually. Cursor tokens refresh 10 minutes ahead of expiry. Run uses a separate bidirectional HTTP/2 Connect-RPC path and maps text, thinking, and tool calls to Anthropic JSON/SSE. Local tests exist, but the implementation has not been validated against a live Cursor upstream; do not treat it as production-ready. Proxying a Cursor subscription may violate its terms of service and put the account at risk of suspension.
 
-With a stable Claude session ID, an MCP tool call keeps the upstream stream open; the next request matches text `tool_result` blocks by `tool_use_id`. All pending tool calls must have matching results. Idle streams expire after five minutes; raw checkpoints are bound to the credential and retained for 30 minutes. Without a stable session, or after the upstream stream expires, the full history and tool results are flattened into a new Run request. Image inputs, built-in exec tool execution, and Cursor CLI passthrough are unsupported; built-in tool requests receive a rejection.
+With a stable Claude session ID, an MCP tool call keeps the upstream stream open; the next request matches text `tool_result` blocks by `tool_use_id`. All pending calls need results, and the model and tool catalog must match. Idle streams expire after five minutes; credential-bound raw checkpoints remain for 30 minutes. A lost tool session returns 400 rather than silently opening another Run. Image inputs, built-in exec tool execution, and Cursor CLI passthrough are unsupported; built-in tool requests receive a rejection.
+
+Requests with the same session and digest share one upstream run and replay its JSON/SSE response after completion. A different digest conflicts with an attached running request (400). The producer continues after an SSE disconnect; it cancels after five seconds without consumers. Matching requests can reconnect during that period; a different digest replaces the detached run. Parked tool sessions retain their five-minute TTL. The memory-only event journal has a 64 MiB frame-data budget and a ten-minute TTL. Eviction removes completed journals first, then active journals; unavailable replay reports `cursor_replay_unavailable` (an error event for an already started SSE response). The budget excludes JSON snapshots and checkpoint/blob data. Persistence is deferred; restarts do not restore sessions.
 
 Cursor supports one credential. Run request DATA remains open; only a Connect JSON trailer with flags `0x02` ends the response, while premature EOF is an error. A 401 triggers one credential refresh and retry only before output; 429 is never retried. Server and transport errors back off within a three-second budget. Error responses forward `Retry-After` when supplied by the upstream.
 

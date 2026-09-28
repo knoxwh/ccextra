@@ -1,8 +1,12 @@
 use super::constants::DEFAULT_CLIENT_VERSION;
 use super::drive::{CursorDrive, CursorEvent};
 use super::error::CursorFailure;
+use super::journal::ReplayStatus;
 use super::response::CursorReply;
-use super::session::{CursorSessions, ToolResult};
+use super::session::{
+    compute_tool_catalog_fingerprint, compute_turn_digest, BeginOutcome, ConsumerGuard,
+    CursorSessions, InflightRun, RunOutcome, ToolResult,
+};
 use super::{provider, refresh, store, stream::CursorStream};
 use crate::http::error::AppError;
 use crate::http::handlers::messages::PreparedMessageRequest;
@@ -11,7 +15,7 @@ use crate::http::retry::compute_retry_delay;
 use crate::http::{AppState, ConfigSnapshot};
 use axum::{
     body::Body,
-    http::{header, HeaderMap, StatusCode},
+    http::{header, HeaderMap, HeaderValue, StatusCode},
     response::{IntoResponse, Response},
 };
 use bytes::Bytes;
@@ -35,6 +39,24 @@ fn uuid() -> Result<String, AppError> {
     ))
 }
 
+async fn consumer_response(
+    is_stream: bool,
+    turn_digest: String,
+    inflight: InflightRun,
+    guard: ConsumerGuard,
+) -> Result<Response, AppError> {
+    if is_stream {
+        Ok(consumer_stream_response(
+            guard.sessions.clone(),
+            turn_digest,
+            inflight,
+            guard,
+        ))
+    } else {
+        consumer_json_response(guard, inflight).await
+    }
+}
+
 fn failure_response(failure: CursorFailure) -> Response {
     let mut response = AppError::with_status(failure.status, failure.message).into_response();
     if let Some(value) = failure.retry_after {
@@ -43,72 +65,314 @@ fn failure_response(failure: CursorFailure) -> Response {
     response
 }
 
-struct SessionLease {
+#[allow(clippy::too_many_arguments)]
+fn handle_producer_error(
+    sessions: &CursorSessions,
+    conversation: &str,
+    identity: &str,
+    generation: u64,
+    turn_digest: &str,
+    reply: &mut CursorReply,
+    inflight: &InflightRun,
+    err_msg: String,
+) {
+    let err_frames = reply.error(&err_msg);
+    sessions.publish_if_current(conversation, identity, generation, |journal| {
+        for frame in err_frames {
+            journal.record(turn_digest, frame.clone());
+            let _ = inflight.event_tx.send(frame);
+        }
+    });
+    let outcome = RunOutcome::Failure(err_msg.clone());
+    *inflight.outcome.lock().unwrap() = Some(outcome.clone());
+    let _ = inflight.notify.send(outcome);
+    sessions.record_failure(conversation, identity, generation);
+    sessions.broadcast_outcome(
+        conversation,
+        identity,
+        generation,
+        RunOutcome::Failure(err_msg),
+    );
+}
+
+fn handle_producer_settle(
+    sessions: &CursorSessions,
+    conversation: &str,
+    identity: &str,
+    generation: u64,
+    drive: CursorDrive,
+    reply: &mut CursorReply,
+    stable: bool,
+) -> Result<(), CursorFailure> {
+    if stable {
+        if let Some(raw) = reply.checkpoint.as_ref() {
+            sessions.record_checkpoint(
+                conversation,
+                identity,
+                generation,
+                raw.clone(),
+                drive.blob_store(),
+            );
+        }
+    }
+    if stable && !reply.pending.is_empty() {
+        sessions
+            .park(
+                conversation,
+                identity,
+                generation,
+                drive,
+                reply.pending.clone(),
+            )
+            .map_err(CursorFailure::from_transport)?;
+    } else {
+        sessions.finish(conversation, identity, generation);
+    }
+    let snapshot = serde_json::to_vec(&reply.json()).map_err(CursorFailure::from_transport)?;
+    sessions.broadcast_outcome(
+        conversation,
+        identity,
+        generation,
+        RunOutcome::Success(snapshot),
+    );
+    Ok(())
+}
+
+struct SetupGuard {
     sessions: CursorSessions,
     conversation: String,
     identity: String,
     generation: u64,
-    stable: bool,
-    settled: bool,
-    cancelled: Option<tokio::sync::watch::Receiver<bool>>,
+    handed_off: bool,
 }
 
-impl SessionLease {
-    async fn wait_cancelled(&mut self) {
-        if let Some(receiver) = &mut self.cancelled {
-            if !*receiver.borrow() {
-                let _ = receiver.changed().await;
-            }
-        }
-    }
-
-    fn checkpoint(&self, reply: &CursorReply, drive: &CursorDrive) {
-        if self.stable {
-            if let Some(raw) = reply.checkpoint.as_ref() {
-                self.sessions.record_checkpoint(
-                    &self.conversation,
-                    &self.identity,
-                    self.generation,
-                    raw.clone(),
-                    drive.blob_store(),
-                );
-            }
-        }
-    }
-
-    fn park(
-        &mut self,
-        drive: CursorDrive,
-        pending: Vec<ccextra_core::convert::cursor::proto::ExecRequest>,
-    ) -> Result<(), CursorFailure> {
-        if self.stable {
-            self.sessions
-                .park(
-                    &self.conversation,
-                    &self.identity,
-                    self.generation,
-                    drive,
-                    pending,
-                )
-                .map_err(CursorFailure::from_transport)?;
-            self.settled = true;
-        }
-        Ok(())
-    }
-
-    fn finish(&mut self) {
-        self.sessions
-            .finish(&self.conversation, &self.identity, self.generation);
-        self.settled = true;
-    }
-}
-
-impl Drop for SessionLease {
+impl Drop for SetupGuard {
     fn drop(&mut self) {
-        if !self.settled {
+        if !self.handed_off {
+            self.sessions.broadcast_outcome(
+                &self.conversation,
+                &self.identity,
+                self.generation,
+                RunOutcome::Failure("Cursor 请求在启动阶段中断".into()),
+            );
             self.sessions
                 .cancel(&self.conversation, &self.identity, self.generation);
         }
+    }
+}
+
+#[allow(clippy::too_many_arguments)]
+fn spawn_cursor_producer(
+    sessions: CursorSessions,
+    conversation: String,
+    identity: String,
+    generation: u64,
+    turn_digest: String,
+    mut drive: CursorDrive,
+    mut reply: CursorReply,
+    inflight: InflightRun,
+    mut cancellation: Option<tokio::sync::watch::Receiver<bool>>,
+    stable: bool,
+) {
+    tokio::spawn(async move {
+        let mut cancelled = false;
+        while !reply.finished {
+            let event = tokio::select! {
+                event = drive.next_event() => event,
+                _ = async {
+                    if let Some(rx) = cancellation.as_mut() {
+                        if !*rx.borrow() {
+                            let _ = rx.changed().await;
+                        }
+                    } else {
+                        futures::future::pending::<()>().await;
+                    }
+                } => {
+                    cancelled = true;
+                    break;
+                }
+            };
+
+            let event = match event {
+                Ok(ev) => ev,
+                Err(err) => {
+                    handle_producer_error(
+                        &sessions,
+                        &conversation,
+                        &identity,
+                        generation,
+                        &turn_digest,
+                        &mut reply,
+                        &inflight,
+                        err.message,
+                    );
+                    return;
+                }
+            };
+
+            let frames = match accept_event(&mut drive, &mut reply, event).await {
+                Ok(f) => f,
+                Err(err) => {
+                    handle_producer_error(
+                        &sessions,
+                        &conversation,
+                        &identity,
+                        generation,
+                        &turn_digest,
+                        &mut reply,
+                        &inflight,
+                        err.message,
+                    );
+                    return;
+                }
+            };
+
+            if !sessions.publish_if_current(&conversation, &identity, generation, |journal| {
+                for frame in frames {
+                    journal.record(&turn_digest, frame.clone());
+                    let _ = inflight.event_tx.send(frame);
+                }
+            }) {
+                cancelled = true;
+                break;
+            }
+
+            if !reply.pending.is_empty() {
+                break;
+            }
+        }
+
+        if cancelled {
+            handle_producer_error(
+                &sessions,
+                &conversation,
+                &identity,
+                generation,
+                &turn_digest,
+                &mut reply,
+                &inflight,
+                "Cursor 会话已被取消".into(),
+            );
+            return;
+        }
+
+        if let Err(error) = handle_producer_settle(
+            &sessions,
+            &conversation,
+            &identity,
+            generation,
+            drive,
+            &mut reply,
+            stable,
+        ) {
+            handle_producer_error(
+                &sessions,
+                &conversation,
+                &identity,
+                generation,
+                &turn_digest,
+                &mut reply,
+                &inflight,
+                error.message,
+            );
+        }
+    });
+}
+
+fn consumer_stream_response(
+    sessions: CursorSessions,
+    turn_digest: String,
+    inflight: InflightRun,
+    guard: ConsumerGuard,
+) -> Response {
+    let mut event_rx = inflight.event_tx.subscribe();
+    let mut outcome_rx = inflight.notify.subscribe();
+    let output = async_stream::stream! {
+        let _guard = guard;
+        let mut cursor = 0;
+        let mut emitted_error = false;
+        let mut ticker = tokio::time::interval_at(
+            tokio::time::Instant::now() + Duration::from_secs(10),
+            Duration::from_secs(10),
+        );
+        loop {
+            let outcome = inflight.outcome.lock().unwrap().clone();
+            match sessions.journal().replay_status(&turn_digest) {
+                ReplayStatus::Available(frames) => {
+                    for frame in frames.into_iter().skip(cursor) {
+                        let terminal = frame.starts_with(b"event: message_delta\n")
+                            || frame.starts_with(b"event: message_stop\n");
+                        // 工具驻留或收尾成功后，才允许客户端看见成功终态。
+                        if terminal && outcome.is_none() {
+                            break;
+                        }
+                        cursor += 1;
+                        if terminal && matches!(outcome, Some(RunOutcome::Failure(_))) {
+                            continue;
+                        }
+                        emitted_error |= frame.starts_with(b"event: error\n");
+                        yield Ok::<Bytes, std::io::Error>(frame);
+                    }
+                }
+                ReplayStatus::Evicted => {
+                    yield Ok(crate::sse::emit::error_event("cursor_replay_unavailable"));
+                    break;
+                }
+                ReplayStatus::NotFound if outcome.is_some() => {
+                    yield Ok(crate::sse::emit::error_event("cursor_replay_unavailable"));
+                    break;
+                }
+                ReplayStatus::NotFound => {}
+            }
+            if let Some(outcome) = outcome {
+                if let RunOutcome::Failure(message) = outcome {
+                    if !emitted_error {
+                        yield Ok(crate::sse::emit::error_event(&message));
+                    }
+                }
+                break;
+            }
+            tokio::select! {
+                _ = ticker.tick() => yield Ok(Bytes::from_static(b": keepalive\n\n")),
+                _ = outcome_rx.recv() => {},
+                _ = event_rx.recv() => {},
+            }
+        }
+    };
+    Response::builder()
+        .status(StatusCode::OK)
+        .header(header::CONTENT_TYPE, "text/event-stream")
+        .header(header::CACHE_CONTROL, "no-cache")
+        .body(Body::from_stream(output))
+        .unwrap_or_else(|_| StatusCode::INTERNAL_SERVER_ERROR.into_response())
+}
+
+async fn consumer_json_response(
+    _guard: ConsumerGuard,
+    inflight: InflightRun,
+) -> Result<Response, AppError> {
+    let mut outcome_rx = inflight.notify.subscribe();
+    let cached = inflight.outcome.lock().unwrap().clone();
+    let outcome = match cached {
+        Some(outcome) => Ok(outcome),
+        None => outcome_rx.recv().await,
+    };
+    match outcome {
+        Ok(RunOutcome::Success(snapshot)) => {
+            let json_body: serde_json::Value = serde_json::from_slice(&snapshot)
+                .map_err(|err| AppError::new(anyhow::anyhow!("解析 JSON 快照失败: {err}")))?;
+            Ok((
+                StatusCode::OK,
+                [(header::CONTENT_TYPE, "application/json")],
+                axum::Json(json_body),
+            )
+                .into_response())
+        }
+        Ok(RunOutcome::Failure(err)) => Err(AppError::with_status(StatusCode::BAD_GATEWAY, err)),
+        Err(_) => Err(AppError::with_status(
+            StatusCode::BAD_GATEWAY,
+            "上游请求未产生有效响应",
+        )),
     }
 }
 
@@ -288,58 +552,215 @@ pub(crate) async fn handle_cursor(
     let results = tool_results(&prepared.body_json)?;
     let has_results = !results.is_empty();
     let stable = session.is_some();
-    if stable && has_results {
-        let resumed = state
+    if has_results && !stable {
+        return Err(AppError::bad_request(
+            "cursor_session_lost: 工具续接需要稳定会话 ID",
+        ));
+    }
+
+    let system = prepared
+        .body_json
+        .get("system")
+        .cloned()
+        .unwrap_or(serde_json::Value::Null);
+    let tools = prepared
+        .body_json
+        .get("tools")
+        .cloned()
+        .unwrap_or(serde_json::Value::Array(vec![]));
+    let tool_catalog_fingerprint = compute_tool_catalog_fingerprint(&tools);
+    let messages = prepared
+        .body_json
+        .get("messages")
+        .cloned()
+        .unwrap_or(serde_json::Value::Array(vec![]));
+    let model_params = serde_json::json!({
+        "max_tokens": prepared.body_json.get("max_tokens"),
+        "temperature": prepared.body_json.get("temperature"),
+        "stream": prepared.body_json.get("stream"),
+        "metadata": prepared.body_json.get("metadata"),
+        "thinking": prepared.body_json.get("thinking"),
+    });
+    let upstream_model = prepared.route.upstream_model.clone();
+    let turn_digest = compute_turn_digest(
+        &conversation,
+        &upstream_model,
+        &model_params,
+        &system,
+        &messages,
+        &tools,
+    );
+
+    // 先检查是否已完成（Completed 状态）
+    if let Some(snapshot) =
+        state
             .cursor_sessions
-            .take(&conversation, identity, results)
-            .map_err(AppError::bad_request)?;
-        if let Some((generation, drive_receiver, matched)) = resumed {
-            let mut lease = SessionLease {
-                sessions: state.cursor_sessions.clone(),
-                conversation: conversation.clone(),
-                identity: identity.clone(),
-                generation,
-                stable,
-                settled: false,
-                cancelled: state
-                    .cursor_sessions
-                    .cancellation(&conversation, identity, generation),
-            };
-            let drive = tokio::select! {
-                drive = drive_receiver => drive.map_err(CursorFailure::from_transport),
-                _ = lease.wait_cancelled() => Err(CursorFailure::from_transport("Cursor 会话 owner 已更换")),
-            };
-            let drive = match drive {
-                Ok(drive) => drive,
-                Err(error) => return Ok(failure_response(error)),
-            };
-            for (exec, result) in matched {
-                let sent = tokio::select! {
-                    sent = drive.send_tool_result(&exec, &result.content, result.is_error) => sent,
-                    _ = lease.wait_cancelled() => Err(CursorFailure::from_transport("Cursor 会话 owner 已更换")),
-                };
-                if let Err(error) = sent {
-                    return Ok(failure_response(error));
-                }
+            .try_get_completed(&conversation, identity, &turn_digest)
+    {
+        if !prepared.is_stream {
+            if let Ok(json_val) = serde_json::from_slice::<serde_json::Value>(&snapshot) {
+                return Ok((
+                    StatusCode::OK,
+                    [(header::CONTENT_TYPE, "application/json")],
+                    axum::Json(json_val),
+                )
+                    .into_response());
             }
-            let reply = CursorReply::new(
-                response_id,
-                inbound_model,
-                (prepared.body_json.to_string().len() / 4).max(1),
-            );
-            let result = if prepared.is_stream {
-                stream_response(drive, reply, lease).await
-            } else {
-                json_response(drive, reply, &mut lease).await
-            };
-            return Ok(result.unwrap_or_else(failure_response));
+            return Err(AppError::with_status(
+                StatusCode::GONE,
+                "cursor_replay_unavailable",
+            ));
         }
+        match state.cursor_sessions.journal().replay_status(&turn_digest) {
+            ReplayStatus::Available(frames) if !frames.is_empty() => {
+                let body_stream =
+                    futures::stream::iter(frames.into_iter().map(Ok::<_, std::io::Error>));
+                let mut response = Response::new(Body::from_stream(body_stream));
+                *response.status_mut() = StatusCode::OK;
+                response.headers_mut().insert(
+                    header::CONTENT_TYPE,
+                    HeaderValue::from_static("text/event-stream"),
+                );
+                response
+                    .headers_mut()
+                    .insert(header::CACHE_CONTROL, HeaderValue::from_static("no-cache"));
+                return Ok(response);
+            }
+            _ => {
+                return Err(AppError::with_status(
+                    StatusCode::GONE,
+                    "cursor_replay_unavailable",
+                ));
+            }
+        }
+    }
+
+    // 检查是否有正在运行的同 digest 请求（singleflight / 断线重连）
+    if let Some((inflight, guard)) =
+        state
+            .cursor_sessions
+            .try_join_inflight(&conversation, identity, &turn_digest)
+    {
+        return consumer_response(prepared.is_stream, turn_digest, inflight, guard).await;
+    }
+
+    if stable && has_results {
+        let continuation_digest = turn_digest.clone();
+        let resumed = match state.cursor_sessions.take(
+            &conversation,
+            identity,
+            results,
+            &upstream_model,
+            &tool_catalog_fingerprint,
+            continuation_digest.clone(),
+        ) {
+            Ok(resumed) => resumed,
+            Err(err) => {
+                // 丢 session 必须 fail closed！
+                return Err(AppError::bad_request(format!("continuation 失败: {err}")));
+            }
+        };
+        let (generation, drive_receiver, matched, inflight) = match resumed {
+            super::session::ResumedSession::Resumed(generation, drive, matched, run) => {
+                (generation, drive, matched, run)
+            }
+            super::session::ResumedSession::Joined(generation, run) => {
+                let guard = state.cursor_sessions.create_consumer_guard(
+                    &conversation,
+                    identity,
+                    generation,
+                    &run,
+                );
+                return consumer_response(prepared.is_stream, turn_digest, run, guard).await;
+            }
+        };
+        let mut setup = SetupGuard {
+            sessions: state.cursor_sessions.clone(),
+            conversation: conversation.clone(),
+            identity: identity.clone(),
+            generation,
+            handed_off: false,
+        };
+        let guard = state.cursor_sessions.create_consumer_guard(
+            &conversation,
+            identity,
+            generation,
+            &inflight,
+        );
+        let cancellation = state
+            .cursor_sessions
+            .cancellation(&conversation, identity, generation);
+
+        let drive = match drive_receiver.await {
+            Ok(d) => d,
+            Err(_) => return Err(AppError::bad_request("Cursor 会话已被取消或通道关闭")),
+        };
+        for (exec, result) in matched {
+            if let Err(err) = drive
+                .send_tool_result(&exec, &result.content, result.is_error)
+                .await
+            {
+                return Ok(failure_response(err));
+            }
+        }
+        let input_tokens = (prepared.body_json.to_string().len() / 4).max(1);
+        let reply = CursorReply::new(response_id, inbound_model, input_tokens);
+        setup.handed_off = true;
+        spawn_cursor_producer(
+            state.cursor_sessions.clone(),
+            conversation,
+            identity.to_string(),
+            generation,
+            continuation_digest.clone(),
+            drive,
+            reply,
+            inflight.clone(),
+            cancellation,
+            stable,
+        );
+        return consumer_response(prepared.is_stream, continuation_digest, inflight, guard).await;
     }
     let checkpoint = if stable && !has_results {
         state.cursor_sessions.checkpoint(&conversation, identity)
     } else {
         None
     };
+
+    // 在打开上游之前，原子注册/加入请求（同 digest 加入 singleflight，不同 digest 且 attached 拒绝）
+    let (generation, inflight) = match state.cursor_sessions.try_begin(
+        &conversation,
+        identity,
+        prepared.route.upstream_model.clone(),
+        tool_catalog_fingerprint,
+        turn_digest.clone(),
+    ) {
+        Ok(BeginOutcome::Started(gen, inf)) => (gen, inf),
+        Ok(BeginOutcome::AlreadyRunning(generation, inf)) => {
+            let guard = state.cursor_sessions.create_consumer_guard(
+                &conversation,
+                identity,
+                generation,
+                &inf,
+            );
+            return consumer_response(prepared.is_stream, turn_digest, inf, guard).await;
+        }
+        Err(err) => {
+            return Err(AppError::with_status(StatusCode::BAD_REQUEST, err));
+        }
+    };
+
+    let mut setup = SetupGuard {
+        sessions: state.cursor_sessions.clone(),
+        conversation: conversation.clone(),
+        identity: identity.clone(),
+        generation,
+        handed_off: false,
+    };
+    let guard =
+        state
+            .cursor_sessions
+            .create_consumer_guard(&conversation, identity, generation, &inflight);
+    state.cursor_sessions.cleanup_turn_journal(&turn_digest);
     let mut retried_auth = false;
     let started = Instant::now();
     let mut attempt = 0;
@@ -370,26 +791,53 @@ pub(crate) async fn handle_cursor(
                 if let Some((_, blobs)) = checkpoint.as_ref() {
                     drive.seed_blobs(blobs.clone());
                 }
-                let generation = state.cursor_sessions.begin(&conversation, identity);
-                let mut lease = SessionLease {
-                    sessions: state.cursor_sessions.clone(),
-                    conversation: conversation.clone(),
-                    identity: identity.clone(),
-                    generation,
-                    stable,
-                    settled: false,
-                    cancelled: state.cursor_sessions.cancellation(
+                let mut reply =
+                    CursorReply::new(response_id.clone(), inbound_model.clone(), input_tokens);
+                let first = async {
+                    loop {
+                        let event = drive.next_event().await?;
+                        let frames = accept_event(&mut drive, &mut reply, event).await?;
+                        if !frames.is_empty() || reply.finished {
+                            return Ok::<_, CursorFailure>(frames);
+                        }
+                    }
+                }
+                .await;
+                if let Err(error) = first {
+                    Err(error)
+                } else {
+                    if !state.cursor_sessions.publish_if_current(
                         &conversation,
                         identity,
                         generation,
-                    ),
-                };
-                let reply =
-                    CursorReply::new(response_id.clone(), inbound_model.clone(), input_tokens);
-                if prepared.is_stream {
-                    stream_response(drive, reply, lease).await
-                } else {
-                    json_response(drive, reply, &mut lease).await
+                        |journal| {
+                            for frame in first.unwrap() {
+                                journal.record(&turn_digest, frame.clone());
+                                let _ = inflight.event_tx.send(frame);
+                            }
+                        },
+                    ) {
+                        return Err(AppError::bad_request("Cursor 会话 owner 已更换"));
+                    }
+                    let cancellation =
+                        state
+                            .cursor_sessions
+                            .cancellation(&conversation, identity, generation);
+                    setup.handed_off = true;
+                    spawn_cursor_producer(
+                        state.cursor_sessions.clone(),
+                        conversation.clone(),
+                        identity.to_string(),
+                        generation,
+                        turn_digest.clone(),
+                        drive,
+                        reply,
+                        inflight.clone(),
+                        cancellation,
+                        stable,
+                    );
+                    return consumer_response(prepared.is_stream, turn_digest, inflight, guard)
+                        .await;
                 }
             }
             Ok(stream) => Err(CursorFailure::from_http(stream.status(), stream.headers())),
@@ -423,6 +871,15 @@ pub(crate) async fn handle_cursor(
             }
         }
         if !failure.retryable() || failure.progressed {
+            state.cursor_sessions.broadcast_outcome(
+                &conversation,
+                identity,
+                generation,
+                RunOutcome::Failure(failure.message.clone()),
+            );
+            state
+                .cursor_sessions
+                .cancel(&conversation, identity, generation);
             return Ok(failure_response(failure));
         }
         let mut headers = HeaderMap::new();
@@ -431,6 +888,15 @@ pub(crate) async fn handle_cursor(
         }
         let Some(delay) = compute_retry_delay(attempt, started, &headers, Some(failure.status))
         else {
+            state.cursor_sessions.broadcast_outcome(
+                &conversation,
+                identity,
+                generation,
+                RunOutcome::Failure(failure.message.clone()),
+            );
+            state
+                .cursor_sessions
+                .cancel(&conversation, identity, generation);
             return Ok(failure_response(failure));
         };
         attempt += 1;
@@ -465,124 +931,4 @@ async fn accept_event(
         frames.extend(reply.tool_boundary());
     }
     Ok(frames)
-}
-
-async fn next_output(
-    drive: &mut CursorDrive,
-    reply: &mut CursorReply,
-    lease: &mut SessionLease,
-) -> Result<Vec<Bytes>, CursorFailure> {
-    loop {
-        let event = tokio::select! {
-            event = drive.next_event() => event,
-            _ = lease.wait_cancelled() => Err(CursorFailure::from_transport("Cursor 会话 owner 已更换")),
-        }.map_err(|mut error| {
-            error.progressed = reply.emitted;
-            error
-        })?;
-        let frames = accept_event(drive, reply, event)
-            .await
-            .map_err(|mut error| {
-                error.progressed = reply.emitted;
-                error
-            })?;
-        if !frames.is_empty() || reply.finished {
-            return Ok(frames);
-        }
-    }
-}
-
-async fn json_response(
-    mut drive: CursorDrive,
-    mut reply: CursorReply,
-    lease: &mut SessionLease,
-) -> Result<Response, CursorFailure> {
-    while !reply.finished {
-        next_output(&mut drive, &mut reply, lease).await?;
-    }
-    settle(lease, &reply, drive).map_err(|mut error| {
-        error.progressed = reply.emitted;
-        error
-    })?;
-    Ok((
-        [(header::CONTENT_TYPE, "application/json")],
-        axum::Json(reply.json()),
-    )
-        .into_response())
-}
-
-fn settle(
-    lease: &mut SessionLease,
-    reply: &CursorReply,
-    drive: CursorDrive,
-) -> Result<(), CursorFailure> {
-    lease.checkpoint(reply, &drive);
-    if reply.pending.is_empty() {
-        lease.finish();
-        Ok(())
-    } else {
-        lease.park(drive, reply.pending.clone())
-    }
-}
-
-async fn stream_response(
-    mut drive: CursorDrive,
-    mut reply: CursorReply,
-    mut lease: SessionLease,
-) -> Result<Response, CursorFailure> {
-    let first = next_output(&mut drive, &mut reply, &mut lease).await?;
-    let output = async_stream::stream! {
-        if reply.finished {
-            match settle(&mut lease, &reply, drive) {
-                Ok(()) => {
-                    for frame in first { yield Ok::<Bytes, std::io::Error>(frame); }
-                }
-                Err(error) => yield Ok(crate::sse::emit::error_event(&error.message)),
-            }
-            return;
-        }
-        for frame in first { yield Ok(frame); }
-        let mut ticker = tokio::time::interval_at(
-            tokio::time::Instant::now() + Duration::from_secs(10),
-            Duration::from_secs(10),
-        );
-        loop {
-            let event = tokio::select! {
-                event = drive.next_event() => event,
-                _ = lease.wait_cancelled() => Err(CursorFailure::from_transport("Cursor 会话 owner 已更换")),
-                _ = ticker.tick() => {
-                    yield Ok(Bytes::from_static(b": keepalive\n\n"));
-                    continue;
-                }
-            };
-            let frames = match event {
-                Ok(event) => accept_event(&mut drive, &mut reply, event).await,
-                Err(error) => Err(error),
-            };
-            match frames {
-                Ok(frames) if reply.finished => {
-                    match settle(&mut lease, &reply, drive) {
-                        Ok(()) => {
-                            for frame in frames { yield Ok(frame); }
-                        }
-                        Err(error) => yield Ok(crate::sse::emit::error_event(&error.message)),
-                    }
-                    break;
-                }
-                Ok(frames) => {
-                    for frame in frames { yield Ok(frame); }
-                }
-                Err(error) => {
-                    for frame in reply.error(&error.message) { yield Ok(frame); }
-                    break;
-                }
-            }
-        }
-    };
-    Response::builder()
-        .status(StatusCode::OK)
-        .header(header::CONTENT_TYPE, "text/event-stream")
-        .header(header::CACHE_CONTROL, "no-cache")
-        .body(Body::from_stream(output))
-        .map_err(CursorFailure::from_transport)
 }

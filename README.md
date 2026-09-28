@@ -164,7 +164,7 @@ curl -H "Authorization: Bearer $ANTHROPIC_AUTH_TOKEN" \
 | 方法与端点 | 权限说明 | 功能描述 |
 | :--- | :--- | :--- |
 | `POST /v1/messages` | 需认证* | 接收 Anthropic Messages，返回 JSON 或 SSE。 |
-| `POST /v1/messages/count_tokens` | 需认证* | Claude 转发上游计数；其他协议读取会话记录，未命中返回 0。 |
+| `POST /v1/messages/count_tokens` | 需认证* | Claude 转发上游计数；其他协议读取会话记录，未命中返回 0。Chat/Responses/Gemini/Antigravity 的流式真实输入用量也更新记录；缺失或零值不覆盖旧值。 |
 | `GET /v1/models` | 需认证* | 获取 Anthropic 格式的可用模型列表。 |
 | `GET /health` | 公开 | 返回 `ok`，不检查上游是否可用。 |
 | `POST /reload` | 公开 | 加载、校验并发布新配置，无需重启。 |
@@ -208,7 +208,9 @@ Antigravity 凭证默认在配置文件旁 `.cache/antigravity`，xAI 在 `.cach
 
 Cursor 登录自行生成 PKCE 并轮询浏览器授权，不依赖 Cursor IDE 或 `cursor-agent`；可用 `--no-browser` 手动打开 URL，token 到期前 10 分钟刷新。Run 请求使用独立双向 HTTP/2 Connect-RPC，将文本、思考和工具调用恢复为 Anthropic JSON/SSE。实现已有本地测试，尚未用真实 Cursor 上游验收；不要视为生产就绪。Cursor 订阅反代可能违反服务条款，账号有封禁风险。
 
-有稳定 Claude 会话 ID 时，MCP 工具调用会驻留上游流，下一次请求按 `tool_use_id` 匹配文本 `tool_result` 并续接；多个工具结果必须全部对应。流会话闲置 5 分钟过期，原始 checkpoint 保留 30 分钟并绑定凭证。无稳定会话或驻留流已失效时，完整历史与工具结果会展平为新 Run 请求。图片输入、内置 exec 工具执行和 Cursor CLI passthrough 不支持；内置工具请求返回拒绝。
+有稳定 Claude 会话 ID 时，MCP 工具调用会驻留上游流，下一次请求按 `tool_use_id` 匹配文本 `tool_result` 并续接；多个工具结果必须全部对应，模型与工具目录须一致。流会话闲置 5 分钟过期，原始 checkpoint 保留 30 分钟并绑定凭证。驻留流丢失后的工具续接返回 400，不静默重开 Run。图片输入、内置 exec 工具执行和 Cursor CLI passthrough 不支持；内置工具请求返回拒绝。
+
+同会话同 digest 请求共享上游，完成后重放原 JSON/SSE；正在连接的请求遇到不同 digest 返回 400。SSE 断开后后台继续消费，最后一个消费者断开满 5 秒仍未重连则取消；宽限期内同 digest 可重连，不同 digest 替换旧请求。等待工具结果的驻留流按 5 分钟 TTL 保留。事件日志仅存内存，帧数据总预算 64 MiB、TTL 10 分钟；超限优先驱逐已结束日志，再驱逐活跃日志，重放不可用返回 `cursor_replay_unavailable`（已开始的 SSE 发 error）。该预算不包含 JSON 快照和 checkpoint/blob。持久化延期，重启不恢复会话。
 
 Cursor 只支持单凭证。Run 请求 DATA 保持打开；响应必须由 flags `0x02` 的 Connect JSON trailer 结束，提前 EOF 属于错误。401 仅在无输出时刷新并重试一次，429 不重试；5xx 和传输错误在 3 秒预算内退避。上游提供 `Retry-After` 时，错误响应会透传该头。
 

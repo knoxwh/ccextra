@@ -1615,7 +1615,19 @@ async fn test_reload_drops_old_cursor_if_credential_or_dir_changes() {
     for change_dir in [false, true] {
         let (mut state, old_dir, mut credential) = cursor_reload_state().await;
         let old_identity = crate::cursor::provider::credential_fingerprint(&credential);
-        let generation = state.cursor_sessions.begin("conv", &old_identity);
+        let crate::cursor::session::BeginOutcome::Started(generation, _) = state
+            .cursor_sessions
+            .try_begin(
+                "conv",
+                &old_identity,
+                String::new(),
+                String::new(),
+                "digest".into(),
+            )
+            .unwrap()
+        else {
+            panic!("expected new run")
+        };
         let cancelled = state
             .cursor_sessions
             .cancellation("conv", &old_identity, generation)

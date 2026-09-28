@@ -1,23 +1,161 @@
 use super::drive::{CursorDrive, CursorEvent};
+use super::journal::{CursorEventJournal, JOURNAL_TTL};
+use bytes::Bytes;
 use ccextra_core::convert::cursor::proto::{ExecKind, ExecRequest};
+use sha2::{Digest, Sha256};
 use std::collections::{HashMap, HashSet};
+use std::sync::atomic::{AtomicU64, AtomicUsize, Ordering};
 use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant};
-use tokio::sync::{oneshot, watch};
+use tokio::sync::{broadcast, oneshot, watch};
 
 const SESSION_TTL: Duration = Duration::from_secs(5 * 60);
 const CHECKPOINT_TTL: Duration = Duration::from_secs(30 * 60);
+const DISCONNECT_GRACE_PERIOD: Duration = Duration::from_secs(5);
+
+/// Singleflight 结果：成功或失败
+#[derive(Clone)]
+pub enum RunOutcome {
+    Success(Vec<u8>),
+    Failure(String),
+}
+
+/// 正在运行的请求状态（用于 singleflight 和断线恢复）
+#[derive(Clone)]
+pub struct InflightRun {
+    /// 结果广播通道
+    pub notify: broadcast::Sender<RunOutcome>,
+    pub outcome: Arc<Mutex<Option<RunOutcome>>>,
+    /// 实时 SSE 帧广播通道
+    pub event_tx: broadcast::Sender<Bytes>,
+    /// 活跃 consumers 计数
+    pub active_consumers: Arc<AtomicUsize>,
+    /// consumer epoch，递增用于区分 grace 定时器
+    pub consumer_epoch: Arc<AtomicU64>,
+}
+
+impl Default for InflightRun {
+    fn default() -> Self {
+        Self::new()
+    }
+}
+
+impl InflightRun {
+    pub fn new() -> Self {
+        let (notify, _) = broadcast::channel(32);
+        let (event_tx, _) = broadcast::channel(512);
+        Self {
+            notify,
+            outcome: Arc::new(Mutex::new(None)),
+            event_tx,
+            active_consumers: Arc::new(AtomicUsize::new(0)),
+            consumer_epoch: Arc::new(AtomicU64::new(0)),
+        }
+    }
+}
+
+/// Consumer 活跃连接看门狗，持有引用计数并提供 5 秒断线 grace
+pub struct ConsumerGuard {
+    pub sessions: CursorSessions,
+    pub conversation: String,
+    pub identity: String,
+    pub generation: u64,
+    pub active_consumers: Arc<AtomicUsize>,
+    pub consumer_epoch: Arc<AtomicU64>,
+}
+
+impl Drop for ConsumerGuard {
+    fn drop(&mut self) {
+        let mut registry = self.sessions.inner.lock().unwrap();
+        let remaining = self.active_consumers.fetch_sub(1, Ordering::SeqCst) - 1;
+        if remaining == 0 {
+            if let Some(owner) = registry.owners.get_mut(&self.conversation) {
+                if owner.identity == self.identity
+                    && owner.generation == self.generation
+                    && owner.inflight.as_ref().is_some_and(|run| {
+                        Arc::ptr_eq(&run.active_consumers, &self.active_consumers)
+                    })
+                {
+                    owner.attached = false;
+                }
+            }
+            let sessions = self.sessions.clone();
+            let conversation = self.conversation.clone();
+            let identity = self.identity.clone();
+            let generation = self.generation;
+            let active_consumers = self.active_consumers.clone();
+            let consumer_epoch = self.consumer_epoch.clone();
+            let my_epoch = consumer_epoch.load(Ordering::SeqCst);
+            tokio::spawn(async move {
+                tokio::time::sleep(DISCONNECT_GRACE_PERIOD).await;
+                // 若 5 秒后仍无活跃 consumer，且没有新连接递增 epoch，则真正取消 session
+                let mut registry = sessions.inner.lock().unwrap();
+                if active_consumers.load(Ordering::SeqCst) == 0
+                    && consumer_epoch.load(Ordering::SeqCst) == my_epoch
+                    && registry.owners.get(&conversation).is_some_and(|owner| {
+                        owner.identity == identity
+                            && owner.generation == generation
+                            && owner.state == SessionState::Running
+                            && !owner.attached
+                            && owner.inflight.as_ref().is_some_and(|run| {
+                                Arc::ptr_eq(&run.active_consumers, &active_consumers)
+                            })
+                    })
+                {
+                    if let Some(owner) = registry.owners.remove(&conversation) {
+                        owner.cancelled.send_replace(true);
+                    }
+                }
+            });
+        }
+    }
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum SessionState {
+    Running,
+    AwaitingToolResults,
+    Completed,
+    Failed,
+}
+
+pub fn compute_turn_digest(
+    conversation: &str,
+    upstream_model: &str,
+    model_params: &serde_json::Value,
+    system: &serde_json::Value,
+    messages: &serde_json::Value,
+    tools: &serde_json::Value,
+) -> String {
+    let mut hasher = Sha256::new();
+    hasher.update(conversation.as_bytes());
+    hasher.update(upstream_model.as_bytes());
+    hasher.update(model_params.to_string().as_bytes());
+    hasher.update(system.to_string().as_bytes());
+    hasher.update(messages.to_string().as_bytes());
+    hasher.update(tools.to_string().as_bytes());
+    format!("{:x}", hasher.finalize())
+}
+
+pub fn compute_tool_catalog_fingerprint(tools: &serde_json::Value) -> String {
+    let mut hasher = Sha256::new();
+    hasher.update(tools.to_string().as_bytes());
+    format!("{:x}", hasher.finalize())
+}
 
 #[derive(Clone)]
 pub struct CursorSessions {
     inner: Arc<Mutex<Registry>>,
+    journal: CursorEventJournal,
 }
 
 impl Default for CursorSessions {
     fn default() -> Self {
         let inner = Arc::new(Mutex::new(Registry::default()));
+        let journal = CursorEventJournal::new();
         if let Ok(handle) = tokio::runtime::Handle::try_current() {
             let weak = Arc::downgrade(&inner);
+            let journal_clone = journal.clone();
             handle.spawn(async move {
                 loop {
                     tokio::time::sleep(Duration::from_secs(30)).await;
@@ -25,10 +163,11 @@ impl Default for CursorSessions {
                         break;
                     };
                     inner.lock().unwrap().sweep(Instant::now());
+                    journal_clone.sweep_expired(JOURNAL_TTL);
                 }
             });
         }
-        Self { inner }
+        Self { inner, journal }
     }
 }
 
@@ -45,6 +184,14 @@ struct Owner {
     generation: u64,
     deadline: Instant,
     cancelled: watch::Sender<bool>,
+    upstream_model: String,
+    tool_catalog_fingerprint: String,
+    turn_digest: String,
+    state: SessionState,
+    attached: bool,
+    response_snapshot: Option<Vec<u8>>,
+    /// 正在运行的请求（singleflight）
+    inflight: Option<InflightRun>,
 }
 
 struct ParkedSession {
@@ -69,8 +216,24 @@ pub struct ToolResult {
 }
 
 type MatchedTools = Vec<(ExecRequest, ToolResult)>;
-type ResumedSession = (u64, oneshot::Receiver<CursorDrive>, MatchedTools);
+pub enum ResumedSession {
+    Resumed(
+        u64,
+        oneshot::Receiver<CursorDrive>,
+        MatchedTools,
+        InflightRun,
+    ),
+    Joined(u64, InflightRun),
+}
 type CheckpointData = (Vec<u8>, HashMap<String, Vec<u8>>);
+
+/// 开启请求结果
+pub enum BeginOutcome {
+    /// 新启动的请求，持有 generation 与 Inflight 状态
+    Started(u64, InflightRun),
+    /// 已有同 digest 运行中请求（singleflight），直接加入
+    AlreadyRunning(u64, InflightRun),
+}
 
 fn match_pending(
     pending: &[ExecRequest],
@@ -111,17 +274,42 @@ impl Registry {
         self.checkpoints
             .retain(|_, checkpoint| checkpoint.deadline > now);
         self.owners.retain(|key, owner| {
-            owner.deadline > now
-                || self.active.contains_key(key)
-                || self.checkpoints.contains_key(key)
+            let keep = owner.deadline > now || self.active.contains_key(key);
+            if !keep {
+                owner.cancelled.send_replace(true);
+            }
+            keep
         });
     }
 }
 
 impl CursorSessions {
-    pub fn begin(&self, conversation: &str, identity: &str) -> u64 {
+    pub fn try_begin(
+        &self,
+        conversation: &str,
+        identity: &str,
+        upstream_model: String,
+        tool_catalog_fingerprint: String,
+        turn_digest: String,
+    ) -> Result<BeginOutcome, &'static str> {
         let mut registry = self.inner.lock().unwrap();
         registry.sweep(Instant::now());
+
+        // 检查是否有 running turn
+        if let Some(existing) = registry.owners.get_mut(conversation) {
+            if existing.identity == identity && existing.state != SessionState::Failed {
+                if existing.turn_digest == turn_digest {
+                    if let Some(inflight) = existing.inflight.clone() {
+                        existing.attached = true;
+                        return Ok(BeginOutcome::AlreadyRunning(existing.generation, inflight));
+                    }
+                }
+                if existing.state == SessionState::Running && existing.attached {
+                    return Err("session attached to running request");
+                }
+            }
+        }
+
         registry.generation = registry.generation.wrapping_add(1);
         let generation = registry.generation;
         registry.active.remove(conversation);
@@ -135,6 +323,7 @@ impl CursorSessions {
                 registry.checkpoints.remove(conversation);
             }
         }
+        let inflight = InflightRun::new();
         registry.owners.insert(
             conversation.into(),
             Owner {
@@ -142,9 +331,16 @@ impl CursorSessions {
                 generation,
                 deadline: Instant::now() + CHECKPOINT_TTL,
                 cancelled: watch::channel(false).0,
+                upstream_model,
+                tool_catalog_fingerprint,
+                turn_digest,
+                state: SessionState::Running,
+                attached: true,
+                response_snapshot: None,
+                inflight: Some(inflight.clone()),
             },
         );
-        generation
+        Ok(BeginOutcome::Started(generation, inflight))
     }
 
     pub fn cancellation(
@@ -248,7 +444,7 @@ impl CursorSessions {
     ) -> Result<(), &'static str> {
         let mut registry = self.inner.lock().unwrap();
         registry.sweep(Instant::now());
-        let Some(owner) = registry.owners.get(conversation) else {
+        let Some(owner) = registry.owners.get_mut(conversation) else {
             return Err("Cursor 会话已取消");
         };
         if owner.identity != identity || owner.generation != generation {
@@ -266,6 +462,7 @@ impl CursorSessions {
         if ids.is_empty() || ids.iter().collect::<HashSet<_>>().len() != ids.len() {
             return Err("Cursor 待处理工具 ID 为空或重复");
         }
+        owner.state = SessionState::AwaitingToolResults;
         let cancelled = owner.cancelled.subscribe();
         let (resume_sender, resume_receiver) = oneshot::channel();
         registry.active.insert(
@@ -294,21 +491,40 @@ impl CursorSessions {
         conversation: &str,
         identity: &str,
         results: Vec<ToolResult>,
-    ) -> Result<Option<ResumedSession>, &'static str> {
+        upstream_model: &str,
+        tool_catalog_fingerprint: &str,
+        turn_digest: String,
+    ) -> Result<ResumedSession, &'static str> {
         let mut registry = self.inner.lock().unwrap();
         registry.sweep(Instant::now());
-        let Some(owner) = registry.owners.get(conversation) else {
-            return Ok(None);
-        };
-        if owner.identity != identity {
-            return Ok(None);
+        {
+            let Some(owner) = registry.owners.get(conversation) else {
+                return Err("session 不存在");
+            };
+            if owner.identity != identity {
+                return Err("credential 不匹配");
+            }
+            if owner.upstream_model != upstream_model {
+                return Err("模型不匹配");
+            }
+            if owner.tool_catalog_fingerprint != tool_catalog_fingerprint {
+                return Err("工具目录不匹配");
+            }
+            if owner.turn_digest == turn_digest && owner.state != SessionState::Failed {
+                if let Some(run) = &owner.inflight {
+                    return Ok(ResumedSession::Joined(owner.generation, run.clone()));
+                }
+            }
+            let Some(session) = registry.active.get(conversation) else {
+                return Err("session 未 park");
+            };
+            if owner.generation != session.generation {
+                return Err("generation 不匹配");
+            }
         }
         let Some(session) = registry.active.get(conversation) else {
-            return Ok(None);
+            return Err("session 未 park");
         };
-        if owner.generation != session.generation {
-            return Ok(None);
-        }
         let matched = match_pending(&session.pending, results)?
             .into_iter()
             .map(|(exec, result)| (exec.clone(), result))
@@ -316,15 +532,30 @@ impl CursorSessions {
         let session = registry
             .active
             .remove(conversation)
-            .expect("validated active session");
+            .expect("validated parked session");
         let (sender, drive) = oneshot::channel();
         if session.resume.send(sender).is_err() {
             if let Some(owner) = registry.owners.remove(conversation) {
                 owner.cancelled.send_replace(true);
             }
-            return Ok(None);
+            return Err("resume channel 已关闭");
         }
-        Ok(Some((session.generation, drive, matched)))
+        let Some(owner) = registry.owners.get_mut(conversation) else {
+            return Err("session 不存在");
+        };
+        // 原子更新 owner 的 digest、state 与 inflight
+        owner.turn_digest = turn_digest;
+        owner.state = SessionState::Running;
+        owner.attached = true;
+        owner.response_snapshot = None;
+        let inflight = InflightRun::new();
+        owner.inflight = Some(inflight.clone());
+        Ok(ResumedSession::Resumed(
+            session.generation,
+            drive,
+            matched,
+            inflight,
+        ))
     }
 
     pub fn record_checkpoint(
@@ -388,14 +619,182 @@ impl CursorSessions {
             .is_some_and(|owner| owner.identity == identity && owner.generation == generation)
         {
             registry.active.remove(conversation);
-            registry.owners.remove(conversation);
+            if let Some(owner) = registry.owners.get_mut(conversation) {
+                owner.state = SessionState::Completed;
+            }
         }
+    }
+
+    pub fn record_failure(&self, conversation: &str, identity: &str, generation: u64) {
+        let mut registry = self.inner.lock().unwrap();
+        if let Some(owner) = registry.owners.get_mut(conversation) {
+            if owner.identity == identity && owner.generation == generation {
+                owner.state = SessionState::Failed;
+            }
+        }
+    }
+
+    /// 创建指定 inflight 的 consumer guard
+    pub fn create_consumer_guard(
+        &self,
+        conversation: &str,
+        identity: &str,
+        generation: u64,
+        inflight: &InflightRun,
+    ) -> ConsumerGuard {
+        let mut registry = self.inner.lock().unwrap();
+        if let Some(owner) = registry.owners.get_mut(conversation) {
+            if owner.identity == identity && owner.generation == generation {
+                owner.attached = true;
+            }
+        }
+        inflight.consumer_epoch.fetch_add(1, Ordering::SeqCst);
+        inflight.active_consumers.fetch_add(1, Ordering::SeqCst);
+        ConsumerGuard {
+            sessions: self.clone(),
+            conversation: conversation.to_string(),
+            identity: identity.to_string(),
+            generation,
+            active_consumers: inflight.active_consumers.clone(),
+            consumer_epoch: inflight.consumer_epoch.clone(),
+        }
+    }
+
+    /// 尝试加入已运行的请求（singleflight / 断线重连）
+    pub fn try_join_inflight(
+        &self,
+        conversation: &str,
+        identity: &str,
+        turn_digest: &str,
+    ) -> Option<(InflightRun, ConsumerGuard)> {
+        let mut registry = self.inner.lock().unwrap();
+        registry.sweep(Instant::now());
+        let owner = registry.owners.get_mut(conversation)?;
+        if owner.identity != identity || owner.turn_digest != turn_digest {
+            return None;
+        }
+        if owner.state != SessionState::Running {
+            return None;
+        }
+        let inflight = owner.inflight.clone()?;
+        owner.attached = true;
+        inflight.consumer_epoch.fetch_add(1, Ordering::SeqCst);
+        inflight.active_consumers.fetch_add(1, Ordering::SeqCst);
+        let guard = ConsumerGuard {
+            sessions: self.clone(),
+            conversation: conversation.to_string(),
+            identity: identity.to_string(),
+            generation: owner.generation,
+            active_consumers: inflight.active_consumers.clone(),
+            consumer_epoch: inflight.consumer_epoch.clone(),
+        };
+        Some((inflight, guard))
+    }
+
+    /// 检查是否已完成（Completed 状态），返回 response_snapshot
+    pub fn try_get_completed(
+        &self,
+        conversation: &str,
+        identity: &str,
+        turn_digest: &str,
+    ) -> Option<Vec<u8>> {
+        let mut registry = self.inner.lock().unwrap();
+        registry.sweep(Instant::now());
+        let owner = registry.owners.get(conversation)?;
+        if owner.identity != identity || owner.turn_digest != turn_digest {
+            return None;
+        }
+        if matches!(
+            owner.state,
+            SessionState::Completed | SessionState::AwaitingToolResults
+        ) {
+            owner.response_snapshot.clone()
+        } else {
+            None
+        }
+    }
+
+    /// 广播 inflight run 完成结果
+    pub fn broadcast_outcome(
+        &self,
+        conversation: &str,
+        identity: &str,
+        generation: u64,
+        outcome: RunOutcome,
+    ) {
+        let mut registry = self.inner.lock().unwrap();
+        if let Some(owner) = registry.owners.get_mut(conversation) {
+            if owner.identity == identity && owner.generation == generation {
+                if let Some(run) = owner.inflight.as_ref() {
+                    *run.outcome.lock().unwrap() = Some(outcome.clone());
+                    let _ = run.notify.send(outcome.clone());
+                    // 标记 state 为 Completed/Failed，保存 response_snapshot
+                    match &outcome {
+                        RunOutcome::Success(snapshot) => {
+                            if owner.state != SessionState::AwaitingToolResults {
+                                owner.state = SessionState::Completed;
+                            }
+                            owner.response_snapshot = Some(snapshot.clone());
+                        }
+                        RunOutcome::Failure(_) => {
+                            owner.state = SessionState::Failed;
+                        }
+                    }
+                }
+            }
+        }
+    }
+
+    /// 在 owner 锁内发布帧，防止旧 producer 污染同 digest 的新执行。
+    pub fn publish_if_current(
+        &self,
+        conversation: &str,
+        identity: &str,
+        generation: u64,
+        publish: impl FnOnce(&CursorEventJournal),
+    ) -> bool {
+        let registry = self.inner.lock().unwrap();
+        if !registry
+            .owners
+            .get(conversation)
+            .is_some_and(|owner| owner.identity == identity && owner.generation == generation)
+        {
+            return false;
+        }
+        publish(&self.journal);
+        true
+    }
+
+    /// 获取 journal 引用（用于在 handler 中直接记录事件）
+    pub fn journal(&self) -> &CursorEventJournal {
+        &self.journal
+    }
+
+    /// 清理 journal 中的旧 turn
+    pub fn cleanup_turn_journal(&self, turn_digest: &str) {
+        self.journal.remove(turn_digest);
     }
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    fn begin(sessions: &CursorSessions, conversation: &str, identity: &str, digest: &str) -> u64 {
+        let BeginOutcome::Started(generation, _) = sessions
+            .try_begin(
+                conversation,
+                identity,
+                String::new(),
+                String::new(),
+                digest.into(),
+            )
+            .unwrap()
+        else {
+            panic!("expected new run")
+        };
+        generation
+    }
 
     fn exec(id: u32, name: &str) -> ExecRequest {
         ExecRequest {
@@ -415,6 +814,65 @@ mod tests {
             content: "ok".into(),
             is_error: false,
         }
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn last_consumer_drop_starts_fresh_grace_and_parked_turn_survives() {
+        let sessions = CursorSessions::default();
+        let BeginOutcome::Started(generation, run) = sessions
+            .try_begin(
+                "conv",
+                "account",
+                "model".into(),
+                String::new(),
+                "digest".into(),
+            )
+            .unwrap()
+        else {
+            panic!("expected new run")
+        };
+        let first = sessions.create_consumer_guard("conv", "account", generation, &run);
+        let second = sessions.create_consumer_guard("conv", "account", generation, &run);
+        drop(second);
+        tokio::time::advance(Duration::from_secs(6)).await;
+        assert!(sessions
+            .cancellation("conv", "account", generation)
+            .is_some());
+        drop(first);
+        tokio::task::yield_now().await;
+        tokio::time::advance(Duration::from_secs(4)).await;
+        let (_, reconnect) = sessions
+            .try_join_inflight("conv", "account", "digest")
+            .unwrap();
+        tokio::time::advance(Duration::from_secs(2)).await;
+        assert!(sessions
+            .cancellation("conv", "account", generation)
+            .is_some());
+        drop(reconnect);
+        tokio::task::yield_now().await;
+        tokio::time::advance(Duration::from_secs(5)).await;
+        tokio::task::yield_now().await;
+        assert!(sessions
+            .cancellation("conv", "account", generation)
+            .is_none());
+
+        let generation = begin(&sessions, "parked", "account", "");
+        let (_, guard) = sessions.try_join_inflight("parked", "account", "").unwrap();
+        sessions
+            .inner
+            .lock()
+            .unwrap()
+            .owners
+            .get_mut("parked")
+            .unwrap()
+            .state = SessionState::AwaitingToolResults;
+        drop(guard);
+        tokio::task::yield_now().await;
+        tokio::time::advance(Duration::from_secs(6)).await;
+        tokio::task::yield_now().await;
+        assert!(sessions
+            .cancellation("parked", "account", generation)
+            .is_some());
     }
 
     #[test]
@@ -439,7 +897,7 @@ mod tests {
     #[test]
     fn checkpoint_rejects_stale_owner_and_account_replacement() {
         let sessions = CursorSessions::default();
-        let old = sessions.begin("conv", "account-a");
+        let old = begin(&sessions, "conv", "account-a", "first");
         assert!(sessions.record_checkpoint(
             "conv",
             "account-a",
@@ -448,7 +906,8 @@ mod tests {
             HashMap::new()
         ));
         assert!(sessions.checkpoint("conv", "account-b").is_none());
-        let new = sessions.begin("conv", "account-a");
+        sessions.finish("conv", "account-a", old);
+        let new = begin(&sessions, "conv", "account-a", "next");
         assert_ne!(new, old);
         assert!(!sessions.record_checkpoint("conv", "account-a", old, vec![9], HashMap::new()));
         assert_eq!(
@@ -457,17 +916,30 @@ mod tests {
         );
         sessions.cancel("conv", "account-a", old);
         assert!(sessions.record_checkpoint("conv", "account-a", new, vec![4], HashMap::new()));
-        sessions.begin("conv", "account-b");
+        begin(&sessions, "conv", "account-b", "first");
         assert!(sessions.checkpoint("conv", "account-a").is_none());
         assert!(sessions.checkpoint("conv", "account-b").is_none());
     }
 
-    #[test]
-    fn replacing_owner_cancels_previous_stream() {
+    #[tokio::test]
+    async fn replacing_owner_cancels_previous_stream() {
         let sessions = CursorSessions::default();
-        let first = sessions.begin("conv", "account-a");
+        let first = begin(&sessions, "conv", "account-a", "first");
         let receiver = sessions.cancellation("conv", "account-a", first).unwrap();
-        let second = sessions.begin("conv", "account-a");
+        assert!(sessions
+            .try_begin(
+                "conv",
+                "account-a",
+                String::new(),
+                String::new(),
+                "next".into()
+            )
+            .is_err());
+        let (_, guard) = sessions
+            .try_join_inflight("conv", "account-a", "first")
+            .unwrap();
+        drop(guard);
+        let second = begin(&sessions, "conv", "account-a", "next");
         assert!(*receiver.borrow());
         assert!(sessions.cancellation("conv", "account-a", first).is_none());
         assert!(!*sessions
@@ -481,10 +953,10 @@ mod tests {
     #[test]
     fn credential_replacement_evicts_old_stream_and_checkpoint() {
         let sessions = CursorSessions::default();
-        let old = sessions.begin("old", "account-a");
+        let old = begin(&sessions, "old", "account-a", "first");
         let receiver = sessions.cancellation("old", "account-a", old).unwrap();
         sessions.record_checkpoint("old", "account-a", old, vec![1], HashMap::new());
-        let current = sessions.begin("current", "account-b");
+        let current = begin(&sessions, "current", "account-b", "first");
         sessions.record_checkpoint("current", "account-b", current, vec![2], HashMap::new());
         sessions.retain_identity(Some("account-b"));
         assert!(*receiver.borrow());
@@ -500,7 +972,7 @@ mod tests {
     #[test]
     fn expired_checkpoint_and_owner_cannot_resume() {
         let sessions = CursorSessions::default();
-        let owner = sessions.begin("conv", "account-a");
+        let owner = begin(&sessions, "conv", "account-a", "first");
         sessions.record_checkpoint("conv", "account-a", owner, vec![1], HashMap::new());
         {
             let mut registry = sessions.inner.lock().unwrap();

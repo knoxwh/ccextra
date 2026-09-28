@@ -384,6 +384,87 @@ async fn call(state: AppState, body: Value) -> (StatusCode, String) {
 }
 
 #[tokio::test]
+async fn dropped_body_reconnects_to_same_upstream_without_duplicate_frames() {
+    use futures::StreamExt;
+    let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let url = format!("http://{}", listener.local_addr().unwrap());
+    let release = Arc::new(tokio::sync::Notify::new());
+    let gate = release.clone();
+    let server = tokio::spawn(async move {
+        let (socket, _) = listener.accept().await.unwrap();
+        let mut connection = h2::server::handshake(socket).await.unwrap();
+        let (request, mut response) = connection.accept().await.unwrap().unwrap();
+        let mut body = request.into_body();
+        let driver = tokio::spawn(async move { while connection.accept().await.is_some() {} });
+        let _ = body.data().await.unwrap().unwrap();
+        let mut sender = response.send_response(Response::new(()), false).unwrap();
+        sender.send_data(text_frame("first"), false).unwrap();
+        gate.notified().await;
+        sender.send_data(text_frame("second"), false).unwrap();
+        sender.send_data(end_frame(), true).unwrap();
+        let _ = tokio::time::timeout(Duration::from_secs(2), driver).await;
+    });
+    let (state, _dir) = fixture(url);
+    let response = http::app(state.clone())
+        .oneshot(request(prompt(true)))
+        .await
+        .unwrap();
+    let mut body = response.into_body().into_data_stream();
+    assert!(body
+        .next()
+        .await
+        .unwrap()
+        .unwrap()
+        .starts_with(b"event: message_start"));
+    drop(body);
+    let response = http::app(state.clone())
+        .oneshot(request(prompt(true)))
+        .await
+        .unwrap();
+    assert_eq!(response.status(), StatusCode::OK);
+    release.notify_one();
+    let bytes = tokio::time::timeout(
+        Duration::from_secs(3),
+        to_bytes(response.into_body(), 65536),
+    )
+    .await
+    .unwrap()
+    .unwrap();
+    let text = String::from_utf8(bytes.to_vec()).unwrap();
+    assert!(text.contains("first") && text.contains("second"), "{text}");
+    assert_eq!(text.matches("event: message_start\n").count(), 1);
+    assert_eq!(text.matches("event: message_stop\n").count(), 1);
+    let replay = call(state, prompt(true)).await;
+    assert_eq!(replay.1, text);
+    server.abort();
+}
+
+#[tokio::test]
+async fn identical_requests_share_run_and_replay_completed_json_and_sse() {
+    for stream in [false, true] {
+        let (url, server, calls) = mock_upstream(vec![Scenario::Success]).await;
+        let (state, _dir) = fixture(url);
+        let (first, second) = tokio::join!(
+            call(state.clone(), prompt(stream)),
+            call(state.clone(), prompt(stream)),
+        );
+        assert_eq!(first.0, StatusCode::OK, "{}", first.1);
+        assert_eq!(second, first);
+        let replay = call(state, prompt(stream)).await;
+        assert_eq!(replay, first);
+        if stream {
+            assert_eq!(replay.1.matches("event: message_start\n").count(), 1);
+            assert_eq!(replay.1.matches("event: message_stop\n").count(), 1);
+        } else {
+            let value: Value = serde_json::from_str(&replay.1).unwrap();
+            assert_eq!(value["content"][0]["text"], "pong");
+        }
+        assert_eq!(calls.load(std::sync::atomic::Ordering::SeqCst), 1);
+        server.abort();
+    }
+}
+
+#[tokio::test]
 async fn text_roundtrip_json_and_sse_end_at_connect_trailer() {
     let (url, server, calls) = mock_upstream(vec![Scenario::Success, Scenario::Success]).await;
     let (state, _dir) = fixture(url);
@@ -462,7 +543,19 @@ async fn parked_stream_handles_controls_before_multiple_tool_results_resume() {
             { "type": "tool_result", "tool_use_id": "call-a", "content": "A" },
         ] },
     ]);
-    let (status, body) = call(state, first).await;
+    let mut invalid = first.clone();
+    invalid["messages"][2]["content"][0]["tool_use_id"] = json!("unknown");
+    assert_eq!(
+        call(state.clone(), invalid).await.0,
+        StatusCode::BAD_REQUEST
+    );
+    let (resumed, duplicate) = tokio::join!(
+        call(state.clone(), first.clone()),
+        call(state.clone(), first.clone()),
+    );
+    assert_eq!(resumed, duplicate);
+    assert_eq!(call(state, first).await, resumed);
+    let (status, body) = resumed;
     assert_eq!(status, StatusCode::OK, "{body}");
     let data: Value = serde_json::from_str(&body).unwrap();
     assert_eq!(data["stop_reason"], "end_turn");

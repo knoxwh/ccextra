@@ -3,6 +3,7 @@ pub mod credential;
 pub mod drive;
 pub mod error;
 pub mod handler;
+mod journal;
 pub mod login;
 pub mod models;
 pub mod oauth;

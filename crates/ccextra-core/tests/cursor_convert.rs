@@ -1,8 +1,8 @@
 use ccextra_core::convert::cursor::proto::{
     decode_agent_server_message, decode_fields, decode_get_usable_models_response, encode_bytes,
-    encode_get_usable_models_request, encode_tag, encode_varint, generated, parse_connect_end_stream,
-    ConnectError, ConnectFrame, ConnectFrameDecoder, ConnectFrameError, ExecKind, Field,
-    ServerMessage, CONNECT_COMPRESSION_FLAG, CONNECT_END_STREAM_FLAG,
+    encode_get_usable_models_request, encode_tag, encode_varint, generated,
+    parse_connect_end_stream, ConnectError, ConnectFrame, ConnectFrameDecoder, ConnectFrameError,
+    ExecKind, Field, ServerMessage, CONNECT_COMPRESSION_FLAG, CONNECT_END_STREAM_FLAG,
 };
 use ccextra_core::convert::cursor::{build_run_request, conversation_id};
 use flate2::{write::GzEncoder, Compression};

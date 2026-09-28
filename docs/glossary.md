@@ -15,6 +15,7 @@
 | `cursor` | Cursor AgentService 的独立 Connect-RPC 协议；支持单凭证 OAuth、动态模型目录和 Run JSON/SSE 转换。 |
 | SSE | `text/event-stream` 响应格式；ccextra 将所有流式路径输出为 Anthropic SSE。 |
 | 非流响应 | `stream` 为 `false` 或缺失时的单个 JSON 响应。 |
+| 会话输入用量缓存 | 按 session 保存上游真实输入 token 数，供下一轮流首和 count_tokens 使用。Chat/Responses/Gemini/Antigravity 的原始 SSE 正数输入用量也会写回；缺失或零值不覆盖旧值，占位值不写回。记录写入后 30 分钟过期，最多 512 条。 |
 
 xAI Grok 与 Codex 不是 protocol。它们使用 OAuth 凭证动态创建 `openai_responses` provider。
 
@@ -74,7 +75,10 @@ Anthropic 推理内容。目标协议会映射为 `reasoning_effort`、reasoning
 Cursor Run 响应以 flags `0x02` 的 JSON 结束帧报告成功或错误。单纯 EOF 不表示成功；成功 trailer 到达前，状态机不会输出正常终态。
 
 **Cursor MCP 续接**
-Cursor 工具调用关联 `exec_msg_id`、`exec_id` 和 `tool_call_id`。有稳定会话 ID 时，客户端下一请求的全部文本 `tool_result` 必须按 `tool_use_id` 匹配驻留上游流的 pending 调用；闲置 5 分钟后改用历史展平的冷路径。
+Cursor 工具调用关联 `exec_msg_id`、`exec_id` 和 `tool_call_id`。有稳定会话 ID 时，客户端下一请求的全部文本 `tool_result` 必须按 `tool_use_id` 匹配驻留上游流的 pending 调用，并保持模型与工具目录一致。闲置 5 分钟过期；会话丢失的续接返回 400，不重开上游。相同 continuation digest 共享执行。
+
+**Cursor replay 与断线宽限期**
+同会话同 digest 的 JSON/SSE 请求复用已有执行结果。后台 producer 独立消费上游，最后一个消费者断开后等待 5 秒再取消；驻留工具会话沿用 5 分钟 TTL。内存 journal 的帧数据预算为 64 MiB，TTL 10 分钟；驱逐后返回 `cursor_replay_unavailable`，不发送残缺的成功重放。该预算不包含 JSON 快照、checkpoint/blob。持久化延期，重启不恢复会话。
 
 ## 缓存稳定化
 

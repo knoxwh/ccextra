@@ -193,10 +193,12 @@ fn relay_with_replay_tap<S>(
     tool_names: Option<Arc<HashMap<String, String>>>,
     replay_scope: Option<(crate::sse::replay_cache::ReplayCache, String, String)>,
     signature_model: Option<Arc<str>>,
+    token_scope: Option<crate::http::session_tokens::TokenCacheScope>,
 ) -> SseStreamPin
 where
     S: futures::Stream<Item = Result<Bytes, reqwest::Error>> + Send + 'static,
 {
+    let stream = crate::http::session_tokens::tap_input_tokens(stream, protocol, token_scope);
     match replay_scope {
         Some((cache, key, request_fingerprint)) => {
             let mut extractor = StreamReplayExtractor::new(cache, key, request_fingerprint);
@@ -280,6 +282,7 @@ pub(crate) struct PreparedMessageRequest {
     pub tool_names: Option<Arc<HashMap<String, String>>>,
     pub replay_scope: Option<(crate::sse::replay_cache::ReplayCache, String, String)>,
     pub signature_model: Option<Arc<str>>,
+    pub token_scope: Option<crate::http::session_tokens::TokenCacheScope>,
 }
 
 pub(crate) struct ExecutedUpstream {
@@ -746,6 +749,8 @@ pub(crate) async fn prepare_message_request(
         tool_names,
         replay_scope,
         signature_model,
+        token_scope: session_id
+            .map(|session| (Arc::clone(&state.last_input_tokens), session.to_string())),
     })
 }
 
@@ -836,6 +841,7 @@ pub(crate) async fn execute_upstream_request(
                 prepared.tool_names.clone(),
                 prepared.replay_scope.clone(),
                 prepared.signature_model.clone(),
+                prepared.token_scope.clone(),
             );
             // 首帧只认业务帧:跳过心跳注释帧,防 keepalive 骗过错误检测提前提交 200
             let first = next_business_frame(&mut out).await;
@@ -972,6 +978,7 @@ pub(crate) async fn deliver_response(
                 prepared.tool_names.clone(),
                 prepared.replay_scope.clone(),
                 prepared.signature_model.clone(),
+                prepared.token_scope.clone(),
             )
         };
         Ok(Response::builder()
