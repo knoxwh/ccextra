@@ -99,7 +99,144 @@ pub fn convert_messages(
         }
     }
 
-    merge_adjacent_gemini_contents(contents)
+    // 对齐 CPA 3de5709d:Antigravity claude 模型先拆分 functionResponse 回合
+    // 再合并纯 user 回合;其余路径保持 MergeAdjacentGeminiContents
+    if antigravity && upstream_model.to_lowercase().contains("claude") {
+        merge_adjacent_gemini_user_contents(split_gemini_function_response_turns(contents))
+    } else {
+        merge_adjacent_gemini_contents(contents)
+    }
+}
+
+/// 对齐 CPA SplitGeminiFunctionResponseTurns:混合 user 回合内 functionResponse
+/// parts 拆为独立回合;紧跟含 functionCall 的 model 回合的连续 user 回合中,
+/// functionResponse 回合提升到纯文本/reminder 回合之前,保证紧邻 model 回合。
+fn split_gemini_function_response_turns(contents: Vec<Value>) -> Vec<Value> {
+    if contents.is_empty() {
+        return contents;
+    }
+    let mut split = Vec::with_capacity(contents.len());
+    for content in contents {
+        let is_user = content.get("role").and_then(|r| r.as_str()) == Some("user");
+        let parts = content.get("parts").and_then(|p| p.as_array());
+        if !is_user || !parts.is_some_and(|p| p.iter().any(is_function_response_part)) {
+            split.push(content);
+            continue;
+        }
+        let parts = parts.unwrap();
+        let mut response_parts = Vec::new();
+        let mut other_parts = Vec::new();
+        for part in parts {
+            if is_function_response_part(part) {
+                response_parts.push(part.clone());
+            } else {
+                other_parts.push(part.clone());
+            }
+        }
+        if !response_parts.is_empty() {
+            split.push(json!({ "role": "user", "parts": response_parts }));
+        }
+        if !other_parts.is_empty() {
+            split.push(json!({ "role": "user", "parts": other_parts }));
+        }
+    }
+
+    // 紧跟含 functionCall 的 model 回合的连续 user 回合:合并全部 functionResponse
+    // parts 为单回合置于最前,其余回合顺延
+    let mut out = Vec::with_capacity(split.len());
+    let mut index = 0;
+    while index < split.len() {
+        if split[index].get("role").and_then(|r| r.as_str()) != Some("user") {
+            out.push(split[index].clone());
+            index += 1;
+            continue;
+        }
+        let start = index;
+        while index < split.len()
+            && split[index].get("role").and_then(|r| r.as_str()) == Some("user")
+        {
+            index += 1;
+        }
+        let user_run = &split[start..index];
+        let preceding_model_has_fc = out.last().is_some_and(|content| {
+            content.get("role").and_then(|r| r.as_str()) == Some("model")
+                && content
+                    .get("parts")
+                    .and_then(|parts| parts.as_array())
+                    .is_some_and(|parts| {
+                        parts.iter().any(|part| part.get("functionCall").is_some())
+                    })
+        });
+        let run_has_fr = user_run.iter().any(content_has_gemini_function_response);
+
+        if preceding_model_has_fc && run_has_fr && user_run.len() > 1 {
+            let mut combined_fr_parts = Vec::new();
+            let mut other_turns = Vec::new();
+            for turn in user_run {
+                if content_has_gemini_function_response(turn) {
+                    if let Some(parts) = turn.get("parts").and_then(|p| p.as_array()) {
+                        combined_fr_parts.extend(parts.iter().cloned());
+                    }
+                } else {
+                    other_turns.push(turn.clone());
+                }
+            }
+            if !combined_fr_parts.is_empty() {
+                out.push(json!({ "role": "user", "parts": combined_fr_parts }));
+            }
+            out.extend(other_turns);
+        } else {
+            out.extend(user_run.iter().cloned());
+        }
+    }
+    out
+}
+
+/// 回合是否含 functionResponse part(对齐 CPA ContentHasGeminiFunctionResponse)
+fn content_has_gemini_function_response(content: &Value) -> bool {
+    content
+        .get("parts")
+        .and_then(|p| p.as_array())
+        .is_some_and(|parts| parts.iter().any(is_function_response_part))
+}
+
+/// part 是否为 functionResponse(兼容 function_response 蛇形键)
+fn is_function_response_part(part: &Value) -> bool {
+    part.get("functionResponse").is_some() || part.get("function_response").is_some()
+}
+
+/// 对齐 CPA MergeAdjacentGeminiUserContents:仅合并都不含 functionResponse 的
+/// 相邻 user 回合,不做 parts 重排
+fn merge_adjacent_gemini_user_contents(contents: Vec<Value>) -> Vec<Value> {
+    if contents.len() <= 1 {
+        return contents;
+    }
+    let mut merged: Vec<Value> = Vec::with_capacity(contents.len());
+    for content in contents {
+        let role = content.get("role").and_then(|r| r.as_str()).unwrap_or("");
+        let Some(parts) = content.get("parts").and_then(|p| p.as_array()) else {
+            continue;
+        };
+        if parts.is_empty() {
+            continue;
+        }
+
+        if let Some(last) = merged.last_mut() {
+            let last_role = last.get("role").and_then(|r| r.as_str()).unwrap_or("");
+            if last_role == "user"
+                && role == "user"
+                && !content_has_gemini_function_response(last)
+                && !content_has_gemini_function_response(&content)
+            {
+                if let Some(last_parts) = last.get_mut("parts").and_then(|p| p.as_array_mut()) {
+                    last_parts.extend(parts.iter().cloned());
+                    continue;
+                }
+            }
+        }
+        merged.push(content);
+    }
+    merged
 }
 
 /// 合并连续相邻的 user content 回合(对齐 CPA MergeAdjacentGeminiContents)。
@@ -1018,6 +1155,106 @@ mod tests {
         let user_parts = contents[1]["parts"].as_array().unwrap();
         // text 已在前,无需重排
         assert_eq!(user_parts[0]["text"], "leading text");
+        assert!(user_parts[1]["functionResponse"].is_object());
+    }
+
+    #[test]
+    fn test_function_response_stays_adjacent_to_model_turn() {
+        let messages = vec![
+            json!({
+                "role": "assistant",
+                "content": [{
+                    "type": "tool_use",
+                    "id": "Read-1",
+                    "name": "Read",
+                    "input": {}
+                }]
+            }),
+            json!({
+                "role": "system",
+                "content": "continue after tool"
+            }),
+            json!({
+                "role": "user",
+                "content": [{
+                    "type": "tool_result",
+                    "tool_use_id": "Read-1",
+                    "content": "ok"
+                }]
+            }),
+        ];
+        let contents = convert_messages(&messages, &HashMap::new(), true, "claude-sonnet");
+
+        assert_eq!(contents[1]["role"], "user");
+        assert!(contents[1]["parts"][0]["functionResponse"].is_object());
+        assert_eq!(
+            contents[2]["parts"][0]["text"],
+            "<system-reminder>\ncontinue after tool\n</system-reminder>"
+        );
+    }
+
+    #[test]
+    fn test_antigravity_claude_splits_mixed_user_turn() {
+        // 对齐 CPA 3de5709d:混合 user 回合拆分后 functionResponse 回合在前
+        let messages = vec![
+            json!({
+                "role": "assistant",
+                "content": [{
+                    "type": "tool_use",
+                    "id": "Read-1",
+                    "name": "Read",
+                    "input": {}
+                }]
+            }),
+            json!({
+                "role": "user",
+                "content": [
+                    {"type": "text", "text": "note"},
+                    {"type": "tool_result", "tool_use_id": "Read-1", "content": "ok"}
+                ]
+            }),
+        ];
+        let contents = convert_messages(&messages, &HashMap::new(), true, "claude-sonnet");
+
+        assert_eq!(contents.len(), 3);
+        assert!(contents[1]["parts"][0]["functionResponse"].is_object());
+        assert_eq!(contents[2]["parts"][0]["text"], "note");
+    }
+
+    #[test]
+    fn test_antigravity_non_claude_keeps_merge_reorder() {
+        // 非 claude 模型维持 MergeAdjacentGeminiContents:合并 + text 重排在前
+        let messages = vec![
+            json!({
+                "role": "assistant",
+                "content": [{
+                    "type": "tool_use",
+                    "id": "Read-1",
+                    "name": "Read",
+                    "input": {}
+                }]
+            }),
+            json!({
+                "role": "system",
+                "content": "continue after tool"
+            }),
+            json!({
+                "role": "user",
+                "content": [{
+                    "type": "tool_result",
+                    "tool_use_id": "Read-1",
+                    "content": "ok"
+                }]
+            }),
+        ];
+        let contents = convert_messages(&messages, &HashMap::new(), true, "gemini-3.5-pro");
+
+        assert_eq!(contents.len(), 2);
+        let user_parts = contents[1]["parts"].as_array().unwrap();
+        assert_eq!(
+            user_parts[0]["text"],
+            "<system-reminder>\ncontinue after tool\n</system-reminder>"
+        );
         assert!(user_parts[1]["functionResponse"].is_object());
     }
 
