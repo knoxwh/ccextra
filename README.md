@@ -146,6 +146,7 @@ curl -H "Authorization: Bearer $ANTHROPIC_AUTH_TOKEN" \
 - `prompt_cache_key` 只用于 OpenAI 路径，取 Claude Code 会话 ID，且不覆盖已有非空值。
 - `models_file` 指向 reasoning 级别表（默认配置文件旁 `models.json`，不入 git，可从 [models.json.example](models.json.example) 复制后按需修改），按上游模型 `id` 精确匹配，把入站 effort 钳到该模型支持的最近档；缺文件或未收录的模型不钳。条目可加 `force_effort`：凡钳制会介入的 effort 一律改写为该固定值（不钳制），`*claude*` 原生模型与显式关闭思考的请求不受影响。Cursor 的动态目录不使用 `models_file`。
 - `cursor_auth_dir` 默认配置文件旁 `.cache/cursor`；`cursor_base_url` 默认 `https://api2.cursor.sh`，`cursor_client_version` 默认 `cli-2026.02.13-41ac335`。`cursor_default_model` 仅在目录不含 `auto` 时指定回退模型，必须由目录广告。四个字段均为顶层配置；不需手写 Cursor provider。
+- `cursor_models` 与 `antigravity_models` 为模型白名单（顶层配置，glob 或精确名，如 `["claude-opus-5-5-*", "gpt-5.2"]`）；缺省或空列表发布全量目录。过滤在动态目录加载时按上游模型名匹配，过滤后为空视为加载失败：Cursor 保留旧目录，Antigravity 该凭证发布空模型列表。`/reload` 与 3 小时后台刷新均生效。
 
 <details>
 <summary>进阶选项</summary>
@@ -202,6 +203,7 @@ curl -H "Authorization: Bearer $ANTHROPIC_AUTH_TOKEN" \
 ./scripts/check_antigravity_quota.sh
 ./scripts/check_grok_quota.sh
 ./scripts/check_codex_quota.sh
+./scripts/check_cursor_quota.sh
 ```
 
 Antigravity 凭证默认在配置文件旁 `.cache/antigravity`，xAI 在 `.cache/xai`，Codex 在 `.cache/codex`，Cursor 在 `.cache/cursor`。xAI、Codex 和 Cursor 启动时自动发现；Cursor `GetUsableModels` 成功才发布模型目录；`/reload` 拉取失败时，仅凭证目录和账号不变才保留旧目录，新配置的模型别名优先。后台刷新失败保留已发布目录。Antigravity 后台加载并每 3 小时刷新模型。Codex 登录使用 PKCE 浏览器授权（本地回调端口默认 1455，可用 `--callback-port` 覆盖），token 提前 24 小时刷新。

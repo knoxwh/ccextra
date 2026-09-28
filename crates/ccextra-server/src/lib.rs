@@ -10,6 +10,7 @@ pub mod upstream;
 pub mod xai;
 
 mod limits;
+mod model_filter;
 #[cfg(test)]
 mod test_support;
 

@@ -292,6 +292,7 @@ async fn main() -> Result<()> {
             let antigravity_providers = ccextra_server::antigravity::load_antigravity_providers(
                 &antigravity_auth_dir,
                 cfg.server.proxy_url.as_deref(),
+                cfg.antigravity_models.as_deref().unwrap_or(&[]),
             )
             .await;
 
@@ -528,6 +529,8 @@ fn provider_refresh_config(config_path: &str, config: &Config) -> ProviderRefres
         cursor_base_url: config.cursor_base_url.clone(),
         cursor_client_version: config.cursor_client_version.clone(),
         cursor_default_model: config.cursor_default_model.clone(),
+        antigravity_models: config.antigravity_models.clone(),
+        cursor_models: config.cursor_models.clone(),
         proxy_url: config.server.proxy_url.clone(),
         static_providers: config.providers.clone(),
     }
@@ -545,6 +548,7 @@ async fn load_cursor_from_refresh(
         refresh.cursor_client_version.as_deref(),
         refresh.cursor_default_model.as_deref(),
         refresh.proxy_url.as_deref(),
+        refresh.cursor_models.as_deref().unwrap_or(&[]),
     )
     .await
 }
@@ -565,6 +569,7 @@ async fn load_refreshed_providers(refresh: ProviderRefreshConfig) -> Option<Vec<
     let injected = ccextra_server::antigravity::load_antigravity_providers(
         auth_dir,
         refresh.proxy_url.as_deref(),
+        refresh.antigravity_models.as_deref().unwrap_or(&[]),
     )
     .await;
     if injected.is_empty() {

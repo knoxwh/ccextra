@@ -3,10 +3,12 @@ use crate::antigravity::{constants, models, refresh, store};
 use ccextra_core::route::{Protocol, ProviderConfig};
 use std::path::Path;
 
-/// 从 auth_dir 扫描 antigravity 凭证，为每个有效凭证生成一个 provider
+/// 从 auth_dir 扫描 antigravity 凭证，为每个有效凭证生成一个 provider；
+/// filter 为模型白名单(空 = 全量)
 pub async fn load_antigravity_providers(
     auth_dir: &Path,
     proxy_url: Option<&str>,
+    filter: &[String],
 ) -> Vec<ProviderConfig> {
     let mut providers = Vec::new();
 
@@ -65,7 +67,9 @@ pub async fn load_antigravity_providers(
         };
 
         let models =
-            match models::fetch_models(&cred.access_token, project_id_ref, proxy_url, None).await {
+            match models::fetch_models(&cred.access_token, project_id_ref, proxy_url, None, filter)
+                .await
+            {
                 Ok(m) => {
                     tracing::info!("为 {} 获取了 {} 个模型", cred.email, m.len());
                     m

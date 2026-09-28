@@ -42,6 +42,12 @@ pub struct Config {
     /// Antigravity 连接池配置(可选);默认短连接
     #[serde(default)]
     pub antigravity: Option<AntigravityConfig>,
+    /// Antigravity 模型白名单(可选);glob 或精确名,缺省/空 = 全量
+    #[serde(default)]
+    pub antigravity_models: Option<Vec<String>>,
+    /// Cursor 模型白名单(可选);glob 或精确名,缺省/空 = 全量
+    #[serde(default)]
+    pub cursor_models: Option<Vec<String>>,
     /// User-Agent 覆盖(可选);缺失时用默认值
     #[serde(default)]
     pub user_agents: Option<UserAgents>,

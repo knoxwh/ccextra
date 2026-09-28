@@ -14,10 +14,19 @@ pub async fn fetch_models(
     project_id: Option<&str>,
     proxy_url: Option<&str>,
     user_agent: Option<&str>,
+    filter: &[String],
 ) -> Result<Vec<ModelConfig>> {
     // 对齐 CLIProxyAPI: daily 优先, prod 其次, sandbox 兜底
     let base_urls = [DAILY_API_ENDPOINT, API_ENDPOINT, SANDBOX_DAILY_API_ENDPOINT];
-    fetch_models_from(&base_urls, access_token, project_id, proxy_url, user_agent).await
+    fetch_models_from(
+        &base_urls,
+        access_token,
+        project_id,
+        proxy_url,
+        user_agent,
+        filter,
+    )
+    .await
 }
 
 /// 按给定端点顺序拉取模型列表;URL 参数化便于接线测试
@@ -27,6 +36,7 @@ pub(crate) async fn fetch_models_from(
     project_id: Option<&str>,
     proxy_url: Option<&str>,
     user_agent: Option<&str>,
+    filter: &[String],
 ) -> Result<Vec<ModelConfig>> {
     let client = oauth::http_client(proxy_url)?;
     let ua = user_agent.unwrap_or(super::constants::REQUEST_UA);
@@ -85,15 +95,15 @@ pub(crate) async fn fetch_models_from(
                 }
             };
 
-            return parse_models(&body);
+            return parse_models(&body, filter);
         }
     }
 
     Err(anyhow!("无法从任何 Antigravity 端点获取模型列表"))
 }
 
-/// 解析 Antigravity API 返回的模型列表
-fn parse_models(body: &Value) -> Result<Vec<ModelConfig>> {
+/// 解析 Antigravity API 返回的模型列表;filter 为白名单(空 = 全量)
+fn parse_models(body: &Value, filter: &[String]) -> Result<Vec<ModelConfig>> {
     let models_obj = body
         .get("models")
         .and_then(|v| v.as_object())
@@ -149,6 +159,12 @@ fn parse_models(body: &Value) -> Result<Vec<ModelConfig>> {
         return Err(anyhow!("没有找到可用模型"));
     }
 
+    // 白名单过滤;过滤后为空同样报错,调用方按现有语义处理
+    let models = crate::model_filter::filter_models(models, filter);
+    if models.is_empty() {
+        return Err(anyhow!("Antigravity 模型过滤后为空"));
+    }
+
     Ok(models)
 }
 
@@ -186,7 +202,7 @@ mod tests {
             }
         });
 
-        let models = parse_models(&body).unwrap();
+        let models = parse_models(&body, &[]).unwrap();
         assert_eq!(models.len(), 2);
 
         let names: Vec<&str> = models.iter().map(|m| m.name.as_str()).collect();
@@ -224,6 +240,7 @@ mod tests {
                 None,
                 Some("direct"),
                 None,
+                &[],
             )
             .await
             .unwrap();
@@ -254,10 +271,33 @@ mod tests {
         let ok_base = spawn_ok_models_server().await;
         let bases = [format!("http://{addr}"), ok_base.url.clone()];
         let base_refs: Vec<&str> = bases.iter().map(String::as_str).collect();
-        let models = fetch_models_from(&base_refs, "tok", None, None, None)
+        let models = fetch_models_from(&base_refs, "tok", None, None, None, &[])
             .await
             .unwrap();
         assert_eq!(models.len(), 1);
         assert_eq!(models[0].name, "gemini-3.8-flash-high");
+    }
+
+    /// 白名单过滤:glob 命中保留,未命中丢弃;过滤后为空报错
+    #[tokio::test]
+    async fn filter_keeps_matching_models_only() {
+        let server = TestServer::reply(
+            StatusCode::OK,
+            r#"{"models":{"gemini-3.8-flash-high":{},"gemini-3.1-pro":{}}}"#,
+        )
+        .await;
+        let filter: Vec<String> = vec!["gemini-3.8-*".into()];
+        let models = fetch_models_from(&[&server.url], "tok", None, None, None, &filter)
+            .await
+            .unwrap();
+        assert_eq!(models.len(), 1);
+        assert_eq!(models[0].name, "gemini-3.8-flash-high");
+
+        let no_match: Vec<String> = vec!["zzz-*".into()];
+        assert!(
+            fetch_models_from(&[&server.url], "tok", None, None, None, &no_match)
+                .await
+                .is_err()
+        );
     }
 }

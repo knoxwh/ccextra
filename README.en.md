@@ -146,6 +146,7 @@ See [config.example.yaml](config.example.yaml) for every field. Key points:
 - `prompt_cache_key` applies only to OpenAI paths, uses Claude Code session ID, and never replaces a nonempty key.
 - `models_file` points at the reasoning-level table (default `models.json` next to the config; not tracked by git — copy [models.json.example](models.json.example) and edit as needed). Exact `id` match clamps inbound effort to the nearest supported level; missing file or unknown models leave effort unchanged. An entry may set `force_effort`: wherever clamping would apply, effort is rewritten to this fixed value (unclamped); native `*claude*` models and requests with thinking explicitly disabled are unaffected. Cursor's dynamic catalog does not use `models_file`.
 - `cursor_auth_dir` defaults to `.cache/cursor` next to the config. `cursor_base_url` defaults to `https://api2.cursor.sh`; `cursor_client_version` defaults to `cli-2026.02.13-41ac335`. `cursor_default_model` specifies an advertised fallback only if the catalog does not advertise `auto`. Set these at the top level, not in `providers`; no static Cursor provider is needed.
+- `cursor_models` and `antigravity_models` are model allowlists (top-level, glob or exact names, e.g. `["claude-opus-5-5-*", "gpt-5.2"]`); absent or empty publishes the full catalog. Filtering happens at dynamic catalog load against upstream model names; an empty result counts as a load failure: Cursor keeps the prior catalog, Antigravity publishes an empty model list for that credential. Applies to `/reload` and the three-hour background refresh.
 
 <details>
 <summary>Advanced options</summary>
@@ -202,6 +203,7 @@ Log in to an upstream or inspect saved credential status:
 ./scripts/check_antigravity_quota.sh
 ./scripts/check_grok_quota.sh
 ./scripts/check_codex_quota.sh
+./scripts/check_cursor_quota.sh
 ```
 
 Antigravity credentials default to `.cache/antigravity` next to the config; xAI uses `.cache/xai`, Codex `.cache/codex`, and Cursor `.cache/cursor`. xAI, Codex, and Cursor are discovered at startup; Cursor publishes models only after `GetUsableModels` succeeds. On a failed `/reload` discovery, it keeps the prior catalog only if the credential directory and account are unchanged; aliases from new static providers take priority. Background refresh failures keep the published catalog. Antigravity loads in the background and refreshes models every three hours. Codex login uses PKCE browser authorization (local callback port defaults to 1455, override with `--callback-port`); tokens refresh 24 hours ahead of expiry.

@@ -92,6 +92,10 @@ pub struct ProviderRefreshConfig {
     pub cursor_base_url: Option<String>,
     pub cursor_client_version: Option<String>,
     pub cursor_default_model: Option<String>,
+    /// Antigravity 模型白名单;空 = 全量
+    pub antigravity_models: Option<Vec<String>>,
+    /// Cursor 模型白名单;空 = 全量
+    pub cursor_models: Option<Vec<String>>,
     pub proxy_url: Option<String>,
     pub static_providers: Vec<ProviderConfig>,
 }

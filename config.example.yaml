@@ -34,6 +34,14 @@ secret_key: "sk-ccextra-xxx"
 # cursor_client_version: "cli-2026.02.13-41ac335"
 # auto 未被模型目录广告时才使用的明确回退模型(必须在目录中)。
 # cursor_default_model: "composer-2"
+# Cursor 模型白名单(可选)。glob 或精确名;缺省/空 = 全量发布。
+# cursor_models:
+#   - "claude-opus-5-5-*"
+#   - "gpt-5.2"
+
+# Antigravity 模型白名单(可选)。语义同 cursor_models。
+# antigravity_models:
+#   - "gemini-3.8-flash-*"
 
 # reasoning 级别注册表(可选)。相对配置文件解析,默认同目录 models.json。
 # 缺文件 = 不钳制 effort;/reload 会重读。示例见仓库根 models.json。

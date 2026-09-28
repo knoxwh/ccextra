@@ -10,6 +10,7 @@ pub async fn fetch_models(
     client_version: &str,
     access_token: &str,
     proxy_url: Option<&str>,
+    filter: &[String],
 ) -> Result<Vec<ModelConfig>> {
     let client = oauth::http_client(proxy_url)?;
     let url = format!("{}{MODELS_PATH}", base_url.trim_end_matches('/'));
@@ -48,6 +49,11 @@ pub async fn fetch_models(
     if models.is_empty() {
         return Err(anyhow!("Cursor 未返回可用模型"));
     }
+    // 白名单过滤;过滤后为空同样不发布,保留旧目录
+    let models = crate::model_filter::filter_models(models, filter);
+    if models.is_empty() {
+        return Err(anyhow!("Cursor 模型过滤后为空"));
+    }
     Ok(models)
 }
 
@@ -65,7 +71,7 @@ mod tests {
             b"\x0a\x0c\x0a\x0acomposer-2".as_slice(),
         )
         .await;
-        let models = fetch_models(&server.url, "cli-test", "token", None)
+        let models = fetch_models(&server.url, "cli-test", "token", None, &[])
             .await
             .unwrap();
         assert_eq!(models[0].name, "composer-2");
@@ -90,13 +96,34 @@ mod tests {
     #[tokio::test]
     async fn empty_or_failed_catalog_is_not_published() {
         let (server, _) = spawn_captured_server(MODELS_PATH, StatusCode::OK, b"".as_slice()).await;
-        assert!(fetch_models(&server.url, "cli-test", "token", None)
+        assert!(fetch_models(&server.url, "cli-test", "token", None, &[])
             .await
             .is_err());
         let (server, _) =
             spawn_captured_server(MODELS_PATH, StatusCode::BAD_GATEWAY, b"failed".as_slice()).await;
-        assert!(fetch_models(&server.url, "cli-test", "token", None)
+        assert!(fetch_models(&server.url, "cli-test", "token", None, &[])
             .await
             .is_err());
+    }
+
+    /// 白名单过滤:glob 命中保留,未命中丢弃;过滤后为空报错不发布
+    #[tokio::test]
+    async fn filter_keeps_matching_models_only() {
+        // 两个模型:composer-2 与 gpt-5.2
+        let body = b"\x0a\x0c\x0a\x0acomposer-2\x0a\x09\x0a\x07gpt-5.2".as_slice();
+        let (server, _) = spawn_captured_server(MODELS_PATH, StatusCode::OK, body).await;
+        let filter: Vec<String> = vec!["composer-*".into()];
+        let models = fetch_models(&server.url, "cli-test", "token", None, &filter)
+            .await
+            .unwrap();
+        assert_eq!(models.len(), 1);
+        assert_eq!(models[0].name, "composer-2");
+
+        let no_match: Vec<String> = vec!["zzz-*".into()];
+        assert!(
+            fetch_models(&server.url, "cli-test", "token", None, &no_match)
+                .await
+                .is_err()
+        );
     }
 }

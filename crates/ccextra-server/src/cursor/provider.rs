@@ -21,6 +21,7 @@ pub async fn load_cursor_provider(
     client_version: Option<&str>,
     default_model: Option<&str>,
     proxy_url: Option<&str>,
+    filter: &[String],
 ) -> Result<Option<ProviderConfig>> {
     if !store::credential_path(auth_dir).exists() {
         return Ok(None);
@@ -28,8 +29,14 @@ pub async fn load_cursor_provider(
     let cred = refresh::ensure_credential_fresh(auth_dir, proxy_url, None).await?;
     let base_url = base_url.unwrap_or(constants::DEFAULT_BASE_URL);
     let client_version = client_version.unwrap_or(constants::DEFAULT_CLIENT_VERSION);
-    let models =
-        models::fetch_models(base_url, client_version, &cred.access_token, proxy_url).await?;
+    let models = models::fetch_models(
+        base_url,
+        client_version,
+        &cred.access_token,
+        proxy_url,
+        filter,
+    )
+    .await?;
 
     let fingerprint = credential_fingerprint(&cred);
     let mut metadata = std::collections::HashMap::new();
