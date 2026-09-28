@@ -41,6 +41,25 @@ fn stream_headers(protocol: Protocol, is_stream: bool) -> Vec<(&'static str, &'s
     ]
 }
 
+/// 对齐 codex rust-v0.155.0 build_routing_hint_header 与 CPA b97f71da/dd3b657b:
+/// ChatGPT 后端(Codex OAuth 订阅)Responses 请求携带 `model=<解析后模型>`,
+/// body 存在非空 `service_tier` 时追加 `;tier=<值>`。必须在压缩前从最终
+/// body 构造;入站同名头(操作员覆盖)由 extra_headers 后置覆盖。
+fn codex_routing_hint(upstream_model: &str, body: &serde_json::Value) -> Option<String> {
+    if !is_gpt_model(upstream_model) {
+        return None;
+    }
+    let mut hint = format!("model={upstream_model}");
+    if let Some(tier) = body.get("service_tier").and_then(|v| v.as_str()) {
+        let tier = tier.trim();
+        if !tier.is_empty() {
+            hint.push_str(";tier=");
+            hint.push_str(tier);
+        }
+    }
+    Some(hint)
+}
+
 /// codex 订阅请求体 zstd 压缩(对齐 codex prepare_encoded_json:level 3,
 /// debug 记录压缩前后字节与耗时)。ccextra 的 codex extra_headers 由
 /// messages.rs 新建仅含 chatgpt-account-id,不存在 Content-Encoding
@@ -444,6 +463,14 @@ impl UpstreamClient {
             body_bytes
         };
         let upstream_model = body.get("model").and_then(|v| v.as_str()).unwrap_or("");
+        // 路由提示从压缩前的最终 body 构造(对齐 codex build_routing_hint_header)
+        let routing_hint = if extra_headers.contains_key("chatgpt-account-id")
+            && matches!(protocol, Protocol::OpenAiResponses)
+        {
+            codex_routing_hint(upstream_model, body)
+        } else {
+            None
+        };
         match self
             .request_once(
                 base_url,
@@ -452,6 +479,7 @@ impl UpstreamClient {
                 provider_proxy,
                 &body_bytes,
                 upstream_model,
+                routing_hint.as_deref(),
                 is_stream,
                 session_id,
                 thread_id,
@@ -471,6 +499,7 @@ impl UpstreamClient {
                     provider_proxy,
                     &body_bytes,
                     upstream_model,
+                    routing_hint.as_deref(),
                     is_stream,
                     session_id,
                     thread_id,
@@ -493,6 +522,7 @@ impl UpstreamClient {
         provider_proxy: Option<&str>,
         body: &bytes::Bytes,
         upstream_model: &str,
+        routing_hint: Option<&str>,
         is_stream: bool,
         session_id: Option<&str>,
         thread_id: Option<&str>,
@@ -543,6 +573,9 @@ impl UpstreamClient {
             }
             if is_gpt_model(upstream_model) {
                 req = req.header("Originator", "codex_cli_rs");
+                if let Some(hint) = routing_hint {
+                    req = req.header("X-Codex-Routing-Hint", hint);
+                }
             }
         }
 
@@ -1277,5 +1310,31 @@ mod tests {
             serde_yaml::from_str("connection-pool:\n  enabled: true\n  idle-conn-timeout: \"0s\"")
                 .unwrap();
         assert!(AntigravityPoolSettings::resolve(Some(&cfg)).short_mode);
+    }
+
+    #[test]
+    fn test_codex_routing_hint_includes_service_tier() {
+        // 对齐 CPA applyCodexRoutingHint:任意非空 service_tier 原样追加
+        assert_eq!(
+            codex_routing_hint("gpt-5", &serde_json::json!({"service_tier": "priority"})),
+            Some("model=gpt-5;tier=priority".to_string())
+        );
+        assert_eq!(
+            codex_routing_hint("gpt-5", &serde_json::json!({"service_tier": "ultrafast"})),
+            Some("model=gpt-5;tier=ultrafast".to_string())
+        );
+        assert_eq!(
+            codex_routing_hint("gpt-5", &serde_json::json!({"service_tier": "  "})),
+            Some("model=gpt-5".to_string())
+        );
+        assert_eq!(
+            codex_routing_hint("gpt-5", &serde_json::json!({})),
+            Some("model=gpt-5".to_string())
+        );
+    }
+
+    #[test]
+    fn test_codex_routing_hint_rejects_non_gpt_model() {
+        assert_eq!(codex_routing_hint("grok-4", &serde_json::json!({})), None);
     }
 }

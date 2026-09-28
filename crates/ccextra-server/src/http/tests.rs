@@ -2923,6 +2923,11 @@ async fn test_codex_provider_compresses_request_body() {
     assert_eq!(response.status(), StatusCode::OK);
     // codex 订阅请求:声明 zstd 编码,线上字节解压后与出站 JSON 等价
     assert_eq!(captured.header("content-encoding").as_deref(), Some("zstd"));
+    // 压缩 body 不影响路由提示:hint 从压缩前的最终 body 构造
+    assert_eq!(
+        captured.header("x-codex-routing-hint").as_deref(),
+        Some("model=gpt-5.6-terra")
+    );
     let raw = captured
         .raw_body
         .lock()
@@ -2996,6 +3001,8 @@ models:
     // API key 静态 provider 无 codex metadata,不发订阅身份头,也不压缩
     assert!(!captured.has_header("chatgpt-account-id"));
     assert!(!captured.has_header("content-encoding"));
+    // 路由提示仅 codex OAuth 订阅请求携带(对齐 CPA applyCodexRoutingHint)
+    assert!(!captured.has_header("x-codex-routing-hint"));
     assert_eq!(
         captured.header("authorization").as_deref(),
         Some("Bearer sk-static")
