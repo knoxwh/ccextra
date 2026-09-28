@@ -1,5 +1,7 @@
 use super::proto::{encode_bytes, generated};
 use super::{input, schema, CursorConvertError};
+use base64::engine::general_purpose::STANDARD;
+use base64::Engine;
 use prost::Message;
 use serde_json::Value;
 use sha2::{Digest, Sha256};
@@ -17,6 +19,11 @@ pub fn conversation_id(identity: &str, session_id: &str) -> String {
     ))
 }
 
+/// 图片 uuid(对齐 Plus generateId 的 32 位 hex;确定性派生自 message_id 与序号)
+fn image_uuid(message_id: &str, index: usize) -> String {
+    hex::encode(&Sha256::digest(format!("{message_id}:{index}").as_bytes())[..16])
+}
+
 pub fn build_run_request(
     body: &Value,
     model: &str,
@@ -29,16 +36,45 @@ pub fn build_run_request(
             "model、conversation_id 和 message_id 不能为空".into(),
         ));
     }
-    let text = input::user_text(body, checkpoint.is_some())?;
+    let input::UserInput {
+        text,
+        system,
+        images,
+    } = input::user_text(body, checkpoint.is_some())?;
     if text.is_empty() {
         return Err(CursorConvertError::Invalid("缺少用户消息".into()));
     }
+    // 对齐 Plus:图片进 SelectedContext.selected_images(base64 解码为 bytes)
+    let mut decoded_images = Vec::with_capacity(images.len());
+    for (index, image) in images.iter().enumerate() {
+        let data = STANDARD.decode(image.data.as_bytes()).map_err(|error| {
+            CursorConvertError::Invalid(format!("图片 base64 解码失败: {error}"))
+        })?;
+        decoded_images.push((image_uuid(message_id, index), image.mime_type.clone(), data));
+    }
+    let selected_context = if decoded_images.is_empty() {
+        None
+    } else {
+        Some(generated::SelectedContext {
+            selected_images: decoded_images
+                .into_iter()
+                .map(|(uuid, mime_type, data)| generated::SelectedImage {
+                    data_or_blob_id: Some(generated::selected_image::DataOrBlobId::Data(data)),
+                    uuid,
+                    mime_type,
+                    ..Default::default()
+                })
+                .collect(),
+            ..Default::default()
+        })
+    };
     let action = generated::ConversationAction {
         action: Some(generated::conversation_action::Action::UserMessageAction(
             generated::UserMessageAction {
                 user_message: Some(generated::UserMessage {
                     text,
                     message_id: message_id.into(),
+                    selected_context,
                     ..Default::default()
                 }),
                 ..Default::default()
@@ -56,7 +92,9 @@ pub fn build_run_request(
     let state = match checkpoint {
         Some(raw) => raw.to_vec(),
         None => {
-            let system = serde_json::json!({ "content": "", "role": "system" });
+            // 对齐 Plus:真 system 进 root blob(键序 content 先,对齐 Go json.Marshal
+            // 字母序;blob id 是 sha256,需字节稳定),UserText 只留用户输入
+            let system = serde_json::json!({ "content": system, "role": "system" });
             let bytes = serde_json::to_vec(&system)?;
             let digest = Sha256::digest(&bytes);
             blobs.insert(hex::encode(digest), bytes);

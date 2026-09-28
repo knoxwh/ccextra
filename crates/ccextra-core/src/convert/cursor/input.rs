@@ -12,7 +12,9 @@ fn text(content: &Value) -> Result<String, CursorConvertError> {
                     Some("text") => {
                         out.push_str(part.get("text").and_then(Value::as_str).unwrap_or(""))
                     }
-                    Some("tool_use" | "tool_result" | "thinking" | "redacted_thinking") => {}
+                    Some(
+                        "tool_use" | "tool_result" | "thinking" | "redacted_thinking" | "image",
+                    ) => {}
                     Some(other) => {
                         return Err(CursorConvertError::Unsupported(format!("输入块 {other}")))
                     }
@@ -38,9 +40,54 @@ fn entry(out: &mut String, role: &str, content: &str) {
     }
 }
 
-pub(super) fn user_text(body: &Value, checkpoint: bool) -> Result<String, CursorConvertError> {
-    // 对齐 Plus:顶层 system 与 messages 内 system 消息合并为 prompt 文本,
-    // system 不进 transcript、不算对话轮
+/// 图片输入(对齐 Plus extractImages:仅 base64 数据,远程 URL 不支持)
+pub(super) struct CursorImage {
+    pub mime_type: String,
+    pub data: String,
+}
+
+/// UserText 与 root blob system 的拆分结果(对齐 Plus:system 不进 UserText)
+pub(super) struct UserInput {
+    pub text: String,
+    pub system: String,
+    pub images: Vec<CursorImage>,
+}
+
+/// 提取 content 数组顶层的 image 块(对齐 Plus:仅扫 user 消息,tool_result 内图片不收)
+fn extract_images(content: &Value) -> Vec<CursorImage> {
+    let parts = match content.as_array() {
+        Some(parts) => parts,
+        None => return Vec::new(),
+    };
+    parts
+        .iter()
+        .filter(|part| part.get("type").and_then(Value::as_str) == Some("image"))
+        .filter_map(|part| {
+            let source = part.get("source")?;
+            if source.get("type").and_then(Value::as_str) != Some("base64") {
+                return None;
+            }
+            let data = source.get("data").and_then(Value::as_str)?;
+            if data.is_empty() {
+                return None;
+            }
+            let mime_type = source
+                .get("media_type")
+                .or_else(|| source.get("mime_type"))
+                .and_then(Value::as_str)
+                .unwrap_or("application/octet-stream")
+                .to_string();
+            Some(CursorImage {
+                mime_type,
+                data: data.to_string(),
+            })
+        })
+        .collect()
+}
+
+pub(super) fn user_text(body: &Value, checkpoint: bool) -> Result<UserInput, CursorConvertError> {
+    // 对齐 Plus:顶层 system 与 messages 内 system 消息合并为 root blob 的 system prompt,
+    // system 不进 UserText、不算对话轮;无 system 时兜底默认提示词
     let mut system_parts: Vec<String> = Vec::new();
     if let Some(system) = body.get("system").map(text).transpose()? {
         if !system.is_empty() {
@@ -59,11 +106,13 @@ pub(super) fn user_text(body: &Value, checkpoint: bool) -> Result<String, Cursor
             }
         }
     }
-    let system = system_parts.join("\n");
+    let system = if system_parts.is_empty() {
+        "You are a helpful assistant.".to_string()
+    } else {
+        system_parts.join("\n")
+    };
     let mut transcript = String::new();
-    if !checkpoint {
-        entry(&mut transcript, "SYSTEM", &system);
-    }
+    let mut images = Vec::new();
     for (index, message) in messages.iter().enumerate() {
         let role = message
             .get("role")
@@ -77,6 +126,10 @@ pub(super) fn user_text(body: &Value, checkpoint: bool) -> Result<String, Cursor
         }
         let content = message.get("content").unwrap_or(&Value::Null);
         let line = text(content)?;
+        if role == "user" {
+            // 对齐 Plus:每条 user 消息覆盖,最终保留最后一条的图片
+            images = extract_images(content);
+        }
         if !checkpoint || index + 1 == messages.len() {
             entry(
                 &mut transcript,
@@ -107,7 +160,7 @@ pub(super) fn user_text(body: &Value, checkpoint: bool) -> Result<String, Cursor
         }
     }
     // 单条对话消息且无工具结果 = 首轮流对话:直接取原文,不拼续接尾巴。
-    // system 已并入 prompt,不算对话轮(Plus 同场景无尾巴)。
+    // system 已并入 root blob,不算对话轮(Plus 同场景无尾巴)。
     let conversation: Vec<&Value> = messages
         .iter()
         .filter(|message| message.get("role").and_then(Value::as_str) != Some("system"))
@@ -131,7 +184,11 @@ pub(super) fn user_text(body: &Value, checkpoint: bool) -> Result<String, Cursor
         format!("{transcript}The above is the previous conversation context including tool call results.\nContinue your response based on this context.\n\nContinue from the conversation above.")
     };
     result.push_str(&output_constraints(body)?);
-    Ok(result)
+    Ok(UserInput {
+        text: result,
+        system,
+        images,
+    })
 }
 
 fn output_constraints(body: &Value) -> Result<String, CursorConvertError> {

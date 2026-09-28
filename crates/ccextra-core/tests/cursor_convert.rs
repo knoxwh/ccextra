@@ -4,7 +4,7 @@ use ccextra_core::convert::cursor::proto::{
     parse_connect_end_stream, ConnectError, ConnectFrame, ConnectFrameDecoder, ConnectFrameError,
     ExecKind, Field, ServerMessage, CONNECT_COMPRESSION_FLAG, CONNECT_END_STREAM_FLAG,
 };
-use ccextra_core::convert::cursor::{build_run_request, conversation_id};
+use ccextra_core::convert::cursor::{build_run_request, conversation_id, CursorRunRequest};
 use flate2::{write::GzEncoder, Compression};
 use prost::Message;
 use serde_json::json;
@@ -16,6 +16,15 @@ fn run(payload: &[u8]) -> generated::AgentRunRequest {
         generated::agent_client_message::Message::RunRequest(request) => request,
         _ => panic!("expected run_request"),
     }
+}
+
+/// 解析 root blob 的 system content(对齐 Plus:真 system 进 KV blob)
+fn blob_system(request: &CursorRunRequest) -> String {
+    assert_eq!(request.blob_store.len(), 1);
+    let bytes = request.blob_store.values().next().unwrap();
+    let value: serde_json::Value = serde_json::from_slice(bytes).unwrap();
+    assert_eq!(value["role"], "system");
+    value["content"].as_str().unwrap().to_string()
 }
 
 fn message(number: u64, value: &[u8]) -> Vec<u8> {
@@ -220,10 +229,12 @@ fn cold_request_flattens_history_and_defines_mcp_schema() {
         _ => panic!("expected user message"),
     };
     let text = action.user_message.unwrap().text;
-    assert_eq!(text.matches("Be brief").count(), 1);
+    // 对齐 Plus:system 进 root blob,不进 UserText
+    assert!(!text.contains("Be brief"));
     assert!(text.contains("ASSISTANT_TOOL_CALL"));
     assert!(text.contains("TOOL_RESULT"));
     assert!(text.contains("OUTPUT CONSTRAINTS"));
+    assert_eq!(blob_system(&request), "Be brief");
     assert_eq!(run.model_details.unwrap().model_id, "composer-2-medium");
     let tools = run.mcp_tools.unwrap().mcp_tools;
     assert_eq!(tools[0].provider_identifier, "proxy");
@@ -255,9 +266,51 @@ fn first_turn_with_system_has_no_continuation_tail() {
         _ => panic!("expected user message"),
     };
     let text = action.user_message.unwrap().text;
-    assert!(text.contains("Be brief"));
-    assert!(text.contains("Find status"));
+    // 对齐 Plus:system 进 root blob;单轮 UserText 为原文,无 USER: 前缀
+    assert!(!text.contains("Be brief"));
+    assert_eq!(text, "Find status about TOOL_RESULT:");
+    assert_eq!(
+        blob_system(&request),
+        "Be brief. TOOL_RESULT: is a label in examples."
+    );
     assert!(!text.contains("Continue from the conversation above"));
+}
+
+#[test]
+fn empty_system_falls_back_to_default_prompt() {
+    // 对齐 Plus:无 system 时 root blob 兜底默认提示词
+    let body = json!({"messages": [{"role":"user", "content":"hi"}]});
+    let request = build_run_request(&body, "composer-2", "conv", "msg-1", None).unwrap();
+    assert_eq!(blob_system(&request), "You are a helpful assistant.");
+}
+
+#[test]
+fn image_blocks_become_selected_images() {
+    // 对齐 Plus:image 块进 SelectedContext.selected_images,不进 UserText
+    let body = json!({
+        "messages": [{"role":"user", "content":[
+            {"type":"text", "text":"describe"},
+            {"type":"image", "source":{"type":"base64", "media_type":"image/png", "data":"aGk="}}
+        ]}]
+    });
+    let request = build_run_request(&body, "composer-2", "conv", "msg-1", None).unwrap();
+    let run = run(&request.payload);
+    let action = match run.action.unwrap().action.unwrap() {
+        generated::conversation_action::Action::UserMessageAction(action) => action,
+        _ => panic!("expected user message"),
+    };
+    let user_message = action.user_message.unwrap();
+    assert_eq!(user_message.text, "describe");
+    let images = user_message.selected_context.unwrap().selected_images;
+    assert_eq!(images.len(), 1);
+    assert_eq!(images[0].mime_type, "image/png");
+    assert_eq!(
+        images[0].data_or_blob_id,
+        Some(generated::selected_image::DataOrBlobId::Data(
+            b"hi".to_vec()
+        ))
+    );
+    assert_eq!(images[0].uuid.len(), 32);
 }
 
 #[test]
@@ -276,9 +329,10 @@ fn messages_system_role_merges_into_system_prompt() {
         _ => panic!("expected user message"),
     };
     let text = action.user_message.unwrap().text;
-    assert!(text.contains("SYSTEM: You are terse"));
-    assert!(text.contains("USER: hi"));
-    // system 不算对话轮:单条 user 消息仍视为首轮,无续接尾巴
+    // 对齐 Plus:messages 内 system 并入 root blob,不进 UserText;单轮无前缀无尾巴
+    assert!(!text.contains("SYSTEM:"));
+    assert_eq!(text, "hi");
+    assert_eq!(blob_system(&request), "You are terse");
     assert!(!text.contains("Continue from the conversation above"));
 }
 
@@ -299,9 +353,10 @@ fn messages_system_role_with_history_keeps_continuation_tail() {
         _ => panic!("expected user message"),
     };
     let text = action.user_message.unwrap().text;
-    assert!(text.contains("SYSTEM: You are terse"));
+    assert!(!text.contains("SYSTEM:"));
     assert!(text.contains("ASSISTANT: two"));
     assert!(text.contains("Continue from the conversation above"));
+    assert_eq!(blob_system(&request), "You are terse");
 }
 
 #[test]
