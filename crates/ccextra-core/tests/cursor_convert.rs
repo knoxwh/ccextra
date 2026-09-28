@@ -197,6 +197,95 @@ fn kv_decoder_keeps_id_when_field_order_is_not_canonical() {
 }
 
 #[test]
+fn mcp_state_and_subagent_exec_decode_and_reply() {
+    // field 36 = McpStateExecArgs{server_identifiers},field 28 = SubagentArgs{tool_call_id}
+    let mut mcp_state_args = Vec::new();
+    encode_bytes(1, b"proxy", &mut mcp_state_args);
+    let mut exec = Vec::new();
+    encode_tag(1, 0, &mut exec);
+    encode_varint(7, &mut exec);
+    encode_bytes(15, b"exec-1", &mut exec);
+    encode_bytes(36, &mcp_state_args, &mut exec);
+    let messages = decode_agent_server_message(&message(2, &exec)).unwrap();
+    assert_eq!(
+        messages,
+        vec![ServerMessage::Exec(
+            ccextra_core::convert::cursor::proto::ExecRequest {
+                exec_msg_id: 7,
+                exec_id: "exec-1".into(),
+                kind: ExecKind::McpState {
+                    server_identifiers: vec!["proxy".into()],
+                },
+            },
+        )]
+    );
+
+    let mut subagent_args = Vec::new();
+    encode_bytes(1, b"call-1", &mut subagent_args);
+    let mut exec = Vec::new();
+    encode_tag(1, 0, &mut exec);
+    encode_varint(8, &mut exec);
+    encode_bytes(15, b"exec-2", &mut exec);
+    encode_bytes(28, &subagent_args, &mut exec);
+    let messages = decode_agent_server_message(&message(2, &exec)).unwrap();
+    assert_eq!(
+        messages,
+        vec![ServerMessage::Exec(
+            ccextra_core::convert::cursor::proto::ExecRequest {
+                exec_msg_id: 8,
+                exec_id: "exec-2".into(),
+                kind: ExecKind::Subagent {
+                    tool_call_id: "call-1".into(),
+                },
+            },
+        )]
+    );
+
+    // 回复编码:McpStateExecResult(field 36)与 SubagentResult(field 28)
+    let tools = vec![generated::McpToolDefinition {
+        name: "read_file".into(),
+        provider_identifier: "proxy".into(),
+        tool_name: "read_file".into(),
+        ..Default::default()
+    }];
+    let payload =
+        ccextra_core::convert::cursor::proto::reply::encode_mcp_state_result(7, "exec-1", tools);
+    let client = generated::AgentClientMessage::decode(payload.as_slice()).unwrap();
+    let generated::agent_client_message::Message::ExecClientMessage(exec) = client.message.unwrap()
+    else {
+        panic!("expected exec reply");
+    };
+    assert_eq!(exec.id, 7);
+    assert_eq!(exec.exec_id, "exec-1");
+    let generated::exec_client_message::Message::McpStateExecResult(result) = exec.message.unwrap()
+    else {
+        panic!("expected mcp_state_exec_result");
+    };
+    let generated::mcp_state_exec_result::Result::Success(success) = result.result.unwrap() else {
+        panic!("expected success");
+    };
+    assert_eq!(success.servers.len(), 1);
+    assert_eq!(success.servers[0].server_identifier, "proxy");
+    assert_eq!(success.servers[0].tools.len(), 1);
+
+    let payload = ccextra_core::convert::cursor::proto::reply::encode_subagent_error(8, "exec-2");
+    let client = generated::AgentClientMessage::decode(payload.as_slice()).unwrap();
+    let generated::agent_client_message::Message::ExecClientMessage(exec) = client.message.unwrap()
+    else {
+        panic!("expected exec reply");
+    };
+    assert_eq!(exec.id, 8);
+    let generated::exec_client_message::Message::SubagentResult(result) = exec.message.unwrap()
+    else {
+        panic!("expected subagent_result");
+    };
+    assert!(matches!(
+        result.result.unwrap(),
+        generated::subagent_result::Result::Error(_)
+    ));
+}
+
+#[test]
 fn malformed_nested_length_is_rejected() {
     let err = decode_agent_server_message(&[0x0a, 0x05, 0x0a, 0x04, b'x']).unwrap_err();
     assert!(matches!(

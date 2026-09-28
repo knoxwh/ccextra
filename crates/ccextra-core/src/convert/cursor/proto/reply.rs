@@ -63,6 +63,39 @@ pub fn encode_request_context_result(
     encode_exec(id, exec_id, 10, &result)
 }
 
+/// 回复 McpStateExecArgs(field 36):发布 proxy server 的工具表,
+/// 对齐 CLI mcpState handler 的 McpStateSuccess 形状
+pub fn encode_mcp_state_result(
+    id: u32,
+    exec_id: &str,
+    tools: Vec<generated::McpToolDefinition>,
+) -> Vec<u8> {
+    let success = generated::McpStateSuccess {
+        servers: vec![generated::McpStateServer {
+            server_name: "proxy".into(),
+            server_identifier: "proxy".into(),
+            tools,
+            ..Default::default()
+        }],
+    }
+    .encode_to_vec();
+    let mut result = Vec::new();
+    encode_bytes(1, &success, &mut result);
+    encode_exec(id, exec_id, 36, &result)
+}
+
+/// 回复 SubagentArgs(field 28):ccextra 不支持子代理,回 error
+pub fn encode_subagent_error(id: u32, exec_id: &str) -> Vec<u8> {
+    let error = generated::SubagentError {
+        error: "Subagents are not supported in this environment.".into(),
+        ..Default::default()
+    }
+    .encode_to_vec();
+    let mut result = Vec::new();
+    encode_bytes(2, &error, &mut result);
+    encode_exec(id, exec_id, 28, &result)
+}
+
 pub fn encode_mcp_result(id: u32, exec_id: &str, content: &str, is_error: bool) -> Vec<u8> {
     let mut text = Vec::new();
     encode_bytes(1, content.as_bytes(), &mut text);

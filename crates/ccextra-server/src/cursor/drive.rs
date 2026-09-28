@@ -173,6 +173,32 @@ impl CursorDrive {
                         .map_err(CursorFailure::from_transport)?;
                     None
                 }
+                ExecKind::McpState { .. } => {
+                    // 对齐 CLI mcpState handler:回 proxy server 工具表
+                    let payload = reply::encode_mcp_state_result(
+                        exec.exec_msg_id,
+                        &exec.exec_id,
+                        self.tools.clone(),
+                    );
+                    self.stream
+                        .send_message(&payload)
+                        .await
+                        .map_err(CursorFailure::from_transport)?;
+                    None
+                }
+                ExecKind::Subagent { .. } => {
+                    // 子代理不支持:回 error,不中断流
+                    let payload = reply::encode_subagent_error(exec.exec_msg_id, &exec.exec_id);
+                    self.stream
+                        .send_message(&payload)
+                        .await
+                        .map_err(CursorFailure::from_transport)?;
+                    None
+                }
+                ExecKind::Builtin { field_number: 0 } => {
+                    // 对齐 Plus:无 kind 的 exec(仅 span_context 等元数据字段)忽略不回复
+                    None
+                }
                 ExecKind::Builtin { field_number } => {
                     let payload = reply::encode_builtin_rejection(
                         exec.exec_msg_id,

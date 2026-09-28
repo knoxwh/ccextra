@@ -1631,10 +1631,74 @@ message ExecServerMessage {
     agent.v1.RecordScreenArgs record_screen_args = 21;
     agent.v1.ComputerUseArgs computer_use_args = 22;
     agent.v1.WriteShellStdinArgs write_shell_stdin_args = 23;
+    agent.v1.McpStateExecArgs mcp_state_exec_args = 36;
+    agent.v1.SubagentArgs subagent_args = 28;
   }
   uint32 id = 1;
   string exec_id = 15;
   optional agent.v1.SpanContext span_context = 19;
+}
+
+// MCP server 状态查询(上游按 server identifier 探测工具表)
+message McpStateExecArgs {
+  repeated string server_identifiers = 1;
+  bool kick_only = 2;
+}
+
+message McpStateServer {
+  string server_name = 1;
+  string server_identifier = 2;
+  optional string plugin = 3;
+  optional string marketplace = 4;
+  repeated agent.v1.McpToolDefinition tools = 5;
+  repeated string instructions = 6;
+  optional string status = 7;
+  optional string error_message = 8;
+}
+
+message McpStateSuccess {
+  repeated agent.v1.McpStateServer servers = 1;
+}
+
+message McpStateError {
+  string error = 1;
+}
+
+message McpStateRejected {
+  string reason = 1;
+}
+
+message McpStateExecResult {
+  oneof result {
+    agent.v1.McpStateSuccess success = 1;
+    agent.v1.McpStateError error = 2;
+    agent.v1.McpStateRejected rejected = 3;
+  }
+}
+
+// 子代理调用(ccextra 不支持,回 error)
+message SubagentArgs {
+  string tool_call_id = 1;
+  string subagent_type = 2;
+  string model_id = 3;
+  string prompt = 4;
+  bool readonly = 5;
+}
+
+message SubagentError {
+  optional string agent_id = 1;
+  string error = 2;
+}
+
+message SubagentResult {
+  oneof result {
+    agent.v1.SubagentSuccess success = 1;
+    agent.v1.SubagentError error = 2;
+  }
+}
+
+message SubagentSuccess {
+  string agent_id = 1;
 }
 
 message ExecClientMessage {
@@ -1657,6 +1721,8 @@ message ExecClientMessage {
     agent.v1.RecordScreenResult record_screen_result = 21;
     agent.v1.ComputerUseResult computer_use_result = 22;
     agent.v1.WriteShellStdinResult write_shell_stdin_result = 23;
+    agent.v1.McpStateExecResult mcp_state_exec_result = 36;
+    agent.v1.SubagentResult subagent_result = 28;
   }
   uint32 id = 1;
   string exec_id = 15;

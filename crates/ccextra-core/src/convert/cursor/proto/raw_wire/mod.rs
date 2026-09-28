@@ -42,6 +42,14 @@ pub enum ExecKind {
         tool_call_id: String,
         args: std::collections::BTreeMap<String, Vec<u8>>,
     },
+    /// MCP server 状态查询(field 36,上游按 server identifier 探测工具表)
+    McpState {
+        server_identifiers: Vec<String>,
+    },
+    /// 子代理调用(field 28,ccextra 不支持)
+    Subagent {
+        tool_call_id: String,
+    },
     Builtin {
         field_number: u64,
     },

@@ -37,10 +37,40 @@ pub fn decode_exec(data: &[u8]) -> Result<ExecRequest, WireError> {
             }
             Field::Bytes { number: 10, .. } => kind = ExecKind::RequestContext,
             Field::Bytes { number: 11, value } => kind = parts::decode_mcp(value)?,
+            Field::Bytes { number: 36, value } => {
+                // McpStateExecArgs:repeated string server_identifiers(field 1)
+                let mut server_identifiers = Vec::new();
+                for field in fields(value)? {
+                    if let Field::Bytes { number: 1, value } = field {
+                        server_identifiers.push(String::from_utf8_lossy(value).into_owned());
+                    }
+                }
+                kind = ExecKind::McpState { server_identifiers };
+            }
+            Field::Bytes { number: 28, value } => {
+                // SubagentArgs:tool_call_id(field 1)
+                let mut tool_call_id = String::new();
+                for field in fields(value)? {
+                    if let Field::Bytes { number: 1, value } = field {
+                        tool_call_id = String::from_utf8_lossy(value).into_owned();
+                    }
+                }
+                kind = ExecKind::Subagent { tool_call_id };
+            }
             Field::Bytes { number, .. } if parts::is_builtin(number) => {
                 kind = ExecKind::Builtin {
                     field_number: number,
                 }
+            }
+            Field::Bytes { number: 19, .. } => {
+                // span_context:链路追踪元数据,已知字段,静默忽略
+            }
+            Field::Bytes { number, value } => {
+                // 未知 exec 字段:记录字段号与内容便于排查上游新增的内置工具
+                tracing::warn!(
+                    "Cursor exec 消息未识别字段 {number} 内容 {:02x?}",
+                    &value[..value.len().min(64)]
+                );
             }
             _ => {}
         }
