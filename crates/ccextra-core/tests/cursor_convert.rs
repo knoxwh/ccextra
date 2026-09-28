@@ -261,6 +261,50 @@ fn first_turn_with_system_has_no_continuation_tail() {
 }
 
 #[test]
+fn messages_system_role_merges_into_system_prompt() {
+    // 对齐 Plus:messages 内 system 消息并入 prompt 文本,不报未知角色、不算对话轮
+    let body = json!({
+        "messages": [
+            {"role":"system", "content":"You are terse"},
+            {"role":"user", "content":"hi"}
+        ]
+    });
+    let request = build_run_request(&body, "composer-2", "conv", "msg-1", None).unwrap();
+    let run = run(&request.payload);
+    let action = match run.action.unwrap().action.unwrap() {
+        generated::conversation_action::Action::UserMessageAction(action) => action,
+        _ => panic!("expected user message"),
+    };
+    let text = action.user_message.unwrap().text;
+    assert!(text.contains("SYSTEM: You are terse"));
+    assert!(text.contains("USER: hi"));
+    // system 不算对话轮:单条 user 消息仍视为首轮,无续接尾巴
+    assert!(!text.contains("Continue from the conversation above"));
+}
+
+#[test]
+fn messages_system_role_with_history_keeps_continuation_tail() {
+    let body = json!({
+        "messages": [
+            {"role":"system", "content":"You are terse"},
+            {"role":"user", "content":"one"},
+            {"role":"assistant", "content":"two"},
+            {"role":"user", "content":"three"}
+        ]
+    });
+    let request = build_run_request(&body, "composer-2", "conv", "msg-1", None).unwrap();
+    let run = run(&request.payload);
+    let action = match run.action.unwrap().action.unwrap() {
+        generated::conversation_action::Action::UserMessageAction(action) => action,
+        _ => panic!("expected user message"),
+    };
+    let text = action.user_message.unwrap().text;
+    assert!(text.contains("SYSTEM: You are terse"));
+    assert!(text.contains("ASSISTANT: two"));
+    assert!(text.contains("Continue from the conversation above"));
+}
+
+#[test]
 fn single_tool_result_without_checkpoint_uses_continuation() {
     let body = json!({
         "messages": [{"role":"user", "content":[

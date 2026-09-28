@@ -63,7 +63,7 @@ flowchart LR
 | `openai_responses` | Responses | 转换 `instructions` 与 `input`；支持 reasoning replay 和搜索域过滤。 |
 | `gemini` | Gemini GenerateContent | 转换内容块、工具结果和 schema。 |
 | `antigravity` | Cloud Code Assist | 封装 Gemini 请求，处理工具命名和模型输出上限；默认短连接。 |
-| `cursor` | Cursor AgentService/Run Connect-RPC | 单凭证 OAuth、动态模型目录、双向 H2 与 Anthropic JSON/SSE 恢复；有稳定会话时支持 MCP 工具续接。真实上游兼容性待验证。 |
+| `cursor` | Cursor AgentService/Run Connect-RPC | 单凭证 OAuth、动态模型目录、双向 H2 与 Anthropic JSON/SSE 恢复；有稳定会话时支持 MCP 工具续接。基础对话已通过真实上游验证，MCP 续接等高级路径仍以本地测试为准。 |
 
 > **提示**：xAI Grok 与 Codex 均通过 OAuth 动态注册为 `openai_responses` provider，无需配置独立协议。Codex 订阅请求自动携带 `Chatgpt-Account-Id` 身份头，请求体自动 zstd 压缩（对齐 codex CLI 默认行为）。
 
@@ -208,7 +208,7 @@ curl -H "Authorization: Bearer $ANTHROPIC_AUTH_TOKEN" \
 
 Antigravity 凭证默认在配置文件旁 `.cache/antigravity`，xAI 在 `.cache/xai`，Codex 在 `.cache/codex`，Cursor 在 `.cache/cursor`。xAI、Codex 和 Cursor 启动时自动发现；Cursor `GetUsableModels` 成功才发布模型目录；`/reload` 拉取失败时，仅凭证目录和账号不变才保留旧目录，新配置的模型别名优先。后台刷新失败保留已发布目录。Antigravity 后台加载并每 3 小时刷新模型。Codex 登录使用 PKCE 浏览器授权（本地回调端口默认 1455，可用 `--callback-port` 覆盖），token 提前 24 小时刷新。
 
-Cursor 登录自行生成 PKCE 并轮询浏览器授权，不依赖 Cursor IDE 或 `cursor-agent`；可用 `--no-browser` 手动打开 URL，token 到期前 10 分钟刷新。Run 请求使用独立双向 HTTP/2 Connect-RPC，将文本、思考和工具调用恢复为 Anthropic JSON/SSE。实现已有本地测试，尚未用真实 Cursor 上游验收；不要视为生产就绪。Cursor 订阅反代可能违反服务条款，账号有封禁风险。
+Cursor 登录自行生成 PKCE 并轮询浏览器授权，不依赖 Cursor IDE 或 `cursor-agent`；可用 `--no-browser` 手动打开 URL，token 到期前 10 分钟刷新。Run 请求使用独立双向 HTTP/2 Connect-RPC，将文本、思考和工具调用恢复为 Anthropic JSON/SSE。实现已有本地测试，基础对话（含 `messages` 内 `role: system` 项并入 system prompt）已通过真实 Cursor 上游验证；MCP 续接等高级路径未经完整上游验收。Cursor 订阅反代可能违反服务条款，账号有封禁风险。
 
 有稳定 Claude 会话 ID 时，MCP 工具调用会驻留上游流，下一次请求按 `tool_use_id` 匹配文本 `tool_result` 并续接；多个工具结果必须全部对应，模型与工具目录须一致。流会话闲置 5 分钟过期，原始 checkpoint 保留 30 分钟并绑定凭证。驻留流丢失后的工具续接返回 400，不静默重开 Run。图片输入、内置 exec 工具执行和 Cursor CLI passthrough 不支持；内置工具请求返回拒绝。
 

@@ -39,15 +39,27 @@ fn entry(out: &mut String, role: &str, content: &str) {
 }
 
 pub(super) fn user_text(body: &Value, checkpoint: bool) -> Result<String, CursorConvertError> {
-    let system = body
-        .get("system")
-        .map(text)
-        .transpose()?
-        .unwrap_or_default();
+    // 对齐 Plus:顶层 system 与 messages 内 system 消息合并为 prompt 文本,
+    // system 不进 transcript、不算对话轮
+    let mut system_parts: Vec<String> = Vec::new();
+    if let Some(system) = body.get("system").map(text).transpose()? {
+        if !system.is_empty() {
+            system_parts.push(system);
+        }
+    }
     let messages = body
         .get("messages")
         .and_then(Value::as_array)
         .ok_or_else(|| CursorConvertError::Invalid("缺少 messages 数组".into()))?;
+    for message in messages {
+        if message.get("role").and_then(Value::as_str) == Some("system") {
+            let line = text(message.get("content").unwrap_or(&Value::Null))?;
+            if !line.is_empty() {
+                system_parts.push(line);
+            }
+        }
+    }
+    let system = system_parts.join("\n");
     let mut transcript = String::new();
     if !checkpoint {
         entry(&mut transcript, "SYSTEM", &system);
@@ -57,6 +69,9 @@ pub(super) fn user_text(body: &Value, checkpoint: bool) -> Result<String, Cursor
             .get("role")
             .and_then(Value::as_str)
             .ok_or_else(|| CursorConvertError::Invalid("message 缺少 role".into()))?;
+        if role == "system" {
+            continue;
+        }
         if !matches!(role, "user" | "assistant") {
             return Err(CursorConvertError::Invalid(format!("未知角色 {role}")));
         }
@@ -91,10 +106,14 @@ pub(super) fn user_text(body: &Value, checkpoint: bool) -> Result<String, Cursor
             }
         }
     }
-    // 单条消息且无工具结果 = 首轮流对话:直接取原文,不拼续接尾巴。
-    // system 已并入 transcript,不能作为判别条件(Plus 同场景无尾巴)。
-    let single_turn_without_results = messages.len() == 1
-        && !messages[0]
+    // 单条对话消息且无工具结果 = 首轮流对话:直接取原文,不拼续接尾巴。
+    // system 已并入 prompt,不算对话轮(Plus 同场景无尾巴)。
+    let conversation: Vec<&Value> = messages
+        .iter()
+        .filter(|message| message.get("role").and_then(Value::as_str) != Some("system"))
+        .collect();
+    let single_turn_without_results = conversation.len() == 1
+        && !conversation[0]
             .get("content")
             .and_then(Value::as_array)
             .is_some_and(|parts| {
