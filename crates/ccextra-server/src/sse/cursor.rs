@@ -1,5 +1,5 @@
 use bytes::Bytes;
-use ccextra_core::convert::cursor::proto::ServerMessage;
+use ccextra_core::convert::cursor::proto::{ServerMessage, TurnUsage};
 
 use super::emit;
 
@@ -14,6 +14,7 @@ pub struct CursorSse {
     model: String,
     input_tokens: i64,
     output_tokens: i64,
+    turn_usage: Option<TurnUsage>,
     next_index: i64,
     block: Option<Block>,
     started: bool,
@@ -30,6 +31,7 @@ impl CursorSse {
             model: model.into(),
             input_tokens: i64::try_from(input_tokens).unwrap_or(i64::MAX).max(1),
             output_tokens: 0,
+            turn_usage: None,
             next_index: 0,
             block: None,
             started: false,
@@ -58,7 +60,10 @@ impl CursorSse {
             ServerMessage::TokenDelta(delta) if *delta > 0 => {
                 self.output_tokens = self.output_tokens.saturating_add(*delta);
             }
-            ServerMessage::TurnEnded => self.turn_ended = true,
+            ServerMessage::TurnEnded(usage) => {
+                self.turn_ended = true;
+                self.turn_usage = Some(*usage);
+            }
             _ => {}
         }
         frames
@@ -132,6 +137,15 @@ impl CursorSse {
             frames.push(emit::content_block_start_text(self.next_index));
             frames.push(emit::content_block_stop(self.next_index));
         }
+        // TurnEnded 上报全量用量时覆盖估算值;input 含 cache 部分,按 Anthropic 语义拆出
+        let usage = self.turn_usage.unwrap_or_default();
+        let cache_read = usage.cache_read_tokens.unwrap_or(0);
+        let cache_write = usage.cache_write_tokens.unwrap_or(0);
+        let input_tokens = usage
+            .input_tokens
+            .map(|tokens| (tokens - cache_read - cache_write).max(0))
+            .unwrap_or(self.input_tokens);
+        let output_tokens = usage.output_tokens.unwrap_or(self.output_tokens);
         frames.push(emit::message_delta(
             if tool_use || self.has_tool_use {
                 "tool_use"
@@ -139,11 +153,11 @@ impl CursorSse {
                 "end_turn"
             },
             None,
-            self.input_tokens,
-            self.output_tokens,
-            0,
-            0,
-            -1,
+            input_tokens,
+            output_tokens,
+            cache_read,
+            cache_write,
+            usage.reasoning_tokens.unwrap_or(-1),
         ));
         frames.push(emit::message_stop());
         frames
@@ -187,7 +201,7 @@ mod tests {
         let mut frames = state.handle(&ServerMessage::ThinkingDelta("plan".into()));
         frames.extend(state.handle(&ServerMessage::TextDelta("answer".into())));
         frames.extend(state.handle(&ServerMessage::TokenDelta(3)));
-        frames.extend(state.handle(&ServerMessage::TurnEnded));
+        frames.extend(state.handle(&ServerMessage::TurnEnded(Default::default())));
         assert!(!state.is_finished());
         frames.extend(state.finish(false));
         let names: Vec<_> = frames.iter().map(|frame| event(frame).0).collect();
@@ -214,6 +228,28 @@ mod tests {
             .handle(&ServerMessage::TextDelta("late".into()))
             .is_empty());
         assert!(state.finish(false).is_empty());
+    }
+
+    #[test]
+    fn turn_ended_usage_overrides_estimates_in_message_delta() {
+        let mut state = CursorSse::new("message-3", "composer-2", 10);
+        let mut frames = state.handle(&ServerMessage::TextDelta("answer".into()));
+        frames.extend(state.handle(&ServerMessage::TokenDelta(3)));
+        frames.extend(state.handle(&ServerMessage::TurnEnded(TurnUsage {
+            input_tokens: Some(1000),
+            output_tokens: Some(200),
+            cache_read_tokens: Some(600),
+            cache_write_tokens: Some(50),
+            reasoning_tokens: Some(30),
+        })));
+        frames.extend(state.finish(false));
+        // input 拆出 cache 部分:1000 - 600 - 50 = 350
+        let delta = event(&frames[frames.len() - 2]).1["usage"].clone();
+        assert_eq!(delta["input_tokens"], 350);
+        assert_eq!(delta["output_tokens"], 200);
+        assert_eq!(delta["cache_read_input_tokens"], 600);
+        assert_eq!(delta["cache_creation_input_tokens"], 50);
+        assert_eq!(delta["output_tokens_details"]["thinking_tokens"], 30);
     }
 
     #[test]

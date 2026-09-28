@@ -286,6 +286,37 @@ fn mcp_state_and_subagent_exec_decode_and_reply() {
 }
 
 #[test]
+fn turn_ended_carries_usage_fields() {
+    // TurnEndedUpdate:1 input|2 output|3 cache_read|4 cache_write|5 reasoning(全 optional varint)
+    let mut turn_ended = Vec::new();
+    encode_tag(1, 0, &mut turn_ended);
+    encode_varint(1000, &mut turn_ended);
+    encode_tag(2, 0, &mut turn_ended);
+    encode_varint(200, &mut turn_ended);
+    encode_tag(3, 0, &mut turn_ended);
+    encode_varint(600, &mut turn_ended);
+    encode_tag(4, 0, &mut turn_ended);
+    encode_varint(50, &mut turn_ended);
+    let messages = decode_agent_server_message(&message(1, &message(14, &turn_ended))).unwrap();
+    assert_eq!(
+        messages,
+        vec![ServerMessage::TurnEnded(
+            ccextra_core::convert::cursor::proto::TurnUsage {
+                input_tokens: Some(1000),
+                output_tokens: Some(200),
+                cache_read_tokens: Some(600),
+                cache_write_tokens: Some(50),
+                reasoning_tokens: None,
+            },
+        )]
+    );
+
+    // 空 payload:全 None,不误报用量
+    let messages = decode_agent_server_message(&message(1, &message(14, &[]))).unwrap();
+    assert_eq!(messages, vec![ServerMessage::TurnEnded(Default::default())]);
+}
+
+#[test]
 fn malformed_nested_length_is_rejected() {
     let err = decode_agent_server_message(&[0x0a, 0x05, 0x0a, 0x04, b'x']).unwrap_err();
     assert!(matches!(

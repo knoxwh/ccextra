@@ -1,7 +1,7 @@
 use super::drive::CursorEvent;
 use crate::sse::cursor::CursorSse;
 use bytes::Bytes;
-use ccextra_core::convert::cursor::proto::{ExecKind, ExecRequest, ServerMessage};
+use ccextra_core::convert::cursor::proto::{ExecKind, ExecRequest, ServerMessage, TurnUsage};
 use serde_json::{json, Value};
 
 pub struct CursorReply {
@@ -11,6 +11,7 @@ pub struct CursorReply {
     content: Vec<Value>,
     input_tokens: usize,
     output_tokens: i64,
+    turn_usage: Option<TurnUsage>,
     pub checkpoint: Option<Vec<u8>>,
     pub pending: Vec<ExecRequest>,
     pub finished: bool,
@@ -26,6 +27,7 @@ impl CursorReply {
             content: Vec::new(),
             input_tokens: input_tokens.max(1),
             output_tokens: 0,
+            turn_usage: None,
             checkpoint: None,
             pending: Vec::new(),
             finished: false,
@@ -78,7 +80,10 @@ impl CursorReply {
                 self.output_tokens = self.output_tokens.saturating_add(delta.max(0));
                 self.sse.handle(&ServerMessage::TokenDelta(delta))
             }
-            CursorEvent::TurnEnded => self.sse.handle(&ServerMessage::TurnEnded),
+            CursorEvent::TurnEnded(usage) => {
+                self.turn_usage = Some(usage);
+                self.sse.handle(&ServerMessage::TurnEnded(usage))
+            }
             CursorEvent::Checkpoint(raw) => {
                 self.checkpoint = Some(raw);
                 Vec::new()
@@ -130,12 +135,26 @@ impl CursorReply {
         } else {
             self.content.clone()
         };
+        // TurnEnded 上报全量用量时覆盖估算值;input 含 cache 部分,按 Anthropic 语义拆出
+        let usage = self.turn_usage.unwrap_or_default();
+        let cache_read = usage.cache_read_tokens.unwrap_or(0);
+        let cache_write = usage.cache_write_tokens.unwrap_or(0);
+        let input_tokens = usage
+            .input_tokens
+            .map(|tokens| (tokens - cache_read - cache_write).max(0))
+            .unwrap_or(self.input_tokens as i64);
+        let output_tokens = usage.output_tokens.unwrap_or(self.output_tokens);
         json!({
             "id": self.id, "type": "message", "role": "assistant", "model": self.model,
             "content": content,
             "stop_reason": if self.pending.is_empty() { "end_turn" } else { "tool_use" },
             "stop_sequence": null,
-            "usage": { "input_tokens": self.input_tokens, "output_tokens": self.output_tokens }
+            "usage": {
+                "input_tokens": input_tokens,
+                "output_tokens": output_tokens,
+                "cache_read_input_tokens": cache_read,
+                "cache_creation_input_tokens": cache_write
+            }
         })
     }
 }

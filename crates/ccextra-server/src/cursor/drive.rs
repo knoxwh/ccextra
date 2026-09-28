@@ -2,7 +2,7 @@ use super::error::CursorFailure;
 use super::stream::CursorStream;
 use ccextra_core::convert::cursor::proto::{
     decode_agent_server_message, parse_connect_end_stream, reply, ConnectFrame,
-    ConnectFrameDecoder, ExecKind, ExecRequest, ServerMessage, CONNECT_END_STREAM_FLAG,
+    ConnectFrameDecoder, ExecKind, ExecRequest, ServerMessage, TurnUsage, CONNECT_END_STREAM_FLAG,
     DEFAULT_MAX_FRAME_SIZE,
 };
 use ccextra_core::convert::cursor::{decode_mcp_args, CursorRunRequest};
@@ -13,7 +13,7 @@ pub enum CursorEvent {
     Text(String),
     Thinking(String),
     Tokens(i64),
-    TurnEnded,
+    TurnEnded(TurnUsage),
     Checkpoint(Vec<u8>),
     ToolUse { exec: ExecRequest, input: Value },
     End,
@@ -127,7 +127,7 @@ impl CursorDrive {
             ServerMessage::TextDelta(text) => Some(CursorEvent::Text(text)),
             ServerMessage::ThinkingDelta(text) => Some(CursorEvent::Thinking(text)),
             ServerMessage::TokenDelta(tokens) => Some(CursorEvent::Tokens(tokens)),
-            ServerMessage::TurnEnded => Some(CursorEvent::TurnEnded),
+            ServerMessage::TurnEnded(usage) => Some(CursorEvent::TurnEnded(usage)),
             ServerMessage::Checkpoint(raw) => Some(CursorEvent::Checkpoint(raw.0)),
             ServerMessage::KvGet { id, blob_id } => {
                 let payload = reply::encode_kv_get(

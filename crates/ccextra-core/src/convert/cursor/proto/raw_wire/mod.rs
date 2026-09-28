@@ -9,7 +9,7 @@ pub enum ServerMessage {
     ThinkingDelta(String),
     ThinkingCompleted,
     TokenDelta(i64),
-    TurnEnded,
+    TurnEnded(TurnUsage),
     Heartbeat,
     Checkpoint(RawCheckpoint),
     KvGet {
@@ -22,6 +22,16 @@ pub enum ServerMessage {
         data: Vec<u8>,
     },
     Exec(ExecRequest),
+}
+
+/// TurnEndedUpdate 携带的回合用量(field 全 optional,None 表示上游未上报)
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub struct TurnUsage {
+    pub input_tokens: Option<i64>,
+    pub output_tokens: Option<i64>,
+    pub cache_read_tokens: Option<i64>,
+    pub cache_write_tokens: Option<i64>,
+    pub reasoning_tokens: Option<i64>,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]

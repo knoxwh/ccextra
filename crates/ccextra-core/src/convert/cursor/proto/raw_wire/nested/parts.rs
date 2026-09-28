@@ -1,4 +1,4 @@
-use super::super::ExecKind;
+use super::super::{ExecKind, TurnUsage};
 use crate::convert::cursor::proto::raw_wire::decode::fields;
 use crate::convert::cursor::proto::wire::{Field, WireError};
 use std::collections::BTreeMap;
@@ -73,6 +73,25 @@ pub fn decode_mcp(data: &[u8]) -> Result<ExecKind, WireError> {
         tool_call_id,
         args,
     })
+}
+
+/// TurnEndedUpdate:1 input_tokens|2 output_tokens|3 cache_read_tokens|4 cache_write_tokens|5 reasoning_tokens(全 int64 optional)
+pub fn decode_turn_ended(data: &[u8]) -> Result<TurnUsage, WireError> {
+    let mut usage = TurnUsage::default();
+    for field in fields(data)? {
+        if let Field::Varint { number, value } = field {
+            let tokens = i64::try_from(value).unwrap_or(i64::MAX);
+            match number {
+                1 => usage.input_tokens = Some(tokens),
+                2 => usage.output_tokens = Some(tokens),
+                3 => usage.cache_read_tokens = Some(tokens),
+                4 => usage.cache_write_tokens = Some(tokens),
+                5 => usage.reasoning_tokens = Some(tokens),
+                _ => {}
+            }
+        }
+    }
+    Ok(usage)
 }
 
 pub fn is_builtin(number: u64) -> bool {

@@ -428,7 +428,7 @@ impl CursorSessions {
                 }
                 // 工具边界已收尾；对齐 Plus 的等待循环，迟到的输出增量不跨回合发送。
                 CursorEvent::Text(_) | CursorEvent::Thinking(_) | CursorEvent::Tokens(_) => {}
-                CursorEvent::End | CursorEvent::TurnEnded | CursorEvent::ToolUse { .. } => break,
+                CursorEvent::End | CursorEvent::TurnEnded(_) | CursorEvent::ToolUse { .. } => break,
             }
         }
         self.cancel(&conversation, &identity, generation);

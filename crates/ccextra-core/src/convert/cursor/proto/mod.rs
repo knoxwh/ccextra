@@ -11,7 +11,7 @@ pub use connect::{
     CONNECT_END_STREAM_FLAG, DEFAULT_MAX_FRAME_SIZE,
 };
 pub use raw_wire::{
-    decode_agent_server_message, ExecKind, ExecRequest, RawCheckpoint, ServerMessage,
+    decode_agent_server_message, ExecKind, ExecRequest, RawCheckpoint, ServerMessage, TurnUsage,
 };
 pub use trailer::{parse_connect_end_stream, ConnectError, TrailerError};
 pub use unary::{decode_get_usable_models_response, encode_get_usable_models_request, UnaryError};

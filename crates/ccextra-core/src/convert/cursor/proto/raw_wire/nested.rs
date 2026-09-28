@@ -18,7 +18,7 @@ pub fn decode_interaction(data: &[u8]) -> Result<Option<ServerMessage>, WireErro
                 parts::varint_field(value, 1)? as i64
             )),
             13 => Some(ServerMessage::Heartbeat),
-            14 => Some(ServerMessage::TurnEnded),
+            14 => Some(ServerMessage::TurnEnded(parts::decode_turn_ended(value)?)),
             _ => result,
         };
     }
