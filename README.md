@@ -214,7 +214,9 @@ Cursor 登录自行生成 PKCE 并轮询浏览器授权，不依赖 Cursor IDE �
 
 Cursor 只支持单凭证。Run 请求 DATA 保持打开；响应必须由 flags `0x02` 的 Connect JSON trailer 结束，提前 EOF 属于错误。401 仅在无输出时刷新并重试一次，429 不重试；5xx 和传输错误在 3 秒预算内退避。上游提供 `Retry-After` 时，错误响应会透传该头。
 
-修改配置或需要立即重新加载凭证时：
+四种登录命令保存凭证后，都会按 `--config` 的 `server.host` / `server.port` 自动发送 `POST /reload`。通配监听地址转为本机回环地址，请求不走代理，连接超时 2 秒、总超时 30 秒。失败只提示，不撤销登录；服务未启动时下次启动加载。使用 `--auth-dir` 时，服务配置也需指向该目录。
+
+修改配置或自动重载失败后，可手动重载：
 
 ```bash
 curl -X POST http://127.0.0.1:8222/reload

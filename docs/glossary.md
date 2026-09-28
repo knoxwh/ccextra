@@ -139,6 +139,7 @@ Gemini 函数调用模式。Antigravity Claude 模型强制使用；Gemini 直�
 由保存的 Antigravity、xAI、Codex 或 Cursor 凭证生成的运行时 provider。Antigravity 后台刷新模型；xAI 与 Codex 在启动和重载时扫描、刷新凭证；Cursor 单凭证从 `GetUsableModels` 成功结果发布模型目录，失败时首次不发布；`/reload` 失败时仅凭证目录和账号未变才保留旧目录，新静态模型别名优先；后台刷新失败保留已发布目录。Codex 请求携带 `Chatgpt-Account-Id` 订阅身份头。
 
 **热重载**
+四种 OAuth 登录命令保存凭证后自动调用配置地址的 `POST /reload`（直连，通配地址转回环地址，连接超时 2 秒、总超时 30 秒）；失败仅提示，凭证保留，服务未启动时下次启动加载。
 `POST /reload` 串行加载、校验后原子替换统一不可变配置快照；失败不改变已生效版本。旧请求保留旧快照，新请求取得新快照。后台刷新绑定版本，过期结果丢弃；后续轮次使用最新已发布的静态配置、目录及代理。
 
 **配置快照**

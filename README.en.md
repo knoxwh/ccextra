@@ -214,7 +214,9 @@ Requests with the same session and digest share one upstream run and replay its 
 
 Cursor supports one credential. Run request DATA remains open; only a Connect JSON trailer with flags `0x02` ends the response, while premature EOF is an error. A 401 triggers one credential refresh and retry only before output; 429 is never retried. Server and transport errors back off within a three-second budget. Error responses forward `Retry-After` when supplied by the upstream.
 
-After editing configuration, or to reload credentials immediately:
+After saving credentials, all four login commands automatically send `POST /reload` to `server.host` / `server.port` from `--config`. Wildcard bind addresses map to loopback; the request bypasses proxies, with a 2-second connection timeout and a 30-second total timeout. Failure prints a warning without undoing login; a stopped service loads credentials on its next startup. When using `--auth-dir`, the service configuration must point to that directory too.
+
+After editing configuration or if automatic reload fails, reload manually:
 
 ```bash
 curl -X POST http://127.0.0.1:8222/reload

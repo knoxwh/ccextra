@@ -171,6 +171,7 @@ async fn main() -> Result<()> {
                 proxy_url: cfg.and_then(|c| c.server.proxy_url),
             };
             run_cursor_login(options).await?;
+            reload_after_login(&cli.config).await;
             return Ok(());
         }
         Some(Commands::CursorStatus { auth_dir }) => {
@@ -721,6 +722,41 @@ fn merge_providers(
     base
 }
 
+/// 登录凭证已保存，重载失败只提示，不改变登录结果。
+async fn reload_after_login(config_path: &str) {
+    let result: Result<()> = async {
+        let config = Config::load(config_path)?;
+        let host = config.server.host.trim_matches(['[', ']']);
+        let host = match host.parse::<std::net::IpAddr>() {
+            Ok(std::net::IpAddr::V4(ip)) if ip.is_unspecified() => "127.0.0.1".into(),
+            Ok(std::net::IpAddr::V6(ip)) if ip.is_unspecified() => "[::1]".into(),
+            Ok(std::net::IpAddr::V6(ip)) => format!("[{ip}]"),
+            _ => host.to_string(),
+        };
+        let url = format!("http://{host}:{}/reload", config.server.port);
+        let response = reqwest::Client::builder()
+            .no_proxy()
+            .redirect(reqwest::redirect::Policy::none())
+            .connect_timeout(std::time::Duration::from_secs(2))
+            .timeout(std::time::Duration::from_secs(30))
+            .build()?
+            .post(&url)
+            .send()
+            .await?;
+        anyhow::ensure!(
+            response.status().is_success(),
+            "reload HTTP {}",
+            response.status()
+        );
+        println!("已重载运行中的 ccextra: {url}");
+        Ok(())
+    }
+    .await;
+    if let Err(error) = result {
+        eprintln!("凭证已保存，自动重载未完成: {error}。服务未启动时下次启动生效，否则请手动 POST /reload。");
+    }
+}
+
 async fn cmd_antigravity_login(
     config_path: &str,
     auth_dir: Option<String>,
@@ -736,6 +772,7 @@ async fn cmd_antigravity_login(
         proxy_url,
     };
     run_antigravity_login(opts).await?;
+    reload_after_login(config_path).await;
     Ok(())
 }
 
@@ -792,6 +829,7 @@ async fn cmd_xai_login(
         proxy_url,
     };
     run_xai_login(opts).await?;
+    reload_after_login(config_path).await;
     Ok(())
 }
 
@@ -851,6 +889,7 @@ async fn cmd_codex_login(
         proxy_url,
     };
     run_codex_login(opts).await?;
+    reload_after_login(config_path).await;
     Ok(())
 }
 
