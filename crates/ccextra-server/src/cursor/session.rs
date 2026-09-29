@@ -225,6 +225,14 @@ pub enum ResumedSession {
     ),
     Joined(u64, InflightRun),
 }
+
+/// take 失败分类:Lost 可安全回退 flatten 冷分支,Invalid 必须 fail closed
+pub enum TakeError {
+    /// 驻留会话/凭证/模型/工具目录绑定丢失(如进程重启、TTL 过期)
+    Lost(&'static str),
+    /// 客户端工具结果形状错误(数量或 ID 不匹配)
+    Invalid(&'static str),
+}
 type CheckpointData = (Vec<u8>, HashMap<String, Vec<u8>>);
 
 /// 开启请求结果
@@ -494,21 +502,21 @@ impl CursorSessions {
         upstream_model: &str,
         tool_catalog_fingerprint: &str,
         turn_digest: String,
-    ) -> Result<ResumedSession, &'static str> {
+    ) -> Result<ResumedSession, TakeError> {
         let mut registry = self.inner.lock().unwrap();
         registry.sweep(Instant::now());
         {
             let Some(owner) = registry.owners.get(conversation) else {
-                return Err("session 不存在");
+                return Err(TakeError::Lost("session 不存在"));
             };
             if owner.identity != identity {
-                return Err("credential 不匹配");
+                return Err(TakeError::Lost("credential 不匹配"));
             }
             if owner.upstream_model != upstream_model {
-                return Err("模型不匹配");
+                return Err(TakeError::Lost("模型不匹配"));
             }
             if owner.tool_catalog_fingerprint != tool_catalog_fingerprint {
-                return Err("工具目录不匹配");
+                return Err(TakeError::Lost("工具目录不匹配"));
             }
             if owner.turn_digest == turn_digest && owner.state != SessionState::Failed {
                 if let Some(run) = &owner.inflight {
@@ -516,16 +524,17 @@ impl CursorSessions {
                 }
             }
             let Some(session) = registry.active.get(conversation) else {
-                return Err("session 未 park");
+                return Err(TakeError::Lost("session 未 park"));
             };
             if owner.generation != session.generation {
-                return Err("generation 不匹配");
+                return Err(TakeError::Lost("generation 不匹配"));
             }
         }
         let Some(session) = registry.active.get(conversation) else {
-            return Err("session 未 park");
+            return Err(TakeError::Lost("session 未 park"));
         };
-        let matched = match_pending(&session.pending, results)?
+        let matched = match_pending(&session.pending, results)
+            .map_err(TakeError::Invalid)?
             .into_iter()
             .map(|(exec, result)| (exec.clone(), result))
             .collect();
@@ -538,10 +547,10 @@ impl CursorSessions {
             if let Some(owner) = registry.owners.remove(conversation) {
                 owner.cancelled.send_replace(true);
             }
-            return Err("resume channel 已关闭");
+            return Err(TakeError::Lost("resume channel 已关闭"));
         }
         let Some(owner) = registry.owners.get_mut(conversation) else {
-            return Err("session 不存在");
+            return Err(TakeError::Lost("session 不存在"));
         };
         // 原子更新 owner 的 digest、state 与 inflight
         owner.turn_digest = turn_digest;

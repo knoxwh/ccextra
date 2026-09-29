@@ -680,3 +680,57 @@ async fn retries_503_before_output_but_not_connect_429() {
         .unwrap();
     assert_eq!(calls.load(std::sync::atomic::Ordering::SeqCst), 1);
 }
+
+#[tokio::test]
+async fn lost_tool_continuation_falls_back_to_flatten() {
+    // 模拟进程重启:registry 无驻留会话,工具续接请求回退 flatten 而非 400
+    let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let url = format!("http://{}", listener.local_addr().unwrap());
+    let captured = Arc::new(Mutex::new(Vec::new()));
+    let seen = captured.clone();
+    let server = tokio::spawn(async move {
+        let (socket, _) = listener.accept().await.unwrap();
+        let mut connection = h2::server::handshake(socket).await.unwrap();
+        let (request, mut response) = connection.accept().await.unwrap().unwrap();
+        let mut body = request.into_body();
+        let driver = tokio::spawn(async move {
+            while let Some(next) = connection.accept().await {
+                next.unwrap();
+            }
+        });
+        let initial = body.data().await.unwrap().unwrap();
+        seen.lock().unwrap().extend(&initial);
+        let mut sender = response.send_response(Response::new(()), false).unwrap();
+        sender.send_data(text_frame("recovered"), false).unwrap();
+        sender.send_data(end_frame(), true).unwrap();
+        drop(sender);
+        let _ = tokio::time::timeout(Duration::from_secs(1), driver).await;
+    });
+    let (state, _dir) = fixture(url);
+    let mut body = prompt(false);
+    body["tools"] = json!([{
+        "name": "lookup", "description": "Look up data",
+        "input_schema": { "type": "object", "properties": {} },
+    }]);
+    body["messages"] = json!([
+        { "role": "user", "content": "ping" },
+        { "role": "assistant", "content": [
+            { "type": "tool_use", "id": "call-a", "name": "lookup", "input": {} },
+        ] },
+        { "role": "user", "content": [
+            { "type": "tool_result", "tool_use_id": "call-a", "content": "A" },
+        ] },
+    ]);
+    let (status, text) = call(state, body).await;
+    assert_eq!(status, StatusCode::OK, "{text}");
+    let data: Value = serde_json::from_str(&text).unwrap();
+    assert_eq!(data["content"][0]["text"], "recovered");
+    // flatten 请求应把工具调用与结果渲染进 UserText 文本
+    let payload = String::from_utf8_lossy(&captured.lock().unwrap()).to_string();
+    assert!(payload.contains("ASSISTANT_TOOL_CALL"), "缺少工具调用文本");
+    assert!(payload.contains("TOOL_RESULT"), "缺少工具结果文本");
+    tokio::time::timeout(Duration::from_secs(5), server)
+        .await
+        .unwrap()
+        .unwrap();
+}

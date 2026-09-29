@@ -79,11 +79,11 @@ Cursor 不是 `openai_responses` provider，而是独立 `cursor` 协议。`curs
 
 Run 已接入独立双向 HTTP/2 Connect-RPC：请求 HEADERS/DATA 不半关，5 秒发送上游心跳；仅 flags `0x02` 的 JSON trailer 表示响应结束，提前 EOF 为错误。raw-wire 解码保留同帧多个顶层事件，KV、RequestContext 和内置 exec 在同一 H2 stream 回帧（内置工具统一拒绝）。文本、思考、token 与 MCP 调用映射为 Anthropic JSON/SSE，流式响应空闲时发送 10 秒 `: keepalive`。401 只在客户端无输出时刷新并重试一次；429 快速失败，5xx/传输错误共享 3 秒退避预算；错误响应透传可用的 `Retry-After`。
 
-有稳定会话 ID 时，`conversation_id` 绑定凭证身份；MCP 工具边界先结束 Anthropic 响应，驻留上游 H2 stream，下一轮按 `tool_call_id` 精确匹配所有文本工具结果，并使用保存的 `exec_msg_id` 与 `exec_id` 回帧。续接校验凭证、模型和工具目录，丢失驻留会话时返回 400，不静默重开 Run；无效工具结果不消耗驻留会话。驻留会话闲置 5 分钟过期；checkpoint 原始 protobuf bytes 和 blob store 绑定凭证与 owner generation，保留 30 分钟，旧 owner 不得覆盖新状态。内置 exec 执行、Cursor CLI passthrough 和多账号不在范围内。
+有稳定会话 ID 时，`conversation_id` 绑定凭证身份；MCP 工具边界先结束 Anthropic 响应，驻留上游 H2 stream，下一轮按 `tool_call_id` 精确匹配所有文本工具结果，并使用保存的 `exec_msg_id` 与 `exec_id` 回帧。续接校验凭证、模型和工具目录；驻留会话丢失（进程重启、TTL 过期、模型或工具目录变更）时回退 flatten 冷分支：全量 transcript（含 `ASSISTANT_TOOL_CALL`/`TOOL_RESULT` 文本）重新起跑，不返回 400，对齐 Plus 无会话时的摊平行为；无效工具结果（数量或 ID 不匹配）仍 fail closed 且不消耗驻留会话。驻留会话闲置 5 分钟过期；checkpoint 原始 protobuf bytes 和 blob store 绑定凭证与 owner generation，保留 30 分钟，旧 owner 不得覆盖新状态。内置 exec 执行、Cursor CLI passthrough 和多账号不在范围内。
 
 在打开上游前注册 owner；同会话同 digest 请求共享一次执行，digest 覆盖 system、消息、工具、模型与请求参数。续接在同一锁内取走驻留流并更新 digest/state/inflight。真实 JSON 快照和完整末帧发布后通知等待者；工具边界保留 AwaitingToolResults，重复请求可重放。SSE producer 独立持有 drive，消费者按 journal 游标读取；最后一个消费者断开后等待 5 秒，无重连则取消。重连使旧宽限期失效；不同 digest 拒绝 attached running，允许替换 detached running。
 
-journal 帧数据预算为 64 MiB，TTL 为 10 分钟，每 30 秒清理；超限优先驱逐已终止日志，然后驱逐活跃日志。驱逐后不重新建立残缺日志，返回 `cursor_replay_unavailable`；已开始的 SSE 使用 error 事件。预算不涵盖 JSON 快照、checkpoint/blob 或网络缓冲。所有会话状态仅在内存，持久化延期，重启不保证恢复或去重。
+journal 帧数据预算为 64 MiB，TTL 为 10 分钟，每 30 秒清理；超限优先驱逐已终止日志，然后驱逐活跃日志。驱逐后不重新建立残缺日志，返回 `cursor_replay_unavailable`；已开始的 SSE 使用 error 事件。预算不涵盖 JSON 快照、checkpoint/blob 或网络缓冲。所有会话状态仅在内存，持久化延期；重启后驻留续接走 flatten 冷分支（防重复执行仅靠 transcript 可见性，模型重发相同调用会再次执行），checkpoint 丢失则全量摊平。
 
 以上是当前代码路径与本地测试范围；尚未对真实 Cursor 上游验收。特别是 RequestContextResult 重新声明 MCP 工具的行为对齐 CLIProxyAPIPlus，OmniRoute 使用空 ack，真实服务兼容性仍需验证。
 

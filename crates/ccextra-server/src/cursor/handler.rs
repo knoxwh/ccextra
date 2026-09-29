@@ -5,7 +5,7 @@ use super::journal::ReplayStatus;
 use super::response::CursorReply;
 use super::session::{
     compute_tool_catalog_fingerprint, compute_turn_digest, BeginOutcome, ConsumerGuard,
-    CursorSessions, InflightRun, RunOutcome, ToolResult,
+    CursorSessions, InflightRun, RunOutcome, TakeError, ToolResult,
 };
 use super::{provider, refresh, store, stream::CursorStream};
 use crate::http::error::AppError;
@@ -654,71 +654,83 @@ pub(crate) async fn handle_cursor(
             &tool_catalog_fingerprint,
             continuation_digest.clone(),
         ) {
-            Ok(resumed) => resumed,
-            Err(err) => {
-                // 丢 session 必须 fail closed！
-                return Err(AppError::bad_request(format!("continuation 失败: {err}")));
+            Ok(resumed) => Some(resumed),
+            Err(TakeError::Invalid(reason)) => {
+                // 工具结果形状错误是客户端问题,必须 fail closed
+                return Err(AppError::bad_request(format!(
+                    "continuation 失败: {reason}"
+                )));
+            }
+            Err(TakeError::Lost(reason)) => {
+                // 驻留会话丢失(进程重启/TTL 过期/模型或工具目录变更):对齐 Plus,
+                // 冷分支 flatten 全量 transcript(含 tool_use/tool_result 文本)重新起跑
+                tracing::warn!("Cursor 工具续接会话丢失,回退 flatten: {reason}");
+                None
             }
         };
-        let (generation, drive_receiver, matched, inflight) = match resumed {
-            super::session::ResumedSession::Resumed(generation, drive, matched, run) => {
-                (generation, drive, matched, run)
-            }
-            super::session::ResumedSession::Joined(generation, run) => {
-                let guard = state.cursor_sessions.create_consumer_guard(
-                    &conversation,
-                    identity,
-                    generation,
-                    &run,
-                );
-                return consumer_response(prepared.is_stream, turn_digest, run, guard).await;
-            }
-        };
-        let mut setup = SetupGuard {
-            sessions: state.cursor_sessions.clone(),
-            conversation: conversation.clone(),
-            identity: identity.clone(),
-            generation,
-            handed_off: false,
-        };
-        let guard = state.cursor_sessions.create_consumer_guard(
-            &conversation,
-            identity,
-            generation,
-            &inflight,
-        );
-        let cancellation = state
-            .cursor_sessions
-            .cancellation(&conversation, identity, generation);
+        if let Some(resumed) = resumed {
+            let (generation, drive_receiver, matched, inflight) = match resumed {
+                super::session::ResumedSession::Resumed(generation, drive, matched, run) => {
+                    (generation, drive, matched, run)
+                }
+                super::session::ResumedSession::Joined(generation, run) => {
+                    let guard = state.cursor_sessions.create_consumer_guard(
+                        &conversation,
+                        identity,
+                        generation,
+                        &run,
+                    );
+                    return consumer_response(prepared.is_stream, turn_digest, run, guard).await;
+                }
+            };
+            let mut setup = SetupGuard {
+                sessions: state.cursor_sessions.clone(),
+                conversation: conversation.clone(),
+                identity: identity.clone(),
+                generation,
+                handed_off: false,
+            };
+            let guard = state.cursor_sessions.create_consumer_guard(
+                &conversation,
+                identity,
+                generation,
+                &inflight,
+            );
+            let cancellation =
+                state
+                    .cursor_sessions
+                    .cancellation(&conversation, identity, generation);
 
-        let drive = match drive_receiver.await {
-            Ok(d) => d,
-            Err(_) => return Err(AppError::bad_request("Cursor 会话已被取消或通道关闭")),
-        };
-        for (exec, result) in matched {
-            if let Err(err) = drive
-                .send_tool_result(&exec, &result.content, result.is_error)
-                .await
-            {
-                return Ok(failure_response(err));
+            let drive = match drive_receiver.await {
+                Ok(d) => d,
+                Err(_) => return Err(AppError::bad_request("Cursor 会话已被取消或通道关闭")),
+            };
+            for (exec, result) in matched {
+                if let Err(err) = drive
+                    .send_tool_result(&exec, &result.content, result.is_error)
+                    .await
+                {
+                    return Ok(failure_response(err));
+                }
             }
+            let input_tokens = (prepared.body_json.to_string().len() / 4).max(1);
+            let reply = CursorReply::new(response_id, inbound_model, input_tokens);
+            setup.handed_off = true;
+            spawn_cursor_producer(
+                state.cursor_sessions.clone(),
+                conversation,
+                identity.to_string(),
+                generation,
+                continuation_digest.clone(),
+                drive,
+                reply,
+                inflight.clone(),
+                cancellation,
+                stable,
+            );
+            return consumer_response(prepared.is_stream, continuation_digest, inflight, guard)
+                .await;
         }
-        let input_tokens = (prepared.body_json.to_string().len() / 4).max(1);
-        let reply = CursorReply::new(response_id, inbound_model, input_tokens);
-        setup.handed_off = true;
-        spawn_cursor_producer(
-            state.cursor_sessions.clone(),
-            conversation,
-            identity.to_string(),
-            generation,
-            continuation_digest.clone(),
-            drive,
-            reply,
-            inflight.clone(),
-            cancellation,
-            stable,
-        );
-        return consumer_response(prepared.is_stream, continuation_digest, inflight, guard).await;
     }
     let checkpoint = if stable && !has_results {
         state.cursor_sessions.checkpoint(&conversation, identity)
