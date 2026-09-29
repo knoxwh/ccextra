@@ -217,7 +217,22 @@ impl CursorDrive {
                     None
                 }
                 ExecKind::Mcp { args, .. } => {
-                    if let ExecKind::Mcp { tool_call_id, .. } = &mut exec.kind {
+                    if let ExecKind::Mcp {
+                        tool_call_id, name, ..
+                    } = &mut exec.kind
+                    {
+                        // 上游把声明工具渲染为 "{provider_identifier}-{name}" 再回传
+                        // (实测 proxy- 前缀);对账声明表,组合名改写回声明名,
+                        // 否则客户端按未知工具拒绝。精确命中优先,不中则原样直传
+                        if !self.tools.iter().any(|tool| tool.name == *name) {
+                            if let Some(declared) = self.tools.iter().find(|tool| {
+                                !tool.provider_identifier.is_empty()
+                                    && *name
+                                        == format!("{}-{}", tool.provider_identifier, tool.name)
+                            }) {
+                                *name = declared.name.clone();
+                            }
+                        }
                         if tool_call_id.is_empty() {
                             *tool_call_id = format!("cursor_{}_{}", exec.exec_msg_id, exec.exec_id);
                         }
