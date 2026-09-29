@@ -113,6 +113,11 @@ pub(super) fn user_text(body: &Value, checkpoint: bool) -> Result<UserInput, Cur
     };
     let mut transcript = String::new();
     let mut images = Vec::new();
+    // checkpoint 模式只 entry 最后一条非 system 消息;Claude Code 会在 user 后追加
+    // system reminder,末条常是 system,不能让它挤掉真正的用户输入
+    let last_conversation = messages
+        .iter()
+        .rposition(|message| message.get("role").and_then(Value::as_str) != Some("system"));
     for (index, message) in messages.iter().enumerate() {
         let role = message
             .get("role")
@@ -130,7 +135,7 @@ pub(super) fn user_text(body: &Value, checkpoint: bool) -> Result<UserInput, Cur
             // 对齐 Plus:每条 user 消息覆盖,最终保留最后一条的图片
             images = extract_images(content);
         }
-        if !checkpoint || index + 1 == messages.len() {
+        if !checkpoint || Some(index) == last_conversation {
             entry(
                 &mut transcript,
                 if role == "assistant" {

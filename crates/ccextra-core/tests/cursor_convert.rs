@@ -524,3 +524,27 @@ fn checkpoint_is_embedded_without_reencoding_unknown_fields() {
         conversation_id("other", "session")
     );
 }
+
+#[test]
+fn checkpoint_with_trailing_system_keeps_last_user_message() {
+    // Claude Code 会在 user 后追加 system reminder,末条常是 system;
+    // checkpoint 续接必须取最后一条非 system 消息,不能让尾部 reminder 挤掉用户输入
+    let checkpoint = [0x0a, 0x01, b'A', 0x98, 0x06, 0x01];
+    let body = json!({
+        "messages": [
+            {"role":"user", "content":"我叫小明"},
+            {"role":"assistant", "content":"你好"},
+            {"role":"user", "content":"我叫什么名字?"},
+            {"role":"system", "content":"<total_tokens>15000</total_tokens>"}
+        ]
+    });
+    let request = build_run_request(&body, "composer-2", "conv", "msg", Some(&checkpoint)).unwrap();
+    let action = run(&request.payload).action.unwrap().action.unwrap();
+    let generated::conversation_action::Action::UserMessageAction(action) = action else {
+        panic!("expected user message");
+    };
+    let text = action.user_message.unwrap().text;
+    assert!(text.contains("我叫什么名字?"));
+    assert!(!text.contains("我叫小明"));
+    assert!(!text.contains("total_tokens"));
+}
