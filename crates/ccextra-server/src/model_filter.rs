@@ -1,4 +1,4 @@
-// 动态 provider 模型白名单过滤(antigravity/cursor 共用)
+// 动态 provider 模型白名单过滤(antigravity)
 use ccextra_core::route::ModelConfig;
 use globset::Glob;
 

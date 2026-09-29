@@ -42,7 +42,7 @@ where
                             .or_else(|| value.pointer("/response/cpaUsageMetadata/promptTokenCount"))
                             .or_else(|| value.pointer("/usageMetadata/promptTokenCount"))
                             .or_else(|| value.pointer("/cpaUsageMetadata/promptTokenCount")),
-                        Protocol::Claude | Protocol::Cursor => None,
+                        Protocol::Claude => None,
                     }.and_then(serde_json::Value::as_u64)
                         .and_then(|tokens| usize::try_from(tokens).ok())
                         .filter(|tokens| *tokens > 0);

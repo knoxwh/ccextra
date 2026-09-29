@@ -12,7 +12,6 @@
 | `openai_responses` | OpenAI Responses 协议，端点为 `/responses`。 |
 | `gemini` | Google Gemini GenerateContent 协议。 |
 | `antigravity` | Cloud Code Assist 运输协议，内部携带 Gemini 请求。 |
-| `cursor` | Cursor AgentService 的独立 Connect-RPC 协议；支持单凭证 OAuth、动态模型目录和 Run JSON/SSE 转换。 |
 | SSE | `text/event-stream` 响应格式；ccextra 将所有流式路径输出为 Anthropic SSE。 |
 | 非流响应 | `stream` 为 `false` 或缺失时的单个 JSON 响应。 |
 | 会话输入用量缓存 | 按 session 保存上游真实输入 token 数，供下一轮流首和 count_tokens 使用。Chat/Responses/Gemini/Antigravity 的原始 SSE 正数输入用量也会写回；缺失或零值不覆盖旧值，占位值不写回。记录写入后 30 分钟过期，最多 512 条。 |
@@ -65,21 +64,6 @@ Claude `web_search_*` 工具。Chat 路径删除它；Responses 映射为 `web_s
 **thinking**
 Anthropic 推理内容。目标协议会映射为 `reasoning_effort`、reasoning 项或 Gemini thinking 配置；不兼容签名会丢弃。
 
-**Cursor 模型目录与 variant**
-`GetUsableModels` 返回的可用模型及其变体。Cursor 仅从已广告的 variant 中按 family、effort、thinking 和 fast 选择；`-extra-high` 视为 `xhigh`。目录未广告 `auto` 时，可选用显式配置且已广告的 `cursor_default_model`。不从 `models.json` 推断 Cursor 能力。
-
-**Cursor checkpoint**
-会话状态的原始 protobuf bytes 与 blob store，绑定单个凭证和 owner generation，保留 30 分钟；有稳定会话 ID 的后续 Run 请求可原样传递 bytes。首次请求、凭证更换或工具流失效的冷路径将历史消息展平进 UserText。
-
-**Connect-RPC trailer**
-Cursor Run 响应以 flags `0x02` 的 JSON 结束帧报告成功或错误。单纯 EOF 不表示成功；成功 trailer 到达前，状态机不会输出正常终态。
-
-**Cursor MCP 续接**
-Cursor 工具调用关联 `exec_msg_id`、`exec_id` 和 `tool_call_id`。有稳定会话 ID 时，客户端下一请求的全部文本 `tool_result` 必须按 `tool_use_id` 匹配驻留上游流的 pending 调用，并保持模型与工具目录一致。闲置 5 分钟过期；会话丢失的续接返回 400，不重开上游。相同 continuation digest 共享执行。
-
-**Cursor replay 与断线宽限期**
-同会话同 digest 的 JSON/SSE 请求复用已有执行结果。后台 producer 独立消费上游，最后一个消费者断开后等待 5 秒再取消；驻留工具会话沿用 5 分钟 TTL。内存 journal 的帧数据预算为 64 MiB，TTL 10 分钟；驱逐后返回 `cursor_replay_unavailable`，不发送残缺的成功重放。该预算不包含 JSON 快照、checkpoint/blob。持久化延期，重启不恢复会话。
-
 ## 缓存稳定化
 
 **归一化**
@@ -103,7 +87,7 @@ OpenAI Chat 或 Responses 的 provider 级缓存桶标识。来自 Claude Code �
 按最终代理地址缓存 `reqwest::Client` 的发送器。它选择协议端点、认证、User-Agent、Grok 会话头和流式头。
 
 **重试与回退**
-messages 路径不做本地退避：429/5xx（含 52x）与网络错误在同轮内轮转多 `base_url`，耗尽后快速失败，把末次上游错误返给客户端，透传 `Retry-After`，退避重试交客户端（如 Claude Code）。流式首帧 error 内部重试一次，仍失败返回 502，不提交 200。Cursor 路径保留 3 秒退避预算（初始 300ms，单次最多 1.5 秒）。
+messages 路径不做本地退避：429/5xx（含 52x）与网络错误在同轮内轮转多 `base_url`，耗尽后快速失败，把末次上游错误返给客户端，透传 `Retry-After`，退避重试交客户端（如 Claude Code）。流式首帧 error 内部重试一次，仍失败返回 502，不提交 200。
 
 **有界读取**
 非流响应 body 的统一读取边界：成功 body 16 MiB（恰好上限可读，多 1 字节拒绝），错误 body 256 KiB（超出停止读取并标记截断，截断前缀不当作完整 JSON 解析）；读取停顿与流 chunk idle 共用 180s，每次非空数据后重置。成功 body 超限返回 502、停顿返回 504；错误 body 截断或读取失败保留上游状态码（429/401 不被改写）；OAuth/project/model 保留各自 30s 请求总超时。
@@ -136,7 +120,7 @@ Gemini 函数调用模式。Antigravity Claude 模型强制使用；Gemini 直�
 将 Anthropic `input_schema` 转成 Gemini 或 Antigravity 可接受 JSON Schema 的递归过程。它内联本地引用、移除不支持关键字、归一化布尔 `true` 子 schema、处理 enum 和 required，并为不同目标采用不同规则；Gemini 直连保留 `additionalProperties` 与标准约束，Antigravity 搬入 description 提示。声明 `items` 但缺 `type` 的节点补 `type: array`；`type` 显式不是 `array` 时去掉 `items`。OpenAI Chat/Responses 转换另会删除 schema 节点中的 `required: null`，保留实例数据中的同名字段。
 
 **OAuth 动态 provider**
-由保存的 Antigravity、xAI、Codex 或 Cursor 凭证生成的运行时 provider。Antigravity 后台刷新模型；xAI 与 Codex 在启动和重载时扫描、刷新凭证；Cursor 单凭证从 `GetUsableModels` 成功结果发布模型目录，失败时首次不发布；`/reload` 失败时仅凭证目录和账号未变才保留旧目录，新静态模型别名优先；后台刷新失败保留已发布目录。Codex 请求携带 `Chatgpt-Account-Id` 订阅身份头。
+由保存的 Antigravity、xAI 或 Codex 凭证生成的运行时 provider。Antigravity 后台刷新模型；xAI 与 Codex 在启动和重载时扫描、刷新凭证。Codex 请求携带 `Chatgpt-Account-Id` 订阅身份头。
 
 **热重载**
 四种 OAuth 登录命令保存凭证后自动调用配置地址的 `POST /reload`（直连，通配地址转回环地址，连接超时 2 秒、总超时 30 秒）；失败仅提示，凭证保留，服务未启动时下次启动加载。

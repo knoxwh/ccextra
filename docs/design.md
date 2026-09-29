@@ -73,19 +73,7 @@ Anthropic `system` 成为 system message；o 系列（`o1-mini`/`o1-preview` 除
 
 ### Cursor
 
-Cursor 不是 `openai_responses` provider，而是独立 `cursor` 协议。`cursor-login` 生成 PKCE verifier/challenge 并轮询 `api2.cursor.sh/auth/poll`，保存单份 `cursor.json`；到期前 10 分钟通过 refresh token 换取新 access token。启动与 `/reload` 向 `GetUsableModels` 发送空的原始 protobuf 请求，成功后才发布动态 provider。目录失败时首次不发布；`/reload` 失败时仅原凭证目录和账号不变才携带旧目录，新静态模型别名优先；后台刷新失败保留已发布目录。`cursor_auth_dir`（默认配置文件旁 `.cache/cursor`）、`cursor_base_url`（默认 `https://api2.cursor.sh`）、`cursor_client_version`（默认 `cli-2026.02.13-41ac335`）、`cursor_default_model` 均为顶层配置。
-
-已实现纯逻辑的 family/variant 解析：精确 alias/name 优先；family 只选择模型目录已广告的 variant，支持 effort、thinking、fast；`-extra-high` 归一为 `xhigh`。目录没有 `auto` 时只能退回显式配置且已广告的 `cursor_default_model`。不使用 `models.json` 为 Cursor 猜测模型或 effort。请求转换对齐 Plus：顶层 system 与 `messages` 内 `role: system` 项合并进 root blob（`{"content":...,"role":"system"}`，键序 content 先保证 sha256 blob id 字节稳定；无 system 兜底 `"You are a helpful assistant."`），UserText 只留用户输入，system 不算对话轮；无 checkpoint 的历史摊平进 UserText；base64 图片块随最后一条 user 消息进 `SelectedContext.selected_images`（`SelectedImage{data, uuid, mime_type}`，uuid 为 message_id 派生的 32 位 hex）；工具声明的 `input_schema` 编码为 protobuf `Value`。回程 exec 的工具名若为上游渲染的 `{provider_identifier}-{声明名}` 组合（实测 `proxy-` 前缀），对账声明表改写回声明名；精确命中或无匹配则原样直传。checkpoint 路径保持原始 bytes，避免丢失未知字段。
-
-Run 已接入独立双向 HTTP/2 Connect-RPC：请求 HEADERS/DATA 不半关，5 秒发送上游心跳；仅 flags `0x02` 的 JSON trailer 表示响应结束，提前 EOF 为错误。raw-wire 解码保留同帧多个顶层事件，KV、RequestContext 和内置 exec 在同一 H2 stream 回帧（内置工具统一拒绝）。文本、思考、token 与 MCP 调用映射为 Anthropic JSON/SSE，流式响应空闲时发送 10 秒 `: keepalive`。401 只在客户端无输出时刷新并重试一次；429 快速失败，5xx/传输错误共享 3 秒退避预算；错误响应透传可用的 `Retry-After`。
-
-有稳定会话 ID 时，`conversation_id` 绑定凭证身份；MCP 工具边界先结束 Anthropic 响应，驻留上游 H2 stream，下一轮按 `tool_call_id` 精确匹配所有文本工具结果，并使用保存的 `exec_msg_id` 与 `exec_id` 回帧。续接校验凭证、模型和工具目录；驻留会话丢失（进程重启、TTL 过期、模型或工具目录变更）时回退 flatten 冷分支：全量 transcript（含 `ASSISTANT_TOOL_CALL`/`TOOL_RESULT` 文本）重新起跑，不返回 400，对齐 Plus 无会话时的摊平行为；无效工具结果（数量或 ID 不匹配）仍 fail closed 且不消耗驻留会话。驻留会话闲置 5 分钟过期；checkpoint 原始 protobuf bytes 和 blob store 绑定凭证与 owner generation，保留 30 分钟，旧 owner 不得覆盖新状态。内置 exec 执行、Cursor CLI passthrough 和多账号不在范围内。
-
-在打开上游前注册 owner；同会话同 digest 请求共享一次执行，digest 覆盖 system、消息、工具、模型与请求参数。续接在同一锁内取走驻留流并更新 digest/state/inflight。真实 JSON 快照和完整末帧发布后通知等待者；工具边界保留 AwaitingToolResults，重复请求可重放。SSE producer 独立持有 drive，消费者按 journal 游标读取；最后一个消费者断开后等待 5 秒，无重连则取消。重连使旧宽限期失效；不同 digest 拒绝 attached running，允许替换 detached running。
-
-journal 帧数据预算为 64 MiB，TTL 为 10 分钟，每 30 秒清理；超限优先驱逐已终止日志，然后驱逐活跃日志。驱逐后不重新建立残缺日志，返回 `cursor_replay_unavailable`；已开始的 SSE 使用 error 事件。预算不涵盖 JSON 快照、checkpoint/blob 或网络缓冲。所有会话状态仅在内存，持久化延期；重启后驻留续接走 flatten 冷分支（防重复执行仅靠 transcript 可见性，模型重发相同调用会再次执行），checkpoint 丢失则全量摊平。
-
-以上是当前代码路径与本地测试范围；尚未对真实 Cursor 上游验收。特别是 RequestContextResult 重新声明 MCP 工具的行为对齐 CLIProxyAPIPlus，OmniRoute 使用空 ack，真实服务兼容性仍需验证。
+Cursor 代理路径已移除,仅保留订阅凭证能力:`cursor-login` 生成 PKCE verifier/challenge 并轮询 `api2.cursor.sh/auth/poll`,保存单份 `cursor.json`;到期前 10 分钟通过 refresh token 换取新 access token。`cursor_auth_dir`(默认配置文件旁 `.cache/cursor`)为顶层配置。`cursor-status` 显示已保存凭证状态。
 
 ### 各协议 System 提示词清洗差异矩阵
 
@@ -107,7 +95,7 @@ journal 帧数据预算为 64 MiB，TTL 为 10 分钟，每 30 秒清理；超�
 
 非流响应 body 有界读取：成功 body 上限 16 MiB（恰好上限可读，多 1 字节拒绝），错误 body 最多保留 256 KiB（超出停止读取并标记截断，截断前缀不当作完整 JSON 解析）；读取停顿与流 chunk idle 共用 180s，每次非空数据后重置，空 chunk 不续期。成功 body 超限返回 502、停顿返回 504（Anthropic `api_error`）；错误 body 截断或读取失败保留已知上游状态（429/401 不被改写），生成有界 Anthropic error，不再触发上游重试。OAuth/project/model 路径同样有界，保留各自 30s 请求总超时。
 
-messages 路径不做本地退避重试：429、5xx（含 Cloudflare 52x）与网络错误在同轮内轮转多 `base_url`，耗尽后快速失败，把末次上游错误（Anthropic error 形状）返给客户端；退避重试交客户端（如 Claude Code 自带退避），`Retry-After` 头透传。429 不本地重试对齐 codex 传输层 `retry_429: false`。Cursor 路径保留 3 秒退避预算（`compute_retry_delay`，初始 300ms、单次最多 1.5 秒）。流式 OpenAI 请求声明 `Accept: text/event-stream` 和 `Cache-Control: no-cache`。
+messages 路径不做本地退避重试：429、5xx（含 Cloudflare 52x）与网络错误在同轮内轮转多 `base_url`，耗尽后快速失败，把末次上游错误（Anthropic error 形状）返给客户端；退避重试交客户端（如 Claude Code 自带退避），`Retry-After` 头透传。429 不本地重试对齐 codex 传输层 `retry_429: false`。流式 OpenAI 请求声明 `Accept: text/event-stream` 和 `Cache-Control: no-cache`。
 
 ## 响应转发
 

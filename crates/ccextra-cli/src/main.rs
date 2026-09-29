@@ -11,9 +11,8 @@ use ccextra_server::codex::{
     CodexLoginOptions,
 };
 use ccextra_server::cursor::{
-    load as load_cursor_credential, load_cursor_provider,
-    resolve_auth_dir as resolve_cursor_auth_dir, run_login as run_cursor_login,
-    session::CursorSessions, CursorLoginOptions,
+    load as load_cursor_credential, resolve_auth_dir as resolve_cursor_auth_dir,
+    run_login as run_cursor_login, CursorLoginOptions,
 };
 use ccextra_server::http::{
     publish_refreshed_providers, AppState, ConfigSnapshot, ProviderRefreshConfig, ReloadData,
@@ -257,23 +256,12 @@ async fn main() -> Result<()> {
         tracing::info!("动态加载 {} 个 Codex providers", codex_providers.len());
     }
 
-    let cursor_provider = match load_cursor_from_refresh(&refresh).await {
-        Ok(provider) => provider,
-        Err(error) => {
-            tracing::warn!("Cursor 模型目录加载失败,暂不发布: {error}");
-            None
-        }
-    };
-
     // 合并配置文件 providers 和 xAI providers
     // Antigravity 模型列表需在线拉取(对齐 CPA 启动模式:已知数据先行、
     // 后台刷新、失败保旧),不阻塞监听 —— 转入 serve 之后的后台任务注入
     let mut all_providers = merge_providers(config.providers, Vec::new());
     all_providers = merge_providers(all_providers, xai_providers);
     all_providers = merge_providers(all_providers, codex_providers);
-    if let Some(cursor) = cursor_provider {
-        all_providers = merge_providers(all_providers, vec![cursor]);
-    }
 
     // 启动时验证配置
     ccextra_core::route::validate_providers(&all_providers)?;
@@ -309,23 +297,9 @@ async fn main() -> Result<()> {
                 cfg.server.proxy_url.as_deref(),
             )
             .await;
-            // Cursor 拉取失败不阻断 reload；发布方仅在凭证身份未变时保留旧 provider。
-            // Ok(None) 表示配置主动移除,不携带。
-            let (cursor_provider, cursor_load_failed) =
-                match load_cursor_from_refresh(&refresh).await {
-                    Ok(provider) => (provider, false),
-                    Err(error) => {
-                        tracing::warn!("Cursor 模型目录加载失败: {error}");
-                        (None, true)
-                    }
-                };
-
             let mut providers = merge_providers(cfg.providers, antigravity_providers);
             providers = merge_providers(providers, xai_providers);
             providers = merge_providers(providers, codex_providers);
-            if let Some(cursor) = cursor_provider {
-                providers = merge_providers(providers, vec![cursor]);
-            }
 
             let user_agents = build_user_agents(cfg.user_agents.as_ref());
             let thinking_registry = load_thinking_registry(&config_path, cfg.models_file.as_deref())?;
@@ -341,7 +315,6 @@ async fn main() -> Result<()> {
                 user_agents,
                 thinking_registry,
                 refresh,
-                cursor_load_failed,
             })
         })
     });
@@ -378,7 +351,6 @@ async fn main() -> Result<()> {
             std::time::Duration::from_secs(3600),
             1024,
         ),
-        cursor_sessions: ccextra_server::cursor::session::CursorSessions::default(),
         last_input_tokens: Arc::new(std::sync::Mutex::new(
             ccextra_server::http::session_tokens::SessionTokenCache::new(),
         )),
@@ -386,14 +358,7 @@ async fn main() -> Result<()> {
 
     // Antigravity 后台注入(对齐 CPA 启动模式:listening 不等在线模型列表;
     // 任务内部立即拉取一次,成功替换 providers,失败保旧等下轮)
-    tokio::spawn(run_antigravity_injection(
-        state.config.clone(),
-        state.cursor_sessions.clone(),
-    ));
-    tokio::spawn(run_cursor_injection(
-        state.config.clone(),
-        state.cursor_sessions.clone(),
-    ));
+    tokio::spawn(run_antigravity_injection(state.config.clone()));
 
     // 启动 HTTP 服务
     let addr = format!("{}:{}", config.server.host, config.server.port);
@@ -521,36 +486,10 @@ fn provider_refresh_config(config_path: &str, config: &Config) -> ProviderRefres
             config.codex_auth_dir.as_deref(),
             resolve_codex_auth_dir,
         )),
-        cursor_auth_dir: Some(pin_auth_dir(
-            config_path,
-            config.cursor_auth_dir.as_deref(),
-            resolve_cursor_auth_dir,
-        )),
-        cursor_base_url: config.cursor_base_url.clone(),
-        cursor_client_version: config.cursor_client_version.clone(),
-        cursor_default_model: config.cursor_default_model.clone(),
         antigravity_models: config.antigravity_models.clone(),
-        cursor_models: config.cursor_models.clone(),
         proxy_url: config.server.proxy_url.clone(),
         static_providers: config.providers.clone(),
     }
-}
-
-async fn load_cursor_from_refresh(
-    refresh: &ProviderRefreshConfig,
-) -> Result<Option<ProviderConfig>> {
-    let Some(auth_dir) = refresh.cursor_auth_dir.as_ref() else {
-        return Ok(None);
-    };
-    load_cursor_provider(
-        auth_dir,
-        refresh.cursor_base_url.as_deref(),
-        refresh.cursor_client_version.as_deref(),
-        refresh.cursor_default_model.as_deref(),
-        refresh.proxy_url.as_deref(),
-        refresh.cursor_models.as_deref().unwrap_or(&[]),
-    )
-    .await
 }
 
 /// 动态拉取失败时保留整个已发布集合;静态配置仅由成功的 reload 更新。
@@ -590,58 +529,15 @@ where
     Fut: std::future::Future<Output = Option<Vec<ProviderConfig>>>,
 {
     let snapshot = config.read().await.clone();
-    let Some(mut providers) = load(snapshot.refresh.clone()).await else {
+    let Some(providers) = load(snapshot.refresh.clone()).await else {
         return Ok(false);
     };
-    // Antigravity 刷新不能清掉由独立模型发现任务发布的 Cursor 目录。
-    if !providers
-        .iter()
-        .any(|p| p.protocol == ccextra_core::route::Protocol::Cursor)
-    {
-        if let Some(cursor) = snapshot.providers.iter().find(|p| {
-            p.protocol == ccextra_core::route::Protocol::Cursor
-                && snapshot
-                    .refresh
-                    .cursor_auth_dir
-                    .as_ref()
-                    .is_some_and(|dir| {
-                        ccextra_server::cursor::store::load(dir)
-                            .ok()
-                            .is_some_and(|credential| {
-                                p.metadata.as_ref().and_then(|m| m.get("credential_id"))
-                                    == Some(
-                                        &ccextra_server::cursor::provider::credential_fingerprint(
-                                            &credential,
-                                        ),
-                                    )
-                            })
-                    })
-        }) {
-            providers = merge_providers(providers, vec![cursor.clone()]);
-        }
-    }
     publish_refreshed_providers(config, snapshot.version, providers).await
-}
-
-async fn retain_published_cursor_identity(
-    config: &Arc<RwLock<Arc<ConfigSnapshot>>>,
-    sessions: &CursorSessions,
-) {
-    let snapshot = config.read().await.clone();
-    let identity = snapshot
-        .providers
-        .iter()
-        .find(|provider| provider.protocol == ccextra_core::route::Protocol::Cursor)
-        .and_then(|provider| provider.metadata.as_ref()?.get("credential_id"));
-    sessions.retain_identity(identity.map(String::as_str));
 }
 
 /// Antigravity 注入任务:启动即拉取,成功注入后每 3 小时刷新;失败保旧。
 /// 每轮从当前快照获取参数,不发布尚未成功 reload 的磁盘配置。
-async fn run_antigravity_injection(
-    config: Arc<RwLock<Arc<ConfigSnapshot>>>,
-    sessions: CursorSessions,
-) {
+async fn run_antigravity_injection(config: Arc<RwLock<Arc<ConfigSnapshot>>>) {
     /// 刷新周期(对齐 CPA modelsRefreshInterval = 3h)
     const REFRESH_INTERVAL: std::time::Duration = std::time::Duration::from_secs(3 * 3600);
 
@@ -653,7 +549,6 @@ async fn run_antigravity_injection(
         ticker.tick().await;
         match refresh_providers(&config, load_refreshed_providers).await {
             Ok(true) => {
-                retain_published_cursor_identity(&config, &sessions).await;
                 if ready {
                     tracing::info!("Antigravity 周期刷新完成");
                 } else {
@@ -663,36 +558,6 @@ async fn run_antigravity_injection(
             }
             Ok(false) => {}
             Err(error) => tracing::warn!("provider 刷新校验失败,保持现有数据: {error}"),
-        }
-    }
-}
-
-async fn run_cursor_injection(config: Arc<RwLock<Arc<ConfigSnapshot>>>, sessions: CursorSessions) {
-    const REFRESH_INTERVAL: std::time::Duration = std::time::Duration::from_secs(3 * 3600);
-    let mut ticker = tokio::time::interval_at(
-        tokio::time::Instant::now() + REFRESH_INTERVAL,
-        REFRESH_INTERVAL,
-    );
-    ticker.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
-    loop {
-        ticker.tick().await;
-        let snapshot = config.read().await.clone();
-        let provider = match load_cursor_from_refresh(&snapshot.refresh).await {
-            Ok(provider) => provider,
-            Err(error) => {
-                tracing::warn!("Cursor 模型目录刷新失败,保留现有目录: {error}");
-                continue;
-            }
-        };
-        let mut providers = snapshot.providers.clone();
-        providers.retain(|p| p.protocol != ccextra_core::route::Protocol::Cursor);
-        if let Some(cursor) = provider {
-            providers = merge_providers(providers, vec![cursor]);
-        }
-        match publish_refreshed_providers(&config, snapshot.version, providers).await {
-            Ok(true) => retain_published_cursor_identity(&config, &sessions).await,
-            Ok(false) => {}
-            Err(error) => tracing::warn!("Cursor provider 发布失败: {error}"),
         }
     }
 }
@@ -1089,48 +954,6 @@ mod tests {
         );
     }
 
-    #[tokio::test]
-    async fn antigravity_refresh_keeps_cursor_only_for_same_account() {
-        use ccextra_core::route::Protocol;
-        use ccextra_server::cursor::{provider::credential_fingerprint, CursorCredential};
-        let temp = tempfile::tempdir().unwrap();
-        let dir = temp.path().join("cursor");
-        let mut credential = CursorCredential {
-            access_token: "old-token".into(),
-            refresh_token: "old-refresh".into(),
-            sub: "account-one".into(),
-            expires_at: None,
-        };
-        ccextra_server::cursor::store::save(&dir, &credential).unwrap();
-        let state = refresh_state();
-        let provider = ProviderConfig::new(
-            "cursor".into(),
-            Protocol::Cursor,
-            vec!["https://example.invalid".into()],
-            "old-token".into(),
-            None,
-            false,
-            vec![],
-        )
-        .with_metadata([("credential_id".into(), credential_fingerprint(&credential))].into());
-        {
-            let mut current = state.write().await;
-            let snapshot = Arc::make_mut(&mut current);
-            snapshot.providers = vec![provider];
-            snapshot.refresh.cursor_auth_dir = Some(dir.clone());
-        }
-        refresh_providers(&state, |_| async { Some(vec![]) })
-            .await
-            .unwrap();
-        assert_eq!(state.read().await.providers.len(), 1);
-        credential.sub = "account-two".into();
-        ccextra_server::cursor::store::save(&dir, &credential).unwrap();
-        refresh_providers(&state, |_| async { Some(vec![]) })
-            .await
-            .unwrap();
-        assert!(state.read().await.providers.is_empty());
-    }
-
     #[test]
     fn refresh_parameters_pin_dirs_and_retain_static_providers() {
         let config: Config = serde_yaml::from_str(
@@ -1149,8 +972,6 @@ normalize: { enabled: false, drift_detector: false }
 logging: { level: info, request_body: false }
 auth_dir: new-antigravity
 xai_auth_dir: new-xai
-cursor_auth_dir: new-cursor
-cursor_default_model: composer-2
 "#,
         )
         .unwrap();
@@ -1164,11 +985,6 @@ cursor_default_model: composer-2
             Some(PathBuf::from("/tmp/project/new-xai"))
         );
         assert_eq!(refresh.proxy_url.as_deref(), Some("http://new-proxy:8080"));
-        assert_eq!(
-            refresh.cursor_auth_dir,
-            Some(PathBuf::from("/tmp/project/new-cursor"))
-        );
-        assert_eq!(refresh.cursor_default_model.as_deref(), Some("composer-2"));
         assert_eq!(refresh.static_providers.len(), 1);
         assert_eq!(refresh.static_providers[0].name, "static-provider");
     }

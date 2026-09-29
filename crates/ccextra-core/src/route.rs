@@ -1,10 +1,7 @@
 // 路由决策:model → provider → protocol
 
 use serde::{Deserialize, Deserializer, Serialize};
-use serde_json::Value;
 use thiserror::Error;
-
-mod cursor;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
@@ -16,7 +13,6 @@ pub enum Protocol {
     OpenAiResponses,
     Gemini,
     Antigravity,
-    Cursor,
 }
 
 #[derive(Debug, Clone)]
@@ -36,9 +32,6 @@ pub enum RouteError {
 
     #[error("model_variant_unavailable: {0}")]
     VariantUnavailable(String),
-
-    #[error("Cursor 模型选项无效: {0}")]
-    InvalidOption(String),
 }
 
 #[derive(Debug, Clone, PartialEq, Deserialize)]
@@ -166,36 +159,6 @@ pub fn resolve_route(
     }
 
     Err(RouteError::ModelNotFound(inbound_model.to_string()))
-}
-
-pub fn resolve_route_with_body(
-    inbound_model: &str,
-    body: &Value,
-    providers: &[ProviderConfig],
-) -> Result<RouteDecision, RouteError> {
-    match resolve_route(inbound_model, providers) {
-        Ok(mut route) if route.protocol == Protocol::Cursor => {
-            let provider = providers.iter().find(|p| p.name == route.provider).unwrap();
-            route.upstream_model =
-                cursor::resolve_cursor_model(inbound_model, body, provider, &route.upstream_model)?;
-            Ok(route)
-        }
-        Ok(route) => Ok(route),
-        Err(RouteError::ModelNotFound(_)) => {
-            let provider = providers
-                .iter()
-                .find(|p| p.protocol == Protocol::Cursor)
-                .ok_or_else(|| RouteError::ModelNotFound(inbound_model.to_string()))?;
-            let upstream_model =
-                cursor::resolve_cursor_model(inbound_model, body, provider, inbound_model)?;
-            Ok(RouteDecision {
-                provider: provider.name.clone(),
-                protocol: Protocol::Cursor,
-                upstream_model,
-            })
-        }
-        Err(error) => Err(error),
-    }
 }
 
 /// 启动时验证配置:检查 alias 冲突

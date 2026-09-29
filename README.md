@@ -34,10 +34,10 @@
 
 ## 核心特性
 
-- **按模型切换上游**：Claude、OpenAI、Gemini、Antigravity 和 Cursor 共用一个端口。模型别名与实际模型名分开配置。
+- **按模型切换上游**：Claude、OpenAI、Gemini 和 Antigravity 共用一个端口。模型别名与实际模型名分开配置。
 - **请求内容稳定化**：归一化工具、schema 和历史内容，减少无意义的跨轮差异；实际缓存命中由上游决定。
 - **模型能力适配**：转换消息、工具调用与图片，按 `models.json` 调整支持的 reasoning 档位。
-- **OAuth 接入**：支持 Antigravity、xAI Grok、Codex（OpenAI ChatGPT 订阅）和 Cursor 的凭证加载、刷新与动态模型路由；Cursor 另使用独立 Connect-RPC Run 路径。
+- **OAuth 接入**：支持 Antigravity、xAI Grok 和 Codex（OpenAI ChatGPT 订阅）的凭证加载、刷新与动态模型路由。
 - **配置热重载**：无需重启即可发布新配置；进行中的请求继续使用原快照。
 
 ## 架构流向
@@ -49,7 +49,6 @@ flowchart LR
     P -->|openai_chat| B["Chat Completions"]
     P -->|openai_responses| C["Responses"]
     P -->|gemini / antigravity| D["Gemini GenerateContent"]
-    P -->|cursor| E["Connect-RPC Run"]
 ```
 
 一个进程监听一个端口。入站始终是 Anthropic 形状，出口统一还原为 Anthropic 响应（含 SSE）。详见[架构设计](docs/design.md)。
@@ -63,7 +62,6 @@ flowchart LR
 | `openai_responses` | Responses | 转换 `instructions` 与 `input`；支持 reasoning replay 和搜索域过滤。 |
 | `gemini` | Gemini GenerateContent | 转换内容块、工具结果和 schema。 |
 | `antigravity` | Cloud Code Assist | 封装 Gemini 请求，处理工具命名和模型输出上限；默认短连接。 |
-| `cursor` | Cursor AgentService/Run Connect-RPC | 单凭证 OAuth、动态模型目录、双向 H2 与 Anthropic JSON/SSE 恢复；有稳定会话时支持 MCP 工具续接。基础对话已通过真实上游验证，MCP 续接等高级路径仍以本地测试为准。 |
 
 > **提示**：xAI Grok 与 Codex 均通过 OAuth 动态注册为 `openai_responses` provider，无需配置独立协议。Codex 订阅请求自动携带 `Chatgpt-Account-Id` 身份头，请求体自动 zstd 压缩（对齐 codex CLI 默认行为）。
 
@@ -144,9 +142,8 @@ curl -H "Authorization: Bearer $ANTHROPIC_AUTH_TOKEN" \
 - `secret_key` 启用入口认证：明文 key 在加载时转为 bcrypt 并写回配置，请求接受 `x-api-key` 或 `Authorization: Bearer`。
 - `payload` 按模型 glob 覆盖顶层参数，可用 `protocol` 限定。
 - `prompt_cache_key` 只用于 OpenAI 路径，取 Claude Code 会话 ID，且不覆盖已有非空值。
-- `models_file` 指向 reasoning 级别表（默认配置文件旁 `models.json`，不入 git，可从 [models.json.example](models.json.example) 复制后按需修改），按上游模型 `id` 精确匹配，把入站 effort 钳到该模型支持的最近档；缺文件或未收录的模型不钳。条目可加 `force_effort`：凡钳制会介入的 effort 一律改写为该固定值（不钳制），`*claude*` 原生模型与显式关闭思考的请求不受影响。Cursor 的动态目录不使用 `models_file`。
-- `cursor_auth_dir` 默认配置文件旁 `.cache/cursor`；`cursor_base_url` 默认 `https://api2.cursor.sh`，`cursor_client_version` 默认 `cli-2026.02.13-41ac335`。`cursor_default_model` 仅在目录不含 `auto` 时指定回退模型，必须由目录广告。四个字段均为顶层配置；不需手写 Cursor provider。
-- `cursor_models` 与 `antigravity_models` 为模型白名单（顶层配置，glob 或精确名，如 `["claude-opus-5-5-*", "gpt-5.2"]`）；缺省或空列表发布全量目录。过滤在动态目录加载时按上游模型名匹配，过滤后为空视为加载失败：Cursor 保留旧目录，Antigravity 该凭证发布空模型列表。`/reload` 与 3 小时后台刷新均生效。
+- `models_file` 指向 reasoning 级别表（默认配置文件旁 `models.json`，不入 git，可从 [models.json.example](models.json.example) 复制后按需修改），按上游模型 `id` 精确匹配，把入站 effort 钳到该模型支持的最近档；缺文件或未收录的模型不钳。条目可加 `force_effort`：凡钳制会介入的 effort 一律改写为该固定值（不钳制），`*claude*` 原生模型与显式关闭思考的请求不受影响。
+- `antigravity_models` 为模型白名单（顶层配置，glob 或精确名，如 `["claude-opus-5-5-*", "gpt-5.2"]`）；缺省或空列表发布全量目录。过滤在动态目录加载时按上游模型名匹配，过滤后为空时该凭证发布空模型列表。`/reload` 与 3 小时后台刷新均生效。
 
 <details>
 <summary>进阶选项</summary>
@@ -206,15 +203,9 @@ curl -H "Authorization: Bearer $ANTHROPIC_AUTH_TOKEN" \
 ./scripts/check_cursor_quota.sh
 ```
 
-Antigravity 凭证默认在配置文件旁 `.cache/antigravity`，xAI 在 `.cache/xai`，Codex 在 `.cache/codex`，Cursor 在 `.cache/cursor`。xAI、Codex 和 Cursor 启动时自动发现；Cursor `GetUsableModels` 成功才发布模型目录；`/reload` 拉取失败时，仅凭证目录和账号不变才保留旧目录，新配置的模型别名优先。后台刷新失败保留已发布目录。Antigravity 后台加载并每 3 小时刷新模型。Codex 登录使用 PKCE 浏览器授权（本地回调端口默认 1455，可用 `--callback-port` 覆盖），token 提前 24 小时刷新。
+Antigravity 凭证默认在配置文件旁 `.cache/antigravity`，xAI 在 `.cache/xai`，Codex 在 `.cache/codex`。xAI 和 Codex 启动时自动发现。Antigravity 后台加载并每 3 小时刷新模型。Codex 登录使用 PKCE 浏览器授权（本地回调端口默认 1455，可用 `--callback-port` 覆盖），token 提前 24 小时刷新。
 
-Cursor 登录自行生成 PKCE 并轮询浏览器授权，不依赖 Cursor IDE 或 `cursor-agent`；可用 `--no-browser` 手动打开 URL，token 到期前 10 分钟刷新。Run 请求使用独立双向 HTTP/2 Connect-RPC，将文本、思考和工具调用恢复为 Anthropic JSON/SSE。实现已有本地测试，基础对话（含 `messages` 内 `role: system` 项并入 system prompt）已通过真实 Cursor 上游验证；MCP 续接等高级路径未经完整上游验收。Cursor 订阅反代可能违反服务条款，账号有封禁风险。
-
-有稳定 Claude 会话 ID 时，MCP 工具调用会驻留上游流，下一次请求按 `tool_use_id` 匹配文本 `tool_result` 并续接；多个工具结果必须全部对应，模型与工具目录须一致。流会话闲置 5 分钟过期，原始 checkpoint 保留 30 分钟并绑定凭证。驻留流丢失后的工具续接返回 400，不静默重开 Run。base64 图片输入随最后一条 user 消息进入 `SelectedContext.selected_images`（远程 URL 不支持）；内置 exec 工具执行和 Cursor CLI passthrough 不支持，内置工具请求返回拒绝。
-
-同会话同 digest 请求共享上游，完成后重放原 JSON/SSE；正在连接的请求遇到不同 digest 返回 400。SSE 断开后后台继续消费，最后一个消费者断开满 5 秒仍未重连则取消；宽限期内同 digest 可重连，不同 digest 替换旧请求。等待工具结果的驻留流按 5 分钟 TTL 保留。事件日志仅存内存，帧数据总预算 64 MiB、TTL 10 分钟；超限优先驱逐已结束日志，再驱逐活跃日志，重放不可用返回 `cursor_replay_unavailable`（已开始的 SSE 发 error）。该预算不包含 JSON 快照和 checkpoint/blob。持久化延期，重启不恢复会话。
-
-Cursor 只支持单凭证。Run 请求 DATA 保持打开；响应必须由 flags `0x02` 的 Connect JSON trailer 结束，提前 EOF 属于错误。401 仅在无输出时刷新并重试一次，429 不重试；5xx 和传输错误在 3 秒预算内退避。上游提供 `Retry-After` 时，错误响应会透传该头。
+Cursor 登录自行生成 PKCE 并轮询浏览器授权，不依赖 Cursor IDE 或 `cursor-agent`；可用 `--no-browser` 手动打开 URL，token 到期前 10 分钟刷新。代理路径已移除，当前仅保留登录与凭证保鲜（`cursor-login` / `cursor-status`）。
 
 四种登录命令保存凭证后，都会按 `--config` 的 `server.host` / `server.port` 自动发送 `POST /reload`。通配监听地址转为本机回环地址，请求不走代理，连接超时 2 秒、总超时 30 秒。失败只提示，不撤销登录；服务未启动时下次启动加载。使用 `--auth-dir` 时，服务配置也需指向该目录。
 

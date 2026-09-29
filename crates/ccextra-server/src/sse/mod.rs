@@ -7,7 +7,6 @@
 // - relay:    按协议分派响应流
 
 pub mod chat;
-pub mod cursor;
 pub mod emit;
 pub mod gemini;
 pub mod non_stream;
@@ -140,8 +139,6 @@ where
             tool_names,
             signature_model.unwrap_or_default(),
         ),
-        // Cursor 使用独立 H2/Connect 流，接入专用 relay 前不走通用转换器。
-        Protocol::Cursor => chat::relay_claude_passthrough(stream),
     };
     with_idle_keepalive(inner)
 }

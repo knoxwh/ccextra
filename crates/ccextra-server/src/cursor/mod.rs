@@ -1,24 +1,13 @@
+// Cursor 订阅凭证:PKCE 登录、token 刷新与本地存储。
+// 代理路径已移除,仅保留登录与凭证保鲜能力。
 pub mod constants;
 pub mod credential;
-pub mod drive;
-pub mod error;
-pub mod handler;
-mod journal;
 pub mod login;
-pub mod models;
 pub mod oauth;
-pub mod provider;
 pub mod refresh;
-mod response;
-pub mod session;
 pub mod store;
-pub mod stream;
 
 pub use credential::CursorCredential;
 pub use login::{run_login, CursorLoginOptions};
-pub use provider::load_cursor_provider;
 pub use refresh::ensure_credential_fresh;
 pub use store::{load, resolve_auth_dir, save};
-
-#[cfg(test)]
-mod handler_tests;

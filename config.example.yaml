@@ -28,18 +28,10 @@ secret_key: "sk-ccextra-xxx"
 # codex_auth_dir: ".cache/codex"
 
 # Cursor 单凭证目录(可选)。默认配置文件旁 .cache/cursor。
+# 代理路径已移除,仅保留 cursor-login / cursor-status 凭证能力。
 # cursor_auth_dir: ".cache/cursor"
-# Cursor API 地址与 CLI 版本(可选)。
-# cursor_base_url: "https://api2.cursor.sh"
-# cursor_client_version: "cli-2026.02.13-41ac335"
-# auto 未被模型目录广告时才使用的明确回退模型(必须在目录中)。
-# cursor_default_model: "composer-2"
-# Cursor 模型白名单(可选)。glob 或精确名;缺省/空 = 全量发布。
-# cursor_models:
-#   - "claude-opus-5-5-*"
-#   - "gpt-5.2"
 
-# Antigravity 模型白名单(可选)。语义同 cursor_models。
+# Antigravity 模型白名单(可选)。glob 或精确名;缺省/空 = 全量发布。
 # antigravity_models:
 #   - "gemini-3.8-flash-*"
 
@@ -111,12 +103,6 @@ providers:
   # xAI Grok (OAuth)。无需手配:启动时自动扫描上方 xai_auth_dir,
   # 为每份有效凭证注入一个 xai provider(OpenAI Responses 协议)。
   # 凭证获取: ./ccextra xai-login → 写入 .cache/xai
-
-  # Cursor (单账号 OAuth)。无需手配 provider/key/models:
-  # ./ccextra cursor-login 写入 cursor_auth_dir/cursor.json;
-  # GetUsableModels 成功后动态发布目录,失败时首次不发布、运行中保留旧目录。
-  # 模型族与 effort/fast 只在已广告的 variant 中选择。
-  # Run 使用双向 H2；跨请求工具续接需要稳定的 Claude 会话 ID。
 
 # Payload 参数覆盖(按模型名模式匹配)
 payload:
