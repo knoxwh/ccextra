@@ -639,6 +639,24 @@ fn append_block_parts(
                 "inline_data": { "mime_type": mime, "data": data }
             }));
         }
+        "document" => {
+            // base64 文档 → inline_data;Gemini/Antigravity 均支持 PDF 等文档类型
+            let source = block.get("source").cloned().unwrap_or_else(|| json!({}));
+            if source.get("type").and_then(|t| t.as_str()) != Some("base64") {
+                return;
+            }
+            let mime = source
+                .get("media_type")
+                .and_then(|m| m.as_str())
+                .unwrap_or("");
+            let data = source.get("data").and_then(|d| d.as_str()).unwrap_or("");
+            if mime.is_empty() || data.trim().is_empty() {
+                return;
+            }
+            parts.push(json!({
+                "inline_data": { "mime_type": mime, "data": data }
+            }));
+        }
         _ => {}
     }
 }
@@ -949,6 +967,45 @@ mod tests {
         assert_eq!(parts.len(), 2);
         assert_eq!(parts[0]["inline_data"]["mime_type"], "image/jpeg");
         assert_eq!(parts[1]["text"], "what is this");
+    }
+
+    #[test]
+    fn test_convert_messages_document_block() {
+        let messages = vec![json!({
+            "role": "user",
+            "content": [{
+                "type": "document",
+                "source": {
+                    "type": "base64",
+                    "media_type": "application/pdf",
+                    "data": "JVBERi0="
+                }
+            }]
+        })];
+        let contents = convert_messages(&messages, &HashMap::new(), false, "gemini-2.0");
+        assert_eq!(contents.len(), 1);
+        assert_eq!(
+            contents[0]["parts"][0]["inline_data"]["mime_type"],
+            "application/pdf"
+        );
+        assert_eq!(contents[0]["parts"][0]["inline_data"]["data"], "JVBERi0=");
+    }
+
+    #[test]
+    fn test_convert_messages_ignores_whitespace_document_data() {
+        let messages = vec![json!({
+            "role": "user",
+            "content": [{
+                "type": "document",
+                "source": {
+                    "type": "base64",
+                    "media_type": "application/pdf",
+                    "data": " \t\n"
+                }
+            }]
+        })];
+        let contents = convert_messages(&messages, &HashMap::new(), false, "gemini-2.0");
+        assert!(contents.is_empty());
     }
 
     #[test]

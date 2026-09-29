@@ -361,14 +361,33 @@ fn convert_refs_to_hints(schema: &mut Value, preserve_siblings: bool) {
 /// const → 单元素 enum
 fn convert_const_to_enum(schema: &mut Value) {
     let mut path = Vec::new();
-    walk_objects(schema, &mut path, &mut |_, map| {
-        let Some(val) = map.get("const") else {
+    walk_objects(schema, &mut path, &mut |path, map| {
+        if is_property_definition(path) {
+            return;
+        }
+        let Some(val) = map.get("const").cloned() else {
             return;
         };
+        if val.is_string() {
+            let values = map
+                .get("enum")
+                .and_then(Value::as_array)
+                .map(|existing| {
+                    existing
+                        .iter()
+                        .filter(|item| *item == &val)
+                        .cloned()
+                        .collect::<Vec<_>>()
+                })
+                .unwrap_or_else(|| vec![val]);
+            map.insert("enum".into(), Value::Array(values));
+            map.entry("type").or_insert_with(|| json!("string"));
+            return;
+        }
         if map.contains_key("enum") {
             return;
         }
-        map.insert("enum".into(), json!([val.clone()]));
+        map.insert("enum".into(), json!([val]));
     });
 }
 
@@ -1600,6 +1619,38 @@ mod tests {
             .unwrap()
             .contains("(nullable)"));
         assert!(out.get("required").is_none());
+    }
+
+    #[test]
+    fn test_antigravity_string_const_keeps_string_type() {
+        let schema = json!({"const": "read"});
+        let out = clean_json_schema_for_antigravity(&schema);
+        assert_eq!(out["type"], "string");
+        assert!(out.get("enum").is_none());
+        assert!(out["description"]
+            .as_str()
+            .unwrap()
+            .contains("Allowed: read"));
+    }
+
+    #[test]
+    fn test_gemini_string_const_intersects_existing_enum() {
+        let schema = json!({"const": "read", "enum": ["read", "write"]});
+        let out = clean_json_schema_for_gemini(&schema);
+        assert_eq!(out["enum"], json!(["read"]));
+        assert_eq!(out["type"], "string");
+    }
+
+    #[test]
+    fn test_gemini_property_named_const_is_not_treated_as_schema_keyword() {
+        let schema = json!({
+            "type": "object",
+            "properties": {"const": {"const": "browser"}}
+        });
+        let out = clean_json_schema_for_gemini(&schema);
+        assert!(out["properties"].get("enum").is_none());
+        assert_eq!(out["properties"]["const"]["enum"], json!(["browser"]));
+        assert_eq!(out["properties"]["const"]["type"], "string");
     }
 
     #[test]

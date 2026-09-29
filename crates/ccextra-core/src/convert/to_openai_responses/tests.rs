@@ -473,6 +473,77 @@ fn test_regular_tool_unaffected_by_custom() {
 }
 
 #[test]
+fn test_tool_use_empty_string_input_becomes_empty_object_arguments() {
+    let mut body = json!({
+        "model": "test",
+        "messages": [{
+            "role": "assistant",
+            "content": [{
+                "type": "tool_use",
+                "id": "t1",
+                "name": "get_weather",
+                "input": ""
+            }]
+        }]
+    });
+    convert_to_openai_responses(&mut body, "gpt-5.6").unwrap();
+    let call = body["input"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .find(|item| item["type"] == "function_call")
+        .unwrap();
+    assert_eq!(call["arguments"], "{}");
+}
+
+#[test]
+fn test_tool_use_whitespace_input_becomes_empty_object_arguments() {
+    let mut body = json!({
+        "model": "test",
+        "messages": [{
+            "role": "assistant",
+            "content": [{
+                "type": "tool_use",
+                "id": "t1",
+                "name": "get_weather",
+                "input": " \t\n"
+            }]
+        }]
+    });
+    convert_to_openai_responses(&mut body, "gpt-5.6").unwrap();
+    let call = body["input"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .find(|item| item["type"] == "function_call")
+        .unwrap();
+    assert_eq!(call["arguments"], "{}");
+}
+
+#[test]
+fn test_tool_use_missing_input_becomes_empty_object_arguments() {
+    let mut body = json!({
+        "model": "test",
+        "messages": [{
+            "role": "assistant",
+            "content": [{
+                "type": "tool_use",
+                "id": "t1",
+                "name": "get_weather"
+            }]
+        }]
+    });
+    convert_to_openai_responses(&mut body, "gpt-5.6").unwrap();
+    let call = body["input"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .find(|item| item["type"] == "function_call")
+        .unwrap();
+    assert_eq!(call["arguments"], "{}");
+}
+
+#[test]
 fn test_tool_use_and_result() {
     let mut body = json!({
         "model": "test",

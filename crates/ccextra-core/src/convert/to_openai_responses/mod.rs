@@ -315,10 +315,11 @@ pub fn convert_to_openai_responses_with(
                                 "input": input_str
                             }));
                         } else {
-                            let args = part
-                                .get("input")
-                                .map(|i| i.to_string())
-                                .unwrap_or_else(|| "{}".to_string());
+                            let args = match part.get("input") {
+                                Some(Value::String(s)) if s.trim().is_empty() => "{}".to_string(),
+                                Some(input) => input.to_string(),
+                                None => "{}".to_string(),
+                            };
                             out_items.push(json!({
                                 "type": "function_call",
                                 "call_id": short_id,
