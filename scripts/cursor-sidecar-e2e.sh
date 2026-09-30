@@ -4,6 +4,7 @@ set -euo pipefail
 # Cursor SDK sidecar 端到端验证脚本
 # 前置: ccextra 已运行且配置 cursor_auth_dir,api_key.txt 已写入 User API Key
 # (cursor.com/settings → API Keys 生成;PKCE 登录凭证不适用,见 README)。
+# 入口认证: CCEXTRA_API_KEY 环境变量;未设且 secret_key 已哈希时提示输入明文。
 # 依次验证: /health、/v1/models 含 cursor provider、文本终态、
 #           工具 tool_use、tool_result 下一轮、sidecar kill 后冷续接。
 # 安全: 只读取现有配置;不打印 apiKey、token 或对话内容。
@@ -34,7 +35,7 @@ fail() { echo "FAIL: $1" >&2; exit 1; }
 pass() { echo "PASS: $1"; }
 
 # 入口认证:优先 CCEXTRA_API_KEY 环境变量;否则读 config.yaml secret_key
-# (仅作请求头,不回显)。config 中已是 bcrypt 哈希时必须用环境变量。
+# (仅作请求头,不回显)。config 中已是 bcrypt 哈希时交互式询问明文。
 API_KEY="${CCEXTRA_API_KEY:-}"
 if [[ -z "$API_KEY" && -f "$CONFIG_FILE" ]]; then
     API_KEY="$(awk -F: '
@@ -45,6 +46,14 @@ if [[ -z "$API_KEY" && -f "$CONFIG_FILE" ]]; then
             print line
             exit
         }' "$CONFIG_FILE")"
+fi
+# bcrypt 哈希无法还原明文;改为提示输入(不回显,无 tty 时给出明确指引)
+# 提示走 printf 到 stderr:read -p 的提示同样写 stderr,会被下面的 2>/dev/null 吞掉
+if [[ "$API_KEY" =~ ^\$2[aby]\$ ]]; then
+    printf "config.yaml 的 secret_key 已是 bcrypt 哈希,请输入明文 API key: " >&2
+    read -rs API_KEY 2>/dev/null </dev/tty || API_KEY=""
+    [[ -n "$API_KEY" ]] && echo >&2
+    [[ -n "$API_KEY" ]] || fail "未获得明文 API key;请设 CCEXTRA_API_KEY 环境变量后重跑"
 fi
 AUTH_ARGS=()
 if [[ -n "$API_KEY" ]]; then
@@ -70,11 +79,13 @@ echo "$MODELS_JSON" | grep -q '"cursor"' || fail "/v1/models 不含 cursor provi
 pass "/v1/models 含 cursor provider"
 
 # 3. 文本终态(流式);首消息嵌 RUN_TAG,避免与历史残留会话撞哈希
+#    带 system 字段:覆盖 systemPrompt 正文前缀路径(账号无 SDK systemPrompt 权限)
 STREAM="$(curl -sf -X POST "$BASE_URL/v1/messages" \
     ${AUTH_ARGS[@]+"${AUTH_ARGS[@]}"} \
     -H 'content-type: application/json' \
     -H "x-claude-code-session-id: e2e-cursor-text-$RUN_TAG" \
     -d '{"model":"'"$MODEL"'","max_tokens":256,"stream":true,
+         "system":"You are a helpful assistant.",
          "messages":[{"role":"user","content":"Reply with exactly: ok (run '"$RUN_TAG"')"}]}')" \
     || fail "文本流式请求失败"
 echo "$STREAM" | grep -q 'message_stop' || fail "文本流未到 message_stop 终态"
