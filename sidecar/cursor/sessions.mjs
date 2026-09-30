@@ -6,7 +6,7 @@ import { isAbsolute } from "node:path";
 
 const sha256 = (value) => createHash("sha256").update(value).digest("hex");
 
-/** 递归剥除 thinking block;其余结构原样保留。 */
+/** 递归剥除 thinking block 与 cache_control 标记;其余结构原样保留。 */
 function stripThinkingBlocks(value) {
   if (Array.isArray(value)) {
     return value
@@ -15,7 +15,12 @@ function stripThinkingBlocks(value) {
   }
   if (value && typeof value === "object") {
     const out = {};
-    for (const [key, child] of Object.entries(value)) out[key] = stripThinkingBlocks(child);
+    for (const [key, child] of Object.entries(value)) {
+      // cache_control 是缓存断点标记,客户端随轮次移动(当前消息打标、历史回显剥标),
+      // 不属内容语义,入哈希会断前缀链导致每轮 full replay
+      if (key === "cache_control") continue;
+      out[key] = stripThinkingBlocks(child);
+    }
     return out;
   }
   return value;

@@ -75,9 +75,11 @@ fn flatten_system(system: Option<&Value>) -> String {
     }
 }
 
-/// 递归剥 thinking 块;图片块原样保留。
+/// 递归剥 thinking 块与 cache_control 标记;图片块原样保留。
 ///
-/// 对齐 sidecar stripThinkingBlocks 的递归语义(含 tool_result 嵌套内容)
+/// 对齐 sidecar stripThinkingBlocks 的递归语义(含 tool_result 嵌套内容)。
+/// cache_control 是 Anthropic 缓存断点标记,客户端随轮次移动(当前消息打标、
+/// 历史回显剥标),非内容语义;剥掉避免 journal 快照携带瞬态噪声。
 fn strip_thinking_blocks(messages: Vec<Value>) -> Vec<Value> {
     messages.into_iter().map(strip_value).collect()
 }
@@ -94,6 +96,9 @@ fn strip_value(value: Value) -> Value {
         Value::Object(map) => {
             let mut out = Map::with_capacity(map.len());
             for (key, child) in map {
+                if key == "cache_control" {
+                    continue;
+                }
                 out.insert(key, strip_value(child));
             }
             Value::Object(out)
@@ -135,6 +140,29 @@ mod tests {
         assert_eq!(messages[2]["content"][0]["text"], "go on");
         assert_eq!(out["tools"].as_array().unwrap().len(), 1);
         assert_eq!(out["tools"][0]["name"], "Bash");
+    }
+
+    #[test]
+    fn strips_cache_control_markers() {
+        let body = json!({
+            "model": "auto",
+            "messages": [
+                { "role": "user", "content": [
+                    { "type": "text", "text": "hi", "cache_control": { "type": "ephemeral" } }
+                ] },
+                { "role": "assistant", "content": [{ "type": "text", "text": "hello" }] },
+                { "role": "user", "content": [
+                    { "type": "tool_result", "tool_use_id": "t1", "content": "done",
+                      "cache_control": { "type": "ephemeral" } }
+                ] }
+            ]
+        });
+        let out = convert_to_cursor_sdk(body, "auto", &workspace()).unwrap();
+        let messages = out["messages"].as_array().unwrap();
+        assert_eq!(messages[0]["content"][0].get("cache_control"), None);
+        assert_eq!(messages[0]["content"][0]["text"], "hi");
+        assert_eq!(messages[2]["content"][0].get("cache_control"), None);
+        assert_eq!(messages[2]["content"][0]["tool_use_id"], "t1");
     }
 
     #[test]

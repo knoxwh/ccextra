@@ -93,6 +93,14 @@ test("canonicalizeTurn drops null and undefined fields", () => {
   assert.equal("cache_control" in canonical, false);
 });
 
+test("canonicalizeTurn ignores cache_control markers", () => {
+  // Claude Code 在当前消息打 cache_control 断点,历史回显时剥标;
+  // 两种形状必须同哈希,否则前缀链每轮断裂触发 full replay
+  const marked = { role: "user", content: [{ type: "text", text: "hi", cache_control: { type: "ephemeral" } }] };
+  const plain = { role: "user", content: [{ type: "text", text: "hi" }] };
+  assert.equal(canonicalizeTurn(marked), canonicalizeTurn(plain));
+});
+
 test("canonicalizeTurn is idempotent", () => {
   const turn = { role: "assistant", content: [{ type: "text", text: "a" }] };
   assert.equal(canonicalizeTurn(turn), canonicalizeTurn(JSON.parse(canonicalizeTurn(turn))));
@@ -499,6 +507,28 @@ test("suffix reuse sends only missing turns", async () => {
   assert.equal(sdk.state.sends[1].text.includes("again"), true);
   // suffix 续跑不带 system 前缀(首轮已含)
   assert.equal(sdk.state.sends[1].text.includes("system:"), false);
+});
+
+test("suffix reuse survives cache_control marker movement", async () => {
+  const { sdk, registry } = makeRegistry();
+  // 首轮:当前消息带 cache_control 断点(块数组形状)
+  await registry.run(baseRequest([
+    { role: "user", content: [{ type: "text", text: "hi", cache_control: { type: "ephemeral" } }] },
+  ]), fakeSubscriber());
+  const send1 = sdk.state.sends[0];
+  send1.run.push({ type: "assistant", message: { content: [{ type: "text", text: "hello" }] } });
+  send1.run.end();
+  send1.run.finish({ status: "finished" });
+  await settle();
+  // 下一轮:历史回显剥标并坍缩为裸字符串,新末轮消息重新打标;须仍走 suffix
+  await registry.run(baseRequest([
+    { role: "user", content: "hi" },
+    { role: "assistant", content: "hello" },
+    { role: "user", content: [{ type: "text", text: "again", cache_control: { type: "ephemeral" } }] },
+  ]), fakeSubscriber());
+  assert.equal(sdk.state.created.length, 1);
+  assert.equal(sdk.state.sends[1].text.includes("again"), true);
+  assert.equal(sdk.state.sends[1].text.includes("hello"), false);
 });
 
 test("empty messages rejected before agent creation", async () => {
