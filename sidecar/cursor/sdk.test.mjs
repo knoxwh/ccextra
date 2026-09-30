@@ -131,6 +131,21 @@ test("sendRun passes two-argument send with exact options", async () => {
   assert.equal(typeof wrapped.cancel, "function");
 });
 
+test("sendRun passes base64 images as SDK user message", async () => {
+  const { agent, sent } = fakeSendAgent();
+  const adapter = createSdkAdapter(loadSdk({ Agent: { create: async () => agent, resume: async () => agent } }));
+  const images = [{ data: "AQID", mimeType: "image/png" }];
+  await adapter.sendRun(agent, {
+    text: "inspect",
+    images,
+    modelId: "auto",
+    modelParams: [],
+    runId: "run-image",
+    idempotencyKey: "hash-image",
+  });
+  assert.deepEqual(sent[0].text, { text: "inspect", images });
+});
+
 test("sendRun wait normalizes status and usage", async () => {
   const { agent } = fakeSendAgent();
   const adapter = createSdkAdapter(loadSdk({ Agent: { create: async () => agent, resume: async () => agent } }));

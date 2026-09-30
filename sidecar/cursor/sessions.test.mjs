@@ -10,6 +10,7 @@ import {
   normalizeWorkspaceDir,
   matchTurnHashes,
   isResumable,
+  renderTurnsText,
 } from "./sessions.mjs";
 
 const base = {
@@ -46,6 +47,19 @@ test("canonicalizeTurn strips thinking blocks and sorts keys", () => {
   // 键排序稳定:序列化后 content 内块键按字母序
   const keys = Object.keys(canonical.content[0]);
   assert.deepEqual(keys, [...keys].sort());
+});
+
+test("renderTurnsText marks image blocks for separate SDK attachments", () => {
+  const text = renderTurnsText([
+    {
+      role: "user",
+      content: [
+        { type: "text", text: "inspect" },
+        { type: "image", source: { type: "base64", media_type: "image/png", data: "AQID" } },
+      ],
+    },
+  ]);
+  assert.equal(text, "user:\ninspect\n[image]");
 });
 
 test("canonicalizeTurn keeps empty tool_result content and error flag", () => {
@@ -158,6 +172,7 @@ test("isResumable only allows clean state", () => {
 
 import { SessionRegistry } from "./sessions.mjs";
 import { Journal } from "./journal.mjs";
+import { createSdkAdapter } from "./sdk.mjs";
 
 function controlledRun() {
   const queue = [];
@@ -212,8 +227,9 @@ function fakeSdk() {
       state.resumed.push({ input, agent });
       return agent;
     },
-    async sendRun(agent, { text, modelId, modelParams, customTools, force, onDelta, runId, idempotencyKey }) {
-      const raw = await agent.send(text, {
+    async sendRun(agent, { text, images, modelId, modelParams, customTools, force, onDelta, runId, idempotencyKey }) {
+      const message = images?.length > 0 ? { text, images } : text;
+      const raw = await agent.send(message, {
         model: { id: modelId, params: modelParams },
         mode: "agent",
         local: { customTools, force },
@@ -471,10 +487,31 @@ test("suffix reuse sends only missing turns", async () => {
   assert.equal(sdk.state.sends[1].text.includes("again"), true);
 });
 
+test("suffix reuse sends only missing image attachments", async () => {
+  const { sdk, registry } = makeRegistry();
+  const firstImage = { type: "image", source: { type: "base64", media_type: "image/png", data: "AQID" } };
+  const secondImage = { type: "image", source: { type: "base64", media_type: "image/jpeg", data: "BAUG" } };
+  await registry.run(baseRequest([{ role: "user", content: [{ type: "text", text: "first" }, firstImage] }]), fakeSubscriber());
+  const send1 = sdk.state.sends[0];
+  send1.run.push({ type: "assistant", message: { content: [{ type: "text", text: "done" }] } });
+  send1.run.end();
+  send1.run.finish({ status: "finished" });
+  await settle();
+  await registry.run(baseRequest([
+    { role: "user", content: [{ type: "text", text: "first" }, firstImage] },
+    { role: "assistant", content: "done" },
+    { role: "user", content: [{ type: "text", text: "second" }, secondImage] },
+  ]), fakeSubscriber());
+  assert.deepEqual(sdk.state.sends[1].text, {
+    text: "user:\nsecond\n[image]",
+    images: [{ data: "BAUG", mimeType: "image/jpeg" }],
+  });
+});
 test("history rewrite triggers full replay with new agent", async () => {
   const { sdk, registry } = makeRegistry();
+  const image = { type: "image", source: { type: "base64", media_type: "image/png", data: "AQID" } };
   const first = fakeSubscriber();
-  await registry.run(baseRequest([{ role: "user", content: "hi" }]), first);
+  await registry.run(baseRequest([{ role: "user", content: [{ type: "text", text: "hi" }, image] }]), first);
   const send1 = sdk.state.sends[0];
   send1.run.push({ type: "assistant", message: { content: [{ type: "text", text: "hello" }] } });
   send1.run.end();
@@ -482,13 +519,38 @@ test("history rewrite triggers full replay with new agent", async () => {
   await settle();
   const second = fakeSubscriber();
   await registry.run(baseRequest([
-    { role: "user", content: "hi" },
+    { role: "user", content: [{ type: "text", text: "hi" }, image] },
     { role: "assistant", content: "changed" },
     { role: "user", content: "again" },
   ]), second);
   assert.equal(sdk.state.created.length, 2);
-  assert.equal(sdk.state.sends[1].text.includes("hi"), true);
-  assert.equal(sdk.state.sends[1].text.includes("changed"), true);
+  assert.equal(sdk.state.sends[1].text.text.includes("hi"), true);
+  assert.equal(sdk.state.sends[1].text.text.includes("changed"), true);
+  assert.deepEqual(sdk.state.sends[1].text.images, [{ data: "AQID", mimeType: "image/png" }]);
+});
+
+test("tool result image reaches SDK tool callback as content", async () => {
+  const { sdk, registry } = makeRegistry();
+  const tools = [{ name: "Read", input_schema: {} }];
+  await registry.run(baseRequest([{ role: "user", content: "read" }], tools), fakeSubscriber());
+  const send = sdk.state.sends[0];
+  const pending = send.options.local.customTools.Read.execute({}, { toolCallId: "call-image" });
+  await settle(20);
+  const actor = [...registry.actors.values()][0];
+  await actor.submitToolResults(actor.activeRun.runId, actor.activeRun.batch.batchId, [{
+    type: "tool_result",
+    tool_use_id: "call-image",
+    content: [
+      { type: "text", text: "screenshot" },
+      { type: "image", source: { type: "base64", media_type: "image/png", data: "AQID" } },
+    ],
+  }]);
+  assert.deepEqual(await pending, {
+    content: [
+      { type: "text", text: "screenshot" },
+      { type: "image", data: "AQID", mimeType: "image/png" },
+    ],
+  });
 });
 
 test("sweep evicts idle actors and restores from journal index", async () => {

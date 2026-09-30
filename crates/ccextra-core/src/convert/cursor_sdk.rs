@@ -2,8 +2,8 @@
 //
 // 纯逻辑无 IO。输出字段:model / modelParams / systemPrompt / workspaceDir /
 // messages / tools。apiKey 由 server 侧 client 注入,不进 converter。
-// 历史 thinking 块剥离(对齐 sidecar stripThinkingBlocks);图片块拦截
-// 返回 UnsupportedImage(D4:v1 不支持图片);system 复用 passthrough 的
+// 历史 thinking 块剥离(对齐 sidecar stripThinkingBlocks);图片原样保留,
+// 由 sidecar 校验并转换为 SDK 附件;system 复用 passthrough 的
 // 非 Claude 清洗(剥计费归属指纹/身份声明/触发块)。
 
 use std::path::Path;
@@ -13,10 +13,6 @@ use thiserror::Error;
 
 #[derive(Debug, Error)]
 pub enum CursorSdkConvertError {
-    /// v1 不支持图片输入(D4),收到 image 块直接报错
-    #[error("unsupported image block in messages")]
-    UnsupportedImage,
-
     /// messages 缺失或不是非空数组
     #[error("messages must be a non-empty array")]
     InvalidMessages,
@@ -44,7 +40,7 @@ pub fn convert_to_cursor_sdk(
     if messages.is_empty() {
         return Err(CursorSdkConvertError::InvalidMessages);
     }
-    let messages = strip_thinking_and_guard_images(messages)?;
+    let messages = strip_thinking_blocks(messages);
 
     // tools 原样透传(Anthropic 形状);缺省输出空数组,与 sidecar 缺省语义一致
     let tools = body
@@ -79,43 +75,30 @@ fn flatten_system(system: Option<&Value>) -> String {
     }
 }
 
-/// 递归剥 thinking 块;遇到 image 块返回 UnsupportedImage
+/// 递归剥 thinking 块;图片块原样保留。
 ///
 /// 对齐 sidecar stripThinkingBlocks 的递归语义(含 tool_result 嵌套内容)
-fn strip_thinking_and_guard_images(
-    messages: Vec<Value>,
-) -> Result<Vec<Value>, CursorSdkConvertError> {
-    let mut out = Vec::with_capacity(messages.len());
-    for message in messages {
-        out.push(strip_value(message)?);
-    }
-    Ok(out)
+fn strip_thinking_blocks(messages: Vec<Value>) -> Vec<Value> {
+    messages.into_iter().map(strip_value).collect()
 }
 
-fn strip_value(value: Value) -> Result<Value, CursorSdkConvertError> {
+fn strip_value(value: Value) -> Value {
     match value {
-        Value::Array(items) => {
-            let mut kept = Vec::with_capacity(items.len());
-            for item in items {
-                let block_type = item.get("type").and_then(|t| t.as_str());
-                if block_type == Some("thinking") {
-                    continue;
-                }
-                if block_type == Some("image") {
-                    return Err(CursorSdkConvertError::UnsupportedImage);
-                }
-                kept.push(strip_value(item)?);
-            }
-            Ok(Value::Array(kept))
-        }
+        Value::Array(items) => Value::Array(
+            items
+                .into_iter()
+                .filter(|item| item.get("type").and_then(|t| t.as_str()) != Some("thinking"))
+                .map(strip_value)
+                .collect(),
+        ),
         Value::Object(map) => {
             let mut out = Map::with_capacity(map.len());
             for (key, child) in map {
-                out.insert(key, strip_value(child)?);
+                out.insert(key, strip_value(child));
             }
-            Ok(Value::Object(out))
+            Value::Object(out)
         }
-        other => Ok(other),
+        other => other,
     }
 }
 
@@ -206,33 +189,41 @@ mod tests {
     }
 
     #[test]
-    fn image_block_returns_unsupported_image() {
+    fn preserves_image_block_for_sidecar() {
         let body = json!({
             "model": "auto",
             "messages": [
                 { "role": "user", "content": [
-                    { "type": "image", "source": { "type": "base64" } }
+                    { "type": "image", "source": {
+                        "type": "base64", "media_type": "image/png", "data": "AQID"
+                    } }
                 ] }
             ]
         });
-        let err = convert_to_cursor_sdk(body, "auto", &workspace()).unwrap_err();
-        assert!(matches!(err, CursorSdkConvertError::UnsupportedImage));
+        let out = convert_to_cursor_sdk(body, "auto", &workspace()).unwrap();
+        assert_eq!(out["messages"][0]["content"][0]["type"], "image");
+        assert_eq!(out["messages"][0]["content"][0]["source"]["data"], "AQID");
     }
 
     #[test]
-    fn image_inside_tool_result_also_rejected() {
+    fn preserves_image_inside_tool_result_for_sidecar() {
         let body = json!({
             "model": "auto",
             "messages": [
                 { "role": "user", "content": [
                     { "type": "tool_result", "tool_use_id": "t1", "content": [
-                        { "type": "image", "source": { "type": "base64" } }
+                        { "type": "image", "source": {
+                            "type": "base64", "media_type": "image/jpeg", "data": "BAUG"
+                        } }
                     ] }
                 ] }
             ]
         });
-        let err = convert_to_cursor_sdk(body, "auto", &workspace()).unwrap_err();
-        assert!(matches!(err, CursorSdkConvertError::UnsupportedImage));
+        let out = convert_to_cursor_sdk(body, "auto", &workspace()).unwrap();
+        assert_eq!(
+            out["messages"][0]["content"][0]["content"][0]["source"]["media_type"],
+            "image/jpeg"
+        );
     }
 
     #[test]

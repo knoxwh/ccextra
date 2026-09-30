@@ -148,7 +148,7 @@ curl -H "Authorization: Bearer $ANTHROPIC_AUTH_TOKEN" \
 - `prompt_cache_key` 只用于 OpenAI 路径，取 Claude Code 会话 ID，且不覆盖已有非空值。
 - `models_file` 指向 reasoning 级别表（默认配置文件旁 `models.json`，不入 git，可从 [models.json.example](models.json.example) 复制后按需修改），按上游模型 `id` 精确匹配，把入站 effort 钳到该模型支持的最近档；缺文件或未收录的模型不钳。条目可加 `force_effort`：凡钳制会介入的 effort 一律改写为该固定值（不钳制），`*claude*` 原生模型与显式关闭思考的请求不受影响。
 - `antigravity_models` 为模型白名单（顶层配置，glob 或精确名，如 `["claude-opus-5-5-*", "gpt-5.2"]`）；缺省或空列表发布全量目录。过滤在动态目录加载时按上游模型名匹配，过滤后为空时该凭证发布空模型列表。`/reload` 与 3 小时后台刷新均生效。
-- Cursor 字段：`cursor_auth_dir` 启用 SDK sidecar（凭证目录，默认配置文件旁 `.cache/cursor`）；`cursor_models` 白名单（glob 或精确名，`default` 等价 `auto`，缺省全量）；`cursor_sidecar_idle_secs`（默认 1800）与 `cursor_sidecar_max_agents`（默认 16）控制 sidecar 回收与并发；`cursor_workspace_dir` 为 SDK 工作目录（缺省进程 cwd，支持 `~` 与相对配置文件目录）。启用后自动合成 name `cursor` 的 `cursor_sdk` provider；与现有 provider 的模型 name/alias 冲突时跳过该模型并告警。刷新失败保留最近成功目录。
+- Cursor 字段：`cursor_auth_dir` 启用 SDK sidecar（凭证目录，默认配置文件旁 `.cache/cursor`）；`cursor_models` 白名单（glob 或精确名，`default` 等价 `auto`，缺省全量）；`cursor_sidecar_idle_secs`（默认 1800）与 `cursor_sidecar_max_agents`（默认 16）控制 sidecar 回收与并发；`cursor_workspace_dir` 为 SDK 工作目录（缺省进程 cwd，支持 `~` 与相对配置文件目录）。启用后自动合成 name `cursor` 的 `cursor_sdk` provider；与现有 provider 的模型 name/alias 冲突时跳过该模型并告警。刷新失败保留最近成功目录。Cursor 图片支持 PNG、JPEG、WebP、GIF base64；远程图片 URL 返回 400。
 
 <details>
 <summary>进阶选项</summary>

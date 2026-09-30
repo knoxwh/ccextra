@@ -133,26 +133,87 @@ export class ToolUseIndex {
   }
 }
 
+const IMAGE_MIME_TYPES = new Set(["image/png", "image/jpeg", "image/webp", "image/gif"]);
+
+function imageError(message, code = "invalid_request_error") {
+  return Object.assign(new Error(message), { statusCode: 400, code });
+}
+
+/** Anthropic image block → Cursor SDK image;仅允许 base64 与白名单 MIME。 */
+export function toSdkImage(block) {
+  const source = block?.source;
+  const sourceIsObject = source !== null && typeof source === "object";
+  if (sourceIsObject && (source.type === "url" || "url" in source)) {
+    throw imageError(
+      "Local Cursor SDK image inputs require a base64 data URL; remote image URLs are unsupported.",
+      "unsupported_parameter",
+    );
+  }
+  const data = source?.data;
+  const mimeType = source?.media_type;
+  const validBase64 = typeof data === "string"
+    && /^[A-Za-z0-9+/]+={0,2}$/.test(data)
+    && Buffer.from(data, "base64").toString("base64").replace(/=+$/, "") === data.replace(/=+$/, "");
+  if (source?.type !== "base64" || !validBase64 || !IMAGE_MIME_TYPES.has(mimeType)) {
+    throw imageError("Image inputs must contain valid base64 PNG, JPEG, WebP or GIF data.");
+  }
+  return { data, mimeType };
+}
+
+/** 校验 messages 内全部 image block;必须在会话状态变更前调用。 */
+export function validateMessageImages(value) {
+  if (Array.isArray(value)) {
+    for (const child of value) validateMessageImages(child);
+  } else if (value && typeof value === "object") {
+    if (value.type === "image") toSdkImage(value);
+    for (const child of Object.values(value)) validateMessageImages(child);
+  }
+}
+
+/** 提取本次发送回合的顶层图片;tool_result 图片走工具结果回调。 */
+export function extractMessageImages(turns) {
+  const images = [];
+  for (const turn of turns ?? []) {
+    if (turn?.role !== "user" || !Array.isArray(turn?.content)) continue;
+    for (const block of turn.content) {
+      if (block?.type === "image") images.push(toSdkImage(block));
+    }
+  }
+  return images;
+}
 /**
  * normalizeToolResult:Anthropic tool_result → SDK tool result(对齐 cursor2response toSdkToolResult)。
- * content 字符串或 text block 数组拼接;is_error 保留为 isError。
+ * content 字符串或 text/image block;is_error 保留为 isError。
  */
 export function normalizeToolResult(block) {
-  const text = extractToolResultText(block?.content);
-  if (block?.is_error) {
-    return { content: [{ type: "text", text }], isError: true };
+  const { text, images } = normalizeToolContent(block?.content);
+  if (images.length > 0 || block?.is_error) {
+    return {
+      content: [
+        { type: "text", text },
+        ...images.map(({ data, mimeType }) => ({ type: "image", data, mimeType })),
+      ],
+      ...(block?.is_error ? { isError: true } : {}),
+    };
   }
   return text;
 }
 
-function extractToolResultText(content) {
-  if (typeof content === "string") return content;
-  if (Array.isArray(content)) {
-    return content
-      .map((block) => (block?.type === "text" && typeof block.text === "string" ? block.text : JSON.stringify(block ?? null)))
-      .join("");
+function normalizeToolContent(content) {
+  if (typeof content === "string") return { text: content, images: [] };
+  if (!Array.isArray(content)) return { text: "", images: [] };
+  let text = "";
+  const images = [];
+  for (const block of content) {
+    if (block?.type === "text" && typeof block.text === "string") {
+      text += block.text;
+    } else if (block?.type === "image") {
+      images.push(toSdkImage(block));
+    } else {
+      text += JSON.stringify(block ?? null);
+    }
   }
-  return "";
+  return { text, images };
 }
 
 /**

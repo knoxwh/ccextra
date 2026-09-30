@@ -68,6 +68,36 @@ test("run with invalid JSON returns 400", async () => {
   });
 });
 
+test("run rejects invalid image before touching session registry", async () => {
+  let calls = 0;
+  const registry = {
+    health: () => ({ agents: 0, pendingCallbacks: 0 }),
+    run: async () => { calls += 1; throw new Error("must not run"); },
+  };
+  const authDir = await mkdtemp(join(tmpdir(), "ccextra-cursor-image-"));
+  const server = createServer({ token: "secret", authDir, sessionRegistry: registry, modelCatalog: null });
+  try {
+    await new Promise((resolve) => server.listen(0, "127.0.0.1", resolve));
+    const response = await fetch(`http://127.0.0.1:${server.address().port}/run`, {
+      method: "POST",
+      headers: { authorization: "Bearer secret", "content-type": "application/json" },
+      body: JSON.stringify({
+        apiKey: "key",
+        model: "auto",
+        workspaceDir: process.cwd(),
+        messages: [{ role: "user", content: [{ type: "image", source: { type: "base64", media_type: "image/png", data: "bad!" } }] }],
+      }),
+    });
+    assert.equal(response.status, 400);
+    const body = await response.json();
+    assert.equal(body.error.type, "invalid_request_error");
+    assert.equal(calls, 0);
+  } finally {
+    await new Promise((resolve, reject) => server.close((error) => (error ? reject(error) : resolve())));
+    await rm(authDir, { recursive: true, force: true });
+  }
+});
+
 test("run streams normalized SSE events", async () => {
   const registry = {
     health: () => ({ agents: 1, pendingCallbacks: 0 }),

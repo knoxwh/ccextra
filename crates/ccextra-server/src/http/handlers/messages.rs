@@ -768,9 +768,6 @@ pub(crate) async fn prepare_message_request(
 /// Cursor 转换错误 → Anthropic 400 消息
 fn cursor_convert_error_message(error: &CursorSdkConvertError) -> String {
     match error {
-        CursorSdkConvertError::UnsupportedImage => {
-            "unsupported image block: Cursor SDK v1 不支持图片输入".to_string()
-        }
         CursorSdkConvertError::InvalidMessages => {
             "invalid messages: messages 必须是非空数组".to_string()
         }

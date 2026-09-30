@@ -125,6 +125,7 @@ import {
   mapCustomTools,
   buildCompletedResults,
   normalizeToolResult,
+  extractMessageImages,
 } from "./tools.mjs";
 import { pumpRunEvents } from "./events.mjs";
 
@@ -143,11 +144,11 @@ export function renderTurnsText(turns) {
           const content = typeof block.content === "string"
             ? block.content
             : Array.isArray(block.content)
-              ? block.content.map((b) => (b?.type === "text" ? b.text : JSON.stringify(b ?? null))).join("\n")
+              ? block.content.map((b) => (b?.type === "text" ? b.text : b?.type === "image" ? "[image]" : JSON.stringify(b ?? null))).join("\n")
               : "";
           return `[tool_result ${block.tool_use_id} is_error=${block.is_error === true}]\n${content}`;
         }
-        return "";
+        if (block?.type === "image") return "[image]";
       })
       .filter(Boolean)
       .join("\n");
@@ -297,6 +298,7 @@ export class SessionActor {
     );
     const wrapped = await this.sdk.sendRun(this.agent, {
       text: renderTurnsText(sendTurns),
+      images: extractMessageImages(sendTurns),
       modelId: request.model,
       modelParams: request.modelParams ?? [],
       customTools,

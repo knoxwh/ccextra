@@ -6,6 +6,7 @@ import { isAbsolute } from "node:path";
 import { Journal } from "./journal.mjs";
 import { SessionRegistry } from "./sessions.mjs";
 import { normalizeWorkspaceDir } from "./sessions.mjs";
+import { validateMessageImages } from "./tools.mjs";
 import { createSdkAdapter, loadSdk } from "./sdk.mjs";
 import { discoverModels, loadModelCache, saveModelCache } from "./models.mjs";
 
@@ -119,6 +120,7 @@ async function handleRun(req, res, sessionRegistry) {
     respondJson(res, 400, errorBody("invalid_request_error", "apiKey and model are required"));
     return;
   }
+  validateMessageImages(request.messages);
   try {
     request.workspaceDir = await normalizeWorkspaceDir(request.workspaceDir);
   } catch (error) {

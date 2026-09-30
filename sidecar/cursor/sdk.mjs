@@ -62,10 +62,11 @@ export function createSdkAdapter(bindings) {
      * idempotencyKey 为当前完整 transcript 的稳定 turn_hash,不得使用 runId。
      * customTools 只属于当前 send,不累积上一请求工具。
      */
-    async sendRun(agent, { text, modelId, modelParams, customTools, force, onDelta, runId, idempotencyKey }) {
+    async sendRun(agent, { text, images, modelId, modelParams, customTools, force, onDelta, runId, idempotencyKey }) {
       if (!runId) throw new Error("runId is required for stale event binding");
       if (!idempotencyKey) throw new Error("idempotencyKey is required for request deduplication");
-      const run = await agent.send(text, {
+      const message = images?.length > 0 ? { text, images } : text;
+      const run = await agent.send(message, {
         model: { id: modelId, params: modelParams },
         mode: "agent",
         local: { customTools, force: force === true },

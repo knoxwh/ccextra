@@ -3264,9 +3264,9 @@ async fn test_cursor_sdk_sidecar_429_maps_anthropic_error_with_retry_after() {
     assert_eq!(error["type"], "error");
 }
 
-/// 图片输入:Cursor SDK v1 不支持,返回 Anthropic 400
+/// 图片输入:Cursor SDK sidecar 接收 base64 图片并返回正常响应
 #[tokio::test]
-async fn test_cursor_sdk_image_input_returns_400() {
+async fn test_cursor_sdk_image_input_is_forwarded() {
     let frames = "data: {\"type\":\"turn_end\",\"stop_reason\":\"end_turn\"}\n\n";
     let sidecar = crate::test_support::TestServer::spawn(cursor_sidecar_router(frames)).await;
     let auth_dir = tempfile::tempdir().unwrap();
@@ -3297,14 +3297,9 @@ async fn test_cursor_sdk_image_input_returns_400() {
         ))
         .unwrap();
     let response = app.oneshot(request).await.unwrap();
-    assert_eq!(response.status(), StatusCode::BAD_REQUEST);
+    assert_eq!(response.status(), StatusCode::OK);
     let body = to_bytes(response.into_body(), 1024 * 1024).await.unwrap();
-    let error: Value = serde_json::from_slice(&body).unwrap();
-    assert_eq!(error["type"], "error");
-    assert!(error["error"]["message"]
-        .as_str()
-        .unwrap()
-        .contains("image"));
+    assert!(!body.is_empty());
 }
 
 /// 首帧 error:不本地重试(D11 退避交客户端),/run 恰好 1 次,返回 502

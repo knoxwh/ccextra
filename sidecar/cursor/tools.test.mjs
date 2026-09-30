@@ -27,6 +27,42 @@ test("normalizeToolResult maps Anthropic shapes to SDK results", () => {
   );
 });
 
+test("normalizeToolResult preserves base64 images as SDK content", () => {
+  assert.deepEqual(
+    normalizeToolResult({
+      content: [
+        { type: "text", text: "diagram" },
+        { type: "image", source: { type: "base64", media_type: "image/png", data: "AQID" } },
+      ],
+    }),
+    {
+      content: [
+        { type: "text", text: "diagram" },
+        { type: "image", data: "AQID", mimeType: "image/png" },
+      ],
+    }
+  );
+});
+
+test("normalizeToolResult rejects remote image URLs", () => {
+  assert.throws(
+    () => normalizeToolResult({ content: [{ type: "image", source: { type: "url", url: "https://example.com/a.png" } }] }),
+    (error) => error?.statusCode === 400 && error?.code === "unsupported_parameter"
+  );
+});
+
+test("normalizeToolResult rejects invalid base64 and MIME", () => {
+  for (const source of [
+    { type: "base64", media_type: "image/png", data: "not base64!" },
+    { type: "base64", media_type: "image/tiff", data: "AQID" },
+    "malformed source",
+  ]) {
+    assert.throws(
+      () => normalizeToolResult({ content: [{ type: "image", source }] }),
+      (error) => error?.statusCode === 400 && error?.code === "invalid_request_error"
+    );
+  }
+});
 test("mapCustomTools produces SDK customTools shape", async () => {
   const tools = [{ name: "Read", description: "read a file", input_schema: { type: "object" } }];
   const customTools = mapCustomTools(tools, () => {}, undefined);
