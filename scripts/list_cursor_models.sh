@@ -101,16 +101,29 @@ if not models:
     print("⚠️ 未解析到模型(响应可能为空或格式变化)")
     sys.exit(0)
 
-print(f"🤖 SDK 模型目录 ({len(models)} 个,白名单匹配目标):")
+rows = []
 for m in models:
     mid = m.get("id") or "unknown"
-    name = m.get("displayName")
-    if name and name != mid:
-        print(f"  - {mid} ({name})")
-    else:
-        print(f"  - {mid}")
+    name = m.get("displayName") or ""
+    parts = []
     for p in m.get("parameters") or []:
-        values = ", ".join(p.get("values") or [])
         pid = p.get("id")
-        print(f"      {pid}: {values}")
+        values = "|".join(p.get("values") or [])
+        parts.append(f"{pid}: {values}")
+    rows.append((mid, name, ", ".join(parts) or "-"))
+rows.sort()
+
+w_model = max(len("MODEL"), max(len(r[0]) for r in rows))
+w_name = max(len("NAME"), max(len(r[1]) for r in rows))
+
+print(f"SDK 模型目录 ({len(rows)} 个,白名单匹配目标):")
+print()
+hdr_model = "MODEL".ljust(w_model)
+hdr_name = "NAME".ljust(w_name)
+print(f"{hdr_model}  {hdr_name}  PARAMETERS")
+sep_model = "-" * w_model
+sep_name = "-" * w_name
+print(f"{sep_model}  {sep_name}  ---------")
+for mid, name, params in rows:
+    print(f"{mid:<{w_model}}  {name:<{w_name}}  {params}")
 ' "$MODELS_JSON"
