@@ -77,11 +77,11 @@ Cursor 走本地 Node sidecar 而非 HTTP 反代。凭证是 **User API Key**（
 
 **Rust/Node 边界**：sidecar 是 ccextra 的子进程（`sidecar/cursor/main.mjs`，嵌入 `@cursor/sdk`），固定监听 `127.0.0.1:8223`，端口占用时启动失败且不回退随机端口。Rust 侧 `CursorSidecar` 负责 spawn、READY 握手（严格 JSON `{"event":"ready","port":8223}`，10 秒超时）、stderr 转 tracing、每 5 秒健康巡检与 1/2/4…秒退避重启（封顶 60 秒）。服务收到 `SIGTERM`/`SIGINT`、`/reload` 禁用 Cursor 或修改 `auth_dir` 时，先停止 sidecar 并释放端口。Bearer token 由 Rust 生成，只经 `CCEXTRA_CURSOR_TOKEN` 环境变量传递，不落盘；凭证目录经 `CCEXTRA_CURSOR_AUTH_DIR` 注入。协议为两个端点：`POST /run`（SSE）与 `POST /models`。Rust 不解析 SDK 内部结构，sidecar 不接触 ccextra 配置。
 
-**请求形状**：`convert_to_cursor_sdk`（core，纯函数）将 Anthropic body 转为 `/run` 载荷——`model`、`modelParams: []`、`systemPrompt`（system 块拍平为单字符串）、`workspaceDir`、Anthropic 形状 `messages`（递归剥 thinking 块并保留图片）与 `tools` 透传；sidecar 校验图片仅允许 `image/png`、`image/jpeg`、`image/webp`、`image/gif` 的合法 base64，远程 URL 返回 400，并将图片作为 SDK 附件传递。`apiKey` 由 Rust dispatch 时注入，不进转换层。分派链：凭证保鲜 → 注入 apiKey → `/run` → 401 时刷新一次重发 → 流式首业务帧预读（跳过心跳帧，首帧 error 返回 502 不提交 200）。
+**请求形状**：`convert_to_cursor_sdk`（core，纯函数）将 Anthropic body 转为 `/run` 载荷——`model`、`modelParams: []`、`systemPrompt`（system 块拍平为单字符串）、`workspaceDir`、Anthropic 形状 `messages`（递归剥 thinking 块并保留图片）与 `tools` 透传；sidecar 校验图片仅允许 `image/png`、`image/jpeg`、`image/webp`、`image/gif` 的合法 base64，远程 URL 返回 400，并将图片作为 SDK 附件传递。`apiKey` 由 Rust dispatch 时注入，不进转换层。分派链：凭证保鲜 → 注入 apiKey → `/run` → 401 时刷新一次重发 → 流式首业务帧预读（跳过心跳帧，首帧 error 返回 502 不提交 200）。system 提示词不传 SDK `systemPrompt` 选项（该选项账号级门控，无权限账号 `send` 即报 `invalid_argument unknown option '--system-prompt'`，官方 forum 确认无自助开通）；sidecar 在全量发送 transcript 时（new/replay/resume）将 system 文本以 `system:\n<prompt>` 前缀拼进 run 正文，suffix 续跑不拼（首轮已含）。
 
 **SSE 事件与终态**：sidecar 事件已归一为 `text_delta`/`thinking_delta`/`tool_use`/`usage`/`turn_end`/`error` 六类。`relay_cursor_sdk_to_anthropic` 状态机自动开合 content block（text/thinking 增量、tool_use 单次 `input_json_delta`），`turn_end` 触发 `message_delta` + `message_stop` 后立即结束流；EOF 无 `turn_end`、`error` 事件或读取错误产生结构化 Anthropic error，不在已收尾后追加成功事件。非流路径 `collect_cursor_sdk_response` 聚合同一事件集为 Anthropic JSON，缺终态或 error 返回 502。usage 写入会话 token cache，`count_tokens` 复用（缺失返回 0）。
 
-**Run 状态机与 journal 恢复**：sidecar 内每个 `/run` 对应一个 SDK Agent Run。会话状态（消息前缀、pending callback）持久化在 `cursor_auth_dir` 的 `sessions.jsonl` 与 journal 文件：journal 记录已确认的消息前缀哈希，冷续接（sidecar 崩溃重启后同会话下一请求）只回放到已确认边界，不跨过未确认的副作用。已知限制：崩溃窗口内未确认的工具副作用可能在续接后重复执行，由客户端 tool_result 幂等性兜底。模型目录经 `/models` 拉取，按 `cursor_models` 白名单（`default` 归一为 `auto`）过滤后合成 name `cursor` 的 provider；与现有 provider name/alias 冲突的模型跳过并告警。启动、`/reload` 与每 3 小时后台刷新；失败保留最近成功目录。
+**Run 状态机与 journal 恢复**：sidecar 内每个 `/run` 对应一个 SDK Agent Run。会话状态（消息前缀、pending callback）持久化在 `cursor_auth_dir` 的 `sessions.jsonl` 与 journal 文件：journal 记录已确认的消息前缀哈希，冷续接（sidecar 崩溃重启后同会话下一请求）只回放到已确认边界，不跨过未确认的副作用。入站与已记录 transcript 完全相同（零新回合，即客户端失败后重发同一 body）时降级 full replay 重跑，不报错。已知限制：崩溃窗口内未确认的工具副作用可能在续接后重复执行，由客户端 tool_result 幂等性兜底。模型目录经 `/models` 拉取，按 `cursor_models` 白名单（`default` 归一为 `auto`）过滤后合成 name `cursor` 的 provider；与现有 provider name/alias 冲突的模型跳过并告警。启动、`/reload` 与每 3 小时后台刷新；失败保留最近成功目录。
 
 ### 各协议 System 提示词清洗差异矩阵
 
@@ -96,6 +96,7 @@ Cursor 走本地 Node sidecar 而非 HTTP 反代。凭证是 **User API Key**（
 | **OpenAI Responses** (其他上游，如 GLM/DeepSeek) | 剥离 | 剥离 | 剥离 | 剥离 | 保留 | 仅合并白名单段落直入 `instructions` 字段；无 developer 适配块注入 |
 | **Gemini 直连** | 剥离 | 剥离 | 剥离 | 剥离 | 保留 | 转换为 `systemInstruction.parts` |
 | **Antigravity** | 剥离 | system 前导 Claude 身份句中和为 `You are an AI agent.`，保留后文 | 剥离 | 剥离 | 保留 | 转换为 `request.systemInstruction.parts`；不改 user 内容 |
+| **Cursor SDK** | 剥离 | 剥离 | 剥离 | 剥离 | 保留 | 全量发送时以 `system:\n<prompt>` 前缀拼进 run 正文（SDK `systemPrompt` 选项账号门控不可用）；suffix 续跑不拼 |
 
 ## 传输与可靠性
 

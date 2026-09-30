@@ -164,6 +164,19 @@ export function extractCurrentToolResults(messages) {
   return lastUser.content.filter((block) => block?.type === "tool_result");
 }
 
+/**
+ * run text 组装:全量发送(new/replay/resume)时 system 提示词拼正文前缀。
+ * SDK systemPrompt 选项账号级门控不可用,前缀是官方推荐替代
+ * (forum: "add your instructions at the start of the message you pass into agent.send()")。
+ */
+export function renderRunText(request, sendTurns, includeSystem) {
+  const turnsText = renderTurnsText(sendTurns);
+  if (includeSystem && typeof request.systemPrompt === "string" && request.systemPrompt.length > 0) {
+    return `system:\n${request.systemPrompt}\n\n${turnsText}`;
+  }
+  return turnsText;
+}
+
 /** 哈希输入组装:workspaceDir 必须已规范化。 */
 function hashInput(request) {
   return {
@@ -257,6 +270,10 @@ export class SessionActor {
 
   /** 启动新 Run:前缀匹配决定 suffix-only 或 full replay;返回 runId。 */
   async startRun(request, subscriber) {
+    if (request.messages.length === 0) {
+      // 守卫先于 Agent 创建:避免空 messages 孤儿 Agent
+      throw new Error("cursor_sdk_empty_messages");
+    }
     const runId = randomUUID();
     const batch = new ToolBatch(runId);
     const incoming = computeTurnHashes(hashInput(request));
@@ -265,11 +282,19 @@ export class SessionActor {
       : { mode: "new", matchedCount: 0 };
     let sendTurns;
     let completedResults;
-    if (match.mode === "suffix" && this.agent) {
-      sendTurns = request.messages.slice(match.matchedCount);
+    let includeSystem = false;
+    // suffix 候选:Agent 存在且入站覆盖已记录链且带新回合;
+    // 零新回合 = 客户端失败后重发同一 body,不算 suffix,回落 full replay 重跑
+    const suffixTurns = match.mode === "suffix" && this.agent
+      ? request.messages.slice(match.matchedCount)
+      : null;
+    if (suffixTurns !== null && suffixTurns.length > 0) {
+      sendTurns = suffixTurns;
       completedResults = undefined;
     } else {
-      // full replay:部分前缀、历史改写、新建、journal 恢复后失配
+      // full replay:部分前缀、历史改写、新建、journal 恢复后失配、零新回合重试
+      // 全量 transcript 发送时 system 提示词拼正文前缀;suffix 续跑不拼(首轮已含)
+      includeSystem = true;
       completedResults = buildCompletedResults(request.messages);
       if (this.agent) {
         this.agent = await this.sdk.createAgent(this.createInput(request));
@@ -280,9 +305,6 @@ export class SessionActor {
         this.agent = await this.sdk.createAgent(this.createInput(request));
       }
       sendTurns = request.messages;
-    }
-    if (sendTurns.length === 0) {
-      throw new Error("cursor_sdk_transcript_not_extended");
     }
     this.model = request.model;
     this.modelParams = request.modelParams ?? [];
@@ -297,7 +319,7 @@ export class SessionActor {
       completedResults
     );
     const wrapped = await this.sdk.sendRun(this.agent, {
-      text: renderTurnsText(sendTurns),
+      text: renderRunText(request, sendTurns, includeSystem),
       images: extractMessageImages(sendTurns),
       modelId: request.model,
       modelParams: request.modelParams ?? [],
@@ -317,11 +339,11 @@ export class SessionActor {
   }
 
   createInput(request) {
+    // systemPrompt 不入 SDK options(账号门控);正文前缀见 renderRunText
     return {
       apiKey: request.apiKey,
       modelId: request.model,
       modelParams: request.modelParams ?? [],
-      systemPrompt: request.systemPrompt,
       workspaceDir: request.workspaceDir,
     };
   }

@@ -37,7 +37,6 @@ test("createAgent passes exact shared options", async () => {
     apiKey: "key",
     model: { id: "auto", params: [] },
     mode: "agent",
-    systemPrompt: "be brief",
     tools: ["mcp"],
     local: { cwd: "/tmp", settingSources: [] },
   });
@@ -61,7 +60,6 @@ test("resumeAgent passes agentId and identical shared options", async () => {
     apiKey: "key",
     model: { id: "auto", params: [] },
     mode: "agent",
-    systemPrompt: "be brief",
     tools: ["mcp"],
     local: { cwd: "/tmp", settingSources: [] },
   });
@@ -161,7 +159,7 @@ test("sendRun wait normalizes status and usage", async () => {
   assert.equal(result.result, "hi");
 });
 
-test("sharedOptions omits empty systemPrompt so SDK default applies", async () => {
+test("sharedOptions never passes systemPrompt (account-gated option)", async () => {
   const { createSdkAdapter } = await import("./sdk.mjs");
   const created = [];
   const adapter = createSdkAdapter({
@@ -178,7 +176,7 @@ test("sharedOptions omits empty systemPrompt so SDK default applies", async () =
     apiKey: "k",
     modelId: "auto",
     modelParams: [],
-    systemPrompt: "",
+    systemPrompt: "be brief",
     workspaceDir: "/tmp",
   });
   assert.equal("systemPrompt" in created[0], false);

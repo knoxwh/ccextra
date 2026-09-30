@@ -11,6 +11,7 @@ import {
   matchTurnHashes,
   isResumable,
   renderTurnsText,
+  renderRunText,
 } from "./sessions.mjs";
 
 const base = {
@@ -60,6 +61,17 @@ test("renderTurnsText marks image blocks for separate SDK attachments", () => {
     },
   ]);
   assert.equal(text, "user:\ninspect\n[image]");
+});
+
+test("renderRunText prefixes system prompt only on full send", () => {
+  const request = { systemPrompt: "be brief" };
+  const turns = [{ role: "user", content: "hi" }];
+  // 全量发送(new/replay):system 拼正文前缀
+  assert.equal(renderRunText(request, turns, true), "system:\nbe brief\n\nuser:\nhi");
+  // suffix 续跑:不拼
+  assert.equal(renderRunText(request, turns, false), "user:\nhi");
+  // 空 systemPrompt:不拼
+  assert.equal(renderRunText({ systemPrompt: "" }, turns, true), "user:\nhi");
 });
 
 test("canonicalizeTurn keeps empty tool_result content and error flag", () => {
@@ -485,6 +497,41 @@ test("suffix reuse sends only missing turns", async () => {
   assert.equal(sdk.state.sends[1].text.includes("hi"), false);
   assert.equal(sdk.state.sends[1].text.includes("hello"), false);
   assert.equal(sdk.state.sends[1].text.includes("again"), true);
+  // suffix 续跑不带 system 前缀(首轮已含)
+  assert.equal(sdk.state.sends[1].text.includes("system:"), false);
+});
+
+test("empty messages rejected before agent creation", async () => {
+  const { sdk, registry } = makeRegistry();
+  await assert.rejects(
+    () => registry.run(baseRequest([]), fakeSubscriber()),
+    /cursor_sdk_empty_messages/
+  );
+  assert.equal(sdk.state.created.length, 0);
+});
+
+test("identical resend after failed run replays instead of erroring", async () => {
+  const { sdk, registry } = makeRegistry();
+  const first = fakeSubscriber();
+  await registry.run(baseRequest([{ role: "user", content: "hi" }]), first);
+  const send1 = sdk.state.sends[0];
+  // run 失败:无 assistant 输出,wait 返回 error → dirty;transcript 已记录 [user]
+  send1.run.end();
+  send1.run.finish({ status: "error", error: { message: "boom" } });
+  await settle();
+  // 客户端失败重试:同一 body 重发,零新回合,不再抛 transcript_not_extended
+  const second = fakeSubscriber();
+  await registry.run(baseRequest([{ role: "user", content: "hi" }]), second);
+  assert.equal(sdk.state.created.length, 2); // 重建 Agent full replay
+  assert.equal(sdk.state.sends.length, 2);
+  assert.equal(sdk.state.sends[1].text.startsWith("system:\ns\n\n"), true);
+  assert.equal(sdk.state.sends[1].text.includes("hi"), true);
+  // 重放 run 正常完成
+  sdk.state.sends[1].run.push({ type: "assistant", message: { content: [{ type: "text", text: "hello" }] } });
+  sdk.state.sends[1].run.end();
+  sdk.state.sends[1].run.finish({ status: "finished" });
+  await settle();
+  assert.equal(second.events.some((event) => event.type === "turn_end"), true);
 });
 
 test("suffix reuse sends only missing image attachments", async () => {
@@ -526,6 +573,8 @@ test("history rewrite triggers full replay with new agent", async () => {
   assert.equal(sdk.state.created.length, 2);
   assert.equal(sdk.state.sends[1].text.text.includes("hi"), true);
   assert.equal(sdk.state.sends[1].text.text.includes("changed"), true);
+  // full replay 重建 Agent,system 前缀随全量 transcript 重发
+  assert.equal(sdk.state.sends[1].text.text.startsWith("system:\ns\n\n"), true);
   assert.deepEqual(sdk.state.sends[1].text.images, [{ data: "AQID", mimeType: "image/png" }]);
 });
 

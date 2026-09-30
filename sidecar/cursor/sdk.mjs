@@ -11,19 +11,17 @@ export function loadSdk({ Agent, Cursor }) {
 }
 
 /** Agent.create / Agent.resume 共享 options(对齐 cursor2response localAgentCreateOptions)。 */
-function sharedOptions({ apiKey, modelId, modelParams, systemPrompt, workspaceDir }) {
-  const options = {
+function sharedOptions({ apiKey, modelId, modelParams, workspaceDir }) {
+  // systemPrompt 不传 SDK:该选项账号级门控,无权限账号 send 即报
+  // invalid_argument unknown option '--system-prompt'(官方 forum 确认)。
+  // system 文本由 sessions 层拼进 run text 前缀,绕开门控。
+  return {
     apiKey,
     model: { id: modelId, params: modelParams },
     mode: "agent",
     tools: ["mcp"],
     local: { cwd: workspaceDir, settingSources: [] },
   };
-  // SDK 拒绝空字符串 systemPrompt;空 = 省略,用 SDK 默认提示词
-  if (typeof systemPrompt === "string" && systemPrompt.length > 0) {
-    options.systemPrompt = systemPrompt;
-  }
-  return options;
 }
 
 /**
