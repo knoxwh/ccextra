@@ -127,9 +127,9 @@ pub fn budget_to_level(budget: i64) -> Option<Level> {
 
 /// 请求 body → effort 字符串
 ///
-/// 优先读取顶层 `output_config.effort`(Claude Code 2.1+ 新格式:
-/// thinking 只含 type,effort 单独放顶层),回退 legacy
-/// `thinking.output_config.effort` / budget 映射。返回 None 表示不注入。
+/// `thinking.budget_tokens` 优先，回退顶层 `output_config.effort`(Claude Code
+/// 2.1+ 新格式)，再回退 legacy `thinking.output_config.effort` / budget 映射。
+/// 返回 None 表示不注入。
 pub fn resolve_effort_from_body(body: &serde_json::Value) -> Option<&'static str> {
     // thinking 显式 disabled 时忽略残留 effort(对齐上游钳制行为)
     if body
@@ -140,6 +140,35 @@ pub fn resolve_effort_from_body(body: &serde_json::Value) -> Option<&'static str
     {
         return Some(Level::None.as_str());
     }
+    let thinking = body.get("thinking");
+    let thinking_type = thinking
+        .and_then(|t| t.get("type"))
+        .and_then(|v| v.as_str());
+
+    // adaptive/auto 使用顶层 effort;budget_tokens 仅属于 enabled legacy 形状。
+    if matches!(thinking_type, Some("adaptive") | Some("auto")) {
+        if let Some(e) = body
+            .get("output_config")
+            .and_then(|o| o.get("effort"))
+            .and_then(|v| v.as_str())
+            .and_then(Level::parse)
+        {
+            return Some(e.as_str());
+        }
+        return thinking.and_then(resolve_effort);
+    }
+
+    // enabled 同时提供两种形状时,legacy budget 优先;无效 budget 继续走顶层 effort。
+    if thinking_type == Some("enabled") {
+        if let Some(e) = thinking
+            .and_then(|t| t.get("budget_tokens"))
+            .and_then(|v| v.as_i64())
+            .and_then(budget_to_level)
+        {
+            return Some(e.as_str());
+        }
+    }
+
     // Claude Code 2.1+:effort 在请求顶层 output_config
     if let Some(e) = body
         .get("output_config")
@@ -149,7 +178,7 @@ pub fn resolve_effort_from_body(body: &serde_json::Value) -> Option<&'static str
     {
         return Some(e.as_str());
     }
-    body.get("thinking").and_then(resolve_effort)
+    thinking.and_then(resolve_effort)
 }
 
 /// 钳制 effort 到模型支持的最近级别
@@ -307,6 +336,38 @@ mod tests {
             (
                 json!({"thinking": {"type": "enabled", "budget_tokens": 8192}}),
                 Some("medium"),
+            ),
+            (
+                json!({
+                    "thinking": {"type": "enabled", "budget_tokens": 8192},
+                    "output_config": {"effort": "high"}
+                }),
+                Some("medium"),
+            ),
+            (
+                json!({"thinking": {"type": "enabled"}, "output_config": {"effort": "high"}}),
+                Some("high"),
+            ),
+            (
+                json!({"thinking": {"type": "adaptive", "budget_tokens": 8192}, "output_config": {"effort": "high"}}),
+                Some("high"),
+            ),
+            (
+                json!({"thinking": {"type": "auto", "budget_tokens": 8192}, "output_config": {"effort": "low"}}),
+                Some("low"),
+            ),
+            (json!({"thinking": {"type": "enabled"}}), Some("auto")),
+            (
+                json!({"thinking": {"type": "enabled"}, "output_config": {"effort": ""}}),
+                Some("auto"),
+            ),
+            (
+                json!({"thinking": {"type": "enabled"}, "output_config": {"effort": "   "}}),
+                Some("auto"),
+            ),
+            (
+                json!({"thinking": {"type": "enabled"}, "output_config": {"effort": 123}}),
+                Some("auto"),
             ),
             (
                 json!({"thinking": {"type": "disabled"}, "output_config": {"effort": "max"}}),

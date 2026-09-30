@@ -39,7 +39,7 @@ pub fn convert_to_openai_chat_with(
     // 对齐 顶层键序:model,max_tokens|max_completion_tokens,temperature/top_p,stop,stream,
     // reasoning_effort,messages,tools,tool_choice,user
     openai.insert("model".into(), json!(upstream_model));
-    // thinking → reasoning_effort(忠实 thinking 映射;顶层 output_config 优先)
+    // thinking → reasoning_effort(legacy budget 优先;无 budget 时读取顶层 output_config)
     // 先解析,能力矩阵按最终 effort 判定采样是否可发。
     let reasoning_effort = crate::thinking::resolve_effort_from_body(body).map(|effort| {
         // 对齐 CPA kimi ModeNone:直接走 disabled 形状,不过 clampLevel
