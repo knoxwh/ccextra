@@ -1,9 +1,9 @@
 #!/usr/bin/env bash
 set -euo pipefail
 
-# Cursor 订阅额度与模型列表查询脚本
+# Cursor 订阅额度查询脚本
 # 数据源: api2.cursor.sh DashboardService/GetCurrentPeriodUsage (Connect JSON)
-#         + AgentService/GetUsableModels (protobuf)
+# 模型目录已拆分至 list_cursor_models.sh(SDK 目录,白名单配置依据)
 # 刷新: /auth/exchange_user_api_key (对齐 ccextra cursor/oauth.rs,提前 10 分钟)
 
 # 默认配置
@@ -11,11 +11,10 @@ BASE_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
 AUTH_DIR="${BASE_DIR}/.cache/cursor"
 CONFIG_FILE="${BASE_DIR}/config.yaml"
 DEFAULT_BASE_URL="https://api2.cursor.sh"
-DEFAULT_CLIENT_VERSION="cli-2026.02.13-41ac335"
 # 对齐 ccextra cursor/constants.rs REFRESH_SKEW_SECS
 REFRESH_SKEW_SECS=600
 
-# 从 config.yaml 读取 cursor_base_url / cursor_client_version(可选)
+# 从 config.yaml 读取 cursor_base_url(可选)
 read_yaml_str() {
     [[ -f "$CONFIG_FILE" ]] || return 0
     awk -v key="$1" '
@@ -29,9 +28,7 @@ read_yaml_str() {
 }
 
 BASE_URL="$(read_yaml_str cursor_base_url)"
-CLIENT_VERSION="$(read_yaml_str cursor_client_version)"
 [[ -z "$BASE_URL" ]] && BASE_URL="$DEFAULT_BASE_URL"
-[[ -z "$CLIENT_VERSION" ]] && CLIENT_VERSION="$DEFAULT_CLIENT_VERSION"
 
 usage() {
     echo "用法: $0 [选项]"
@@ -187,24 +184,10 @@ check_account() {
         --compressed --max-time 15 \
         -d '{}' 2>/dev/null || true)"
 
-    # 查询模型列表 (AgentService GetUsableModels, protobuf, 对齐 ccextra cursor/models.rs)
-    local models_b64
-    models_b64="$(curl -sS -X POST "${BASE_URL}/agent.v1.AgentService/GetUsableModels" \
-        -H "Content-Type: application/proto" \
-        -H "Te: trailers" \
-        -H "X-Ghost-Mode: true" \
-        -H "X-Cursor-Client-Type: cli" \
-        -H "X-Cursor-Client-Version: ${CLIENT_VERSION}" \
-        -H "Authorization: Bearer ${token}" \
-        --max-time 15 \
-        --data-binary '' 2>/dev/null | base64 | tr -d '\n' || true)"
-
     if [[ "$RAW_OUTPUT" == true ]]; then
         echo "=== 凭证: $(basename "$cred_file") ==="
         echo "--- GetCurrentPeriodUsage ---"
         echo "$usage_resp" | jq . 2>/dev/null || echo "$usage_resp"
-        echo "--- GetUsableModels (protobuf, base64) ---"
-        echo "$models_b64"
         return
     fi
 
@@ -295,102 +278,6 @@ cycle_end = fmt_time(usage.get("billingCycleEnd"))
 print(f"📅 账单周期: {cycle_start} ~ {cycle_end}")
 ' "$usage_resp" 2>/dev/null || echo "⚠️ 用量: 解析失败"
 
-    # 解析模型列表 (GetUsableModelsResponse.models[].model_id/display_name)
-    python3 -c '
-import sys, base64
-
-def read_varint(data, pos):
-    result = 0
-    shift = 0
-    while pos < len(data):
-        b = data[pos]
-        pos += 1
-        result |= (b & 0x7F) << shift
-        if not (b & 0x80):
-            return result, pos
-        shift += 7
-    raise ValueError("truncated varint")
-
-def strip_frames(data):
-    # Connect 信封: 1 字节 flags + 4 字节大端长度;flags 合法位 0x01/0x02
-    # 原始 protobuf 首字节是字段 tag(如 0x0a),不会落进合法 flags 范围
-    if not data or data[0] & ~0x03:
-        return data
-    out = b""
-    pos = 0
-    while pos < len(data):
-        if pos + 5 > len(data):
-            return data
-        flags = data[pos]
-        length = int.from_bytes(data[pos + 1:pos + 5], "big")
-        end = pos + 5 + length
-        if flags & ~0x03 or end > len(data):
-            return data
-        if not flags & 0x02:
-            out += data[pos + 5:end]
-        pos = end
-    return out
-
-def parse_model(blob):
-    # ModelDetails: model_id = 1, display_name = 4
-    m = {"model_id": "", "display_name": ""}
-    pos = 0
-    while pos < len(blob):
-        tag, pos = read_varint(blob, pos)
-        field, wire = tag >> 3, tag & 7
-        if wire == 2:
-            length, pos = read_varint(blob, pos)
-            val = blob[pos:pos + length]
-            pos += length
-            if field == 1:
-                m["model_id"] = val.decode("utf-8", "replace")
-            elif field == 4:
-                m["display_name"] = val.decode("utf-8", "replace")
-        elif wire == 0:
-            _, pos = read_varint(blob, pos)
-        elif wire == 5:
-            pos += 4
-        elif wire == 1:
-            pos += 8
-        else:
-            break
-    return m
-
-raw = base64.b64decode(sys.argv[1] or "")
-data = strip_frames(raw)
-models = []
-pos = 0
-while pos < len(data):
-    tag, pos = read_varint(data, pos)
-    field, wire = tag >> 3, tag & 7
-    if field == 1 and wire == 2:
-        length, pos = read_varint(data, pos)
-        models.append(parse_model(data[pos:pos + length]))
-        pos += length
-    elif wire == 0:
-        _, pos = read_varint(data, pos)
-    elif wire == 2:
-        length, pos = read_varint(data, pos)
-        pos += length
-    elif wire == 5:
-        pos += 4
-    elif wire == 1:
-        pos += 8
-    else:
-        break
-
-if models:
-    print(f"🤖 可用模型 ({len(models)} 个):")
-    for m in models:
-        mid = m["model_id"] or "unknown"
-        name = m["display_name"]
-        if name and name != mid:
-            print(f"  - {mid} ({name})")
-        else:
-            print(f"  - {mid}")
-else:
-    print("⚠️ 模型列表: 未解析到模型(响应可能为空或格式变化)")
-' "$models_b64" 2>/dev/null || echo "⚠️ 模型列表: 解析失败"
     echo "=========================================================================================="
 }
 

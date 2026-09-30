@@ -206,12 +206,13 @@ curl -H "Authorization: Bearer $ANTHROPIC_AUTH_TOKEN" \
 ./scripts/check_grok_quota.sh
 ./scripts/check_codex_quota.sh
 ./scripts/check_cursor_quota.sh
+./scripts/list_cursor_models.sh
 ./scripts/cursor-sidecar-e2e.sh
 ```
 
 Antigravity 凭证默认在配置文件旁 `.cache/antigravity`，xAI 在 `.cache/xai`，Codex 在 `.cache/codex`。xAI 和 Codex 启动时自动发现。Antigravity 后台加载并每 3 小时刷新模型。Codex 登录使用 PKCE 浏览器授权（本地回调端口默认 1455，可用 `--callback-port` 覆盖），token 提前 24 小时刷新。
 
-Cursor 登录自行生成 PKCE 并轮询浏览器授权，不依赖 Cursor IDE 或 `cursor-agent`；可用 `--no-browser` 手动打开 URL，token 到期前 10 分钟刷新。注意：PKCE 凭证仅适用于配额查询（`check_cursor_quota.sh`），**不能驱动 SDK sidecar**——SDK 需要在 cursor.com/settings → API Keys 手动生成的 User API Key，写入 `cursor_auth_dir/api_key.txt`（单行裸 key）。该文件 SDK 专用且优先于 `cursor.json`，`cursor-login` 只写 `cursor.json`，两者互不覆盖。配置后启动与 `/reload` 时拉取账户模型目录合成 `cursor` provider，每 3 小时后台刷新，失败保留最近成功目录。
+Cursor 登录自行生成 PKCE 并轮询浏览器授权，不依赖 Cursor IDE 或 `cursor-agent`；可用 `--no-browser` 手动打开 URL，token 到期前 10 分钟刷新。注意：PKCE 凭证仅适用于配额查询（`check_cursor_quota.sh`），**不能驱动 SDK sidecar**——SDK 需要在 cursor.com/settings → API Keys 手动生成的 User API Key，写入 `cursor_auth_dir/api_key.txt`（单行裸 key）。该文件 SDK 专用且优先于 `cursor.json`，`cursor-login` 只写 `cursor.json`，两者互不覆盖。配置后启动与 `/reload` 时拉取账户模型目录合成 `cursor` provider，每 3 小时后台刷新，失败保留最近成功目录。`cursor_models` 白名单匹配的是 SDK 模型目录（`list_cursor_models.sh` 输出，含各模型参数档位），不是 GetUsableModels 的 IDE 目录；配白名单前先跑该脚本核对模型 id。
 
 **Cursor sidecar 运维要点**：
 

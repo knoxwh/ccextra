@@ -206,12 +206,13 @@ Log in to an upstream or inspect saved credential status:
 ./scripts/check_grok_quota.sh
 ./scripts/check_codex_quota.sh
 ./scripts/check_cursor_quota.sh
+./scripts/list_cursor_models.sh
 ./scripts/cursor-sidecar-e2e.sh
 ```
 
 Antigravity credentials default to `.cache/antigravity` next to the config; xAI uses `.cache/xai`, Codex `.cache/codex`. xAI and Codex are discovered at startup. Antigravity loads in the background and refreshes models every three hours. Codex login uses PKCE browser authorization (local callback port defaults to 1455, override with `--callback-port`); tokens refresh 24 hours ahead of expiry.
 
-Cursor login uses its own PKCE browser flow and polling; neither the Cursor IDE nor `cursor-agent` is required. Use `--no-browser` to open the login URL manually. Cursor tokens refresh 10 minutes ahead of expiry. Note: the PKCE credential only serves quota checks (`check_cursor_quota.sh`) and **cannot drive the SDK sidecar** — the SDK requires a User API Key generated manually at cursor.com/settings → API Keys, stored in `cursor_auth_dir/api_key.txt` (a single bare key line). That file is SDK-only and takes priority over `cursor.json`; `cursor-login` writes only `cursor.json`, so the two never overwrite each other. Once configured, startup and `/reload` fetch the account model catalog and synthesize the `cursor` provider, a background refresh runs every three hours, and failures keep the last successful catalog.
+Cursor login uses its own PKCE browser flow and polling; neither the Cursor IDE nor `cursor-agent` is required. Use `--no-browser` to open the login URL manually. Cursor tokens refresh 10 minutes ahead of expiry. Note: the PKCE credential only serves quota checks (`check_cursor_quota.sh`) and **cannot drive the SDK sidecar** — the SDK requires a User API Key generated manually at cursor.com/settings → API Keys, stored in `cursor_auth_dir/api_key.txt` (a single bare key line). That file is SDK-only and takes priority over `cursor.json`; `cursor-login` writes only `cursor.json`, so the two never overwrite each other. Once configured, startup and `/reload` fetch the account model catalog and synthesize the `cursor` provider, a background refresh runs every three hours, and failures keep the last successful catalog. The `cursor_models` whitelist matches the SDK model catalog (`list_cursor_models.sh` output, including per-model parameter levels), not the GetUsableModels IDE catalog; run that script to verify model ids before configuring the whitelist.
 
 **Cursor sidecar operations**:
 
