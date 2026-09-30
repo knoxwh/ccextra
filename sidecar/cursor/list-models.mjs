@@ -2,6 +2,7 @@
 // 不经 sidecar HTTP;apiKey 从 CCEXTRA_CURSOR_API_KEY 环境变量读取,
 // 避免命令行参数泄漏。输出 JSON:{ models: [{ id, displayName, parameters }] }
 // 与 main.mjs 同属入口边界,直接 import @cursor/sdk。
+import "./proxy-tunnel.mjs";
 
 const apiKey = process.env.CCEXTRA_CURSOR_API_KEY;
 if (!apiKey) {

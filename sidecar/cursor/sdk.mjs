@@ -37,7 +37,14 @@ export function createSdkAdapter(bindings) {
         throw new Error("Cursor SDK models bindings are incomplete");
       }
       const models = await Cursor.models.list({ apiKey });
-      return models.map((model) => ({ id: model.id }));
+      // parameters 归一为 {id, values: [string]}(SDK 原始 values 为 {value} 对象)
+      return models.map((model) => ({
+        id: model.id,
+        parameters: (model.parameters ?? []).map((p) => ({
+          id: p.id,
+          values: (p.values ?? []).map((v) => v.value),
+        })),
+      }));
     },
 
     /** 新建 Agent;systemPrompt 仅此处生效(SDK 创建后不可变)。 */

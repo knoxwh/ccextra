@@ -37,9 +37,13 @@ secret_key: "sk-ccextra-xxx"
 # cursor_auth_dir: ".cache/cursor"
 
 # Cursor 模型白名单(可选)。glob 或精确名;default 等价 auto;缺省/空 = 全量发布。
+# 条目可钉固定参数 "id:param=value,param=value"(须在 SDK 目录词表内),
+# 如 "auto-smart:optimize_for=intelligence";入站 thinking/effort 按词表
+# 自动映射为 modelParams(词表无 thinking/effort 参数则忽略)。
 # cursor_models:
 #   - "default"
 #   - "composer-*"
+#   - "auto-smart:optimize_for=intelligence"
 
 # Cursor sidecar 空闲回收秒数(可选,默认 1800)。
 # cursor_sidecar_idle_secs: 1800

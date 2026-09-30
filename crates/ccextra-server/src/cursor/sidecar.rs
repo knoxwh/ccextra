@@ -15,7 +15,7 @@ use tokio::process::{Child, Command};
 use tokio::sync::{Mutex, RwLock};
 use tokio::task::JoinHandle;
 
-use super::client::{CursorSidecarError, SidecarClient};
+use super::client::{CursorModelEntry, CursorSidecarError, SidecarClient};
 
 /// READY 握手超时
 const READY_TIMEOUT: Duration = Duration::from_secs(10);
@@ -173,7 +173,7 @@ impl CursorSidecar {
     pub async fn models(
         &self,
         api_key: &str,
-    ) -> std::result::Result<Vec<String>, CursorSidecarError> {
+    ) -> std::result::Result<Vec<CursorModelEntry>, CursorSidecarError> {
         match self.inner.client.read().await.as_ref() {
             Some(client) => client.models(api_key).await,
             None => Err(CursorSidecarError::NotReady),
@@ -275,6 +275,9 @@ impl CursorSidecar {
             .env("CCEXTRA_CURSOR_TOKEN", &token)
             .env("CCEXTRA_CURSOR_AUTH_DIR", &auth_dir)
             .env("CCEXTRA_CURSOR_PORT", config.port.to_string())
+            // Node fetch 默认忽略代理环境变量;开启后 SDK 出站走
+            // http_proxy/https_proxy(无代理环境变量时无副作用)
+            .env("NODE_USE_ENV_PROXY", "1")
             .stdout(std::process::Stdio::piped())
             .stderr(std::process::Stdio::piped())
             .kill_on_drop(true)
@@ -478,7 +481,9 @@ mod tests {
             .unwrap();
         assert_eq!(response.status(), StatusCode::OK);
         let models = sidecar.models("key").await.unwrap();
-        assert_eq!(models, vec!["auto".to_string()]);
+        assert_eq!(models.len(), 1);
+        assert_eq!(models[0].id, "auto");
+        assert!(models[0].parameters.is_empty());
     }
 
     #[tokio::test]

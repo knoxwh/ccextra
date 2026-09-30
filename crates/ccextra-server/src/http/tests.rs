@@ -2858,6 +2858,7 @@ models:
             max_agents: 16,
             workspace_dir: std::path::PathBuf::from("/tmp"),
         }),
+        vocab: tokio::sync::RwLock::new(std::collections::HashMap::new()),
     };
     *state.cursor.write().unwrap() = Some(Arc::new(runtime));
     state

@@ -148,7 +148,7 @@ curl -H "Authorization: Bearer $ANTHROPIC_AUTH_TOKEN" \
 - `prompt_cache_key` 只用于 OpenAI 路径，取 Claude Code 会话 ID，且不覆盖已有非空值。
 - `models_file` 指向 reasoning 级别表（默认配置文件旁 `models.json`，不入 git，可从 [models.json.example](models.json.example) 复制后按需修改），按上游模型 `id` 精确匹配，把入站 effort 钳到该模型支持的最近档；缺文件或未收录的模型不钳。条目可加 `force_effort`：凡钳制会介入的 effort 一律改写为该固定值（不钳制），`*claude*` 原生模型与显式关闭思考的请求不受影响。
 - `antigravity_models` 为模型白名单（顶层配置，glob 或精确名，如 `["claude-opus-5-5-*", "gpt-5.2"]`）；缺省或空列表发布全量目录。过滤在动态目录加载时按上游模型名匹配，过滤后为空时该凭证发布空模型列表。`/reload` 与 3 小时后台刷新均生效。
-- Cursor 字段：`cursor_auth_dir` 启用 SDK sidecar（凭证目录，默认配置文件旁 `.cache/cursor`）；`cursor_models` 白名单（glob 或精确名，`default` 等价 `auto`，缺省全量）；`cursor_sidecar_idle_secs`（默认 1800）与 `cursor_sidecar_max_agents`（默认 16）控制 sidecar 回收与并发；`cursor_workspace_dir` 为 SDK 工作目录（缺省进程 cwd，支持 `~` 与相对配置文件目录）。启用后自动合成 name `cursor` 的 `cursor_sdk` provider；与现有 provider 的模型 name/alias 冲突时跳过该模型并告警。刷新失败保留最近成功目录。Cursor 图片支持 PNG、JPEG、WebP、GIF base64；远程图片 URL 返回 400。
+- Cursor 字段：`cursor_auth_dir` 启用 SDK sidecar（凭证目录，默认配置文件旁 `.cache/cursor`）；`cursor_models` 白名单（glob 或精确名，`default` 等价 `auto`，缺省全量），条目可钉固定参数 `"id:param=value"`（如 `"auto-smart:optimize_for=intelligence"`，参数须在 SDK 目录词表内，`list_cursor_models.sh` 可查）；入站 `thinking`/effort 按词表自动映射为 `modelParams`——`thinking.type: enabled` 映射 `thinking=true`（词表含该参数时），effort 取 models.json 注册表优先、回落 body 解析，钳到词表最近档位（`none` 不钳升，词表无 effort 参数则忽略）；`cursor_sidecar_idle_secs`（默认 1800）与 `cursor_sidecar_max_agents`（默认 16）控制 sidecar 回收与并发；`cursor_workspace_dir` 为 SDK 工作目录（缺省进程 cwd，支持 `~` 与相对配置文件目录）。启用后自动合成 name `cursor` 的 `cursor_sdk` provider；与现有 provider 的模型 alias 冲突时跳过该模型并告警（name 可跨 provider 重复）。刷新失败保留最近成功目录。Cursor 图片支持 PNG、JPEG、WebP、GIF base64；远程图片 URL 返回 400。
 
 <details>
 <summary>进阶选项</summary>
@@ -217,6 +217,7 @@ Cursor 登录自行生成 PKCE 并轮询浏览器授权，不依赖 Cursor IDE �
 **Cursor sidecar 运维要点**：
 
 - sidecar 是 ccextra 子进程（Node，嵌入 `@cursor/sdk`），固定监听 `127.0.0.1:8223`，Bearer token 只经环境变量传递，不落盘。端口被占用时启动失败，不回退随机端口。
+- sidecar 出站流量遵循 `https_proxy`/`http_proxy`/`no_proxy` 环境变量（spawn 时注入 `NODE_USE_ENV_PROXY=1` 覆盖 fetch 与 https.Agent；SDK 的 http2 主流量由 `sidecar/cursor/proxy-tunnel.mjs` 以预建 CONNECT 隧道池接管，池空时该次直连并异步补池）。无代理环境变量时零副作用。区域受限模型（如 `muse-spark-1.3`）需全量代理出口才能使用。
 - 健康巡检每 5 秒；进程退出按 1/2/4…秒退避自动重启（封顶 60 秒）。服务收到 `SIGTERM`/`SIGINT`、`/reload` 禁用 Cursor 或修改 `auth_dir` 时，先关闭 sidecar 并释放 `8223`。
 - 会话状态写入 `cursor_auth_dir` 下的 `sessions.jsonl` 与 journal 文件，包含对话内容，属敏感数据，请勿提交或分享该目录。
 - 已知限制：sidecar 崩溃窗口内未确认的副作用（如工具调用）可能在冷续接后重复执行；续接以 journal 记录的已确认前缀为准，不跨过未确认边界。

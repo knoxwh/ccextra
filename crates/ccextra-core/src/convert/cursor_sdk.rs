@@ -11,6 +11,8 @@ use std::path::Path;
 use serde_json::{json, Map, Value};
 use thiserror::Error;
 
+use crate::thinking::{forced_effort, resolve_effort_from_body, ModelCapability};
+
 #[derive(Debug, Error)]
 pub enum CursorSdkConvertError {
     /// messages 缺失或不是非空数组
@@ -18,14 +20,24 @@ pub enum CursorSdkConvertError {
     InvalidMessages,
 }
 
+/// SDK 模型参数词表(目录刷新时从 sidecar /models 带回)
+#[derive(Debug, Clone, PartialEq, serde::Deserialize)]
+pub struct CursorParamVocab {
+    pub id: String,
+    pub values: Vec<String>,
+}
+
 /// 转换为 sidecar /run body
 ///
 /// 输入:归一化后的 anthropic body(含 system / messages / tools)
 /// 输出:sidecar /run 请求体(不含 apiKey)
+/// vocab/registry 为空时 modelParams 退化为白名单固定参数(兼容旧目录)
 pub fn convert_to_cursor_sdk(
     body: Value,
     upstream_model: &str,
     workspace_dir: &Path,
+    vocab: &[CursorParamVocab],
+    registry: &[ModelCapability],
 ) -> Result<Value, CursorSdkConvertError> {
     let mut body = body;
     // system 清洗:Cursor 非 Claude 上游,剥归属指纹/身份声明/触发块
@@ -49,15 +61,134 @@ pub fn convert_to_cursor_sdk(
         .cloned()
         .unwrap_or_default();
 
+    let (model_id, model_params) = resolve_model_params(upstream_model, &body, vocab, registry);
+
     Ok(json!({
-        "model": upstream_model,
-        // v1 固定空参数:入站无标准 modelParams 字段,不从 metadata 解析
-        "modelParams": [],
+        "model": model_id,
+        "modelParams": model_params,
         "systemPrompt": system_prompt,
         "workspaceDir": workspace_dir.to_string_lossy(),
         "messages": messages,
         "tools": tools,
     }))
+}
+
+/// 解析 upstream_model 并组装 modelParams
+///
+/// upstream_model 可携带白名单固定参数("base:param=value,..."),固定值优先;
+/// 入站 thinking.type=enabled 映射词表 thinking 参数;effort(force_effort
+/// 优先,回退入站)钳到词表最近档,映射到 effort/reasoning/reasoning_effort。
+/// 参数按 id 排序,保证会话哈希稳定。
+fn resolve_model_params(
+    upstream_model: &str,
+    body: &Value,
+    vocab: &[CursorParamVocab],
+    registry: &[ModelCapability],
+) -> (String, Vec<Value>) {
+    let (base, mut params) = split_pinned_params(upstream_model);
+
+    let thinking_enabled = body
+        .get("thinking")
+        .and_then(|t| t.get("type"))
+        .and_then(|v| v.as_str())
+        == Some("enabled");
+    if thinking_enabled
+        && vocab
+            .iter()
+            .any(|p| p.id == "thinking" && p.values.iter().any(|v| v == "true"))
+        && !params.iter().any(|(k, _)| k == "thinking")
+    {
+        params.push(("thinking".to_string(), "true".to_string()));
+    }
+
+    let effort = forced_effort(&base, registry)
+        .map(str::to_string)
+        .or_else(|| resolve_effort_from_body(body).map(str::to_string));
+    if let Some(effort) = effort {
+        if let Some(param) = vocab
+            .iter()
+            .find(|p| matches!(p.id.as_str(), "effort" | "reasoning" | "reasoning_effort"))
+        {
+            if !params.iter().any(|(k, _)| k == &param.id) {
+                if let Some(value) = clamp_to_vocab_values(&effort, &param.values) {
+                    params.push((param.id.clone(), value));
+                }
+            }
+        }
+    }
+
+    params.sort_by(|a, b| a.0.cmp(&b.0));
+    let values = params
+        .into_iter()
+        .map(|(id, value)| json!({ "id": id, "value": value }))
+        .collect();
+    (base, values)
+}
+
+/// 拆 "base:param=value,param=value" → (base, 固定参数对)
+///
+/// 无 ":" 时整串即 base;参数段格式非法时整串退回 base,不把垃圾发给 SDK
+fn split_pinned_params(upstream_model: &str) -> (String, Vec<(String, String)>) {
+    let Some((base, tail)) = upstream_model.split_once(':') else {
+        return (upstream_model.to_string(), Vec::new());
+    };
+    let mut pinned = Vec::new();
+    for pair in tail.split(',') {
+        match pair.split_once('=') {
+            Some((k, v)) if !k.is_empty() && !v.is_empty() => {
+                pinned.push((k.to_string(), v.to_string()));
+            }
+            // 非法参数段:整串退回 base
+            _ => return (upstream_model.to_string(), Vec::new()),
+        }
+    }
+    (base.to_string(), pinned)
+}
+
+/// effort 钳到词表最近值(tie 取低);词表无可排序值或 effort 非法 → None。
+/// effort 为 none 而词表不含 none 时不钳制(钳上去会强行开思考),返回 None。
+fn clamp_to_vocab_values(effort: &str, values: &[String]) -> Option<String> {
+    if values.iter().any(|v| v == effort) {
+        return Some(effort.to_string());
+    }
+    if effort == "none" {
+        return None;
+    }
+    let target = param_value_rank(effort)?;
+    let mut best: Option<(usize, u8)> = None;
+    for (index, value) in values.iter().enumerate() {
+        let Some(rank) = param_value_rank(value) else {
+            continue;
+        };
+        let dist = target.abs_diff(rank);
+        let take = match best {
+            None => true,
+            Some((_, best_rank)) => {
+                let best_dist = target.abs_diff(best_rank);
+                dist < best_dist || (dist == best_dist && rank < best_rank)
+            }
+        };
+        if take {
+            best = Some((index, rank));
+        }
+    }
+    best.map(|(index, _)| values[index].clone())
+}
+
+/// 思考档排序(none 最低,max 最高;extra-high 介于 high 与 xhigh)
+/// effort 档位序(钳位距离用);`auto` 不参与排序,仅经精确匹配透传
+fn param_value_rank(value: &str) -> Option<u8> {
+    Some(match value {
+        "none" => 0,
+        "minimal" => 1,
+        "low" => 2,
+        "medium" => 3,
+        "high" => 4,
+        "extra-high" => 5,
+        "xhigh" => 6,
+        "max" => 7,
+        _ => return None,
+    })
 }
 
 /// 顶层 system(字符串或 text 块数组)压平为单个字符串
@@ -130,7 +261,7 @@ mod tests {
                 { "name": "Bash", "description": "run shell", "input_schema": { "type": "object" } }
             ]
         });
-        let out = convert_to_cursor_sdk(body, "composer-2.5", &workspace()).unwrap();
+        let out = convert_to_cursor_sdk(body, "composer-2.5", &workspace(), &[], &[]).unwrap();
         assert_eq!(out["model"], "composer-2.5");
         assert_eq!(out["systemPrompt"], "You are helpful.");
         assert_eq!(out["workspaceDir"], "/tmp/workspace");
@@ -157,7 +288,7 @@ mod tests {
                 ] }
             ]
         });
-        let out = convert_to_cursor_sdk(body, "auto", &workspace()).unwrap();
+        let out = convert_to_cursor_sdk(body, "auto", &workspace(), &[], &[]).unwrap();
         let messages = out["messages"].as_array().unwrap();
         assert_eq!(messages[0]["content"][0].get("cache_control"), None);
         assert_eq!(messages[0]["content"][0]["text"], "hi");
@@ -183,7 +314,7 @@ mod tests {
                 ] }
             ]
         });
-        let out = convert_to_cursor_sdk(body, "auto", &workspace()).unwrap();
+        let out = convert_to_cursor_sdk(body, "auto", &workspace(), &[], &[]).unwrap();
         let messages = out["messages"].as_array().unwrap();
         let assistant = messages[1]["content"].as_array().unwrap();
         assert_eq!(assistant.len(), 1);
@@ -207,7 +338,7 @@ mod tests {
                 { "role": "user", "content": "hi" }
             ]
         });
-        let out = convert_to_cursor_sdk(body, "auto", &workspace()).unwrap();
+        let out = convert_to_cursor_sdk(body, "auto", &workspace(), &[], &[]).unwrap();
         // 归属指纹与身份声明块被剥,只留真实指令
         assert_eq!(out["systemPrompt"], "Real instructions.");
         let messages = out["messages"].as_array().unwrap();
@@ -228,7 +359,7 @@ mod tests {
                 ] }
             ]
         });
-        let out = convert_to_cursor_sdk(body, "auto", &workspace()).unwrap();
+        let out = convert_to_cursor_sdk(body, "auto", &workspace(), &[], &[]).unwrap();
         assert_eq!(out["messages"][0]["content"][0]["type"], "image");
         assert_eq!(out["messages"][0]["content"][0]["source"]["data"], "AQID");
     }
@@ -247,7 +378,7 @@ mod tests {
                 ] }
             ]
         });
-        let out = convert_to_cursor_sdk(body, "auto", &workspace()).unwrap();
+        let out = convert_to_cursor_sdk(body, "auto", &workspace(), &[], &[]).unwrap();
         assert_eq!(
             out["messages"][0]["content"][0]["content"][0]["source"]["media_type"],
             "image/jpeg"
@@ -257,11 +388,11 @@ mod tests {
     #[test]
     fn missing_or_empty_messages_is_invalid() {
         let body = json!({ "model": "auto", "messages": [] });
-        let err = convert_to_cursor_sdk(body, "auto", &workspace()).unwrap_err();
+        let err = convert_to_cursor_sdk(body, "auto", &workspace(), &[], &[]).unwrap_err();
         assert!(matches!(err, CursorSdkConvertError::InvalidMessages));
 
         let body = json!({ "model": "auto" });
-        let err = convert_to_cursor_sdk(body, "auto", &workspace()).unwrap_err();
+        let err = convert_to_cursor_sdk(body, "auto", &workspace(), &[], &[]).unwrap_err();
         assert!(matches!(err, CursorSdkConvertError::InvalidMessages));
     }
 
@@ -271,7 +402,7 @@ mod tests {
             "model": "auto",
             "messages": [{ "role": "user", "content": "hi" }]
         });
-        let out = convert_to_cursor_sdk(body, "auto", &workspace()).unwrap();
+        let out = convert_to_cursor_sdk(body, "auto", &workspace(), &[], &[]).unwrap();
         assert_eq!(out["modelParams"], json!([]));
         assert_eq!(out["tools"], json!([]));
         // temperature / top_p / stop_sequences / thinking 不进输出
@@ -294,8 +425,153 @@ mod tests {
             ],
             "tools": [{ "name": "Bash", "input_schema": { "type": "object" } }]
         });
-        let first = convert_to_cursor_sdk(body.clone(), "auto", &workspace()).unwrap();
-        let second = convert_to_cursor_sdk(body, "auto", &workspace()).unwrap();
+        let first = convert_to_cursor_sdk(body.clone(), "auto", &workspace(), &[], &[]).unwrap();
+        let second = convert_to_cursor_sdk(body, "auto", &workspace(), &[], &[]).unwrap();
         assert_eq!(first, second);
+    }
+
+    fn vocab(id: &str, values: &[&str]) -> CursorParamVocab {
+        CursorParamVocab {
+            id: id.to_string(),
+            values: values.iter().map(|v| v.to_string()).collect(),
+        }
+    }
+
+    #[test]
+    fn pinned_params_flow_and_model_strips_suffix() {
+        let body = json!({
+            "model": "auto-smart",
+            "messages": [{ "role": "user", "content": "hi" }]
+        });
+        let out = convert_to_cursor_sdk(
+            body,
+            "auto-smart:optimize_for=intelligence",
+            &workspace(),
+            &[],
+            &[],
+        )
+        .unwrap();
+        assert_eq!(out["model"], "auto-smart");
+        assert_eq!(
+            out["modelParams"],
+            json!([{ "id": "optimize_for", "value": "intelligence" }])
+        );
+    }
+
+    #[test]
+    fn invalid_pinned_tail_falls_back_to_whole_model() {
+        let body = json!({
+            "model": "auto",
+            "messages": [{ "role": "user", "content": "hi" }]
+        });
+        let out = convert_to_cursor_sdk(body, "auto:oops", &workspace(), &[], &[]).unwrap();
+        assert_eq!(out["model"], "auto:oops");
+        assert_eq!(out["modelParams"], json!([]));
+    }
+
+    #[test]
+    fn thinking_enabled_maps_to_true_and_effort_clamps() {
+        let body = json!({
+            "model": "grok-4.7",
+            "thinking": { "type": "enabled" },
+            "output_config": { "effort": "max" },
+            "messages": [{ "role": "user", "content": "hi" }]
+        });
+        let vocab = vec![
+            vocab("thinking", &["false", "true"]),
+            vocab("reasoning_effort", &["low", "medium", "high", "xhigh"]),
+        ];
+        let out = convert_to_cursor_sdk(body, "grok-4.7", &workspace(), &vocab, &[]).unwrap();
+        // max 不在词表,钳到最近档 xhigh;参数按 id 排序
+        assert_eq!(
+            out["modelParams"],
+            json!([
+                { "id": "reasoning_effort", "value": "xhigh" },
+                { "id": "thinking", "value": "true" }
+            ])
+        );
+    }
+
+    #[test]
+    fn thinking_disabled_omits_params() {
+        let body = json!({
+            "model": "grok-4.7",
+            "thinking": { "type": "disabled" },
+            "messages": [{ "role": "user", "content": "hi" }]
+        });
+        let vocab = vec![
+            vocab("thinking", &["false", "true"]),
+            vocab("reasoning_effort", &["low", "high"]),
+        ];
+        let out = convert_to_cursor_sdk(body, "grok-4.7", &workspace(), &vocab, &[]).unwrap();
+        assert_eq!(out["modelParams"], json!([]));
+    }
+
+    #[test]
+    fn force_effort_overrides_inbound_and_clamps() {
+        let body = json!({
+            "model": "muse-spark-1.3",
+            "thinking": { "type": "enabled", "output_config": { "effort": "low" } },
+            "messages": [{ "role": "user", "content": "hi" }]
+        });
+        let vocab = vec![vocab(
+            "effort",
+            &["minimal", "low", "medium", "high", "xhigh", "max"],
+        )];
+        let registry = vec![ModelCapability {
+            id: "muse-spark-1.3".to_string(),
+            reasoning_levels: vec!["low".to_string(), "max".to_string()],
+            force_effort: Some("max".to_string()),
+        }];
+        let out =
+            convert_to_cursor_sdk(body, "muse-spark-1.3", &workspace(), &vocab, &registry).unwrap();
+        assert_eq!(
+            out["modelParams"],
+            json!([{ "id": "effort", "value": "max" }])
+        );
+    }
+
+    #[test]
+    fn pinned_overrides_mapped_param() {
+        let body = json!({
+            "model": "grok-4.7",
+            "thinking": { "type": "enabled", "output_config": { "effort": "low" } },
+            "messages": [{ "role": "user", "content": "hi" }]
+        });
+        let vocab = vec![vocab("reasoning_effort", &["low", "high"])];
+        let out = convert_to_cursor_sdk(
+            body,
+            "grok-4.7:reasoning_effort=high",
+            &workspace(),
+            &vocab,
+            &[],
+        )
+        .unwrap();
+        assert_eq!(
+            out["modelParams"],
+            json!([{ "id": "reasoning_effort", "value": "high" }])
+        );
+    }
+
+    #[test]
+    fn effort_clamps_tie_takes_lower() {
+        // high 不在词表,low 与 xhigh 距离相等时取低
+        let values: Vec<String> = ["low", "xhigh"].iter().map(|v| v.to_string()).collect();
+        assert_eq!(
+            clamp_to_vocab_values("high", &values).as_deref(),
+            Some("low")
+        );
+        // extra-high 介于 high 与 xhigh:词表只有 high/xhigh 时 tie 取低 → high
+        let values: Vec<String> = ["high", "xhigh"].iter().map(|v| v.to_string()).collect();
+        assert_eq!(
+            clamp_to_vocab_values("extra-high", &values).as_deref(),
+            Some("high")
+        );
+        // effort none 而词表不含 none:不钳上去,跳过参数
+        let values: Vec<String> = ["low", "high"].iter().map(|v| v.to_string()).collect();
+        assert_eq!(clamp_to_vocab_values("none", &values), None);
+        // 词表无可排序值 → None
+        let values: Vec<String> = ["false", "true"].iter().map(|v| v.to_string()).collect();
+        assert_eq!(clamp_to_vocab_values("high", &values), None);
     }
 }

@@ -21,6 +21,19 @@ pub enum CursorSidecarError {
     InvalidModels(String),
 }
 
+/// /models 目录条目:id + 参数词表(旧缓存无 parameters 字段 → 空)
+#[derive(Debug, Clone, PartialEq, serde::Deserialize)]
+pub struct CursorModelEntry {
+    pub id: String,
+    #[serde(default)]
+    pub parameters: Vec<ccextra_core::convert::CursorParamVocab>,
+}
+
+#[derive(serde::Deserialize)]
+struct ModelsPayload {
+    models: Vec<CursorModelEntry>,
+}
+
 /// sidecar HTTP 客户端:每次请求附加 Bearer token
 #[derive(Clone)]
 pub struct SidecarClient {
@@ -50,8 +63,8 @@ impl SidecarClient {
         Ok(response)
     }
 
-    /// POST /models:apiKey 发现模型目录,解析为 ID 列表
-    pub async fn models(&self, api_key: &str) -> Result<Vec<String>, CursorSidecarError> {
+    /// POST /models:apiKey 发现模型目录,解析为 id + 参数词表
+    pub async fn models(&self, api_key: &str) -> Result<Vec<CursorModelEntry>, CursorSidecarError> {
         let response = self
             .http
             .post(format!("{}/models", self.base_url))
@@ -66,18 +79,9 @@ impl SidecarClient {
                 "status {status}: {text}"
             )));
         }
-        let payload: Value = serde_json::from_str(&text)
+        let payload: ModelsPayload = serde_json::from_str(&text)
             .map_err(|e| CursorSidecarError::InvalidModels(e.to_string()))?;
-        let Some(models) = payload.get("models").and_then(|m| m.as_array()) else {
-            return Err(CursorSidecarError::InvalidModels(
-                "missing models array".into(),
-            ));
-        };
-        Ok(models
-            .iter()
-            .filter_map(|m| m.get("id").and_then(|id| id.as_str()))
-            .map(str::to_string)
-            .collect())
+        Ok(payload.models)
     }
 
     /// GET /health:200 视为健康,其余(含网络失败)视为不健康
@@ -156,12 +160,21 @@ mod tests {
     async fn models_parses_id_list() {
         let server = TestServer::reply(
             StatusCode::OK,
-            Bytes::from(r#"{"models":[{"id":"auto"},{"id":"composer-2.5"}]}"#),
+            Bytes::from(
+                r#"{"models":[{"id":"auto"},{"id":"grok-4.7","parameters":[{"id":"reasoning_effort","values":["low","xhigh"]}]},{"id":"composer-2.5"}]}"#,
+            ),
         )
         .await;
         let client = client_for(&server.url);
         let models = client.models("key").await.unwrap();
-        assert_eq!(models, vec!["auto".to_string(), "composer-2.5".to_string()]);
+        assert_eq!(models.len(), 3);
+        assert_eq!(models[0].id, "auto");
+        assert!(models[0].parameters.is_empty());
+        assert_eq!(models[1].id, "grok-4.7");
+        assert_eq!(models[1].parameters.len(), 1);
+        assert_eq!(models[1].parameters[0].id, "reasoning_effort");
+        assert_eq!(models[1].parameters[0].values, vec!["low", "xhigh"]);
+        assert_eq!(models[2].id, "composer-2.5");
     }
 
     #[tokio::test]

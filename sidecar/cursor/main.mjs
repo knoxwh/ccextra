@@ -1,5 +1,6 @@
 // main.mjs:sidecar 入口。HTTP server + Bearer 鉴权 + 请求分派。
 // stdout 只允许一行 READY 帧;日志全部 stderr。
+import "./proxy-tunnel.mjs";
 import http from "node:http";
 import { join } from "node:path";
 import { isAbsolute } from "node:path";

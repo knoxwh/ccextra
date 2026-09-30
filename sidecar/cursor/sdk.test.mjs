@@ -181,3 +181,30 @@ test("sharedOptions never passes systemPrompt (account-gated option)", async () 
   });
   assert.equal("systemPrompt" in created[0], false);
 });
+
+test("listModels normalizes parameters to flat value strings", async () => {
+  const { createSdkAdapter } = await import("./sdk.mjs");
+  const adapter = createSdkAdapter({
+    Agent: { create: async () => ({}), resume: async () => {} },
+    Cursor: {
+      models: {
+        list: async () => [
+          {
+            id: "grok-4.7",
+            parameters: [
+              { id: "reasoning_effort", values: [{ value: "low" }, { value: "xhigh" }] },
+            ],
+          },
+          { id: "auto" },
+        ],
+      },
+    },
+  });
+  assert.deepEqual(await adapter.listModels("k"), [
+    {
+      id: "grok-4.7",
+      parameters: [{ id: "reasoning_effort", values: ["low", "xhigh"] }],
+    },
+    { id: "auto", parameters: [] },
+  ]);
+});

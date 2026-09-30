@@ -283,8 +283,9 @@ async fn main() -> Result<()> {
         )
         .await
         {
-            Some(provider) => {
+            Some((provider, vocab)) => {
                 let count = provider.models.len();
+                *runtime.vocab.write().await = vocab;
                 all_providers = merge_providers(all_providers, vec![provider]);
                 tracing::info!("Cursor 目录合成 {} 个模型", count);
             }
@@ -509,6 +510,7 @@ async fn start_cursor_runtime(
     Ok(Some(Arc::new(CursorRuntime {
         sidecar,
         config: RwLock::new(cursor_cfg),
+        vocab: RwLock::new(std::collections::HashMap::new()),
     })))
 }
 
@@ -639,7 +641,10 @@ async fn load_refreshed_providers(
                     )
                     .await
                     {
-                        Some(provider) => vec![provider],
+                        Some((provider, vocab)) => {
+                            *runtime.vocab.write().await = vocab;
+                            vec![provider]
+                        }
                         None => current_providers
                             .into_iter()
                             .filter(|p| p.name == "cursor")

@@ -116,6 +116,7 @@ async fn spawn_cursor_runtime(
     Ok(std::sync::Arc::new(crate::cursor::CursorRuntime {
         sidecar,
         config: tokio::sync::RwLock::new(config.clone()),
+        vocab: tokio::sync::RwLock::new(std::collections::HashMap::new()),
     }))
 }
 
@@ -142,11 +143,13 @@ async fn refresh_cursor_provider(state: &AppState, config: &crate::cursor::Curso
         .filter(|p| p.name != "cursor")
         .cloned()
         .collect();
-    let Some(provider) =
+    let Some((provider, vocab)) =
         crate::cursor::load_cursor_provider(&runtime.sidecar, config, &existing).await
     else {
         return;
     };
+    // 词表与 provider 同源同刷:目录成功即整体替换
+    *runtime.vocab.write().await = vocab;
     let mut providers = snapshot
         .providers
         .iter()

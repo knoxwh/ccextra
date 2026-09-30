@@ -14,12 +14,24 @@ async function withDir(run) {
   }
 }
 
-test("discoverModels maps adapter catalog to flat ids", async () => {
+test("discoverModels maps adapter catalog to ids with parameters", async () => {
   const adapter = { listModels: async (apiKey) => {
     assert.equal(apiKey, "key");
-    return [{ id: "auto" }, { id: "composer-2.5" }];
+    return [
+      { id: "auto" },
+      {
+        id: "grok-4.7",
+        parameters: [{ id: "reasoning_effort", values: ["low", "xhigh"] }],
+      },
+    ];
   } };
-  assert.deepEqual(await discoverModels(adapter, "key"), [{ id: "auto" }, { id: "composer-2.5" }]);
+  assert.deepEqual(await discoverModels(adapter, "key"), [
+    { id: "auto", parameters: [] },
+    {
+      id: "grok-4.7",
+      parameters: [{ id: "reasoning_effort", values: ["low", "xhigh"] }],
+    },
+  ]);
 });
 
 test("model cache round-trips with 0600 permissions", async () => {

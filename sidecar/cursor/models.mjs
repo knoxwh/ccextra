@@ -32,7 +32,7 @@ export async function saveModelCache(authDir, models) {
 }
 
 /**
- * 发现模型目录:adapter.listModels(apiKey) → 扁平 ID 列表并写缓存。
+ * 发现模型目录:adapter.listModels(apiKey) → {id, parameters} 列表并写缓存。
  * 失败抛出原始错误(调用方决定保留旧目录)。
  */
 export async function discoverModels(adapter, apiKey) {
@@ -40,8 +40,17 @@ export async function discoverModels(adapter, apiKey) {
     throw new Error("apiKey is required for model discovery");
   }
   const models = await adapter.listModels(apiKey);
-  const ids = models
-    .map((model) => (typeof model?.id === "string" ? { id: model.id } : null))
+  const entries = models
+    .map((model) => {
+      if (typeof model?.id !== "string") {
+        return null;
+      }
+      // parameters 透传(adapter 已归一为 {id, values: [string]})
+      const parameters = Array.isArray(model.parameters)
+        ? model.parameters
+        : [];
+      return { id: model.id, parameters };
+    })
     .filter(Boolean);
-  return ids;
+  return entries;
 }

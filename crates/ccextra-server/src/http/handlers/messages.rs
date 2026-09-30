@@ -472,14 +472,39 @@ pub(crate) async fn prepare_message_request(
         }
         // Cursor SDK:纯转换组装 /run body;apiKey 由 dispatch 注入
         Protocol::CursorSdk => {
-            // workspace_dir 来自 CursorConfig(缺省已在配置侧解析为进程 cwd)
-            let workspace_dir = match state.cursor.read().ok().and_then(|guard| guard.clone()) {
-                Some(runtime) => runtime.config.read().await.workspace_dir.clone(),
-                None => std::env::current_dir()
-                    .map_err(|e| AppError::new(anyhow::anyhow!("无法解析进程 cwd: {e}")))?,
-            };
-            body_json = convert_to_cursor_sdk(body_json, &route.upstream_model, &workspace_dir)
-                .map_err(|e| AppError::bad_request(cursor_convert_error_message(&e)))?;
+            // workspace_dir 来自 CursorConfig(缺省已在配置侧解析为进程 cwd);
+            // vocab 取目录参数词表(词表键为归一 id,与 name 的 base 段对齐)
+            let (workspace_dir, vocab) =
+                match state.cursor.read().ok().and_then(|guard| guard.clone()) {
+                    Some(runtime) => {
+                        let workspace_dir = runtime.config.read().await.workspace_dir.clone();
+                        // 词表键为归一 id(default 归一为 auto);手动 provider 配置
+                        // 可能仍写 default,此处对齐避免词表落空
+                        let base = route.upstream_model.split(':').next().unwrap_or("");
+                        let base = if base == "default" { "auto" } else { base };
+                        let vocab = runtime
+                            .vocab
+                            .read()
+                            .await
+                            .get(base)
+                            .cloned()
+                            .unwrap_or_default();
+                        (workspace_dir, vocab)
+                    }
+                    None => (
+                        std::env::current_dir()
+                            .map_err(|e| AppError::new(anyhow::anyhow!("无法解析进程 cwd: {e}")))?,
+                        Vec::new(),
+                    ),
+                };
+            body_json = convert_to_cursor_sdk(
+                body_json,
+                &route.upstream_model,
+                &workspace_dir,
+                &vocab,
+                thinking_registry,
+            )
+            .map_err(|e| AppError::bad_request(cursor_convert_error_message(&e)))?;
         }
     }
 
