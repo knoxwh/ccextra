@@ -87,6 +87,8 @@ pub struct ProviderRefreshConfig {
     pub codex_auth_dir: Option<std::path::PathBuf>,
     /// Antigravity 模型白名单;空 = 全量
     pub antigravity_models: Option<Vec<String>>,
+    /// Cursor 运行时配置;None = 未启用
+    pub cursor: Option<crate::cursor::CursorConfig>,
     pub proxy_url: Option<String>,
     pub static_providers: Vec<ProviderConfig>,
 }
@@ -115,6 +117,9 @@ pub struct AppState {
     pub replay_cache: crate::sse::replay_cache::ReplayCache,
     /// session_id → 最新 input_tokens(避免非 Claude 上游 count_tokens 估算不准导致 context 跳动)
     pub last_input_tokens: Arc<std::sync::Mutex<session_tokens::SessionTokenCache>>,
+    /// Cursor SDK sidecar 运行时;None = 未启用(cursor_auth_dir 未配置)。
+    /// reload 可启停,故用共享读写锁持有,不进 ConfigSnapshot
+    pub cursor: Arc<std::sync::RwLock<Option<Arc<crate::cursor::CursorRuntime>>>>,
 }
 
 #[derive(Clone, Debug, serde::Deserialize)]
@@ -174,11 +179,46 @@ pub fn app(state: AppState) -> Router {
 }
 
 pub async fn serve(addr: &str, state: AppState) -> anyhow::Result<()> {
+    serve_with_shutdown(addr, state, shutdown_signal()).await
+}
+
+pub(crate) async fn serve_with_shutdown<F>(
+    addr: &str,
+    state: AppState,
+    shutdown: F,
+) -> anyhow::Result<()>
+where
+    F: Future<Output = ()> + Send + 'static,
+{
     let listener = tokio::net::TcpListener::bind(addr).await?;
     tracing::info!("ccextra listening on {}", addr);
 
-    axum::serve(listener, app(state)).await?;
+    let cursor = state.cursor.clone();
+    let result = axum::serve(listener, app(state))
+        .with_graceful_shutdown(shutdown)
+        .await;
+    if let Some(runtime) = cursor.read().ok().and_then(|guard| guard.clone()) {
+        runtime.sidecar.shutdown().await;
+    }
+    result?;
     Ok(())
+}
+
+async fn shutdown_signal() {
+    #[cfg(unix)]
+    {
+        let mut terminate =
+            tokio::signal::unix::signal(tokio::signal::unix::SignalKind::terminate())
+                .expect("install SIGTERM handler");
+        tokio::select! {
+            _ = tokio::signal::ctrl_c() => {}
+            _ = terminate.recv() => {}
+        }
+    }
+    #[cfg(not(unix))]
+    {
+        let _ = tokio::signal::ctrl_c().await;
+    }
 }
 
 #[cfg(test)]

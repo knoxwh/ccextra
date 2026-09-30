@@ -101,6 +101,10 @@ fn endpoint_path(protocol: Protocol, is_stream: bool) -> String {
                 "/v1internal:generateContent".to_string()
             }
         }
+        // Cursor SDK 走 sidecar 专用通道,不经通用 upstream
+        Protocol::CursorSdk => {
+            unreachable!("CursorSdk must bypass generic upstream")
+        }
     }
 }
 
@@ -448,6 +452,10 @@ impl UpstreamClient {
         user_agents: &crate::http::UserAgentSet,
         inbound_user_agent: Option<&str>,
     ) -> anyhow::Result<UpstreamResponse> {
+        // Cursor SDK 走 sidecar 专用通道,禁止进入通用 upstream
+        if matches!(protocol, Protocol::CursorSdk) {
+            anyhow::bail!("cursor_sdk must bypass generic upstream");
+        }
         // 对齐 codex EncodedJsonBody:一次序列化,Bytes 共享分配;
         // stale-connection 重试复用同一份字节,不重复序列化
         let body_bytes = bytes::Bytes::from(

@@ -306,6 +306,7 @@ fn mock_state() -> AppState {
         last_input_tokens: Arc::new(std::sync::Mutex::new(
             crate::http::session_tokens::SessionTokenCache::new(),
         )),
+        cursor: Arc::new(std::sync::RwLock::new(None)),
     }
 }
 
@@ -2823,4 +2824,757 @@ models:
         captured.header("authorization").as_deref(),
         Some("Bearer sk-static")
     );
+}
+
+// ===== Cursor SDK sidecar 集成 =====
+
+/// 构造 Cursor 测试状态:cursor provider + for_test sidecar + 临时凭证目录
+async fn cursor_test_state(sidecar_url: String, auth_dir: &std::path::Path) -> AppState {
+    let state = mock_state();
+    let provider_yaml = r#"
+name: cursor
+protocol: cursor_sdk
+base_url: ""
+key: managed
+models:
+  - name: auto
+    alias: cursor-auto
+"#;
+    let provider: ProviderConfig = serde_yaml::from_str(provider_yaml).unwrap();
+    Arc::make_mut(&mut *state.config.write().await)
+        .providers
+        .push(provider);
+    let sidecar = crate::cursor::CursorSidecar::for_test(
+        sidecar_url,
+        "test-token".into(),
+        auth_dir.to_path_buf(),
+    );
+    let runtime = crate::cursor::CursorRuntime {
+        sidecar,
+        config: tokio::sync::RwLock::new(crate::cursor::CursorConfig {
+            auth_dir: auth_dir.to_path_buf(),
+            models: vec![],
+            idle_secs: 1800,
+            max_agents: 16,
+            workspace_dir: std::path::PathBuf::from("/tmp"),
+        }),
+    };
+    *state.cursor.write().unwrap() = Some(Arc::new(runtime));
+    state
+}
+
+/// 写入新鲜测试凭证(expires_at = now + 1h)
+fn write_cursor_credential(auth_dir: &std::path::Path) {
+    std::fs::create_dir_all(auth_dir).unwrap();
+    let expires_at = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .unwrap()
+        .as_secs() as i64
+        + 3600;
+    let credential = json!({
+        "accessToken": "test-access-token",
+        "refreshToken": "test-refresh-token",
+        "sub": "test-sub",
+        "expires_at": expires_at,
+    });
+    std::fs::write(
+        auth_dir.join("cursor.json"),
+        serde_json::to_vec(&credential).unwrap(),
+    )
+    .unwrap();
+}
+
+/// sidecar mock /run:校验 Bearer token 与 apiKey,回固定 SSE 帧
+fn cursor_sidecar_router(frames: &'static str) -> Router {
+    Router::new().route(
+        "/run",
+        post(move |headers: HeaderMap, body: bytes::Bytes| {
+            let frames = frames;
+            async move {
+                assert_eq!(
+                    headers.get("authorization").and_then(|v| v.to_str().ok()),
+                    Some("Bearer test-token")
+                );
+                let payload: Value = serde_json::from_slice(&body).unwrap();
+                assert_eq!(payload["apiKey"], "test-access-token");
+                assert_eq!(payload["model"], "auto");
+                (
+                    StatusCode::OK,
+                    [(header::CONTENT_TYPE, "text/event-stream")],
+                    frames,
+                )
+            }
+        }),
+    )
+}
+
+#[tokio::test]
+async fn test_cursor_sdk_stream_relay_end_to_end() {
+    let frames = concat!(
+        "data: {\"type\":\"text_delta\",\"text\":\"hello\"}\n\n",
+        "data: {\"type\":\"usage\",\"input_tokens\":42,\"output_tokens\":7}\n\n",
+        "data: {\"type\":\"turn_end\",\"stop_reason\":\"end_turn\"}\n\n",
+    );
+    let sidecar = crate::test_support::TestServer::spawn(cursor_sidecar_router(frames)).await;
+    let auth_dir = tempfile::tempdir().unwrap();
+    write_cursor_credential(auth_dir.path());
+    let state = cursor_test_state(sidecar.url.clone(), auth_dir.path()).await;
+    let app = app(state.clone());
+
+    let request = Request::builder()
+        .uri("/v1/messages")
+        .method("POST")
+        .header("content-type", "application/json")
+        .header("x-claude-code-session-id", "cursor-sess-1")
+        .body(Body::from(
+            serde_json::to_vec(&json!({
+                "model": "cursor-auto",
+                "max_tokens": 64,
+                "stream": true,
+                "messages": [{"role": "user", "content": "hi"}]
+            }))
+            .unwrap(),
+        ))
+        .unwrap();
+    let response = app.oneshot(request).await.unwrap();
+    assert_eq!(response.status(), StatusCode::OK);
+    let body = to_bytes(response.into_body(), 1024 * 1024).await.unwrap();
+    let text = String::from_utf8_lossy(&body);
+    assert!(text.contains("event: message_start"));
+    assert!(text.contains("hello"));
+    assert!(text.contains("\"input_tokens\":42"));
+    assert!(text.contains("event: message_stop"));
+    // usage 写入 session cache
+    assert_eq!(
+        state.last_input_tokens.lock().unwrap().get("cursor-sess-1"),
+        Some(42)
+    );
+}
+
+#[tokio::test]
+async fn test_cursor_sdk_non_stream_aggregates_anthropic_json() {
+    let frames = concat!(
+        "data: {\"type\":\"thinking_delta\",\"text\":\"ponder\"}\n\n",
+        "data: {\"type\":\"text_delta\",\"text\":\"hello\"}\n\n",
+        "data: {\"type\":\"usage\",\"input_tokens\":10,\"output_tokens\":5}\n\n",
+        "data: {\"type\":\"turn_end\",\"stop_reason\":\"end_turn\"}\n\n",
+    );
+    let sidecar = crate::test_support::TestServer::spawn(cursor_sidecar_router(frames)).await;
+    let auth_dir = tempfile::tempdir().unwrap();
+    write_cursor_credential(auth_dir.path());
+    let state = cursor_test_state(sidecar.url.clone(), auth_dir.path()).await;
+    let app = app(state.clone());
+
+    let request = Request::builder()
+        .uri("/v1/messages")
+        .method("POST")
+        .header("content-type", "application/json")
+        .header("x-claude-code-session-id", "cursor-sess-2")
+        .body(Body::from(
+            serde_json::to_vec(&json!({
+                "model": "cursor-auto",
+                "max_tokens": 64,
+                "messages": [{"role": "user", "content": "hi"}]
+            }))
+            .unwrap(),
+        ))
+        .unwrap();
+    let response = app.oneshot(request).await.unwrap();
+    assert_eq!(response.status(), StatusCode::OK);
+    let body = to_bytes(response.into_body(), 1024 * 1024).await.unwrap();
+    let message: Value = serde_json::from_slice(&body).unwrap();
+    assert_eq!(message["type"], "message");
+    assert_eq!(message["model"], "auto");
+    assert_eq!(message["stop_reason"], "end_turn");
+    let content = message["content"].as_array().unwrap();
+    assert_eq!(content[0]["type"], "text");
+    assert_eq!(content[0]["text"], "hello");
+    assert_eq!(content[1]["type"], "thinking");
+    assert_eq!(message["usage"]["input_tokens"], 10);
+    // 非流聚合也写 session cache
+    assert_eq!(
+        state.last_input_tokens.lock().unwrap().get("cursor-sess-2"),
+        Some(10)
+    );
+}
+
+#[tokio::test]
+async fn test_cursor_sdk_sidecar_503_maps_anthropic_error_with_retry_after() {
+    // sidecar 503 + Retry-After:不提交 200,Anthropic error 形状透传
+    let sidecar = Router::new().route(
+        "/run",
+        post(|| async {
+            (
+                StatusCode::SERVICE_UNAVAILABLE,
+                [(header::RETRY_AFTER, "7")],
+                "cursor sidecar busy",
+            )
+        }),
+    );
+    let server = crate::test_support::TestServer::spawn(sidecar).await;
+    let auth_dir = tempfile::tempdir().unwrap();
+    write_cursor_credential(auth_dir.path());
+    let state = cursor_test_state(server.url.clone(), auth_dir.path()).await;
+    let app = app(state);
+
+    let request = Request::builder()
+        .uri("/v1/messages")
+        .method("POST")
+        .header("content-type", "application/json")
+        .body(Body::from(
+            serde_json::to_vec(&json!({
+                "model": "cursor-auto",
+                "max_tokens": 64,
+                "stream": true,
+                "messages": [{"role": "user", "content": "hi"}]
+            }))
+            .unwrap(),
+        ))
+        .unwrap();
+    let response = app.oneshot(request).await.unwrap();
+    assert_eq!(response.status(), StatusCode::SERVICE_UNAVAILABLE);
+    assert_eq!(
+        response
+            .headers()
+            .get("retry-after")
+            .and_then(|v| v.to_str().ok()),
+        Some("7")
+    );
+    let body = to_bytes(response.into_body(), 1024 * 1024).await.unwrap();
+    let error: Value = serde_json::from_slice(&body).unwrap();
+    assert_eq!(error["type"], "error");
+    assert!(error["error"]["message"].as_str().unwrap().contains("busy"));
+}
+
+#[tokio::test]
+async fn test_cursor_sdk_first_frame_error_returns_502() {
+    // sidecar 200 但首业务帧是 error:不提交 200,返回 502
+    let frames = "data: {\"type\":\"error\",\"code\":\"x\",\"message\":\"sidecar boom\"}\n\n";
+    let sidecar = crate::test_support::TestServer::spawn(cursor_sidecar_router(frames)).await;
+    let auth_dir = tempfile::tempdir().unwrap();
+    write_cursor_credential(auth_dir.path());
+    let state = cursor_test_state(sidecar.url.clone(), auth_dir.path()).await;
+    let app = app(state);
+
+    let request = Request::builder()
+        .uri("/v1/messages")
+        .method("POST")
+        .header("content-type", "application/json")
+        .body(Body::from(
+            serde_json::to_vec(&json!({
+                "model": "cursor-auto",
+                "max_tokens": 64,
+                "stream": true,
+                "messages": [{"role": "user", "content": "hi"}]
+            }))
+            .unwrap(),
+        ))
+        .unwrap();
+    let response = app.oneshot(request).await.unwrap();
+    assert_eq!(response.status(), StatusCode::BAD_GATEWAY);
+    let body = to_bytes(response.into_body(), 1024 * 1024).await.unwrap();
+    let error: Value = serde_json::from_slice(&body).unwrap();
+    assert!(error["error"]["message"]
+        .as_str()
+        .unwrap()
+        .contains("sidecar boom"));
+}
+
+#[tokio::test]
+async fn test_cursor_sdk_count_tokens_reuses_cache_and_defaults_zero() {
+    let frames = concat!(
+        "data: {\"type\":\"text_delta\",\"text\":\"hi\"}\n\n",
+        "data: {\"type\":\"usage\",\"input_tokens\":33,\"output_tokens\":1}\n\n",
+        "data: {\"type\":\"turn_end\",\"stop_reason\":\"end_turn\"}\n\n",
+    );
+    let sidecar = crate::test_support::TestServer::spawn(cursor_sidecar_router(frames)).await;
+    let auth_dir = tempfile::tempdir().unwrap();
+    write_cursor_credential(auth_dir.path());
+    let state = cursor_test_state(sidecar.url.clone(), auth_dir.path()).await;
+    let app = app(state.clone());
+
+    // 先跑一轮非流,写入 usage cache
+    let request = Request::builder()
+        .uri("/v1/messages")
+        .method("POST")
+        .header("content-type", "application/json")
+        .header("x-claude-code-session-id", "cursor-count")
+        .body(Body::from(
+            serde_json::to_vec(&json!({
+                "model": "cursor-auto",
+                "max_tokens": 64,
+                "messages": [{"role": "user", "content": "hi"}]
+            }))
+            .unwrap(),
+        ))
+        .unwrap();
+    let response = app.clone().oneshot(request).await.unwrap();
+    assert_eq!(response.status(), StatusCode::OK);
+
+    // count_tokens:同 session 命中 cache
+    let request = Request::builder()
+        .uri("/v1/messages/count_tokens")
+        .method("POST")
+        .header("content-type", "application/json")
+        .header("x-claude-code-session-id", "cursor-count")
+        .body(Body::from(
+            serde_json::to_vec(&json!({
+                "model": "cursor-auto",
+                "messages": [{"role": "user", "content": "hi"}]
+            }))
+            .unwrap(),
+        ))
+        .unwrap();
+    let response = app.clone().oneshot(request).await.unwrap();
+    assert_eq!(response.status(), StatusCode::OK);
+    let body = to_bytes(response.into_body(), 1024 * 1024).await.unwrap();
+    assert_eq!(body, bytes::Bytes::from_static(br#"{"input_tokens":33}"#));
+
+    // 未知 session:返回 0,不请求 sidecar
+    let request = Request::builder()
+        .uri("/v1/messages/count_tokens")
+        .method("POST")
+        .header("content-type", "application/json")
+        .header("x-claude-code-session-id", "cursor-unknown")
+        .body(Body::from(
+            serde_json::to_vec(&json!({
+                "model": "cursor-auto",
+                "messages": [{"role": "user", "content": "hi"}]
+            }))
+            .unwrap(),
+        ))
+        .unwrap();
+    let response = app.oneshot(request).await.unwrap();
+    assert_eq!(response.status(), StatusCode::OK);
+    let body = to_bytes(response.into_body(), 1024 * 1024).await.unwrap();
+    assert_eq!(body, bytes::Bytes::from_static(br#"{"input_tokens":0}"#));
+}
+
+/// Cursor 请求不得触碰 generic upstream:同 snapshot 内并存 openai_chat
+/// provider 时,cursor 路由命中 sidecar,generic upstream 调用次数为 0
+#[tokio::test]
+async fn test_cursor_sdk_never_calls_generic_upstream() {
+    use std::sync::atomic::{AtomicUsize, Ordering};
+    let counter = std::sync::Arc::new(AtomicUsize::new(0));
+    let captured = counter.clone();
+    let generic = Router::new().route(
+        "/v1/chat/completions",
+        post(move |_body: bytes::Bytes| {
+            let captured = captured.clone();
+            async move {
+                captured.fetch_add(1, Ordering::SeqCst);
+                (
+                    StatusCode::OK,
+                    bytes::Bytes::from_static(br#"{"choices":[{"message":{"content":"x"}}]}"#),
+                )
+            }
+        }),
+    );
+    let generic_server = crate::test_support::TestServer::spawn(generic).await;
+
+    let frames = concat!(
+        "data: {\"type\":\"text_delta\",\"text\":\"hello\"}\n\n",
+        "data: {\"type\":\"turn_end\",\"stop_reason\":\"end_turn\"}\n\n",
+    );
+    let sidecar = crate::test_support::TestServer::spawn(cursor_sidecar_router(frames)).await;
+    let auth_dir = tempfile::tempdir().unwrap();
+    write_cursor_credential(auth_dir.path());
+    let state = cursor_test_state(sidecar.url.clone(), auth_dir.path()).await;
+    let generic_provider: ProviderConfig = serde_yaml::from_str(&format!(
+        r#"
+name: generic
+protocol: openai_chat
+base_url: {}
+key: sk-test
+models:
+  - name: gpt-test
+    alias: generic-gpt
+"#,
+        generic_server.url
+    ))
+    .unwrap();
+    Arc::make_mut(&mut *state.config.write().await)
+        .providers
+        .push(generic_provider);
+    let app = app(state);
+
+    let request = Request::builder()
+        .uri("/v1/messages")
+        .method("POST")
+        .header("content-type", "application/json")
+        .body(Body::from(
+            serde_json::to_vec(&json!({
+                "model": "cursor-auto",
+                "max_tokens": 64,
+                "stream": true,
+                "messages": [{"role": "user", "content": "hi"}]
+            }))
+            .unwrap(),
+        ))
+        .unwrap();
+    let response = app.oneshot(request).await.unwrap();
+    assert_eq!(response.status(), StatusCode::OK);
+    assert_eq!(counter.load(Ordering::SeqCst), 0);
+}
+
+/// sidecar 429:Anthropic error 形状 + Retry-After 透传
+#[tokio::test]
+async fn test_cursor_sdk_sidecar_429_maps_anthropic_error_with_retry_after() {
+    let sidecar = Router::new().route(
+        "/run",
+        post(|| async {
+            (
+                StatusCode::TOO_MANY_REQUESTS,
+                [(header::RETRY_AFTER, "9")],
+                "rate limited",
+            )
+        }),
+    );
+    let server = crate::test_support::TestServer::spawn(sidecar).await;
+    let auth_dir = tempfile::tempdir().unwrap();
+    write_cursor_credential(auth_dir.path());
+    let state = cursor_test_state(server.url.clone(), auth_dir.path()).await;
+    let app = app(state);
+
+    let request = Request::builder()
+        .uri("/v1/messages")
+        .method("POST")
+        .header("content-type", "application/json")
+        .body(Body::from(
+            serde_json::to_vec(&json!({
+                "model": "cursor-auto",
+                "max_tokens": 64,
+                "stream": true,
+                "messages": [{"role": "user", "content": "hi"}]
+            }))
+            .unwrap(),
+        ))
+        .unwrap();
+    let response = app.oneshot(request).await.unwrap();
+    assert_eq!(response.status(), StatusCode::TOO_MANY_REQUESTS);
+    assert_eq!(
+        response
+            .headers()
+            .get("retry-after")
+            .and_then(|v| v.to_str().ok()),
+        Some("9")
+    );
+    let body = to_bytes(response.into_body(), 1024 * 1024).await.unwrap();
+    let error: Value = serde_json::from_slice(&body).unwrap();
+    assert_eq!(error["type"], "error");
+}
+
+/// 图片输入:Cursor SDK v1 不支持,返回 Anthropic 400
+#[tokio::test]
+async fn test_cursor_sdk_image_input_returns_400() {
+    let frames = "data: {\"type\":\"turn_end\",\"stop_reason\":\"end_turn\"}\n\n";
+    let sidecar = crate::test_support::TestServer::spawn(cursor_sidecar_router(frames)).await;
+    let auth_dir = tempfile::tempdir().unwrap();
+    write_cursor_credential(auth_dir.path());
+    let state = cursor_test_state(sidecar.url.clone(), auth_dir.path()).await;
+    let app = app(state);
+
+    let request = Request::builder()
+        .uri("/v1/messages")
+        .method("POST")
+        .header("content-type", "application/json")
+        .body(Body::from(
+            serde_json::to_vec(&json!({
+                "model": "cursor-auto",
+                "max_tokens": 64,
+                "messages": [{
+                    "role": "user",
+                    "content": [
+                        {"type": "image", "source": {
+                            "type": "base64",
+                            "media_type": "image/png",
+                            "data": "aGk="
+                        }}
+                    ]
+                }]
+            }))
+            .unwrap(),
+        ))
+        .unwrap();
+    let response = app.oneshot(request).await.unwrap();
+    assert_eq!(response.status(), StatusCode::BAD_REQUEST);
+    let body = to_bytes(response.into_body(), 1024 * 1024).await.unwrap();
+    let error: Value = serde_json::from_slice(&body).unwrap();
+    assert_eq!(error["type"], "error");
+    assert!(error["error"]["message"]
+        .as_str()
+        .unwrap()
+        .contains("image"));
+}
+
+/// 首帧 error:不本地重试(D11 退避交客户端),/run 恰好 1 次,返回 502
+#[tokio::test]
+async fn test_cursor_sdk_first_frame_error_fails_fast_without_retry() {
+    use std::sync::atomic::{AtomicUsize, Ordering};
+    let counter = std::sync::Arc::new(AtomicUsize::new(0));
+    let captured = counter.clone();
+    let router = Router::new().route(
+        "/run",
+        post(move |_headers: HeaderMap, _body: bytes::Bytes| {
+            let captured = captured.clone();
+            async move {
+                captured.fetch_add(1, Ordering::SeqCst);
+                (
+                    StatusCode::OK,
+                    [(header::CONTENT_TYPE, "text/event-stream")],
+                    "data: {\"type\":\"error\",\"code\":\"x\",\"message\":\"boom\"}\n\n",
+                )
+            }
+        }),
+    );
+    let sidecar = crate::test_support::TestServer::spawn(router).await;
+    let auth_dir = tempfile::tempdir().unwrap();
+    write_cursor_credential(auth_dir.path());
+    let state = cursor_test_state(sidecar.url.clone(), auth_dir.path()).await;
+    let app = app(state);
+
+    let request = Request::builder()
+        .uri("/v1/messages")
+        .method("POST")
+        .header("content-type", "application/json")
+        .body(Body::from(
+            serde_json::to_vec(&json!({
+                "model": "cursor-auto",
+                "max_tokens": 64,
+                "stream": true,
+                "messages": [{"role": "user", "content": "hi"}]
+            }))
+            .unwrap(),
+        ))
+        .unwrap();
+    let response = app.oneshot(request).await.unwrap();
+    assert_eq!(response.status(), StatusCode::BAD_GATEWAY);
+    // D11:Cursor 路径不本地重试,首帧 error 快速失败
+    assert_eq!(counter.load(Ordering::SeqCst), 1);
+}
+
+/// /reload 禁用 Cursor:sidecar 停止,运行时清空
+#[tokio::test]
+async fn test_reload_disables_cursor_runtime() {
+    let auth_dir = tempfile::tempdir().unwrap();
+    let server = crate::test_support::TestServer::spawn(cursor_sidecar_router("")).await;
+    let state = cursor_test_state(server.url.clone(), auth_dir.path()).await;
+    let runtime = state.cursor.read().unwrap().clone().unwrap();
+
+    crate::http::handlers::reload::reconcile_cursor_runtime(&state, None).await;
+
+    assert!(state.cursor.read().unwrap().is_none());
+    // sidecar 已 shutdown:后续 run 返回 NotReady,不再发请求
+    let error = runtime
+        .sidecar
+        .run(&json!({"model": "auto"}))
+        .await
+        .unwrap_err();
+    assert!(matches!(error, crate::cursor::CursorSidecarError::NotReady));
+}
+
+/// /reload 保留启用:配置原子更新,catalog 按白名单重新合成并发布
+#[tokio::test]
+async fn test_reload_reconciles_cursor_config_and_refreshes_catalog() {
+    let auth_dir = tempfile::tempdir().unwrap();
+    write_cursor_credential(auth_dir.path());
+    let router = Router::new().route(
+        "/models",
+        post(|headers: HeaderMap, body: bytes::Bytes| async move {
+            assert_eq!(
+                headers.get("authorization").and_then(|v| v.to_str().ok()),
+                Some("Bearer test-token")
+            );
+            let payload: Value = serde_json::from_slice(&body).unwrap();
+            assert_eq!(payload["apiKey"], "test-access-token");
+            (
+                StatusCode::OK,
+                [(header::CONTENT_TYPE, "application/json")],
+                bytes::Bytes::from(
+                    serde_json::to_vec(
+                        &json!({"models": [{"id": "auto"}, {"id": "composer-2.5"}]}),
+                    )
+                    .unwrap(),
+                ),
+            )
+        }),
+    );
+    let server = crate::test_support::TestServer::spawn(router).await;
+    let state = cursor_test_state(server.url.clone(), auth_dir.path()).await;
+
+    let desired = crate::cursor::CursorConfig {
+        auth_dir: auth_dir.path().to_path_buf(),
+        models: vec!["default".to_string()],
+        idle_secs: 60,
+        max_agents: 2,
+        workspace_dir: std::path::PathBuf::from("/tmp"),
+    };
+    crate::http::handlers::reload::reconcile_cursor_runtime(&state, Some(desired)).await;
+
+    // 运行时配置已原子更新
+    let runtime = state.cursor.read().unwrap().clone().unwrap();
+    let config = runtime.config.read().await;
+    assert_eq!(config.idle_secs, 60);
+    assert_eq!(config.max_agents, 2);
+    drop(config);
+
+    // catalog 已发布:cursor provider 模型集按白名单过滤,alias 归一 default
+    let snapshot = state.config.read().await.clone();
+    let cursor = snapshot
+        .providers
+        .iter()
+        .find(|p| p.name == "cursor")
+        .expect("cursor provider 已发布");
+    assert_eq!(cursor.models.len(), 1);
+    assert_eq!(cursor.models[0].name, "auto");
+    assert_eq!(cursor.models[0].alias, "default");
+}
+
+/// /reload 目录拉取失败:保留快照中现有 cursor provider,不发布空集
+#[tokio::test]
+async fn test_reload_cursor_catalog_failure_retains_provider() {
+    let auth_dir = tempfile::tempdir().unwrap();
+    write_cursor_credential(auth_dir.path());
+    let router = Router::new().route(
+        "/models",
+        post(|| async {
+            (
+                StatusCode::SERVICE_UNAVAILABLE,
+                [(header::CONTENT_TYPE, "application/json")],
+                bytes::Bytes::from_static(br#"{"error":"upstream down"}"#),
+            )
+        }),
+    );
+    let server = crate::test_support::TestServer::spawn(router).await;
+    let state = cursor_test_state(server.url.clone(), auth_dir.path()).await;
+    let before = state.config.read().await.clone();
+
+    let desired = crate::cursor::CursorConfig {
+        auth_dir: auth_dir.path().to_path_buf(),
+        models: vec![],
+        idle_secs: 1800,
+        max_agents: 16,
+        workspace_dir: std::path::PathBuf::from("/tmp"),
+    };
+    crate::http::handlers::reload::reconcile_cursor_runtime(&state, Some(desired)).await;
+
+    // 拉取失败:快照整体未变,原 cursor provider(model auto/alias cursor-auto)保留
+    let after = state.config.read().await.clone();
+    assert_eq!(after.version, before.version);
+    let cursor = after
+        .providers
+        .iter()
+        .find(|p| p.name == "cursor")
+        .expect("cursor provider 保留");
+    assert_eq!(cursor.models[0].alias, "cursor-auto");
+}
+
+/// node >= 24 且 sidecar 依赖已装(真实 spawn 测试守卫)
+fn cursor_sidecar_prerequisites() -> bool {
+    let sidecar_dir = std::path::PathBuf::from(env!("CARGO_MANIFEST_DIR"))
+        .join("../..")
+        .join("sidecar")
+        .join("cursor");
+    let sdk_installed = sidecar_dir
+        .join("node_modules")
+        .join("@cursor")
+        .join("sdk")
+        .join("package.json")
+        .exists();
+    let node_ok = std::process::Command::new("node")
+        .arg("--version")
+        .output()
+        .map(|out| {
+            let version = String::from_utf8_lossy(&out.stdout);
+            version
+                .trim_start_matches('v')
+                .split('.')
+                .next()
+                .and_then(|major| major.parse::<u32>().ok())
+                >= Some(24)
+        })
+        .unwrap_or(false);
+    sdk_installed && node_ok
+}
+
+/// /reload 从禁用到启用:sidecar 真实启动,运行时注入,catalog 失败不回滚启用
+#[tokio::test]
+async fn test_reload_enables_cursor_runtime_from_disabled() {
+    if !cursor_sidecar_prerequisites() {
+        eprintln!("skipping: sidecar node_modules or node >= 24 unavailable");
+        return;
+    }
+    let state = mock_state();
+    assert!(state.cursor.read().unwrap().is_none());
+    let auth_dir = tempfile::tempdir().unwrap();
+    write_cursor_credential(auth_dir.path());
+
+    let desired = crate::cursor::CursorConfig {
+        auth_dir: auth_dir.path().to_path_buf(),
+        models: vec![],
+        idle_secs: 1800,
+        max_agents: 16,
+        workspace_dir: std::path::PathBuf::from("/tmp"),
+    };
+    crate::http::handlers::reload::reconcile_cursor_runtime(&state, Some(desired)).await;
+
+    // sidecar 已启动且健康;catalog 拉取失败(测试凭证无法过真实 SDK)不撤销启用
+    let runtime = state
+        .cursor
+        .read()
+        .unwrap()
+        .clone()
+        .expect("cursor runtime enabled");
+    assert!(runtime.sidecar.health().await);
+    runtime.sidecar.shutdown().await;
+}
+
+/// /reload auth_dir 变化:sidecar 受控重启指向新目录,配置原子更新
+#[tokio::test]
+async fn test_reload_cursor_auth_dir_change_restarts_sidecar() {
+    if !cursor_sidecar_prerequisites() {
+        eprintln!("skipping: sidecar node_modules or node >= 24 unavailable");
+        return;
+    }
+    let server = crate::test_support::TestServer::spawn(cursor_sidecar_router("")).await;
+    let dir_a = tempfile::tempdir().unwrap();
+    write_cursor_credential(dir_a.path());
+    let state = cursor_test_state(server.url.clone(), dir_a.path()).await;
+    let dir_b = tempfile::tempdir().unwrap();
+    write_cursor_credential(dir_b.path());
+
+    let desired = crate::cursor::CursorConfig {
+        auth_dir: dir_b.path().to_path_buf(),
+        models: vec![],
+        idle_secs: 1800,
+        max_agents: 16,
+        workspace_dir: std::path::PathBuf::from("/tmp"),
+    };
+    crate::http::handlers::reload::reconcile_cursor_runtime(&state, Some(desired)).await;
+
+    // sidecar 重启后 auth_dir 指向新目录;运行时配置同步
+    let runtime = state.cursor.read().unwrap().clone().unwrap();
+    assert_eq!(runtime.sidecar.auth_dir().await, dir_b.path());
+    let config = runtime.config.read().await;
+    assert_eq!(config.auth_dir, dir_b.path());
+    drop(config);
+    runtime.sidecar.shutdown().await;
+}
+
+#[tokio::test]
+async fn serve_shutdown_stops_cursor_sidecar() {
+    let sidecar = crate::test_support::TestServer::spawn(cursor_sidecar_router("")).await;
+    let auth_dir = tempfile::tempdir().unwrap();
+    let state = cursor_test_state(sidecar.url.clone(), auth_dir.path()).await;
+    let runtime = state.cursor.read().unwrap().clone().unwrap();
+    let (shutdown_tx, shutdown_rx) = tokio::sync::oneshot::channel();
+    shutdown_tx.send(()).unwrap();
+
+    crate::http::serve_with_shutdown("127.0.0.1:0", state, async move {
+        shutdown_rx.await.unwrap();
+    })
+    .await
+    .unwrap();
+
+    assert!(!runtime.sidecar.health().await);
 }

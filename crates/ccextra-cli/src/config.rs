@@ -30,6 +30,18 @@ pub struct Config {
     /// Cursor 凭证目录(可选);默认配置文件旁 `.cache/cursor`
     #[serde(default)]
     pub cursor_auth_dir: Option<String>,
+    /// Cursor 模型白名单(可选);glob 或精确名,缺省/空 = 全量
+    #[serde(default)]
+    pub cursor_models: Option<Vec<String>>,
+    /// Cursor sidecar 空闲回收秒数(可选);默认 1800
+    #[serde(default)]
+    pub cursor_sidecar_idle_secs: Option<u64>,
+    /// Cursor sidecar 最大 Agent 数(可选);默认 16
+    #[serde(default)]
+    pub cursor_sidecar_max_agents: Option<usize>,
+    /// Cursor SDK 工作目录(可选);缺省 = 进程 cwd
+    #[serde(default)]
+    pub cursor_workspace_dir: Option<String>,
     /// Antigravity 连接池配置(可选);默认短连接
     #[serde(default)]
     pub antigravity: Option<AntigravityConfig>,
@@ -429,5 +441,25 @@ normalize:
         // 缺少 logging 字段,应解析失败
         let result = Config::load(file.path().to_str().unwrap());
         assert!(result.is_err());
+    }
+
+    #[test]
+    fn config_loads_cursor_sidecar_fields() {
+        use std::io::Write;
+        let yaml = r#"
+server: { host: 127.0.0.1, port: 8222 }
+providers: []
+normalize: { enabled: false, drift_detector: false }
+logging: { level: info, request_body: false }
+cursor_sidecar_idle_secs: 1800
+cursor_sidecar_max_agents: 16
+cursor_workspace_dir: ~/work
+"#;
+        let mut file = NamedTempFile::new().unwrap();
+        file.write_all(yaml.as_bytes()).unwrap();
+        let config = Config::load(file.path().to_str().unwrap()).unwrap();
+        assert_eq!(config.cursor_sidecar_idle_secs, Some(1800));
+        assert_eq!(config.cursor_sidecar_max_agents, Some(16));
+        assert_eq!(config.cursor_workspace_dir.as_deref(), Some("~/work"));
     }
 }

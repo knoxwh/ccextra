@@ -23,6 +23,20 @@ async fn ensure_credential_fresh_at(
     rejected_token: Option<&str>,
     refresh_url: Option<&str>,
 ) -> Result<CursorCredential> {
+    // User API Key 优先:SDK 专用凭证,无过期无刷新,不触碰 OAuth cursor.json
+    if let Some(key) = store::load_api_key(auth_dir)? {
+        if rejected_token != Some(key.as_str()) {
+            return Ok(CursorCredential {
+                access_token: key,
+                refresh_token: String::new(),
+                sub: String::new(),
+                expires_at: Some(i64::MAX),
+            });
+        }
+        return Err(anyhow!(
+            "Cursor User API Key 已被上游拒绝,请更换 api_key.txt"
+        ));
+    }
     let cred = store::load(auth_dir)?;
     if usable(&cred, rejected_token) {
         return Ok(cred);
@@ -126,4 +140,53 @@ mod tests {
             "refresh-secret"
         );
     }
+}
+
+#[tokio::test]
+async fn api_key_file_takes_priority_and_skips_oauth_refresh() {
+    let temp = tempfile::tempdir().unwrap();
+    // OAuth 凭证已过期,若走 cursor.json 会触发刷新(此处无刷新服务,必失败)
+    let expired = CursorCredential {
+        access_token: "expired-oauth".into(),
+        refresh_token: "refresh-secret".into(),
+        sub: "account".into(),
+        expires_at: Some(0),
+    };
+    store::save(temp.path(), &expired).unwrap();
+    std::fs::write(temp.path().join("api_key.txt"), "crsr_test_key\n").unwrap();
+
+    let cred = ensure_credential_fresh(temp.path(), None, None)
+        .await
+        .unwrap();
+    assert_eq!(cred.access_token, "crsr_test_key");
+    assert_eq!(cred.refresh_token, "");
+    assert!(cred.is_fresh(SystemTime::now(), 600));
+    // OAuth 文件未被触碰
+    assert_eq!(store::load(temp.path()).unwrap(), expired);
+}
+
+#[tokio::test]
+async fn rejected_api_key_returns_error_without_refresh() {
+    let temp = tempfile::tempdir().unwrap();
+    std::fs::write(temp.path().join("api_key.txt"), "crsr_rejected\n").unwrap();
+    let error = ensure_credential_fresh(temp.path(), None, Some("crsr_rejected"))
+        .await
+        .unwrap_err();
+    assert!(error.to_string().contains("User API Key"));
+}
+
+#[tokio::test]
+async fn missing_api_key_falls_back_to_oauth_credential() {
+    let temp = tempfile::tempdir().unwrap();
+    // 无 api_key.txt:保持原行为(此处过期凭证报错,证明走了 OAuth 路径)
+    let expired = CursorCredential {
+        access_token: "expired-oauth".into(),
+        refresh_token: String::new(),
+        sub: "account".into(),
+        expires_at: Some(0),
+    };
+    store::save(temp.path(), &expired).unwrap();
+    assert!(ensure_credential_fresh(temp.path(), None, None)
+        .await
+        .is_err());
 }

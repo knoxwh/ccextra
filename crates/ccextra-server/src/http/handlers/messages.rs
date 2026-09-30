@@ -12,9 +12,9 @@ use ccextra_core::cache_stabilization::drift_detector::{
 };
 use ccextra_core::convert::{
     clamp_passthrough_effort, convert_passthrough, convert_to_antigravity_with,
-    convert_to_gemini_with_registry, convert_to_openai_chat_with, convert_to_openai_responses_with,
-    is_thinking_signature_invalid, sanitize_gpt_reasoning_items, sanitize_passthrough_prompt,
-    trim_encrypted_reasoning_items,
+    convert_to_cursor_sdk, convert_to_gemini_with_registry, convert_to_openai_chat_with,
+    convert_to_openai_responses_with, is_thinking_signature_invalid, sanitize_gpt_reasoning_items,
+    sanitize_passthrough_prompt, trim_encrypted_reasoning_items, CursorSdkConvertError,
 };
 use ccextra_core::normalize::{
     normalize_anthropic_full, normalize_anthropic_pretransform, normalize_target_post, TargetShape,
@@ -470,6 +470,17 @@ pub(crate) async fn prepare_message_request(
                 }
             }
         }
+        // Cursor SDK:纯转换组装 /run body;apiKey 由 dispatch 注入
+        Protocol::CursorSdk => {
+            // workspace_dir 来自 CursorConfig(缺省已在配置侧解析为进程 cwd)
+            let workspace_dir = match state.cursor.read().ok().and_then(|guard| guard.clone()) {
+                Some(runtime) => runtime.config.read().await.workspace_dir.clone(),
+                None => std::env::current_dir()
+                    .map_err(|e| AppError::new(anyhow::anyhow!("无法解析进程 cwd: {e}")))?,
+            };
+            body_json = convert_to_cursor_sdk(body_json, &route.upstream_model, &workspace_dir)
+                .map_err(|e| AppError::bad_request(cursor_convert_error_message(&e)))?;
+        }
     }
 
     if matches!(
@@ -701,6 +712,9 @@ pub(crate) async fn prepare_message_request(
         (cc_session.as_deref(), extract_claude_code_thread(headers))
     } else if is_grok && matches!(route.protocol, Protocol::OpenAiChat) {
         (cc_session.as_deref(), None)
+    } else if matches!(route.protocol, Protocol::CursorSdk) {
+        // usage 写 session token cache + count_tokens 复用
+        (cc_session.as_deref(), None)
     } else {
         (None, None)
     };
@@ -749,6 +763,18 @@ pub(crate) async fn prepare_message_request(
         token_scope: session_id
             .map(|session| (Arc::clone(&state.last_input_tokens), session.to_string())),
     })
+}
+
+/// Cursor 转换错误 → Anthropic 400 消息
+fn cursor_convert_error_message(error: &CursorSdkConvertError) -> String {
+    match error {
+        CursorSdkConvertError::UnsupportedImage => {
+            "unsupported image block: Cursor SDK v1 不支持图片输入".to_string()
+        }
+        CursorSdkConvertError::InvalidMessages => {
+            "invalid messages: messages 必须是非空数组".to_string()
+        }
+    }
 }
 
 pub(crate) async fn execute_upstream_request(
@@ -884,6 +910,130 @@ pub(crate) async fn execute_upstream_request(
     })
 }
 
+/// Cursor SDK 分派:凭证保鲜 → sidecar /run → 首业务帧预读
+///
+/// 不走通用 upstream(UpstreamClient 拒绝 CursorSdk);认证失败仅用旧
+/// token 刷新一次并重发,不做通用本地退避。流式首帧 error 在提交 200 前
+/// 返回 502 Anthropic error;sidecar 503/502 由 deliver_response 统一映射。
+pub(crate) async fn dispatch_cursor_sdk(
+    state: &AppState,
+    prepared: &mut PreparedMessageRequest,
+    upstream_client: &crate::upstream::UpstreamClient,
+) -> Result<ExecutedUpstream, AppError> {
+    use crate::cursor::{CursorRelayMeta, CursorSidecarError};
+
+    let runtime = state
+        .cursor
+        .read()
+        .ok()
+        .and_then(|guard| guard.clone())
+        .ok_or_else(|| {
+            AppError::with_status(
+                axum::http::StatusCode::SERVICE_UNAVAILABLE,
+                "cursor_sdk_unavailable: Cursor SDK sidecar 未启动".to_string(),
+            )
+        })?;
+    let sidecar = Arc::clone(&runtime.sidecar);
+    let auth_dir = runtime.config.read().await.auth_dir.clone();
+    let proxy = upstream_client.resolve_proxy(prepared.upstream_proxy.as_deref());
+    let proxy_opt = if proxy == "direct" {
+        None
+    } else {
+        Some(proxy.as_str())
+    };
+
+    let run_once = |body: Value| {
+        let sidecar = Arc::clone(&sidecar);
+        async move { sidecar.run(&body).await }
+    };
+    let sidecar_error = |error: CursorSidecarError| match error {
+        CursorSidecarError::NotReady => AppError::with_status(
+            axum::http::StatusCode::SERVICE_UNAVAILABLE,
+            "cursor sidecar not ready".to_string(),
+        ),
+        other => AppError::with_status(
+            axum::http::StatusCode::BAD_GATEWAY,
+            format!("cursor sidecar request failed: {other}"),
+        ),
+    };
+
+    // 凭证保鲜 + 注入 apiKey(token 不落日志)
+    let credential = crate::cursor::ensure_credential_fresh(&auth_dir, proxy_opt, None)
+        .await
+        .map_err(|e| {
+            AppError::with_status(
+                axum::http::StatusCode::BAD_GATEWAY,
+                format!("Cursor 凭证不可用: {e:#}"),
+            )
+        })?;
+    let mut body = prepared.body_json.clone();
+    body["apiKey"] = Value::String(credential.access_token.clone());
+
+    let mut response = run_once(body.clone()).await.map_err(sidecar_error)?;
+    // 认证失败:仅用旧 token 强制刷新一次并重发
+    if response.status().as_u16() == 401 {
+        let refreshed = crate::cursor::ensure_credential_fresh(
+            &auth_dir,
+            proxy_opt,
+            Some(&credential.access_token),
+        )
+        .await
+        .map_err(|e| {
+            AppError::with_status(
+                axum::http::StatusCode::BAD_GATEWAY,
+                format!("Cursor 凭证刷新失败: {e:#}"),
+            )
+        })?;
+        body["apiKey"] = Value::String(refreshed.access_token.clone());
+        response = run_once(body).await.map_err(sidecar_error)?;
+    }
+
+    let status = response.status();
+    if !status.is_success() || !prepared.is_stream {
+        // 错误交付与非流聚合都交给 deliver_response(UpstreamResponse 透传)
+        return Ok(ExecutedUpstream {
+            status,
+            upstream: Some(UpstreamResponse {
+                status,
+                body: response,
+            }),
+            preloaded_stream: None,
+        });
+    }
+
+    // 流式:relay + 首业务帧预读(跳过心跳;首帧 error 不提交 200)
+    let mut out = crate::cursor::relay_cursor_sdk_to_anthropic(
+        Box::pin(response.bytes_stream()),
+        CursorRelayMeta {
+            model: prepared.route.upstream_model.clone(),
+            estimated_input_tokens: prepared.estimated_input_tokens.unwrap_or(0) as i64,
+            token_scope: prepared.token_scope.clone(),
+        },
+    );
+    let first = next_business_frame(&mut out).await;
+    let bad = match &first {
+        Some(Ok(frame)) => is_initial_sse_error(frame),
+        Some(Err(_)) | None => true,
+    };
+    if bad {
+        let msg = match &first {
+            Some(Ok(frame)) => initial_sse_error_message(frame),
+            Some(Err(e)) => e.to_string(),
+            None => "cursor sidecar 流在首帧前结束".to_string(),
+        };
+        return Err(AppError::with_status(
+            axum::http::StatusCode::BAD_GATEWAY,
+            format!("cursor sidecar 首帧失败: {msg}"),
+        ));
+    }
+    let first = first.expect("bad 为 false 时必有首帧");
+    Ok(ExecutedUpstream {
+        status,
+        upstream: None,
+        preloaded_stream: Some(prepend_sse_frame(first, out)),
+    })
+}
+
 pub(crate) async fn deliver_response(
     state: &AppState,
     prepared: &mut PreparedMessageRequest,
@@ -986,6 +1136,35 @@ pub(crate) async fn deliver_response(
             .map_err(|e| AppError::new(anyhow::anyhow!("构造流式响应失败: {e}")))?)
     } else {
         let upstream = executed.upstream.take().expect("上游响应应存在");
+        // Cursor SDK 非流:聚合 sidecar SSE 为 Anthropic JSON
+        if matches!(prepared.route.protocol, Protocol::CursorSdk) {
+            let mut message =
+                crate::cursor::collect_cursor_sdk_response(Box::pin(upstream.body.bytes_stream()))
+                    .await?;
+            message["model"] = Value::String(prepared.route.upstream_model.clone());
+            // usage 写 session cache(与流式 relay 同一语义)
+            if let Some(sid) = prepared.session_id.as_deref() {
+                if let Some(tokens) = message
+                    .pointer("/usage/input_tokens")
+                    .and_then(|t| t.as_i64())
+                    .filter(|t| *t > 0)
+                {
+                    let _ = state
+                        .last_input_tokens
+                        .lock()
+                        .ok()
+                        .map(|mut cache| cache.insert(sid.to_string(), tokens as usize));
+                }
+            }
+            let payload = serde_json::to_vec(&message)
+                .map(Bytes::from)
+                .map_err(|e| AppError::new(anyhow::anyhow!("序列化 Cursor 响应失败: {e}")))?;
+            return Response::builder()
+                .status(status)
+                .header(header::CONTENT_TYPE, "application/json")
+                .body(Body::from(payload))
+                .map_err(|e| AppError::new(anyhow::anyhow!("构造响应失败: {e}")));
+        }
         let body_bytes = crate::limits::read_success_body_or_anthropic(upstream.body).await?;
         if let Some((cache, key, fingerprint)) = prepared.replay_scope.as_ref() {
             if let Ok(v) = serde_json::from_slice::<Value>(&body_bytes) {
@@ -1026,7 +1205,8 @@ pub(crate) async fn deliver_response(
                                 .pointer("/usageMetadata/promptTokenCount")
                                 .and_then(|t| t.as_i64())
                         }
-                        Protocol::Claude => None,
+                        // Cursor usage 由 relay/非流聚合写入;此处不可达
+                        Protocol::Claude | Protocol::CursorSdk => None,
                     };
                     if let Some(tokens) = input_tokens {
                         if tokens > 0 {
@@ -1039,6 +1219,8 @@ pub(crate) async fn deliver_response(
                 }
                 match prepared.route.protocol {
                     Protocol::Claude => None,
+                    // Cursor 非流由上方聚合早返回;此处不可达
+                    Protocol::CursorSdk => None,
                     Protocol::OpenAiChat => crate::sse::non_stream::openai_chat_to_anthropic(&v),
                     Protocol::OpenAiResponses => crate::sse::non_stream::responses_to_anthropic(
                         &v,
@@ -1128,12 +1310,17 @@ pub async fn handle_messages(
     let mut prepared =
         prepare_message_request(&state, &headers, &bytes, &effective_snapshot).await?;
 
-    let executed = execute_upstream_request(
-        &mut prepared,
-        &effective_snapshot.runtime.upstream,
-        &effective_snapshot.runtime.user_agents,
-    )
-    .await?;
+    let executed = if matches!(prepared.route.protocol, Protocol::CursorSdk) {
+        // Cursor SDK 走 sidecar 专用通道,不经通用 upstream
+        dispatch_cursor_sdk(&state, &mut prepared, &effective_snapshot.runtime.upstream).await?
+    } else {
+        execute_upstream_request(
+            &mut prepared,
+            &effective_snapshot.runtime.upstream,
+            &effective_snapshot.runtime.user_agents,
+        )
+        .await?
+    };
 
     deliver_response(
         &state,

@@ -12,7 +12,7 @@ use ccextra_server::codex::{
 };
 use ccextra_server::cursor::{
     load as load_cursor_credential, resolve_auth_dir as resolve_cursor_auth_dir,
-    run_login as run_cursor_login, CursorLoginOptions,
+    run_login as run_cursor_login, CursorConfig, CursorLoginOptions, CursorRuntime,
 };
 use ccextra_server::http::{
     publish_refreshed_providers, AppState, ConfigSnapshot, ProviderRefreshConfig, ReloadData,
@@ -175,6 +175,15 @@ async fn main() -> Result<()> {
         }
         Some(Commands::CursorStatus { auth_dir }) => {
             let dir = cursor_auth_dir_from(&cli.config, auth_dir);
+            // api_key.txt(SDK 专用)存在即有效:无过期无刷新
+            match ccextra_server::cursor::store::load_api_key(&dir) {
+                Ok(Some(_)) => {
+                    println!("Cursor status=valid (User API Key: api_key.txt)");
+                    return Ok(());
+                }
+                Ok(None) => {}
+                Err(error) => return Err(error),
+            }
             match load_cursor_credential(&dir) {
                 Ok(credential) => println!(
                     "Cursor sub={} status={}",
@@ -259,9 +268,29 @@ async fn main() -> Result<()> {
     // 合并配置文件 providers 和 xAI providers
     // Antigravity 模型列表需在线拉取(对齐 CPA 启动模式:已知数据先行、
     // 后台刷新、失败保旧),不阻塞监听 —— 转入 serve 之后的后台任务注入
-    let mut all_providers = merge_providers(config.providers, Vec::new());
+    let mut all_providers = merge_providers(config.providers.clone(), Vec::new());
     all_providers = merge_providers(all_providers, xai_providers);
     all_providers = merge_providers(all_providers, codex_providers);
+
+    // Cursor SDK sidecar 启动(启用判定:cursor_auth_dir 非空)
+    let cursor_runtime = start_cursor_runtime(&cli.config, &config).await?;
+    if let Some(runtime) = cursor_runtime.as_ref() {
+        let cursor_cfg = runtime.config.read().await.clone();
+        match ccextra_server::cursor::load_cursor_provider(
+            &runtime.sidecar,
+            &cursor_cfg,
+            &all_providers,
+        )
+        .await
+        {
+            Some(provider) => {
+                let count = provider.models.len();
+                all_providers = merge_providers(all_providers, vec![provider]);
+                tracing::info!("Cursor 目录合成 {} 个模型", count);
+            }
+            None => tracing::warn!("Cursor 模型目录拉取失败,先以无 cursor provider 启动"),
+        }
+    }
 
     // 启动时验证配置
     ccextra_core::route::validate_providers(&all_providers)?;
@@ -354,11 +383,12 @@ async fn main() -> Result<()> {
         last_input_tokens: Arc::new(std::sync::Mutex::new(
             ccextra_server::http::session_tokens::SessionTokenCache::new(),
         )),
+        cursor: Arc::new(std::sync::RwLock::new(cursor_runtime)),
     };
 
     // Antigravity 后台注入(对齐 CPA 启动模式:listening 不等在线模型列表;
     // 任务内部立即拉取一次,成功替换 providers,失败保旧等下轮)
-    tokio::spawn(run_antigravity_injection(state.config.clone()));
+    tokio::spawn(run_antigravity_injection(state.clone()));
 
     // 启动 HTTP 服务
     let addr = format!("{}:{}", config.server.host, config.server.port);
@@ -407,6 +437,79 @@ fn cursor_auth_dir_from(config_path: &str, override_dir: Option<String>) -> Path
         load_optional_config(config_path).and_then(|cfg| cfg.cursor_auth_dir)
     };
     pin_auth_dir(config_path, raw.as_deref(), resolve_cursor_auth_dir)
+}
+
+/// Cursor workspace 目录:展开前导 ~ → 相对路径钉配置文件目录 → realpath
+///
+/// 缺省 = 进程 cwd;realpath 失败(目录暂不存在)容忍,保留绝对化结果
+fn cursor_workspace_dir_from(config_path: &str, raw: Option<&str>) -> PathBuf {
+    let Some(raw) = raw.map(str::trim).filter(|s| !s.is_empty()) else {
+        return std::env::current_dir().unwrap_or_else(|_| PathBuf::from("."));
+    };
+    let expanded = if let Some(rest) = raw.strip_prefix('~') {
+        let rest = rest.trim_start_matches('/');
+        let home = std::env::var_os("HOME")
+            .or_else(|| std::env::var_os("USERPROFILE"))
+            .map(PathBuf::from)
+            .unwrap_or_else(|| PathBuf::from("."));
+        home.join(rest)
+    } else {
+        PathBuf::from(raw)
+    };
+    let pinned = pin_path(config_path, &expanded.to_string_lossy());
+    std::fs::canonicalize(&pinned).unwrap_or(pinned)
+}
+
+/// CursorConfig 组装:启用判定(cursor_auth_dir 非空)+ 目录钉定 + 默认值
+fn cursor_config_from(config_path: &str, cfg: &Config) -> Option<CursorConfig> {
+    if !ccextra_server::cursor::cursor_enabled(cfg.cursor_auth_dir.as_deref()) {
+        return None;
+    }
+    let auth_dir = pin_auth_dir(
+        config_path,
+        cfg.cursor_auth_dir.as_deref(),
+        resolve_cursor_auth_dir,
+    );
+    Some(CursorConfig {
+        auth_dir,
+        models: cfg.cursor_models.clone().unwrap_or_default(),
+        idle_secs: cfg.cursor_sidecar_idle_secs.unwrap_or(1800),
+        max_agents: cfg.cursor_sidecar_max_agents.unwrap_or(16),
+        workspace_dir: cursor_workspace_dir_from(config_path, cfg.cursor_workspace_dir.as_deref()),
+    })
+}
+
+/// 仓库根(编译期锚定,开发环境回退用;部署环境走 exe 同级)
+fn repository_root() -> PathBuf {
+    PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("../..")
+}
+
+/// 启动 Cursor sidecar 并组装运行时;未启用返回 None
+async fn start_cursor_runtime(
+    config_path: &str,
+    cfg: &Config,
+) -> anyhow::Result<Option<Arc<CursorRuntime>>> {
+    let Some(cursor_cfg) = cursor_config_from(config_path, cfg) else {
+        return Ok(None);
+    };
+    let exe =
+        std::env::current_exe().map_err(|e| anyhow::anyhow!("无法定位当前可执行文件: {e}"))?;
+    let sidecar_dir = ccextra_server::cursor::resolve_sidecar_dir(&exe, &repository_root())?;
+    let sidecar =
+        ccextra_server::cursor::CursorSidecar::start(ccextra_server::cursor::CursorSidecarConfig {
+            sidecar_dir,
+            auth_dir: cursor_cfg.auth_dir.clone(),
+            ..Default::default()
+        })
+        .await?;
+    tracing::info!(
+        auth_dir = %cursor_cfg.auth_dir.display(),
+        "Cursor SDK sidecar 已启动"
+    );
+    Ok(Some(Arc::new(CursorRuntime {
+        sidecar,
+        config: RwLock::new(cursor_cfg),
+    })))
 }
 
 /// 读用户 models.json。缺文件 = 空表不钳;解析失败则启动/reload 报错。
@@ -487,13 +590,18 @@ fn provider_refresh_config(config_path: &str, config: &Config) -> ProviderRefres
             resolve_codex_auth_dir,
         )),
         antigravity_models: config.antigravity_models.clone(),
+        cursor: cursor_config_from(config_path, config),
         proxy_url: config.server.proxy_url.clone(),
         static_providers: config.providers.clone(),
     }
 }
 
 /// 动态拉取失败时保留整个已发布集合;静态配置仅由成功的 reload 更新。
-async fn load_refreshed_providers(refresh: ProviderRefreshConfig) -> Option<Vec<ProviderConfig>> {
+async fn load_refreshed_providers(
+    refresh: ProviderRefreshConfig,
+    current_providers: Vec<ProviderConfig>,
+    cursor: &Arc<std::sync::RwLock<Option<Arc<CursorRuntime>>>>,
+) -> Option<Vec<ProviderConfig>> {
     let auth_dir = refresh.auth_dir.as_ref()?;
     let xai = if let Some(dir) = refresh.xai_auth_dir.as_ref() {
         ccextra_server::xai::load_xai_providers(dir, refresh.proxy_url.as_deref()).await
@@ -517,7 +625,38 @@ async fn load_refreshed_providers(refresh: ProviderRefreshConfig) -> Option<Vec<
     }
     let set = merge_providers(refresh.static_providers, xai);
     let set = merge_providers(set, codex);
-    Some(merge_providers(set, injected))
+    let set = merge_providers(set, injected);
+    // Cursor catalog:成功合成则并入;失败保留快照中现有 cursor provider
+    let cursor_set = match refresh.cursor.as_ref() {
+        Some(cursor_cfg) => {
+            let runtime = cursor.read().ok().and_then(|guard| guard.clone());
+            match runtime {
+                Some(runtime) => {
+                    match ccextra_server::cursor::load_cursor_provider(
+                        &runtime.sidecar,
+                        cursor_cfg,
+                        &set,
+                    )
+                    .await
+                    {
+                        Some(provider) => vec![provider],
+                        None => current_providers
+                            .into_iter()
+                            .filter(|p| p.name == "cursor")
+                            .collect(),
+                    }
+                }
+                // sidecar 未运行:保留现有 cursor provider
+                None => current_providers
+                    .into_iter()
+                    .filter(|p| p.name == "cursor")
+                    .collect(),
+            }
+        }
+        // 未启用:不合成也不保留(禁用后旧 provider 应移除)
+        None => Vec::new(),
+    };
+    Some(merge_providers(set, cursor_set))
 }
 
 async fn refresh_providers<F, Fut>(
@@ -525,11 +664,11 @@ async fn refresh_providers<F, Fut>(
     load: F,
 ) -> anyhow::Result<bool>
 where
-    F: FnOnce(ProviderRefreshConfig) -> Fut,
+    F: FnOnce(ProviderRefreshConfig, Vec<ProviderConfig>) -> Fut,
     Fut: std::future::Future<Output = Option<Vec<ProviderConfig>>>,
 {
     let snapshot = config.read().await.clone();
-    let Some(providers) = load(snapshot.refresh.clone()).await else {
+    let Some(providers) = load(snapshot.refresh.clone(), snapshot.providers.clone()).await else {
         return Ok(false);
     };
     publish_refreshed_providers(config, snapshot.version, providers).await
@@ -537,17 +676,24 @@ where
 
 /// Antigravity 注入任务:启动即拉取,成功注入后每 3 小时刷新;失败保旧。
 /// 每轮从当前快照获取参数,不发布尚未成功 reload 的磁盘配置。
-async fn run_antigravity_injection(config: Arc<RwLock<Arc<ConfigSnapshot>>>) {
+/// Cursor catalog 同周期刷新(失败保留现有 cursor provider)。
+async fn run_antigravity_injection(state: AppState) {
     /// 刷新周期(对齐 CPA modelsRefreshInterval = 3h)
     const REFRESH_INTERVAL: std::time::Duration = std::time::Duration::from_secs(3 * 3600);
 
+    let config = state.config.clone();
+    let cursor = state.cursor.clone();
     let mut ticker = tokio::time::interval(REFRESH_INTERVAL);
     // 首次 tick 立即到期,启动后马上拉取一次(CPA tryStartupRefresh 同构)
     ticker.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
     let mut ready = false;
     loop {
         ticker.tick().await;
-        match refresh_providers(&config, load_refreshed_providers).await {
+        let result = refresh_providers(&config, |refresh, current| {
+            load_refreshed_providers(refresh, current, &cursor)
+        })
+        .await;
+        match result {
             Ok(true) => {
                 if ready {
                     tracing::info!("Antigravity 周期刷新完成");
@@ -842,9 +988,9 @@ fn build_user_agents(config: Option<&config::UserAgents>) -> UserAgentSet {
 #[cfg(test)]
 mod tests {
     use super::{
-        build_user_agents, load_refreshed_providers, load_thinking_registry, pin_auth_dir,
-        pin_path, provider_refresh_config, refresh_providers, Arc, Config, ProviderConfig,
-        RuntimeConfig, RwLock, UpstreamClient,
+        build_user_agents, cursor_config_from, cursor_workspace_dir_from, load_refreshed_providers,
+        load_thinking_registry, pin_auth_dir, pin_path, provider_refresh_config, refresh_providers,
+        Arc, Config, ProviderConfig, RuntimeConfig, RwLock, UpstreamClient,
     };
     use ccextra_server::antigravity::resolve_auth_dir as resolve_antigravity_auth_dir;
     use ccextra_server::cursor::resolve_auth_dir as resolve_cursor_auth_dir;
@@ -887,7 +1033,7 @@ mod tests {
             snapshot.refresh.xai_auth_dir = Some(PathBuf::from("/new/xai"));
             snapshot.refresh.proxy_url = Some("http://new-proxy:8080".into());
         }
-        let published = refresh_providers(&state, |refresh| async move {
+        let published = refresh_providers(&state, |refresh, _current| async move {
             assert_eq!(refresh.auth_dir, Some(PathBuf::from("/new/antigravity")));
             assert_eq!(refresh.xai_auth_dir, Some(PathBuf::from("/new/xai")));
             assert_eq!(refresh.proxy_url.as_deref(), Some("http://new-proxy:8080"));
@@ -918,16 +1064,19 @@ mod tests {
             snapshot.refresh.xai_auth_dir = Some(directory.path().join("xai"));
         }
         let before = state.read().await.clone();
-        assert!(!refresh_providers(&state, load_refreshed_providers)
-            .await
-            .unwrap());
+        let cursor = Arc::new(std::sync::RwLock::new(None));
+        assert!(!refresh_providers(&state, |refresh, current| {
+            load_refreshed_providers(refresh, current, &cursor)
+        })
+        .await
+        .unwrap());
         assert!(Arc::ptr_eq(&before, &*state.read().await));
     }
 
     #[tokio::test]
     async fn refresh_discards_result_after_new_configuration_is_published() {
         let state = refresh_state();
-        let published = refresh_providers(&state, |_| async {
+        let published = refresh_providers(&state, |_, _| async {
             let mut current = state.write().await;
             let snapshot = Arc::make_mut(&mut current);
             snapshot.version = 2;
@@ -1058,5 +1207,65 @@ xai_auth_dir: new-xai
         let reg = load_thinking_registry(cfg.to_str().unwrap(), None).unwrap();
         assert_eq!(reg.len(), 1);
         assert_eq!(reg[0].id, "gpt-6-astra");
+    }
+
+    fn cursor_test_config(extra: &str) -> Config {
+        let yaml = format!(
+            "server: {{ host: 127.0.0.1, port: 8222 }}\n\
+             providers: []\n\
+             normalize: {{ enabled: false, drift_detector: false }}\n\
+             logging: {{ level: info, request_body: false }}\n{extra}"
+        );
+        serde_yaml::from_str(&yaml).unwrap()
+    }
+
+    #[test]
+    fn cursor_config_from_disabled_when_auth_dir_blank() {
+        assert!(cursor_config_from("/tmp/proj/config.yaml", &cursor_test_config("")).is_none());
+        let cfg = cursor_test_config("cursor_auth_dir: \"  \"\n");
+        assert!(cursor_config_from("/tmp/proj/config.yaml", &cfg).is_none());
+    }
+
+    #[test]
+    fn cursor_config_from_applies_defaults_and_pins_auth_dir() {
+        let cfg = cursor_test_config("cursor_auth_dir: .cache/cursor\n");
+        let config = cursor_config_from("/tmp/proj/config.yaml", &cfg).unwrap();
+        assert_eq!(config.auth_dir, PathBuf::from("/tmp/proj/.cache/cursor"));
+        assert!(config.models.is_empty());
+        assert_eq!(config.idle_secs, 1800);
+        assert_eq!(config.max_agents, 16);
+        assert_eq!(
+            config.workspace_dir,
+            std::env::current_dir().unwrap_or_else(|_| PathBuf::from("."))
+        );
+    }
+
+    #[test]
+    fn cursor_config_from_reads_overrides() {
+        let cfg = cursor_test_config(
+            "cursor_auth_dir: /abs/cursor\ncursor_models: [\"default\", \"composer-*\"]\n\
+             cursor_sidecar_idle_secs: 60\ncursor_sidecar_max_agents: 2\n\
+             cursor_workspace_dir: /abs/ws\n",
+        );
+        let config = cursor_config_from("/tmp/proj/config.yaml", &cfg).unwrap();
+        assert_eq!(config.auth_dir, PathBuf::from("/abs/cursor"));
+        assert_eq!(
+            config.models,
+            vec!["default".to_string(), "composer-*".to_string()]
+        );
+        assert_eq!(config.idle_secs, 60);
+        assert_eq!(config.max_agents, 2);
+        assert_eq!(config.workspace_dir, PathBuf::from("/abs/ws"));
+    }
+
+    #[test]
+    fn cursor_workspace_dir_expands_home_and_pins_relative() {
+        let home = std::env::var_os("HOME")
+            .map(PathBuf::from)
+            .unwrap_or_default();
+        let expanded = cursor_workspace_dir_from("/tmp/proj/config.yaml", Some("~/ws"));
+        assert_eq!(expanded, home.join("ws"));
+        let pinned = cursor_workspace_dir_from("/tmp/proj/config.yaml", Some("ws"));
+        assert_eq!(pinned, PathBuf::from("/tmp/proj/ws"));
     }
 }

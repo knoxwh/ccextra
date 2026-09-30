@@ -38,7 +38,7 @@ ccextra 将 Anthropic Messages 入口接到不同上游协议，同时尽量保�
 5. OpenAI 路径执行转换后归一化；Gemini 和 Antigravity 跳过该步骤。
 6. 应用 `payload` 顶层参数覆盖，保留已有非空 `prompt_cache_key`。
 7. 为符合条件的 OpenAI 请求注入会话 cache key，必要时写诊断日志。
-8. 选择 URL、代理、认证头和 User-Agent，发送上游请求并处理重试。
+8. 选择 URL、代理、认证头和 User-Agent，发送上游请求并处理重试。`cursor_sdk` 例外：不经通用 upstream，由 cursor relay 注入 apiKey 后直发本地 sidecar `/run`。
 9. 直通或转换流式 SSE；非流响应也恢复为 Anthropic 形状。
 
 ## 路由与配置
@@ -73,7 +73,15 @@ Anthropic `system` 成为 system message；o 系列（`o1-mini`/`o1-preview` 除
 
 ### Cursor
 
-Cursor 代理路径已移除,仅保留订阅凭证能力:`cursor-login` 生成 PKCE verifier/challenge 并轮询 `api2.cursor.sh/auth/poll`,保存单份 `cursor.json`;到期前 10 分钟通过 refresh token 换取新 access token。`cursor_auth_dir`(默认配置文件旁 `.cache/cursor`)为顶层配置。`cursor-status` 显示已保存凭证状态。
+Cursor 走本地 Node sidecar 而非 HTTP 反代。凭证是 **User API Key**（cursor.com/settings → API Keys 手动生成）：SDK 内部经 `/auth/exchange_user_api_key` 换 access token，OAuth access token 不被该端点接受。凭证存 `cursor_auth_dir/api_key.txt`（单行裸 key，0600），`ensure_credential_fresh` 优先读取且不触发刷新；缺失时回落 `cursor.json`。`cursor-login` 的 PKCE 凭证写 `cursor.json`（DashboardService 配额查询用），与 `api_key.txt` 互不覆盖。`cursor_auth_dir`（默认配置文件旁 `.cache/cursor`）非空即启用。
+
+**Rust/Node 边界**：sidecar 是 ccextra 的子进程（`sidecar/cursor/main.mjs`，嵌入 `@cursor/sdk`），固定监听 `127.0.0.1:8223`，端口占用时启动失败且不回退随机端口。Rust 侧 `CursorSidecar` 负责 spawn、READY 握手（严格 JSON `{"event":"ready","port":8223}`，10 秒超时）、stderr 转 tracing、每 5 秒健康巡检与 1/2/4…秒退避重启（封顶 60 秒）。服务收到 `SIGTERM`/`SIGINT`、`/reload` 禁用 Cursor 或修改 `auth_dir` 时，先停止 sidecar 并释放端口。Bearer token 由 Rust 生成，只经 `CCEXTRA_CURSOR_TOKEN` 环境变量传递，不落盘；凭证目录经 `CCEXTRA_CURSOR_AUTH_DIR` 注入。协议为两个端点：`POST /run`（SSE）与 `POST /models`。Rust 不解析 SDK 内部结构，sidecar 不接触 ccextra 配置。
+
+**请求形状**：`convert_to_cursor_sdk`（core，纯函数）将 Anthropic body 转为 `/run` 载荷——`model`、`modelParams: []`、`systemPrompt`（system 块拍平为单字符串）、`workspaceDir`、Anthropic 形状 `messages`（递归剥 thinking 块，遇图片报 400）与 `tools` 透传；`apiKey` 由 Rust dispatch 时注入，不进转换层。分派链：凭证保鲜 → 注入 apiKey → `/run` → 401 时刷新一次重发 → 流式首业务帧预读（跳过心跳帧，首帧 error 返回 502 不提交 200）。
+
+**SSE 事件与终态**：sidecar 事件已归一为 `text_delta`/`thinking_delta`/`tool_use`/`usage`/`turn_end`/`error` 六类。`relay_cursor_sdk_to_anthropic` 状态机自动开合 content block（text/thinking 增量、tool_use 单次 `input_json_delta`），`turn_end` 触发 `message_delta` + `message_stop` 后立即结束流；EOF 无 `turn_end`、`error` 事件或读取错误产生结构化 Anthropic error，不在已收尾后追加成功事件。非流路径 `collect_cursor_sdk_response` 聚合同一事件集为 Anthropic JSON，缺终态或 error 返回 502。usage 写入会话 token cache，`count_tokens` 复用（缺失返回 0）。
+
+**Run 状态机与 journal 恢复**：sidecar 内每个 `/run` 对应一个 SDK Agent Run。会话状态（消息前缀、pending callback）持久化在 `cursor_auth_dir` 的 `sessions.jsonl` 与 journal 文件：journal 记录已确认的消息前缀哈希，冷续接（sidecar 崩溃重启后同会话下一请求）只回放到已确认边界，不跨过未确认的副作用。已知限制：崩溃窗口内未确认的工具副作用可能在续接后重复执行，由客户端 tool_result 幂等性兜底。模型目录经 `/models` 拉取，按 `cursor_models` 白名单（`default` 归一为 `auto`）过滤后合成 name `cursor` 的 provider；与现有 provider name/alias 冲突的模型跳过并告警。启动、`/reload` 与每 3 小时后台刷新；失败保留最近成功目录。
 
 ### 各协议 System 提示词清洗差异矩阵
 
@@ -120,6 +128,8 @@ Antigravity 上游默认短连接：空闲连接在响应结束后立即关闭�
 `xai-login` 使用 OAuth device flow。启动和配置重载扫描 xAI 凭证，必要时提前刷新 token，并为每份有效凭证注入一个 Responses provider。相对 `auth_dir`、`xai_auth_dir` 和 `models_file` 始终相对配置文件目录解析。缺省 `models.json` 与配置同目录。缺文件或模型未收录时不钳 effort；条目可设 `force_effort` 固定档（生效范围与钳制一致，值不钳制）；解析失败则启动或 `/reload` 报错。
 
 `codex-login` 使用 PKCE 浏览器授权（本地回调端口默认 1455）。凭证保存 `chatgpt_account_id` 与 `chatgpt_plan_type`（取自 ID token 的 `https://api.openai.com/auth` claim）。启动和配置重载扫描 Codex 凭证，token 提前 24 小时刷新（失败重试 3 次，`refresh_token_reused` 不重试），并为每份有效凭证注入一个 Responses provider，上游为 `https://chatgpt.com/backend-api/codex/responses`。请求时自动携带 `Chatgpt-Account-Id` 订阅身份头与 `X-Codex-Routing-Hint: model=<解析后模型>[;tier=<service_tier>]`（对齐 codex CLI `build_routing_hint_header`，hint 在压缩前从最终 body 构造，入站同名头可覆盖），并对请求体做 zstd 压缩（level 3，对齐 codex CLI `enable_request_compression` 默认行为；压缩在序列化后执行一次，退避重试共享压缩字节）；静态 API key provider 无该 metadata 不发头也不压缩。`codex_auth_dir` 相对配置文件目录解析。
+
+Cursor sidecar 生命周期独立于配置快照：运行时状态（进程句柄、sidecar 客户端）挂在 `AppState.cursor` 的进程级 RwLock 中，不进 `ConfigSnapshot`。启动时若 `cursor_auth_dir` 启用则 spawn sidecar 并拉取目录合入 providers；`/reload` 发布新快照后按新旧配置对齐——禁用变启用启动、启用变禁用停止、`auth_dir` 变化受控重启，其余字段原子更新；catalog 重新合成后按版本保护发布（版本过期丢弃）。3 小时后台刷新失败或 sidecar 未运行时，从当前快照保留 name `cursor` 的 provider，不移除路由。
 
 ## 并发、安全与诊断
 

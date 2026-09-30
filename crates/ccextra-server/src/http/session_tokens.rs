@@ -43,6 +43,8 @@ where
                             .or_else(|| value.pointer("/usageMetadata/promptTokenCount"))
                             .or_else(|| value.pointer("/cpaUsageMetadata/promptTokenCount")),
                         Protocol::Claude => None,
+                        // 过渡 arm:Task 8 由 Cursor relay usage 写入
+                        Protocol::CursorSdk => None,
                     }.and_then(serde_json::Value::as_u64)
                         .and_then(|tokens| usize::try_from(tokens).ok())
                         .filter(|tokens| *tokens > 0);

@@ -139,6 +139,12 @@ where
             tool_names,
             signature_model.unwrap_or_default(),
         ),
+        // Cursor SDK 流由 dispatch_cursor_sdk 预载(relay 需要 meta,不经此
+        // 分派);此 arm 仅防御误接线
+        Protocol::CursorSdk => {
+            let message = "cursor_sdk stream must be dispatched via cursor relay".to_string();
+            futures::stream::once(async move { Ok(emit::error_event(&message)) }).boxed()
+        }
     };
     with_idle_keepalive(inner)
 }

@@ -27,9 +27,28 @@ secret_key: "sk-ccextra-xxx"
 # Codex 凭证目录(可选)。默认配置文件旁 .cache/codex。
 # codex_auth_dir: ".cache/codex"
 
-# Cursor 单凭证目录(可选)。默认配置文件旁 .cache/cursor。
-# 代理路径已移除,仅保留 cursor-login / cursor-status 凭证能力。
+# Cursor SDK sidecar(可选)。配置后启动 Node sidecar 嵌入 @cursor/sdk,
+# 自动发现账户模型目录并合成 name "cursor" provider(protocol: cursor_sdk)。
+# 凭证:在 cursor.com/settings → API Keys 生成 User API Key,写入
+# cursor_auth_dir/api_key.txt(单行裸 key,0600)。SDK 专用,优先于 cursor.json;
+# cursor-login 的 PKCE 凭证写 cursor.json,两者互不覆盖
+# (SDK 内部经 /auth/exchange_user_api_key 换 token,OAuth access token 不被接受)
+# 前置条件: Node >= 24,sidecar/cursor 已 npm ci(见 build.sh)。
 # cursor_auth_dir: ".cache/cursor"
+
+# Cursor 模型白名单(可选)。glob 或精确名;default 等价 auto;缺省/空 = 全量发布。
+# cursor_models:
+#   - "default"
+#   - "composer-*"
+
+# Cursor sidecar 空闲回收秒数(可选,默认 1800)。
+# cursor_sidecar_idle_secs: 1800
+
+# Cursor sidecar 最大并发 Agent 数(可选,默认 16)。
+# cursor_sidecar_max_agents: 16
+
+# Cursor SDK 工作目录(可选)。缺省 = 进程 cwd;支持 ~ 与相对配置文件目录。
+# cursor_workspace_dir: "~"
 
 # Antigravity 模型白名单(可选)。glob 或精确名;缺省/空 = 全量发布。
 # antigravity_models:

@@ -20,6 +20,13 @@ for pid in $(lsof -ti :8222 2>/dev/null || true); do
     kill "$pid" 2>/dev/null || true
 done
 
+# 清理 Cursor SDK sidecar 固定端口
+for pid in $(lsof -ti :8223 2>/dev/null || true); do
+    cmd=$(ps -p "$pid" -o command= 2>/dev/null | head -1 || true)
+    echo "Stopping Cursor sidecar on port 8223 (PID: $pid, cmd: $cmd)"
+    kill "$pid" 2>/dev/null || true
+done
+
 # 等待退出
 for i in $(seq 1 10); do
     CC_ALIVE=false
@@ -29,7 +36,7 @@ for i in $(seq 1 10); do
             break
         fi
     done
-    if ! $CC_ALIVE && ! lsof -ti :8222 >/dev/null 2>&1; then
+    if ! $CC_ALIVE && ! lsof -ti :8222 >/dev/null 2>&1 && ! lsof -ti :8223 >/dev/null 2>&1; then
         echo "ccextra stopped"
         break
     fi
@@ -45,6 +52,10 @@ for name in $CC_NAMES; do
 done
 for pid in $(lsof -ti :8222 2>/dev/null || true); do
     echo "Force killing process on port 8222 (PID: $pid)"
+    kill -9 "$pid" 2>/dev/null || true
+done
+for pid in $(lsof -ti :8223 2>/dev/null || true); do
+    echo "Force killing Cursor sidecar on port 8223 (PID: $pid)"
     kill -9 "$pid" 2>/dev/null || true
 done
 
