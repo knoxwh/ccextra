@@ -1055,10 +1055,6 @@ pub(crate) async fn dispatch_cursor_sdk(
             Some(Err(e)) => e.to_string(),
             None => "cursor sidecar 流在首帧前结束".to_string(),
         };
-        tracing::warn!(
-            upstream_model = %prepared.route.upstream_model,
-            "Cursor sidecar 首帧失败: {msg}"
-        );
         return Err(AppError::with_status(
             axum::http::StatusCode::BAD_GATEWAY,
             format!("cursor sidecar 首帧失败: {msg}"),
@@ -1089,19 +1085,6 @@ pub(crate) async fn deliver_response(
         let mut retry_after = parse_retry_after(failed.body.headers());
         let (err_bytes, err_truncated) =
             crate::limits::read_error_body_or_anthropic(failed.body, status).await?;
-        // 上游错误落日志:此前该路径静默,客户端报错时无从诊断
-        tracing::warn!(
-            provider = %prepared.route.provider,
-            protocol = ?prepared.route.protocol,
-            upstream_model = %prepared.route.upstream_model,
-            status = status.as_u16(),
-            retry_after_secs = retry_after.map(|ra| ra.as_secs()),
-            "上游错误: {}",
-            String::from_utf8_lossy(&err_bytes)
-                .chars()
-                .take(300)
-                .collect::<String>()
-        );
         let mut final_status = status;
         let mut final_bytes = err_bytes;
         let mut final_truncated = err_truncated;
