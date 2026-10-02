@@ -10,15 +10,16 @@ function unknown(reason) {
   return new Error(`unknown SDK event: ${reason}`);
 }
 
-/** usage 归一化:inputTokens/outputTokens 必填数字,cacheReadTokens 可选。 */
+/** usage 归一化:inputTokens/outputTokens 必填数字,cacheReadTokens/cacheWriteTokens 可选。 */
 export function normalizeUsage(raw) {
   if (!raw || typeof raw !== "object") throw unknown("invalid_usage");
-  const { inputTokens, outputTokens, cacheReadTokens } = raw;
+  const { inputTokens, outputTokens, cacheReadTokens, cacheWriteTokens } = raw;
   if (typeof inputTokens !== "number" || typeof outputTokens !== "number") {
     throw unknown("invalid_usage");
   }
   const usage = { input_tokens: inputTokens, output_tokens: outputTokens };
   if (typeof cacheReadTokens === "number") usage.cache_read_input_tokens = cacheReadTokens;
+  if (typeof cacheWriteTokens === "number") usage.cache_write_input_tokens = cacheWriteTokens;
   return usage;
 }
 

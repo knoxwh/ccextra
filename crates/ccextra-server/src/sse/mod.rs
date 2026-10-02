@@ -109,7 +109,9 @@ impl InitialResponseDelayState {
                     }
                     let deadline = tokio::time::sleep(self.delay);
                     tokio::pin!(deadline);
-                    let mut keepalive = tokio::time::interval(KEEPALIVE_INTERVAL.min(self.delay));
+                    // 心跳间隔固定 10s:取 min(delay) 会与 deadline 同时到期,
+                    // select 随机赢导致帧数不定;delay < 10s 时不插心跳
+                    let mut keepalive = tokio::time::interval(KEEPALIVE_INTERVAL);
                     keepalive.tick().await;
                     loop {
                         tokio::select! {

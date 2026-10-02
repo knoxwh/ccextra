@@ -52,3 +52,48 @@ test("http2 session tunnels through https_proxy pool", async () => {
     `CONNECT count ${count} not above prewarm ${POOL_SIZE}: ${JSON.stringify(connectRequests)}`,
   );
 });
+
+test("stale tunnels beyond TTL are discarded and rebuilt", async () => {
+  const connectRequests = [];
+  const proxy = http.createServer();
+  proxy.on("connect", (req, client) => {
+    connectRequests.push(req.url);
+    client.write("HTTP/1.1 200 Connection established\r\n\r\n");
+  });
+  await new Promise((resolve) => proxy.listen(0, "127.0.0.1", resolve));
+  const proxyPort = proxy.address().port;
+
+  const script = `
+    const { warmProxyPool } = await import("./proxy-tunnel.mjs");
+    warmProxyPool();
+    await new Promise((r) => setTimeout(r, 300));
+    const http2 = await import("node:http2");
+    http2.connect("https://tunnel-test.invalid");
+    await new Promise((r) => setTimeout(r, 800));
+    process.exit(0);
+  `;
+  const child = spawn(
+    process.execPath,
+    ["--input-type=module", "-e", script],
+    {
+      cwd: new URL(".", import.meta.url).pathname,
+      env: {
+        ...process.env,
+        https_proxy: `http://127.0.0.1:${proxyPort}`,
+        no_proxy: "",
+        NODE_USE_ENV_PROXY: "1",
+        CURSOR_BACKEND_URL: "https://tunnel-test.invalid",
+        CCEXTRA_TUNNEL_TTL_MS: "100",
+      },
+    },
+  );
+  await new Promise((resolve) => child.on("exit", resolve));
+  proxy.close();
+
+  const count = connectRequests.filter((u) => u === "tunnel-test.invalid:443").length;
+  // 预热 300ms 后全部超龄(TTL 100ms):消费必须新建隧道而非复用死隧道
+  assert.ok(
+    count > POOL_SIZE,
+    `CONNECT count ${count} not above prewarm ${POOL_SIZE}: ${JSON.stringify(connectRequests)}`,
+  );
+});

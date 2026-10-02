@@ -357,6 +357,40 @@ test("tool round trip parks, freezes batch, resumes on tool_result", async () =>
   assert.equal(journal.appended.at(-1).state, "clean");
 });
 
+test("second tool batch after continuation freezes again", async () => {
+  // 回归:continuation 不重置 frozen 时,续跑后第二个工具批次
+  // 被 freezeBatch 守卫拦截,流挂死到 idle 超时
+  const { sdk, journal, registry } = makeRegistry();
+  const tools = [{ name: "Read", description: "read", input_schema: { type: "object" } }];
+  const subscriber = fakeSubscriber();
+  await registry.run(baseRequest([{ role: "user", content: "read a" }], tools), subscriber);
+  const send = sdk.state.sends[0];
+  const pending = send.options.local.customTools.Read.execute({ path: "a" }, { toolCallId: "call-1" });
+  await settle(20);
+  assert.equal(subscriber.closed, true);
+  // 下一请求带 tool_result:延续同一 Run
+  const second = fakeSubscriber();
+  await registry.run(baseRequest([
+    { role: "user", content: "read a" },
+    { role: "assistant", content: [{ type: "tool_use", id: "call-1", name: "Read", input: { path: "a" } }] },
+    { role: "user", content: [{ type: "tool_result", tool_use_id: "call-1", content: "file body" }] },
+  ], tools), second);
+  assert.equal(await pending, "file body");
+  // 续跑后模型再调工具:必须再次冻结并关流
+  const pending2 = send.options.local.customTools.Read.execute({ path: "b" }, { toolCallId: "call-2" });
+  await settle(20);
+  assert.deepEqual(second.events, [
+    { type: "tool_use", id: "call-2", name: "Read", input: { path: "b" } },
+    { type: "turn_end", stop_reason: "tool_use" },
+  ]);
+  assert.equal(second.closed, true);
+  assert.equal(journal.appended.at(-1).state, "awaiting_tool_results");
+  // 收尾:abort 清挂起回调,避免 unhandled rejection
+  const actor = [...registry.actors.values()][0];
+  await actor.abort(actor.activeRun.runId, "test_cleanup");
+  await pending2.catch(() => {});
+});
+
 test("second concurrent request on same session returns 503", async () => {
   const { registry } = makeRegistry();
   const tools = [{ name: "Read", input_schema: {} }];

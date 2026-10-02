@@ -17,6 +17,9 @@ const noProxy = (process.env.no_proxy || process.env.NO_PROXY || "")
   .filter(Boolean);
 // SDK 会为 privacy/server-config/run 等并发建多个 h2 传输,池需覆盖突发
 const POOL_SIZE = 8;
+// 隧道最大复用年龄:代理(clash 等)会静默丢弃空闲 CONNECT 隧道(无 FIN,
+// 半开连接写缓冲成功但永无响应,SDK run 挂死到空闲超时),超龄隧道直接弃用
+const TUNNEL_TTL_MS = Number(process.env.CCEXTRA_TUNNEL_TTL_MS || 60_000);
 
 function shouldProxy(host) {
   if (!proxyRaw || !host) return false;
@@ -98,11 +101,11 @@ function refill(host, port) {
   entry.filling = true;
   buildTunnel(host, port)
     .then((sock) => {
-      entry.ready.push(sock);
+      entry.ready.push({ sock, born: Date.now() });
       entry.failures = 0;
       // 池内隧道被代理空闲超时关闭时移出队列,避免取到死隧道
       sock.once("close", () => {
-        const index = entry.ready.indexOf(sock);
+        const index = entry.ready.findIndex((item) => item.sock === sock);
         if (index !== -1) entry.ready.splice(index, 1);
       });
     })
@@ -121,14 +124,21 @@ function refill(host, port) {
 
 function takeTunnel(host, port) {
   const entry = pool.get(`${host}:${port}`);
-  // 跳过已被对端关闭的隧道(close 事件可能尚未派发)
-  let sock;
-  while ((sock = entry?.ready.shift())) {
-    if (!sock.destroyed && !sock.readableEnded) break;
-    sock = null;
+  // 跳过已被对端关闭或超龄的隧道(close 事件可能尚未派发)
+  let sock = null;
+  let item;
+  while ((item = entry?.ready.shift())) {
+    const candidate = item.sock;
+    if (candidate.destroyed || candidate.readableEnded) continue;
+    if (Date.now() - item.born > TUNNEL_TTL_MS) {
+      candidate.destroy();
+      continue;
+    }
+    sock = candidate;
+    break;
   }
   refill(host, port);
-  return sock ?? null;
+  return sock;
 }
 
 // 预热默认后端(SDK 未设 CURSOR_BACKEND_URL 时为 api2.cursor.sh)

@@ -1034,14 +1034,16 @@ pub(crate) async fn dispatch_cursor_sdk(
     }
 
     // 流式:relay + 首业务帧预读(跳过心跳;首帧 error 不提交 200)
-    let mut out = crate::cursor::relay_cursor_sdk_to_anthropic(
+    // 心跳与通用路径一致:xhigh 思考间隙上游无字节,缺心跳会触发客户端
+    // 空闲超时断连(Claude Code "check your network" 重试)
+    let mut out = crate::sse::with_idle_keepalive(crate::cursor::relay_cursor_sdk_to_anthropic(
         Box::pin(response.bytes_stream()),
         CursorRelayMeta {
             model: prepared.route.upstream_model.clone(),
             estimated_input_tokens: prepared.estimated_input_tokens.unwrap_or(0) as i64,
             token_scope: prepared.token_scope.clone(),
         },
-    );
+    ));
     let first = next_business_frame(&mut out).await;
     let bad = match &first {
         Some(Ok(frame)) => is_initial_sse_error(frame),
@@ -1053,6 +1055,10 @@ pub(crate) async fn dispatch_cursor_sdk(
             Some(Err(e)) => e.to_string(),
             None => "cursor sidecar 流在首帧前结束".to_string(),
         };
+        tracing::warn!(
+            upstream_model = %prepared.route.upstream_model,
+            "Cursor sidecar 首帧失败: {msg}"
+        );
         return Err(AppError::with_status(
             axum::http::StatusCode::BAD_GATEWAY,
             format!("cursor sidecar 首帧失败: {msg}"),
@@ -1083,6 +1089,19 @@ pub(crate) async fn deliver_response(
         let mut retry_after = parse_retry_after(failed.body.headers());
         let (err_bytes, err_truncated) =
             crate::limits::read_error_body_or_anthropic(failed.body, status).await?;
+        // 上游错误落日志:此前该路径静默,客户端报错时无从诊断
+        tracing::warn!(
+            provider = %prepared.route.provider,
+            protocol = ?prepared.route.protocol,
+            upstream_model = %prepared.route.upstream_model,
+            status = status.as_u16(),
+            retry_after_secs = retry_after.map(|ra| ra.as_secs()),
+            "上游错误: {}",
+            String::from_utf8_lossy(&err_bytes)
+                .chars()
+                .take(300)
+                .collect::<String>()
+        );
         let mut final_status = status;
         let mut final_bytes = err_bytes;
         let mut final_truncated = err_truncated;

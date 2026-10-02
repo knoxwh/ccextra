@@ -53,6 +53,7 @@ struct CursorRelay {
     usage_input: i64,
     usage_output: i64,
     usage_cached: i64,
+    usage_write: i64,
     usage_seen: bool,
     estimated_input: i64,
     token_scope: Option<TokenCacheScope>,
@@ -70,6 +71,7 @@ impl CursorRelay {
             usage_input: 0,
             usage_output: 0,
             usage_cached: 0,
+            usage_write: 0,
             usage_seen: false,
             estimated_input: meta.estimated_input_tokens,
             token_scope: meta.token_scope,
@@ -133,9 +135,16 @@ impl CursorRelay {
             .get("cache_read_input_tokens")
             .and_then(|v| v.as_i64())
             .unwrap_or(0);
-        self.usage_input = input;
+        let write = root
+            .get("cache_write_input_tokens")
+            .and_then(|v| v.as_i64())
+            .unwrap_or(0);
+        // Anthropic 语义:input_tokens 不含缓存读;SDK inputTokens 为含缓存总量,
+        // 扣除 cache_read(下限 0)。session token cache 仍记总量供 count_tokens
+        self.usage_input = (input - cached).max(0);
         self.usage_output = output;
         self.usage_cached = cached;
+        self.usage_write = write;
         self.usage_seen = true;
         if input > 0 {
             if let Some(scope) = self.token_scope.as_ref() {
@@ -153,18 +162,19 @@ impl CursorRelay {
         let id = root.get("id").and_then(|v| v.as_str()).unwrap_or("");
         let name = root.get("name").and_then(|v| v.as_str()).unwrap_or("");
         let input = root.get("input").cloned().unwrap_or(json!({}));
+        let input_json = input.to_string();
         let index = self.next_block_index;
         self.next_block_index += 1;
         frames.push(emit::content_block_start_tool_use(index, id, name));
-        frames.push(emit::content_block_delta_input_json(
-            index,
-            &input.to_string(),
-        ));
+        frames.push(emit::content_block_delta_input_json(index, &input_json));
         frames.push(emit::content_block_stop(index));
         frames
     }
 
     /// 统一收尾:close active + message_delta + message_stop
+    ///
+    /// usage 只透传 SDK 真实数字(对齐 Responses 协议:缺 usage 即 0,
+    /// 不估算);tool_use 回合 SDK 不报 usage,usage 落在下一请求流里
     fn finalize(&mut self, stop_reason: &str) -> Vec<Bytes> {
         if self.finished {
             return Vec::new();
@@ -177,7 +187,7 @@ impl CursorRelay {
             self.usage_input,
             self.usage_output,
             self.usage_cached,
-            0,
+            self.usage_write,
             -1,
         ));
         frames.push(emit::message_stop());
@@ -323,7 +333,8 @@ pub fn relay_cursor_sdk_to_anthropic(
 /// 非流聚合:sidecar SSE → Anthropic message JSON
 ///
 /// 聚合 text / thinking / tool_use / usage / terminal;error 事件与
-/// 缺失 turn_end 的残缺流都返回 AppError
+/// 缺失 turn_end 的残缺流都返回 AppError。usage 只透传 SDK 真实数字
+/// (对齐 Responses 协议:缺 usage 即 0,不估算)
 pub async fn collect_cursor_sdk_response(stream: CursorSdkStream) -> Result<Value, AppError> {
     let mut stream = stream;
     let mut parser = SseParser::new();
@@ -373,15 +384,22 @@ pub async fn collect_cursor_sdk_response(stream: CursorSdkStream) -> Result<Valu
                     }));
                 }
                 "usage" => {
+                    // input_tokens 扣除 cache_read(Anthropic 语义,SDK 报含缓存总量)
+                    let input = root.get("input_tokens").and_then(|v| v.as_i64()).unwrap_or(0);
+                    let output = root.get("output_tokens").and_then(|v| v.as_i64()).unwrap_or(0);
+                    let cached = root.get("cache_read_input_tokens").and_then(|v| v.as_i64()).unwrap_or(0);
                     usage = json!({
-                        "input_tokens": root.get("input_tokens").and_then(|v| v.as_i64()).unwrap_or(0),
-                        "output_tokens": root.get("output_tokens").and_then(|v| v.as_i64()).unwrap_or(0),
+                        "input_tokens": (input - cached).max(0),
+                        "output_tokens": output,
                     });
-                    if let Some(cached) =
-                        root.get("cache_read_input_tokens").and_then(|v| v.as_i64())
-                    {
-                        if cached > 0 {
-                            usage["cache_read_input_tokens"] = json!(cached);
+                    for (field, key) in [
+                        ("cache_read_input_tokens", "cache_read_input_tokens"),
+                        ("cache_write_input_tokens", "cache_creation_input_tokens"),
+                    ] {
+                        if let Some(value) = root.get(field).and_then(|v| v.as_i64()) {
+                            if value > 0 {
+                                usage[key] = json!(value);
+                            }
                         }
                     }
                 }
@@ -524,7 +542,7 @@ mod tests {
         let scope: TokenCacheScope = (cache.clone(), "session-1".into());
         let frames = [
             r#"{"type":"text_delta","text":"hi"}"#,
-            r#"{"type":"usage","input_tokens":42,"output_tokens":7}"#,
+            r#"{"type":"usage","input_tokens":42,"output_tokens":7,"cache_write_input_tokens":9}"#,
             r#"{"type":"turn_end","stop_reason":"end_turn"}"#,
         ];
         let stream = frame_stream(&frames);
@@ -535,7 +553,22 @@ mod tests {
         };
         let output = drain(relay_cursor_sdk_to_anthropic(stream, meta)).await;
         assert!(output.contains("\"input_tokens\":42"));
+        assert!(output.contains("\"cache_creation_input_tokens\":9"));
         assert_eq!(cache.lock().unwrap().get("session-1"), Some(42));
+    }
+
+    #[tokio::test]
+    async fn usage_input_excludes_cache_read() {
+        // Anthropic 语义:input_tokens 不含缓存读;SDK inputTokens 为总量 50 - 30 = 20
+        let frames = [
+            r#"{"type":"text_delta","text":"hi"}"#,
+            r#"{"type":"usage","input_tokens":50,"output_tokens":7,"cache_read_input_tokens":30}"#,
+            r#"{"type":"turn_end","stop_reason":"end_turn"}"#,
+        ];
+        let stream = frame_stream(&frames);
+        let output = drain(relay_cursor_sdk_to_anthropic(stream, meta())).await;
+        assert!(output.contains("\"input_tokens\":20"));
+        assert!(output.contains("\"cache_read_input_tokens\":30"));
     }
 
     #[tokio::test]
@@ -589,7 +622,7 @@ mod tests {
             r#"{"type":"thinking_delta","text":"ponder"}"#,
             r#"{"type":"text_delta","text":"hello"}"#,
             r#"{"type":"tool_use","id":"call-1","name":"Read","input":{"path":"a"}}"#,
-            r#"{"type":"usage","input_tokens":10,"output_tokens":5,"cache_read_input_tokens":3}"#,
+            r#"{"type":"usage","input_tokens":10,"output_tokens":5,"cache_read_input_tokens":3,"cache_write_input_tokens":2}"#,
             r#"{"type":"turn_end","stop_reason":"tool_use"}"#,
         ];
         let message = collect_cursor_sdk_response(frame_stream(&frames))
@@ -606,8 +639,60 @@ mod tests {
         assert_eq!(content[1]["text"], "hello");
         assert_eq!(content[2]["type"], "tool_use");
         assert_eq!(content[2]["id"], "call-1");
-        assert_eq!(message["usage"]["input_tokens"], 10);
+        assert_eq!(message["usage"]["input_tokens"], 7);
         assert_eq!(message["usage"]["cache_read_input_tokens"], 3);
+        assert_eq!(message["usage"]["cache_creation_input_tokens"], 2);
+    }
+
+    #[tokio::test]
+    async fn tool_turn_without_usage_reports_zero() {
+        // 对齐 Responses 协议:SDK 不报 usage 即 0,不估算
+        let frames = [
+            r#"{"type":"thinking_delta","text":"need weather"}"#,
+            r#"{"type":"tool_use","id":"call-1","name":"get_weather","input":{"city":"Tokyo"}}"#,
+            r#"{"type":"turn_end","stop_reason":"tool_use"}"#,
+        ];
+        let stream = frame_stream(&frames);
+        let meta = CursorRelayMeta {
+            model: "auto".into(),
+            estimated_input_tokens: 1200,
+            token_scope: None,
+        };
+        let output = drain(relay_cursor_sdk_to_anthropic(stream, meta)).await;
+        assert!(output.contains("\"input_tokens\":0"));
+        assert!(output.contains("\"output_tokens\":0"));
+    }
+
+    #[tokio::test]
+    async fn end_turn_usage_passthrough() {
+        let frames = [
+            r#"{"type":"text_delta","text":"hello world"}"#,
+            r#"{"type":"usage","input_tokens":42,"output_tokens":7}"#,
+            r#"{"type":"turn_end","stop_reason":"end_turn"}"#,
+        ];
+        let stream = frame_stream(&frames);
+        let meta = CursorRelayMeta {
+            model: "auto".into(),
+            estimated_input_tokens: 1200,
+            token_scope: None,
+        };
+        let output = drain(relay_cursor_sdk_to_anthropic(stream, meta)).await;
+        assert!(output.contains("\"input_tokens\":42"));
+        assert!(output.contains("\"output_tokens\":7"));
+    }
+
+    #[tokio::test]
+    async fn collect_without_usage_reports_zero() {
+        let frames = [
+            r#"{"type":"text_delta","text":"hello"}"#,
+            r#"{"type":"tool_use","id":"call-1","name":"Read","input":{"path":"a"}}"#,
+            r#"{"type":"turn_end","stop_reason":"tool_use"}"#,
+        ];
+        let message = collect_cursor_sdk_response(frame_stream(&frames))
+            .await
+            .unwrap();
+        assert_eq!(message["usage"]["input_tokens"], 0);
+        assert_eq!(message["usage"]["output_tokens"], 0);
     }
 
     #[tokio::test]

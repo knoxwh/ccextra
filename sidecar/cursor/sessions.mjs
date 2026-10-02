@@ -263,6 +263,10 @@ export class SessionActor {
         this.transcript = request.messages;
         this.turnHashes = computeTurnHashes(hashInput(request));
         active.subscriber = subscriber;
+        // 解冻:上一批次已冻结关流,续跑后模型再调工具需允许新批次冻结,
+        // 否则 freezeBatch 被 frozen 守卫拦截,流挂死到 180s idle 超时
+        active.frozen = false;
+        this.state = "active";
         this.touch();
         return { runId: active.runId, abort: (reason) => this.abort(active.runId, reason) };
       }
