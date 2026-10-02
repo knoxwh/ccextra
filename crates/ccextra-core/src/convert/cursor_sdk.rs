@@ -78,6 +78,7 @@ pub fn convert_to_cursor_sdk(
 /// upstream_model 可携带白名单固定参数("base:param=value,..."),固定值优先;
 /// 入站 thinking.type=enabled 映射词表 thinking 参数;effort(force_effort
 /// 优先,回退入站)钳到词表最近档,映射到 effort/reasoning/reasoning_effort。
+/// 词表含 fast 且未显式指定时补 fast=false(Cursor 缺省按 true 处理)。
 /// 参数按 id 排序,保证会话哈希稳定。
 fn resolve_model_params(
     upstream_model: &str,
@@ -119,6 +120,16 @@ fn resolve_model_params(
                 }
             }
         }
+    }
+
+    // fast 缺省关:Cursor 后端把缺省 fast 当 true(dashboard 显示 -fast 后缀),
+    // 显式补 fast=false 才走普通档;词表无 fast 或已钉参时不注入
+    if !params.iter().any(|(k, _)| k == "fast")
+        && vocab
+            .iter()
+            .any(|p| p.id == "fast" && p.values.iter().any(|v| v == "false"))
+    {
+        params.push(("fast".to_string(), "false".to_string()));
     }
 
     params.sort_by(|a, b| a.0.cmp(&b.0));
@@ -602,6 +613,49 @@ mod tests {
             out["modelParams"],
             json!([{ "id": "reasoning_effort", "value": "high" }])
         );
+    }
+
+    #[test]
+    fn fast_defaults_false_when_vocab_has_fast() {
+        let body = json!({
+            "model": "grok-4.7",
+            "messages": [{ "role": "user", "content": "hi" }]
+        });
+        let vocab = vec![
+            vocab("reasoning_effort", &["low", "high"]),
+            vocab("fast", &["false", "true"]),
+        ];
+        let out = convert_to_cursor_sdk(body, "grok-4.7", &workspace(), &vocab, &[]).unwrap();
+        assert_eq!(
+            out["modelParams"],
+            json!([{ "id": "fast", "value": "false" }])
+        );
+    }
+
+    #[test]
+    fn pinned_fast_true_wins_over_default() {
+        let body = json!({
+            "model": "grok-4.7",
+            "messages": [{ "role": "user", "content": "hi" }]
+        });
+        let vocab = vec![vocab("fast", &["false", "true"])];
+        let out = convert_to_cursor_sdk(body, "grok-4.7:fast=true", &workspace(), &vocab, &[])
+            .unwrap();
+        assert_eq!(
+            out["modelParams"],
+            json!([{ "id": "fast", "value": "true" }])
+        );
+    }
+
+    #[test]
+    fn no_fast_param_without_vocab_fast() {
+        let body = json!({
+            "model": "grok-4.7",
+            "messages": [{ "role": "user", "content": "hi" }]
+        });
+        let vocab = vec![vocab("reasoning_effort", &["low", "high"])];
+        let out = convert_to_cursor_sdk(body, "grok-4.7", &workspace(), &vocab, &[]).unwrap();
+        assert_eq!(out["modelParams"], json!([]));
     }
 
     #[test]
