@@ -132,7 +132,7 @@ function takeTunnel(host, port) {
 }
 
 // 预热默认后端(SDK 未设 CURSOR_BACKEND_URL 时为 api2.cursor.sh)
-{
+export function warmProxyPool() {
   const backend = process.env.CURSOR_BACKEND_URL || "https://api2.cursor.sh";
   const url = new URL(backend);
   if (shouldProxy(url.hostname)) refill(url.hostname, url.port || 443);

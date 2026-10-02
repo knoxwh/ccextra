@@ -229,6 +229,7 @@ test("process entry emits a single READY frame on stdout", async () => {
       ...process.env,
       CCEXTRA_CURSOR_TOKEN: "ready-token",
       CCEXTRA_CURSOR_AUTH_DIR: authDir,
+      CCEXTRA_CURSOR_PORT: "0",
     },
     stdio: ["ignore", "pipe", "pipe"],
   });
@@ -249,15 +250,19 @@ test("process entry emits a single READY frame on stdout", async () => {
     });
     const frame = JSON.parse(firstLine);
     assert.equal(frame.event, "ready");
-    assert.equal(frame.port, 8223);
+    assert.ok(frame.port > 0);
+    assert.notEqual(frame.port, 8223);
     // READY 后 /health 可用且要求 token
     const response = await fetch(`http://127.0.0.1:${frame.port}/health`, {
       headers: { authorization: "Bearer ready-token" },
     });
     assert.equal(response.status, 200);
   } finally {
-    child.kill("SIGTERM");
-    await new Promise((resolve) => child.on("exit", resolve));
+    if (child.exitCode === null && child.signalCode === null) {
+      const exited = new Promise((resolve) => child.once("exit", resolve));
+      child.kill("SIGTERM");
+      await exited;
+    }
     await rm(authDir, { recursive: true, force: true });
   }
 });
@@ -278,6 +283,7 @@ test("startup compacts journal to 32 sessions before READY", async () => {
       ...process.env,
       CCEXTRA_CURSOR_TOKEN: "compact-token",
       CCEXTRA_CURSOR_AUTH_DIR: authDir,
+      CCEXTRA_CURSOR_PORT: "0",
     },
     stdio: ["ignore", "pipe", "pipe"],
   });
@@ -309,8 +315,11 @@ test("startup compacts journal to 32 sessions before READY", async () => {
     assert.equal(keys[0], "s-8");
     assert.equal(keys[31], "s-39");
   } finally {
-    child.kill("SIGTERM");
-    await new Promise((resolve) => child.on("exit", resolve));
+    if (child.exitCode === null && child.signalCode === null) {
+      const exited = new Promise((resolve) => child.once("exit", resolve));
+      child.kill("SIGTERM");
+      await exited;
+    }
     await rm(authDir, { recursive: true, force: true });
   }
 });

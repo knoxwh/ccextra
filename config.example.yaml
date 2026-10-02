@@ -39,7 +39,8 @@ secret_key: "sk-ccextra-xxx"
 # Cursor 模型白名单(可选)。glob 或精确名;default 等价 auto;缺省/空 = 全量发布。
 # 条目可钉固定参数 "id:param=value,param=value"(须在 SDK 目录词表内),
 # 如 "auto-smart:optimize_for=intelligence";入站 thinking/effort 按词表
-# 自动映射为 modelParams(词表无 thinking/effort 参数则忽略)。
+# 自动映射为 modelParams(词表无 thinking/effort 参数则忽略)。固定参数 id 会
+# 按模型词表归一 effort/reasoning_effort 与 auto-smart 的 mode/optimize_for 别名。
 # cursor_models:
 #   - "default"
 #   - "composer-*"

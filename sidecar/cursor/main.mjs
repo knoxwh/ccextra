@@ -1,6 +1,6 @@
 // main.mjs:sidecar 入口。HTTP server + Bearer 鉴权 + 请求分派。
 // stdout 只允许一行 READY 帧;日志全部 stderr。
-import "./proxy-tunnel.mjs";
+import { warmProxyPool } from "./proxy-tunnel.mjs";
 import http from "node:http";
 import { join } from "node:path";
 import { isAbsolute } from "node:path";
@@ -224,6 +224,8 @@ export async function main() {
   const journal = new Journal(join(authDir, "sessions.jsonl"));
   // compact 必须在 HTTP server 接收请求前完成
   const journalIndex = await restoreJournalIndex(journal);
+  // 代理隧道预热放在入口,避免测试导入模块时建立真实网络连接
+  warmProxyPool();
   const sdkModule = await import("@cursor/sdk");
   const adapter = createSdkAdapter(loadSdk(sdkModule));
   const registry = new SessionRegistry({

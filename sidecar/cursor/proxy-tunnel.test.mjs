@@ -20,7 +20,8 @@ test("http2 session tunnels through https_proxy pool", async () => {
   const proxyPort = proxy.address().port;
 
   const script = `
-    await import("./proxy-tunnel.mjs");
+    const { warmProxyPool } = await import("./proxy-tunnel.mjs");
+    warmProxyPool();
     await new Promise((r) => setTimeout(r, 300));
     const http2 = await import("node:http2");
     http2.connect("https://tunnel-test.invalid");

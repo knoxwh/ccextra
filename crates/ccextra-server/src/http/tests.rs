@@ -3039,9 +3039,10 @@ async fn test_cursor_sdk_non_stream_aggregates_anthropic_json() {
     assert_eq!(message["model"], "auto");
     assert_eq!(message["stop_reason"], "end_turn");
     let content = message["content"].as_array().unwrap();
-    assert_eq!(content[0]["type"], "text");
-    assert_eq!(content[0]["text"], "hello");
-    assert_eq!(content[1]["type"], "thinking");
+    assert_eq!(content[0]["type"], "thinking");
+    assert_eq!(content[0]["thinking"], "ponder");
+    assert_eq!(content[1]["type"], "text");
+    assert_eq!(content[1]["text"], "hello");
     assert_eq!(message["usage"]["input_tokens"], 10);
     // 非流聚合也写 session cache
     assert_eq!(

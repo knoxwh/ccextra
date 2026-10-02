@@ -189,8 +189,15 @@ impl CursorRelay {
         if self.finished {
             return Vec::new();
         }
+        let mut frames = Vec::new();
+        if self.started {
+            self.close_active_block(&mut frames);
+            frames.push(emit::message_delta_incomplete());
+            frames.push(emit::message_stop());
+        }
+        frames.push(emit::error_event(message));
         self.finished = true;
-        vec![emit::error_event(message)]
+        frames
     }
 
     /// EOF 兜底:未见 turn_end 的残缺流转 error
@@ -409,14 +416,14 @@ pub async fn collect_cursor_sdk_response(stream: CursorSdkStream) -> Result<Valu
             "cursor sidecar stream ended without turn_end".to_string(),
         ));
     };
+    if !text_parts.is_empty() {
+        content.insert(0, json!({"type": "text", "text": text_parts.concat()}));
+    }
     if !thinking_parts.is_empty() {
         content.insert(
             0,
             json!({"type": "thinking", "thinking": thinking_parts.concat()}),
         );
-    }
-    if !text_parts.is_empty() {
-        content.insert(0, json!({"type": "text", "text": text_parts.concat()}));
     }
     Ok(json!({
         "id": id,
@@ -541,8 +548,12 @@ mod tests {
         let output = drain(relay_cursor_sdk_to_anthropic(stream, meta())).await;
         assert!(output.contains("event: error"));
         assert!(output.contains("boom"));
-        // error 后不得追加成功事件
-        assert!(!output.contains("event: message_stop"));
+        // 先闭合当前块，再发终止事件，最后发 error
+        assert!(output.contains("event: content_block_stop"));
+        assert!(output.contains("event: message_delta"));
+        assert!(output.contains("\"stop_reason\":null"));
+        assert!(output.contains("event: message_stop"));
+        assert!(output.find("event: message_stop") < output.find("event: error"));
     }
 
     #[tokio::test]
@@ -550,7 +561,11 @@ mod tests {
         let frames = [r#"{"type":"text_delta","text":"partial"}"#];
         let stream = frame_stream(&frames);
         let output = drain(relay_cursor_sdk_to_anthropic(stream, meta())).await;
-        assert!(output.contains("event: error"));
+        assert!(output.contains("event: content_block_stop"));
+        assert!(output.contains("event: message_delta"));
+        assert!(output.contains("\"stop_reason\":null"));
+        assert!(output.contains("event: message_stop"));
+        assert!(output.find("event: message_stop") < output.find("event: error"));
         assert!(output.contains("without turn_end"));
     }
 
@@ -585,10 +600,10 @@ mod tests {
         assert_eq!(message["stop_reason"], "tool_use");
         let content = message["content"].as_array().unwrap();
         assert_eq!(content.len(), 3);
-        assert_eq!(content[0]["type"], "text");
-        assert_eq!(content[0]["text"], "hello");
-        assert_eq!(content[1]["type"], "thinking");
-        assert_eq!(content[1]["thinking"], "ponder");
+        assert_eq!(content[0]["type"], "thinking");
+        assert_eq!(content[0]["thinking"], "ponder");
+        assert_eq!(content[1]["type"], "text");
+        assert_eq!(content[1]["text"], "hello");
         assert_eq!(content[2]["type"], "tool_use");
         assert_eq!(content[2]["id"], "call-1");
         assert_eq!(message["usage"]["input_tokens"], 10);

@@ -85,7 +85,11 @@ fn resolve_model_params(
     vocab: &[CursorParamVocab],
     registry: &[ModelCapability],
 ) -> (String, Vec<Value>) {
-    let (base, mut params) = split_pinned_params(upstream_model);
+    let (base, pinned) = split_pinned_params(upstream_model);
+    let mut params = pinned
+        .into_iter()
+        .map(|(id, value)| (canonicalize_param_id(&base, &id, vocab), value))
+        .collect::<Vec<_>>();
 
     let thinking_enabled = body
         .get("thinking")
@@ -143,6 +147,23 @@ fn split_pinned_params(upstream_model: &str) -> (String, Vec<(String, String)>) 
         }
     }
     (base.to_string(), pinned)
+}
+
+/// 按当前模型词表归一 Cursor 参数别名,避免固定参数使用旧名称
+fn canonicalize_param_id(model: &str, id: &str, vocab: &[CursorParamVocab]) -> String {
+    let supports = |candidate: &str| vocab.iter().any(|param| param.id == candidate);
+    match id {
+        "effort" if !supports("effort") && supports("reasoning_effort") => {
+            "reasoning_effort".to_string()
+        }
+        "reasoning_effort" if !supports("reasoning_effort") && supports("effort") => {
+            "effort".to_string()
+        }
+        "mode" if model == "auto-smart" && !supports("mode") && supports("optimize_for") => {
+            "optimize_for".to_string()
+        }
+        _ => id.to_string(),
+    }
 }
 
 /// effort 钳到词表最近值(tie 取低);词表无可排序值或 effort 非法 → None。
@@ -528,6 +549,36 @@ mod tests {
         assert_eq!(
             out["modelParams"],
             json!([{ "id": "effort", "value": "max" }])
+        );
+    }
+
+    #[test]
+    fn pinned_effort_alias_uses_catalog_parameter_name() {
+        let body = json!({
+            "model": "grok-4.7",
+            "messages": [{ "role": "user", "content": "hi" }]
+        });
+        let vocab = vec![vocab("reasoning_effort", &["low", "high"])];
+        let out =
+            convert_to_cursor_sdk(body, "grok-4.7:effort=high", &workspace(), &vocab, &[]).unwrap();
+        assert_eq!(
+            out["modelParams"],
+            json!([{ "id": "reasoning_effort", "value": "high" }])
+        );
+    }
+
+    #[test]
+    fn auto_smart_mode_alias_uses_optimize_for() {
+        let body = json!({
+            "model": "auto-smart",
+            "messages": [{ "role": "user", "content": "hi" }]
+        });
+        let vocab = vec![vocab("optimize_for", &["speed", "quality"])];
+        let out = convert_to_cursor_sdk(body, "auto-smart:mode=speed", &workspace(), &vocab, &[])
+            .unwrap();
+        assert_eq!(
+            out["modelParams"],
+            json!([{ "id": "optimize_for", "value": "speed" }])
         );
     }
 
