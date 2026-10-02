@@ -24,11 +24,105 @@ use futures::StreamExt;
 use std::collections::HashMap;
 use std::io;
 use std::pin::Pin;
-use std::sync::Arc;
-use std::time::Duration;
+use std::sync::{Arc, Mutex};
+use std::time::{Duration, Instant};
 
 /// 统一响应流类型:可 Send 的固定字节流
 pub type SseStreamPin = Pin<Box<dyn Stream<Item = Result<Bytes, io::Error>> + Send>>;
+
+type InitialResponseKey = (String, Option<String>);
+type ClaimEntry = (Instant, u64);
+
+const INITIAL_RESPONSE_DELAY_CAPACITY: usize = 512;
+const INITIAL_RESPONSE_DELAY_TTL: Duration = Duration::from_secs(30 * 60);
+
+#[derive(Clone)]
+pub struct InitialResponseDelayState {
+    claimed: Arc<Mutex<HashMap<InitialResponseKey, ClaimEntry>>>,
+    next_sequence: Arc<Mutex<u64>>,
+    delay: Duration,
+}
+
+impl InitialResponseDelayState {
+    pub fn new(delay: Duration) -> Self {
+        Self {
+            claimed: Arc::new(Mutex::new(HashMap::new())),
+            next_sequence: Arc::new(Mutex::new(0)),
+            delay,
+        }
+    }
+
+    pub fn claim(&self, session_id: &str, thread_id: Option<&str>) -> bool {
+        self.claim_at(session_id, thread_id, Instant::now())
+    }
+
+    fn claim_at(&self, session_id: &str, thread_id: Option<&str>, now: Instant) -> bool {
+        let key = (session_id.to_string(), thread_id.map(str::to_string));
+        let mut claimed = self.claimed.lock().expect("首请求状态锁不应中毒");
+        if let Some((written_at, _)) = claimed.get(&key).copied() {
+            if now.saturating_duration_since(written_at) < INITIAL_RESPONSE_DELAY_TTL {
+                return false;
+            }
+        }
+
+        let mut seq_guard = self.next_sequence.lock().expect("首请求序号锁不应中毒");
+        let sequence = *seq_guard;
+        *seq_guard = seq_guard.wrapping_add(1);
+        drop(seq_guard);
+
+        claimed.insert(key, (now, sequence));
+        if claimed.len() > INITIAL_RESPONSE_DELAY_CAPACITY {
+            if let Some(oldest) = claimed
+                .iter()
+                .min_by_key(|(_, (_, sequence))| *sequence)
+                .map(|(k, _)| k.clone())
+            {
+                claimed.remove(&oldest);
+            }
+        }
+        true
+    }
+
+    pub async fn wait(&self) {
+        tokio::time::sleep(self.delay).await;
+    }
+
+    /// 新身份(会话+thread)首个响应压住 message_stop 3s:
+    /// 客户端要等流收尾才发下一请求,故延迟第二个请求的发出时间。
+    pub fn hold_message_stop(
+        self,
+        stream: SseStreamPin,
+        key: (String, Option<String>),
+    ) -> SseStreamPin
+    where
+        Self: 'static,
+    {
+        Box::pin(async_stream::stream! {
+            let mut stream = stream;
+            while let Some(item) = stream.next().await {
+                let should_delay = item.as_ref()
+                    .is_ok_and(|bytes| bytes.starts_with(b"event: message_stop"));
+                if should_delay && self.claim(&key.0, key.1.as_deref()) {
+                    if self.delay.is_zero() {
+                        yield item;
+                        continue;
+                    }
+                    let deadline = tokio::time::sleep(self.delay);
+                    tokio::pin!(deadline);
+                    let mut keepalive = tokio::time::interval(KEEPALIVE_INTERVAL.min(self.delay));
+                    keepalive.tick().await;
+                    loop {
+                        tokio::select! {
+                            _ = &mut deadline => break,
+                            _ = keepalive.tick() => yield Ok(Bytes::from_static(KEEPALIVE_FRAME.as_bytes())),
+                        }
+                    }
+                }
+                yield item;
+            }
+        })
+    }
+}
 
 /// 空闲心跳间隔与心跳帧。
 /// 长 reasoning 期间上游可能几十秒不出 delta,客户端/中间 LB 会掐空闲连接;
@@ -276,6 +370,65 @@ mod tests {
         let d4 = frames.iter().position(|f| f == "d4").unwrap();
         let after = frames.iter().position(|f| f == "after").unwrap();
         assert!(d4 < after, "顺序不得被心跳打乱: {frames:?}");
+    }
+
+    #[test]
+    fn initial_response_delay_claims_identity_once() {
+        let state = InitialResponseDelayState::new(Duration::ZERO);
+        assert!(state.claim("session", Some("subagent")));
+        assert!(!state.claim("session", Some("subagent")));
+        assert!(state.claim("session", Some("other")));
+    }
+
+    #[test]
+    fn initial_response_delay_evicts_lru_and_ttl() {
+        let state = InitialResponseDelayState::new(Duration::ZERO);
+        let start = Instant::now();
+
+        assert!(state.claim_at("s1", None, start));
+        assert!(!state.claim_at("s1", None, start + Duration::from_secs(60)));
+        // 超过 TTL 可再次 claim
+        assert!(state.claim_at(
+            "s1",
+            None,
+            start + INITIAL_RESPONSE_DELAY_TTL + Duration::from_secs(1)
+        ));
+
+        // 填满容量淘汰最久条目(s1 是最旧序号)
+        for i in 0..INITIAL_RESPONSE_DELAY_CAPACITY {
+            assert!(state.claim_at(&format!("fill-{i}"), None, start));
+        }
+        // 刚插入的还在
+        assert!(!state.claim_at("fill-511", None, start));
+        // 最旧 s1 已被逐出，未过 TTL 亦可重新 claim
+        assert!(state.claim_at("s1", None, start));
+    }
+
+    /// 首身份 message_stop 被压住 3s 且帧序与内容不变;同身份第二次不再压
+    #[tokio::test(start_paused = true)]
+    async fn hold_message_stop_delays_once_and_preserves_frames() {
+        let state = InitialResponseDelayState::new(Duration::from_secs(3));
+        let key = ("session".to_string(), Some("subagent".to_string()));
+        let frames = || {
+            Box::pin(futures::stream::iter(vec![
+                Ok(Bytes::from_static(b"event: message_start\ndata: {}\n\n")),
+                Ok(Bytes::from_static(
+                    b"event: content_block_delta\ndata: {}\n\n",
+                )),
+                Ok(Bytes::from_static(b"event: message_stop\ndata: {}\n\n")),
+            ])) as SseStreamPin
+        };
+
+        let started = tokio::time::Instant::now();
+        let first = drain(state.clone().hold_message_stop(frames(), key.clone())).await;
+        assert!(started.elapsed() >= Duration::from_secs(3));
+        assert_eq!(first.len(), 3);
+        assert!(first[2].contains("event: message_stop"));
+
+        let started = tokio::time::Instant::now();
+        let second = drain(state.hold_message_stop(frames(), key)).await;
+        assert_eq!(started.elapsed(), Duration::ZERO);
+        assert_eq!(second, first);
     }
 
     #[tokio::test(start_paused = true)]

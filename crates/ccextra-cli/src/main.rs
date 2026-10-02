@@ -384,6 +384,9 @@ async fn main() -> Result<()> {
         last_input_tokens: Arc::new(std::sync::Mutex::new(
             ccextra_server::http::session_tokens::SessionTokenCache::new(),
         )),
+        initial_response_delay: ccextra_server::sse::InitialResponseDelayState::new(
+            std::time::Duration::from_secs(3),
+        ),
         cursor: Arc::new(std::sync::RwLock::new(cursor_runtime)),
     };
 

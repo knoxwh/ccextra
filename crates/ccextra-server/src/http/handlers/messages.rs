@@ -283,6 +283,7 @@ pub(crate) struct PreparedMessageRequest {
     pub replay_scope: Option<(crate::sse::replay_cache::ReplayCache, String, String)>,
     pub signature_model: Option<Arc<str>>,
     pub token_scope: Option<crate::http::session_tokens::TokenCacheScope>,
+    pub initial_response_delay_key: Option<(String, Option<String>)>,
 }
 
 pub(crate) struct ExecutedUpstream {
@@ -737,6 +738,8 @@ pub(crate) async fn prepare_message_request(
         (cc_session.as_deref(), extract_claude_code_thread(headers))
     } else if is_grok && matches!(route.protocol, Protocol::OpenAiChat) {
         (cc_session.as_deref(), None)
+    } else if matches!(route.protocol, Protocol::Antigravity) {
+        (cc_session.as_deref(), extract_claude_code_thread(headers))
     } else if matches!(route.protocol, Protocol::CursorSdk) {
         // usage 写 session token cache + count_tokens 复用
         (cc_session.as_deref(), None)
@@ -769,6 +772,12 @@ pub(crate) async fn prepare_message_request(
     let signature_model: Option<Arc<str>> = matches!(route.protocol, Protocol::Antigravity)
         .then(|| Arc::from(route.upstream_model.as_str()));
 
+    let initial_response_delay_key = if matches!(route.protocol, Protocol::Antigravity) {
+        session_id.map(|session| (session.to_string(), thread_id.clone()))
+    } else {
+        None
+    };
+
     Ok(PreparedMessageRequest {
         route,
         body_json,
@@ -785,6 +794,7 @@ pub(crate) async fn prepare_message_request(
         tool_names,
         replay_scope,
         signature_model,
+        initial_response_delay_key,
         token_scope: session_id
             .map(|session| (Arc::clone(&state.last_input_tokens), session.to_string())),
     })
@@ -1136,7 +1146,7 @@ pub(crate) async fn deliver_response(
 
     // 响应转换
     if prepared.is_stream {
-        let out = if let Some(out) = executed.preloaded_stream {
+        let mut out = if let Some(out) = executed.preloaded_stream {
             out
         } else {
             let upstream = executed.upstream.take().expect("上游响应应存在");
@@ -1150,6 +1160,13 @@ pub(crate) async fn deliver_response(
                 prepared.token_scope.clone(),
             )
         };
+        // Antigravity 新身份首个响应压住 message_stop,推迟客户端下一请求
+        if let Some(key) = prepared.initial_response_delay_key.clone() {
+            out = state
+                .initial_response_delay
+                .clone()
+                .hold_message_stop(out, key);
+        }
         Ok(Response::builder()
             .status(status)
             .header(header::CONTENT_TYPE, "text/event-stream")
@@ -1283,6 +1300,11 @@ pub(crate) async fn deliver_response(
             .and_then(|out| serde_json::to_vec(&out).ok())
             .map(Bytes::from)
             .unwrap_or(body_bytes);
+        if let Some(key) = prepared.initial_response_delay_key.as_ref() {
+            if state.initial_response_delay.claim(&key.0, key.1.as_deref()) {
+                state.initial_response_delay.wait().await;
+            }
+        }
         Ok(Response::builder()
             .status(status)
             .header(header::CONTENT_TYPE, "application/json")
