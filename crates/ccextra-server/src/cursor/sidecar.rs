@@ -540,7 +540,8 @@ mod tests {
         let config = CursorSidecarConfig {
             sidecar_dir,
             auth_dir: auth.path().to_path_buf(),
-            port: 8223,
+            // 动态端口与运行中的生产 sidecar 隔离
+            port: 0,
             // 缩短巡检间隔,加速 kill 重启断言
             health_interval: Duration::from_millis(200),
             restart_backoff: Duration::from_secs(1),
@@ -548,7 +549,15 @@ mod tests {
         let sidecar = CursorSidecar::start(config).await.unwrap();
         // READY 握手成功后 /health 可用
         assert!(sidecar.health().await);
-        assert!(tokio::net::TcpStream::connect(("127.0.0.1", 8223))
+        let port = sidecar
+            .run(&serde_json::json!({}))
+            .await
+            .unwrap()
+            .url()
+            .port()
+            .unwrap();
+        assert_ne!(port, DEFAULT_SIDECAR_PORT);
+        assert!(tokio::net::TcpStream::connect(("127.0.0.1", port))
             .await
             .is_ok());
 
@@ -570,12 +579,21 @@ mod tests {
         let new_pid = sidecar.child_pid().await.unwrap();
         assert_ne!(pid, new_pid, "monitor must spawn a new child process");
 
+        // 重启会重新分配端口,使用当前客户端的实际地址检查关闭
+        let port = sidecar
+            .run(&serde_json::json!({}))
+            .await
+            .unwrap()
+            .url()
+            .port()
+            .unwrap();
+        assert_ne!(port, DEFAULT_SIDECAR_PORT);
         // shutdown 后 /run 返回 NotReady(映射 503)
         sidecar.shutdown().await;
         assert!(!sidecar.health().await);
         assert!(tokio::time::timeout(
             Duration::from_secs(1),
-            tokio::net::TcpStream::connect(("127.0.0.1", 8223)),
+            tokio::net::TcpStream::connect(("127.0.0.1", port)),
         )
         .await
         .is_ok_and(|result| result.is_err()));
