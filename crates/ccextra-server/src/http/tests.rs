@@ -16,7 +16,7 @@ mod snapshot;
 // 测试用默认 User-Agent 值
 const TEST_CLAUDE_CLI: &str = "claude-cli/2.1.258";
 const TEST_CODEX_TUI: &str = "codex_cli_rs/0.153.3 (Mac OS 26.6.2; arm64)";
-const TEST_GROK_VERSION: &str = "1.0.5";
+const TEST_GROK_VERSION: &str = "1.0.46";
 const TEST_ANTIGRAVITY: &str = "antigravity/hub/2.10.0 darwin/arm64";
 
 fn test_user_agents() -> UserAgentSet {
@@ -2000,8 +2000,8 @@ models:
     assert_eq!(status, StatusCode::OK);
     let ua = captured.header("user-agent").unwrap_or_default();
     assert!(
-        ua.starts_with("grok-shell/1.0.5 ("),
-        "UA 应为 grok-shell,实际 {ua}"
+        ua.starts_with("grok-pager/1.0.46 grok-shell/1.0.46 ("),
+        "UA 应为交互式 Grok CLI,实际 {ua}"
     );
     assert_eq!(
         captured.header("x-xai-token-auth").as_deref(),
@@ -2009,12 +2009,17 @@ models:
     );
     assert_eq!(
         captured.header("x-grok-client-version").as_deref(),
-        Some("1.0.5")
+        Some("1.0.46")
     );
     assert_eq!(
         captured.header("x-grok-client-identifier").as_deref(),
-        Some("grok-shell")
+        Some("grok-pager")
     );
+    assert_eq!(
+        captured.header("x-grok-client-mode").as_deref(),
+        Some("interactive")
+    );
+    assert!(!captured.has_header("x-authenticateresponse"));
     assert_eq!(
         captured.header("x-grok-model-override").as_deref(),
         Some("grok-4.6")
@@ -2097,7 +2102,7 @@ models:
 
     assert_eq!(status, StatusCode::OK);
     let ua = captured.header("user-agent").unwrap_or_default();
-    assert!(ua.starts_with("grok-shell/1.0.5 ("));
+    assert!(ua.starts_with("grok-pager/1.0.46 grok-shell/1.0.46 ("));
     assert_eq!(
         captured.header("x-xai-token-auth").as_deref(),
         Some("xai-grok-cli")
@@ -2187,8 +2192,8 @@ models:
     assert_eq!(captured.body()["model"], "grok-4.6");
     let ua = captured.header("user-agent").unwrap_or_default();
     assert!(
-        ua.starts_with("grok-shell/1.0.5 ("),
-        "UA 应为 grok-shell,实际 {ua}"
+        ua.starts_with("grok-pager/1.0.46 grok-shell/1.0.46 ("),
+        "UA 应为交互式 Grok CLI,实际 {ua}"
     );
     assert_eq!(
         captured.header("x-grok-model-override").as_deref(),
@@ -2654,6 +2659,52 @@ async fn test_codex_provider_sends_account_id_header() {
         ua.starts_with("codex_cli_rs/"),
         "UA 应为 codex CLI,实际 {ua}"
     );
+}
+
+#[tokio::test]
+async fn test_responses_payload_tier_is_serialized_before_input() {
+    let (server, captured) = spawn_captured_server(
+        "/responses",
+        StatusCode::OK,
+        json!({
+            "id": "resp_routing", "model": "gpt-5",
+            "output": [{"type": "message", "content": [{"type": "output_text", "text": "ok"}]}],
+            "usage": {"input_tokens": 1, "output_tokens": 1}
+        })
+        .to_string(),
+    )
+    .await;
+    let state = mock_state();
+    let provider: ProviderConfig = serde_yaml::from_str(&format!(
+        "name: routing-test\nprotocol: openai_responses\nbase_url: '{}'\nkey: sk-test\nproxy_url: direct\nmodels:\n  - name: gpt-5\n    alias: routing-test\n", server.url
+    )).unwrap();
+    {
+        let mut config = state.config.write().await;
+        let snapshot = Arc::make_mut(&mut config);
+        snapshot.providers.push(provider);
+        snapshot.payload_rules = serde_yaml::from_str(
+            "- models: ['*']\n  protocol: openai_responses\n  params:\n    service_tier: priority\n"
+        ).unwrap();
+    }
+    let request = Request::builder()
+        .uri("/v1/messages")
+        .method("POST")
+        .header("content-type", "application/json")
+        .body(Body::from(
+            json!({
+                "model": "routing-test", "max_tokens": 64, "stream": false,
+                "messages": [{"role": "user", "content": "hi"}]
+            })
+            .to_string(),
+        ))
+        .unwrap();
+    let response = app(state).oneshot(request).await.unwrap();
+    assert_eq!(response.status(), StatusCode::OK);
+    let raw = captured.raw_body.lock().unwrap().clone().unwrap();
+    assert!(std::str::from_utf8(&raw).unwrap().starts_with(
+        r#"{"model":"gpt-5","stream":false,"service_tier":"priority","instructions":"#
+    ));
+    assert_eq!(captured.body()["service_tier"], "priority");
 }
 
 #[tokio::test]

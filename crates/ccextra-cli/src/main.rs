@@ -963,7 +963,7 @@ fn cmd_codex_status(config_path: &str, auth_dir: Option<String>) -> Result<()> {
 fn build_user_agents(config: Option<&config::UserAgents>) -> UserAgentSet {
     const DEFAULT_CLAUDE_CLI: &str = "claude-cli/2.1.258";
     const DEFAULT_CODEX_TUI: &str = "codex_cli_rs/0.153.3 (Mac OS 26.6.2; arm64)";
-    const DEFAULT_GROK_VERSION: &str = "1.0.5";
+    const DEFAULT_GROK_VERSION: &str = "1.0.46";
     const DEFAULT_ANTIGRAVITY: &str = "antigravity/hub/2.10.0 darwin/arm64";
 
     UserAgentSet {
@@ -1002,6 +1002,17 @@ mod tests {
     use ccextra_server::xai::resolve_auth_dir as resolve_xai_auth_dir;
     use std::io::Write;
     use std::path::PathBuf;
+
+    #[test]
+    fn grok_identity_defaults_to_current_pin_and_preserves_override() {
+        assert_eq!(build_user_agents(None).grok_version.as_str(), "1.0.46");
+        let config: super::config::UserAgents =
+            serde_yaml::from_str("grok_version: '1.0.44'").unwrap();
+        assert_eq!(
+            build_user_agents(Some(&config)).grok_version.as_str(),
+            "1.0.44"
+        );
+    }
 
     fn refresh_state() -> Arc<RwLock<Arc<ccextra_server::http::ConfigSnapshot>>> {
         use ccextra_server::http::{ConfigSnapshot, LoggingConfig, NormalizeConfig};

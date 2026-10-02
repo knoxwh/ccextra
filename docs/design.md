@@ -61,7 +61,7 @@ ccextra 将 Anthropic Messages 入口接到不同上游协议，同时尽量保�
 
 ### OpenAI Chat
 
-Anthropic `system` 成为 system message；o 系列（`o1-mini`/`o1-preview` 除外）、GPT-5 族、`gpt-6-astra` 及其日期快照改用 `developer`。这些模型把 `max_tokens` 改发为 `max_completion_tokens`；o 系列删除 `temperature`，GPT-5 仅在 `gpt-5.1`/`gpt-5.2`/`gpt-5.4` 无 reasoning 时保留采样，Astra 永不发 `temperature`/`top_p`。全量 `openai_chat` 模型剥除 Claude system triggers 与 prompt reminder。Kimi K2.8 模型（`kimi-k2.8`/`kimi-k2.8-code`）将 reasoning 映射为 `thinking.type`/`effort`，显式 `none` 绕过 clamp，并守卫 temperature（disabled 限 0.6，enabled/default 限 1.0）。用户、助手、图片、工具调用和工具结果转换为 Chat Completions 形状。工具 `input_schema` 中的 `required: null` 仅在 schema 节点删除；原本缺省的 `required` 仍按现有规则补 `[]`，显式 null 不补。`tool_choice.disable_parallel_tool_use` 映射为 `parallel_tool_calls: false`（未显式关闭不写，OpenAI 默认开）。`thinking` 映射为受模型能力限制的 `reasoning_effort` 或兼容的 reasoning 内容。无等价物的 Claude server-side web search 工具会删除。
+Anthropic `system` 成为 system message；o 系列（`o1-mini`/`o1-preview` 除外）、GPT-5 族、`gpt-6-astra` 及其日期快照改用 `developer`。这些模型把 `max_tokens` 改发为 `max_completion_tokens`；o 系列删除 `temperature`，GPT-5 仅在 `gpt-5.1`/`gpt-5.2`/`gpt-5.4` 无 reasoning 时保留采样，Astra 永不发 `temperature`/`top_p`。全量 `openai_chat` 模型剥除 Claude system triggers 与 prompt reminder。Kimi K2.8 模型（`kimi-k2.8`/`kimi-k2.8-code`）将 reasoning 映射为 `thinking.type`/`effort`，显式 `none` 绕过 clamp，并守卫 temperature（disabled 限 0.6，enabled/default 限 1.0）。用户、助手、图片、工具调用和工具结果转换为 Chat Completions 形状。工具 `input_schema` 中的 `required: null` 仅在 schema 节点删除；原本缺省的 `required` 仍按现有规则补 `[]`，显式 null 不补。对齐 CPA `4b4a4448`，schema 位置的 `true`（根、properties/$defs、items 和联合分支）转为 `{}`；`false`、布尔 `additionalProperties`、`default` 和 `enum` 实例数据保持不变。`tool_choice.disable_parallel_tool_use` 映射为 `parallel_tool_calls: false`（未显式关闭不写，OpenAI 默认开）。`thinking` 映射为受模型能力限制的 `reasoning_effort` 或兼容的 reasoning 内容。无等价物的 Claude server-side web search 工具会删除。
 
 ### OpenAI Responses
 
@@ -99,6 +99,10 @@ Cursor 走本地 Node sidecar 而非 HTTP 反代。凭证是 **User API Key**（
 | **Cursor SDK** | 剥离 | 剥离 | 剥离 | 剥离 | 保留 | 全量发送时以 `system:\n<prompt>` 前缀拼进 run 正文（SDK `systemPrompt` 选项账号门控不可用）；suffix 续跑不拼 |
 
 ## 传输与可靠性
+
+Responses 的最终 body 在 payload 覆盖后、zstd 压缩前序列化，对齐 codex `ed0cc1a4ab`，顶层按 `model`、`stream`、已有 `service_tier` 排在 instructions/input 前，避免增量解析网关先缓冲多 MiB prompt。缺失字段不补，显式值不改；其余顶层键与全部嵌套数据保持原顺序，不克隆大 input。Claude、Chat、Gemini 和 Antigravity 的序列化字节不受影响。
+
+Grok 交互身份对齐 sub2api `ad05eda15`：Chat/Responses 的 identifier 为 `grok-pager`，mode 为 `interactive`，UA 为 `grok-pager/{version} grok-shell/{version} ({os}; {arch})`。默认版本 `1.0.46`，已有 `user_agents.grok_version` 覆盖原样保留；不新增版本钳制。`x-authenticateresponse: authenticate-response` 仅解析后 host 等于 `cli-chat-proxy.grok.com` 时添加，不匹配子域或路径字面量；既有模型/协议门控与 session/doom-loop 语义不变。
 
 `UpstreamClient` 按最终代理地址缓存 `reqwest::Client`。请求使用协议对应 URL、认证和 User-Agent：Gemini 使用 `x-goog-api-key`，其他协议使用 Bearer；Responses 的 GPT 请求带 Codex 会话头，Grok 请求带 CLI 身份头和会话亲和 `x-grok-conv-id`。连接池空闲 90s（对齐 grok；流 chunk idle 为服务当前设置 180s，不是池寿命）。`send()` 等到响应头最多 60s。流式路径在转换前对上游 `stream.next()` 套 180s chunk idle，超时发 Anthropic error，不套 `Client::timeout` 掐整条 SSE。复用连接死亡（reset/broken pipe/提前关闭）立刻重试一次；普通建连失败/建连超时不属于死连接，交给 URL 回退，避免单 URL 建连超时被内部重试放大。`build()` 失败返回错误，不回落到默认 Client。
 

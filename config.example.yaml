@@ -10,7 +10,7 @@ server:
 user_agents:
   claude_cli: "claude-cli/2.1.258"
   codex_tui: "codex_cli_rs/0.153.3 (Mac OS 26.6.2; arm64)"
-  grok_version: "1.0.5"
+  grok_version: "1.0.46"
   antigravity: "antigravity/hub/2.10.0 darwin/arm64"
 
 # 入口 secret key(可选)。配置后 /v1/messages、/v1/messages/count_tokens 与

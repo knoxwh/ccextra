@@ -181,7 +181,8 @@ curl -H "Authorization: Bearer $ANTHROPIC_AUTH_TOKEN" \
 
 请求经过入口认证、模型路由、归一化、协议转换和参数覆盖后发送上游。OpenAI 路径按配置注入 `prompt_cache_key`，Gemini 和 Antigravity 不运行 OpenAI 专用处理。
 
-- **请求兼容**：OpenAI Chat/Responses 转换时删除工具 schema 中的 `required: null`，不改 `default` 等实例数据；Antigravity 将 system 开头的 Claude Agent SDK/Claude Code 身份句中和，保留后续指令。Claude 原生直通不受影响。
+- **请求兼容**：OpenAI Chat/Responses 转换时删除工具 schema 中的 `required: null`，不改 `default` 等实例数据；Chat 另将 schema 位置的 `true` 转为 `{}`，保留 `false` 和布尔 `additionalProperties`。Responses 线上 JSON 前置 `model`、`stream` 与已有的 `service_tier`，其余字段和嵌套内容不变。Antigravity 将 system 开头的 Claude Agent SDK/Claude Code 身份句中和，保留后续指令。Claude 原生直通不受影响。
+- **Grok 身份**：Chat/Responses 使用 `grok-pager` 标识、`interactive` 模式和双组件 UA；`user_agents.grok_version` 默认 `1.0.46`，显式配置仍优先。仅官方 `cli-chat-proxy.grok.com` 添加 `x-authenticateresponse: authenticate-response`。
 - **流式响应**：Claude 正文字节直通，其他协议转换为 Anthropic SSE；所有流式路径使用 10 秒 `: keepalive`。
 - **重试与回退**：429/5xx（含 52x）与网络错误在同轮内轮转多 `base_url`，耗尽后快速失败，把末次上游错误返给客户端；退避重试交客户端（如 Claude Code），上游 `Retry-After` 头透传。流式首帧预读跳过 `: keepalive` 心跳帧；首帧 error 内部重试一次，仍失败返回 502 错误而非提交 200。正常生成不被截断。
 - **读取边界**：非流成功正文上限 16 MiB，错误正文最多保留 256 KiB，读取 idle 为 180 秒。成功正文超限返回 502、停顿返回 504；错误正文读取异常保留已知状态，再按统一错误规则映射。OAuth、project 和模型读取仍保留 30 秒总超时。

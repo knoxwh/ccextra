@@ -60,6 +60,34 @@ fn codex_routing_hint(upstream_model: &str, body: &serde_json::Value) -> Option<
     Some(hint)
 }
 
+/// Responses 路由字段先发(对齐 codex ed0cc1a4ab)，不克隆大 input 或改动其余键序。
+fn serialize_request_body(
+    protocol: Protocol,
+    body: &serde_json::Value,
+) -> serde_json::Result<Vec<u8>> {
+    use serde::ser::{SerializeMap, Serializer};
+    let Some(object) = body
+        .as_object()
+        .filter(|_| matches!(protocol, Protocol::OpenAiResponses))
+    else {
+        return serde_json::to_vec(body);
+    };
+    let mut serializer = serde_json::Serializer::new(Vec::new());
+    let mut map = serializer.serialize_map(Some(object.len()))?;
+    for key in ["model", "stream", "service_tier"] {
+        if let Some(value) = object.get(key) {
+            map.serialize_entry(key, value)?;
+        }
+    }
+    for (key, value) in object {
+        if !matches!(key.as_str(), "model" | "stream" | "service_tier") {
+            map.serialize_entry(key, value)?;
+        }
+    }
+    map.end()?;
+    Ok(serializer.into_inner())
+}
+
 /// codex 订阅请求体 zstd 压缩(对齐 codex prepare_encoded_json:level 3,
 /// debug 记录压缩前后字节与耗时)。ccextra 的 codex extra_headers 由
 /// messages.rs 新建仅含 chatgpt-account-id,不存在 Content-Encoding
@@ -110,9 +138,10 @@ fn endpoint_path(protocol: Protocol, is_stream: bool) -> String {
 
 /// Grok CLI 身份头常量
 /// Token-Auth 对齐 grok-build GrokAuthCredentials (`xai-grok-cli`);
-/// version/identifier 对齐 grok-shell,不在 sampler GrokRequestHeaders 里
+/// identifier/mode 对齐 sub2api ad05eda15 的官方交互式 CLI 抓包。
 const GROK_TOKEN_AUTH: &str = "xai-grok-cli";
-const GROK_CLIENT_IDENTIFIER: &str = "grok-shell";
+const GROK_CLIENT_IDENTIFIER: &str = "grok-pager";
+const GROK_CLIENT_MODE: &str = "interactive";
 
 /// 模型名是否为 GPT/Codex 模型(对齐 ccextra_core::convert::to_openai_responses::is_gpt_upstream)
 pub(crate) fn is_gpt_model(upstream_model: &str) -> bool {
@@ -124,8 +153,8 @@ pub(crate) fn is_grok_model(upstream_model: &str) -> bool {
     upstream_model.to_ascii_lowercase().contains("grok")
 }
 
-/// grok chat/responses 出站头(手术对齐 grok-build)
-/// Token-Auth/version/identifier 来自 GrokAuthCredentials + grok-shell;
+/// grok chat/responses 出站头(会话语义对齐 grok-build，交互身份对齐 sub2api)
+/// Token-Auth 来自 GrokAuthCredentials，version/identifier/mode 来自 CLI 身份;
 /// conv-id/model-override 来自 GrokRequestHeaders(不发 req-id/session-id/agent-id/turn-idx)
 /// 非 grok 或非 chat/responses 返回空,conv-id 仅 session trim 非空才带,doom-loop 仅 responses
 fn grok_cli_headers(
@@ -146,6 +175,7 @@ fn grok_cli_headers(
             "x-grok-client-identifier",
             GROK_CLIENT_IDENTIFIER.to_string(),
         ),
+        ("x-grok-client-mode", GROK_CLIENT_MODE.to_string()),
         ("x-grok-model-override", upstream_model.to_string()),
     ];
     if let Some(sid) = session_id {
@@ -164,7 +194,7 @@ fn grok_cli_headers(
 /// 按协议+模型取 User-Agent(对齐上游期望的客户端标识)
 ///
 /// 仅 responses + *gpt* 用 Codex UA;chat 或 responses + *grok* 用 Grok CLI UA
-/// (对齐 grok-shell `{name}/{ver} ({os}; {arch})`);其余用 claude-cli
+/// (对齐 sub2api CLIUserAgent 的双组件 UA);其余用 claude-cli
 /// 部分上游按 UA 分流缓存/特性,reqwest 默认 UA 会被识别为非官方客户端。
 fn user_agent(
     protocol: Protocol,
@@ -187,10 +217,10 @@ fn user_agent(
         }
         Protocol::OpenAiChat | Protocol::OpenAiResponses if is_grok_model(upstream_model) => {
             format!(
-                "grok-shell/{} ({}; {})",
-                user_agents.grok_version,
+                "grok-pager/{version} grok-shell/{version} ({}; {})",
                 std::env::consts::OS,
-                std::env::consts::ARCH
+                std::env::consts::ARCH,
+                version = user_agents.grok_version
             )
         }
         _ => user_agents.claude_cli.to_string(),
@@ -459,7 +489,8 @@ impl UpstreamClient {
         // 对齐 codex EncodedJsonBody:一次序列化,Bytes 共享分配;
         // stale-connection 重试复用同一份字节,不重复序列化
         let body_bytes = bytes::Bytes::from(
-            serde_json::to_vec(body).map_err(|e| anyhow::anyhow!("序列化请求体失败: {e}"))?,
+            serialize_request_body(protocol, body)
+                .map_err(|e| anyhow::anyhow!("序列化请求体失败: {e}"))?,
         );
         // 对齐 codex responses_request_compression:仅 codex OAuth 订阅请求
         // (uses_codex_backend + openai provider 的等价标记 chatgpt-account-id)
@@ -594,6 +625,14 @@ impl UpstreamClient {
             &user_agents.grok_version,
         );
         if !grok_headers.is_empty() {
+            // 对齐 sub2api ApplyCLIProxyHeaders:仅官方 host 请求携带响应认证标记。
+            if reqwest::Url::parse(&url).is_ok_and(|parsed| {
+                parsed
+                    .host_str()
+                    .is_some_and(|host| host.eq_ignore_ascii_case("cli-chat-proxy.grok.com"))
+            }) {
+                req = req.header("x-authenticateresponse", "authenticate-response");
+            }
             tracing::debug!(
                 session_id = ?session_id,
                 upstream_model = upstream_model,
@@ -609,7 +648,7 @@ impl UpstreamClient {
             req = req.header(name, value);
         }
         // 已编码字节直接发送(对齐 codex prepare_body_for_send:补 Content-Type,
-        // Bytes clone 零拷贝);线上字节与 reqwest .json() 等价
+        // Bytes clone 零拷贝);仅 Responses 顶层路由键前置，字段值不变
         // codex 订阅请求 body 已在 request() 内 zstd 压缩,声明编码
         if codex_subscription {
             req = req.header(reqwest::header::CONTENT_ENCODING, "zstd");
@@ -756,7 +795,7 @@ mod tests {
             CODEX_CLI
         );
         let grok_ua = user_agent(Protocol::OpenAiResponses, "grok-4.6", &uas, None);
-        assert!(grok_ua.starts_with("grok-shell/1.0.5 ("));
+        assert!(grok_ua.starts_with("grok-pager/1.0.5 grok-shell/1.0.5 ("));
         assert_eq!(
             user_agent(Protocol::OpenAiChat, "grok-4.6", &uas, None),
             grok_ua
@@ -810,7 +849,11 @@ mod tests {
         );
         assert_eq!(
             h.get("x-grok-client-identifier").map(String::as_str),
-            Some("grok-shell")
+            Some("grok-pager")
+        );
+        assert_eq!(
+            h.get("x-grok-client-mode").map(String::as_str),
+            Some("interactive")
         );
         assert_eq!(
             h.get("x-grok-model-override").map(String::as_str),
@@ -889,6 +932,84 @@ mod tests {
     fn test_grok_cli_headers_empty_model_skips_override() {
         // 空模型名不含 grok,整组头都不发(override 无从谈起)
         assert!(grok_cli_headers(Protocol::OpenAiChat, "", Some("sess"), "1.0.5").is_empty());
+    }
+
+    #[tokio::test]
+    async fn grok_authenticate_response_is_limited_to_official_host() {
+        use crate::test_support::spawn_captured_server;
+        for (host, protocol, model, expected) in [
+            (
+                "cli-chat-proxy.grok.com",
+                Protocol::OpenAiChat,
+                "grok-4.7",
+                Some("authenticate-response"),
+            ),
+            (
+                "CLI-CHAT-PROXY.GROK.COM",
+                Protocol::OpenAiResponses,
+                "grok-4.7",
+                Some("authenticate-response"),
+            ),
+            ("api.x.ai", Protocol::OpenAiResponses, "grok-4.7", None),
+            (
+                "cli-chat-proxy.grok.com.example.com",
+                Protocol::OpenAiResponses,
+                "grok-4.7",
+                None,
+            ),
+            (
+                "cli-chat-proxy.grok.com",
+                Protocol::OpenAiResponses,
+                "gpt-5",
+                None,
+            ),
+            (
+                "cli-chat-proxy.grok.com",
+                Protocol::Claude,
+                "grok-4.7",
+                None,
+            ),
+        ] {
+            let (server, captured) = spawn_captured_server(
+                &endpoint_path(protocol, false),
+                axum::http::StatusCode::OK,
+                "{}",
+            )
+            .await;
+            let addr: std::net::SocketAddr =
+                server.url.trim_start_matches("http://").parse().unwrap();
+            let client = UpstreamClient::new(None);
+            client.clients.lock().unwrap().insert(
+                ("direct".into(), false, false),
+                Client::builder()
+                    .no_proxy()
+                    .resolve(&host.to_ascii_lowercase(), addr)
+                    .build()
+                    .unwrap(),
+            );
+            let result = client
+                .request(
+                    &format!("http://{host}:{}", addr.port()),
+                    "sk-test",
+                    protocol,
+                    Some("direct"),
+                    &serde_json::json!({"model": model}),
+                    false,
+                    None,
+                    None,
+                    &axum::http::HeaderMap::new(),
+                    &mock_user_agents(),
+                    None,
+                )
+                .await
+                .unwrap();
+            assert_eq!(result.status, axum::http::StatusCode::OK);
+            assert_eq!(
+                captured.header("x-authenticateresponse").as_deref(),
+                expected,
+                "{host} {protocol:?} {model}"
+            );
+        }
     }
 
     #[test]
@@ -1317,6 +1438,128 @@ mod tests {
             serde_yaml::from_str("connection-pool:\n  enabled: true\n  idle-conn-timeout: \"0s\"")
                 .unwrap();
         assert!(AntigravityPoolSettings::resolve(Some(&cfg)).short_mode);
+    }
+
+    #[tokio::test]
+    async fn responses_routing_fields_precede_large_input_on_the_wire() {
+        use crate::test_support::{CapturedUpstream, TestServer};
+        for (tier, subscription) in [
+            (None, false),
+            (Some("priority"), false),
+            (Some("priority"), true),
+        ] {
+            let captured = CapturedUpstream::default();
+            let cap = captured.clone();
+            let server = TestServer::spawn(
+                axum::Router::new()
+                    .route(
+                        "/responses",
+                        axum::routing::post(
+                            move |headers: axum::http::HeaderMap, body: bytes::Bytes| {
+                                let cap = cap.clone();
+                                async move {
+                                    cap.record(headers, body);
+                                    "{}"
+                                }
+                            },
+                        ),
+                    )
+                    .layer(axum::extract::DefaultBodyLimit::max(4 * 1024 * 1024)),
+            )
+            .await;
+            let mut body = serde_json::json!({
+                "instructions": "Say hi",
+                "input": [{"type": "message", "role": "user", "content": [
+                    {"type": "input_text", "text": "x".repeat(2 * 1024 * 1024)}
+                ]}],
+                "tools": [{"z": 1, "a": 2}],
+                "model": "gpt-test",
+                "stream": true
+            });
+            if let Some(tier) = tier {
+                body["service_tier"] = tier.into();
+            }
+            let original = serde_json::to_vec(&body).unwrap();
+            let mut extra = axum::http::HeaderMap::new();
+            if subscription {
+                extra.insert("chatgpt-account-id", "acct-123".parse().unwrap());
+            }
+            let response = UpstreamClient::new(None)
+                .request(
+                    &server.url,
+                    "sk-test",
+                    Protocol::OpenAiResponses,
+                    Some("direct"),
+                    &body,
+                    true,
+                    None,
+                    None,
+                    &extra,
+                    &mock_user_agents(),
+                    None,
+                )
+                .await
+                .unwrap();
+            assert_eq!(response.status, axum::http::StatusCode::OK);
+            assert_eq!(
+                captured.header("content-encoding").as_deref(),
+                subscription.then_some("zstd")
+            );
+            let raw = captured.raw_body.lock().unwrap().clone().unwrap();
+            let decoded = if subscription {
+                zstd::stream::decode_all(&raw[..]).unwrap()
+            } else {
+                raw.to_vec()
+            };
+            let wire = std::str::from_utf8(&decoded).unwrap();
+            let prefix = if tier.is_some() {
+                r#"{"model":"gpt-test","stream":true,"service_tier":"priority","instructions":"Say hi","input":"#
+            } else {
+                r#"{"model":"gpt-test","stream":true,"instructions":"Say hi","input":"#
+            };
+            assert!(
+                wire.starts_with(prefix),
+                "路由字段必须在 input 前，subscription={subscription}, tier={tier:?}"
+            );
+            assert!(wire.ends_with(r#""tools":[{"z":1,"a":2}]}"#));
+            assert!(decoded.len() > 2 * 1024 * 1024);
+            assert_eq!(
+                serde_json::from_slice::<serde_json::Value>(&decoded).unwrap(),
+                body
+            );
+            assert_eq!(serde_json::to_vec(&body).unwrap(), original);
+        }
+    }
+
+    #[test]
+    fn request_serialization_preserves_other_protocols_and_missing_fields() {
+        let body = serde_json::json!({
+            "input": [{"z": 1, "a": 2}], "service_tier": null, "stream": false, "model": "test"
+        });
+        let original = serde_json::to_vec(&body).unwrap();
+        for protocol in [
+            Protocol::Claude,
+            Protocol::OpenAiChat,
+            Protocol::Gemini,
+            Protocol::Antigravity,
+        ] {
+            assert_eq!(serialize_request_body(protocol, &body).unwrap(), original);
+        }
+        assert_eq!(
+            std::str::from_utf8(&serialize_request_body(Protocol::OpenAiResponses, &body).unwrap())
+                .unwrap(),
+            r#"{"model":"test","stream":false,"service_tier":null,"input":[{"z":1,"a":2}]}"#
+        );
+        for body in [
+            serde_json::json!({"input": []}),
+            serde_json::json!({}),
+            serde_json::json!(null),
+        ] {
+            assert_eq!(
+                serialize_request_body(Protocol::OpenAiResponses, &body).unwrap(),
+                serde_json::to_vec(&body).unwrap()
+            );
+        }
     }
 
     #[test]

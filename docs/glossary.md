@@ -85,7 +85,10 @@ OpenAI Chat 或 Responses 的 provider 级缓存桶标识。来自 Claude Code �
 ## 运行时术语
 
 **UpstreamClient**
-按最终代理地址缓存 `reqwest::Client` 的发送器。它选择协议端点、认证、User-Agent、Grok 会话头和流式头。
+按最终代理地址缓存 `reqwest::Client` 的发送器。它选择协议端点、认证、User-Agent、Grok 会话头和流式头。Responses 序列化时先发顶层 `model`、`stream` 和已有 `service_tier`，供网关在大 input 到达前路由；其余键序与值不变。
+
+**Grok CLI 身份**
+Grok Chat/Responses 请求使用 `x-grok-client-identifier: grok-pager`、`x-grok-client-mode: interactive` 与 `grok-pager/{version} grok-shell/{version} ({os}; {arch})`。版本默认 `1.0.46`，可由 `user_agents.grok_version` 覆盖；`x-authenticateresponse: authenticate-response` 仅官方 `cli-chat-proxy.grok.com` 添加，不用于普通 API 或其他模型/协议。
 
 **重试与回退**
 messages 路径不做本地退避：429/5xx（含 52x）与网络错误在同轮内轮转多 `base_url`，耗尽后快速失败，把末次上游错误返给客户端，透传 `Retry-After`，退避重试交客户端（如 Claude Code）。流式首帧 error 内部重试一次，仍失败返回 502，不提交 200。
@@ -118,7 +121,7 @@ Antigravity 请求的外层对象，含 `model`、`request`、`project`、`reque
 Gemini 函数调用模式。Antigravity Claude 模型强制使用；Gemini 直连在任一工具带 `strict: true` 且 tool_choice 为 auto/缺省时使用。其工具 schema 需要可验证的 object properties，因此清洗器会补必要占位字段。
 
 **schema 清洗**
-将 Anthropic `input_schema` 转成 Gemini 或 Antigravity 可接受 JSON Schema 的递归过程。它内联本地引用、移除不支持关键字、归一化布尔 `true` 子 schema、处理 enum 和 required，并为不同目标采用不同规则；Gemini 直连保留 `additionalProperties` 与标准约束，Antigravity 搬入 description 提示。声明 `items` 但缺 `type` 的节点补 `type: array`；`type` 显式不是 `array` 时去掉 `items`。OpenAI Chat/Responses 转换另会删除 schema 节点中的 `required: null`，保留实例数据中的同名字段。
+将 Anthropic `input_schema` 转成 Gemini 或 Antigravity 可接受 JSON Schema 的递归过程。它内联本地引用、移除不支持关键字、归一化布尔 `true` 子 schema、处理 enum 和 required，并为不同目标采用不同规则；Gemini 直连保留 `additionalProperties` 与标准约束，Antigravity 搬入 description 提示。声明 `items` 但缺 `type` 的节点补 `type: array`；`type` 显式不是 `array` 时去掉 `items`。OpenAI Chat/Responses 转换另会删除 schema 节点中的 `required: null`，保留实例数据中的同名字段。Chat 将 schema 位置的 `true` 转为空对象，保留 `false`、布尔 `additionalProperties` 与 `default`/`enum` 实例数据。
 
 **OAuth 动态 provider**
 由保存的 Antigravity、xAI、Codex 或 Cursor 凭证生成的运行时 provider。Antigravity 后台刷新模型；xAI 与 Codex 在启动和重载时扫描、刷新凭证。Codex 请求携带 `Chatgpt-Account-Id` 订阅身份头；Cursor 合成固定 name `cursor` 的 `cursor_sdk` provider。

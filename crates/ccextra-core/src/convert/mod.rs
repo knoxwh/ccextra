@@ -116,10 +116,11 @@ pub fn is_web_search_tool_type(tool_type: &str) -> bool {
     matches!(tool_type, "web_search_20250305" | "web_search_20260209")
 }
 
-/// type:object 节点递归补 properties:{}(部分 OpenAI 兼容上游要求 object schema 必须带 properties)。
+/// object 节点补 properties:{}；schema true 转 {}，保留 false 和布尔 additionalProperties。
 pub fn normalize_object_schema_properties(schema: serde_json::Value) -> serde_json::Value {
     use serde_json::Value;
     match schema {
+        Value::Bool(true) => serde_json::json!({}),
         Value::Object(mut map) => {
             let is_object_type = map
                 .get("type")
@@ -162,6 +163,10 @@ pub fn normalize_object_schema_properties(schema: serde_json::Value) -> serde_js
             for val_key in SCHEMA_VALUE_KEYWORDS {
                 if let Some(val) = map.get_mut(*val_key) {
                     match val {
+                        Value::Bool(true) if *val_key != "additionalProperties" => {
+                            // 对齐 CPA 4b4a4448:additionalProperties 的布尔开关不改。
+                            *val = serde_json::json!({});
+                        }
                         Value::Object(_) => {
                             let taken = std::mem::take(val);
                             *val = normalize_object_schema_properties(taken);
@@ -376,6 +381,64 @@ mod tests {
         let props = out["patternProperties"].as_object().unwrap();
         assert_eq!(props.len(), 1, "只应保留合法键: {props:?}");
         assert!(props.contains_key("^[a-z]+$"));
+    }
+
+    #[test]
+    fn test_normalize_object_schema_properties_boolean_subschemas() {
+        // 对齐 CPA 4b4a4448:只归一化 schema，保留拒绝约束和布尔实例数据。
+        let schema = serde_json::json!({
+            "type": "object",
+            "properties": {
+                "patch": {"type": "array", "items": true},
+                "anything": true,
+                "disabled": false,
+                "enabled_flag": {"type": "boolean", "default": true, "enum": [true, false]},
+                "either": {"anyOf": [true, false, {"type": "string"}]},
+                "nested_obj": {"type": "object", "additionalProperties": true}
+            },
+            "additionalProperties": false,
+            "$defs": {"wildcard": true},
+            "default": {"properties": {"anything": true}, "items": true}
+        });
+        let out = normalize_object_schema_properties(schema);
+        for path in [
+            "/properties/patch/items",
+            "/properties/anything",
+            "/properties/either/anyOf/0",
+            "/$defs/wildcard",
+        ] {
+            assert_eq!(out.pointer(path), Some(&serde_json::json!({})), "{path}");
+        }
+        assert_eq!(out["properties"]["disabled"], false);
+        assert_eq!(out["properties"]["either"]["anyOf"][1], false);
+        assert_eq!(out["additionalProperties"], false);
+        assert_eq!(
+            out["properties"]["nested_obj"]["additionalProperties"],
+            true
+        );
+        assert_eq!(out["properties"]["enabled_flag"]["default"], true);
+        assert_eq!(
+            out["properties"]["enabled_flag"]["enum"],
+            serde_json::json!([true, false])
+        );
+        assert_eq!(
+            out["default"],
+            serde_json::json!({
+                "properties": {"anything": true}, "items": true
+            })
+        );
+        assert_eq!(
+            normalize_object_schema_properties(serde_json::json!(true)),
+            serde_json::json!({})
+        );
+        assert_eq!(
+            normalize_object_schema_properties(serde_json::json!(false)),
+            false
+        );
+        assert_eq!(
+            serde_json::to_string(&normalize_object_schema_properties(out.clone())).unwrap(),
+            serde_json::to_string(&out).unwrap()
+        );
     }
 
     #[test]

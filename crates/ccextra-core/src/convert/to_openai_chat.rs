@@ -752,6 +752,37 @@ mod tests {
     }
 
     #[test]
+    fn test_tool_schema_normalizes_boolean_subschemas() {
+        let mut body = json!({
+            "messages": [{"role": "user", "content": "hello"}],
+            "tools": [{"name": "patch_tool", "input_schema": {
+                "type": "object",
+                "properties": {
+                    "patch": {"type": "array", "items": true},
+                    "anything": true,
+                    "disabled": false,
+                    "flag": {"type": "boolean", "default": true, "enum": [true, false]},
+                    "either": {"anyOf": [true, {"type": "string"}]},
+                    "nested": {"type": "object", "additionalProperties": true}
+                },
+                "additionalProperties": false,
+                "$defs": {"wildcard": true}
+            }}]
+        });
+        convert_to_openai_chat(&mut body, "gpt-4").unwrap();
+        let schema = &body["tools"][0]["function"]["parameters"];
+        assert_eq!(schema["properties"]["patch"]["items"], json!({}));
+        assert_eq!(schema["properties"]["anything"], json!({}));
+        assert_eq!(schema["properties"]["either"]["anyOf"][0], json!({}));
+        assert_eq!(schema["$defs"]["wildcard"], json!({}));
+        assert_eq!(schema["properties"]["disabled"], false);
+        assert_eq!(schema["additionalProperties"], false);
+        assert_eq!(schema["properties"]["nested"]["additionalProperties"], true);
+        assert_eq!(schema["properties"]["flag"]["default"], true);
+        assert_eq!(schema["properties"]["flag"]["enum"], json!([true, false]));
+    }
+
+    #[test]
     fn test_tool_schema_drops_null_required() {
         let mut body = json!({
             "messages": [],

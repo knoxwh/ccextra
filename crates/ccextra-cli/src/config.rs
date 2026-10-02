@@ -62,7 +62,7 @@ pub struct UserAgents {
     pub claude_cli: Option<String>,
     /// Codex CLI UA,默认 "codex_cli_rs/0.153.3 (Mac OS 26.6.2; arm64)"
     pub codex_tui: Option<String>,
-    /// Grok CLI 版本号,默认 "1.0.5"(完整 UA 运行时拼接 os/arch)
+    /// Grok CLI 版本号,默认 "1.0.46"(完整交互式 UA 运行时拼接 os/arch)
     pub grok_version: Option<String>,
     /// Antigravity hub UA,默认 "antigravity/hub/2.10.0 darwin/arm64"
     pub antigravity: Option<String>,
