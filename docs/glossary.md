@@ -12,7 +12,7 @@
 | `openai_responses` | OpenAI Responses 协议，端点为 `/responses`。 |
 | `gemini` | Google Gemini GenerateContent 协议。 |
 | `antigravity` | Cloud Code Assist 运输协议，内部携带 Gemini 请求。 |
-| `cursor_sdk` | 经本地 Node sidecar 调用 `@cursor/sdk` 的协议；不经通用 upstream，base_url 为占位空串。 |
+| `cursor_sdk` | Cursor 原生 connect-rpc 协议（`AgentService/Run` 双向流）；不经通用 upstream，由 cursor handler 直连 api2.cursor.sh。 |
 | SSE | `text/event-stream` 响应格式；ccextra 将所有流式路径输出为 Anthropic SSE。 |
 | 非流响应 | `stream` 为 `false` 或缺失时的单个 JSON 响应。 |
 | 会话输入用量缓存 | 按 session 保存上游真实输入 token 数，供下一轮流首和 count_tokens 使用。Chat/Responses/Gemini/Antigravity 的原始 SSE 正数输入用量也会写回；缺失或零值不覆盖旧值，占位值不写回。记录写入后 30 分钟过期，最多 512 条。 |
@@ -124,16 +124,16 @@ Gemini 函数调用模式。Antigravity Claude 模型强制使用；Gemini 直�
 将 Anthropic `input_schema` 转成 Gemini 或 Antigravity 可接受 JSON Schema 的递归过程。它内联本地引用、移除不支持关键字、归一化布尔 `true` 子 schema、处理 enum 和 required，并为不同目标采用不同规则；Gemini 直连保留 `additionalProperties` 与标准约束，Antigravity 搬入 description 提示。声明 `items` 但缺 `type` 的节点补 `type: array`；`type` 显式不是 `array` 时去掉 `items`。OpenAI Chat/Responses 转换另会删除 schema 节点中的 `required: null`，保留实例数据中的同名字段。Chat 将 schema 位置的 `true` 转为空对象，保留 `false`、布尔 `additionalProperties` 与 `default`/`enum` 实例数据。
 
 **OAuth 动态 provider**
-由保存的 Antigravity、xAI、Codex 或 Cursor 凭证生成的运行时 provider。Antigravity 后台刷新模型；xAI 与 Codex 在启动和重载时扫描、刷新凭证。Codex 请求携带 `Chatgpt-Account-Id` 订阅身份头；Cursor 合成固定 name `cursor` 的 `cursor_sdk` provider。
+由保存的 Antigravity、xAI、Codex 或 Cursor 凭证生成的运行时 provider。Antigravity 后台刷新模型；xAI 与 Codex 在启动和重载时扫描、刷新凭证。Codex 请求携带 `Chatgpt-Account-Id` 订阅身份头；Cursor 经 GetUsableModels 拉取目录合成固定 name `cursor` 的 `cursor_sdk` provider。
 
-**sidecar**
-ccextra 的 Node 子进程（`sidecar/cursor/main.mjs`），嵌入 `@cursor/sdk` 并固定监听 `127.0.0.1:8223`。端口被占用时启动失败，不回退随机端口。Rust 侧经 `POST /run`（SSE）与 `POST /models` 两个端点通信；Bearer token 只经环境变量传递。健康巡检 5 秒，崩溃按 1/2/4…秒退避重启（封顶 60 秒）。服务关闭、`/reload` 禁用 Cursor 或修改 `auth_dir` 时先停止 sidecar。
-
-**Agent**
-`@cursor/sdk` 的会话执行单元。一个 Claude Code 会话对应一个 Agent；`/run` 触发一次 Agent 回合。并发上限由 `cursor_sidecar_max_agents` 控制（默认 16），空闲回收由 `cursor_sidecar_idle_secs` 控制（默认 1800）。
+**connect-rpc 双向流**
+Cursor 原生传输：`agent.v1.AgentService/Run`（h2 + rustls 直连 api2.cursor.sh），Connect 帧 `[1B flags][4B len BE][payload]`。请求头含 `content-type: application/connect+proto`、`connect-protocol-version: 1`、`te: trailers`、`x-ghost-mode: true`、`x-cursor-client-version`、`x-cursor-client-type: cli`；无 checksum、无 x-client-key。出站代理复用全局 `proxy`（HTTP CONNECT 隧道）。
 
 **Run**
-sidecar 的一次 `/run` 调用，对应 SDK Agent 的一个回合。事件流归一为 `text_delta`/`thinking_delta`/`tool_use`/`usage`/`turn_end`/`error`；`turn_end` 是唯一成功终态。
+一次 `AgentService/Run` 双向流调用，对应一个会话回合。服务端事件归一为 text/thinking 增量、tool 调用、TurnEnded 用量与 checkpoint；TurnEnded 是唯一成功终态。服务端 InteractionQuery（web_search/ask_question 等）必须回 InteractionResponse，否则挂死整流。
+
+**InteractionQuery**
+服务端下发的交互查询（web_search/ask_question/switch_mode/exa_search/exa_fetch/create_plan/setup_vm）。ccextra 按种类回 reject/error（SetupVm 回空 success），不提供交互能力。
 
 **pending callback**
 Agent 回合中已发起但未收到结果的工具副作用。崩溃窗口内的 pending callback 不写入 journal 确认边界，冷续接后可能重复执行，由客户端 tool_result 幂等性兜底。

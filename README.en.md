@@ -37,7 +37,7 @@ A single-process Rust proxy. Claude Code sends Anthropic Messages requests; ccex
 - **Route by model**: Claude, OpenAI, Gemini, and Antigravity share one endpoint. Client-facing aliases remain separate from upstream model names.
 - **Stable request content**: Normalize tools, schemas, and history to reduce incidental changes between turns. Actual cache hits depend on the upstream.
 - **Model adaptation**: Translate messages, tool calls, and images; adjust supported reasoning levels through `models.json`.
-- **OAuth providers**: Load and refresh Antigravity, xAI Grok, Codex (OpenAI ChatGPT subscription), and Cursor (Agent SDK sidecar) credentials with dynamic model routing.
+- **OAuth providers**: Load and refresh Antigravity, xAI Grok, Codex (OpenAI ChatGPT subscription), and Cursor (native connect-rpc proxy) credentials with dynamic model routing.
 - **Hot reload**: Publish configuration without restarting. In-flight requests keep their original snapshot.
 
 ## Architecture
@@ -49,7 +49,7 @@ flowchart LR
     P -->|openai_chat| B["Chat Completions"]
     P -->|openai_responses| C["Responses"]
     P -->|gemini / antigravity| D["Gemini GenerateContent"]
-    P -->|cursor_sdk| E["Node sidecar (@cursor/sdk)"]
+    P -->|cursor_sdk| E["Cursor AgentService/Run"]
 ```
 
 One process listens on one port. Input is always Anthropic-shaped; every path returns Anthropic responses (including SSE). See [architecture](docs/design.md).
@@ -63,7 +63,7 @@ One process listens on one port. Input is always Anthropic-shaped; every path re
 | `openai_responses` | Responses | Map `instructions` and `input`; support reasoning replay and search domain filtering. |
 | `gemini` | Gemini GenerateContent | Translate content blocks, tool results, and schemas. |
 | `antigravity` | Cloud Code Assist | Wrap Gemini requests, adapt tool names and output limits; use short connections by default. |
-| `cursor_sdk` | Cursor Agent SDK | Call `@cursor/sdk` through a local Node sidecar; auto-discover the model catalog and resume sessions. |
+| `cursor_sdk` | Cursor AgentService/Run | Native connect-rpc bidirectional stream straight to api2.cursor.sh; auto-discover the model catalog and resume sessions. |
 
 > **Note**: xAI Grok and Codex are automatically injected as `openai_responses` providers via OAuth without requiring a distinct protocol. Codex subscription requests carry the `Chatgpt-Account-Id` identity header automatically, and request bodies are zstd-compressed (matching codex CLI defaults). Cursor is likewise synthesized into a `cursor_sdk` provider (fixed name `cursor`) from the `cursor_auth_dir` credential — no manual provider entry required.
 
@@ -75,7 +75,7 @@ One process listens on one port. Input is always Anthropic-shaped; every path re
 cargo build --release
 ```
 
-Enabling the Cursor SDK sidecar requires extra prerequisites: Node >= 24 and installed dependencies under `sidecar/cursor`. `build.sh` checks the Node version, runs `npm ci`, and verifies the `@cursor/sdk` version before building; a plain `cargo build` skips those steps, and a missing or unpopulated sidecar directory makes Cursor enablement fail at runtime (other protocols are unaffected).
+Cursor uses the native connect-rpc path with no Node prerequisite; `cargo build --release` is enough.
 
 ### 2. Configure an upstream
 
@@ -148,7 +148,7 @@ See [config.example.yaml](config.example.yaml) for every field. Key points:
 - `prompt_cache_key` applies only to OpenAI paths, uses Claude Code session ID, and never replaces a nonempty key.
 - `models_file` points at the reasoning-level table (default `models.json` next to the config; not tracked by git — copy [models.json.example](models.json.example) and edit as needed). Exact `id` match clamps inbound effort to the nearest supported level; missing file or unknown models leave effort unchanged. An entry may set `force_effort`: wherever clamping would apply, effort is rewritten to this fixed value (unclamped); native `*claude*` models and requests with thinking explicitly disabled are unaffected.
 - `antigravity_models` is a model allowlist (top-level, glob or exact names, e.g. `["claude-opus-5-5-*", "gpt-5.2"]`); absent or empty publishes the full catalog. Filtering happens at dynamic catalog load against upstream model names; an empty result makes Antigravity publish an empty model list for that credential. Applies to `/reload` and the three-hour background refresh.
-- Cursor fields: `cursor_auth_dir` enables the SDK sidecar (credential directory, default `.cache/cursor` next to the config); `cursor_models` is an allowlist (glob or exact names, `default` is equivalent to `auto`, absent means full catalog), and entries may pin fixed parameters as `"id:param=value"` (e.g. `"auto-smart:optimize_for=intelligence"`; parameters must exist in the SDK catalog vocabulary, see `list_cursor_models.sh`); inbound `thinking`/effort maps to `modelParams` against that vocabulary — `thinking.type: enabled` maps to `thinking=true` (when the vocabulary has that parameter), effort prefers the models.json registry and falls back to body parsing, clamped to the nearest vocabulary level (`none` never clamps up; models without an effort parameter skip it); fixed parameter ids normalize `effort`/`reasoning_effort` and `auto-smart` `mode`/`optimize_for` aliases against the current model vocabulary. When the vocabulary has `fast` and no pinned value exists, `fast=false` is injected automatically (the Cursor backend treats an absent `fast` as true and labels the request with a `-fast` suffix in the dashboard; pin `"id:fast=true"` to enable it). `cursor_sidecar_idle_secs` (default 1800) and `cursor_sidecar_max_agents` (default 16) control sidecar recycling and concurrency; `cursor_workspace_dir` sets the SDK working directory (defaults to the process cwd; supports `~` and paths relative to the config file). When enabled, a `cursor_sdk` provider named `cursor` is synthesized automatically; models whose alias conflicts with an existing provider are skipped with a warning (names may repeat across providers). Failed refreshes keep the last successful catalog. Cursor images support base64 PNG, JPEG, WebP, and GIF; remote image URLs return HTTP 400.
+- Cursor fields: `cursor_auth_dir` enables the native proxy (credential directory, default `.cache/cursor` next to the config); `cursor_models` is an allowlist (glob or exact names, both `default` and `auto` match the catalog `default` entry, absent means full catalog), and entries may pin fixed parameters as `"id:param=value"` (e.g. `"auto-smart:optimize_for=intelligence"`, appended to the model name). Thinking level: when a bare allowlist base matches a catalog variant family (e.g. `grok-4.7` maps to `grok-4.7-low/…/xhigh`), a single model is synthesized and the inbound effort (`thinking.budget_tokens` threshold mapping, `output_config.effort`, `reasoning_effort`; `thinking.type: disabled` counts as `none`; `auto` leaves it untouched) is clamped to the levels the catalog actually offers and appended to the upstream model id (e.g. `grok-4.7-high`), with pinned allowlist parameters winning; when no effort is given, a default level applies (medium preferred, otherwise the median level — the family has no bare id, so the bare base is rejected upstream). Models whose bare id already exists in the catalog (`default`, `composer-2.5`) skip family expansion and send effort through `RequestedModel.parameters`. `cursor_base_url` (default `https://api2.cursor.sh`) and `cursor_client_version` (default `cli-2026.10.01-e373342`) are overridable. When enabled, a `cursor_sdk` provider named `cursor` is synthesized automatically; models whose alias conflicts with an existing provider are skipped with a warning (names may repeat across providers). Failed refreshes keep the last successful catalog.
 
 <details>
 <summary>Advanced options</summary>
@@ -207,21 +207,17 @@ Log in to an upstream or inspect saved credential status:
 ./scripts/check_grok_quota.sh
 ./scripts/check_codex_quota.sh
 ./scripts/check_cursor_quota.sh
-./scripts/list_cursor_models.sh
-./scripts/cursor-sidecar-e2e.sh
 ```
 
 Antigravity credentials default to `.cache/antigravity` next to the config; xAI uses `.cache/xai`, Codex `.cache/codex`. xAI and Codex are discovered at startup. Antigravity loads in the background and refreshes models every three hours. Codex login uses PKCE browser authorization (local callback port defaults to 1455, override with `--callback-port`); tokens refresh 24 hours ahead of expiry.
 
-Cursor login uses its own PKCE browser flow and polling; neither the Cursor IDE nor `cursor-agent` is required. Use `--no-browser` to open the login URL manually. Cursor tokens refresh 10 minutes ahead of expiry. Note: the PKCE credential only serves quota checks (`check_cursor_quota.sh`) and **cannot drive the SDK sidecar** — the SDK requires a User API Key generated manually at cursor.com/settings → API Keys, stored in `cursor_auth_dir/api_key.txt` (a single bare key line). That file is SDK-only and takes priority over `cursor.json`; `cursor-login` writes only `cursor.json`, so the two never overwrite each other. Once configured, startup and `/reload` fetch the account model catalog and synthesize the `cursor` provider, a background refresh runs every three hours, and failures keep the last successful catalog. The `cursor_models` whitelist matches the SDK model catalog (`list_cursor_models.sh` output, including per-model parameter levels), not the GetUsableModels IDE catalog; run that script to verify model ids before configuring the whitelist.
+Cursor login uses its own PKCE browser flow and polling; neither the Cursor IDE nor `cursor-agent` is required. Use `--no-browser` to open the login URL manually. Cursor tokens refresh 10 minutes ahead of expiry. The PKCE credential (`cursor.json`) drives the native proxy and quota checks (`check_cursor_quota.sh`, which shows both quota and the model catalog by default; `--models` lists models only). Once configured, startup and `/reload` fetch the account model catalog via GetUsableModels and synthesize the `cursor` provider, a background refresh runs every three hours, and failures keep the last successful catalog. The `cursor_models` whitelist matches that catalog (script output, including display names and aliases); run that command to verify model ids before configuring the whitelist.
 
-**Cursor sidecar operations**:
+**Cursor native proxy operations**:
 
-- The sidecar is a ccextra child process (Node, embedding `@cursor/sdk`) listening on fixed `127.0.0.1:8223`; the bearer token is passed only through environment variables and never written to disk. Startup fails if the port is occupied; it never falls back to a random port.
-- Sidecar outbound traffic honors `https_proxy`/`http_proxy`/`no_proxy` environment variables (spawn injects `NODE_USE_ENV_PROXY=1` to cover fetch and the https Agent; the SDK's http2 run traffic is taken over by `sidecar/cursor/proxy-tunnel.mjs` through a pre-built CONNECT tunnel pool — on pool exhaustion that one connection goes direct and the pool refills asynchronously). Without proxy variables there is no effect. Region-restricted models (e.g. `muse-spark-1.3`) require fully proxied egress.
-- Health checks run every 5 seconds; a crashed process restarts automatically with 1/2/4…second backoff (capped at 60 seconds). On `SIGTERM`/`SIGINT`, `/reload` disabling Cursor, or an `auth_dir` change, ccextra stops the sidecar and releases `8223` first.
+- Outbound traffic goes through Rust h2 + rustls straight to `api2.cursor.sh`; proxying reuses the global `proxy` (HTTP CONNECT tunnel with Basic auth support), and `"direct"` disables it. Region-restricted models (e.g. `muse-spark-1.3`) require fully proxied egress.
 - Session state is written to `sessions.jsonl` and journal files under `cursor_auth_dir`; it contains conversation content and is sensitive — do not commit or share that directory.
-- Known limitation: side effects (such as tool calls) not yet acknowledged inside a sidecar crash window may re-execute after cold resumption; resumption follows the journal's confirmed prefix and never crosses an unacknowledged boundary.
+- Known limitation: side effects (such as tool calls) not yet acknowledged inside a crash window may re-execute after cold resumption; resumption follows the journal's confirmed prefix and never crosses an unacknowledged boundary.
 
 After saving credentials, all four login commands automatically send `POST /reload` to `server.host` / `server.port` from `--config`. Wildcard bind addresses map to loopback; the request bypasses proxies, with a 2-second connection timeout and a 30-second total timeout. Failure prints a warning without undoing login; a stopped service loads credentials on its next startup. When using `--auth-dir`, the service configuration must point to that directory too.
 

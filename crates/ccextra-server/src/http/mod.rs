@@ -119,9 +119,11 @@ pub struct AppState {
     pub last_input_tokens: Arc<std::sync::Mutex<session_tokens::SessionTokenCache>>,
     /// Antigravity 新上游 session(sessionId)首请求延迟状态。
     pub initial_response_delay: crate::sse::InitialResponseDelayState,
-    /// Cursor SDK sidecar 运行时;None = 未启用(cursor_auth_dir 未配置)。
+    /// Cursor 原生运行时(会话表 + 可重载配置);None = 未启用。
     /// reload 可启停,故用共享读写锁持有,不进 ConfigSnapshot
     pub cursor: Arc<std::sync::RwLock<Option<Arc<crate::cursor::CursorRuntime>>>>,
+    /// Cursor 双向流会话表(始终存在;未启用时为空表,handler 侧按凭证身份过滤)
+    pub cursor_sessions: crate::cursor::session::CursorSessions,
 }
 
 #[derive(Clone, Debug, serde::Deserialize)]
@@ -195,13 +197,9 @@ where
     let listener = tokio::net::TcpListener::bind(addr).await?;
     tracing::info!("ccextra listening on {}", addr);
 
-    let cursor = state.cursor.clone();
     let result = axum::serve(listener, app(state))
         .with_graceful_shutdown(shutdown)
         .await;
-    if let Some(runtime) = cursor.read().ok().and_then(|guard| guard.clone()) {
-        runtime.sidecar.shutdown().await;
-    }
     result?;
     Ok(())
 }

@@ -374,6 +374,11 @@ impl UpstreamClient {
         }
     }
 
+    /// 全局代理(供 cursor 目录刷新等不经 upstream 的路径复用)
+    pub fn global_proxy(&self) -> Option<&str> {
+        self.global_proxy.as_deref()
+    }
+
     /// 解析最终代理:provider 覆盖 > 全局 > 直连
     pub(crate) fn resolve_proxy<'a>(&'a self, provider_proxy: Option<&'a str>) -> String {
         match provider_proxy {

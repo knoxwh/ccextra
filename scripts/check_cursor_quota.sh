@@ -1,9 +1,13 @@
 #!/usr/bin/env bash
+# zsh/sh 直接执行时转投 bash(脚本用 bash 语法,BASH_SOURCE 等)
+if [ -z "${BASH_VERSION:-}" ]; then
+    exec bash "$0" "$@"
+fi
 set -euo pipefail
 
-# Cursor 订阅额度查询脚本
-# 数据源: api2.cursor.sh DashboardService/GetCurrentPeriodUsage (Connect JSON)
-# 模型目录已拆分至 list_cursor_models.sh(SDK 目录,白名单配置依据)
+# Cursor 订阅额度与模型目录查询脚本
+# 额度: api2.cursor.sh DashboardService/GetCurrentPeriodUsage (Connect JSON)
+# 模型: agent.v1.AgentService/GetUsableModels (原生 unary protobuf,默认附带;--models 仅列模型)
 # 刷新: /auth/exchange_user_api_key (对齐 ccextra cursor/oauth.rs,提前 10 分钟)
 
 # 默认配置
@@ -11,6 +15,7 @@ BASE_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
 AUTH_DIR="${BASE_DIR}/.cache/cursor"
 CONFIG_FILE="${BASE_DIR}/config.yaml"
 DEFAULT_BASE_URL="https://api2.cursor.sh"
+DEFAULT_CLIENT_VERSION="cli-2026.10.01-e373342"
 # 对齐 ccextra cursor/constants.rs REFRESH_SKEW_SECS
 REFRESH_SKEW_SECS=600
 
@@ -29,10 +34,13 @@ read_yaml_str() {
 
 BASE_URL="$(read_yaml_str cursor_base_url)"
 [[ -z "$BASE_URL" ]] && BASE_URL="$DEFAULT_BASE_URL"
+CLIENT_VERSION="$(read_yaml_str cursor_client_version)"
+[[ -z "$CLIENT_VERSION" ]] && CLIENT_VERSION="$DEFAULT_CLIENT_VERSION"
 
 usage() {
     echo "用法: $0 [选项]"
     echo "选项:"
+    echo "  -m, --models         仅列出模型目录(默认额度+模型都展示)"
     echo "  -d, --dir <dir>      凭证目录 (默认: ${AUTH_DIR})"
     echo "  -f, --file <file>    指定单个凭证文件"
     echo "  -r, --raw            输出原始响应"
@@ -42,9 +50,14 @@ usage() {
 
 TARGET_FILE=""
 RAW_OUTPUT=false
+LIST_MODELS=false
 
 while [[ $# -gt 0 ]]; do
     case "$1" in
+        -m|--models)
+            LIST_MODELS=true
+            shift
+            ;;
         -d|--dir)
             AUTH_DIR="$2"
             shift 2
@@ -162,20 +175,9 @@ refresh_token_if_needed() {
     echo "$access_token"
 }
 
-check_account() {
-    local cred_file="$1"
-    local sub
-    sub="$(jq -r '.sub // "-"' "$cred_file")"
-
-    local token
-    token="$(refresh_token_if_needed "$cred_file")"
-
-    if [[ -z "$token" ]]; then
-        echo "❌ [${sub}] 无法获取有效 accessToken"
-        return
-    fi
-
-    # 查询当前周期用量 (DashboardService Connect JSON)
+# 查询当前周期用量并打印 (DashboardService Connect JSON)
+query_usage() {
+    local token="$1" sub="$2" file_label="$3"
     local usage_resp
     usage_resp="$(curl -sS -X POST "${BASE_URL}/aiserver.v1.DashboardService/GetCurrentPeriodUsage" \
         -H "Authorization: Bearer ${token}" \
@@ -185,15 +187,21 @@ check_account() {
         -d '{}' 2>/dev/null || true)"
 
     if [[ "$RAW_OUTPUT" == true ]]; then
-        echo "=== 凭证: $(basename "$cred_file") ==="
+        echo "=== 凭证: ${file_label} ==="
         echo "--- GetCurrentPeriodUsage ---"
         echo "$usage_resp" | jq . 2>/dev/null || echo "$usage_resp"
         return
     fi
 
+    # 上游拒绝凭证时直接点破,不打印空用量
+    if echo "$usage_resp" | jq -e '.code == "unauthenticated"' >/dev/null 2>&1; then
+        echo "❌ [${file_label}] 凭证被上游拒绝(unauthenticated)"
+        return
+    fi
+
     echo "=========================================================================================="
     echo "🆔 账号: ${sub}"
-    echo "📁 文件: $(basename "$cred_file")"
+    echo "📁 文件: ${file_label}"
     echo "🔗 端点: ${BASE_URL}"
     echo "------------------------------------------------------------------------------------------"
 
@@ -281,22 +289,141 @@ print(f"📅 账单周期: {cycle_start} ~ {cycle_end}")
     echo "=========================================================================================="
 }
 
+# 模型目录:GetUsableModels unary,空 body protobuf,响应可能带 Connect 帧信封
+# 二进制响应不能过 shell 变量(剥 null 字节),落临时文件
+list_models() {
+    local token="$1"
+    local resp_file status=0
+    resp_file="$(mktemp)"
+    curl -sS -X POST "${BASE_URL}/agent.v1.AgentService/GetUsableModels" \
+        -H "Authorization: Bearer ${token}" \
+        -H "Content-Type: application/proto" \
+        -H "Connect-Protocol-Version: 1" \
+        -H "Te: trailers" \
+        -H "X-Ghost-Mode: true" \
+        -H "X-Cursor-Client-Type: cli" \
+        -H "X-Cursor-Client-Version: ${CLIENT_VERSION}" \
+        --max-time 15 \
+        -o "$resp_file" \
+        --data-binary @- <<'CURL_EOF' 2>/dev/null || true
+CURL_EOF
+
+    # 解析 protobuf:GetUsableModelsResponse{repeated ModelDetails models = 1}
+    # ModelDetails{model_id=1, display_name=3, aliases=6}
+    local raw_flag=""
+    [[ "$RAW_OUTPUT" == true ]] && raw_flag="--raw"
+    python3 - "$resp_file" "$raw_flag" <<'PY_EOF' || status=$?
+import sys, json, struct
+
+data = open(sys.argv[1], "rb").read()
+
+# Connect 帧信封: [1B flags][4B len BE];flags 0x02 为 end-stream JSON,跳过
+frames = []
+if len(data) >= 5 and data[0] in (0x00, 0x02):
+    offset = 0
+    ok = True
+    while offset < len(data):
+        if offset + 5 > len(data):
+            ok = False
+            break
+        flags = data[offset]
+        length = struct.unpack(">I", data[offset + 1:offset + 5])[0]
+        if offset + 5 + length > len(data):
+            ok = False
+            break
+        if flags == 0x00:
+            frames.append(data[offset + 5:offset + 5 + length])
+        offset += 5 + length
+    if ok and frames:
+        data = frames[0]
+
+def read_varint(buf, pos):
+    result = 0
+    shift = 0
+    while pos < len(buf):
+        byte = buf[pos]
+        result |= (byte & 0x7F) << shift
+        pos += 1
+        if not byte & 0x80:
+            return result, pos
+        shift += 7
+    raise ValueError("truncated varint")
+
+def fields(buf):
+    pos = 0
+    while pos < len(buf):
+        tag, pos = read_varint(buf, pos)
+        number, wire = tag >> 3, tag & 7
+        if wire == 2:
+            length, pos = read_varint(buf, pos)
+            yield number, buf[pos:pos + length]
+            pos += length
+        elif wire == 0:
+            value, pos = read_varint(buf, pos)
+            yield number, value
+        else:
+            raise ValueError(f"unsupported wire type {wire}")
+
+models = []
+for number, value in fields(data):
+    if number != 1 or not isinstance(value, bytes):
+        continue
+    model_id, display_name, aliases = "", "", []
+    for field, sub in fields(value):
+        if field == 1 and isinstance(sub, bytes):
+            model_id = sub.decode("utf-8", "replace")
+        elif field == 3 and isinstance(sub, bytes):
+            display_name = sub.decode("utf-8", "replace")
+        elif field == 6 and isinstance(sub, bytes):
+            aliases.append(sub.decode("utf-8", "replace"))
+    if model_id:
+        models.append({
+            "model_id": model_id,
+            "display_name": display_name,
+            "aliases": aliases,
+        })
+
+if not models:
+    sys.stderr.write("解析失败或目录为空(响应前 64 字节: %s)\n" % data[:64].hex())
+    sys.exit(1)
+
+if "--raw" in sys.argv[2:]:
+    print(json.dumps(models, indent=2, ensure_ascii=False))
+else:
+    print(f"共 {len(models)} 个模型:")
+    for model in models:
+        line = f"  {model['model_id']}"
+        if model["display_name"] and model["display_name"] != model["model_id"]:
+            line += f"  ({model['display_name']})"
+        if model["aliases"]:
+            line += "  aliases: " + ", ".join(model["aliases"])
+        print(line)
+PY_EOF
+    rm -f "$resp_file"
+    return $status
+}
+
 main() {
-    if [[ -n "$TARGET_FILE" ]]; then
-        if [[ ! -f "$TARGET_FILE" ]]; then
-            echo "错误: 文件不存在: $TARGET_FILE" >&2
-            exit 1
-        fi
-        check_account "$TARGET_FILE"
+    local cred_file="${TARGET_FILE:-${AUTH_DIR}/cursor.json}"
+    if [[ ! -f "$cred_file" ]]; then
+        echo "未找到 Cursor 凭证: ${cred_file}" >&2
+        exit 1
+    fi
+    local token
+    token="$(refresh_token_if_needed "$cred_file")"
+    if [[ -z "$token" ]]; then
+        echo "❌ 无法获取有效 accessToken" >&2
+        exit 1
+    fi
+    if [[ "$LIST_MODELS" == true ]]; then
+        list_models "$token"
         return
     fi
-
-    local cred_file="${AUTH_DIR}/cursor.json"
-    if [[ ! -f "$cred_file" ]]; then
-        echo "未找到 Cursor 凭证: ${cred_file}"
-        exit 0
-    fi
-    check_account "$cred_file"
+    local sub
+    sub="$(jq -r '.sub // "-"' "$cred_file")"
+    query_usage "$token" "$sub" "$(basename "$cred_file")"
+    # 默认附带模型目录
+    list_models "$token"
 }
 
 main

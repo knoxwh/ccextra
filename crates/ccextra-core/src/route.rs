@@ -13,7 +13,7 @@ pub enum Protocol {
     OpenAiResponses,
     Gemini,
     Antigravity,
-    /// Cursor SDK sidecar(localhost HTTP,不经通用 upstream)
+    /// Cursor 原生 connect-rpc(不经通用 upstream,直连 api2.cursor.sh)
     CursorSdk,
 }
 

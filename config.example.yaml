@@ -27,33 +27,31 @@ secret_key: "sk-ccextra-xxx"
 # Codex 凭证目录(可选)。默认配置文件旁 .cache/codex。
 # codex_auth_dir: ".cache/codex"
 
-# Cursor SDK sidecar(可选)。配置后启动 Node sidecar 嵌入 @cursor/sdk,
-# 自动发现账户模型目录并合成 name "cursor" provider(protocol: cursor_sdk)。
-# 凭证:在 cursor.com/settings → API Keys 生成 User API Key,写入
-# cursor_auth_dir/api_key.txt(单行裸 key,0600)。SDK 专用,优先于 cursor.json;
-# cursor-login 的 PKCE 凭证写 cursor.json,两者互不覆盖
-# (SDK 内部经 /auth/exchange_user_api_key 换 token,OAuth access token 不被接受)
-# 前置条件: Node >= 24,sidecar/cursor 已 npm ci(见 build.sh)。
+# Cursor 原生代理(可选)。配置后以原生 connect-rpc 双向流直连
+# api2.cursor.sh,拉取账户模型目录并合成 name "cursor" provider
+# (protocol: cursor_sdk)。凭证:cursor-login 的 PKCE 凭证(cursor.json)。
 # cursor_auth_dir: ".cache/cursor"
 
 # Cursor 模型白名单(可选)。glob 或精确名;default 等价 auto;缺省/空 = 全量发布。
-# 条目可钉固定参数 "id:param=value,param=value"(须在 SDK 目录词表内),
-# 如 "auto-smart:optimize_for=intelligence";入站 thinking/effort 按词表
-# 自动映射为 modelParams(词表无 thinking/effort 参数则忽略)。固定参数 id 会
-# 按模型词表归一 effort/reasoning_effort 与 auto-smart 的 mode/optimize_for 别名。
+# 条目可钉固定参数 "id:param=value,param=value",如
+# "auto-smart:optimize_for=intelligence"。
+# 思考等级:裸 base 命中目录变体家族(如 grok-4.7 对应 grok-4.7-low/…/xhigh)
+# 时合成单一模型,入站 effort(thinking.budget_tokens 阈值映射/
+# output_config.effort/reasoning_effort,thinking.type: disabled 视为 none)
+# 钳制到目录实际等级后拼进上游 model id(如 grok-4.7-high),白名单钉参优先;
+# 目录已有裸 id 的模型(auto/composer-2.5)不经家族展开,effort 走
+# RequestedModel.parameters。
 # cursor_models:
 #   - "default"
 #   - "composer-*"
+#   - "grok-4.7"
 #   - "auto-smart:optimize_for=intelligence"
 
-# Cursor sidecar 空闲回收秒数(可选,默认 1800)。
-# cursor_sidecar_idle_secs: 1800
+# Cursor 上游地址(可选,默认 https://api2.cursor.sh)。
+# cursor_base_url: "https://api2.cursor.sh"
 
-# Cursor sidecar 最大并发 Agent 数(可选,默认 16)。
-# cursor_sidecar_max_agents: 16
-
-# Cursor SDK 工作目录(可选)。缺省 = 进程 cwd;支持 ~ 与相对配置文件目录。
-# cursor_workspace_dir: "~"
+# Cursor 客户端版本头(可选,默认 cli-2026.10.01-e373342)。
+# cursor_client_version: "cli-2026.10.01-e373342"
 
 # Antigravity 模型白名单(可选)。glob 或精确名;缺省/空 = 全量发布。
 # antigravity_models:

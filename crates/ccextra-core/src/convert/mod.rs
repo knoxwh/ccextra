@@ -10,7 +10,7 @@ use thiserror::Error;
 
 pub mod antigravity;
 pub mod antigravity_tools;
-pub mod cursor_sdk;
+pub mod cursor;
 pub mod fix_json;
 pub mod gemini;
 pub mod gemini_response;
@@ -29,7 +29,6 @@ pub use antigravity::{convert_to_antigravity, convert_to_antigravity_with};
 pub use antigravity_tools::{
     antigravity_tool_name_to_upstream, antigravity_upstream_tool_name_to_client,
 };
-pub use cursor_sdk::{convert_to_cursor_sdk, CursorParamVocab, CursorSdkConvertError};
 pub use fix_json::fix_json_quotes;
 pub use gemini::{convert_to_gemini, convert_to_gemini_with_registry};
 pub use gemini_response::{

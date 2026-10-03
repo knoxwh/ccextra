@@ -28,11 +28,16 @@ base64.workspace = true
 sha2.workspace = true
 hex.workspace = true
 lru = "0.12"
+h2 = "0.4"
+tokio-rustls = "0.26"
+rustls-native-certs = "0.8"
+percent-encoding = "2"
 
 time = { version = "0.3", features = ["formatting", "parsing", "std"] }
 getrandom = "0.2"
 
 [dev-dependencies]
+prost.workspace = true
 tower.workspace = true
 tempfile = "3"
 serde_yaml = "0.9"

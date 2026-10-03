@@ -37,7 +37,7 @@
 - **按模型切换上游**：Claude、OpenAI、Gemini 和 Antigravity 共用一个端口。模型别名与实际模型名分开配置。
 - **请求内容稳定化**：归一化工具、schema 和历史内容，减少无意义的跨轮差异；实际缓存命中由上游决定。
 - **模型能力适配**：转换消息、工具调用与图片，按 `models.json` 调整支持的 reasoning 档位。
-- **OAuth 接入**：支持 Antigravity、xAI Grok、Codex（OpenAI ChatGPT 订阅）和 Cursor（Agent SDK sidecar）的凭证加载、刷新与动态模型路由。
+- **OAuth 接入**：支持 Antigravity、xAI Grok、Codex（OpenAI ChatGPT 订阅）和 Cursor（原生 connect-rpc 代理）的凭证加载、刷新与动态模型路由。
 - **配置热重载**：无需重启即可发布新配置；进行中的请求继续使用原快照。
 
 ## 架构流向
@@ -49,7 +49,7 @@ flowchart LR
     P -->|openai_chat| B["Chat Completions"]
     P -->|openai_responses| C["Responses"]
     P -->|gemini / antigravity| D["Gemini GenerateContent"]
-    P -->|cursor_sdk| E["Node sidecar (@cursor/sdk)"]
+    P -->|cursor_sdk| E["Cursor AgentService/Run"]
 ```
 
 一个进程监听一个端口。入站始终是 Anthropic 形状，出口统一还原为 Anthropic 响应（含 SSE）。详见[架构设计](docs/design.md)。
@@ -63,7 +63,7 @@ flowchart LR
 | `openai_responses` | Responses | 转换 `instructions` 与 `input`；支持 reasoning replay 和搜索域过滤。 |
 | `gemini` | Gemini GenerateContent | 转换内容块、工具结果和 schema。 |
 | `antigravity` | Cloud Code Assist | 封装 Gemini 请求，处理工具命名和模型输出上限；默认短连接。 |
-| `cursor_sdk` | Cursor Agent SDK | 经本地 Node sidecar 调用 `@cursor/sdk`；自动发现模型目录，支持会话续接。 |
+| `cursor_sdk` | Cursor AgentService/Run | 原生 connect-rpc 双向流直连 api2.cursor.sh；自动发现模型目录，支持会话续接。 |
 
 > **提示**：xAI Grok 与 Codex 均通过 OAuth 动态注册为 `openai_responses` provider，无需配置独立协议。Codex 订阅请求自动携带 `Chatgpt-Account-Id` 身份头，请求体自动 zstd 压缩（对齐 codex CLI 默认行为）。Cursor 同样由 `cursor_auth_dir` 凭证自动合成为 `cursor_sdk` provider（name 固定 `cursor`），无需手写 provider 条目。
 
@@ -75,7 +75,7 @@ flowchart LR
 cargo build --release
 ```
 
-启用 Cursor SDK sidecar 需要额外前置：Node >= 24 与 `sidecar/cursor` 依赖安装。`build.sh` 会在构建前自动检查 Node 版本、执行 `npm ci` 并校验 `@cursor/sdk` 版本；纯 `cargo build` 不含这些步骤，运行时 sidecar 目录缺失或依赖未装会导致 Cursor 启用失败（其余协议不受影响）。
+Cursor 走原生 connect-rpc 路径，无 Node 前置依赖；`cargo build --release` 即可。
 
 ### 2. 配置上游
 
@@ -148,7 +148,7 @@ curl -H "Authorization: Bearer $ANTHROPIC_AUTH_TOKEN" \
 - `prompt_cache_key` 只用于 OpenAI 路径，取 Claude Code 会话 ID，且不覆盖已有非空值。
 - `models_file` 指向 reasoning 级别表（默认配置文件旁 `models.json`，不入 git，可从 [models.json.example](models.json.example) 复制后按需修改），按上游模型 `id` 精确匹配，把入站 effort 钳到该模型支持的最近档；缺文件或未收录的模型不钳。条目可加 `force_effort`：凡钳制会介入的 effort 一律改写为该固定值（不钳制），`*claude*` 原生模型与显式关闭思考的请求不受影响。
 - `antigravity_models` 为模型白名单（顶层配置，glob 或精确名，如 `["claude-opus-5-5-*", "gpt-5.2"]`）；缺省或空列表发布全量目录。过滤在动态目录加载时按上游模型名匹配，过滤后为空时该凭证发布空模型列表。`/reload` 与 3 小时后台刷新均生效。
-- Cursor 字段：`cursor_auth_dir` 启用 SDK sidecar（凭证目录，默认配置文件旁 `.cache/cursor`）；`cursor_models` 白名单（glob 或精确名，`default` 等价 `auto`，缺省全量），条目可钉固定参数 `"id:param=value"`（如 `"auto-smart:optimize_for=intelligence"`，参数须在 SDK 目录词表内，`list_cursor_models.sh` 可查）；入站 `thinking`/effort 按词表自动映射为 `modelParams`——`thinking.type: enabled` 映射 `thinking=true`（词表含该参数时），effort 取 models.json 注册表优先、回落 body 解析，钳到词表最近档位（`none` 不钳升，词表无 effort 参数则忽略）；固定参数 id 按当前模型词表归一 `effort`/`reasoning_effort` 与 `auto-smart` 的 `mode`/`optimize_for` 别名。词表含 `fast` 且未显式钉参时自动补 `fast=false`（Cursor 后端把缺省 fast 按 true 处理，dashboard 显示 `-fast` 后缀；想开钉 `"id:fast=true"`）。`cursor_sidecar_idle_secs`（默认 1800）与 `cursor_sidecar_max_agents`（默认 16）控制 sidecar 回收与并发；`cursor_workspace_dir` 为 SDK 工作目录（缺省进程 cwd，支持 `~` 与相对配置文件目录）。启用后自动合成 name `cursor` 的 `cursor_sdk` provider；与现有 provider 的模型 alias 冲突时跳过该模型并告警（name 可跨 provider 重复）。刷新失败保留最近成功目录。Cursor 图片支持 PNG、JPEG、WebP、GIF base64；远程图片 URL 返回 400。
+- Cursor 字段：`cursor_auth_dir` 启用原生代理（凭证目录，默认配置文件旁 `.cache/cursor`）；`cursor_models` 白名单（glob 或精确名，`default` 与 `auto` 均匹配目录 `default` 条目，缺省全量），条目可钉固定参数 `"id:param=value"`（如 `"auto-smart:optimize_for=intelligence"`，拼进模型 name）。思考等级：白名单裸 base 命中目录变体家族（如 `grok-4.7` 对应 `grok-4.7-low/…/xhigh`）时合成单一模型，入站 effort（`thinking.budget_tokens` 阈值映射、`output_config.effort`、`reasoning_effort`；`thinking.type: disabled` 视为 `none`，`auto` 不干预）钳制到目录实际等级后拼进上游 model id（如 `grok-4.7-high`），白名单钉参优先不覆盖；无 effort 时用缺省等级（优先 medium，否则等级中位；家族无裸 id，裸 base 会被上游拒绝）。目录已有裸 id 的模型（`default`、`composer-2.5`）不经家族展开，effort 走 `RequestedModel.parameters`。`cursor_base_url`（默认 `https://api2.cursor.sh`）与 `cursor_client_version`（默认 `cli-2026.10.01-e373342`）可覆盖。启用后自动合成 name `cursor` 的 `cursor_sdk` provider；与现有 provider 的模型 alias 冲突时跳过该模型并告警（name 可跨 provider 重复）。刷新失败保留最近成功目录。
 
 <details>
 <summary>进阶选项</summary>
@@ -207,21 +207,17 @@ curl -H "Authorization: Bearer $ANTHROPIC_AUTH_TOKEN" \
 ./scripts/check_grok_quota.sh
 ./scripts/check_codex_quota.sh
 ./scripts/check_cursor_quota.sh
-./scripts/list_cursor_models.sh
-./scripts/cursor-sidecar-e2e.sh
 ```
 
 Antigravity 凭证默认在配置文件旁 `.cache/antigravity`，xAI 在 `.cache/xai`，Codex 在 `.cache/codex`。xAI 和 Codex 启动时自动发现。Antigravity 后台加载并每 3 小时刷新模型。Codex 登录使用 PKCE 浏览器授权（本地回调端口默认 1455，可用 `--callback-port` 覆盖），token 提前 24 小时刷新。
 
-Cursor 登录自行生成 PKCE 并轮询浏览器授权，不依赖 Cursor IDE 或 `cursor-agent`；可用 `--no-browser` 手动打开 URL，token 到期前 10 分钟刷新。注意：PKCE 凭证仅适用于配额查询（`check_cursor_quota.sh`），**不能驱动 SDK sidecar**——SDK 需要在 cursor.com/settings → API Keys 手动生成的 User API Key，写入 `cursor_auth_dir/api_key.txt`（单行裸 key）。该文件 SDK 专用且优先于 `cursor.json`，`cursor-login` 只写 `cursor.json`，两者互不覆盖。配置后启动与 `/reload` 时拉取账户模型目录合成 `cursor` provider，每 3 小时后台刷新，失败保留最近成功目录。`cursor_models` 白名单匹配的是 SDK 模型目录（`list_cursor_models.sh` 输出，含各模型参数档位），不是 GetUsableModels 的 IDE 目录；配白名单前先跑该脚本核对模型 id。
+Cursor 登录自行生成 PKCE 并轮询浏览器授权，不依赖 Cursor IDE 或 `cursor-agent`；可用 `--no-browser` 手动打开 URL，token 到期前 10 分钟刷新。PKCE 凭证（`cursor.json`）驱动原生代理与配额查询（`check_cursor_quota.sh`，默认同时展示额度与模型目录，`--models` 仅列模型）。配置后启动与 `/reload` 时经 GetUsableModels 拉取账户模型目录合成 `cursor` provider，每 3 小时后台刷新，失败保留最近成功目录。`cursor_models` 白名单匹配的就是该目录（脚本输出，含 display name 与 aliases）；配白名单前先跑该命令核对模型 id。
 
-**Cursor sidecar 运维要点**：
+**Cursor 原生代理运维要点**：
 
-- sidecar 是 ccextra 子进程（Node，嵌入 `@cursor/sdk`），固定监听 `127.0.0.1:8223`，Bearer token 只经环境变量传递，不落盘。端口被占用时启动失败，不回退随机端口。
-- sidecar 出站流量遵循 `https_proxy`/`http_proxy`/`no_proxy` 环境变量（spawn 时注入 `NODE_USE_ENV_PROXY=1` 覆盖 fetch 与 https.Agent；SDK 的 http2 主流量由 `sidecar/cursor/proxy-tunnel.mjs` 以预建 CONNECT 隧道池接管，池空时该次直连并异步补池）。无代理环境变量时零副作用。区域受限模型（如 `muse-spark-1.3`）需全量代理出口才能使用。
-- 健康巡检每 5 秒；进程退出按 1/2/4…秒退避自动重启（封顶 60 秒）。服务收到 `SIGTERM`/`SIGINT`、`/reload` 禁用 Cursor 或修改 `auth_dir` 时，先关闭 sidecar 并释放 `8223`。
+- 出站流量走 Rust h2 + rustls 直连 `api2.cursor.sh`；代理复用全局 `proxy`（HTTP CONNECT 隧道，支持 Basic 认证），`"direct"` 禁用。区域受限模型（如 `muse-spark-1.3`）需全量代理出口才能使用。
 - 会话状态写入 `cursor_auth_dir` 下的 `sessions.jsonl` 与 journal 文件，包含对话内容，属敏感数据，请勿提交或分享该目录。
-- 已知限制：sidecar 崩溃窗口内未确认的副作用（如工具调用）可能在冷续接后重复执行；续接以 journal 记录的已确认前缀为准，不跨过未确认边界。
+- 已知限制：崩溃窗口内未确认的副作用（如工具调用）可能在冷续接后重复执行；续接以 journal 记录的已确认前缀为准，不跨过未确认边界。
 
 四种登录命令保存凭证后，都会按 `--config` 的 `server.host` / `server.port` 自动发送 `POST /reload`。通配监听地址转为本机回环地址，请求不走代理，连接超时 2 秒、总超时 30 秒。失败只提示，不撤销登录；服务未启动时下次启动加载。使用 `--auth-dir` 时，服务配置也需指向该目录。
 

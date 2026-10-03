@@ -6,3 +6,7 @@ pub const REFRESH_PATH: &str = "/auth/exchange_user_api_key";
 pub const REFRESH_SKEW_SECS: i64 = 600;
 pub const POLL_MAX_ATTEMPTS: usize = 150;
 pub const POLL_MAX_ERRORS: usize = 10;
+pub const DEFAULT_CLIENT_VERSION: &str = "cli-2026.10.01-e373342";
+pub const MODELS_PATH: &str = "/agent.v1.AgentService/GetUsableModels";
+pub const RUN_PATH: &str = "/agent.v1.AgentService/Run";
+pub const CLIENT_TIMEOUT_SECS: u64 = 15;

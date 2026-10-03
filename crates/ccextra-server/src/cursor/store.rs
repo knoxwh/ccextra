@@ -15,26 +15,6 @@ pub fn credential_path(dir: &Path) -> PathBuf {
     dir.join("cursor.json")
 }
 
-/// User API Key 文件路径(SDK 专用,与 OAuth cursor.json 分离)
-pub fn api_key_path(dir: &Path) -> PathBuf {
-    dir.join("api_key.txt")
-}
-
-/// 读取 User API Key;文件缺失或空白返回 None(回落 cursor.json)
-pub fn load_api_key(dir: &Path) -> Result<Option<String>> {
-    let path = api_key_path(dir);
-    if !path.exists() {
-        return Ok(None);
-    }
-    let data = fs::read_to_string(&path)
-        .with_context(|| format!("读取 Cursor API Key 失败: {}", path.display()))?;
-    let key = data.trim();
-    if key.is_empty() {
-        return Ok(None);
-    }
-    Ok(Some(key.to_string()))
-}
-
 pub fn load(dir: &Path) -> Result<CursorCredential> {
     let path = credential_path(dir);
     let data =

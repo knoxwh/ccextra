@@ -7,6 +7,7 @@
 // - relay:    按协议分派响应流
 
 pub mod chat;
+pub mod cursor;
 pub mod emit;
 pub mod gemini;
 pub mod non_stream;

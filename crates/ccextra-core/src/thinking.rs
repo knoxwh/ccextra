@@ -219,7 +219,7 @@ fn clamp_to_nearest(level: Level, supported: &[Level]) -> Level {
 }
 
 /// 级别排序(数值越大级别越高)
-fn level_rank(level: Level) -> u8 {
+pub fn level_rank(level: Level) -> u8 {
     match level {
         Level::None => 0,
         Level::Auto => 1,
@@ -230,6 +230,21 @@ fn level_rank(level: Level) -> u8 {
         Level::XHigh => 6,
         Level::Max => 7,
     }
+}
+
+/// 将 effort 钳制到给定级别字符串集合(最近邻,tie 取低)
+///
+/// 供目录驱动的变体家族使用(如 Cursor `grok-4.7-{low,high}`):
+/// 非法 effort 或空集合原样返回,不钳制。
+pub fn clamp_effort_to_levels(effort: &str, supported: &[&str]) -> String {
+    let Some(level) = Level::parse(effort) else {
+        return effort.to_string();
+    };
+    let levels: Vec<Level> = supported.iter().filter_map(|s| Level::parse(s)).collect();
+    if levels.is_empty() {
+        return effort.to_string();
+    }
+    clamp_to_nearest(level, &levels).as_str().to_string()
 }
 
 /// thinking 配置 → effort 字符串
@@ -268,6 +283,35 @@ pub fn resolve_effort(thinking: &serde_json::Value) -> Option<&'static str> {
 mod tests {
     use super::*;
     use serde_json::json;
+
+    #[test]
+    fn test_clamp_effort_to_levels() {
+        // 精确命中:原样
+        assert_eq!(clamp_effort_to_levels("high", &["low", "high"]), "high");
+        // 越档:最近邻(xhigh → high,无 xhigh)
+        assert_eq!(
+            clamp_effort_to_levels("xhigh", &["low", "medium", "high"]),
+            "high"
+        );
+        // 低于最低档:钳到最低(none → low)
+        assert_eq!(
+            clamp_effort_to_levels("none", &["low", "medium", "high"]),
+            "low"
+        );
+        // 高于最高档:钳到最高(max → xhigh)
+        assert_eq!(
+            clamp_effort_to_levels("max", &["low", "medium", "xhigh"]),
+            "xhigh"
+        );
+        // tie 取低:medium 在 low/high 之间等距 → low
+        assert_eq!(clamp_effort_to_levels("medium", &["low", "high"]), "low");
+        // 非法 effort 原样返回
+        assert_eq!(clamp_effort_to_levels("bogus", &["low", "high"]), "bogus");
+        // 空集合不钳制
+        assert_eq!(clamp_effort_to_levels("high", &[]), "high");
+        // 集合含非法条目:忽略后仍可用
+        assert_eq!(clamp_effort_to_levels("max", &["high", "bogus"]), "high");
+    }
 
     #[test]
     fn test_budget_to_level_thresholds() {

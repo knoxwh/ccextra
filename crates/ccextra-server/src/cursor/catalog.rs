@@ -1,26 +1,26 @@
-// catalog.rs:Cursor 模型目录合成
+// catalog.rs:Cursor 模型目录合成(原生 GetUsableModels)
 //
-// sidecar /models 发现账户目录 → 白名单过滤 → ModelConfig 列表 →
-// 合成 name "cursor" / protocol CursorSdk provider。刷新失败由调用方
-// 保留最近成功 provider(对齐 antigravity 语义)。
+// 原生目录拉取 → 白名单过滤 → ModelConfig 列表 → 合成 name "cursor" /
+// protocol CursorSdk provider。刷新失败由调用方保留最近成功 provider
+// (对齐 antigravity 语义)。白名单裸 base 命中变体家族(grok-4.7-high 等)
+// 时合成 effort_levels 标记模型,转换层把钳制后的思考等级拼进 model id;
+// 目录已有裸 id 的模型(auto/composer-2.5)不经家族展开。
 
 use std::collections::HashMap;
 use std::path::PathBuf;
 use std::sync::Arc;
 
-use ccextra_core::convert::CursorParamVocab;
 use ccextra_core::route::{ModelConfig, Protocol, ProviderConfig};
 
-use super::sidecar::CursorSidecar;
+use super::models::{fetch_models, CursorModelEntry};
+use super::session::CursorSessions;
 
-/// Cursor 运行时:sidecar 进程 + 可重载配置 + 模型参数词表
+/// Cursor 运行时:双向流会话表 + 可重载配置
 ///
 /// 挂 AppState.cursor,不进 ConfigSnapshot(进程状态不入不可变快照)
 pub struct CursorRuntime {
-    pub sidecar: Arc<CursorSidecar>,
+    pub sessions: CursorSessions,
     pub config: tokio::sync::RwLock<CursorConfig>,
-    /// 模型参数词表(归一 id → params;目录刷新时整体替换)
-    pub vocab: tokio::sync::RwLock<HashMap<String, Vec<CursorParamVocab>>>,
 }
 
 /// Cursor 运行时配置(reload 可整体替换)
@@ -30,12 +30,10 @@ pub struct CursorConfig {
     pub auth_dir: PathBuf,
     /// 模型白名单;空 = 全量
     pub models: Vec<String>,
-    /// sidecar 空闲回收秒数
-    pub idle_secs: u64,
-    /// sidecar 最大 Agent 数
-    pub max_agents: usize,
-    /// SDK 工作目录(local.cwd)
-    pub workspace_dir: PathBuf,
+    /// 上游 base_url 覆盖(默认 api2.cursor.sh)
+    pub base_url: Option<String>,
+    /// 客户端版本头覆盖
+    pub client_version: Option<String>,
 }
 
 /// 启用判定:cursor_auth_dir 存在且 trim 后非空
@@ -57,6 +55,40 @@ fn split_whitelist_base(entry: &str) -> &str {
     entry.split(':').next().unwrap_or(entry)
 }
 
+/// 目录变体家族检测:base-{level} 形态的等级后缀
+///
+/// `-fast` 与 `thinking` 等非等级后缀不算;返回目录中实际存在的等级
+fn family_levels(catalog: &[CursorModelEntry], base: &str) -> Vec<String> {
+    let mut levels = Vec::new();
+    for entry in catalog {
+        let Some(suffix) = entry.id.strip_prefix(base) else {
+            continue;
+        };
+        let Some(level) = suffix.strip_prefix('-') else {
+            continue;
+        };
+        if ccextra_core::thinking::Level::parse(level).is_some() {
+            levels.push(level.to_string());
+        }
+    }
+    levels
+}
+
+/// 家族缺省等级:优先 medium,否则取等级中位(按档位排序)
+fn default_effort_level(levels: &[String]) -> String {
+    if levels.iter().any(|level| level == "medium") {
+        return "medium".to_string();
+    }
+    let mut ranked: Vec<&str> = levels.iter().map(String::as_str).collect();
+    ranked.sort_by_key(|level| ccextra_core::thinking::level_rank(
+        ccextra_core::thinking::Level::parse(level).expect("family_levels 已过滤非法等级"),
+    ));
+    ranked
+        .get(ranked.len() / 2)
+        .map(|level| (*level).to_string())
+        .unwrap_or_else(|| "medium".to_string())
+}
+
 /// 固定参数段合法性:逗号分隔的 `k=v`,k/v 均非空(与转换层 split_pinned_params 对齐)
 fn valid_pinned_tail(tail: &str) -> bool {
     tail.split(',')
@@ -75,10 +107,12 @@ fn glob_matches(pattern: &str, id: &str) -> bool {
 /// - 白名单空 = 全放行;glob 展开对目录 id 精确匹配
 /// - 条目可带固定参数 `"id:param=value,param=value"`:base 参与匹配,
 ///   固定参数拼进 name 随路由传给转换层(入站仍用裸 base/alias)
-/// - `auto` 生成 `{name: "auto", alias: "default"}`(name 兜底仍支持入站 auto)
+/// - `default` 条目生成 `{name: "default", alias: "default"}`:name 是发往
+///   上游的 model id,必须保持目录原值(上游拒绝 "auto");白名单写
+///   `default` 或 `auto` 均归一后命中该条目
 /// - 与现有 provider 的 alias 冲突跳过并告警(不阻断;name 可跨 provider 重复)
 pub fn build_cursor_models(
-    catalog: &[super::client::CursorModelEntry],
+    catalog: &[CursorModelEntry],
     whitelist: &[String],
     existing: &[ProviderConfig],
 ) -> Vec<ModelConfig> {
@@ -122,15 +156,15 @@ pub fn build_cursor_models(
         if !allow_all && matched.is_none() {
             continue;
         }
-        // name = 归一 base + 白名单固定参数段(原样保留参数顺序);
-        // 非法参数段(缺 = 或空 k/v)跳过并告警,避免合成转换层无法解析的 name
+        // name 是发往上游的 model id:default 条目必须保持目录原值 "default"
+        // (上游拒绝 "auto",实测 ERROR_BAD_MODEL_NAME);归一仅用于白名单匹配
         let name = match matched.map(|raw| raw.split_once(':')) {
-            Some(Some((_, tail))) if valid_pinned_tail(tail) => format!("{id}:{tail}"),
+            Some(Some((_, tail))) if valid_pinned_tail(tail) => format!("{}:{tail}", entry.id),
             Some(Some(_)) => {
                 tracing::warn!(model = %entry.id, "cursor 白名单固定参数段非法(须为 k=v 逗号分隔),跳过");
                 continue;
             }
-            _ => id.to_string(),
+            _ => entry.id.clone(),
         };
         let alias = if id == "auto" { "default" } else { id };
         if taken_aliases.contains(alias) {
@@ -144,78 +178,153 @@ pub fn build_cursor_models(
             max_tokens: None,
         });
     }
+    // 家族展开:白名单条目未命中任何目录 id 时,检测 base-{level} 变体家族
+    // (上游目录以变体形态发布思考等级,如 grok-4.7-high;裸 base 上游按
+    // default/auto 处理)。合成单一模型,name 携带 effort_levels 标记,
+    // 转换层把钳制后的 effort 拼进 model id
+    if !allow_all {
+        // 同 build 内已产出的 alias(精确路径 + 先前的家族条目):
+        // 重复白名单条目(如裸 base 与钉参条目同 base)不重复物化
+        let mut emitted_aliases: HashSet<String> =
+            models.iter().map(|m| m.alias.clone()).collect();
+        for (pattern, raw) in &entries {
+            // glob 已命中目录 id 的条目走上面的精确路径,不重复展开
+            if catalog.iter().any(|entry| {
+                let id = if entry.id == "default" {
+                    "auto"
+                } else {
+                    entry.id.as_str()
+                };
+                glob_matches(pattern, id)
+            }) {
+                continue;
+            }
+            let levels = family_levels(catalog, pattern);
+            if levels.is_empty() {
+                continue;
+            }
+            let alias = if pattern == "auto" {
+                "default"
+            } else {
+                pattern.as_str()
+            };
+            if taken_aliases.contains(alias) || emitted_aliases.contains(alias) {
+                tracing::warn!(model = %pattern, "cursor 模型 alias 与现有 provider 冲突,跳过");
+                continue;
+            }
+            // name = base + 固定参数段(原样)+ effort_levels 标记;
+            // 等级用 '+' 分隔,避开参数段的逗号切分。
+            // 家族展开意味着目录无裸 base 条目,无 effort 的请求也必须拼
+            // 等级后缀,否则上游 not_found;effort_default 指定缺省等级
+            let levels_csv = levels.join("+");
+            let default_level = default_effort_level(&levels);
+            let name = match raw.split_once(':') {
+                Some((_, tail)) if valid_pinned_tail(tail) => {
+                    format!("{pattern}:{tail},effort_levels={levels_csv},effort_default={default_level}")
+                }
+                Some(_) => {
+                    tracing::warn!(model = %pattern, "cursor 白名单固定参数段非法(须为 k=v 逗号分隔),跳过");
+                    continue;
+                }
+                None => format!("{pattern}:effort_levels={levels_csv},effort_default={default_level}"),
+            };
+            models.push(ModelConfig {
+                name,
+                alias: alias.to_string(),
+                max_input_tokens: None,
+                max_tokens: None,
+            });
+            emitted_aliases.insert(alias.to_string());
+        }
+    }
     models
 }
 
-/// 目录词表:归一 id → 参数列表(转换层 effort/thinking 映射依据)
-pub fn build_cursor_vocab(
-    catalog: &[super::client::CursorModelEntry],
-) -> HashMap<String, Vec<CursorParamVocab>> {
-    catalog
-        .iter()
-        .map(|entry| {
-            let id = if entry.id == "default" {
-                "auto".to_string()
-            } else {
-                entry.id.clone()
-            };
-            (id, entry.parameters.clone())
-        })
-        .collect()
-}
-
-/// 合成 cursor provider(base_url 占位空串,不经通用 upstream)
-pub fn synthesize_cursor_provider(models: Vec<ModelConfig>) -> ProviderConfig {
+/// 合成 cursor provider(base_url 进 provider,handler 从路由快照读取)
+pub fn synthesize_cursor_provider(
+    models: Vec<ModelConfig>,
+    base_url: &str,
+    metadata: HashMap<String, String>,
+) -> ProviderConfig {
     ProviderConfig::new(
         "cursor".to_string(),
         Protocol::CursorSdk,
-        vec![String::new()],
+        vec![base_url.to_string()],
         "managed".to_string(),
         None,
         false,
         models,
     )
+    .with_metadata(metadata)
 }
 
-/// 拉取目录并合成 provider:凭证保鲜 → sidecar /models → 过滤合成
+/// 拉取目录并合成 provider:凭证保鲜 → 原生 GetUsableModels → 过滤合成
 ///
-/// 失败返回 None(调用方保留最近成功 provider 与词表);成功返回
-/// (provider, 参数词表),空目录按设计发布空 cursor model 集
+/// 失败返回 None(调用方保留最近成功 provider);成功返回 provider,
+/// 空目录按设计发布空 cursor model 集
 pub async fn load_cursor_provider(
-    sidecar: &CursorSidecar,
     config: &CursorConfig,
     existing: &[ProviderConfig],
-) -> Option<(ProviderConfig, HashMap<String, Vec<CursorParamVocab>>)> {
-    let credential = super::ensure_credential_fresh(&config.auth_dir, None, None)
+    proxy_url: Option<&str>,
+) -> Option<ProviderConfig> {
+    // 凭证刷新与目录拉取走同一出站代理(Run 路径用全局 proxy,此处对齐)
+    let credential = super::ensure_credential_fresh(&config.auth_dir, proxy_url, None)
         .await
         .map_err(|e| {
             tracing::warn!("Cursor 凭证不可用,目录刷新跳过: {e:#}");
             e
         })
         .ok()?;
-    let catalog = sidecar
-        .models(&credential.access_token)
-        .await
-        .map_err(|e| {
-            tracing::warn!("Cursor sidecar 模型目录拉取失败,保留现有: {e}");
-            e
-        })
-        .ok()?;
+    let base_url = config
+        .base_url
+        .clone()
+        .unwrap_or_else(|| super::constants::DEFAULT_BASE_URL.to_string());
+    let client_version = config
+        .client_version
+        .clone()
+        .unwrap_or_else(|| super::constants::DEFAULT_CLIENT_VERSION.to_string());
+    let catalog = fetch_models(
+        &base_url,
+        &client_version,
+        &credential.access_token,
+        proxy_url,
+    )
+    .await
+    .map_err(|e| {
+        tracing::warn!("Cursor 模型目录拉取失败,保留现有: {e}");
+        e
+    })
+    .ok()?;
     let models = build_cursor_models(&catalog, &config.models, existing);
-    let vocab = build_cursor_vocab(&catalog);
-    Some((synthesize_cursor_provider(models), vocab))
+    let mut metadata = std::collections::HashMap::new();
+    metadata.insert("base_url".to_string(), base_url.clone());
+    metadata.insert(
+        "auth_dir".to_string(),
+        config.auth_dir.to_string_lossy().to_string(),
+    );
+    metadata.insert(
+        "credential_id".to_string(),
+        super::provider::credential_fingerprint(&credential),
+    );
+    metadata.insert("client_version".to_string(), client_version);
+    Some(synthesize_cursor_provider(models, &base_url, metadata))
+}
+
+/// 组装原生运行时(会话表 + 配置);cli 与 reload 共用
+pub fn new_cursor_runtime(config: CursorConfig) -> Arc<CursorRuntime> {
+    Arc::new(CursorRuntime {
+        sessions: CursorSessions::default(),
+        config: tokio::sync::RwLock::new(config),
+    })
 }
 
 #[cfg(test)]
 mod tests {
-    use super::super::client::CursorModelEntry;
+    use super::super::models::CursorModelEntry;
     use super::*;
 
     fn entry(id: &str) -> CursorModelEntry {
-        CursorModelEntry {
-            id: id.to_string(),
-            parameters: vec![],
-        }
+        CursorModelEntry { id: id.to_string() }
     }
 
     fn provider(name: &str, models: Vec<(&str, &str)>) -> ProviderConfig {
@@ -305,7 +414,8 @@ mod tests {
 
     #[test]
     fn empty_catalog_yields_empty_provider() {
-        let provider = synthesize_cursor_provider(build_cursor_models(&[], &[], &[]));
+        let provider =
+            synthesize_cursor_provider(build_cursor_models(&[], &[], &[]), "https://api2.cursor.sh", HashMap::new());
         assert_eq!(provider.name, "cursor");
         assert_eq!(provider.protocol, Protocol::CursorSdk);
         assert!(provider.models.is_empty());
@@ -313,15 +423,16 @@ mod tests {
     }
 
     #[test]
-    fn catalog_default_id_maps_to_auto_model() {
-        // SDK catalog 实际返回 id "default"(非 auto),须归一后与白名单 default 匹配
+    fn catalog_default_id_keeps_default_model() {
+        // 目录实际返回 id "default"(非 auto);归一仅用于白名单匹配,
+        // name(上游 model id)必须保持 "default"(上游拒绝 "auto")
         let models = build_cursor_models(
             &[entry("default"), entry("composer-2.5")],
             &["default".into()],
             &[],
         );
         assert_eq!(models.len(), 1);
-        assert_eq!(models[0].name, "auto");
+        assert_eq!(models[0].name, "default");
         assert_eq!(models[0].alias, "default");
     }
 
@@ -339,14 +450,14 @@ mod tests {
     }
 
     #[test]
-    fn whitelist_pinned_default_base_normalizes_to_auto() {
+    fn whitelist_pinned_default_base_keeps_default_model() {
         let models = build_cursor_models(
             &[entry("default")],
             &["default:optimize_for=intelligence".to_string()],
             &[],
         );
         assert_eq!(models.len(), 1);
-        assert_eq!(models[0].name, "auto:optimize_for=intelligence");
+        assert_eq!(models[0].name, "default:optimize_for=intelligence");
         assert_eq!(models[0].alias, "default");
     }
 
@@ -365,23 +476,86 @@ mod tests {
     }
 
     #[test]
-    fn build_vocab_normalizes_default_and_keeps_params() {
+    fn unmatched_whitelist_base_expands_effort_family() {
+        // 目录无裸 grok-4.7,只有变体:家族展开合成单一模型,-fast 不算等级
         let catalog = vec![
-            CursorModelEntry {
-                id: "default".to_string(),
-                parameters: vec![],
-            },
-            CursorModelEntry {
-                id: "grok-4.7".to_string(),
-                parameters: vec![CursorParamVocab {
-                    id: "reasoning_effort".to_string(),
-                    values: vec!["low".to_string(), "xhigh".to_string()],
-                }],
-            },
+            entry("grok-4.7-low"),
+            entry("grok-4.7-medium"),
+            entry("grok-4.7-high"),
+            entry("grok-4.7-high-fast"),
+            entry("composer-2.5"),
         ];
-        let vocab = build_cursor_vocab(&catalog);
-        assert!(vocab.contains_key("auto"));
-        assert_eq!(vocab["grok-4.7"][0].id, "reasoning_effort");
-        assert_eq!(vocab["grok-4.7"][0].values, vec!["low", "xhigh"]);
+        let models = build_cursor_models(&catalog, &["grok-4.7".into()], &[]);
+        assert_eq!(models.len(), 1);
+        assert_eq!(
+            models[0].name,
+            "grok-4.7:effort_levels=low+medium+high,effort_default=medium"
+        );
+        assert_eq!(models[0].alias, "grok-4.7");
+    }
+
+    #[test]
+    fn exact_id_whitelist_skips_family_expansion() {
+        // 目录已有裸 id(auto/composer-2.5 形态):精确路径,不合成家族模型
+        let catalog = vec![entry("composer-2.5"), entry("composer-2.5-fast")];
+        let models = build_cursor_models(&catalog, &["composer-2.5".into()], &[]);
+        assert_eq!(models.len(), 1);
+        assert_eq!(models[0].name, "composer-2.5");
+    }
+
+    #[test]
+    fn glob_hit_whitelist_skips_family_expansion() {
+        // glob 命中目录 id 时按 id 逐个物化,不再对条目做家族展开
+        let catalog = vec![entry("grok-4.7-low"), entry("grok-4.7-high")];
+        let models = build_cursor_models(&catalog, &["grok-*".into()], &[]);
+        assert_eq!(models.len(), 2);
+        assert_eq!(models[0].name, "grok-4.7-low");
+        assert_eq!(models[1].name, "grok-4.7-high");
+    }
+
+    #[test]
+    fn family_expansion_keeps_pinned_params_in_name() {
+        let catalog = vec![entry("grok-4.7-low"), entry("grok-4.7-high")];
+        let models = build_cursor_models(
+            &catalog,
+            &["grok-4.7:reasoning_effort=high".to_string()],
+            &[],
+        );
+        assert_eq!(models.len(), 1);
+        assert_eq!(
+            models[0].name,
+            "grok-4.7:reasoning_effort=high,effort_levels=low+high,effort_default=high"
+        );
+    }
+
+    #[test]
+    fn family_expansion_skips_alias_conflict() {
+        let existing = vec![provider("other", vec![("x", "grok-4.7")])];
+        let catalog = vec![entry("grok-4.7-low"), entry("grok-4.7-high")];
+        let models = build_cursor_models(&catalog, &["grok-4.7".into()], &existing);
+        assert!(models.is_empty());
+    }
+
+    #[test]
+    fn duplicate_whitelist_entries_dedup_by_alias() {
+        // 裸 base 与同 base 钉参条目:只物化一个家族模型
+        let catalog = vec![entry("grok-4.7-low"), entry("grok-4.7-high")];
+        let models = build_cursor_models(
+            &catalog,
+            &["grok-4.7".to_string(), "grok-4.7:reasoning_effort=high".to_string()],
+            &[],
+        );
+        assert_eq!(models.len(), 1);
+        assert_eq!(models[0].alias, "grok-4.7");
+    }
+
+    #[test]
+    fn family_expansion_requires_level_suffix() {
+        // thinking 等非等级后缀不算家族变体
+        let catalog = vec![entry("claude-4.5-sonnet"), entry("claude-4.5-sonnet-thinking")];
+        let models = build_cursor_models(&catalog, &["claude-4.5-sonnet".into()], &[]);
+        // 裸 id 精确命中,thinking 变体不参与
+        assert_eq!(models.len(), 1);
+        assert_eq!(models[0].name, "claude-4.5-sonnet");
     }
 }
