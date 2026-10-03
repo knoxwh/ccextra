@@ -75,23 +75,12 @@ pub fn decode_mcp(data: &[u8]) -> Result<ExecKind, WireError> {
     })
 }
 
-/// TurnEndedUpdate:1 input_tokens|2 output_tokens|3 cache_read_tokens|4 cache_write_tokens|5 reasoning_tokens(全 int64 optional)
+/// `TurnEndedUpdate` 在 agent.proto 里是空消息。Plus 只把它当生成结束信号。
+/// 子字段里的 varint 先不当 token:空帧与带未知字段的帧都返回全 None,
+/// 避免把以后的协议字段误读成用量。仍校验 payload 是合法 protobuf。
 pub fn decode_turn_ended(data: &[u8]) -> Result<TurnUsage, WireError> {
-    let mut usage = TurnUsage::default();
-    for field in fields(data)? {
-        if let Field::Varint { number, value } = field {
-            let tokens = i64::try_from(value).unwrap_or(i64::MAX);
-            match number {
-                1 => usage.input_tokens = Some(tokens),
-                2 => usage.output_tokens = Some(tokens),
-                3 => usage.cache_read_tokens = Some(tokens),
-                4 => usage.cache_write_tokens = Some(tokens),
-                5 => usage.reasoning_tokens = Some(tokens),
-                _ => {}
-            }
-        }
-    }
-    Ok(usage)
+    let _ = fields(data)?;
+    Ok(TurnUsage::default())
 }
 
 pub fn is_builtin(number: u64) -> bool {

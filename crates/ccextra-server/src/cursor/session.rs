@@ -434,9 +434,13 @@ impl CursorSessions {
                         drive.blob_store(),
                     );
                 }
-                // 工具边界已收尾；对齐 Plus 的等待循环，迟到的输出增量不跨回合发送。
-                CursorEvent::Text(_) | CursorEvent::Thinking(_) | CursorEvent::Tokens(_) => {}
-                CursorEvent::End | CursorEvent::TurnEnded(_) | CursorEvent::ToolUse { .. } => break,
+                // 工具边界已收尾。迟到的输出增量不跨回合发送。
+                // TurnEnded 只表示这一步生成结束，流还在；取消会让下一轮 tool_result 丢掉这条 Run。
+                CursorEvent::Text(_)
+                | CursorEvent::Thinking(_)
+                | CursorEvent::Tokens(_)
+                | CursorEvent::TurnEnded(_) => {}
+                CursorEvent::End | CursorEvent::ToolUse { .. } => break,
             }
         }
         self.cancel(&conversation, &identity, generation);

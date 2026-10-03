@@ -1,5 +1,5 @@
 use bytes::Bytes;
-use ccextra_core::convert::cursor::proto::{ServerMessage, TurnUsage};
+use ccextra_core::convert::cursor::proto::ServerMessage;
 
 use super::emit;
 
@@ -14,10 +14,6 @@ pub struct CursorSse {
     model: String,
     input_tokens: i64,
     output_tokens: i64,
-    turn_usage: Option<TurnUsage>,
-    /// 工具续接(多回合)请求:TurnEnded 是整回合累计口径,
-    /// 不能当单请求 usage 直报,退回请求体字节估算
-    continuation: bool,
     next_index: i64,
     block: Option<Block>,
     started: bool,
@@ -28,14 +24,12 @@ pub struct CursorSse {
 }
 
 impl CursorSse {
-    pub fn new(id: &str, model: &str, input_tokens: usize, continuation: bool) -> Self {
+    pub fn new(id: &str, model: &str, input_tokens: usize) -> Self {
         Self {
             id: id.into(),
             model: model.into(),
             input_tokens: i64::try_from(input_tokens).unwrap_or(i64::MAX),
             output_tokens: 0,
-            turn_usage: None,
-            continuation,
             next_index: 0,
             block: None,
             started: false,
@@ -64,9 +58,8 @@ impl CursorSse {
             ServerMessage::TokenDelta(delta) if *delta > 0 => {
                 self.output_tokens = self.output_tokens.saturating_add(*delta);
             }
-            ServerMessage::TurnEnded(usage) => {
+            ServerMessage::TurnEnded(_) => {
                 self.turn_ended = true;
-                self.turn_usage = Some(*usage);
             }
             _ => {}
         }
@@ -141,28 +134,8 @@ impl CursorSse {
             frames.push(emit::content_block_start_text(self.next_index));
             frames.push(emit::content_block_stop(self.next_index));
         }
-        // 单轮回合 TurnEnded 是真实单请求用量;多轮回合是整回合累计口径,
-        // 直报会撑爆上下文/成本显示,退回请求体估算(input)与本响应
-        // TokenDelta 累计(output),rd/wr 置 0(单请求真实值不存在)
-        let usage = self.turn_usage.unwrap_or_default();
-        let (input_tokens, cache_read, cache_write) = if self.continuation {
-            (self.input_tokens, 0, 0)
-        } else {
-            let cache_read = usage.cache_read_tokens.unwrap_or(0);
-            let cache_write = usage.cache_write_tokens.unwrap_or(0);
-            let input = usage
-                .input_tokens
-                .map(|tokens| (tokens - cache_read - cache_write).max(0))
-                .unwrap_or(self.input_tokens);
-            (input, cache_read, cache_write)
-        };
-        let output_tokens = self.output_tokens;
-        // 多回合 reasoning 同为累计口径,本请求无真实值,报未知(-1)
-        let reasoning_tokens = if self.continuation {
-            -1
-        } else {
-            usage.reasoning_tokens.unwrap_or(-1)
-        };
+        // TurnEndedUpdate 是空消息,不从中读 token。input 用请求体字节/4,
+        // output 用本响应 TokenDelta 累计。
         frames.push(emit::message_delta(
             if tool_use || self.has_tool_use {
                 "tool_use"
@@ -170,11 +143,11 @@ impl CursorSse {
                 "end_turn"
             },
             None,
-            input_tokens,
-            output_tokens,
-            cache_read,
-            cache_write,
-            reasoning_tokens,
+            self.input_tokens,
+            self.output_tokens,
+            0,
+            0,
+            -1,
         ));
         frames.push(emit::message_stop());
         frames
@@ -202,6 +175,7 @@ impl CursorSse {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use ccextra_core::convert::cursor::proto::TurnUsage;
 
     fn event(bytes: &Bytes) -> (String, serde_json::Value) {
         let text = std::str::from_utf8(bytes).unwrap();
@@ -214,7 +188,7 @@ mod tests {
 
     #[test]
     fn text_and_thinking_finish_only_after_trailer() {
-        let mut state = CursorSse::new("message-1", "composer-2", 10, false);
+        let mut state = CursorSse::new("message-1", "composer-2", 10);
         let mut frames = state.handle(&ServerMessage::ThinkingDelta("plan".into()));
         frames.extend(state.handle(&ServerMessage::TextDelta("answer".into())));
         frames.extend(state.handle(&ServerMessage::TokenDelta(3)));
@@ -248,8 +222,8 @@ mod tests {
     }
 
     #[test]
-    fn turn_ended_usage_overrides_estimates_in_message_delta() {
-        let mut state = CursorSse::new("message-3", "composer-2", 10, false);
+    fn turn_ended_does_not_override_estimate() {
+        let mut state = CursorSse::new("message-3", "composer-2", 10);
         let mut frames = state.handle(&ServerMessage::TextDelta("answer".into()));
         frames.extend(state.handle(&ServerMessage::TokenDelta(3)));
         frames.extend(state.handle(&ServerMessage::TurnEnded(TurnUsage {
@@ -260,19 +234,18 @@ mod tests {
             reasoning_tokens: Some(30),
         })));
         frames.extend(state.finish(false));
-        // input 拆出 cache 部分:1000 - 600 - 50 = 350;output 取本响应
-        // TokenDelta 累计,不用 TurnEnded 的整回合累计值
+        // TurnEnded 不携带用量。input 用请求体估算,output 用 TokenDelta。
         let delta = event(&frames[frames.len() - 2]).1["usage"].clone();
-        assert_eq!(delta["input_tokens"], 350);
+        assert_eq!(delta["input_tokens"], 10);
         assert_eq!(delta["output_tokens"], 3);
-        assert_eq!(delta["cache_read_input_tokens"], 600);
-        assert_eq!(delta["cache_creation_input_tokens"], 50);
-        assert_eq!(delta["output_tokens_details"]["thinking_tokens"], 30);
+        assert!(delta.get("cache_read_input_tokens").is_none());
+        assert!(delta.get("cache_creation_input_tokens").is_none());
+        assert!(delta.get("output_tokens_details").is_none());
     }
 
     #[test]
     fn continuation_turn_reports_estimate_not_cumulative_usage() {
-        let mut state = CursorSse::new("message-4", "composer-2", 40, true);
+        let mut state = CursorSse::new("message-4", "composer-2", 40);
         let mut frames = state.handle(&ServerMessage::TextDelta("answer".into()));
         frames.extend(state.handle(&ServerMessage::TokenDelta(5)));
         frames.extend(state.handle(&ServerMessage::TurnEnded(TurnUsage {
@@ -283,8 +256,7 @@ mod tests {
             reasoning_tokens: Some(26578),
         })));
         frames.extend(state.finish(false));
-        // 多回合续接:TurnEnded 是整回合累计,退回估算 input 与本响应
-        // TokenDelta output,rd/wr 与 thinking 置未知
+        // 大额 TurnEnded 字段同样不进入 usage
         let delta = event(&frames[frames.len() - 2]).1["usage"].clone();
         assert_eq!(delta["input_tokens"], 40);
         assert_eq!(delta["output_tokens"], 5);
@@ -296,11 +268,11 @@ mod tests {
 
     #[test]
     fn tool_boundary_closes_response_without_waiting_for_turn_end() {
-        let mut state = CursorSse::new("message-2", "composer-2", 0, false);
+        let mut state = CursorSse::new("message-2", "composer-2", 0);
         let mut frames = state.handle(&ServerMessage::TextDelta("checking".into()));
         frames.extend(state.tool_use("call-1", "lookup", r#"{"id":1}"#));
         frames.extend(state.finish(true));
-        // 无会话缓存时 input 占位为 0:真实值由 TurnEnded 上报,不伪造
+        // input 占位为构造时传入的估算
         assert_eq!(event(&frames[0]).1["message"]["usage"]["input_tokens"], 0);
         assert_eq!(event(&frames[4]).1["content_block"]["type"], "tool_use");
         assert_eq!(event(&frames[5]).1["delta"]["partial_json"], r#"{"id":1}"#);
@@ -310,7 +282,7 @@ mod tests {
 
     #[test]
     fn eof_after_partial_output_emits_error_not_success() {
-        let mut state = CursorSse::new("message-3", "composer-2", 4, false);
+        let mut state = CursorSse::new("message-3", "composer-2", 4);
         let _ = state.handle(&ServerMessage::TextDelta("partial".into()));
         let frames = state.error("Cursor 连接提前关闭");
         assert_eq!(event(frames.last().unwrap()).0, "error");

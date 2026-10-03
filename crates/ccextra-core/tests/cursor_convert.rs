@@ -300,8 +300,8 @@ fn mcp_state_and_subagent_exec_decode_and_reply() {
 }
 
 #[test]
-fn turn_ended_carries_usage_fields() {
-    // TurnEndedUpdate:1 input|2 output|3 cache_read|4 cache_write|5 reasoning(全 optional varint)
+fn turn_ended_payload_is_not_usage() {
+    // agent.proto 的 TurnEndedUpdate 是空消息。带 varint 的帧也不能当成 token。
     let mut turn_ended = Vec::new();
     encode_tag(1, 0, &mut turn_ended);
     encode_varint(1000, &mut turn_ended);
@@ -312,22 +312,33 @@ fn turn_ended_carries_usage_fields() {
     encode_tag(4, 0, &mut turn_ended);
     encode_varint(50, &mut turn_ended);
     let messages = decode_agent_server_message(&message(1, &message(14, &turn_ended))).unwrap();
-    assert_eq!(
-        messages,
-        vec![ServerMessage::TurnEnded(
-            ccextra_core::convert::cursor::proto::TurnUsage {
-                input_tokens: Some(1000),
-                output_tokens: Some(200),
-                cache_read_tokens: Some(600),
-                cache_write_tokens: Some(50),
-                reasoning_tokens: None,
-            },
-        )]
-    );
+    assert_eq!(messages, vec![ServerMessage::TurnEnded(Default::default())]);
 
-    // 空 payload:全 None,不误报用量
     let messages = decode_agent_server_message(&message(1, &message(14, &[]))).unwrap();
     assert_eq!(messages, vec![ServerMessage::TurnEnded(Default::default())]);
+}
+
+#[test]
+fn mcp_integer_args_stay_json_integers() {
+    use ccextra_core::convert::cursor::decode_mcp_args;
+    use prost_types::value::Kind;
+    use std::collections::BTreeMap;
+
+    let encode = |number: f64| {
+        prost_types::Value {
+            kind: Some(Kind::NumberValue(number)),
+        }
+        .encode_to_vec()
+    };
+    let mut args = BTreeMap::new();
+    args.insert("n".into(), encode(1.0));
+    args.insert("neg".into(), encode(-3.0));
+    args.insert("frac".into(), encode(1.5));
+    let value = decode_mcp_args(&args).unwrap();
+    assert_eq!(value, json!({"frac": 1.5, "n": 1, "neg": -3}));
+    assert_eq!(value["n"].to_string(), "1");
+    assert_eq!(value["neg"].to_string(), "-3");
+    assert_eq!(value["frac"].to_string(), "1.5");
 }
 
 #[test]
@@ -378,13 +389,10 @@ fn cold_request_flattens_history_and_defines_mcp_schema() {
         Some(prost_types::value::Kind::StructValue(_))
     ));
     assert_eq!(request.blob_store.len(), 1);
-    assert_eq!(
-        run.conversation_state
-            .unwrap()
-            .root_prompt_messages_json
-            .len(),
-        1
-    );
+    let state = run.conversation_state.unwrap();
+    assert!(state.turns.is_empty());
+    assert!(state.turns_old.is_empty());
+    assert_eq!(state.root_prompt_messages_json.len(), 1);
 }
 
 #[test]

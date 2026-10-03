@@ -181,6 +181,8 @@ async fn tool_upstream_with(
             )
             .unwrap();
         parked_rx.await.unwrap();
+        // 工具响应已经返回后才到的 TurnEnded:驻留必须留着,否则 tool_result 续接失败
+        sender.send_data(turn_ended_frame(), false).unwrap();
         let mut controls = kv_request(42, 3, Some(b"stored"));
         controls.extend(kv_request(43, 2, None));
         // 未存过且非 32B sha 的 key(UserMessage 形态):回显 blob_id 作为内容
@@ -274,6 +276,11 @@ async fn tool_upstream_with(
 
 fn interaction(kind: u64, value: &[u8]) -> Vec<u8> {
     field(1, &field(kind, value))
+}
+
+fn turn_ended_frame() -> Bytes {
+    let message = field(1, &field(14, &[]));
+    Bytes::from(ConnectFrame::encode(&message, 0).unwrap())
 }
 
 fn text_frame(text: &str) -> Bytes {

@@ -45,7 +45,7 @@ pub enum InteractionQueryKind {
     SetupVm,
 }
 
-/// TurnEndedUpdate 携带的回合用量(field 全 optional,None 表示上游未上报)
+/// 回合结束信号上的用量。当前 proto 没有这些字段，解码总是 None。
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
 pub struct TurnUsage {
     pub input_tokens: Option<i64>,

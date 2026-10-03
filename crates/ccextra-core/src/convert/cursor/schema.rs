@@ -62,13 +62,35 @@ pub(super) fn tools(
     Ok(tools)
 }
 
+/// protobuf number 是 f64。整数值写成 JSON integer，避免 `1` 变成 `1.0`。
+fn json_number(value: f64) -> Value {
+    if value.is_finite() && value.fract() == 0.0 {
+        if value >= 0.0 {
+            let bits = value as u64;
+            if bits as f64 == value {
+                if let Some(number) = serde_json::Number::from_u128(u128::from(bits)) {
+                    return Value::Number(number);
+                }
+            }
+        } else {
+            let bits = value as i64;
+            if bits as f64 == value {
+                if let Some(number) = serde_json::Number::from_i128(i128::from(bits)) {
+                    return Value::Number(number);
+                }
+            }
+        }
+    }
+    serde_json::Number::from_f64(value)
+        .map(Value::Number)
+        .unwrap_or(Value::Null)
+}
+
 fn from_proto(value: ProtoValue) -> Value {
     match value.kind {
         None | Some(Kind::NullValue(_)) => Value::Null,
         Some(Kind::BoolValue(v)) => Value::Bool(v),
-        Some(Kind::NumberValue(v)) => serde_json::Number::from_f64(v)
-            .map(Value::Number)
-            .unwrap_or(Value::Null),
+        Some(Kind::NumberValue(v)) => json_number(v),
         Some(Kind::StringValue(v)) => Value::String(v),
         Some(Kind::ListValue(v)) => Value::Array(v.values.into_iter().map(from_proto).collect()),
         Some(Kind::StructValue(v)) => Value::Object(

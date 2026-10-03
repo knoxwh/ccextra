@@ -140,11 +140,8 @@ fn handle_producer_settle(
         sessions.finish(conversation, identity, generation);
     }
     let snapshot = serde_json::to_vec(&reply.json()).map_err(CursorFailure::from_transport)?;
-    // 单回合写 TurnEnded 真实 input;多回合续接无单请求真实值,
-    // 写请求体估算(count_tokens 与下轮占位复用)
-    let settled_input = reply
-        .real_usage_input()
-        .unwrap_or_else(|| reply.estimated_input());
+    // input 固定为请求体字节/4(count_tokens 与下轮占位复用)
+    let settled_input = reply.estimated_input();
     if let (Some(sid), true) = (session_id, settled_input > 0) {
         let _ = token_cache
             .lock()
@@ -760,9 +757,7 @@ pub(crate) async fn handle_cursor(
                     return Ok(failure_response(err));
                 }
             }
-            // park 续接同一 Run:TurnEnded 是整回合累计口径,标记续接走估算
-            let reply =
-                CursorReply::new(response_id, inbound_model, input_estimate(&prepared), true);
+            let reply = CursorReply::new(response_id, inbound_model, input_estimate(&prepared));
             setup.handed_off = true;
             spawn_cursor_producer(
                 state.cursor_sessions.clone(),
@@ -852,12 +847,10 @@ pub(crate) async fn handle_cursor(
                 if let Some((_, blobs)) = checkpoint.as_ref() {
                     drive.seed_blobs(blobs.clone());
                 }
-                // 新 Run(含 flatten 重跑):TurnEnded 对本请求是真实口径,不标记续接
                 let mut reply = CursorReply::new(
                     response_id.clone(),
                     inbound_model.clone(),
                     input_estimate(&prepared),
-                    false,
                 );
                 let first = async {
                     loop {
@@ -976,17 +969,22 @@ async fn accept_event(
     reply: &mut CursorReply,
     event: CursorEvent,
 ) -> Result<Vec<Bytes>, CursorFailure> {
+    let mut saw_turn_ended = matches!(event, CursorEvent::TurnEnded(_));
     let mut frames = reply.accept(event);
     if !reply.pending.is_empty() && !reply.finished {
+        // 同一批工具:缓冲里的事件一次排空。TurnEnded 结束等待,但不把回复标成已结束。
+        // 没有 TurnEnded 时,缓冲空后最多再等 16ms。
         let deadline = tokio::time::Instant::now() + Duration::from_millis(16);
         loop {
             let event = match drive.next_ready_event().await? {
                 Some(event) => event,
+                None if saw_turn_ended => break,
                 None => match tokio::time::timeout_at(deadline, drive.next_event()).await {
                     Ok(event) => event?,
                     Err(_) => break,
                 },
             };
+            saw_turn_ended |= matches!(event, CursorEvent::TurnEnded(_));
             frames.extend(reply.accept(event));
             if reply.finished {
                 break;

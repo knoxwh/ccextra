@@ -130,7 +130,7 @@ Gemini 函数调用模式。Antigravity Claude 模型强制使用；Gemini 直�
 Cursor 原生传输：`agent.v1.AgentService/Run`（h2 + rustls 直连 api2.cursor.sh），Connect 帧 `[1B flags][4B len BE][payload]`。请求头含 `content-type: application/connect+proto`、`connect-protocol-version: 1`、`te: trailers`、`x-ghost-mode: true`、`x-cursor-client-version`、`x-cursor-client-type: cli`；无 checksum、无 x-client-key。出站代理复用全局 `proxy`（HTTP CONNECT 隧道）。
 
 **Run**
-一次 `AgentService/Run` 双向流调用，对应一个会话回合。服务端事件归一为 text/thinking 增量、tool 调用、TurnEnded 用量与 checkpoint；TurnEnded 是唯一成功终态。服务端 InteractionQuery（web_search/ask_question 等）必须回 InteractionResponse，否则挂死整流。TurnEnded 用量是整回合累计口径：新 Run 直报真实值，park 续接的工具续接请求退回请求体字节/4 估算（对齐 Plus）。
+一次 `AgentService/Run` 双向流调用，对应一个会话回合。服务端事件归一为 text/thinking 增量、tool 调用、TurnEnded 与 checkpoint。TurnEnded 只表示这一步生成结束，成功终态仍是 Connect end-stream；工具驻留期间忽略 TurnEnded，不取消会话。服务端 InteractionQuery（web_search/ask_question 等）必须回 InteractionResponse，否则挂死整流。用量不读 TurnEnded（proto 为空消息）：input 为请求体字节/4，output 为本响应 TokenDelta 累计（对齐 Plus）。
 
 **InteractionQuery**
 服务端下发的交互查询（web_search/ask_question/switch_mode/exa_search/exa_fetch/create_plan/setup_vm）。ccextra 按种类回 reject/error（SetupVm 回空 success），不提供交互能力。

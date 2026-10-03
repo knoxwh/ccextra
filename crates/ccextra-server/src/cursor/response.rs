@@ -1,7 +1,7 @@
 use super::drive::CursorEvent;
 use crate::sse::cursor::CursorSse;
 use bytes::Bytes;
-use ccextra_core::convert::cursor::proto::{ExecKind, ExecRequest, ServerMessage, TurnUsage};
+use ccextra_core::convert::cursor::proto::{ExecKind, ExecRequest, ServerMessage};
 use serde_json::{json, Value};
 
 pub struct CursorReply {
@@ -11,10 +11,6 @@ pub struct CursorReply {
     content: Vec<Value>,
     input_tokens: usize,
     output_tokens: i64,
-    turn_usage: Option<TurnUsage>,
-    /// 本请求是工具续接(多轮回合):TurnEnded 是整回合累计口径,
-    /// 不能当单请求 usage 直报,退回请求体字节估算
-    continuation: bool,
     pub checkpoint: Option<Vec<u8>>,
     pub pending: Vec<ExecRequest>,
     pub finished: bool,
@@ -22,18 +18,15 @@ pub struct CursorReply {
 }
 
 impl CursorReply {
-    /// input_tokens 是请求体字节/4 估算(对齐 Plus);单轮回合的
-    /// TurnEnded 真实 usage 到达后覆盖,不估算
-    pub fn new(id: String, model: String, input_tokens: usize, continuation: bool) -> Self {
+    /// input_tokens 是请求体字节/4 估算(对齐 Plus)。TurnEnded 不携带用量。
+    pub fn new(id: String, model: String, input_tokens: usize) -> Self {
         Self {
-            sse: CursorSse::new(&id, &model, input_tokens, continuation),
+            sse: CursorSse::new(&id, &model, input_tokens),
             id,
             model,
             content: Vec::new(),
             input_tokens,
             output_tokens: 0,
-            turn_usage: None,
-            continuation,
             checkpoint: None,
             pending: Vec::new(),
             finished: false,
@@ -86,10 +79,7 @@ impl CursorReply {
                 self.output_tokens = self.output_tokens.saturating_add(delta.max(0));
                 self.sse.handle(&ServerMessage::TokenDelta(delta))
             }
-            CursorEvent::TurnEnded(usage) => {
-                self.turn_usage = Some(usage);
-                self.sse.handle(&ServerMessage::TurnEnded(usage))
-            }
+            CursorEvent::TurnEnded(usage) => self.sse.handle(&ServerMessage::TurnEnded(usage)),
             CursorEvent::Checkpoint(raw) => {
                 self.checkpoint = Some(raw);
                 Vec::new()
@@ -130,21 +120,7 @@ impl CursorReply {
         frames
     }
 
-    /// 上报给客户端的 input:单轮回合取 TurnEnded 真实值(Anthropic 语义,
-    /// 已扣 cache);多轮回合无单请求真实数,用请求体估算;未上报为 None
-    pub fn real_usage_input(&self) -> Option<i64> {
-        let usage = self.turn_usage?;
-        if self.continuation {
-            return None;
-        }
-        let cache_read = usage.cache_read_tokens.unwrap_or(0);
-        let cache_write = usage.cache_write_tokens.unwrap_or(0);
-        usage
-            .input_tokens
-            .map(|tokens| (tokens - cache_read - cache_write).max(0))
-    }
-
-    /// 请求体字节/4 估算的 input(settle 写 token cache 的兜底值)
+    /// 请求体字节/4 估算的 input(settle 写 token cache)
     pub fn estimated_input(&self) -> i64 {
         self.input_tokens as i64
     }
@@ -165,32 +141,17 @@ impl CursorReply {
         } else {
             self.content.clone()
         };
-        // 单轮回合 TurnEnded 是真实单请求用量;多轮回合是整回合累计口径,
-        // 直报会撑爆上下文/成本显示,退回请求体估算(input)与本响应
-        // TokenDelta 累计(output),rd/wr 置 0(单请求真实值不存在)
-        let usage = self.turn_usage.unwrap_or_default();
-        let (input_tokens, cache_read, cache_write) = if self.continuation {
-            (self.input_tokens as i64, 0, 0)
-        } else {
-            let cache_read = usage.cache_read_tokens.unwrap_or(0);
-            let cache_write = usage.cache_write_tokens.unwrap_or(0);
-            let input = usage
-                .input_tokens
-                .map(|tokens| (tokens - cache_read - cache_write).max(0))
-                .unwrap_or(self.input_tokens as i64);
-            (input, cache_read, cache_write)
-        };
-        let output_tokens = self.output_tokens;
+        // TurnEnded 不携带用量。input 用请求体估算,output 用本响应 TokenDelta。
         json!({
             "id": self.id, "type": "message", "role": "assistant", "model": self.model,
             "content": content,
             "stop_reason": if self.pending.is_empty() { "end_turn" } else { "tool_use" },
             "stop_sequence": null,
             "usage": {
-                "input_tokens": input_tokens,
-                "output_tokens": output_tokens,
-                "cache_read_input_tokens": cache_read,
-                "cache_creation_input_tokens": cache_write
+                "input_tokens": self.input_tokens as i64,
+                "output_tokens": self.output_tokens,
+                "cache_read_input_tokens": 0,
+                "cache_creation_input_tokens": 0
             }
         })
     }
