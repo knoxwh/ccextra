@@ -775,7 +775,7 @@ fn server_control_abort_fails_decode_immediately() {
 }
 
 #[test]
-fn conversation_state_double_writes_turns_and_turns_old() {
+fn conversation_state_omits_structured_turns_without_checkpoint() {
     let body = json!({
         "messages": [
             {"role":"user", "content":"first"},
@@ -786,26 +786,18 @@ fn conversation_state_double_writes_turns_and_turns_old() {
     let request = build_run_request(&body, "composer-2", "conv", "msg-1", None).unwrap();
     let run = run(&request.payload);
     let state = run.conversation_state.unwrap();
-    // turns(field 8) 与 turns_old(field 2) 双写,内容一致
-    assert_eq!(state.turns.len(), 2);
-    assert_eq!(state.turns_old.len(), 2);
-    for (turn, old) in state.turns.iter().zip(state.turns_old.iter()) {
-        assert_eq!(turn, old);
-        let parsed = generated::ConversationTurnStructure::decode(turn.as_slice()).unwrap();
-        let generated::conversation_turn_structure::Turn::AgentConversationTurn(agent) =
-            parsed.turn.unwrap()
-        else {
-            panic!("expected agent turn");
-        };
-        let user = generated::UserMessage::decode(agent.user_message.as_slice()).unwrap();
-        assert!(!user.text.is_empty());
-    }
-    // 第一回合含 assistant 步骤,第二回合只有 user 文本
-    let first = generated::ConversationTurnStructure::decode(state.turns[0].as_slice()).unwrap();
-    let generated::conversation_turn_structure::Turn::AgentConversationTurn(agent) =
-        first.turn.unwrap()
-    else {
-        panic!()
+    // 对齐 Plus flatten 路径(Turns=nil):无 checkpoint 不发结构化 turns,
+    // Run 端点对无服务端状态的会话拒绝/掐断大 turns,UserText 才是可靠通道
+    assert!(state.turns.is_empty());
+    assert!(state.turns_old.is_empty());
+    // root blob 仍在,UserText 承载全量 transcript
+    assert_eq!(state.root_prompt_messages_json.len(), 1);
+    let action = match run.action.unwrap().action.unwrap() {
+        generated::conversation_action::Action::UserMessageAction(action) => action,
+        _ => panic!("expected user message"),
     };
-    assert_eq!(agent.steps.len(), 1);
+    let user_text = action.user_message.unwrap().text;
+    assert!(user_text.contains("first"));
+    assert!(user_text.contains("answer one"));
+    assert!(user_text.contains("second"));
 }

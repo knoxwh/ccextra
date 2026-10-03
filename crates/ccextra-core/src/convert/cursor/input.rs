@@ -51,15 +51,6 @@ pub(super) struct UserInput {
     pub text: String,
     pub system: String,
     pub images: Vec<CursorImage>,
-    /// 结构化对话轮(对齐 Plus turns 双写):user 文本 + assistant 文本步骤;
-    /// checkpoint 模式为空(服务端已有状态)
-    pub turns: Vec<ConversationTurn>,
-}
-
-/// 单轮对话:user 消息与其后的 assistant 文本步骤
-pub(super) struct ConversationTurn {
-    pub user_text: String,
-    pub assistant_steps: Vec<String>,
 }
 
 /// 提取 content 数组顶层的 image 块(对齐 Plus:仅扫 user 消息,tool_result 内图片不收)
@@ -122,7 +113,6 @@ pub(super) fn user_text(body: &Value, checkpoint: bool) -> Result<UserInput, Cur
     };
     let mut transcript = String::new();
     let mut images = Vec::new();
-    let mut turns: Vec<ConversationTurn> = Vec::new();
     // checkpoint 模式只 entry 最后一条非 system 消息;Claude Code 会在 user 后追加
     // system reminder,末条常是 system,不能让它挤掉真正的用户输入
     let last_conversation = messages
@@ -144,23 +134,6 @@ pub(super) fn user_text(body: &Value, checkpoint: bool) -> Result<UserInput, Cur
         if role == "user" {
             // 对齐 Plus:每条 user 消息覆盖,最终保留最后一条的图片
             images = extract_images(content);
-            if !checkpoint {
-                turns.push(ConversationTurn {
-                    user_text: line.clone(),
-                    assistant_steps: Vec::new(),
-                });
-            }
-        } else if !checkpoint {
-            // assistant 文本进当前轮步骤;无活动轮(首条即 assistant)时开空轮
-            if !line.is_empty() {
-                match turns.last_mut() {
-                    Some(turn) => turn.assistant_steps.push(line.clone()),
-                    None => turns.push(ConversationTurn {
-                        user_text: String::new(),
-                        assistant_steps: vec![line.clone()],
-                    }),
-                }
-            }
         }
         if !checkpoint || Some(index) == last_conversation {
             entry(
@@ -220,7 +193,6 @@ pub(super) fn user_text(body: &Value, checkpoint: bool) -> Result<UserInput, Cur
         text: result,
         system,
         images,
-        turns,
     })
 }
 

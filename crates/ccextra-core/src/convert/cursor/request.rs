@@ -55,7 +55,7 @@ pub fn build_run_request(
         text,
         system,
         images,
-        turns,
+        ..
     } = input::user_text(body, checkpoint.is_some())?;
     if text.is_empty() {
         return Err(CursorConvertError::Invalid("缺少用户消息".into()));
@@ -180,55 +180,15 @@ pub fn build_run_request(
         Some(raw) => raw.to_vec(),
         None => {
             // 对齐 Plus:真 system 进 root blob(键序 content 先,对齐 Go json.Marshal
-            // 字母序;blob id 是 sha256,需字节稳定),UserText 只留用户输入
+            // 字母序;blob id 是 sha256,需字节稳定),UserText 只留用户输入。
+            // 无 checkpoint 时不发结构化 turns(Plus flatten 路径 Turns=nil):
+            // Run 端点对无服务端状态的会话拒绝/掐断大 turns,UserText 才是可靠通道
             let system = serde_json::json!({ "content": system, "role": "system" });
             let bytes = serde_json::to_vec(&system)?;
             let digest = Sha256::digest(&bytes);
             blobs.insert(hex::encode(digest), bytes);
-            // 对齐 Plus:结构化 turns 双写 field 8(turns)+ field 2(turns_old),
-            // 服务端可靠读取 UserText,turns 为补充(可能被忽略)
-            let turn_bytes: Vec<Vec<u8>> = turns
-                .iter()
-                .enumerate()
-                .map(|(index, turn)| {
-                    let user_message = generated::UserMessage {
-                        text: turn.user_text.clone(),
-                        message_id: image_uuid(message_id, index),
-                        ..Default::default()
-                    };
-                    let steps = turn
-                        .assistant_steps
-                        .iter()
-                        .map(|text| {
-                            generated::ConversationStep {
-                                message: Some(
-                                    generated::conversation_step::Message::AssistantMessage(
-                                        generated::AssistantMessage { text: text.clone() },
-                                    ),
-                                ),
-                            }
-                            .encode_to_vec()
-                        })
-                        .collect();
-                    let agent_turn = generated::AgentConversationTurnStructure {
-                        user_message: user_message.encode_to_vec(),
-                        steps,
-                        ..Default::default()
-                    };
-                    generated::ConversationTurnStructure {
-                        turn: Some(
-                            generated::conversation_turn_structure::Turn::AgentConversationTurn(
-                                agent_turn,
-                            ),
-                        ),
-                    }
-                    .encode_to_vec()
-                })
-                .collect();
             generated::ConversationStateStructure {
                 root_prompt_messages_json: vec![digest.to_vec()],
-                turns: turn_bytes.clone(),
-                turns_old: turn_bytes,
                 ..Default::default()
             }
             .encode_to_vec()
