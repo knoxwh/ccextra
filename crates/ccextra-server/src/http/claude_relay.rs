@@ -32,6 +32,9 @@ pub fn is_claude_relay_header_excluded(name: &str, connection_header_names: &[St
                 | "user-agent"
                 | "host"
                 | "content-length"
+                // reqwest 未启用解压 feature:转发客户端 accept-encoding 会让上游
+                // 返回压缩 body,错误路径按原始字节解析会得到乱码,故剥掉
+                | "accept-encoding"
                 | "connection"
                 | "keep-alive"
                 | "proxy-connection"

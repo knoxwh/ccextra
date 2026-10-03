@@ -175,6 +175,7 @@ fn test_claude_relay_header_filtering() {
         ("content-length", "99"),
         ("connection", "keep-alive, x-remove-me"),
         ("transfer-encoding", "chunked"),
+        ("accept-encoding", "gzip, deflate, br"),
         ("user-agent", "claude-code/inbound"),
         ("x-remove-me", "remove-me"),
     ]);
@@ -196,6 +197,7 @@ fn test_claude_relay_header_filtering() {
         "content-length",
         "connection",
         "transfer-encoding",
+        "accept-encoding",
         "user-agent",
         "x-remove-me",
     ] {
