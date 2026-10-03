@@ -454,7 +454,10 @@ cursor_client_version: cli-test
         let mut file = NamedTempFile::new().unwrap();
         file.write_all(yaml.as_bytes()).unwrap();
         let config = Config::load(file.path().to_str().unwrap()).unwrap();
-        assert_eq!(config.cursor_base_url.as_deref(), Some("https://api2.example.com"));
+        assert_eq!(
+            config.cursor_base_url.as_deref(),
+            Some("https://api2.example.com")
+        );
         assert_eq!(config.cursor_client_version.as_deref(), Some("cli-test"));
     }
 }

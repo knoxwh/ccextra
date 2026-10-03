@@ -586,7 +586,8 @@ fn pinned_model_params_win_over_body_effort() {
         "messages": [{"role":"user", "content":"hi"}],
         "reasoning_effort": "high"
     });
-    let request = build_run_request(&body, "auto:reasoning_effort=low", "conv", "msg-1", None).unwrap();
+    let request =
+        build_run_request(&body, "auto:reasoning_effort=low", "conv", "msg-1", None).unwrap();
     let run = run(&request.payload);
     assert_eq!(run.model_details.unwrap().model_id, "auto");
     let requested = run.requested_model.unwrap();
@@ -736,12 +737,10 @@ fn interaction_query_decodes_from_asm_field_7_and_partial_tool_call_is_ignored()
     let messages = decode_agent_server_message(&data).unwrap();
     assert_eq!(
         messages,
-        vec![ServerMessage::InteractionQuery(
-            InteractionQuery {
-                id: 5,
-                kind: InteractionQueryKind::WebSearch,
-            }
-        )]
+        vec![ServerMessage::InteractionQuery(InteractionQuery {
+            id: 5,
+            kind: InteractionQueryKind::WebSearch,
+        })]
     );
     // 纯 partial_tool_call 帧不产生任何消息,也不误报查询
     assert!(decode_agent_server_message(&partial).unwrap().is_empty());
@@ -772,10 +771,7 @@ fn server_control_abort_fails_decode_immediately() {
     // ASM field 5:ExecServerControlMessage(服务端主动中止)
     let data = message(5, &message(1, b""));
     let err = decode_agent_server_message(&data).unwrap_err();
-    assert!(matches!(
-        err,
-        WireError::ServerAbort
-    ));
+    assert!(matches!(err, WireError::ServerAbort));
 }
 
 #[test]

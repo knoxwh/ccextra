@@ -136,8 +136,7 @@ pub fn build_run_request(
         .filter(|(id, value)| {
             *id != "effort_levels"
                 && *id != "effort_default"
-                && !(*id == "reasoning_effort"
-                    && (!effort_levels.is_empty() || *value == "auto"))
+                && !(*id == "reasoning_effort" && (!effort_levels.is_empty() || *value == "auto"))
         })
         .map(|(id, value)| generated::RequestedModelModelParameterbytes {
             id: (*id).to_string(),
@@ -217,9 +216,11 @@ pub fn build_run_request(
                         ..Default::default()
                     };
                     generated::ConversationTurnStructure {
-                        turn: Some(generated::conversation_turn_structure::Turn::AgentConversationTurn(
-                            agent_turn,
-                        )),
+                        turn: Some(
+                            generated::conversation_turn_structure::Turn::AgentConversationTurn(
+                                agent_turn,
+                            ),
+                        ),
                     }
                     .encode_to_vec()
                 })

@@ -12,9 +12,9 @@ use ccextra_core::cache_stabilization::drift_detector::{
 };
 use ccextra_core::convert::{
     clamp_passthrough_effort, convert_passthrough, convert_to_antigravity_with,
-    convert_to_gemini_with_registry, convert_to_openai_chat_with,
-    convert_to_openai_responses_with, is_thinking_signature_invalid, sanitize_gpt_reasoning_items,
-    sanitize_passthrough_prompt, trim_encrypted_reasoning_items,
+    convert_to_gemini_with_registry, convert_to_openai_chat_with, convert_to_openai_responses_with,
+    is_thinking_signature_invalid, sanitize_gpt_reasoning_items, sanitize_passthrough_prompt,
+    trim_encrypted_reasoning_items,
 };
 use ccextra_core::normalize::{
     normalize_anthropic_full, normalize_anthropic_pretransform, normalize_target_post, TargetShape,

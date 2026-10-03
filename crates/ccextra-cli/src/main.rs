@@ -11,8 +11,9 @@ use ccextra_server::codex::{
     CodexLoginOptions,
 };
 use ccextra_server::cursor::{
-    load as load_cursor_credential, new_cursor_runtime, resolve_auth_dir as resolve_cursor_auth_dir,
-    run_login as run_cursor_login, CursorConfig, CursorLoginOptions,
+    load as load_cursor_credential, new_cursor_runtime,
+    resolve_auth_dir as resolve_cursor_auth_dir, run_login as run_cursor_login, CursorConfig,
+    CursorLoginOptions,
 };
 use ccextra_server::http::{
     publish_refreshed_providers, AppState, ConfigSnapshot, ProviderRefreshConfig, ReloadData,
@@ -264,8 +265,7 @@ async fn main() -> Result<()> {
     all_providers = merge_providers(all_providers, codex_providers);
 
     // Cursor 原生运行时组装(启用判定:cursor_auth_dir 非空)
-    let cursor_runtime = cursor_config_from(&cli.config, &config)
-        .map(new_cursor_runtime);
+    let cursor_runtime = cursor_config_from(&cli.config, &config).map(new_cursor_runtime);
     if let Some(runtime) = cursor_runtime.as_ref() {
         let cursor_cfg = runtime.config.read().await.clone();
         match ccextra_server::cursor::load_cursor_provider(
@@ -917,9 +917,9 @@ fn build_user_agents(config: Option<&config::UserAgents>) -> UserAgentSet {
 #[cfg(test)]
 mod tests {
     use super::{
-        build_user_agents, cursor_config_from, load_refreshed_providers,
-        load_thinking_registry, pin_auth_dir, pin_path, provider_refresh_config, refresh_providers,
-        Arc, Config, ProviderConfig, RuntimeConfig, RwLock, UpstreamClient,
+        build_user_agents, cursor_config_from, load_refreshed_providers, load_thinking_registry,
+        pin_auth_dir, pin_path, provider_refresh_config, refresh_providers, Arc, Config,
+        ProviderConfig, RuntimeConfig, RwLock, UpstreamClient,
     };
     use ccextra_server::antigravity::resolve_auth_dir as resolve_antigravity_auth_dir;
     use ccextra_server::cursor::resolve_auth_dir as resolve_cursor_auth_dir;
@@ -1190,6 +1190,4 @@ xai_auth_dir: new-xai
         assert_eq!(config.base_url.as_deref(), Some("https://api2.example.com"));
         assert_eq!(config.client_version.as_deref(), Some("cli-test"));
     }
-
-
 }

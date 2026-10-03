@@ -80,9 +80,11 @@ fn default_effort_level(levels: &[String]) -> String {
         return "medium".to_string();
     }
     let mut ranked: Vec<&str> = levels.iter().map(String::as_str).collect();
-    ranked.sort_by_key(|level| ccextra_core::thinking::level_rank(
-        ccextra_core::thinking::Level::parse(level).expect("family_levels 已过滤非法等级"),
-    ));
+    ranked.sort_by_key(|level| {
+        ccextra_core::thinking::level_rank(
+            ccextra_core::thinking::Level::parse(level).expect("family_levels 已过滤非法等级"),
+        )
+    });
     ranked
         .get(ranked.len() / 2)
         .map(|level| (*level).to_string())
@@ -185,8 +187,7 @@ pub fn build_cursor_models(
     if !allow_all {
         // 同 build 内已产出的 alias(精确路径 + 先前的家族条目):
         // 重复白名单条目(如裸 base 与钉参条目同 base)不重复物化
-        let mut emitted_aliases: HashSet<String> =
-            models.iter().map(|m| m.alias.clone()).collect();
+        let mut emitted_aliases: HashSet<String> = models.iter().map(|m| m.alias.clone()).collect();
         for (pattern, raw) in &entries {
             // glob 已命中目录 id 的条目走上面的精确路径,不重复展开
             if catalog.iter().any(|entry| {
@@ -226,7 +227,9 @@ pub fn build_cursor_models(
                     tracing::warn!(model = %pattern, "cursor 白名单固定参数段非法(须为 k=v 逗号分隔),跳过");
                     continue;
                 }
-                None => format!("{pattern}:effort_levels={levels_csv},effort_default={default_level}"),
+                None => {
+                    format!("{pattern}:effort_levels={levels_csv},effort_default={default_level}")
+                }
             };
             models.push(ModelConfig {
                 name,
@@ -414,8 +417,11 @@ mod tests {
 
     #[test]
     fn empty_catalog_yields_empty_provider() {
-        let provider =
-            synthesize_cursor_provider(build_cursor_models(&[], &[], &[]), "https://api2.cursor.sh", HashMap::new());
+        let provider = synthesize_cursor_provider(
+            build_cursor_models(&[], &[], &[]),
+            "https://api2.cursor.sh",
+            HashMap::new(),
+        );
         assert_eq!(provider.name, "cursor");
         assert_eq!(provider.protocol, Protocol::CursorSdk);
         assert!(provider.models.is_empty());
@@ -542,7 +548,10 @@ mod tests {
         let catalog = vec![entry("grok-4.7-low"), entry("grok-4.7-high")];
         let models = build_cursor_models(
             &catalog,
-            &["grok-4.7".to_string(), "grok-4.7:reasoning_effort=high".to_string()],
+            &[
+                "grok-4.7".to_string(),
+                "grok-4.7:reasoning_effort=high".to_string(),
+            ],
             &[],
         );
         assert_eq!(models.len(), 1);
@@ -552,7 +561,10 @@ mod tests {
     #[test]
     fn family_expansion_requires_level_suffix() {
         // thinking 等非等级后缀不算家族变体
-        let catalog = vec![entry("claude-4.5-sonnet"), entry("claude-4.5-sonnet-thinking")];
+        let catalog = vec![
+            entry("claude-4.5-sonnet"),
+            entry("claude-4.5-sonnet-thinking"),
+        ];
         let models = build_cursor_models(&catalog, &["claude-4.5-sonnet".into()], &[]);
         // 裸 id 精确命中,thinking 变体不参与
         assert_eq!(models.len(), 1);

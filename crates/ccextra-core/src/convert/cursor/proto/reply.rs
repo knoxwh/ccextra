@@ -4,8 +4,7 @@ use prost::Message;
 pub const BUILTIN_REJECTION: &str =
     "Tool not available in this environment. Use the MCP tools provided instead.";
 
-pub const INTERACTION_REJECTION: &str =
-    "Interaction is not available in this environment.";
+pub const INTERACTION_REJECTION: &str = "Interaction is not available in this environment.";
 
 pub fn encode_heartbeat() -> Vec<u8> {
     generated::AgentClientMessage {
@@ -91,12 +90,14 @@ pub fn encode_interaction_response(query: super::raw_wire::InteractionQuery) -> 
         }
     };
     generated::AgentClientMessage {
-        message: Some(generated::agent_client_message::Message::InteractionResponse(
-            generated::InteractionResponse {
-                id: query.id,
-                result: Some(result),
-            },
-        )),
+        message: Some(
+            generated::agent_client_message::Message::InteractionResponse(
+                generated::InteractionResponse {
+                    id: query.id,
+                    result: Some(result),
+                },
+            ),
+        ),
     }
     .encode_to_vec()
 }

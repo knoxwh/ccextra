@@ -93,11 +93,7 @@ impl InitialResponseDelayState {
     /// 键是上游 sessionId(首条 user 消息哈希,对齐 CPA generateStableSessionID),
     /// 不是客户端会话头:subagent 与主线程共享 x-claude-code-session-id,
     /// 但各自开新上游 session,按客户端身份 claim 会漏掉 subagent。
-    pub fn hold_message_stop(
-        self,
-        stream: SseStreamPin,
-        key: InitialResponseKey,
-    ) -> SseStreamPin
+    pub fn hold_message_stop(self, stream: SseStreamPin, key: InitialResponseKey) -> SseStreamPin
     where
         Self: 'static,
     {

@@ -18,7 +18,7 @@ pub fn decode_interaction(data: &[u8]) -> Result<Vec<ServerMessage>, WireError> 
             4 => messages.push(ServerMessage::ThinkingDelta(parts::string_field(value, 1)?)),
             5 => messages.push(ServerMessage::ThinkingCompleted),
             8 => messages.push(ServerMessage::TokenDelta(
-                parts::varint_field(value, 1)? as i64,
+                parts::varint_field(value, 1)? as i64
             )),
             13 => messages.push(ServerMessage::Heartbeat),
             14 => messages.push(ServerMessage::TurnEnded(parts::decode_turn_ended(value)?)),

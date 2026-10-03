@@ -133,9 +133,7 @@ impl CursorDrive {
                 // 服务器会以 UserMessage 序列化字节(非 32B sha)为 key 发起 get,
                 // 期望客户端回显内容确认;sha 形式的 key 才查本地 blob store
                 let found = self.blobs.get(&hex::encode(&blob_id)).cloned();
-                let blob = found.or_else(|| {
-                    (blob_id.len() != 32).then(|| blob_id.clone())
-                });
+                let blob = found.or_else(|| (blob_id.len() != 32).then(|| blob_id.clone()));
                 let payload = reply::encode_kv_get(id, blob.as_deref());
                 self.stream
                     .send_message(&payload)

@@ -2934,7 +2934,9 @@ fn cursor_models_router(ids: &'static [&'static str]) -> Router {
                     Some("Bearer test-access-token")
                 );
                 assert_eq!(
-                    headers.get("x-cursor-client-version").and_then(|v| v.to_str().ok()),
+                    headers
+                        .get("x-cursor-client-version")
+                        .and_then(|v| v.to_str().ok()),
                     Some("cli-test")
                 );
                 (
@@ -2947,7 +2949,10 @@ fn cursor_models_router(ids: &'static [&'static str]) -> Router {
     )
 }
 
-fn cursor_native_config(auth_dir: &std::path::Path, base_url: String) -> crate::cursor::CursorConfig {
+fn cursor_native_config(
+    auth_dir: &std::path::Path,
+    base_url: String,
+) -> crate::cursor::CursorConfig {
     crate::cursor::CursorConfig {
         auth_dir: auth_dir.to_path_buf(),
         models: vec![],
@@ -2961,11 +2966,9 @@ fn cursor_native_config(auth_dir: &std::path::Path, base_url: String) -> crate::
 async fn test_reload_reconciles_cursor_config_and_refreshes_catalog() {
     let auth_dir = tempfile::tempdir().unwrap();
     write_cursor_credential(auth_dir.path());
-    let server = crate::test_support::TestServer::spawn(cursor_models_router(&[
-        "default",
-        "composer-2.5",
-    ]))
-    .await;
+    let server =
+        crate::test_support::TestServer::spawn(cursor_models_router(&["default", "composer-2.5"]))
+            .await;
     let state = mock_state();
 
     let mut desired = cursor_native_config(auth_dir.path(), server.url.clone());
@@ -3020,7 +3023,10 @@ async fn test_reload_cursor_catalog_failure_retains_provider() {
     let fail_server = crate::test_support::TestServer::spawn(fail_router).await;
     crate::http::handlers::reload::reconcile_cursor_runtime(
         &state,
-        Some(cursor_native_config(auth_dir.path(), fail_server.url.clone())),
+        Some(cursor_native_config(
+            auth_dir.path(),
+            fail_server.url.clone(),
+        )),
     )
     .await;
 
