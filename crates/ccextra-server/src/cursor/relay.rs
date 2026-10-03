@@ -173,18 +173,24 @@ impl CursorRelay {
 
     /// 统一收尾:close active + message_delta + message_stop
     ///
-    /// usage 只透传 SDK 真实数字(对齐 Responses 协议:缺 usage 即 0,
-    /// 不估算);tool_use 回合 SDK 不报 usage,usage 落在下一请求流里
+    /// usage 只透传 SDK 真实数字(对齐 Responses 协议,不估算);tool_use
+    /// 回合 SDK 不报 usage(该回合 usage 落在下一请求流里),input 回退
+    /// session cache 上轮真实值(滞后测量,非估算),无缓存为 0
     fn finalize(&mut self, stop_reason: &str) -> Vec<Bytes> {
         if self.finished {
             return Vec::new();
         }
         let mut frames = self.ensure_started();
         self.close_active_block(&mut frames);
+        let input = if self.usage_seen {
+            self.usage_input
+        } else {
+            self.estimated_input
+        };
         frames.push(emit::message_delta(
             stop_reason,
             None,
-            self.usage_input,
+            input,
             self.usage_output,
             self.usage_cached,
             self.usage_write,
@@ -218,7 +224,8 @@ impl CursorRelay {
         self.stream_error("cursor sidecar stream ended without turn_end")
     }
 
-    /// 确保 message_start 已发(usage 未到时用入站估算占位)
+    /// 确保 message_start 已发(usage 未到时用 session cache 上轮真实
+    /// input 占位;无缓存为 0,不造数)
     fn ensure_started(&mut self) -> Vec<Bytes> {
         if self.started {
             return Vec::new();
@@ -236,7 +243,7 @@ impl CursorRelay {
             vec![emit::message_start(
                 &self.id,
                 &self.model,
-                self.estimated_input.max(1),
+                self.estimated_input,
                 0,
                 true,
             )]
@@ -645,8 +652,9 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn tool_turn_without_usage_reports_zero() {
-        // 对齐 Responses 协议:SDK 不报 usage 即 0,不估算
+    async fn tool_turn_without_usage_falls_back_to_cached_input() {
+        // SDK 工具回合不报 usage:input 回退 session cache 上轮真实值
+        // (滞后测量,非估算);output 无真实数保持 0
         let frames = [
             r#"{"type":"thinking_delta","text":"need weather"}"#,
             r#"{"type":"tool_use","id":"call-1","name":"get_weather","input":{"city":"Tokyo"}}"#,
@@ -659,7 +667,7 @@ mod tests {
             token_scope: None,
         };
         let output = drain(relay_cursor_sdk_to_anthropic(stream, meta)).await;
-        assert!(output.contains("\"input_tokens\":0"));
+        assert!(output.contains("\"input_tokens\":1200"));
         assert!(output.contains("\"output_tokens\":0"));
     }
 

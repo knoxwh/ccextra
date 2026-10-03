@@ -5,6 +5,7 @@ import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { spawn } from "node:child_process";
 import { createServer } from "./main.mjs";
+import { externalToolCallId } from "./tools.mjs";
 import { loadModelCache, saveModelCache, discoverModels } from "./models.mjs";
 
 const sessionRegistry = {
@@ -457,7 +458,7 @@ test("tool_result with unknown id on active run returns HTTP 400", async () => {
 });
 
 test("tool_result with settled id from an old batch returns HTTP 400", async () => {
-  await withRegistryServer(async ({ sdk, post }) => {
+  await withRegistryServer(async ({ sdk, registry, post }) => {
     // 第一轮:park call-1 并正常 resolve,Run 完成
     const firstPromise = post(runRequest([{ role: "user", content: "read a" }], readTool()));
     await waitFor(() => sdk.state.sends.length === 1);
@@ -466,12 +467,15 @@ test("tool_result with settled id from an old batch returns HTTP 400", async () 
     assert.equal(first.status, 200);
     await first.text();
     await settle(20);
+    // 客户端回显的外部 id:由 sessionKey + 原始 toolCallId 合成
+    const sessionKey = [...registry.actors.values()][0].sessionKey;
+    const extId = externalToolCallId(sessionKey, "call-1", "Read");
 
     // resolve call-1:续接当前 Run(不新建 send),推进到终态
     const secondPromise = post(runRequest([
       { role: "user", content: "read a" },
-      { role: "assistant", content: [{ type: "tool_use", id: "call-1", name: "Read", input: { path: "a" } }] },
-      { role: "user", content: [{ type: "tool_result", tool_use_id: "call-1", content: "ok" }] },
+      { role: "assistant", content: [{ type: "tool_use", id: extId, name: "Read", input: { path: "a" } }] },
+      { role: "user", content: [{ type: "tool_result", tool_use_id: extId, content: "ok" }] },
     ], readTool()));
     await settle(20);
     sdk.state.sends[0].run.push({ type: "assistant", message: { content: [{ type: "text", text: "done" }] } });
@@ -485,8 +489,8 @@ test("tool_result with settled id from an old batch returns HTTP 400", async () 
     // 第二轮:park call-2 后,续接带旧 batch 的 call-1 → unmatched 400
     const thirdPromise = post(runRequest([
       { role: "user", content: "read a" },
-      { role: "assistant", content: [{ type: "tool_use", id: "call-1", name: "Read", input: { path: "a" } }] },
-      { role: "user", content: [{ type: "tool_result", tool_use_id: "call-1", content: "ok" }] },
+      { role: "assistant", content: [{ type: "tool_use", id: extId, name: "Read", input: { path: "a" } }] },
+      { role: "user", content: [{ type: "tool_result", tool_use_id: extId, content: "ok" }] },
       { role: "assistant", content: [{ type: "text", text: "done" }] },
       { role: "user", content: "read b" },
     ], readTool()));
@@ -496,14 +500,15 @@ test("tool_result with settled id from an old batch returns HTTP 400", async () 
     assert.equal(third.status, 200);
     await third.text();
     await settle(20);
+    const extId2 = externalToolCallId(sessionKey, "call-2", "Read");
 
     const response = await post(runRequest([
       { role: "user", content: "read a" },
-      { role: "assistant", content: [{ type: "tool_use", id: "call-1", name: "Read", input: { path: "a" } }] },
-      { role: "user", content: [{ type: "tool_result", tool_use_id: "call-1", content: "ok" }] },
+      { role: "assistant", content: [{ type: "tool_use", id: extId, name: "Read", input: { path: "a" } }] },
+      { role: "user", content: [{ type: "tool_result", tool_use_id: extId, content: "ok" }] },
       { role: "assistant", content: [{ type: "text", text: "done" }] },
       { role: "user", content: "read b" },
-      { role: "assistant", content: [{ type: "tool_use", id: "call-2", name: "Read", input: { path: "b" } }] },
+      { role: "assistant", content: [{ type: "tool_use", id: extId2, name: "Read", input: { path: "b" } }] },
       { role: "user", content: [{ type: "tool_result", tool_use_id: "call-1", content: "stale" }] },
     ], readTool()));
     assert.equal(response.status, 400);

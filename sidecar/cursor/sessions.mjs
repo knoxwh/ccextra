@@ -127,6 +127,7 @@ import { randomUUID } from "node:crypto";
 import {
   ToolBatch,
   ToolUseIndex,
+  externalToolCallId,
   mapCustomTools,
   buildCompletedResults,
   normalizeToolResult,
@@ -222,7 +223,7 @@ export class SessionActor {
     this.state = "clean";
     this.activeRun = null;
     this.lastRequestAt = Date.now();
-    this.toolBatchGraceMs = config.toolBatchGraceMs ?? 50;
+    this.toolBatchGraceMs = config.toolBatchGraceMs ?? 150;
     this.runIdleTimeoutMs = config.runIdleTimeoutMs ?? 180_000;
     this.batchTimer = null;
     this.idleTimer = null;
@@ -374,13 +375,20 @@ export class SessionActor {
       stream: wrapped.stream,
       wait: wrapped.wait,
       emit: (event) => this.emitRunEvent(runId, event),
-      onToolCall: () => {},
+      // SDK 流 tool_call 公告:重排冻结定时器,晚到的 sibling execute 仍可入批
+      onToolCall: () => this.announceToolCall(runId),
     });
     if (result.status === "finished") {
       this.finishRun(runId, "clean");
     } else {
       this.finishRun(runId, "dirty");
     }
+  }
+
+  /** 公告驱动冻结窗口(对齐 cursor2response):公告先于 execute 到达,重置定时器扩展聚齐窗口。 */
+  announceToolCall(runId) {
+    const active = this.activeRun;
+    if (active) this.scheduleBatchFreeze(runId, active.batch);
   }
 
   /** 事件下发:runId 不匹配的旧 Run 事件直接丢弃;同时收集 assistant 输出。 */
@@ -435,19 +443,27 @@ export class SessionActor {
 
   /**
    * parkToolCall:customTools execute 挂起。
-   * 登记 batch 与全局索引,发 tool_use 事件;并行 sibling 由 batch 冻结定时器聚齐。
+   * 外部 id 合成(原始 toolCallId 不出 sidecar);登记 batch 与全局索引,
+   * 发 tool_use 事件;并行 sibling 由 batch 冻结定时器聚齐。
    */
   parkToolCall(runId, batch, event) {
     return new Promise((resolve, reject) => {
-      batch.register({ id: event.id, name: event.name, resolve, reject });
-      this.index.register(event.id, { sessionKey: this.sessionKey, runId, batchId: batch.batchId });
-      this.emitRunEvent(runId, { type: "tool_use", id: event.id, name: event.name, input: event.input });
+      // 原始 id 缺失时生成随机内部键,避免匿名调用哈希碰撞
+      const rawId = typeof event.id === "string" && event.id.trim() ? event.id : randomUUID();
+      const id = externalToolCallId(this.sessionKey, rawId, event.name);
+      batch.register({ id, name: event.name, resolve, reject });
+      this.index.register(id, { sessionKey: this.sessionKey, runId, batchId: batch.batchId });
+      this.emitRunEvent(runId, { type: "tool_use", id, name: event.name, input: event.input });
       this.scheduleBatchFreeze(runId, batch);
     });
   }
 
   /** 并行工具收集窗口:重置定时器,到期冻结当前批次。 */
   scheduleBatchFreeze(runId, batch) {
+    // frozen 后不再排定时器(单一 choke point):冻结后 park/公告重排的 stale timer
+    // 会在续跑解冻后触发,对部分提交的批次发出零 tool_use 块的 turn_end(协议违规)
+    const active = this.activeRun;
+    if (!active || active.runId !== runId || active.frozen) return;
     clearTimeout(this.batchTimer);
     this.batchTimer = setTimeout(() => this.freezeBatch(runId, batch), this.toolBatchGraceMs);
     this.batchTimer.unref?.();

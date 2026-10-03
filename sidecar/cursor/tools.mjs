@@ -14,6 +14,17 @@ export function digestJson(value) {
   return createHash("sha256").update(canonical).digest("hex");
 }
 
+/**
+ * 合成外部 tool_use id(对齐 cursor2response externalToolCallId):
+ * 原始 SDK toolCallId 可含换行等控制字符,只做哈希输入,永不下发客户端。
+ * 同 sessionKey + 同原始 id 稳定复现,幂等重放时客户端重试仍可匹配。
+ */
+export function externalToolCallId(sessionKey, rawCallId, toolName) {
+  const hash = createHash("sha256").update(`${sessionKey}\0${rawCallId}`).digest("hex").slice(0, 32);
+  const suffix = String(toolName || "tool").replace(/[^A-Za-z0-9_-]/g, "_").slice(0, 16) || "tool";
+  return `call_sdk_${hash}_${suffix}`;
+}
+
 /** 工具签名:name + input 的稳定摘要;同签名按出现顺序共享结果队列。 */
 export function completedToolSignature(toolName, input) {
   return digestJson({ name: toolName, input: input ?? {} });

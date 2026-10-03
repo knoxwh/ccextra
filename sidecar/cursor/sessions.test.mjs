@@ -266,7 +266,11 @@ function fakeSubscriber() {
   const subscriber = {
     events,
     closed: false,
-    emit: (event) => subscriber.events.push(event),
+    // 对齐生产 subscriber:关流后事件丢弃(main.mjs finished 守卫)
+    emit: (event) => {
+      if (subscriber.closed) return;
+      subscriber.events.push(event);
+    },
     close: () => { subscriber.closed = true; },
   };
   return subscriber;
@@ -283,6 +287,9 @@ function fakeJournal() {
 }
 
 const settle = (ms = 10) => new Promise((resolve) => setTimeout(resolve, ms));
+
+/** 从 subscriber 事件捕获已下发的 tool_use 外部 id(客户端回显同一 id)。 */
+const emittedToolId = (subscriber) => subscriber.events.find((e) => e.type === "tool_use")?.id;
 
 function makeRegistry(config = {}) {
   const sdk = fakeSdk();
@@ -331,8 +338,11 @@ test("tool round trip parks, freezes batch, resumes on tool_result", async () =>
   const send = sdk.state.sends[0];
   const pending = send.options.local.customTools.Read.execute({ path: "a" }, { toolCallId: "call-1" });
   await settle(20);
+  const id = emittedToolId(subscriber);
+  // 外部 id 合成:原始 toolCallId 不出 sidecar
+  assert.match(id, /^call_sdk_[0-9a-f]{32}_Read$/);
   assert.deepEqual(subscriber.events, [
-    { type: "tool_use", id: "call-1", name: "Read", input: { path: "a" } },
+    { type: "tool_use", id, name: "Read", input: { path: "a" } },
     { type: "turn_end", stop_reason: "tool_use" },
   ]);
   assert.equal(subscriber.closed, true);
@@ -341,8 +351,8 @@ test("tool round trip parks, freezes batch, resumes on tool_result", async () =>
   const second = fakeSubscriber();
   await registry.run(baseRequest([
     { role: "user", content: "read a" },
-    { role: "assistant", content: [{ type: "tool_use", id: "call-1", name: "Read", input: { path: "a" } }] },
-    { role: "user", content: [{ type: "tool_result", tool_use_id: "call-1", content: "file body" }] },
+    { role: "assistant", content: [{ type: "tool_use", id, name: "Read", input: { path: "a" } }] },
+    { role: "user", content: [{ type: "tool_result", tool_use_id: id, content: "file body" }] },
   ], tools), second);
   assert.equal(await pending, "file body");
   assert.equal(sdk.state.sends.length, 1);
@@ -367,20 +377,22 @@ test("second tool batch after continuation freezes again", async () => {
   const send = sdk.state.sends[0];
   const pending = send.options.local.customTools.Read.execute({ path: "a" }, { toolCallId: "call-1" });
   await settle(20);
+  const id = emittedToolId(subscriber);
   assert.equal(subscriber.closed, true);
   // 下一请求带 tool_result:延续同一 Run
   const second = fakeSubscriber();
   await registry.run(baseRequest([
     { role: "user", content: "read a" },
-    { role: "assistant", content: [{ type: "tool_use", id: "call-1", name: "Read", input: { path: "a" } }] },
-    { role: "user", content: [{ type: "tool_result", tool_use_id: "call-1", content: "file body" }] },
+    { role: "assistant", content: [{ type: "tool_use", id, name: "Read", input: { path: "a" } }] },
+    { role: "user", content: [{ type: "tool_result", tool_use_id: id, content: "file body" }] },
   ], tools), second);
   assert.equal(await pending, "file body");
   // 续跑后模型再调工具:必须再次冻结并关流
   const pending2 = send.options.local.customTools.Read.execute({ path: "b" }, { toolCallId: "call-2" });
   await settle(20);
+  const id2 = emittedToolId(second);
   assert.deepEqual(second.events, [
-    { type: "tool_use", id: "call-2", name: "Read", input: { path: "b" } },
+    { type: "tool_use", id: id2, name: "Read", input: { path: "b" } },
     { type: "turn_end", stop_reason: "tool_use" },
   ]);
   assert.equal(second.closed, true);
@@ -463,17 +475,19 @@ test("parallel tools keep pending until all siblings settle", async () => {
   const bash = send.options.local.customTools.Bash.execute({ command: "ls" }, { toolCallId: "call-2" });
   await settle(20);
   // 两个 tool_use 都下发,单 freeze 窗口
-  assert.deepEqual(subscriber.events.filter((e) => e.type === "tool_use").map((e) => e.id), ["call-1", "call-2"]);
+  const ids = subscriber.events.filter((e) => e.type === "tool_use").map((e) => e.id);
+  assert.equal(ids.length, 2);
+  for (const id of ids) assert.match(id, /^call_sdk_[0-9a-f]{32}_(Read|Bash)$/);
   assert.equal(subscriber.events.filter((e) => e.type === "turn_end").length, 1);
   // 只提交一个结果:另一个保持 pending,Run 不释放
   const actor = [...registry.actors.values()][0];
   await actor.submitToolResults(actor.activeRun.runId, actor.activeRun.batch.batchId, [
-    { type: "tool_result", tool_use_id: "call-1", content: "body" },
+    { type: "tool_result", tool_use_id: ids[0], content: "body" },
   ]);
   assert.equal(actor.activeRun.batch.pendingCallbacks, 1);
   // 补齐 sibling
   await actor.submitToolResults(actor.activeRun.runId, actor.activeRun.batch.batchId, [
-    { type: "tool_result", tool_use_id: "call-2", content: "out" },
+    { type: "tool_result", tool_use_id: ids[1], content: "out" },
   ]);
   assert.equal(await read, "body");
   assert.equal(await bash, "out");
@@ -481,6 +495,69 @@ test("parallel tools keep pending until all siblings settle", async () => {
   send.run.finish({ status: "finished" });
   await settle();
   assert.equal(journal.appended.at(-1).state, "clean");
+});
+
+test("stream tool_call announcement extends the freeze window for late siblings", async () => {
+  // 公告驱动(对齐 cursor2response):SDK 流先公告 tool_call,后触发 execute;
+  // 公告重排冻结定时器,晚于首 park grace 的 sibling 仍入同批。
+  // 时序:park t=0,公告 t≈10(原冻结 t=20 前),execute t≈25(原窗口外、
+  // 公告窗口内);无公告重排时 Bash 在冻结后被 subscriber 丢弃
+  const { sdk, registry } = makeRegistry({ toolBatchGraceMs: 20 });
+  const tools = [{ name: "Read", input_schema: {} }, { name: "Bash", input_schema: {} }];
+  const subscriber = fakeSubscriber();
+  await registry.run(baseRequest([{ role: "user", content: "a" }], tools), subscriber);
+  const send = sdk.state.sends[0];
+  const read = send.options.local.customTools.Read.execute({ path: "a" }, { toolCallId: "call-1" });
+  await settle(10);
+  send.run.push({ type: "tool_call", call_id: "call-2", name: "Bash", status: "running", args: { command: "ls" } });
+  await settle(15); // t≈25:超过首 park 的 20ms grace
+  const bash = send.options.local.customTools.Bash.execute({ command: "ls" }, { toolCallId: "call-2" });
+  await settle(60);
+  const events = subscriber.events;
+  assert.deepEqual(events.filter((e) => e.type === "tool_use").map((e) => e.name), ["Read", "Bash"]);
+  // 冻结即关流:turn_end 是最后一个事件,单次冻结
+  assert.equal(events.at(-1).type, "turn_end");
+  assert.equal(events.filter((e) => e.type === "turn_end").length, 1);
+  // 收尾:abort 清挂起回调,避免 unhandled rejection
+  const actor = [...registry.actors.values()][0];
+  await actor.abort(actor.activeRun.runId, "test_cleanup");
+  await Promise.allSettled([read, bash]);
+});
+
+test("late sibling parked after freeze emits no empty turn_end after resume", async () => {
+  // 回归:冻结后晚到 sibling 的 park 不得重排定时器;重排的 stale timer 会在
+  // 客户端提交结果续跑(解冻)后触发,对新 subscriber 发零 tool_use 块的 turn_end
+  const { sdk, registry } = makeRegistry({ toolBatchGraceMs: 20 });
+  const tools = [{ name: "Read", input_schema: {} }, { name: "Bash", input_schema: {} }];
+  const subscriber = fakeSubscriber();
+  await registry.run(baseRequest([{ role: "user", content: "a" }], tools), subscriber);
+  const send = sdk.state.sends[0];
+  const read = send.options.local.customTools.Read.execute({ path: "a" }, { toolCallId: "call-1" });
+  await settle(30); // 冻结已触发,流关闭
+  const id = emittedToolId(subscriber);
+  // 冻结后晚到 sibling:park 不重排定时器(choke point 守卫)
+  const bash = send.options.local.customTools.Bash.execute({ command: "ls" }, { toolCallId: "call-2" });
+  await settle(5);
+  // 客户端提交 Read 结果续跑:新 subscriber 接管,解冻
+  const subscriber2 = fakeSubscriber();
+  await registry.run(
+    baseRequest(
+      [
+        { role: "user", content: "a" },
+        { role: "assistant", content: [{ type: "tool_use", id, name: "Read", input: { path: "a" } }] },
+        { role: "user", content: [{ type: "tool_result", tool_use_id: id, content: "body" }] },
+      ],
+      tools
+    ),
+    subscriber2
+  );
+  await settle(60); // 原冻结窗口两倍以上:stale timer 若存在必已触发
+  assert.equal(subscriber2.events.filter((e) => e.type === "turn_end").length, 0);
+  // Bash 仍挂起(已知缺口:晚于冻结的 sibling 挂起至 idle 超时)
+  const actor = [...registry.actors.values()][0];
+  assert.equal(actor.activeRun.batch.pendingCallbacks, 1);
+  await actor.abort(actor.activeRun.runId, "test_cleanup");
+  await Promise.allSettled([read, bash]);
 });
 
 test("unknown tool result id errors at actor level", async () => {
@@ -505,14 +582,15 @@ test("duplicate identical result is idempotent, different payload errors", async
   const send = sdk.state.sends[0];
   const pending = send.options.local.customTools.Read.execute({ path: "a" }, { toolCallId: "call-1" });
   await settle(20);
+  const id = emittedToolId(subscriber);
   const actor = [...registry.actors.values()][0];
   const { runId, batch } = actor.activeRun;
-  const result = { type: "tool_result", tool_use_id: "call-1", content: "same" };
+  const result = { type: "tool_result", tool_use_id: id, content: "same" };
   await actor.submitToolResults(runId, batch.batchId, [result]);
   await actor.submitToolResults(runId, batch.batchId, [result]);
   assert.equal(await pending, "same");
   await actor.submitToolResults(runId, batch.batchId, [
-    { type: "tool_result", tool_use_id: "call-1", content: "different" },
+    { type: "tool_result", tool_use_id: id, content: "different" },
   ]).then(
     () => { throw new Error("expected rejection"); },
     (error) => assert.match(error.message, /different payload/)
@@ -645,14 +723,16 @@ test("history rewrite triggers full replay with new agent", async () => {
 test("tool result image reaches SDK tool callback as content", async () => {
   const { sdk, registry } = makeRegistry();
   const tools = [{ name: "Read", input_schema: {} }];
-  await registry.run(baseRequest([{ role: "user", content: "read" }], tools), fakeSubscriber());
+  const subscriber = fakeSubscriber();
+  await registry.run(baseRequest([{ role: "user", content: "read" }], tools), subscriber);
   const send = sdk.state.sends[0];
   const pending = send.options.local.customTools.Read.execute({}, { toolCallId: "call-image" });
   await settle(20);
+  const id = emittedToolId(subscriber);
   const actor = [...registry.actors.values()][0];
   await actor.submitToolResults(actor.activeRun.runId, actor.activeRun.batch.batchId, [{
     type: "tool_result",
-    tool_use_id: "call-image",
+    tool_use_id: id,
     content: [
       { type: "text", text: "screenshot" },
       { type: "image", source: { type: "base64", media_type: "image/png", data: "AQID" } },

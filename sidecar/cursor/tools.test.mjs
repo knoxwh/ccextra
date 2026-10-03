@@ -3,10 +3,29 @@ import assert from "node:assert/strict";
 import {
   ToolUseIndex,
   completedToolSignature,
+  externalToolCallId,
   mapCustomTools,
   normalizeToolResult,
   buildCompletedResults,
 } from "./tools.mjs";
+
+test("externalToolCallId synthesizes stable ids and never leaks raw id", () => {
+  // 原始 toolCallId 可含换行等控制字符:只做哈希输入,不出现在输出
+  const raw = "call-abc-1\nfc_xyz_0";
+  const id = externalToolCallId("session-key", raw, "Read");
+  assert.match(id, /^call_sdk_[0-9a-f]{32}_Read$/);
+  assert.equal(id.includes("\n"), false);
+  assert.equal(id.includes(raw), false);
+  // 同 sessionKey + 同原始 id 稳定复现(幂等重放可匹配)
+  assert.equal(id, externalToolCallId("session-key", raw, "Read"));
+  // 不同 sessionKey 或不同原始 id 产生不同 id
+  assert.notEqual(id, externalToolCallId("other-session", raw, "Read"));
+  assert.notEqual(id, externalToolCallId("session-key", "call-abc-2\nfc_xyz_1", "Read"));
+  // 工具名清洗:非法字符折叠为 _,超长截断;空名回退 tool
+  assert.match(externalToolCallId("s", "r", "mcp__x__query"), /_mcp__x__query$/);
+  assert.match(externalToolCallId("s", "r", "a".repeat(40)), /_[a-zA-Z0-9_-]{16}$/);
+  assert.match(externalToolCallId("s", "r", ""), /_tool$/);
+});
 
 test("completedToolSignature is stable and input-sensitive", () => {
   assert.equal(completedToolSignature("Read", { path: "a" }), completedToolSignature("Read", { path: "a" }));
