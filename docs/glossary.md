@@ -130,16 +130,16 @@ Gemini 函数调用模式。Antigravity Claude 模型强制使用；Gemini 直�
 Cursor 原生传输：`agent.v1.AgentService/Run`（h2 + rustls 直连 api2.cursor.sh），Connect 帧 `[1B flags][4B len BE][payload]`。请求头含 `content-type: application/connect+proto`、`connect-protocol-version: 1`、`te: trailers`、`x-ghost-mode: true`、`x-cursor-client-version`、`x-cursor-client-type: cli`；无 checksum、无 x-client-key。出站代理复用全局 `proxy`（HTTP CONNECT 隧道）。
 
 **Run**
-一次 `AgentService/Run` 双向流调用，对应一个会话回合。服务端事件归一为 text/thinking 增量、tool 调用、TurnEnded 用量与 checkpoint；TurnEnded 是唯一成功终态。服务端 InteractionQuery（web_search/ask_question 等）必须回 InteractionResponse，否则挂死整流。
+一次 `AgentService/Run` 双向流调用，对应一个会话回合。服务端事件归一为 text/thinking 增量、tool 调用、TurnEnded 用量与 checkpoint；TurnEnded 是唯一成功终态。服务端 InteractionQuery（web_search/ask_question 等）必须回 InteractionResponse，否则挂死整流。TurnEnded 用量是整回合累计口径：新 Run 直报真实值，park 续接的工具续接请求退回请求体字节/4 估算（对齐 Plus）。
 
 **InteractionQuery**
 服务端下发的交互查询（web_search/ask_question/switch_mode/exa_search/exa_fetch/create_plan/setup_vm）。ccextra 按种类回 reject/error（SetupVm 回空 success），不提供交互能力。
 
 **pending callback**
-Agent 回合中已发起但未收到结果的工具副作用。崩溃窗口内的 pending callback 不写入 journal 确认边界，冷续接后可能重复执行，由客户端 tool_result 幂等性兜底。
+Agent 回合中已发起但未收到结果的工具副作用。驻留会话丢失时冷续接 flatten 全量 transcript 重新起跑，崩溃窗口内的 pending callback 可能重复执行，由客户端 tool_result 幂等性兜底。
 
-**前缀哈希**
-journal 中已确认消息前缀的摘要。冷续接按前缀哈希定位回放边界，只回放已确认部分，不跨过未确认的副作用。
+**journal 回放缓存**
+按回合摘要内存缓存的已发布 SSE 帧。同摘要重复请求（断线重连/singleflight）直接回放缓存帧，不重跑上游；进程重启即失效。
 
 **热重载**
 四种 OAuth 登录命令保存凭证后自动调用配置地址的 `POST /reload`（直连，通配地址转回环地址，连接超时 2 秒、总超时 30 秒）；失败仅提示，凭证保留，服务未启动时下次启动加载。

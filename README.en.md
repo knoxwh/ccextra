@@ -216,8 +216,8 @@ Cursor login uses its own PKCE browser flow and polling; neither the Cursor IDE 
 **Cursor native proxy operations**:
 
 - Outbound traffic goes through Rust h2 + rustls straight to `api2.cursor.sh`; proxying reuses the global `proxy` (HTTP CONNECT tunnel with Basic auth support), and `"direct"` disables it. Region-restricted models (e.g. `muse-spark-1.3`) require fully proxied egress.
-- Session state is written to `sessions.jsonl` and journal files under `cursor_auth_dir`; it contains conversation content and is sensitive — do not commit or share that directory.
-- Known limitation: side effects (such as tool calls) not yet acknowledged inside a crash window may re-execute after cold resumption; resumption follows the journal's confirmed prefix and never crosses an unacknowledged boundary.
+- Session state (parked sessions, checkpoints, journal replay cache) lives in memory only and is lost on restart; `cursor_auth_dir` stores only PKCE credentials (`cursor.json`) — do not commit or share that directory.
+- Known limitation: when a parked session is lost (restart, TTL expiry, model or tool-catalog change), tool continuation falls back to flattening the full transcript into a fresh run; side effects (such as tool calls) not yet acknowledged inside a crash window may re-execute, with client-side tool_result idempotency as the backstop.
 
 After saving credentials, all four login commands automatically send `POST /reload` to `server.host` / `server.port` from `--config`. Wildcard bind addresses map to loopback; the request bypasses proxies, with a 2-second connection timeout and a 30-second total timeout. Failure prints a warning without undoing login; a stopped service loads credentials on its next startup. When using `--auth-dir`, the service configuration must point to that directory too.
 

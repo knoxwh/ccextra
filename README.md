@@ -216,8 +216,8 @@ Cursor 登录自行生成 PKCE 并轮询浏览器授权，不依赖 Cursor IDE �
 **Cursor 原生代理运维要点**：
 
 - 出站流量走 Rust h2 + rustls 直连 `api2.cursor.sh`；代理复用全局 `proxy`（HTTP CONNECT 隧道，支持 Basic 认证），`"direct"` 禁用。区域受限模型（如 `muse-spark-1.3`）需全量代理出口才能使用。
-- 会话状态写入 `cursor_auth_dir` 下的 `sessions.jsonl` 与 journal 文件，包含对话内容，属敏感数据，请勿提交或分享该目录。
-- 已知限制：崩溃窗口内未确认的副作用（如工具调用）可能在冷续接后重复执行；续接以 journal 记录的已确认前缀为准，不跨过未确认边界。
+- 会话状态（park 驻留、checkpoint、journal 回放缓存）全部在内存中，进程重启即失效；`cursor_auth_dir` 只存 PKCE 凭证（`cursor.json`），请勿提交或分享该目录。
+- 已知限制：驻留会话丢失（重启、TTL 过期、模型或工具目录变更）时，工具续接回退 flatten 全量 transcript 重新起跑，崩溃窗口内未确认的副作用（如工具调用）可能重复执行，由客户端 tool_result 幂等性兜底。
 
 四种登录命令保存凭证后，都会按 `--config` 的 `server.host` / `server.port` 自动发送 `POST /reload`。通配监听地址转为本机回环地址，请求不走代理，连接超时 2 秒、总超时 30 秒。失败只提示，不撤销登录；服务未启动时下次启动加载。使用 `--auth-dir` 时，服务配置也需指向该目录。
 

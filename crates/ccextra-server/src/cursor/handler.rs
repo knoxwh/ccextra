@@ -57,19 +57,12 @@ async fn consumer_response(
     }
 }
 
-/// session cache 上轮真实 input(滞后测量,非估算);无缓存为 0
-fn cached_session_input(state: &AppState, prepared: &PreparedMessageRequest) -> usize {
-    prepared
-        .session_id
-        .as_deref()
-        .and_then(|sid| {
-            state
-                .last_input_tokens
-                .lock()
-                .ok()
-                .and_then(|mut cache| cache.get(sid))
-        })
-        .unwrap_or(0)
+/// 请求体字节/4 的 input 估算(对齐 Plus setInputEstimate);
+/// 序列化失败退 1,保证占位非零
+fn input_estimate(prepared: &PreparedMessageRequest) -> usize {
+    serde_json::to_vec(&prepared.body_json)
+        .map(|bytes| (bytes.len() / 4).max(1))
+        .unwrap_or(1)
 }
 
 fn failure_response(failure: CursorFailure) -> Response {
@@ -147,14 +140,16 @@ fn handle_producer_settle(
         sessions.finish(conversation, identity, generation);
     }
     let snapshot = serde_json::to_vec(&reply.json()).map_err(CursorFailure::from_transport)?;
-    // TurnEnded 真实 input 写 session cache(count_tokens 与下轮占位复用;不估算)
-    if let (Some(sid), Some(tokens)) = (session_id, reply.real_usage_input()) {
-        if tokens > 0 {
-            let _ = token_cache
-                .lock()
-                .ok()
-                .map(|mut cache| cache.insert(sid.to_string(), tokens as usize));
-        }
+    // 单回合写 TurnEnded 真实 input;多回合续接无单请求真实值,
+    // 写请求体估算(count_tokens 与下轮占位复用)
+    let settled_input = reply
+        .real_usage_input()
+        .unwrap_or_else(|| reply.estimated_input());
+    if let (Some(sid), true) = (session_id, settled_input > 0) {
+        let _ = token_cache
+            .lock()
+            .ok()
+            .map(|mut cache| cache.insert(sid.to_string(), settled_input as usize));
     }
     sessions.broadcast_outcome(
         conversation,
@@ -188,9 +183,8 @@ impl Drop for SetupGuard {
     }
 }
 
-type SessionTokenCacheHandle = std::sync::Arc<
-    std::sync::Mutex<crate::http::session_tokens::SessionTokenCache>,
->;
+type SessionTokenCacheHandle =
+    std::sync::Arc<std::sync::Mutex<crate::http::session_tokens::SessionTokenCache>>;
 
 #[allow(clippy::too_many_arguments)]
 fn spawn_cursor_producer(
@@ -353,7 +347,10 @@ fn consumer_stream_response(
                     yield Ok(crate::sse::emit::error_event("cursor_replay_unavailable"));
                     break;
                 }
-                ReplayStatus::NotFound if outcome.is_some() => {
+                // 失败但 journal 无记录(流未 message_start 就断了,error 帧进不了
+                // journal):放行到下方 Failure 分支,把真实错误发给客户端,
+                // 不用 replay 丢失的笼统文案掩盖
+                ReplayStatus::NotFound if matches!(outcome, Some(RunOutcome::Success(_))) => {
                     yield Ok(crate::sse::emit::error_event("cursor_replay_unavailable"));
                     break;
                 }
@@ -412,10 +409,16 @@ async fn consumer_json_response(
 }
 
 fn tool_results(body: &Value) -> Result<Vec<ToolResult>, AppError> {
+    // Claude Code 会在 tool_result 后追加 system reminder,末条常是 system;
+    // 对齐 input.rs last_conversation:跳过尾部 system 找真正的用户消息
     let Some(message) = body
         .get("messages")
         .and_then(Value::as_array)
-        .and_then(|list| list.last())
+        .and_then(|list| {
+            list.iter()
+                .rev()
+                .find(|message| message.get("role").and_then(Value::as_str) != Some("system"))
+        })
     else {
         return Ok(Vec::new());
     };
@@ -551,13 +554,12 @@ pub(crate) async fn handle_cursor(
             "Cursor 凭证已换号,请 reload 模型目录",
         ));
     }
-    let credential =
-        refresh::ensure_credential_fresh(auth_dir, run_proxy, None)
-            .await
-            .unwrap_or_else(|err| {
-                tracing::warn!("Cursor 请求前刷新失败,尝试当前 token: {err}");
-                current
-            });
+    let credential = refresh::ensure_credential_fresh(auth_dir, run_proxy, None)
+        .await
+        .unwrap_or_else(|err| {
+            tracing::warn!("Cursor 请求前刷新失败,尝试当前 token: {err}");
+            current
+        });
     let refreshed_identity = provider::credential_fingerprint(&credential);
     if refreshed_identity != *identity {
         state
@@ -621,6 +623,10 @@ pub(crate) async fn handle_cursor(
         "stream": prepared.body_json.get("stream"),
         "metadata": prepared.body_json.get("metadata"),
         "thinking": prepared.body_json.get("thinking"),
+        // effort 输入必须进 digest:家族模型把钳制后的 effort 拼进上游
+        // model id,同消息不同 effort 是不同回合,不能 singleflight 合流或回放
+        "reasoning_effort": prepared.body_json.get("reasoning_effort"),
+        "output_config": prepared.body_json.get("output_config"),
     });
     let upstream_model = prepared.route.upstream_model.clone();
     let turn_digest = compute_turn_digest(
@@ -754,7 +760,9 @@ pub(crate) async fn handle_cursor(
                     return Ok(failure_response(err));
                 }
             }
-            let reply = CursorReply::new(response_id, inbound_model, cached_session_input(state, &prepared));
+            // park 续接同一 Run:TurnEnded 是整回合累计口径,标记续接走估算
+            let reply =
+                CursorReply::new(response_id, inbound_model, input_estimate(&prepared), true);
             setup.handed_off = true;
             spawn_cursor_producer(
                 state.cursor_sessions.clone(),
@@ -844,10 +852,12 @@ pub(crate) async fn handle_cursor(
                 if let Some((_, blobs)) = checkpoint.as_ref() {
                     drive.seed_blobs(blobs.clone());
                 }
+                // 新 Run(含 flatten 重跑):TurnEnded 对本请求是真实口径,不标记续接
                 let mut reply = CursorReply::new(
                     response_id.clone(),
                     inbound_model.clone(),
-                    cached_session_input(state, &prepared),
+                    input_estimate(&prepared),
+                    false,
                 );
                 let first = async {
                     loop {
@@ -859,7 +869,12 @@ pub(crate) async fn handle_cursor(
                     }
                 }
                 .await;
-                if let Err(error) = first {
+                if let Err(mut error) = first {
+                    // 首帧循环已收到增量(token 计数或已产帧)后不再重试:
+                    // 重试会丢弃已收增量并重复计费,直接把失败交给客户端
+                    if reply.progressed() {
+                        error.progressed = true;
+                    }
                     Err(error)
                 } else {
                     if !state.cursor_sessions.publish_if_current(
@@ -907,9 +922,7 @@ pub(crate) async fn handle_cursor(
         };
         if failure.status == StatusCode::UNAUTHORIZED && !retried_auth && !failure.progressed {
             retried_auth = true;
-            match refresh::ensure_credential_fresh(auth_dir, run_proxy, Some(&token))
-            .await
-            {
+            match refresh::ensure_credential_fresh(auth_dir, run_proxy, Some(&token)).await {
                 Ok(fresh) if provider::credential_fingerprint(&fresh) == *identity => {
                     token = fresh.access_token;
                     publish_token(state, &prepared.route.provider, identity, &token, auth_dir)

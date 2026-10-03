@@ -11,8 +11,8 @@ use ccextra_core::convert::cursor::proto::{
     decode_fields, encode_bytes, encode_varint, generated, reply, ConnectFrame,
     ConnectFrameDecoder, Field, DEFAULT_MAX_FRAME_SIZE,
 };
-use prost::Message as _;
 use ccextra_core::route::{ModelConfig, Protocol, ProviderConfig};
+use prost::Message as _;
 use serde_json::{json, Value};
 use std::sync::{Arc, Mutex};
 use std::time::Duration;
@@ -86,9 +86,7 @@ fn fixture(url: String) -> (AppState, tempfile::TempDir) {
         reload,
         drift: ccextra_core::cache_stabilization::drift_detector::DriftState::new(100),
         replay_cache: crate::sse::replay_cache::ReplayCache::new(Duration::from_secs(60), 100),
-        initial_response_delay: crate::sse::InitialResponseDelayState::new(
-            Duration::from_secs(3),
-        ),
+        initial_response_delay: crate::sse::InitialResponseDelayState::new(Duration::from_secs(3)),
         cursor: Arc::new(std::sync::RwLock::new(None)),
         cursor_sessions: super::session::CursorSessions::default(),
         last_input_tokens: Arc::new(Mutex::new(http::session_tokens::SessionTokenCache::new())),
@@ -139,6 +137,19 @@ fn context_request(id: u32, exec_id: &str) -> Vec<u8> {
 }
 
 async fn tool_upstream() -> (
+    String,
+    tokio::task::JoinHandle<()>,
+    tokio::sync::oneshot::Sender<()>,
+    tokio::sync::oneshot::Receiver<()>,
+) {
+    tool_upstream_with(false).await
+}
+
+/// fail_after_reply:收到 mcpResult 后不发文本,直接回 Connect 错误 trailer,
+/// 模拟续接回合在首帧前断流
+async fn tool_upstream_with(
+    fail_after_reply: bool,
+) -> (
     String,
     tokio::task::JoinHandle<()>,
     tokio::sync::oneshot::Sender<()>,
@@ -241,8 +252,21 @@ async fn tool_upstream() -> (
             assert_eq!(frames.pop_front().unwrap().payload, item);
             assert!(!body.is_end_stream());
         }
-        sender.send_data(text_frame("tools done"), false).unwrap();
-        sender.send_data(end_frame(), true).unwrap();
+        if fail_after_reply {
+            sender
+                .send_data(
+                    Bytes::from(ConnectFrame::encode(
+                        br#"{"error":{"code":"resource_exhausted","message":"quota exceeded"}}"#,
+                        2,
+                    )
+                    .unwrap()),
+                    true,
+                )
+                .unwrap();
+        } else {
+            sender.send_data(text_frame("tools done"), false).unwrap();
+            sender.send_data(end_frame(), true).unwrap();
+        }
         let _ = tokio::time::timeout(Duration::from_secs(1), driver).await;
     });
     (url, task, parked_tx, replied_rx)
@@ -298,6 +322,8 @@ enum Scenario {
     ExpectCheckpoint,
     /// ASM field 7 InteractionQuery:客户端必须回 InteractionResponse 才不挂流
     InteractionQuery,
+    /// TokenDelta 后无 trailer 断流:回合已推进,不得重试
+    TokenDeltaEof,
 }
 
 async fn mock_upstream(
@@ -382,6 +408,20 @@ async fn mock_upstream(
                     sender.send_data(end_frame(), true).unwrap();
                 }
                 Scenario::Eof => sender.send_data(text_frame("partial"), true).unwrap(),
+                Scenario::TokenDeltaEof => {
+                    // TokenDelta(interaction field 8,内嵌 varint field 1)后断流
+                    sender
+                        .send_data(
+                            Bytes::from(ConnectFrame::encode(
+                                &interaction(8, &[0x08, 0x01]),
+                                0,
+                            )
+                            .unwrap()),
+                            false,
+                        )
+                        .unwrap();
+                    sender.send_data(Bytes::new(), true).unwrap();
+                }
                 Scenario::Connect429 => sender.send_data(Bytes::from(ConnectFrame::encode(
                     br#"{"error":{"code":"resource_exhausted","message":"quota exceeded"}}"#, 2,
                 ).unwrap()), true).unwrap(),
@@ -605,6 +645,9 @@ async fn parked_stream_handles_controls_before_multiple_tool_results_resume() {
             { "type": "tool_result", "tool_use_id": "call-b", "content": "B", "is_error": true },
             { "type": "tool_result", "tool_use_id": "call-a", "content": "A" },
         ] },
+        // Claude Code 会在 tool_result 后追加 system reminder,末条常是 system;
+        // 续接判定必须跳过它找到 tool_result 消息(否则走冷路径丢结果)
+        { "role": "system", "content": "<system-reminder>reminder</system-reminder>" },
     ]);
     let mut invalid = first.clone();
     invalid["messages"][2]["content"][0]["tool_use_id"] = json!("unknown");
@@ -627,6 +670,74 @@ async fn parked_stream_handles_controls_before_multiple_tool_results_resume() {
         .await
         .unwrap()
         .unwrap();
+}
+
+#[tokio::test]
+async fn differing_effort_inputs_do_not_share_turn_digest() {
+    let (url, server, calls) = mock_upstream(vec![Scenario::Success, Scenario::Success]).await;
+    let (state, _dir) = fixture(url);
+    let mut high = prompt(true);
+    high["output_config"] = json!({ "effort": "high" });
+    let mut low = prompt(true);
+    low["output_config"] = json!({ "effort": "low" });
+    let first = call(state.clone(), high).await;
+    assert_eq!(first.0, StatusCode::OK, "{}", first.1);
+    let second = call(state.clone(), low).await;
+    assert_eq!(second.0, StatusCode::OK, "{}", second.1);
+    // 同消息不同 effort 是不同回合:不能 singleflight 合流或回放串档
+    assert_eq!(calls.load(std::sync::atomic::Ordering::SeqCst), 2);
+    server.abort();
+}
+
+#[tokio::test]
+async fn resume_failure_before_first_frame_reports_real_error() {
+    let (url, server, parked, replied) = tool_upstream_with(true).await;
+    let (state, _dir) = fixture(url);
+    let mut first = prompt(false);
+    first["tools"] = json!([{
+        "name": "lookup", "description": "Look up data",
+        "input_schema": { "type": "object", "properties": {} },
+    }]);
+    let (status, body) = call(state.clone(), first.clone()).await;
+    assert_eq!(status, StatusCode::OK, "{body}");
+    let data: Value = serde_json::from_str(&body).unwrap();
+    assert_eq!(data["stop_reason"], "tool_use");
+    parked.send(()).unwrap();
+    tokio::time::timeout(Duration::from_secs(5), replied)
+        .await
+        .unwrap()
+        .unwrap();
+    first["messages"] = json!([
+        { "role": "user", "content": "ping" },
+        { "role": "assistant", "content": data["content"] },
+        { "role": "user", "content": [
+            { "type": "tool_result", "tool_use_id": "call-a", "content": "A" },
+            { "type": "tool_result", "tool_use_id": "call-b", "content": "B", "is_error": true },
+        ] },
+    ]);
+    first["stream"] = json!(true);
+    // 续接回合在首帧前断流:journal 无记录,客户端必须看到真实上游错误,
+    // 而不是 replay 丢失的笼统文案
+    let (status, stream) = call(state, first).await;
+    assert_eq!(status, StatusCode::OK, "{stream}");
+    assert!(stream.contains("quota exceeded"), "{stream}");
+    assert!(!stream.contains("cursor_replay_unavailable"), "{stream}");
+    tokio::time::timeout(Duration::from_secs(5), server)
+        .await
+        .unwrap()
+        .unwrap();
+}
+
+#[tokio::test]
+async fn token_delta_then_eof_does_not_retry_progressed_turn() {
+    let (url, server, calls) = mock_upstream(vec![Scenario::TokenDeltaEof]).await;
+    let (state, _dir) = fixture(url);
+    let (status, body) = call(state, prompt(true)).await;
+    // 已收到 token 增量后断流:回合已推进,重试会丢弃增量并重复计费
+    assert_eq!(status, StatusCode::BAD_GATEWAY, "{body}");
+    assert!(body.contains("Cursor 流中断"), "{body}");
+    assert_eq!(calls.load(std::sync::atomic::Ordering::SeqCst), 1);
+    server.abort();
 }
 
 #[tokio::test]

@@ -12,6 +12,9 @@ pub struct CursorReply {
     input_tokens: usize,
     output_tokens: i64,
     turn_usage: Option<TurnUsage>,
+    /// 本请求是工具续接(多轮回合):TurnEnded 是整回合累计口径,
+    /// 不能当单请求 usage 直报,退回请求体字节估算
+    continuation: bool,
     pub checkpoint: Option<Vec<u8>>,
     pub pending: Vec<ExecRequest>,
     pub finished: bool,
@@ -19,17 +22,18 @@ pub struct CursorReply {
 }
 
 impl CursorReply {
-    /// input_tokens 是占位值:session cache 上轮真实值(滞后测量)或 0,
-    /// TurnEnded 真实 usage 到达后覆盖;不估算
-    pub fn new(id: String, model: String, input_tokens: usize) -> Self {
+    /// input_tokens 是请求体字节/4 估算(对齐 Plus);单轮回合的
+    /// TurnEnded 真实 usage 到达后覆盖,不估算
+    pub fn new(id: String, model: String, input_tokens: usize, continuation: bool) -> Self {
         Self {
-            sse: CursorSse::new(&id, &model, input_tokens),
+            sse: CursorSse::new(&id, &model, input_tokens, continuation),
             id,
             model,
             content: Vec::new(),
             input_tokens,
             output_tokens: 0,
             turn_usage: None,
+            continuation,
             checkpoint: None,
             pending: Vec::new(),
             finished: false,
@@ -126,14 +130,28 @@ impl CursorReply {
         frames
     }
 
-    /// TurnEnded 上报的真实 input(Anthropic 语义,已扣 cache);未上报为 None
+    /// 上报给客户端的 input:单轮回合取 TurnEnded 真实值(Anthropic 语义,
+    /// 已扣 cache);多轮回合无单请求真实数,用请求体估算;未上报为 None
     pub fn real_usage_input(&self) -> Option<i64> {
         let usage = self.turn_usage?;
+        if self.continuation {
+            return None;
+        }
         let cache_read = usage.cache_read_tokens.unwrap_or(0);
         let cache_write = usage.cache_write_tokens.unwrap_or(0);
         usage
             .input_tokens
             .map(|tokens| (tokens - cache_read - cache_write).max(0))
+    }
+
+    /// 请求体字节/4 估算的 input(settle 写 token cache 的兜底值)
+    pub fn estimated_input(&self) -> i64 {
+        self.input_tokens as i64
+    }
+
+    /// 回合是否已向上游推进(已产帧或已收 token 增量);失败后不可安全重试
+    pub fn progressed(&self) -> bool {
+        self.emitted || self.output_tokens > 0
     }
 
     pub fn error(&mut self, message: &str) -> Vec<Bytes> {
@@ -147,15 +165,22 @@ impl CursorReply {
         } else {
             self.content.clone()
         };
-        // TurnEnded 上报全量用量时覆盖占位值;input 含 cache 部分,按 Anthropic 语义拆出
+        // 单轮回合 TurnEnded 是真实单请求用量;多轮回合是整回合累计口径,
+        // 直报会撑爆上下文/成本显示,退回请求体估算(input)与本响应
+        // TokenDelta 累计(output),rd/wr 置 0(单请求真实值不存在)
         let usage = self.turn_usage.unwrap_or_default();
-        let cache_read = usage.cache_read_tokens.unwrap_or(0);
-        let cache_write = usage.cache_write_tokens.unwrap_or(0);
-        let input_tokens = usage
-            .input_tokens
-            .map(|tokens| (tokens - cache_read - cache_write).max(0))
-            .unwrap_or(self.input_tokens as i64);
-        let output_tokens = usage.output_tokens.unwrap_or(self.output_tokens);
+        let (input_tokens, cache_read, cache_write) = if self.continuation {
+            (self.input_tokens as i64, 0, 0)
+        } else {
+            let cache_read = usage.cache_read_tokens.unwrap_or(0);
+            let cache_write = usage.cache_write_tokens.unwrap_or(0);
+            let input = usage
+                .input_tokens
+                .map(|tokens| (tokens - cache_read - cache_write).max(0))
+                .unwrap_or(self.input_tokens as i64);
+            (input, cache_read, cache_write)
+        };
+        let output_tokens = self.output_tokens;
         json!({
             "id": self.id, "type": "message", "role": "assistant", "model": self.model,
             "content": content,
