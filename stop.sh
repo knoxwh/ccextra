@@ -5,7 +5,8 @@ SCRIPT_DIR="$(cd "$(dirname "$0")" && pwd)"
 
 echo "=== Stopping ccextra ==="
 
-CC_NAMES="ccextra"
+# 匹配本仓库二进制的完整路径,避免误杀命令行恰好含 ccextra 的无关进程
+CC_NAMES="$SCRIPT_DIR/ccextra"
 for name in $CC_NAMES; do
     for pid in $(pgrep -f "$name" 2>/dev/null || true); do
         echo "Stopping $name (PID: $pid)"
@@ -13,15 +14,15 @@ for name in $CC_NAMES; do
     done
 done
 
-# 杀占用 8222 端口的进程
-for pid in $(lsof -ti :8222 2>/dev/null || true); do
+# 杀占用 8222 端口的进程(只杀监听者,避免误杀连到该端口的客户端如 Claude Code)
+for pid in $(lsof -ti :8222 -sTCP:LISTEN 2>/dev/null || true); do
     cmd=$(ps -p "$pid" -o command= 2>/dev/null | head -1 || true)
     echo "Stopping process on port 8222 (PID: $pid, cmd: $cmd)"
     kill "$pid" 2>/dev/null || true
 done
 
 # 清理 Cursor SDK sidecar 固定端口
-for pid in $(lsof -ti :8223 2>/dev/null || true); do
+for pid in $(lsof -ti :8223 -sTCP:LISTEN 2>/dev/null || true); do
     cmd=$(ps -p "$pid" -o command= 2>/dev/null | head -1 || true)
     echo "Stopping Cursor sidecar on port 8223 (PID: $pid, cmd: $cmd)"
     kill "$pid" 2>/dev/null || true
@@ -36,7 +37,7 @@ for i in $(seq 1 10); do
             break
         fi
     done
-    if ! $CC_ALIVE && ! lsof -ti :8222 >/dev/null 2>&1 && ! lsof -ti :8223 >/dev/null 2>&1; then
+    if ! $CC_ALIVE && ! lsof -ti :8222 -sTCP:LISTEN >/dev/null 2>&1 && ! lsof -ti :8223 -sTCP:LISTEN >/dev/null 2>&1; then
         echo "ccextra stopped"
         break
     fi
@@ -50,11 +51,11 @@ for name in $CC_NAMES; do
         pkill -9 -f "$name" 2>/dev/null || true
     fi
 done
-for pid in $(lsof -ti :8222 2>/dev/null || true); do
+for pid in $(lsof -ti :8222 -sTCP:LISTEN 2>/dev/null || true); do
     echo "Force killing process on port 8222 (PID: $pid)"
     kill -9 "$pid" 2>/dev/null || true
 done
-for pid in $(lsof -ti :8223 2>/dev/null || true); do
+for pid in $(lsof -ti :8223 -sTCP:LISTEN 2>/dev/null || true); do
     echo "Force killing Cursor sidecar on port 8223 (PID: $pid)"
     kill -9 "$pid" 2>/dev/null || true
 done

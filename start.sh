@@ -27,8 +27,8 @@ if [ ! -x "$BIN" ]; then
     exit 1
 fi
 
-# 端口占用检查
-if lsof -ti :8222 >/dev/null 2>&1; then
+# 端口占用检查(只看监听者,客户端连接不算占用)
+if lsof -ti :8222 -sTCP:LISTEN >/dev/null 2>&1; then
     echo "端口 8222 已被占用,请先 stop.sh" >&2
     exit 1
 fi

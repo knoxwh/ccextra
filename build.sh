@@ -5,10 +5,10 @@ SCRIPT_DIR="$(cd "$(dirname "$0")" && pwd)"
 
 # 检查是否有进程在跑
 WAS_RUNNING=false
-if pgrep -f "ccextra" >/dev/null 2>&1; then
+if pgrep -f "$SCRIPT_DIR/ccextra" >/dev/null 2>&1; then
     WAS_RUNNING=true
 fi
-if lsof -ti :8222 >/dev/null 2>&1; then
+if lsof -ti :8222 -sTCP:LISTEN >/dev/null 2>&1; then
     WAS_RUNNING=true
 fi
 
