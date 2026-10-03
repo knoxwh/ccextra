@@ -283,7 +283,7 @@ pub(crate) struct PreparedMessageRequest {
     pub replay_scope: Option<(crate::sse::replay_cache::ReplayCache, String, String)>,
     pub signature_model: Option<Arc<str>>,
     pub token_scope: Option<crate::http::session_tokens::TokenCacheScope>,
-    pub initial_response_delay_key: Option<(String, Option<String>)>,
+    pub initial_response_delay_key: Option<String>,
 }
 
 pub(crate) struct ExecutedUpstream {
@@ -736,10 +736,10 @@ pub(crate) async fn prepare_message_request(
     let is_grok = is_grok_model(&outbound_model);
     let (session_id, thread_id) = if matches!(route.protocol, Protocol::OpenAiResponses) {
         (cc_session.as_deref(), extract_claude_code_thread(headers))
-    } else if is_grok && matches!(route.protocol, Protocol::OpenAiChat) {
+    } else if (is_grok && matches!(route.protocol, Protocol::OpenAiChat))
+        || matches!(route.protocol, Protocol::Antigravity)
+    {
         (cc_session.as_deref(), None)
-    } else if matches!(route.protocol, Protocol::Antigravity) {
-        (cc_session.as_deref(), extract_claude_code_thread(headers))
     } else if matches!(route.protocol, Protocol::CursorSdk) {
         // usage 写 session token cache + count_tokens 复用
         (cc_session.as_deref(), None)
@@ -772,8 +772,14 @@ pub(crate) async fn prepare_message_request(
     let signature_model: Option<Arc<str>> = matches!(route.protocol, Protocol::Antigravity)
         .then(|| Arc::from(route.upstream_model.as_str()));
 
+    // Antigravity 上游 session 以首条 user 消息哈希为 sessionId(对齐 CPA
+    // generateStableSessionID),与客户端会话头无关:subagent 与主线程共享
+    // x-claude-code-session-id 但各开新上游 session,延迟键必须用上游 sessionId
     let initial_response_delay_key = if matches!(route.protocol, Protocol::Antigravity) {
-        session_id.map(|session| (session.to_string(), thread_id.clone()))
+        body_json
+            .pointer("/request/sessionId")
+            .and_then(|v| v.as_str())
+            .map(str::to_string)
     } else {
         None
     };
@@ -1162,7 +1168,7 @@ pub(crate) async fn deliver_response(
                 prepared.token_scope.clone(),
             )
         };
-        // Antigravity 新身份首个响应压住 message_stop,推迟客户端下一请求
+        // Antigravity 新上游 session 首个响应压住 message_stop,推迟客户端下一请求
         if let Some(key) = prepared.initial_response_delay_key.clone() {
             out = state
                 .initial_response_delay
@@ -1303,7 +1309,7 @@ pub(crate) async fn deliver_response(
             .map(Bytes::from)
             .unwrap_or(body_bytes);
         if let Some(key) = prepared.initial_response_delay_key.as_ref() {
-            if state.initial_response_delay.claim(&key.0, key.1.as_deref()) {
+            if state.initial_response_delay.claim(key) {
                 state.initial_response_delay.wait().await;
             }
         }

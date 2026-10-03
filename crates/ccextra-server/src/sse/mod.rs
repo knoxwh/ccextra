@@ -30,7 +30,7 @@ use std::time::{Duration, Instant};
 /// 统一响应流类型:可 Send 的固定字节流
 pub type SseStreamPin = Pin<Box<dyn Stream<Item = Result<Bytes, io::Error>> + Send>>;
 
-type InitialResponseKey = (String, Option<String>);
+type InitialResponseKey = String;
 type ClaimEntry = (Instant, u64);
 
 const INITIAL_RESPONSE_DELAY_CAPACITY: usize = 512;
@@ -52,12 +52,12 @@ impl InitialResponseDelayState {
         }
     }
 
-    pub fn claim(&self, session_id: &str, thread_id: Option<&str>) -> bool {
-        self.claim_at(session_id, thread_id, Instant::now())
+    pub fn claim(&self, session_id: &str) -> bool {
+        self.claim_at(session_id, Instant::now())
     }
 
-    fn claim_at(&self, session_id: &str, thread_id: Option<&str>, now: Instant) -> bool {
-        let key = (session_id.to_string(), thread_id.map(str::to_string));
+    fn claim_at(&self, session_id: &str, now: Instant) -> bool {
+        let key = session_id.to_string();
         let mut claimed = self.claimed.lock().expect("首请求状态锁不应中毒");
         if let Some((written_at, _)) = claimed.get(&key).copied() {
             if now.saturating_duration_since(written_at) < INITIAL_RESPONSE_DELAY_TTL {
@@ -87,12 +87,15 @@ impl InitialResponseDelayState {
         tokio::time::sleep(self.delay).await;
     }
 
-    /// 新身份(会话+thread)首个响应压住 message_stop 3s:
+    /// 上游新 session(sessionId)首个响应压住 message_stop 3s:
     /// 客户端要等流收尾才发下一请求,故延迟第二个请求的发出时间。
+    /// 键是上游 sessionId(首条 user 消息哈希,对齐 CPA generateStableSessionID),
+    /// 不是客户端会话头:subagent 与主线程共享 x-claude-code-session-id,
+    /// 但各自开新上游 session,按客户端身份 claim 会漏掉 subagent。
     pub fn hold_message_stop(
         self,
         stream: SseStreamPin,
-        key: (String, Option<String>),
+        key: InitialResponseKey,
     ) -> SseStreamPin
     where
         Self: 'static,
@@ -102,7 +105,7 @@ impl InitialResponseDelayState {
             while let Some(item) = stream.next().await {
                 let should_delay = item.as_ref()
                     .is_ok_and(|bytes| bytes.starts_with(b"event: message_stop"));
-                if should_delay && self.claim(&key.0, key.1.as_deref()) {
+                if should_delay && self.claim(&key) {
                     if self.delay.is_zero() {
                         yield item;
                         continue;
@@ -377,9 +380,9 @@ mod tests {
     #[test]
     fn initial_response_delay_claims_identity_once() {
         let state = InitialResponseDelayState::new(Duration::ZERO);
-        assert!(state.claim("session", Some("subagent")));
-        assert!(!state.claim("session", Some("subagent")));
-        assert!(state.claim("session", Some("other")));
+        assert!(state.claim("session-a"));
+        assert!(!state.claim("session-a"));
+        assert!(state.claim("session-b"));
     }
 
     #[test]
@@ -387,30 +390,29 @@ mod tests {
         let state = InitialResponseDelayState::new(Duration::ZERO);
         let start = Instant::now();
 
-        assert!(state.claim_at("s1", None, start));
-        assert!(!state.claim_at("s1", None, start + Duration::from_secs(60)));
+        assert!(state.claim_at("s1", start));
+        assert!(!state.claim_at("s1", start + Duration::from_secs(60)));
         // 超过 TTL 可再次 claim
         assert!(state.claim_at(
             "s1",
-            None,
             start + INITIAL_RESPONSE_DELAY_TTL + Duration::from_secs(1)
         ));
 
         // 填满容量淘汰最久条目(s1 是最旧序号)
         for i in 0..INITIAL_RESPONSE_DELAY_CAPACITY {
-            assert!(state.claim_at(&format!("fill-{i}"), None, start));
+            assert!(state.claim_at(&format!("fill-{i}"), start));
         }
         // 刚插入的还在
-        assert!(!state.claim_at("fill-511", None, start));
+        assert!(!state.claim_at("fill-511", start));
         // 最旧 s1 已被逐出，未过 TTL 亦可重新 claim
-        assert!(state.claim_at("s1", None, start));
+        assert!(state.claim_at("s1", start));
     }
 
     /// 首身份 message_stop 被压住 3s 且帧序与内容不变;同身份第二次不再压
     #[tokio::test(start_paused = true)]
     async fn hold_message_stop_delays_once_and_preserves_frames() {
         let state = InitialResponseDelayState::new(Duration::from_secs(3));
-        let key = ("session".to_string(), Some("subagent".to_string()));
+        let key = "session".to_string();
         let frames = || {
             Box::pin(futures::stream::iter(vec![
                 Ok(Bytes::from_static(b"event: message_start\ndata: {}\n\n")),
