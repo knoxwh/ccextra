@@ -148,7 +148,7 @@ curl -H "Authorization: Bearer $ANTHROPIC_AUTH_TOKEN" \
 - `prompt_cache_key` 只用于 OpenAI 路径，取 Claude Code 会话 ID，且不覆盖已有非空值。
 - `models_file` 指向 reasoning 级别表（默认配置文件旁 `models.json`，不入 git，可从 [models.json.example](models.json.example) 复制后按需修改），按上游模型 `id` 精确匹配，把入站 effort 钳到该模型支持的最近档；缺文件或未收录的模型不钳。条目可加 `force_effort`：凡钳制会介入的 effort 一律改写为该固定值（不钳制），`*claude*` 原生模型与显式关闭思考的请求不受影响。
 - `antigravity_models` 为模型白名单（顶层配置，glob 或精确名，如 `["claude-opus-5-5-*", "gpt-5.2"]`）；缺省或空列表发布全量目录。过滤在动态目录加载时按上游模型名匹配，过滤后为空时该凭证发布空模型列表。`/reload` 与 3 小时后台刷新均生效。
-- Cursor 字段：`cursor_auth_dir` 启用原生代理（凭证目录，默认配置文件旁 `.cache/cursor`）；`cursor_models` 白名单（glob 或精确名，`default` 与 `auto` 均匹配目录 `default` 条目，缺省全量），条目可钉固定参数 `"id:param=value"`（如 `"auto-smart:optimize_for=intelligence"`，拼进模型 name）。思考等级：白名单裸 base 命中目录变体家族（如 `grok-4.7` 对应 `grok-4.7-low/…/xhigh`）时合成单一模型，入站 effort（`thinking.budget_tokens` 阈值映射、`output_config.effort`、`reasoning_effort`；`thinking.type: disabled` 视为 `none`，`auto` 不干预）钳制到目录实际等级后拼进上游 model id（如 `grok-4.7-high`），白名单钉参优先不覆盖；无 effort 时用缺省等级（优先 medium，否则等级中位；家族无裸 id，裸 base 会被上游拒绝）。目录已有裸 id 的模型（`default`、`composer-2.5`）不经家族展开，effort 走 `RequestedModel.parameters`。`cursor_base_url`（默认 `https://api2.cursor.sh`）与 `cursor_client_version`（默认 `cli-2026.10.01-e373342`）可覆盖。启用后自动合成 name `cursor` 的 `cursor_sdk` provider；与现有 provider 的模型 alias 冲突时跳过该模型并告警（name 可跨 provider 重复）。刷新失败保留最近成功目录。
+- Cursor 字段：`cursor_auth_dir` 启用原生代理（凭证目录，默认配置文件旁 `.cache/cursor`）；`cursor_models` 白名单（glob 或精确名，`default` 与 `auto` 均匹配目录 `default` 条目，缺省全量），条目可钉固定参数 `"id:param=value"`（如 `"auto-smart:optimize_for=intelligence"`，拼进模型 name）。思考等级：白名单裸 base 命中目录变体家族（如 `grok-4.7` 对应 `grok-4.7-low/…/xhigh`）时合成单一模型，档位不在白名单配置，由 `models.json` 中同 id 条目（按 base 精确匹配，如 `grok-4.7`）决定：`force_effort` 直接固定档位（显式禁用也改写）；否则入站 effort（`thinking.budget_tokens` 阈值映射、`output_config.effort`、`reasoning_effort`；`thinking.type: disabled` 视为 `none`，`auto` 不干预）按 `reasoning_levels` 钳制。结果再钳到目录实际等级后拼进上游 model id（如 `grok-4.7-high`），保证上游存在该变体；`models.json` 无该条目时只按目录等级钳制；无 effort 时用缺省等级（优先 medium，否则等级中位；家族无裸 id，裸 base 会被上游拒绝）。白名单里遗留的 `reasoning_effort`/`effort` 钉参对家族模型不生效。目录已有裸 id 的模型（`default`、`composer-2.5`）不经家族展开，effort 走 `RequestedModel.parameters`，白名单钉参优先于入站档。`cursor_base_url`（默认 `https://api2.cursor.sh`）与 `cursor_client_version`（默认 `cli-2026.10.01-e373342`）可覆盖。启用后自动合成 name `cursor` 的 `cursor_sdk` provider；与现有 provider 的模型 alias 冲突时跳过该模型并告警（name 可跨 provider 重复）。刷新失败保留最近成功目录。
 
 <details>
 <summary>进阶选项</summary>
@@ -211,7 +211,7 @@ curl -H "Authorization: Bearer $ANTHROPIC_AUTH_TOKEN" \
 
 Antigravity 凭证默认在配置文件旁 `.cache/antigravity`，xAI 在 `.cache/xai`，Codex 在 `.cache/codex`。xAI 和 Codex 启动时自动发现。Antigravity 后台加载并每 3 小时刷新模型。Codex 登录使用 PKCE 浏览器授权（本地回调端口默认 1455，可用 `--callback-port` 覆盖），token 提前 24 小时刷新。
 
-Cursor 登录自行生成 PKCE 并轮询浏览器授权，不依赖 Cursor IDE 或 `cursor-agent`；可用 `--no-browser` 手动打开 URL，token 到期前 10 分钟刷新。PKCE 凭证（`cursor.json`）驱动原生代理与配额查询（`check_cursor_quota.sh`，默认同时展示额度与模型目录，`--models` 仅列模型）。配置后启动与 `/reload` 时经 GetUsableModels 拉取账户模型目录合成 `cursor` provider，每 3 小时后台刷新，失败保留最近成功目录。`cursor_models` 白名单匹配的就是该目录（脚本输出，含 display name 与 aliases）；配白名单前先跑该命令核对模型 id。
+Cursor 登录自行生成 PKCE 并轮询浏览器授权，不依赖 Cursor IDE 或 `cursor-agent`；可用 `--no-browser` 手动打开 URL，token 到期前 10 分钟刷新。PKCE 凭证（`cursor.json`）驱动原生代理与配额查询（`check_cursor_quota.sh`，默认同时展示额度与模型目录，`--models` 仅列模型）。配置后启动与 `/reload` 时经 GetUsableModels 拉取账户模型目录合成 `cursor` provider，每 3 小时后台刷新，失败保留最近成功目录。`cursor_models` 白名单匹配的就是该目录（脚本输出，含 display name 与 aliases）；配白名单前先跑该命令核对模型 id。思考档配在 `models.json`（按 base id），脚本末尾列出各模型可选档位和可直接粘贴的 `models.json` 条目。
 
 **Cursor 原生代理运维要点**：
 

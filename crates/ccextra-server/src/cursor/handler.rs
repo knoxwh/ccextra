@@ -19,7 +19,7 @@ use axum::{
     response::{IntoResponse, Response},
 };
 use bytes::Bytes;
-use ccextra_core::convert::cursor::{build_run_request, conversation_id};
+use ccextra_core::convert::cursor::{build_run_request_with, conversation_id};
 use serde_json::Value;
 use std::time::{Duration, Instant};
 
@@ -822,12 +822,13 @@ pub(crate) async fn handle_cursor(
     let started = Instant::now();
     let mut attempt = 0;
     loop {
-        let request = build_run_request(
+        let request = build_run_request_with(
             &prepared.body_json,
             &prepared.route.upstream_model,
             &conversation,
             &message_id,
             checkpoint.as_ref().map(|(raw, _)| raw.as_slice()),
+            &snapshot.runtime.thinking_registry,
         )
         .map_err(|err| AppError::bad_request(err.to_string()))?;
         let request_id = uuid()?;

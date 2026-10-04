@@ -308,34 +308,25 @@ list_models() {
         --data-binary @- <<'CURL_EOF' 2>/dev/null || true
 CURL_EOF
 
-    # 解析 protobuf:GetUsableModelsResponse{repeated ModelDetails models = 1}
-    # ModelDetails{model_id=1, display_name=3, aliases=6}
-    local raw_flag=""
+    # AvailableModels 带思考档参数名(reasoning_effort 或 effort)。取不到仍列出目录。
+    local avail_file raw_flag=""
+    avail_file="$(mktemp)"
+    curl -sS -X POST "${BASE_URL}/aiserver.v1.AiService/AvailableModels" \
+        -H "Authorization: Bearer ${token}" \
+        -H "Content-Type: application/proto" \
+        -H "Connect-Protocol-Version: 1" \
+        -H "Te: trailers" \
+        -H "X-Ghost-Mode: true" \
+        -H "X-Cursor-Client-Type: cli" \
+        -H "X-Cursor-Client-Version: ${CLIENT_VERSION}" \
+        --max-time 15 \
+        -o "$avail_file" \
+        --data-binary '' 2>/dev/null || true
     [[ "$RAW_OUTPUT" == true ]] && raw_flag="--raw"
-    python3 - "$resp_file" "$raw_flag" <<'PY_EOF' || status=$?
+    python3 - "$resp_file" "$avail_file" "$raw_flag" <<'PY_EOF' || status=$?
 import sys, json, struct
 
 data = open(sys.argv[1], "rb").read()
-
-# Connect 帧信封: [1B flags][4B len BE];flags 0x02 为 end-stream JSON,跳过
-frames = []
-if len(data) >= 5 and data[0] in (0x00, 0x02):
-    offset = 0
-    ok = True
-    while offset < len(data):
-        if offset + 5 > len(data):
-            ok = False
-            break
-        flags = data[offset]
-        length = struct.unpack(">I", data[offset + 1:offset + 5])[0]
-        if offset + 5 + length > len(data):
-            ok = False
-            break
-        if flags == 0x00:
-            frames.append(data[offset + 5:offset + 5 + length])
-        offset += 5 + length
-    if ok and frames:
-        data = frames[0]
 
 def read_varint(buf, pos):
     result = 0
@@ -364,6 +355,85 @@ def fields(buf):
         else:
             raise ValueError(f"unsupported wire type {wire}")
 
+def unwrap_connect(payload):
+    if len(payload) < 5 or payload[0] not in (0x00, 0x02):
+        return payload
+    frames = []
+    offset = 0
+    while offset < len(payload):
+        if offset + 5 > len(payload):
+            return payload
+        flags = payload[offset]
+        length = struct.unpack(">I", payload[offset + 1:offset + 5])[0]
+        if offset + 5 + length > len(payload):
+            return payload
+        if flags == 0x00:
+            frames.append(payload[offset + 5:offset + 5 + length])
+        offset += 5 + length
+    return frames[0] if frames else payload
+
+def is_text(blob):
+    return bool(blob) and all(32 <= byte < 127 for byte in blob)
+
+def collect_option_ids(blob):
+    found = []
+    try:
+        items = list(fields(blob))
+    except ValueError:
+        return found
+    for number, value in items:
+        if not isinstance(value, bytes) or is_text(value):
+            continue
+        if number == 1:
+            try:
+                inner = list(fields(value))
+            except ValueError:
+                continue
+            label = next(
+                (
+                    item.decode()
+                    for field, item in inner
+                    if field == 1 and isinstance(item, bytes) and is_text(item)
+                ),
+                "",
+            )
+            if label:
+                found.append(label)
+            else:
+                found.extend(collect_option_ids(value))
+        else:
+            found.extend(collect_option_ids(value))
+    return found
+
+def effort_param(model_blob):
+    # AvailableModels 模型消息 field 29 = 参数定义
+    for number, value in fields(model_blob):
+        if number != 29 or not isinstance(value, bytes):
+            continue
+        param_id = ""
+        values = []
+        for field, sub in fields(value):
+            if field == 1 and isinstance(sub, bytes) and is_text(sub):
+                param_id = sub.decode()
+            elif field == 4 and isinstance(sub, bytes):
+                values = collect_option_ids(sub)
+        if param_id in ("reasoning_effort", "effort"):
+            return param_id, values
+    return None
+
+LEVELS = {"none", "auto", "minimal", "low", "medium", "high", "xhigh", "max"}
+
+def variant_base(model_id):
+    body = model_id[:-5] if model_id.endswith("-fast") else model_id
+    if "-" not in body:
+        return None
+    base, level = body.rsplit("-", 1)
+    if base and level in LEVELS:
+        return base
+    return None
+
+data = unwrap_connect(data)
+
 models = []
 for number, value in fields(data):
     if number != 1 or not isinstance(value, bytes):
@@ -372,7 +442,9 @@ for number, value in fields(data):
     for field, sub in fields(value):
         if field == 1 and isinstance(sub, bytes):
             model_id = sub.decode("utf-8", "replace")
-        elif field == 3 and isinstance(sub, bytes):
+        elif field == 4 and isinstance(sub, bytes):
+            display_name = sub.decode("utf-8", "replace")
+        elif field == 3 and isinstance(sub, bytes) and not display_name:
             display_name = sub.decode("utf-8", "replace")
         elif field == 6 and isinstance(sub, bytes):
             aliases.append(sub.decode("utf-8", "replace"))
@@ -387,7 +459,45 @@ if not models:
     sys.stderr.write("解析失败或目录为空(响应前 64 字节: %s)\n" % data[:64].hex())
     sys.exit(1)
 
-if "--raw" in sys.argv[2:]:
+effort_by_id = {}
+try:
+    available = unwrap_connect(open(sys.argv[2], "rb").read())
+except OSError:
+    available = b""
+if available:
+    try:
+        available_models = list(fields(available))
+    except ValueError:
+        available_models = []
+        sys.stderr.write("AvailableModels 解析失败，不标明思考档键\n")
+    for number, value in available_models:
+        if number != 2 or not isinstance(value, bytes):
+            continue
+        try:
+            parts = list(fields(value))
+            got = effort_param(value)
+        except ValueError:
+            continue
+        model_id = next(
+            (
+                sub.decode()
+                for field, sub in parts
+                if field == 1 and isinstance(sub, bytes) and is_text(sub)
+            ),
+            "",
+        )
+        if model_id and got:
+            effort_by_id[model_id] = {"key": got[0], "values": got[1]}
+
+usable_ids = {model["model_id"] for model in models}
+for model in models:
+    base = model["model_id"] if model["model_id"] in effort_by_id else variant_base(model["model_id"])
+    if base in effort_by_id:
+        model["effort_base"] = base
+        model["effort_key"] = effort_by_id[base]["key"]
+        model["effort_values"] = effort_by_id[base]["values"]
+
+if "--raw" in sys.argv[3:]:
     print(json.dumps(models, indent=2, ensure_ascii=False))
 else:
     print(f"共 {len(models)} 个模型:")
@@ -398,8 +508,28 @@ else:
         if model["aliases"]:
             line += "  aliases: " + ", ".join(model["aliases"])
         print(line)
+    if effort_by_id:
+        print()
+        print("思考档。变体 id 的档位由 models.json 决定并拼进上游 model id，白名单不配:")
+        for model_id in sorted(effort_by_id):
+            spec = effort_by_id[model_id]
+            values = " | ".join(spec["values"])
+            print(f"  {model_id}")
+            print(f"    {spec['key']} = {values}")
+            if any(variant_base(item) == model_id for item in usable_ids):
+                entry = json.dumps({"id": model_id, "reasoning_levels": spec["values"]})
+                print("    目录是变体 id，models.json 条目（force_effort 可选）:")
+                print(f"    {entry}")
+            elif model_id in usable_ids:
+                print("    目录是裸 id，档位写入 parameters，可在白名单钉:")
+                print(f'    "{model_id}:{spec["key"]}=<档>"')
+            else:
+                print("    GetUsableModels 未列出这个 id")
+    else:
+        print()
+        print("未取到思考档参数名")
 PY_EOF
-    rm -f "$resp_file"
+    rm -f "$resp_file" "$avail_file"
     return $status
 }
 

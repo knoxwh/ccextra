@@ -20,6 +20,15 @@ use tokio::sync::RwLock;
 use tower::util::ServiceExt;
 
 fn fixture(url: String) -> (AppState, tempfile::TempDir) {
+    fixture_with(url, "composer-2", vec![])
+}
+
+/// model_name 是路由 name(家族条目带 effort_levels 标记);registry 是 models.json 快照
+fn fixture_with(
+    url: String,
+    model_name: &str,
+    registry: Vec<ccextra_core::thinking::ModelCapability>,
+) -> (AppState, tempfile::TempDir) {
     let dir = tempfile::tempdir().unwrap();
     let credential = CursorCredential {
         access_token: "test-access".into(),
@@ -48,7 +57,7 @@ fn fixture(url: String) -> (AppState, tempfile::TempDir) {
         Some("direct".into()),
         false,
         vec![ModelConfig {
-            name: "composer-2".into(),
+            name: model_name.into(),
             alias: "cursor-test".into(),
             ..Default::default()
         }],
@@ -78,7 +87,7 @@ fn fixture(url: String) -> (AppState, tempfile::TempDir) {
                 secret: None,
                 upstream: UpstreamClient::new(None),
                 user_agents: agents,
-                thinking_registry: Arc::new(vec![]),
+                thinking_registry: Arc::new(registry),
             },
             refresh: ProviderRefreshConfig::default(),
         }))),
@@ -319,6 +328,18 @@ fn assert_checkpoint_request(initial: &[u8]) {
     assert_eq!(state, CHECKPOINT);
 }
 
+/// 首帧 RunRequest 的上游 model id(ModelDetails.model_id)
+fn assert_model_request(initial: &[u8], expected: &str) {
+    let mut frames = ConnectFrameDecoder::new(DEFAULT_MAX_FRAME_SIZE);
+    let frames = frames.push(initial).unwrap();
+    assert_eq!(frames.len(), 1);
+    let message = generated::AgentClientMessage::decode(frames[0].payload.as_slice()).unwrap();
+    let generated::agent_client_message::Message::RunRequest(run) = message.message.unwrap() else {
+        unreachable!("expected run_request");
+    };
+    assert_eq!(run.model_details.unwrap().model_id, expected);
+}
+
 #[derive(Clone, Copy)]
 enum Scenario {
     Success,
@@ -327,6 +348,8 @@ enum Scenario {
     Http503,
     Checkpoint,
     ExpectCheckpoint,
+    /// 校验首帧 RunRequest 的上游 model id(家族模型拼接后的变体 id)
+    ExpectModel(&'static str),
     /// ASM field 7 InteractionQuery:客户端必须回 InteractionResponse 才不挂流
     InteractionQuery,
     /// TokenDelta 后无 trailer 断流:回合已推进,不得重试
@@ -364,6 +387,9 @@ async fn mock_upstream(
             if matches!(scenario, Scenario::ExpectCheckpoint) {
                 assert_checkpoint_request(&initial);
             }
+            if let Scenario::ExpectModel(expected) = scenario {
+                assert_model_request(&initial, expected);
+            }
             let status = if matches!(scenario, Scenario::Http503) {
                 StatusCode::SERVICE_UNAVAILABLE
             } else {
@@ -373,7 +399,7 @@ async fn mock_upstream(
                 .send_response(Response::builder().status(status).body(()).unwrap(), false)
                 .unwrap();
             match scenario {
-                Scenario::Success | Scenario::ExpectCheckpoint => {
+                Scenario::Success | Scenario::ExpectCheckpoint | Scenario::ExpectModel(_) => {
                     sender.send_data(text_frame("pong"), false).unwrap();
                     sender.send_data(end_frame(), true).unwrap();
                 }
@@ -767,6 +793,32 @@ async fn reuses_raw_checkpoint_only_with_stable_session() {
         .unwrap()
         .unwrap();
     assert_eq!(calls.load(std::sync::atomic::Ordering::SeqCst), 2);
+}
+
+#[tokio::test]
+async fn family_model_appends_snapshot_registry_effort_to_upstream_model_id() {
+    // 家族模型:快照里的 models.json 注册表决定拼进上游 model id 的档位
+    let (url, server, calls) = mock_upstream(vec![Scenario::ExpectModel("grok-4.7-high")]).await;
+    let registry = vec![ccextra_core::thinking::ModelCapability {
+        id: "grok-4.7".into(),
+        reasoning_levels: vec!["low".into(), "medium".into(), "high".into(), "xhigh".into()],
+        force_effort: Some("high".into()),
+    }];
+    let (state, _dir) = fixture_with(
+        url,
+        "grok-4.7:effort_levels=low+medium+high+xhigh,effort_default=medium",
+        registry,
+    );
+    // 入站 budget 映射 xhigh,force_effort 固定为 high
+    let mut request = prompt(false);
+    request["thinking"] = json!({ "type": "enabled", "budget_tokens": 100000 });
+    let (status, body) = call(state, request).await;
+    assert_eq!(status, StatusCode::OK, "{body}");
+    tokio::time::timeout(Duration::from_secs(5), server)
+        .await
+        .unwrap()
+        .unwrap();
+    assert_eq!(calls.load(std::sync::atomic::Ordering::SeqCst), 1);
 }
 
 #[tokio::test]

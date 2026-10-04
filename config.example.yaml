@@ -35,16 +35,16 @@ secret_key: "sk-ccextra-xxx"
 # Cursor 模型白名单(可选)。glob 或精确名;default 等价 auto;缺省/空 = 全量发布。
 # 条目可钉固定参数 "id:param=value,param=value",如
 # "auto-smart:optimize_for=intelligence"。
-# 思考等级:裸 base 命中目录变体家族(如 grok-4.7 对应 grok-4.7-low/…/xhigh)
-# 时合成单一模型,入站 effort(thinking.budget_tokens 阈值映射/
-# output_config.effort/reasoning_effort,thinking.type: disabled 视为 none)
-# 钳制到目录实际等级后拼进上游 model id(如 grok-4.7-high),白名单钉参优先;
-# 目录已有裸 id 的模型(auto/composer-2.5)不经家族展开,effort 走
-# RequestedModel.parameters。
+# 变体家族模型的思考档不在这里配,配在 models.json(按 base id 精确匹配,如 grok-4.7):
+# 目录是 base-low / base-high 变体(grok-4.7-high 等)时,入站 effort 先按
+# reasoning_levels 钳制,force_effort 则直接固定档位,结果再钳到目录实际
+# 等级并拼进上游 model id(如 grok-4.7-high)。可选档位用
+# scripts/check_cursor_quota.sh --models 查看。
 # cursor_models:
 #   - "default"
-#   - "composer-*"
+#   - "composer-2.5"
 #   - "grok-4.7"
+#   - "muse-spark-1.3"
 #   - "auto-smart:optimize_for=intelligence"
 
 # Cursor 上游地址(可选,默认 https://api2.cursor.sh)。

@@ -3,7 +3,8 @@
 // 原生目录拉取 → 白名单过滤 → ModelConfig 列表 → 合成 name "cursor" /
 // protocol CursorSdk provider。刷新失败由调用方保留最近成功 provider
 // (对齐 antigravity 语义)。白名单裸 base 命中变体家族(grok-4.7-high 等)
-// 时合成 effort_levels 标记模型,转换层把钳制后的思考等级拼进 model id;
+// 时合成 effort_levels 标记模型,转换层按 models.json(force_effort /
+// reasoning_levels)钳制思考等级后拼进 model id,不读白名单里的思考钉参。
 // 目录已有裸 id 的模型(auto/composer-2.5)不经家族展开。
 
 use std::collections::HashMap;
@@ -524,13 +525,13 @@ mod tests {
         let catalog = vec![entry("grok-4.7-low"), entry("grok-4.7-high")];
         let models = build_cursor_models(
             &catalog,
-            &["grok-4.7:reasoning_effort=high".to_string()],
+            &["grok-4.7:optimize_for=intelligence".to_string()],
             &[],
         );
         assert_eq!(models.len(), 1);
         assert_eq!(
             models[0].name,
-            "grok-4.7:reasoning_effort=high,effort_levels=low+high,effort_default=high"
+            "grok-4.7:optimize_for=intelligence,effort_levels=low+high,effort_default=high"
         );
     }
 
@@ -550,7 +551,7 @@ mod tests {
             &catalog,
             &[
                 "grok-4.7".to_string(),
-                "grok-4.7:reasoning_effort=high".to_string(),
+                "grok-4.7:optimize_for=intelligence".to_string(),
             ],
             &[],
         );

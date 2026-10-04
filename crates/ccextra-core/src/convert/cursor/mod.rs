@@ -3,7 +3,7 @@ pub mod proto;
 mod request;
 mod schema;
 
-pub use request::{build_run_request, conversation_id, CursorRunRequest};
+pub use request::{build_run_request, build_run_request_with, conversation_id, CursorRunRequest};
 pub use schema::decode_mcp_args;
 
 #[derive(Debug, thiserror::Error)]

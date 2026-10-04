@@ -39,12 +39,30 @@ fn image_uuid(message_id: &str, index: usize) -> String {
     hex::encode(&Sha256::digest(format!("{message_id}:{index}").as_bytes())[..16])
 }
 
+/// 无 reasoning 注册表的转换入口(家族模型只按目录等级钳制)
 pub fn build_run_request(
     body: &Value,
     model: &str,
     conversation_id: &str,
     message_id: &str,
     checkpoint: Option<&[u8]>,
+) -> Result<CursorRunRequest, CursorConvertError> {
+    build_run_request_with(body, model, conversation_id, message_id, checkpoint, &[])
+}
+
+/// 带 reasoning 注册表的转换入口(HTTP 热重载快照注入)
+///
+/// 家族变体模型(name 带 `effort_levels` 标记)的思考档由 models.json 决定:
+/// `force_effort` 固定档,否则入站档按 `reasoning_levels` 钳制,再钳到目录
+/// 实际变体后拼进 model id,白名单思考钉参对其不生效。非家族模型不读注册表,
+/// 仍由白名单钉参/入站档写入 RequestedModel.parameters
+pub fn build_run_request_with(
+    body: &Value,
+    model: &str,
+    conversation_id: &str,
+    message_id: &str,
+    checkpoint: Option<&[u8]>,
+    registry: &[crate::thinking::ModelCapability],
 ) -> Result<CursorRunRequest, CursorConvertError> {
     if model.is_empty() || conversation_id.is_empty() || message_id.is_empty() {
         return Err(CursorConvertError::Invalid(
@@ -112,11 +130,12 @@ pub fn build_run_request(
         .iter()
         .find(|(id, _)| *id == "effort_default")
         .map(|(_, value)| *value);
+    // 非家族模型的目录思考参数有两种名字:reasoning_effort / effort。白名单钉住
+    // 任一即覆盖入站档;钉 auto 等于不钉,回退 body effort。家族模型不读此值
     let pinned_effort = pinned
         .iter()
-        .find(|(id, _)| *id == "reasoning_effort")
+        .find(|(id, _)| matches!(*id, "reasoning_effort" | "effort"))
         .map(|(_, value)| *value)
-        // 钉 auto 等于不钉:不钳制、不拼接,回退 body effort
         .filter(|value| *value != "auto");
     // body effort 走全局解析:thinking.budget_tokens / adaptive / output_config 全覆盖;
     // 顶层 reasoning_effort(OpenAI 风格入站)作回退,auto 不干预
@@ -131,12 +150,14 @@ pub fn build_run_request(
         });
     let mut parameters: Vec<generated::RequestedModelModelParameterbytes> = pinned
         .iter()
-        // effort_levels 是内部标记;家族模式下 reasoning_effort 已消费进 model id,
-        // 钉 auto 等于不钉(避免与回退的 body effort 重复下发)
+        // effort_levels/effort_default 是内部标记;家族模式下思考档由 models.json
+        // 决定并已拼进 model id,白名单残留的思考钉参不下发;钉 auto 等于不钉
+        // (避免与回退的 body effort 重复下发)
         .filter(|(id, value)| {
+            let effort_pin = matches!(*id, "reasoning_effort" | "effort");
             *id != "effort_levels"
                 && *id != "effort_default"
-                && !(*id == "reasoning_effort" && (!effort_levels.is_empty() || *value == "auto"))
+                && !(effort_pin && (!effort_levels.is_empty() || *value == "auto"))
         })
         .map(|(id, value)| generated::RequestedModelModelParameterbytes {
             id: (*id).to_string(),
@@ -155,17 +176,24 @@ pub fn build_run_request(
         }
         model_base.to_string()
     } else {
-        // 家族:钳制到目录变体等级后拼接;无 effort 时用缺省等级
-        // (目录无裸 base 条目,裸 id 会被上游拒绝)
-        pinned_effort
-            .or(body_effort)
-            .or(effort_default)
+        // 家族:思考档策略来自 models.json(按 base 精确匹配,查不到不钳)。
+        // force_effort 固定档优先且不受 reasoning_levels 钳制(与其他协议一致);
+        // 否则入站档(无则目录缺省档)按 reasoning_levels 钳制。最后再钳到目录
+        // 实际变体,保证拼出的 id 上游存在(目录无裸 base 条目,裸 id 会被拒绝)
+        let level = match crate::thinking::forced_effort(model_base, registry) {
+            Some(forced) => Some(forced),
+            None => body_effort
+                .or(effort_default)
+                .map(|effort| crate::thinking::clamp_effort(effort, model_base, registry)),
+        };
+        level
             .map(|effort| {
                 format!(
                     "{model_base}-{}",
                     crate::thinking::clamp_effort_to_levels(effort, &effort_levels)
                 )
             })
+            // 仅手工构造的家族名缺 effort_default 才会回退裸 base(catalog 总会下发该标记)
             .unwrap_or_else(|| model_base.to_string())
     };
     let model_details = generated::ModelDetails {

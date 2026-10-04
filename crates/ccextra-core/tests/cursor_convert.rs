@@ -5,7 +5,10 @@ use ccextra_core::convert::cursor::proto::{
     ConnectFrameError, ExecKind, Field, InteractionQuery, InteractionQueryKind, ServerMessage,
     WireError, CONNECT_COMPRESSION_FLAG, CONNECT_END_STREAM_FLAG,
 };
-use ccextra_core::convert::cursor::{build_run_request, conversation_id, CursorRunRequest};
+use ccextra_core::convert::cursor::{
+    build_run_request, build_run_request_with, conversation_id, CursorRunRequest,
+};
+use ccextra_core::thinking::ModelCapability;
 use flate2::{write::GzEncoder, Compression};
 use prost::Message;
 use serde_json::json;
@@ -605,6 +608,22 @@ fn pinned_model_params_win_over_body_effort() {
 }
 
 #[test]
+fn pinned_catalog_effort_param_suppresses_body_effort() {
+    // 非家族模型的目录思考参数名也可能是 effort 而非 reasoning_effort;钉住后不再另发入站档
+    let body = json!({
+        "messages": [{"role":"user", "content":"hi"}],
+        "output_config": {"effort": "xhigh"}
+    });
+    let request = build_run_request(&body, "composer-2:effort=max", "conv", "msg-1", None).unwrap();
+    let run = run(&request.payload);
+    assert_eq!(run.model_details.unwrap().model_id, "composer-2");
+    let requested = run.requested_model.unwrap();
+    assert_eq!(requested.parameters.len(), 1);
+    assert_eq!(requested.parameters[0].id, "effort");
+    assert_eq!(requested.parameters[0].value, "max");
+}
+
+#[test]
 fn no_effort_leaves_requested_model_absent() {
     let body = json!({"messages": [{"role":"user", "content":"hi"}]});
     let request = build_run_request(&body, "composer-2", "conv", "msg-1", None).unwrap();
@@ -653,22 +672,65 @@ fn family_model_clamps_effort_to_available_levels() {
     assert_eq!(run.model_details.unwrap().model_id, "grok-4.7-high");
 }
 
+/// 测试用 models.json 条目
+fn capability(id: &str, levels: &[&str], force: Option<&str>) -> ModelCapability {
+    ModelCapability {
+        id: id.to_string(),
+        reasoning_levels: levels.iter().map(|level| level.to_string()).collect(),
+        force_effort: force.map(str::to_string),
+    }
+}
+
+/// 家族模型请求:返回上游 model id,并断言思考档不再走 RequestedModel
+fn family_model_id(body: &serde_json::Value, model: &str, registry: &[ModelCapability]) -> String {
+    let request = build_run_request_with(body, model, "conv", "msg-1", None, registry).unwrap();
+    let run = run(&request.payload);
+    assert!(run.requested_model.is_none());
+    run.model_details.unwrap().model_id
+}
+
 #[test]
-fn family_model_pinned_effort_wins_over_body() {
+fn family_model_registry_force_effort_wins_over_body() {
+    // models.json 的 force_effort 固定档:入站 budget 映射 medium 不覆盖
     let body = json!({
         "messages": [{"role":"user", "content":"hi"}],
         "thinking": {"type":"enabled", "budget_tokens": 8192}
     });
-    let model = "grok-4.7:reasoning_effort=high,effort_levels=low+medium+high+xhigh";
-    let request = build_run_request(&body, model, "conv", "msg-1", None).unwrap();
-    let run = run(&request.payload);
-    // 白名单钉住 high,body budget 映射 medium 不覆盖
-    assert_eq!(run.model_details.unwrap().model_id, "grok-4.7-high");
-    assert!(run.requested_model.is_none());
+    let registry = [capability(
+        "grok-4.7",
+        &["low", "medium", "high", "xhigh"],
+        Some("high"),
+    )];
+    let model = "grok-4.7:effort_levels=low+medium+high+xhigh";
+    assert_eq!(family_model_id(&body, model, &registry), "grok-4.7-high");
+    // 显式禁用(none)也改写,同 openai_responses:家族没有 none 变体,每个请求都要选档
+    let disabled = json!({
+        "messages": [{"role":"user", "content":"hi"}],
+        "thinking": {"type":"disabled"}
+    });
+    assert_eq!(
+        family_model_id(&disabled, model, &registry),
+        "grok-4.7-high"
+    );
 }
 
 #[test]
-fn family_model_without_effort_keeps_bare_base() {
+fn family_model_registry_levels_clamp_inbound_effort() {
+    // reasoning_levels 收窄:入站 xhigh 钳到 models.json 最高档 high,
+    // 目录有 xhigh 变体也不用
+    let body = json!({
+        "messages": [{"role":"user", "content":"hi"}],
+        "thinking": {"type":"enabled", "budget_tokens": 100000}
+    });
+    let registry = [capability("grok-4.7", &["low", "high"], None)];
+    let model = "grok-4.7:effort_levels=low+medium+high+xhigh";
+    assert_eq!(family_model_id(&body, model, &registry), "grok-4.7-high");
+}
+
+#[test]
+fn family_model_without_effort_or_default_marker_keeps_bare_base() {
+    // 防御分支:手工构造缺 effort_default 标记的家族名才会回退裸 base;
+    // catalog 总会下发该标记,生产请求走不到这里
     let body = json!({"messages": [{"role":"user", "content":"hi"}]});
     let model = "grok-4.7:effort_levels=low+medium+high+xhigh";
     let request = build_run_request(&body, model, "conv", "msg-1", None).unwrap();
@@ -718,18 +780,39 @@ fn top_level_reasoning_effort_falls_back_for_non_family() {
 }
 
 #[test]
-fn family_model_pinned_auto_effort_falls_back_to_body() {
-    // 钉 auto 等于不钉:回退 body budget 映射,不钳到最低档
+fn family_model_ignores_whitelist_effort_pin() {
+    // 家族模型的档位不由白名单决定:残留的思考钉参既不覆盖档位,也不下发 parameters
     let body = json!({
         "messages": [{"role":"user", "content":"hi"}],
         "thinking": {"type":"enabled", "budget_tokens": 8192}
     });
-    let model = "grok-4.7:reasoning_effort=auto,effort_levels=low+medium+high+xhigh";
-    let request = build_run_request(&body, model, "conv", "msg-1", None).unwrap();
-    let run = run(&request.payload);
-    assert_eq!(run.model_details.unwrap().model_id, "grok-4.7-medium");
-    // 钉参 auto 不重复下发
-    assert!(run.requested_model.is_none());
+    let model = "grok-4.7:reasoning_effort=high,effort_levels=low+medium+high+xhigh";
+    assert_eq!(family_model_id(&body, model, &[]), "grok-4.7-medium");
+}
+
+#[test]
+fn family_model_registry_levels_clamp_catalog_default() {
+    // 无入站档时目录缺省 medium 同样过 reasoning_levels(low/high 平局取低)
+    let body = json!({"messages": [{"role":"user", "content":"hi"}]});
+    let registry = [capability("muse-spark-1.3", &["low", "high"], None)];
+    let model = "muse-spark-1.3:effort_levels=minimal+low+medium+high+max,effort_default=medium";
+    assert_eq!(
+        family_model_id(&body, model, &registry),
+        "muse-spark-1.3-low"
+    );
+}
+
+#[test]
+fn family_model_registry_force_effort_is_clamped_to_catalog() {
+    // force_effort 不受 reasoning_levels 钳制,但目录没有该变体时
+    // 落到最近的真实变体,不拼出上游不存在的 id
+    let body = json!({"messages": [{"role":"user", "content":"hi"}]});
+    let registry = [capability("muse-spark-1.3", &["max"], Some("max"))];
+    let model = "muse-spark-1.3:effort_levels=low+medium+high,effort_default=medium";
+    assert_eq!(
+        family_model_id(&body, model, &registry),
+        "muse-spark-1.3-high"
+    );
 }
 
 #[test]
