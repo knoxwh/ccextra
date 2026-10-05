@@ -18,7 +18,14 @@ pub struct CursorReply {
 }
 
 impl CursorReply {
-    /// input_tokens 是请求体字节/4 估算(对齐 Plus)。TurnEnded 不携带用量。
+    /// 创建新回复（input_tokens 是请求体字节/4 估算）
+    ///
+    /// Cursor TurnEnded 不携带用量。策略对齐 CLIProxyAPIPlus：
+    /// - message_start.input_tokens: 估算值（请求体字节/4）
+    /// - message_start.output_tokens: 0（TokenDelta 流式到达时才累加）
+    /// - message_delta.output_tokens: 本响应 TokenDelta 累计真实值
+    ///
+    /// Claude Code 应读取 message_delta 获得最终准确 usage。
     pub fn new(id: String, model: String, input_tokens: usize) -> Self {
         Self {
             sse: CursorSse::new(&id, &model, input_tokens),
@@ -141,18 +148,14 @@ impl CursorReply {
         } else {
             self.content.clone()
         };
-        // TurnEnded 不携带用量。input 用请求体估算,output 用本响应 TokenDelta。
+        // TurnEnded 现已解析 cache token。input 用请求体估算,output 用 TokenDelta 累计。
+        let usage = self.sse.usage_json();
         json!({
             "id": self.id, "type": "message", "role": "assistant", "model": self.model,
             "content": content,
             "stop_reason": if self.pending.is_empty() { "end_turn" } else { "tool_use" },
             "stop_sequence": null,
-            "usage": {
-                "input_tokens": self.input_tokens as i64,
-                "output_tokens": self.output_tokens,
-                "cache_read_input_tokens": 0,
-                "cache_creation_input_tokens": 0
-            }
+            "usage": usage
         })
     }
 }

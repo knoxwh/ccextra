@@ -14,6 +14,8 @@ pub struct CursorSse {
     model: String,
     input_tokens: i64,
     output_tokens: i64,
+    cache_read_tokens: i64,
+    cache_write_tokens: i64,
     next_index: i64,
     block: Option<Block>,
     started: bool,
@@ -30,6 +32,8 @@ impl CursorSse {
             model: model.into(),
             input_tokens: i64::try_from(input_tokens).unwrap_or(i64::MAX),
             output_tokens: 0,
+            cache_read_tokens: 0,
+            cache_write_tokens: 0,
             next_index: 0,
             block: None,
             started: false,
@@ -58,8 +62,21 @@ impl CursorSse {
             ServerMessage::TokenDelta(delta) if *delta > 0 => {
                 self.output_tokens = self.output_tokens.saturating_add(*delta);
             }
-            ServerMessage::TurnEnded(_) => {
+            ServerMessage::TurnEnded(usage) => {
                 self.turn_ended = true;
+                // 提取 TurnEnded 携带的 cache token
+                if let Some(cache_read) = usage.cache_read_tokens {
+                    self.cache_read_tokens = cache_read;
+                }
+                if let Some(cache_write) = usage.cache_write_tokens {
+                    self.cache_write_tokens = cache_write;
+                }
+                // output_tokens 优先用 TokenDelta 累计值，TurnEnded 作为兜底
+                if self.output_tokens == 0 {
+                    if let Some(output) = usage.output_tokens {
+                        self.output_tokens = output;
+                    }
+                }
             }
             _ => {}
         }
@@ -134,8 +151,8 @@ impl CursorSse {
             frames.push(emit::content_block_start_text(self.next_index));
             frames.push(emit::content_block_stop(self.next_index));
         }
-        // TurnEndedUpdate 是空消息,不从中读 token。input 用请求体字节/4,
-        // output 用本响应 TokenDelta 累计。
+        // TurnEnded 现已解析 cache token。input 仍用请求体估算，
+        // output 用 TokenDelta 累计（TurnEnded 作兜底）。
         frames.push(emit::message_delta(
             if tool_use || self.has_tool_use {
                 "tool_use"
@@ -145,8 +162,8 @@ impl CursorSse {
             None,
             self.input_tokens,
             self.output_tokens,
-            0,
-            0,
+            self.cache_read_tokens,
+            self.cache_write_tokens,
             -1,
         ));
         frames.push(emit::message_stop());
@@ -169,6 +186,17 @@ impl CursorSse {
     }
     pub fn turn_ended(&self) -> bool {
         self.turn_ended
+    }
+
+    /// 导出 usage JSON（供非流式 JSON 响应使用）
+    pub fn usage_json(&self) -> serde_json::Value {
+        use serde_json::json;
+        json!({
+            "input_tokens": self.input_tokens,
+            "output_tokens": self.output_tokens,
+            "cache_read_input_tokens": self.cache_read_tokens,
+            "cache_creation_input_tokens": self.cache_write_tokens
+        })
     }
 }
 
@@ -234,12 +262,12 @@ mod tests {
             reasoning_tokens: Some(30),
         })));
         frames.extend(state.finish(false));
-        // TurnEnded 不携带用量。input 用请求体估算,output 用 TokenDelta。
+        // TurnEnded 现已解析 cache token。input 用估算,output 用 TokenDelta。
         let delta = event(&frames[frames.len() - 2]).1["usage"].clone();
         assert_eq!(delta["input_tokens"], 10);
         assert_eq!(delta["output_tokens"], 3);
-        assert!(delta.get("cache_read_input_tokens").is_none());
-        assert!(delta.get("cache_creation_input_tokens").is_none());
+        assert_eq!(delta["cache_read_input_tokens"], 600);
+        assert_eq!(delta["cache_creation_input_tokens"], 50);
         assert!(delta.get("output_tokens_details").is_none());
     }
 
@@ -256,13 +284,12 @@ mod tests {
             reasoning_tokens: Some(26578),
         })));
         frames.extend(state.finish(false));
-        // 大额 TurnEnded 字段同样不进入 usage
+        // TurnEnded 现已解析 cache token
         let delta = event(&frames[frames.len() - 2]).1["usage"].clone();
         assert_eq!(delta["input_tokens"], 40);
         assert_eq!(delta["output_tokens"], 5);
-        // rd/wr 为 0 时 emit 省略字段,断言缺失即未上报
-        assert!(delta.get("cache_read_input_tokens").is_none());
-        assert!(delta.get("cache_creation_input_tokens").is_none());
+        assert_eq!(delta["cache_read_input_tokens"], 1637760);
+        assert_eq!(delta["cache_creation_input_tokens"], 1000);
         assert!(delta.get("output_tokens_details").is_none());
     }
 

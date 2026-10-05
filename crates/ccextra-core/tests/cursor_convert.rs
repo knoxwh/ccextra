@@ -3,7 +3,7 @@ use ccextra_core::convert::cursor::proto::{
     encode_get_usable_models_request, encode_tag, encode_varint, generated,
     parse_connect_end_stream, reply, ConnectError, ConnectFrame, ConnectFrameDecoder,
     ConnectFrameError, ExecKind, Field, InteractionQuery, InteractionQueryKind, ServerMessage,
-    WireError, CONNECT_COMPRESSION_FLAG, CONNECT_END_STREAM_FLAG,
+    TurnUsage, WireError, CONNECT_COMPRESSION_FLAG, CONNECT_END_STREAM_FLAG,
 };
 use ccextra_core::convert::cursor::{
     build_run_request, build_run_request_with, conversation_id, CursorRunRequest,
@@ -315,7 +315,17 @@ fn turn_ended_payload_is_not_usage() {
     encode_tag(4, 0, &mut turn_ended);
     encode_varint(50, &mut turn_ended);
     let messages = decode_agent_server_message(&message(1, &message(14, &turn_ended))).unwrap();
-    assert_eq!(messages, vec![ServerMessage::TurnEnded(Default::default())]);
+    // TurnEnded 现已解析 output/cache token 字段
+    assert_eq!(
+        messages,
+        vec![ServerMessage::TurnEnded(TurnUsage {
+            input_tokens: None,
+            output_tokens: Some(200),
+            cache_read_tokens: Some(600),
+            cache_write_tokens: Some(50),
+            reasoning_tokens: None,
+        })]
+    );
 
     let messages = decode_agent_server_message(&message(1, &message(14, &[]))).unwrap();
     assert_eq!(messages, vec![ServerMessage::TurnEnded(Default::default())]);

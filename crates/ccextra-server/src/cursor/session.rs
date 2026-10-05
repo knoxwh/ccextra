@@ -587,6 +587,18 @@ impl CursorSessions {
         if owner.identity != identity || owner.generation != generation || raw.is_empty() {
             return false;
         }
+        // 对齐 CPA+:检查 auth 迁移,主动清理旧 checkpoint(不同 identity 产出的状态)
+        if let Some(existing) = registry.checkpoints.get(conversation) {
+            if existing.identity != identity {
+                tracing::info!(
+                    conversation,
+                    old_identity = existing.identity,
+                    new_identity = identity,
+                    "Cursor auth 迁移,丢弃旧 checkpoint"
+                );
+                registry.checkpoints.remove(conversation);
+            }
+        }
         registry.checkpoints.insert(
             conversation.into(),
             Checkpoint {
@@ -600,14 +612,25 @@ impl CursorSessions {
         true
     }
 
-    pub fn checkpoint(&self, conversation: &str, identity: &str) -> Option<CheckpointData> {
+    /// 获取并删除匹配的 checkpoint(对齐 CPA+ take 语义):
+    /// - 匹配 identity → 返回数据并删除
+    /// - 不匹配 → 返回 None(旧 checkpoint 保留等待 TTL 清理)
+    pub fn take_checkpoint(&self, conversation: &str, identity: &str) -> Option<CheckpointData> {
         let mut registry = self.inner.lock().unwrap();
         registry.sweep(Instant::now());
-        registry
-            .checkpoints
-            .get(conversation)
-            .filter(|checkpoint| checkpoint.identity == identity)
-            .map(|checkpoint| (checkpoint.raw.clone(), checkpoint.blobs.clone()))
+        let checkpoint = registry.checkpoints.get(conversation)?;
+        if checkpoint.identity != identity {
+            tracing::debug!(
+                conversation,
+                expected_identity = identity,
+                checkpoint_identity = checkpoint.identity,
+                "Cursor checkpoint identity 不匹配,跳过使用"
+            );
+            return None;
+        }
+        // 匹配则取走并删除
+        let checkpoint = registry.checkpoints.remove(conversation)?;
+        Some((checkpoint.raw, checkpoint.blobs))
     }
 
     pub fn cancel(&self, conversation: &str, identity: &str, generation: u64) {
@@ -918,20 +941,24 @@ mod tests {
             vec![1, 2, 3],
             HashMap::new()
         ));
-        assert!(sessions.checkpoint("conv", "account-b").is_none());
+        assert!(sessions.take_checkpoint("conv", "account-b").is_none());
         sessions.finish("conv", "account-a", old);
         let new = begin(&sessions, "conv", "account-a", "next");
         assert_ne!(new, old);
         assert!(!sessions.record_checkpoint("conv", "account-a", old, vec![9], HashMap::new()));
         assert_eq!(
-            sessions.checkpoint("conv", "account-a").unwrap().0,
+            sessions.take_checkpoint("conv", "account-a").unwrap().0,
             vec![1, 2, 3]
         );
+        // take_checkpoint 已删除,第二次必须返回 None
+        assert!(sessions.take_checkpoint("conv", "account-a").is_none());
         sessions.cancel("conv", "account-a", old);
         assert!(sessions.record_checkpoint("conv", "account-a", new, vec![4], HashMap::new()));
         begin(&sessions, "conv", "account-b", "first");
-        assert!(sessions.checkpoint("conv", "account-a").is_none());
-        assert!(sessions.checkpoint("conv", "account-b").is_none());
+        // account-b 取不到 account-a 的 checkpoint
+        assert!(sessions.take_checkpoint("conv", "account-b").is_none());
+        // account-a 被 account-b 取代后 checkpoint 也被清理
+        assert!(sessions.take_checkpoint("conv", "account-a").is_none());
     }
 
     #[tokio::test]
@@ -973,13 +1000,13 @@ mod tests {
         sessions.record_checkpoint("current", "account-b", current, vec![2], HashMap::new());
         sessions.retain_identity(Some("account-b"));
         assert!(*receiver.borrow());
-        assert!(sessions.checkpoint("old", "account-a").is_none());
+        assert!(sessions.take_checkpoint("old", "account-a").is_none());
         assert_eq!(
-            sessions.checkpoint("current", "account-b").unwrap().0,
+            sessions.take_checkpoint("current", "account-b").unwrap().0,
             vec![2]
         );
         sessions.retain_identity(None);
-        assert!(sessions.checkpoint("current", "account-b").is_none());
+        assert!(sessions.take_checkpoint("current", "account-b").is_none());
     }
 
     #[test]
@@ -994,7 +1021,7 @@ mod tests {
             registry.checkpoints.get_mut("conv").unwrap().deadline =
                 Instant::now() - Duration::from_secs(1);
         }
-        assert!(sessions.checkpoint("conv", "account-a").is_none());
+        assert!(sessions.take_checkpoint("conv", "account-a").is_none());
         assert!(!sessions.record_checkpoint("conv", "account-a", owner, vec![2], HashMap::new()));
     }
 }

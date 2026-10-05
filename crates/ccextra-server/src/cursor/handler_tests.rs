@@ -665,7 +665,7 @@ async fn parked_stream_handles_controls_before_multiple_tool_results_resume() {
     assert_eq!(
         state
             .cursor_sessions
-            .checkpoint(&conversation, &identity)
+            .take_checkpoint(&conversation, &identity)
             .unwrap()
             .0,
         CHECKPOINT,

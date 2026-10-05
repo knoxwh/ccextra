@@ -778,7 +778,9 @@ pub(crate) async fn handle_cursor(
         }
     }
     let checkpoint = if stable && !has_results {
-        state.cursor_sessions.checkpoint(&conversation, identity)
+        state
+            .cursor_sessions
+            .take_checkpoint(&conversation, identity)
     } else {
         None
     };
