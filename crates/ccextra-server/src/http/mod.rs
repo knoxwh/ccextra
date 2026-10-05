@@ -117,8 +117,6 @@ pub struct AppState {
     pub replay_cache: crate::sse::replay_cache::ReplayCache,
     /// session_id → 最新 input_tokens(避免非 Claude 上游 count_tokens 估算不准导致 context 跳动)
     pub last_input_tokens: Arc<std::sync::Mutex<session_tokens::SessionTokenCache>>,
-    /// Antigravity 新上游 session(sessionId)首请求延迟状态。
-    pub initial_response_delay: crate::sse::InitialResponseDelayState,
     /// Cursor 原生运行时(会话表 + 可重载配置);None = 未启用。
     /// reload 可启停,故用共享读写锁持有,不进 ConfigSnapshot
     pub cursor: Arc<std::sync::RwLock<Option<Arc<crate::cursor::CursorRuntime>>>>,

@@ -308,9 +308,6 @@ fn mock_state() -> AppState {
         last_input_tokens: Arc::new(std::sync::Mutex::new(
             crate::http::session_tokens::SessionTokenCache::new(),
         )),
-        initial_response_delay: crate::sse::InitialResponseDelayState::new(
-            std::time::Duration::ZERO,
-        ),
         cursor: Arc::new(std::sync::RwLock::new(None)),
         cursor_sessions: crate::cursor::session::CursorSessions::default(),
     }

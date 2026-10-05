@@ -29,15 +29,16 @@ pub fn convert_to_antigravity(
     upstream_model: &str,
     project_id: Option<&str>,
 ) -> (Value, HashMap<String, String>) {
-    convert_to_antigravity_with(body, upstream_model, project_id, &[])
+    convert_to_antigravity_with(body, upstream_model, project_id, &[], None)
 }
 
-/// 带 reasoning 注册表的 Antigravity 转换
+/// 带 reasoning 注册表与稳定客户端会话的 Antigravity 转换
 pub fn convert_to_antigravity_with(
     body: &Value,
     upstream_model: &str,
     project_id: Option<&str>,
     registry: &[crate::thinking::ModelCapability],
+    session_id: Option<&str>,
 ) -> (Value, HashMap<String, String>) {
     // 1. 先转换为 Gemini 格式(Antigravity 用 VALIDATED schema 语义)
     let (gemini_body, short_to_original) =
@@ -108,8 +109,13 @@ pub fn convert_to_antigravity_with(
         // 对齐 CPA dc21a426:归一化 responseJsonSchema/response_json_schema → responseSchema
         normalize_generation_config_response_schema(&mut request_obj);
 
-        // 稳定 sessionId:取首条 user 文本的 sha256 前 8 字节(对齐 generateStableSessionID)
-        let session_id = stable_session_id(&request_obj);
+        // 对齐 CPA DerivedAntigravitySessionID:客户端显式 session 优先
+        // sha256("cli-proxy-api:antigravity:derived-session\0" + id) 转负数
+        let session_id = if let Some(sid) = session_id.filter(|s| !s.trim().is_empty()) {
+            derived_antigravity_session_id(sid)
+        } else {
+            stable_session_id(&request_obj)
+        };
         request_obj.insert("sessionId".to_string(), Value::String(session_id));
 
         antigravity["request"] = Value::Object(request_obj);
@@ -150,6 +156,19 @@ fn normalize_generation_config_response_schema(request_obj: &mut serde_json::Map
             }
         }
     }
+}
+
+/// 对齐 CLIProxyAPI DerivedAntigravitySessionID:
+/// 将客户端派生会话 id 映射为 Antigravity 负十进制格式:
+/// sha256("cli-proxy-api:antigravity:derived-session\0" + id) 前 8 字节转 int64(掩符号位),前缀 "-"
+pub fn derived_antigravity_session_id(derived_id: &str) -> String {
+    use sha2::Digest;
+    let mut h = sha2::Sha256::new();
+    h.update(b"cli-proxy-api:antigravity:derived-session\0");
+    h.update(derived_id.as_bytes());
+    let digest = h.finalize();
+    let v = i64::from_be_bytes(digest[..8].try_into().unwrap()) & 0x7FFF_FFFF_FFFF_FFFF;
+    format!("-{v}")
 }
 
 /// 对齐 CLIProxyAPI generateStableSessionID:
@@ -403,5 +422,48 @@ mod tests {
         // responseSchema 保持原值（name 属性，不是 stale）
         assert_eq!(gc["responseSchema"]["properties"]["name"]["type"], "string");
         assert!(gc["responseSchema"]["properties"].get("stale").is_none());
+    }
+
+    #[test]
+    fn test_derived_antigravity_session_id() {
+        let sid1 = derived_antigravity_session_id("sess-123");
+        let sid2 = derived_antigravity_session_id("sess-123");
+        let sid3 = derived_antigravity_session_id("sess-456");
+        assert_eq!(sid1, sid2);
+        assert_ne!(sid1, sid3);
+        assert!(sid1.starts_with('-'));
+        let n: i64 = sid1.parse().expect("valid i64");
+        assert!(n < 0);
+    }
+
+    #[test]
+    fn test_convert_to_antigravity_with_stable_session_id() {
+        let req1 = json!({
+            "contents": [{"role": "user", "parts": [{"text": "hello turn 1"}]}]
+        });
+        let req2 = json!({
+            "contents": [{"role": "user", "parts": [{"text": "hello turn 2 completely different"}]}]
+        });
+
+        let (out1, _) = convert_to_antigravity_with(
+            &req1,
+            "gemini-2.5-pro",
+            Some("test-project"),
+            &[],
+            Some("sess-cc-123"),
+        );
+        let (out2, _) = convert_to_antigravity_with(
+            &req2,
+            "gemini-2.5-pro",
+            Some("test-project"),
+            &[],
+            Some("sess-cc-123"),
+        );
+
+        assert_eq!(out1["request"]["sessionId"], out2["request"]["sessionId"]);
+        assert_eq!(
+            out1["request"]["sessionId"].as_str().unwrap(),
+            derived_antigravity_session_id("sess-cc-123")
+        );
     }
 }

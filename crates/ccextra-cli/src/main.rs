@@ -270,7 +270,10 @@ async fn main() -> Result<()> {
     )
     .await;
     if !antigravity_providers.is_empty() {
-        tracing::info!("动态加载 {} 个 Antigravity providers", antigravity_providers.len());
+        tracing::info!(
+            "动态加载 {} 个 Antigravity providers",
+            antigravity_providers.len()
+        );
     }
 
     // 合并所有 providers
@@ -390,9 +393,6 @@ async fn main() -> Result<()> {
         last_input_tokens: Arc::new(std::sync::Mutex::new(
             ccextra_server::http::session_tokens::SessionTokenCache::new(),
         )),
-        initial_response_delay: ccextra_server::sse::InitialResponseDelayState::new(
-            std::time::Duration::from_secs(3),
-        ),
         cursor: Arc::new(std::sync::RwLock::new(cursor_runtime)),
         cursor_sessions: ccextra_server::cursor::session::CursorSessions::default(),
     };
