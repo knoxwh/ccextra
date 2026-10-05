@@ -257,12 +257,27 @@ async fn main() -> Result<()> {
         tracing::info!("动态加载 {} 个 Codex providers", codex_providers.len());
     }
 
-    // 合并配置文件 providers 和 xAI providers
-    // Antigravity 模型列表需在线拉取(对齐 CPA 启动模式:已知数据先行、
-    // 后台刷新、失败保旧),不阻塞监听 —— 转入 serve 之后的后台任务注入
+    // 动态加载 Antigravity providers
+    let antigravity_auth_dir = pin_auth_dir(
+        &cli.config,
+        config.auth_dir.as_deref(),
+        resolve_antigravity_auth_dir,
+    );
+    let antigravity_providers = ccextra_server::antigravity::load_antigravity_providers(
+        &antigravity_auth_dir,
+        config.server.proxy_url.as_deref(),
+        config.antigravity_models.as_deref().unwrap_or(&[]),
+    )
+    .await;
+    if !antigravity_providers.is_empty() {
+        tracing::info!("动态加载 {} 个 Antigravity providers", antigravity_providers.len());
+    }
+
+    // 合并所有 providers
     let mut all_providers = merge_providers(config.providers.clone(), Vec::new());
     all_providers = merge_providers(all_providers, xai_providers);
     all_providers = merge_providers(all_providers, codex_providers);
+    all_providers = merge_providers(all_providers, antigravity_providers);
 
     // Cursor 原生运行时组装(启用判定:cursor_auth_dir 非空)
     let cursor_runtime = cursor_config_from(&cli.config, &config).map(new_cursor_runtime);
