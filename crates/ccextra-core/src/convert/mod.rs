@@ -65,6 +65,8 @@ pub const CLAUDE_AGENT_SDK_IDENTITY: &str =
     "You are a Claude agent, built on Anthropic's Claude Agent SDK.";
 pub const CLAUDE_CODE_CLI_IDENTITY: &str =
     "You are Claude Code, Anthropic's official CLI for Claude.";
+pub const CLAUDE_CODE_SDK_CLI_IDENTITY: &str =
+    "You are Claude Code, Anthropic's official CLI for Claude, running within the Claude Agent SDK.";
 
 /// 是否为 Claude Code 计费归属文本(前导空白后以前缀开头)
 pub fn is_attribution_text(text: &str) -> bool {
@@ -94,10 +96,12 @@ pub fn strip_attribution_line(text: &str) -> &str {
     rest
 }
 
-/// 是否为 Claude 官方固定身份声明句
+/// 是否为 Claude 官方固定身份声明句(对齐 Claude Code 2.1.289 zee: dk/bD/SD)
 pub fn is_claude_identity_text(text: &str) -> bool {
     let t = text.trim();
-    t == CLAUDE_AGENT_SDK_IDENTITY || t == CLAUDE_CODE_CLI_IDENTITY
+    t == CLAUDE_AGENT_SDK_IDENTITY
+        || t == CLAUDE_CODE_CLI_IDENTITY
+        || t == CLAUDE_CODE_SDK_CLI_IDENTITY
 }
 
 /// 是否为目标上游需忽略的系统提示文本(空白、计费头或非 Claude 目标的身份声明)

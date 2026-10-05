@@ -266,7 +266,7 @@ mod tests {
                 {"type": "text", "text": "x-anthropic-billing-header: fp=abc"},
                 {"type": "text", "text": "<response_style>verbose</response_style>\n# Memory\nPath: /m",
                  "cache_control": {"type": "ephemeral"}},
-                {"type": "text", "text": "You are Claude Code, Anthropic's official CLI for Claude."}
+                {"type": "text", "text": "You are Claude Code, Anthropic's official CLI for Claude, running within the Claude Agent SDK."}
             ],
             "messages": []
         });

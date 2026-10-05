@@ -317,7 +317,7 @@ fn neutralize_claude_identity(text: &str) -> String {
     static OPENER: OnceLock<Regex> = OnceLock::new();
     let opener = OPENER.get_or_init(|| {
         Regex::new(
-            r"(?i)^[ \t\r\n]*You are (?:a Claude agent, built on Anthropic'?s Claude Agent SDK|Claude Code, Anthropic'?s official CLI for Claude)\.?",
+            r"(?i)^[ \t\r\n]*You are (?:a Claude agent, built on Anthropic'?s Claude Agent SDK|Claude Code, Anthropic'?s official CLI for Claude(?:, running within the Claude Agent SDK)?)\.?",
         )
         .unwrap()
     });
@@ -492,6 +492,7 @@ mod tests {
                 {"type": "text", "text": "x-anthropic-billing-header: abc"},
                 {"type": "text", "text": "You are a Claude agent, built on Anthropic's Claude Agent SDK."},
                 {"type": "text", "text": "You are Claude Code, Anthropic's official CLI for Claude."},
+                {"type": "text", "text": "You are Claude Code, Anthropic's official CLI for Claude, running within the Claude Agent SDK."},
                 {"type": "text", "text": "You are helpful"}
             ],
             "messages": [{"role": "user", "content": "hi"}]
@@ -501,6 +502,21 @@ mod tests {
         assert_eq!(parts.len(), 1);
         assert_eq!(parts[0]["text"], "You are helpful");
         assert_eq!(gemini["systemInstruction"]["role"], "user");
+    }
+
+    #[test]
+    fn test_convert_to_antigravity_neutralizes_all_claude_identities() {
+        let anthropic = json!({
+            "model": "m", "max_tokens": 100,
+            "system": [
+                {"type": "text", "text": "You are Claude Code, Anthropic's official CLI for Claude, running within the Claude Agent SDK. Solve bugs."},
+            ],
+            "messages": [{"role": "user", "content": "hi"}]
+        });
+        let (gemini, _) = convert_to_gemini_with(&anthropic, "gemini-2.5-pro", SchemaFlavor::Antigravity);
+        let parts = gemini["systemInstruction"]["parts"].as_array().unwrap();
+        assert_eq!(parts.len(), 1);
+        assert_eq!(parts[0]["text"], "You are an AI agent. Solve bugs.");
     }
 
     #[test]
