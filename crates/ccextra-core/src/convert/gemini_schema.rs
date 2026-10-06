@@ -759,8 +759,11 @@ fn flatten_type_arrays(schema: &mut Value, preserve_native_nullable: bool) {
             }
         }
         // 节点已声明 items 时优先 array,避免 union 展平后留下非 array type(对齐 CPA ffe6ad3c)
+        // 节点已声明 properties 时优先 object(对齐 CPA e1e3a811)
         let first = if map.contains_key("items") && non_null.iter().any(|t| t == "array") {
             "array".to_string()
+        } else if map.contains_key("properties") && non_null.iter().any(|t| t == "object") {
+            "object".to_string()
         } else {
             non_null
                 .first()
@@ -2189,5 +2192,26 @@ mod tests {
                 "nested items stripped: {out}"
             );
         }
+    }
+
+    #[test]
+    fn test_flatten_type_arrays_properties_prefer_object() {
+        // 对齐 CPA e1e3a811: type union 含 properties 时优先 object
+        let mut schema = json!({
+            "type": ["string", "object"],
+            "properties": {
+                "name": {"type": "string"}
+            }
+        });
+        flatten_type_arrays(&mut schema, false);
+        assert_eq!(schema["type"], "object");
+        assert!(schema["properties"].is_object());
+
+        // 无 properties 时保持原逻辑(首个非 null)
+        let mut schema2 = json!({
+            "type": ["string", "object"]
+        });
+        flatten_type_arrays(&mut schema2, false);
+        assert_eq!(schema2["type"], "string");
     }
 }
