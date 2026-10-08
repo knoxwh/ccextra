@@ -914,7 +914,48 @@ pub(crate) async fn deliver_response(
         let mut final_truncated = err_truncated;
         let mut retried_ok = false;
 
-        if !final_truncated
+        // Unfit 探测与自适应降级(对齐 magpie gateway.go:3440-3490)
+        if !final_truncated && (status.as_u16() == 400 || status.as_u16() == 422) {
+            let err_text = String::from_utf8_lossy(&final_bytes);
+            if let Some(kind) = crate::http::unfit::detect_unfit_from_error(status.as_u16(), &err_text) {
+                let registry = crate::http::unfit::global_registry();
+                registry.mark(&prepared.route.provider, &prepared.route.upstream_model, kind);
+
+                // 原地修复请求并重试
+                if crate::http::unfit::adapt_request_for_unfit(
+                    &mut prepared.body_json,
+                    &prepared.route.provider,
+                    &prepared.route.upstream_model,
+                    registry.as_ref(),
+                ) {
+                    tracing::info!(
+                        provider = prepared.route.provider,
+                        model = prepared.route.upstream_model,
+                        kind = ?kind,
+                        "unfit detected, retrying with adapted request"
+                    );
+                    if let Some((cache, key, _)) = prepared.replay_scope.as_ref() {
+                        cache.invalidate(key);
+                    }
+                    let retry = prepared.send_retry(upstream_client, user_agents).await?;
+                    final_status = retry.status;
+                    if retry.status.is_success() {
+                        status = retry.status;
+                        executed.upstream = Some(retry);
+                        retried_ok = true;
+                    } else {
+                        retry_after = parse_retry_after(retry.body.headers());
+                        let (bytes, truncated) =
+                            crate::limits::read_error_body_or_anthropic(retry.body, final_status).await?;
+                        final_bytes = bytes;
+                        final_truncated = truncated;
+                    }
+                }
+            }
+        }
+
+        if !retried_ok
+            && !final_truncated
             && (status.as_u16() == 400 || status.as_u16() == 422)
             && matches!(prepared.route.protocol, Protocol::OpenAiResponses)
             && is_thinking_signature_invalid(&final_bytes)

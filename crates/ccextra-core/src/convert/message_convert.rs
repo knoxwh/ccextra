@@ -12,6 +12,23 @@ use super::signature::{
 use super::tool_id::tool_name_from_claude_tool_use_id;
 use super::tool_sanitize::sanitize_function_name;
 
+/// Gemini/Antigravity functionCall/functionResponse id 消毒
+/// (对齐 magpie codeassist.go:27 unsafeToolID,防客户端特殊字符触发上游 400)
+fn sanitize_gemini_tool_id(id: &str, antigravity: bool) -> String {
+    if !antigravity || id.is_empty() {
+        return id.to_string();
+    }
+    id.chars()
+        .map(|c| {
+            if c.is_ascii_alphanumeric() || c == '_' || c == '-' {
+                c
+            } else {
+                '_'
+            }
+        })
+        .collect()
+}
+
 /// functionCall 附加的思考签名哨兵(对齐 CPA geminiClaudeThoughtSignature)
 const THOUGHT_SIGNATURE_SENTINEL: &str = GEMINI_SKIP_THOUGHT_SIGNATURE_VALIDATOR;
 
@@ -535,7 +552,7 @@ fn append_block_parts(
                 }
             }
             if !tool_use_id.is_empty() {
-                function_call["id"] = json!(tool_use_id);
+                function_call["id"] = json!(sanitize_gemini_tool_id(tool_use_id, antigravity));
             }
             // antigravity 按目标族解析(claude 目标不发哨兵,对齐 CPA
             // resolveToolUseThoughtSignature);gemini 直连恒发哨兵
@@ -600,7 +617,7 @@ fn append_block_parts(
                     .collect();
                 parts.push(json!({
                     "functionResponse": {
-                        "id": tool_use_id,
+                        "id": sanitize_gemini_tool_id(tool_use_id, antigravity),
                         "name": upstream_func_name,
                         "response": { "result": result },
                         "parts": image_parts
@@ -609,7 +626,7 @@ fn append_block_parts(
             } else {
                 parts.push(json!({
                     "functionResponse": {
-                        "id": tool_use_id,
+                        "id": sanitize_gemini_tool_id(tool_use_id, antigravity),
                         "name": upstream_func_name,
                         "response": { "result": result }
                     }

@@ -4,6 +4,7 @@ pub mod error;
 pub mod handlers;
 pub mod retry;
 pub mod session_tokens;
+pub mod unfit;
 
 use axum::{
     routing::{get, post},
