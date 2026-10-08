@@ -38,6 +38,10 @@ EOF
 while [[ $# -gt 0 ]]; do
     case "$1" in
         -c|--config)
+            if [[ $# -lt 2 ]]; then
+                echo "错误: $1 需要一个配置文件路径参数" >&2
+                exit 1
+            fi
             CONFIG_FILE="$2"
             shift 2
             ;;
@@ -72,11 +76,42 @@ if [[ ! -f "$CONFIG_FILE" ]]; then
     exit 1
 fi
 
-# 从 config.yaml 读取 proxy_url (如果有)
+# 按顶层 section 定位读取 YAML 标量值 (section 为空表示顶层键)
+read_yaml_val() {
+    local key="$1" section="$2"
+    python3 -c '
+import sys, re
+key, section, path = sys.argv[1], sys.argv[2], sys.argv[3]
+val_re = re.compile(r"^[ \t]*" + re.escape(key) + r":[ \t]*[\"'\'' ]{0,1}([^\"'\''#\r\n]+)[\"'\'' ]{0,1}")
+top_key_re = re.compile(r"^([^\s#][^:\r\n]*):")
+section_header_re = re.compile(r"^[ \t]*(#.*)?\r?\n?$")
+current = None
+with open(path, "r", encoding="utf-8") as f:
+    for line in f:
+        m0 = top_key_re.match(line)
+        if m0:
+            key0 = m0.group(1).strip()
+            is_section = section_header_re.match(line[m0.end():]) is not None
+            current = key0 if is_section else None
+            if not is_section and not section and key0 == key:
+                m = val_re.match(line)
+                if m:
+                    print(m.group(1).strip())
+                    sys.exit(0)
+            continue
+        if section and current == section:
+            m = val_re.match(line)
+            if m:
+                print(m.group(1).strip())
+                sys.exit(0)
+' "$key" "$section" "$CONFIG_FILE" 2>/dev/null || true
+}
+
+# 从 config.yaml 的 server 段读取 proxy_url (如果有)
 read_proxy() {
     local proxy
-    proxy="$(sed -n 's/^[[:space:]]*proxy_url:[[:space:]]*["'\'' ]\{0,1\}\([^"'\'' ]*\)["'\'' ]\{0,1\}[[:space:]]*$/\1/p' "$CONFIG_FILE" | head -n 1 || true)"
-    if [[ -n "$proxy" && "$proxy" != "direct" && "$proxy" != '""' && "$proxy" != "''" ]]; then
+    proxy="$(read_yaml_val "proxy_url" "server")"
+    if [[ -n "$proxy" && "$proxy" != "direct" ]]; then
         echo "$proxy"
     elif [[ -n "${https_proxy:-}" ]]; then
         echo "$https_proxy"
@@ -136,25 +171,11 @@ if [[ -z "$LATEST_CURSOR_VERSION" ]]; then
 fi
 
 # 2. 读取配置当前值
-read_yaml_val() {
-    local key="$1"
-    python3 -c '
-import sys, re
-key = sys.argv[1]
-with open(sys.argv[2], "r", encoding="utf-8") as f:
-    for line in f:
-        m = re.match(r"^[ \t]*" + re.escape(key) + r":[ \t]*[\"'\'' ]{0,1}([^\"'\''#\r\n]+)[\"'\'' ]{0,1}", line)
-        if m:
-            print(m.group(1).strip())
-            break
-' "$key" "$CONFIG_FILE" 2>/dev/null || true
-}
-
-CURRENT_CLAUDE="$(read_yaml_val "claude_cli")"
-CURRENT_CODEX="$(read_yaml_val "codex_tui")"
-CURRENT_GROK="$(read_yaml_val "grok_version")"
-CURRENT_ANTIGRAVITY="$(read_yaml_val "antigravity")"
-CURRENT_CURSOR="$(read_yaml_val "cursor_client_version")"
+CURRENT_CLAUDE="$(read_yaml_val "claude_cli" "user_agents")"
+CURRENT_CODEX="$(read_yaml_val "codex_tui" "user_agents")"
+CURRENT_GROK="$(read_yaml_val "grok_version" "user_agents")"
+CURRENT_ANTIGRAVITY="$(read_yaml_val "antigravity" "user_agents")"
+CURRENT_CURSOR="$(read_yaml_val "cursor_client_version" "")"
 
 # 组装新目标值
 NEW_CLAUDE=""
@@ -231,42 +252,72 @@ if [[ "$DRY_RUN" == true ]]; then
     exit 0
 fi
 
-# 4. 执行替换回写 (使用 python 精确替换标头值并保留注释与排版，临时文件原子写入)
+# 4. 执行替换回写 (按顶层 section 定位替换标头值并保留注释与排版，临时文件原子写入并保留原权限)
 python3 -c '
-import sys, re, os, tempfile
+import sys, re, os, tempfile, stat
 
 config_path = sys.argv[1]
-updates = {
-    "claude_cli": sys.argv[2],
-    "codex_tui": sys.argv[3],
-    "grok_version": sys.argv[4],
-    "antigravity": sys.argv[5],
-    "cursor_client_version": sys.argv[6],
+
+def make_pattern(key):
+    return re.compile(
+        r"^([ \t]*" + re.escape(key) + r":[ \t]*)(?:\"[^\r\n\"]*\"|'\''[^'\''\r\n]*'\''|[^#\r\n]+?)([ \t]*(?:#.*)?\r?)$"
+    )
+
+section_updates = {
+    "user_agents": {
+        "claude_cli": (sys.argv[2], make_pattern("claude_cli")),
+        "codex_tui": (sys.argv[3], make_pattern("codex_tui")),
+        "grok_version": (sys.argv[4], make_pattern("grok_version")),
+        "antigravity": (sys.argv[5], make_pattern("antigravity")),
+    },
+}
+top_updates = {
+    "cursor_client_version": (sys.argv[6], make_pattern("cursor_client_version")),
 }
 
-with open(config_path, "r", encoding="utf-8") as f:
-    content = f.read()
+top_key_re = re.compile(r"^([^\s#][^:\r\n]*):")
+section_header_re = re.compile(r"^[ \t]*(#.*)?\r?\n?$")
 
-for key, new_val in updates.items():
-    if not new_val:
+def try_replace(line, new_val, pattern):
+    m = pattern.match(line)
+    if not m:
+        return line
+    prefix, suffix = m.group(1), m.group(2)
+    sep = " " if suffix.startswith("#") else ""
+    return f"{prefix}\"{new_val}\"{sep}{suffix}{line[m.end():]}"
+
+with open(config_path, "r", encoding="utf-8", newline="") as f:
+    lines = f.readlines()
+
+current = None
+out = []
+for line in lines:
+    m0 = top_key_re.match(line)
+    if m0:
+        key0 = m0.group(1).strip()
+        is_section = section_header_re.match(line[m0.end():]) is not None
+        current = key0 if is_section else None
+        if not is_section and key0 in top_updates:
+            new_val, pattern = top_updates[key0]
+            if new_val:
+                line = try_replace(line, new_val, pattern)
+        out.append(line)
         continue
-    # 匹配 key: "..." 或 key: '\''...'\'' 或 key: val，保留 suffix（含空白与行尾注释）
-    pattern = re.compile(
-        r"^([ \t]*" + re.escape(key) + r":[ \t]*)(?:\"[^\r\n\"]*\"|'\''[^'\''\r\n]*'\''|[^#\r\n]+?)([ \t]*(?:#.*)?)$",
-        re.MULTILINE
-    )
-    def repl(m):
-        prefix = m.group(1)
-        suffix = m.group(2)
-        sep = " " if suffix and not suffix.startswith(" ") else ""
-        return f"{prefix}\"{new_val}\"{sep}{suffix}"
-    content = pattern.sub(repl, content)
+    if current in section_updates:
+        for key, (new_val, pattern) in section_updates[current].items():
+            if new_val and pattern.match(line):
+                line = try_replace(line, new_val, pattern)
+                break
+    out.append(line)
+
+content = "".join(out)
 
 dir_name = os.path.dirname(os.path.abspath(config_path))
 fd, tmp_path = tempfile.mkstemp(dir=dir_name, prefix=".tmp_cfg_")
 try:
-    with os.fdopen(fd, "w", encoding="utf-8") as f:
+    with os.fdopen(fd, "w", encoding="utf-8", newline="") as f:
         f.write(content)
+    os.chmod(tmp_path, stat.S_IMODE(os.stat(config_path).st_mode))
     os.replace(tmp_path, config_path)
 except Exception:
     if os.path.exists(tmp_path):
