@@ -65,7 +65,7 @@ pub fn save(dir: &Path, cred: &AntigravityCredential) -> Result<PathBuf> {
     Ok(path)
 }
 
-/// 列出目录下 `antigravity*.json`(忽略坏文件)
+/// 列出目录下 `antigravity*.json`(忽略坏文件和 client_id 不匹配的凭证)
 pub fn list(dir: &Path) -> Result<Vec<(PathBuf, AntigravityCredential)>> {
     if !dir.exists() {
         return Ok(Vec::new());
@@ -80,12 +80,58 @@ pub fn list(dir: &Path) -> Result<Vec<(PathBuf, AntigravityCredential)>> {
         }
         let path = entry.path();
         match load(&path) {
-            Ok(cred) => out.push((path, cred)),
+            Ok(cred) => {
+                // 验证 client_id(对齐 magpie geminiOwnLogin)
+                if let Err(reason) = verify_client_id(&cred) {
+                    tracing::warn!(
+                        "skip {} (email: {}): {reason}",
+                        path.display(),
+                        cred.email
+                    );
+                    continue;
+                }
+                out.push((path, cred));
+            }
             Err(err) => tracing::warn!("skip {}: {err}", path.display()),
         }
     }
     out.sort_by(|a, b| a.0.cmp(&b.0));
     Ok(out)
+}
+
+/// 验证凭证的 id_token client_id 是否匹配官方 CLIENT_ID
+///
+/// 对齐 magpie `geminiOwnLogin` 逻辑:
+/// - 无 id_token 或解析失败 → 通过(旧凭证或外部工具生成)
+/// - 有 client_id 且不匹配 → 拒绝(非官方 OAuth client)
+fn verify_client_id(cred: &AntigravityCredential) -> Result<(), String> {
+    // 从 extra 字段读取 id_token(老格式可能存在)
+    let id_token = cred
+        .extra
+        .get("id_token")
+        .and_then(|v| v.as_str())
+        .unwrap_or("");
+
+    if id_token.trim().is_empty() {
+        // 无 id_token,无法验证但不拒绝(兼容旧凭证)
+        return Ok(());
+    }
+
+    let Some(client_id) = crate::jwt::extract_client_id(id_token) else {
+        // JWT 解析失败,警告但不拒绝
+        tracing::debug!("antigravity: id_token parse failed, skip client_id check");
+        return Ok(());
+    };
+
+    if client_id != super::constants::CLIENT_ID {
+        return Err(format!(
+            "client_id mismatch: got {}, expected {}",
+            client_id,
+            super::constants::CLIENT_ID
+        ));
+    }
+
+    Ok(())
 }
 
 #[cfg(test)]

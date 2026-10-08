@@ -530,6 +530,7 @@ pub(crate) async fn prepare_message_request(
         upstream_proxy,
         provider_prompt_cache_key,
         antigravity_refresh,
+        antigravity_project_id,
         xai_refresh,
         codex_refresh,
     ) = {
@@ -544,6 +545,11 @@ pub(crate) async fn prepare_message_request(
                 (Some(auth_dir), Some(email)) => Some((auth_dir, email)),
                 _ => None,
             }
+        } else {
+            None
+        };
+        let antigravity_project_id = if matches!(route.protocol, Protocol::Antigravity) {
+            meta.and_then(|m| m.get("project_id")).cloned()
         } else {
             None
         };
@@ -569,6 +575,7 @@ pub(crate) async fn prepare_message_request(
             provider.proxy_url.clone(),
             provider.prompt_cache_key,
             antigravity_refresh,
+            antigravity_project_id,
             xai_refresh,
             codex_refresh,
         )
@@ -683,7 +690,7 @@ pub(crate) async fn prepare_message_request(
     } else {
         None
     };
-    let extra_headers = if matches!(route.protocol, Protocol::Claude) {
+    let mut extra_headers = if matches!(route.protocol, Protocol::Claude) {
         claude_relay_headers(headers)
     } else if let Some(account_id) = codex_account_id.as_deref() {
         // Codex 订阅身份头 (对齐 CPA: 仅 OAuth 账号发,API key provider 无 metadata 不发)
@@ -698,6 +705,18 @@ pub(crate) async fn prepare_message_request(
     } else {
         HeaderMap::new()
     };
+
+    // Antigravity project_id 注入 X-Goog-User-Project header (对齐 magpie googleDoRequest)
+    if let Some(pid) = antigravity_project_id.as_deref() {
+        if !pid.is_empty() {
+            if let Ok(value) = axum::http::HeaderValue::from_str(pid) {
+                extra_headers.insert(
+                    axum::http::HeaderName::from_static("x-goog-user-project"),
+                    value,
+                );
+            }
+        }
+    }
 
     let is_grok = is_grok_model(&outbound_model);
     let (session_id, thread_id) = if matches!(route.protocol, Protocol::OpenAiResponses) {

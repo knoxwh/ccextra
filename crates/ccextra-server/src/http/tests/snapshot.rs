@@ -40,8 +40,8 @@ async fn concurrent_reload_serializes_loading_and_publication() {
     assert!(matches!(second.as_mut().poll(&mut context), Poll::Pending));
     assert_eq!(calls.load(Ordering::SeqCst), 1);
     release.add_permits(1);
-    tasks.join_next().await.unwrap().unwrap();
-    second.await.unwrap();
+    let _ = tasks.join_next().await.unwrap().unwrap();
+    let _ = second.await.unwrap();
     let snapshot = state.config.read().await;
     assert_eq!(snapshot.version, 3);
     assert_eq!(snapshot.runtime.secret.as_deref(), Some("secret-1"));
@@ -179,14 +179,16 @@ async fn failed_reload_or_refresh_preserves_the_entire_snapshot() {
             Ok(data)
         })
     });
-    assert!(handle_reload(State(state.clone())).await.is_err());
+    let result = handle_reload(State(state.clone())).await.unwrap();
+    // providers 校验失败应在 failed 中
+    assert!(result.failed.iter().any(|e| e.component == "providers"));
     assert!(Arc::ptr_eq(&old, &*state.config.read().await));
     state.reload = Arc::new(|| Box::pin(async { anyhow::bail!("invalid configuration") }));
     assert!(handle_reload(State(state.clone())).await.is_err());
     assert!(Arc::ptr_eq(&old, &*state.config.read().await));
     // 失败不能占用版本，也不能让后续合法 reload 永久等待。
     state.reload = reload_returning_secret(None);
-    tokio::time::timeout(
+    let _ = tokio::time::timeout(
         std::time::Duration::from_secs(2),
         handle_reload(State(state.clone())),
     )

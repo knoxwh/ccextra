@@ -63,12 +63,48 @@ pub fn list(auth_dir: &Path) -> Result<Vec<(PathBuf, XAICredential)>> {
         if path.is_file() && path.extension().is_some_and(|ext| ext == "json") {
             if let Ok(cred) = load(&path) {
                 if cred.r#type == "xai" || cred.r#type.is_empty() {
+                    // 验证 client_id(对齐 magpie geminiOwnLogin)
+                    if let Err(reason) = verify_client_id(&cred) {
+                        tracing::warn!(
+                            "skip {} (email: {}): {reason}",
+                            path.display(),
+                            cred.email
+                        );
+                        continue;
+                    }
                     entries.push((path, cred));
                 }
             }
         }
     }
     Ok(entries)
+}
+
+/// 验证 id_token 的 client_id 是否匹配官方 CLIENT_ID
+///
+/// 对齐 magpie `geminiOwnLogin`:
+/// - 无 id_token → 通过(旧凭证或外部工具)
+/// - 有 client_id 且不匹配 → 拒绝
+fn verify_client_id(cred: &XAICredential) -> Result<(), String> {
+    let id_token = cred.id_token.trim();
+    if id_token.is_empty() {
+        return Ok(());
+    }
+
+    let Some(client_id) = crate::jwt::extract_client_id(id_token) else {
+        tracing::debug!("xai: id_token parse failed, skip client_id check");
+        return Ok(());
+    };
+
+    if client_id != super::constants::CLIENT_ID {
+        return Err(format!(
+            "client_id mismatch: got {}, expected {}",
+            client_id,
+            super::constants::CLIENT_ID
+        ));
+    }
+
+    Ok(())
 }
 
 #[cfg(test)]

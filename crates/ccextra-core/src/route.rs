@@ -36,11 +36,14 @@ pub enum RouteError {
     VariantUnavailable(String),
 }
 
-#[derive(Debug, Clone, PartialEq, Deserialize)]
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 pub struct ProviderConfig {
     pub name: String,
     pub protocol: Protocol,
-    #[serde(deserialize_with = "deserialize_base_url")]
+    #[serde(
+        deserialize_with = "deserialize_base_url",
+        serialize_with = "serialize_base_url"
+    )]
     base_url: Vec<String>,
     pub key: String,
     /// 覆盖全局代理;Some("direct") = 直连(缺省 = 用全局)
@@ -50,6 +53,7 @@ pub struct ProviderConfig {
     /// 仅 openai_chat / openai_responses 生效)
     #[serde(default)]
     pub prompt_cache_key: bool,
+    #[serde(serialize_with = "serialize_nonempty_vec")]
     pub models: Vec<ModelConfig>,
     /// 额外元数据(用于 Antigravity 的 project_id 等)
     #[serde(default, skip_serializing_if = "Option::is_none")]
@@ -115,7 +119,30 @@ where
     }
 }
 
-#[derive(Debug, Clone, PartialEq, Deserialize, Default)]
+/// 序列化 base_url:单元素写字符串,多元素写数组(保持输入风格)
+fn serialize_base_url<S>(urls: &[String], serializer: S) -> Result<S::Ok, S::Error>
+where
+    S: serde::Serializer,
+{
+    use serde::Serialize;
+    if urls.len() == 1 {
+        urls[0].serialize(serializer)
+    } else {
+        urls.serialize(serializer)
+    }
+}
+
+/// 空数组规范化:输出 [] 不是 null(对齐 magpie orNone)
+fn serialize_nonempty_vec<T, S>(vec: &[T], serializer: S) -> Result<S::Ok, S::Error>
+where
+    T: Serialize,
+    S: serde::Serializer,
+{
+    use serde::Serialize;
+    vec.serialize(serializer)
+}
+
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize, Default)]
 pub struct ModelConfig {
     pub name: String,  // 上游真实名
     pub alias: String, // 入站别名

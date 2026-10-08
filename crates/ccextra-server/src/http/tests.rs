@@ -1649,7 +1649,7 @@ async fn test_config_snapshot_version_guards_against_stale_injection() {
         .await
         .unwrap()
         .unwrap();
-    handle_reload(axum::extract::State(state.clone()))
+    let _ = handle_reload(axum::extract::State(state.clone()))
         .await
         .unwrap();
     release_tx.send(()).unwrap();
@@ -2970,7 +2970,7 @@ async fn test_reload_reconciles_cursor_config_and_refreshes_catalog() {
 
     let mut desired = cursor_native_config(auth_dir.path(), server.url.clone());
     desired.models = vec!["default".to_string()];
-    crate::http::handlers::reload::reconcile_cursor_runtime(&state, Some(desired)).await;
+    let _ = crate::http::handlers::reload::reconcile_cursor_runtime(&state, Some(desired)).await;
 
     // 运行时已组装且配置原子更新
     let runtime = state.cursor.read().unwrap().clone().unwrap();
@@ -2998,7 +2998,7 @@ async fn test_reload_cursor_catalog_failure_retains_provider() {
     write_cursor_credential(auth_dir.path());
     let ok_server = crate::test_support::TestServer::spawn(cursor_models_router(&["auto"])).await;
     let state = mock_state();
-    crate::http::handlers::reload::reconcile_cursor_runtime(
+    let _ = crate::http::handlers::reload::reconcile_cursor_runtime(
         &state,
         Some(cursor_native_config(auth_dir.path(), ok_server.url.clone())),
     )
@@ -3018,7 +3018,7 @@ async fn test_reload_cursor_catalog_failure_retains_provider() {
         }),
     );
     let fail_server = crate::test_support::TestServer::spawn(fail_router).await;
-    crate::http::handlers::reload::reconcile_cursor_runtime(
+    let _ = crate::http::handlers::reload::reconcile_cursor_runtime(
         &state,
         Some(cursor_native_config(
             auth_dir.path(),
@@ -3039,14 +3039,14 @@ async fn test_reload_disables_cursor_runtime() {
     write_cursor_credential(auth_dir.path());
     let server = crate::test_support::TestServer::spawn(cursor_models_router(&["auto"])).await;
     let state = mock_state();
-    crate::http::handlers::reload::reconcile_cursor_runtime(
+    let _ = crate::http::handlers::reload::reconcile_cursor_runtime(
         &state,
         Some(cursor_native_config(auth_dir.path(), server.url.clone())),
     )
     .await;
     assert!(state.cursor.read().unwrap().is_some());
 
-    crate::http::handlers::reload::reconcile_cursor_runtime(&state, None).await;
+    let _ = crate::http::handlers::reload::reconcile_cursor_runtime(&state, None).await;
     assert!(state.cursor.read().unwrap().is_none());
 }
 
@@ -3070,7 +3070,7 @@ async fn test_reload_enables_cursor_runtime_from_disabled() {
     );
     let server = crate::test_support::TestServer::spawn(fail_router).await;
 
-    crate::http::handlers::reload::reconcile_cursor_runtime(
+    let _ = crate::http::handlers::reload::reconcile_cursor_runtime(
         &state,
         Some(cursor_native_config(auth_dir.path(), server.url.clone())),
     )

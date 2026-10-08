@@ -4,6 +4,7 @@ pub mod antigravity;
 pub mod codex;
 pub mod cursor;
 pub mod http;
+pub mod jwt;
 pub mod oauth;
 pub mod sse;
 pub mod upstream;
