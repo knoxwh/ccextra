@@ -210,6 +210,7 @@ where
             let chunk_bytes = match crate::sse::next_upstream_chunk(&mut stream).await {
                 Ok(Some(Ok(bytes))) => bytes,
                 Ok(Some(Err(e))) => {
+                    // 终态后忽略 context cancellation(对齐 CPA dbc4aad9)
                     if relay.finished {
                         break;
                     }
@@ -227,6 +228,7 @@ where
                 }
                 Ok(None) => break,
                 Err(msg) => {
+                    // 终态后忽略解析错误
                     if relay.finished {
                         break;
                     }
