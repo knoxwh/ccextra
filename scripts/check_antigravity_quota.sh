@@ -3,6 +3,7 @@ set -euo pipefail
 
 # 默认配置
 BASE_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
+CONFIG_YAML="${BASE_DIR}/config.yaml"
 AUTH_DIR="${BASE_DIR}/.cache/antigravity"
 API_ENDPOINT="https://cloudcode-pa.googleapis.com"
 DAILY_API_ENDPOINT="https://daily-cloudcode-pa.googleapis.com"
@@ -11,9 +12,14 @@ OAUTH_TOKEN_URL="https://oauth2.googleapis.com/token"
 CONSTANTS_RS="${BASE_DIR}/crates/ccextra-server/src/antigravity/constants.rs"
 CLIENT_ID="$(sed -n 's/.*pub const CLIENT_ID: &str = "\([^"]*\)".*/\1/p' "${CONSTANTS_RS}" 2>/dev/null || true)"
 CLIENT_SECRET="$(sed -n 's/.*pub const CLIENT_SECRET: &str = "\([^"]*\)".*/\1/p' "${CONSTANTS_RS}" 2>/dev/null || true)"
-# Cloud Code 拒 <2.9.0 看新模型;跟服务端 REQUEST_UA 对齐,避免脚本漏 3.7 档
-USER_AGENT="$(sed -n 's/.*pub const REQUEST_UA: &str = "\([^"]*\)".*/\1/p' "${CONSTANTS_RS}" 2>/dev/null || true)"
-USER_AGENT="${USER_AGENT:-antigravity/hub/2.10.0 darwin/arm64}"
+
+# 优先从 config.yaml 读取 user_agents.antigravity，未配置则回退 constants.rs
+CONFIG_UA="$(sed -n '/^[[:space:]]*user_agents:/,/^[[:space:]]*[a-zA-Z0-9_-]\+:/p' "${CONFIG_YAML}" 2>/dev/null | sed -n 's/^[[:space:]]*antigravity:[[:space:]]*["'\'']\{0,1\}\([^"'\'']*\)["'\'']\{0,1\}[[:space:]]*$/\1/p' | head -n 1 || true)"
+USER_AGENT="${CONFIG_UA}"
+if [[ -z "${USER_AGENT}" ]]; then
+    USER_AGENT="$(sed -n 's/.*pub const REQUEST_UA: &str = "\([^"]*\)".*/\1/p' "${CONSTANTS_RS}" 2>/dev/null || true)"
+fi
+USER_AGENT="${USER_AGENT:-antigravity/hub/2.21.1 darwin/arm64}"
 
 usage() {
     echo "用法: $0 [选项]"

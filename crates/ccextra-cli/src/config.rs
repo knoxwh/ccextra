@@ -61,7 +61,7 @@ pub struct UserAgents {
     pub codex_tui: Option<String>,
     /// Grok CLI 版本号,默认 "1.0.46"(完整交互式 UA 运行时拼接 os/arch)
     pub grok_version: Option<String>,
-    /// Antigravity hub UA,默认 "antigravity/hub/2.10.0 darwin/arm64"
+    /// Antigravity hub UA,默认 "antigravity/hub/2.21.1 darwin/arm64"
     pub antigravity: Option<String>,
 }
 
