@@ -408,10 +408,17 @@ pub fn convert_tool_definitions(
             gemini_tool["description"] = desc.clone();
         }
         if let Some(input_schema) = tool.get("input_schema") {
-            gemini_tool["parametersJsonSchema"] = match flavor {
+            let mut schema = match flavor {
                 SchemaFlavor::Gemini => clean_json_schema_for_gemini(input_schema),
                 SchemaFlavor::Antigravity => clean_nested_schema_for_antigravity(input_schema),
             };
+
+            // 对齐 CPA f051442:Terminal 工具剥离 description 参数(防 Gemini 误填自然语言)
+            if is_terminal_tool(original_name) {
+                strip_description_param(&mut schema);
+            }
+
+            gemini_tool["parametersJsonSchema"] = schema;
         }
 
         gemini_tools.push(gemini_tool);
@@ -419,6 +426,37 @@ pub fn convert_tool_definitions(
     }
 
     (gemini_tools, short_to_original)
+}
+
+/// 识别 Terminal / Shell 工具(对齐 CPA is_shell_or_terminal_tool)
+fn is_terminal_tool(name: &str) -> bool {
+    matches!(
+        name.to_ascii_lowercase().as_str(),
+        "shell"
+            | "bash"
+            | "local_shell"
+            | "local_shell_call"
+            | "powershell"
+            | "pwsh"
+            | "terminal"
+            | "cmd"
+            | "run_command"
+            | "execute_command"
+    )
+}
+
+/// 从 schema properties/required 移除 description 字段(对齐 CPA f051442)
+fn strip_description_param(schema: &mut Value) {
+    if let Some(props) = schema.pointer_mut("/properties") {
+        if let Some(obj) = props.as_object_mut() {
+            obj.remove("description");
+        }
+    }
+    if let Some(required) = schema.pointer_mut("/required") {
+        if let Some(arr) = required.as_array_mut() {
+            arr.retain(|v| v.as_str() != Some("description"));
+        }
+    }
 }
 
 #[cfg(test)]
@@ -513,7 +551,8 @@ mod tests {
             ],
             "messages": [{"role": "user", "content": "hi"}]
         });
-        let (gemini, _) = convert_to_gemini_with(&anthropic, "gemini-2.5-pro", SchemaFlavor::Antigravity);
+        let (gemini, _) =
+            convert_to_gemini_with(&anthropic, "gemini-2.5-pro", SchemaFlavor::Antigravity);
         let parts = gemini["systemInstruction"]["parts"].as_array().unwrap();
         assert_eq!(parts.len(), 1);
         assert_eq!(parts[0]["text"], "You are an AI agent. Solve bugs.");
@@ -957,6 +996,69 @@ IMPORTANT: Assist with authorized security testing.
         assert!(gemini_tools[0].get("input_schema").is_none());
         assert!(gemini_tools[0].get("cache_control").is_none());
         assert_eq!(short_map.get("Read").unwrap(), "Read");
+    }
+
+    #[test]
+    fn test_terminal_tool_strips_description_parameter() {
+        // 对齐 CPA f051442:Terminal 工具剥离 description 参数,防 Gemini 误填自然语言
+        let tools = vec![json!({
+            "name": "bash",
+            "description": "Run shell command",
+            "input_schema": {
+                "type": "object",
+                "properties": {
+                    "command": {"type": "string", "description": "CLI command"},
+                    "description": {"type": "string", "description": "Human label"}
+                },
+                "required": ["command", "description"]
+            }
+        })];
+        let (gemini_tools, _) = convert_tool_definitions(&tools, SchemaFlavor::Gemini);
+
+        let schema = &gemini_tools[0]["parametersJsonSchema"];
+        let props = schema["properties"].as_object().unwrap();
+        assert!(props.contains_key("command"), "command 必须保留");
+        assert!(!props.contains_key("description"), "description 必须剥离");
+
+        let required = schema["required"].as_array().unwrap();
+        assert!(
+            required.iter().any(|v| v == "command"),
+            "command 必须在 required"
+        );
+        assert!(
+            !required.iter().any(|v| v == "description"),
+            "description 必须从 required 移除"
+        );
+    }
+
+    #[test]
+    fn test_non_terminal_tool_preserves_description_parameter() {
+        // 非 Terminal 工具保留 description 参数
+        let tools = vec![json!({
+            "name": "search_files",
+            "description": "Search files",
+            "input_schema": {
+                "type": "object",
+                "properties": {
+                    "query": {"type": "string"},
+                    "description": {"type": "string"}
+                },
+                "required": ["query", "description"]
+            }
+        })];
+        let (gemini_tools, _) = convert_tool_definitions(&tools, SchemaFlavor::Gemini);
+
+        let schema = &gemini_tools[0]["parametersJsonSchema"];
+        let props = schema["properties"].as_object().unwrap();
+        assert!(props.contains_key("query"));
+        assert!(
+            props.contains_key("description"),
+            "非 Terminal 工具保留 description"
+        );
+
+        let required = schema["required"].as_array().unwrap();
+        assert!(required.iter().any(|v| v == "query"));
+        assert!(required.iter().any(|v| v == "description"));
     }
 
     #[test]

@@ -65,11 +65,7 @@ pub fn list(auth_dir: &Path) -> Result<Vec<(PathBuf, XAICredential)>> {
                 if cred.r#type == "xai" || cred.r#type.is_empty() {
                     // 验证 client_id(对齐 magpie geminiOwnLogin)
                     if let Err(reason) = verify_client_id(&cred) {
-                        tracing::warn!(
-                            "skip {} (email: {}): {reason}",
-                            path.display(),
-                            cred.email
-                        );
+                        tracing::warn!("skip {} (email: {}): {reason}", path.display(), cred.email);
                         continue;
                     }
                     entries.push((path, cred));

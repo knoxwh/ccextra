@@ -917,9 +917,15 @@ pub(crate) async fn deliver_response(
         // Unfit 探测与自适应降级(对齐 magpie gateway.go:3440-3490)
         if !final_truncated && (status.as_u16() == 400 || status.as_u16() == 422) {
             let err_text = String::from_utf8_lossy(&final_bytes);
-            if let Some(kind) = crate::http::unfit::detect_unfit_from_error(status.as_u16(), &err_text) {
+            if let Some(kind) =
+                crate::http::unfit::detect_unfit_from_error(status.as_u16(), &err_text)
+            {
                 let registry = crate::http::unfit::global_registry();
-                registry.mark(&prepared.route.provider, &prepared.route.upstream_model, kind);
+                registry.mark(
+                    &prepared.route.provider,
+                    &prepared.route.upstream_model,
+                    kind,
+                );
 
                 // 原地修复请求并重试
                 if crate::http::unfit::adapt_request_for_unfit(
@@ -946,7 +952,8 @@ pub(crate) async fn deliver_response(
                     } else {
                         retry_after = parse_retry_after(retry.body.headers());
                         let (bytes, truncated) =
-                            crate::limits::read_error_body_or_anthropic(retry.body, final_status).await?;
+                            crate::limits::read_error_body_or_anthropic(retry.body, final_status)
+                                .await?;
                         final_bytes = bytes;
                         final_truncated = truncated;
                     }

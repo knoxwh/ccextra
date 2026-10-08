@@ -83,11 +83,7 @@ pub fn list(dir: &Path) -> Result<Vec<(PathBuf, AntigravityCredential)>> {
             Ok(cred) => {
                 // 验证 client_id(对齐 magpie geminiOwnLogin)
                 if let Err(reason) = verify_client_id(&cred) {
-                    tracing::warn!(
-                        "skip {} (email: {}): {reason}",
-                        path.display(),
-                        cred.email
-                    );
+                    tracing::warn!("skip {} (email: {}): {reason}", path.display(), cred.email);
                     continue;
                 }
                 out.push((path, cred));

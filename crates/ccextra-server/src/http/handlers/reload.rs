@@ -24,20 +24,14 @@ pub struct ReloadError {
 
 /// 热重载按取得专用互斥锁的顺序加载并发布；失败收集到 result.failed 但继续处理其他组件。
 /// 加载期间不持有配置锁，请求和后台刷新仍可访问当前快照。
-pub async fn handle_reload(
-    State(state): State<AppState>,
-) -> Result<Json<ReloadResult>, AppError> {
+pub async fn handle_reload(State(state): State<AppState>) -> Result<Json<ReloadResult>, AppError> {
     let _reload_guard = state.reload_lock.lock().await;
     let mut result = ReloadResult::default();
 
     // 1. 读取配置文件(失败则快速失败，无法继续)
     let data = match (state.reload)().await {
         Ok(d) => d,
-        Err(e) => {
-            return Err(AppError::new(anyhow::anyhow!(
-                "配置文件读取失败: {e}"
-            )))
-        }
+        Err(e) => return Err(AppError::new(anyhow::anyhow!("配置文件读取失败: {e}"))),
     };
 
     // 2. 验证 providers(失败记录但尝试继续构建 runtime)

@@ -13,10 +13,10 @@ use std::sync::{Arc, RwLock};
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
 pub enum UnfitKind {
-    RefusesFormat,       // response_format 不支持
-    OffRefused,          // reasoning effort "off" 被拒
-    ToolChoiceRefused,   // tool_choice 不支持
-    ToolsWithoutEffort,  // tools + reasoning 冲突
+    RefusesFormat,      // response_format 不支持
+    OffRefused,         // reasoning effort "off" 被拒
+    ToolChoiceRefused,  // tool_choice 不支持
+    ToolsWithoutEffort, // tools + reasoning 冲突
 }
 
 type UnfitKey = (String, String); // (provider, model)
@@ -67,7 +67,8 @@ pub fn detect_unfit_from_error(status: u16, body: &str) -> Option<UnfitKind> {
     // response_format 拒绝(Gemini: "response_mime_type", OpenAI: "response_format")
     if lower.contains("response_mime_type")
         || lower.contains("response_format")
-        || lower.contains("json_schema") {
+        || lower.contains("json_schema")
+    {
         return Some(UnfitKind::RefusesFormat);
     }
 
@@ -82,8 +83,7 @@ pub fn detect_unfit_from_error(status: u16, body: &str) -> Option<UnfitKind> {
     }
 
     // tools + reasoning 冲突(Gemini: "thinking" + "tools")
-    if (lower.contains("thinking") || lower.contains("reasoning"))
-        && lower.contains("tool") {
+    if (lower.contains("thinking") || lower.contains("reasoning")) && lower.contains("tool") {
         return Some(UnfitKind::ToolsWithoutEffort);
     }
 
@@ -104,32 +104,36 @@ pub fn adapt_request_for_unfit(
         if let Some(schema) = extract_and_remove_response_format(body) {
             inject_schema_to_system(body, &schema);
             adapted = true;
-            tracing::info!(provider, model, "unfit: response_format → system instruction");
+            tracing::info!(
+                provider,
+                model,
+                "unfit: response_format → system instruction"
+            );
         }
     }
 
     // OffRefused: reasoning effort "off" → "low"
-    if registry.is_unfit(provider, model, UnfitKind::OffRefused) {
-        if force_reasoning_effort(body, "low") {
-            adapted = true;
-            tracing::info!(provider, model, "unfit: reasoning effort off → low");
-        }
+    if registry.is_unfit(provider, model, UnfitKind::OffRefused)
+        && force_reasoning_effort(body, "low")
+    {
+        adapted = true;
+        tracing::info!(provider, model, "unfit: reasoning effort off → low");
     }
 
     // ToolChoiceRefused: tool_choice → "auto"
-    if registry.is_unfit(provider, model, UnfitKind::ToolChoiceRefused) {
-        if downgrade_tool_choice(body) {
-            adapted = true;
-            tracing::info!(provider, model, "unfit: tool_choice → auto");
-        }
+    if registry.is_unfit(provider, model, UnfitKind::ToolChoiceRefused)
+        && downgrade_tool_choice(body)
+    {
+        adapted = true;
+        tracing::info!(provider, model, "unfit: tool_choice → auto");
     }
 
     // ToolsWithoutEffort: 移除 thinking/reasoning 配置
-    if registry.is_unfit(provider, model, UnfitKind::ToolsWithoutEffort) {
-        if remove_reasoning_config(body) {
-            adapted = true;
-            tracing::info!(provider, model, "unfit: removed reasoning (tools conflict)");
-        }
+    if registry.is_unfit(provider, model, UnfitKind::ToolsWithoutEffort)
+        && remove_reasoning_config(body)
+    {
+        adapted = true;
+        tracing::info!(provider, model, "unfit: removed reasoning (tools conflict)");
     }
 
     adapted
@@ -193,11 +197,19 @@ fn downgrade_tool_choice(body: &mut serde_json::Value) -> bool {
 
 fn remove_reasoning_config(body: &mut serde_json::Value) -> bool {
     let mut removed = false;
-    if body.as_object_mut().and_then(|m| m.remove("thinking")).is_some() {
+    if body
+        .as_object_mut()
+        .and_then(|m| m.remove("thinking"))
+        .is_some()
+    {
         removed = true;
     }
     if let Some(config) = body.pointer_mut("/output_config") {
-        if config.as_object_mut().and_then(|m| m.remove("effort")).is_some() {
+        if config
+            .as_object_mut()
+            .and_then(|m| m.remove("effort"))
+            .is_some()
+        {
             removed = true;
         }
     }
