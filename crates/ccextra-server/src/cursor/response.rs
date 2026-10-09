@@ -61,7 +61,7 @@ impl CursorReply {
             }
         }
         self.content.push(if kind == "thinking" {
-            json!({ "type": "thinking", "thinking": text })
+            json!({ "type": "thinking", "thinking": text, "signature": "" })
         } else {
             json!({ "type": "text", "text": text })
         });

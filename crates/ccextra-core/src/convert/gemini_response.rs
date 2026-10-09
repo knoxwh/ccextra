@@ -170,7 +170,8 @@ pub fn convert_gemini_stream_chunk(
                             "index": state.response_index,
                             "content_block": {
                                 "type": "thinking",
-                                "thinking": ""
+                                "thinking": "",
+                                "signature": ""
                             }
                         }));
                         events.push(json!({
@@ -497,16 +498,15 @@ pub fn convert_gemini_response(
                         .unwrap_or(false);
                     if is_thought {
                         let mut block = json!({"type": "thinking", "thinking": text});
-                        if let Some(sig) = part
+                        // thinking 块必须包含 signature 字段（对齐 sub2api 412718edf）
+                        let sig = part
                             .get("thoughtSignature")
                             .or_else(|| part.get("thought_signature"))
                             .and_then(|s| s.as_str())
-                        {
-                            if !sig.is_empty() {
-                                block["signature"] =
-                                    json!(outbound_signature(signature_model, sig));
-                            }
-                        }
+                            .filter(|s| !s.is_empty())
+                            .map(|s| outbound_signature(signature_model, s))
+                            .unwrap_or_default();
+                        block["signature"] = json!(sig);
                         content_blocks.push(block);
                     } else {
                         content_blocks.push(json!({"type": "text", "text": text}));

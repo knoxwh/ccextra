@@ -122,14 +122,18 @@ pub fn responses_to_anthropic(
                             "thinking"
                         };
                         let mut block = json!({"type": block_type, block_type: text});
-                        if !valid_signature.is_empty() {
-                            let sig_field = if is_redacted {
-                                "redacted_thinking_data"
+                        if is_redacted {
+                            if !valid_signature.is_empty() {
+                                block["redacted_thinking_data"] = json!(valid_signature
+                                    .trim_start_matches(CLAUDE_RESPONSES_REDACTED_THINKING_PREFIX));
+                            }
+                        } else {
+                            // thinking 块必须包含 signature 字段（对齐 sub2api 412718edf）
+                            block["signature"] = if !valid_signature.is_empty() {
+                                json!(valid_signature)
                             } else {
-                                "signature"
+                                json!("")
                             };
-                            block[sig_field] = json!(valid_signature
-                                .trim_start_matches(CLAUDE_RESPONSES_REDACTED_THINKING_PREFIX));
                         }
                         content.push(block);
                     }
@@ -315,7 +319,8 @@ pub fn openai_chat_to_anthropic(body: &Value) -> Option<Value> {
     if !reasoning_texts.is_empty() {
         content.push(json!({
             "type": "thinking",
-            "thinking": reasoning_texts.join("\n")
+            "thinking": reasoning_texts.join("\n"),
+            "signature": ""
         }));
     }
 
