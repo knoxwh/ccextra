@@ -125,7 +125,7 @@ pub fn content_block_start_thinking(index: i64) -> Bytes {
         &json!({
             "type": "content_block_start",
             "index": index,
-            "content_block": {"type": "thinking", "thinking": ""}
+            "content_block": {"type": "thinking", "thinking": "", "signature": ""}
         }),
     )
 }
