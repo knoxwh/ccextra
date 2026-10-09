@@ -1,3 +1,4 @@
+mod history;
 mod input;
 pub mod proto;
 mod request;

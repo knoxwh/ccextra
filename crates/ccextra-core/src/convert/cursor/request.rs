@@ -1,5 +1,5 @@
 use super::proto::{encode_bytes, generated};
-use super::{input, schema, CursorConvertError};
+use super::{history, input, schema, CursorConvertError};
 use base64::engine::general_purpose::STANDARD;
 use base64::Engine;
 use prost::Message;
@@ -209,14 +209,21 @@ pub fn build_run_request_with(
         None => {
             // 对齐 Plus:真 system 进 root blob(键序 content 先,对齐 Go json.Marshal
             // 字母序;blob id 是 sha256,需字节稳定),UserText 只留用户输入。
-            // 无 checkpoint 时不发结构化 turns(Plus flatten 路径 Turns=nil):
-            // Run 端点对无服务端状态的会话拒绝/掐断大 turns,UserText 才是可靠通道
+            // 多轮历史走 history::fabricate:Anthropic 消息编成 root prompt blob
+            // 序列 + turns 结构(2026-10-09 探针 F/G 实证:服务端经 kv getBlob
+            // 取回未知 blob,伪造历史被模型接受),替代 flatten 全量 UserText
+            // 重放(64KiB RST 风险)
             let system = serde_json::json!({ "content": system, "role": "system" });
             let bytes = serde_json::to_vec(&system)?;
             let digest = Sha256::digest(&bytes);
             blobs.insert(hex::encode(digest), bytes);
+            let history = history::fabricate(body)?;
+            blobs.extend(history.blobs);
+            let mut root_prompt_ids = vec![digest.to_vec()];
+            root_prompt_ids.extend(history.root_prompt_ids);
             generated::ConversationStateStructure {
-                root_prompt_messages_json: vec![digest.to_vec()],
+                root_prompt_messages_json: root_prompt_ids,
+                turns: history.turn_ids,
                 ..Default::default()
             }
             .encode_to_vec()

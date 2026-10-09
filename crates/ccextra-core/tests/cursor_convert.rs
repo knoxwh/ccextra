@@ -11,7 +11,7 @@ use ccextra_core::convert::cursor::{
 use ccextra_core::thinking::ModelCapability;
 use flate2::{write::GzEncoder, Compression};
 use prost::Message;
-use serde_json::json;
+use serde_json::{json, Value};
 use std::io::Write;
 
 fn run(payload: &[u8]) -> generated::AgentRunRequest {
@@ -24,10 +24,15 @@ fn run(payload: &[u8]) -> generated::AgentRunRequest {
 
 /// 解析 root blob 的 system content(对齐 Plus:真 system 进 KV blob)
 fn blob_system(request: &CursorRunRequest) -> String {
-    assert_eq!(request.blob_store.len(), 1);
-    let bytes = request.blob_store.values().next().unwrap();
+    let bytes = request
+        .blob_store
+        .values()
+        .find(|bytes| {
+            serde_json::from_slice::<serde_json::Value>(bytes)
+                .is_ok_and(|value| value["role"] == "system")
+        })
+        .expect("system blob 存在");
     let value: serde_json::Value = serde_json::from_slice(bytes).unwrap();
-    assert_eq!(value["role"], "system");
     value["content"].as_str().unwrap().to_string()
 }
 
@@ -368,7 +373,7 @@ fn malformed_nested_length_is_rejected() {
 // ---------------------------------------------------------------------------
 
 #[test]
-fn cold_request_flattens_history_and_defines_mcp_schema() {
+fn cold_request_fabricates_history_and_defines_mcp_schema() {
     let body = json!({
         "system": [{"type":"text", "text":"Be brief"}],
         "messages": [
@@ -387,10 +392,11 @@ fn cold_request_flattens_history_and_defines_mcp_schema() {
         _ => panic!("expected user message"),
     };
     let text = action.user_message.unwrap().text;
-    // 对齐 Plus:system 进 root blob,不进 UserText
+    // 历史伪造:UserText 只留末条文本,历史进 root prompt blob + turns
     assert!(!text.contains("Be brief"));
-    assert!(text.contains("ASSISTANT_TOOL_CALL"));
-    assert!(text.contains("TOOL_RESULT"));
+    assert!(!text.contains("ASSISTANT_TOOL_CALL"));
+    assert!(!text.contains("TOOL_RESULT"));
+    assert!(text.contains("Continue"));
     assert!(text.contains("OUTPUT CONSTRAINTS"));
     assert_eq!(blob_system(&request), "Be brief");
     assert_eq!(run.model_details.unwrap().model_id, "composer-2-medium");
@@ -401,11 +407,45 @@ fn cold_request_flattens_history_and_defines_mcp_schema() {
         schema.kind,
         Some(prost_types::value::Kind::StructValue(_))
     ));
-    assert_eq!(request.blob_store.len(), 1);
+    // blob_store:system + user(JSON+UserMessage) + assistant(tool-call JSON,
+    // 无文本 step) + tool-result + turn 结构 = 6 个
+    assert_eq!(request.blob_store.len(), 6);
     let state = run.conversation_state.unwrap();
-    assert!(state.turns.is_empty());
+    // system + user + assistant + tool-result 四个 root prompt blob
+    assert_eq!(state.root_prompt_messages_json.len(), 4);
+    assert_eq!(state.turns.len(), 1);
     assert!(state.turns_old.is_empty());
-    assert_eq!(state.root_prompt_messages_json.len(), 1);
+    // 每个 root prompt id 都能在 blob_store 取回且是合法 JSON
+    for id in &state.root_prompt_messages_json {
+        let blob = request.blob_store.get(&hex::encode(id)).unwrap();
+        serde_json::from_slice::<serde_json::Value>(blob).unwrap();
+    }
+    // turns 结构可解码,引用的 blob 也能取回
+    let turn = generated::ConversationTurnStructure::decode(
+        request
+            .blob_store
+            .get(&hex::encode(&state.turns[0]))
+            .unwrap()
+            .as_slice(),
+    )
+    .unwrap();
+    let generated::conversation_turn_structure::Turn::AgentConversationTurn(agent) =
+        turn.turn.unwrap()
+    else {
+        panic!("expected agent turn")
+    };
+    let user_blob = request
+        .blob_store
+        .get(&hex::encode(&agent.user_message))
+        .unwrap();
+    assert_eq!(
+        generated::UserMessage::decode(user_blob.as_slice())
+            .unwrap()
+            .text,
+        "Find status"
+    );
+    // 纯 tool_use 的 assistant 无文本 step
+    assert!(agent.steps.is_empty());
 }
 
 #[test]
@@ -492,7 +532,7 @@ fn messages_system_role_merges_into_system_prompt() {
 }
 
 #[test]
-fn messages_system_role_with_history_keeps_continuation_tail() {
+fn messages_system_role_with_history_fabricates_turns() {
     let body = json!({
         "messages": [
             {"role":"system", "content":"You are terse"},
@@ -508,14 +548,93 @@ fn messages_system_role_with_history_keeps_continuation_tail() {
         _ => panic!("expected user message"),
     };
     let text = action.user_message.unwrap().text;
+    // 历史伪造:UserText 只留末条 "three",历史进 blob,无 flatten 前缀
     assert!(!text.contains("SYSTEM:"));
-    assert!(text.contains("ASSISTANT: two"));
-    assert!(text.contains("Continue from the conversation above"));
+    assert!(!text.contains("ASSISTANT: two"));
+    assert_eq!(text, "three");
     assert_eq!(blob_system(&request), "You are terse");
+    let state = run.conversation_state.unwrap();
+    // system + user("one") + assistant("two") 三个 root prompt blob
+    assert_eq!(state.root_prompt_messages_json.len(), 3);
+    assert_eq!(state.turns.len(), 1);
+    // assistant 文本进 turn step
+    let turn = generated::ConversationTurnStructure::decode(
+        request
+            .blob_store
+            .get(&hex::encode(&state.turns[0]))
+            .unwrap()
+            .as_slice(),
+    )
+    .unwrap();
+    let generated::conversation_turn_structure::Turn::AgentConversationTurn(agent) =
+        turn.turn.unwrap()
+    else {
+        panic!("expected agent turn")
+    };
+    let step = generated::AssistantMessage::decode(
+        request
+            .blob_store
+            .get(&hex::encode(&agent.steps[0]))
+            .unwrap()
+            .as_slice(),
+    )
+    .unwrap();
+    assert_eq!(step.text, "two");
 }
 
 #[test]
-fn single_tool_result_without_checkpoint_uses_continuation() {
+fn image_only_user_turn_fabricates_placeholder() {
+    // 纯图片非末条回合:文本为空,占位 [image] 保证 turn 与 root prompt 完整
+    let body = json!({
+        "messages": [
+            {"role":"user", "content":[{"type":"image", "source":{"type":"base64"}}]},
+            {"role":"assistant", "content":"saw it"},
+            {"role":"user", "content":"next"}
+        ]
+    });
+    let request = build_run_request(&body, "composer-2", "conv", "msg-1", None).unwrap();
+    let run = run(&request.payload);
+    let state = run.conversation_state.unwrap();
+    // user("[image]") + assistant("saw it") 两个 root prompt blob(无 system)
+    // 默认 system + user("[image]") + assistant("saw it") 三个 root prompt blob
+    assert_eq!(state.root_prompt_messages_json.len(), 3);
+    let blob = request
+        .blob_store
+        .get(&hex::encode(&state.root_prompt_messages_json[1]))
+        .unwrap();
+    let entry: Value = serde_json::from_slice(blob).unwrap();
+    assert_eq!(
+        entry["content"][0]["text"],
+        "<user_query>\n[image]\n</user_query>"
+    );
+    // 占位 user 开 turn,assistant 文本成 step
+    assert_eq!(state.turns.len(), 1);
+    let turn = generated::ConversationTurnStructure::decode(
+        request
+            .blob_store
+            .get(&hex::encode(&state.turns[0]))
+            .unwrap()
+            .as_slice(),
+    )
+    .unwrap();
+    let generated::conversation_turn_structure::Turn::AgentConversationTurn(agent) =
+        turn.turn.unwrap()
+    else {
+        panic!("expected agent turn")
+    };
+    let step = generated::AssistantMessage::decode(
+        request
+            .blob_store
+            .get(&hex::encode(&agent.steps[0]))
+            .unwrap()
+            .as_slice(),
+    )
+    .unwrap();
+    assert_eq!(step.text, "saw it");
+}
+
+#[test]
+fn single_tool_result_without_checkpoint_goes_to_history_blob() {
     let body = json!({
         "messages": [{"role":"user", "content":[
             {"type":"tool_result", "tool_use_id":"call-1", "content":"ok"},
@@ -528,8 +647,24 @@ fn single_tool_result_without_checkpoint_uses_continuation() {
         panic!("expected user message");
     };
     let text = action.user_message.unwrap().text;
-    assert!(text.contains("TOOL_RESULT:"));
-    assert!(text.contains("Continue from the conversation above"));
+    // 末条 tool_result 进 root prompt blob,UserText 只留文本,无续接尾巴
+    assert_eq!(text, "Next");
+    assert!(!text.contains("TOOL_RESULT:"));
+    assert!(!text.contains("Continue from the conversation above"));
+    let state = run(&request.payload).conversation_state.unwrap();
+    // 默认 system blob + tool-result blob;无 turn(末条不起 turn)
+    assert_eq!(state.root_prompt_messages_json.len(), 2);
+    assert!(state.turns.is_empty());
+    let tool_blob = request
+        .blob_store
+        .get(&hex::encode(&state.root_prompt_messages_json[1]))
+        .unwrap();
+    let entry: serde_json::Value = serde_json::from_slice(tool_blob).unwrap();
+    assert_eq!(entry["role"], "tool");
+    assert_eq!(entry["id"], "call-1");
+    assert_eq!(entry["content"][0]["type"], "tool-result");
+    assert_eq!(entry["content"][0]["toolCallId"], "call-1");
+    assert_eq!(entry["content"][0]["result"], "ok");
 }
 
 #[test]
@@ -876,7 +1011,7 @@ fn server_control_abort_fails_decode_immediately() {
 }
 
 #[test]
-fn conversation_state_omits_structured_turns_without_checkpoint() {
+fn conversation_state_fabricates_turns_without_checkpoint() {
     let body = json!({
         "messages": [
             {"role":"user", "content":"first"},
@@ -887,18 +1022,16 @@ fn conversation_state_omits_structured_turns_without_checkpoint() {
     let request = build_run_request(&body, "composer-2", "conv", "msg-1", None).unwrap();
     let run = run(&request.payload);
     let state = run.conversation_state.unwrap();
-    // 对齐 Plus flatten 路径(Turns=nil):无 checkpoint 不发结构化 turns,
-    // Run 端点对无服务端状态的会话拒绝/掐断大 turns,UserText 才是可靠通道
-    assert!(state.turns.is_empty());
+    // 历史伪造(2026-10-09 探针 F/G 实证):无 checkpoint 时 turns + root prompt
+    // blob 承载历史,服务端经 kv getBlob 取回,UserText 只留末条
+    assert_eq!(state.turns.len(), 1);
     assert!(state.turns_old.is_empty());
-    // root blob 仍在,UserText 承载全量 transcript
-    assert_eq!(state.root_prompt_messages_json.len(), 1);
+    // 默认 system + user("first") + assistant("answer one")
+    assert_eq!(state.root_prompt_messages_json.len(), 3);
     let action = match run.action.unwrap().action.unwrap() {
         generated::conversation_action::Action::UserMessageAction(action) => action,
         _ => panic!("expected user message"),
     };
     let user_text = action.user_message.unwrap().text;
-    assert!(user_text.contains("first"));
-    assert!(user_text.contains("answer one"));
-    assert!(user_text.contains("second"));
+    assert_eq!(user_text, "second");
 }

@@ -226,7 +226,7 @@ pub enum ResumedSession {
     Joined(u64, InflightRun),
 }
 
-/// take 失败分类:Lost 可安全回退 flatten 冷分支,Invalid 必须 fail closed
+/// take 失败分类:Lost 可安全回退历史伪造冷分支,Invalid 必须 fail closed
 pub enum TakeError {
     /// 驻留会话/凭证/模型/工具目录绑定丢失(如进程重启、TTL 过期)
     Lost(&'static str),

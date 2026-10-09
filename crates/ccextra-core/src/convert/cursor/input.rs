@@ -1,7 +1,10 @@
 use super::CursorConvertError;
-use serde_json::{json, Value};
+use serde_json::Value;
 
-fn text(content: &Value) -> Result<String, CursorConvertError> {
+/// 历史伪造模式末条纯 tool_result 时的续接尾巴(生产验证措辞)
+const CONTINUATION_TAIL: &str = "The above is the previous conversation context including tool call results.\nContinue your response based on this context.\n\nContinue from the conversation above.";
+
+pub(super) fn text(content: &Value) -> Result<String, CursorConvertError> {
     match content {
         Value::Null => Ok(String::new()),
         Value::String(text) => Ok(text.clone()),
@@ -28,15 +31,6 @@ fn text(content: &Value) -> Result<String, CursorConvertError> {
         _ => Err(CursorConvertError::Invalid(
             "content 必须是文本或块数组".into(),
         )),
-    }
-}
-
-fn entry(out: &mut String, role: &str, content: &str) {
-    if !content.is_empty() {
-        out.push_str(role);
-        out.push_str(": ");
-        out.push_str(content);
-        out.push_str("\n\n");
     }
 }
 
@@ -111,10 +105,12 @@ pub(super) fn user_text(body: &Value, checkpoint: bool) -> Result<UserInput, Cur
     } else {
         system_parts.join("\n")
     };
-    let mut transcript = String::new();
+    let mut last_text = String::new();
     let mut images = Vec::new();
-    // checkpoint 模式只 entry 最后一条非 system 消息;Claude Code 会在 user 后追加
-    // system reminder,末条常是 system,不能让它挤掉真正的用户输入
+    // 只取最后一条非 system 消息的文本:checkpoint 模式现状;无 checkpoint 的
+    // 多轮会话走历史伪造(history::fabricate 编 root prompt blob),历史不再
+    // 拼进 UserText。Claude Code 会在 user 后追加 system reminder,末条常是
+    // system,不能让它挤掉真正的用户输入
     let last_conversation = messages
         .iter()
         .rposition(|message| message.get("role").and_then(Value::as_str) != Some("system"));
@@ -135,33 +131,8 @@ pub(super) fn user_text(body: &Value, checkpoint: bool) -> Result<UserInput, Cur
             // 对齐 Plus:每条 user 消息覆盖,最终保留最后一条的图片
             images = extract_images(content);
         }
-        if !checkpoint || Some(index) == last_conversation {
-            entry(
-                &mut transcript,
-                if role == "assistant" {
-                    "ASSISTANT"
-                } else {
-                    "USER"
-                },
-                &line,
-            );
-        }
-        if checkpoint {
-            continue;
-        }
-        if let Some(parts) = content.as_array() {
-            for part in parts {
-                match part.get("type").and_then(Value::as_str) {
-                    Some("tool_use") => entry(&mut transcript, "ASSISTANT_TOOL_CALL", &json!({
-                        "id": part.get("id"), "name": part.get("name"), "arguments": part.get("input")
-                    }).to_string()),
-                    Some("tool_result") => entry(&mut transcript, "TOOL_RESULT", &json!({
-                        "tool_call_id": part.get("tool_use_id"), "content": part.get("content"),
-                        "is_error": part.get("is_error")
-                    }).to_string()),
-                    _ => {}
-                }
-            }
+        if Some(index) == last_conversation {
+            last_text = line;
         }
     }
     // 单条对话消息且无工具结果 = 首轮流对话:直接取原文,不拼续接尾巴。
@@ -179,14 +150,12 @@ pub(super) fn user_text(body: &Value, checkpoint: bool) -> Result<UserInput, Cur
                     .iter()
                     .any(|part| part.get("type").and_then(Value::as_str) == Some("tool_result"))
             });
-    let mut result = if checkpoint || single_turn_without_results {
-        transcript
-            .trim_end()
-            .strip_prefix("USER: ")
-            .unwrap_or(transcript.trim_end())
-            .to_string()
+    let mut result = if !single_turn_without_results && !checkpoint && last_text.is_empty() {
+        // 历史伪造模式末条纯 tool_result:历史已编入 root prompt blob,
+        // UserText 用续接尾巴引导模型继续
+        CONTINUATION_TAIL.to_string()
     } else {
-        format!("{transcript}The above is the previous conversation context including tool call results.\nContinue your response based on this context.\n\nContinue from the conversation above.")
+        last_text
     };
     result.push_str(&output_constraints(body)?);
     Ok(UserInput {

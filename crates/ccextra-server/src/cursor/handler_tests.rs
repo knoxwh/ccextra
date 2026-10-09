@@ -914,8 +914,8 @@ async fn retries_503_before_output_but_not_connect_429() {
 }
 
 #[tokio::test]
-async fn lost_tool_continuation_falls_back_to_flatten() {
-    // 模拟进程重启:registry 无驻留会话,工具续接请求回退 flatten 而非 400
+async fn lost_tool_continuation_falls_back_to_history_fabrication() {
+    // 模拟进程重启:registry 无驻留会话,工具续接请求回退历史伪造而非 400
     let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
     let url = format!("http://{}", listener.local_addr().unwrap());
     let captured = Arc::new(Mutex::new(Vec::new()));
@@ -957,10 +957,18 @@ async fn lost_tool_continuation_falls_back_to_flatten() {
     assert_eq!(status, StatusCode::OK, "{text}");
     let data: Value = serde_json::from_str(&text).unwrap();
     assert_eq!(data["content"][0]["text"], "recovered");
-    // flatten 请求应把工具调用与结果渲染进 UserText 文本
+    // 历史伪造请求:工具调用与结果编进 root prompt blob(二进制 proto 载荷),
+    // UserText 只留续接尾巴,不再渲染 ASSISTANT_TOOL_CALL/TOOL_RESULT 文本
     let payload = String::from_utf8_lossy(&captured.lock().unwrap()).to_string();
-    assert!(payload.contains("ASSISTANT_TOOL_CALL"), "缺少工具调用文本");
-    assert!(payload.contains("TOOL_RESULT"), "缺少工具结果文本");
+    assert!(
+        !payload.contains("ASSISTANT_TOOL_CALL"),
+        "不应再有 flatten 文本"
+    );
+    assert!(!payload.contains("TOOL_RESULT"), "不应再有 flatten 文本");
+    assert!(
+        payload.contains("Continue from the conversation above"),
+        "末条纯 tool_result 应带续接尾巴"
+    );
     tokio::time::timeout(Duration::from_secs(5), server)
         .await
         .unwrap()
