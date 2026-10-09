@@ -22,8 +22,8 @@ impl CursorReply {
     ///
     /// - message_start.input_tokens: 估算值（请求体字节/4）
     /// - message_start.output_tokens: 0（TokenDelta 流式到达时才累加）
-    /// - message_delta.usage: TurnEnded 自校验——cache 字段与 input 整除时
-    ///   上报真值,否则按 1%/99% 假拆分;output 用 TokenDelta 累计
+    /// - message_delta.usage: TurnEnded 自校验——read+write≤input 时上报
+    ///   真值（input=总输入减缓存子集），否则按 1%/99% 假拆分;output 用 TokenDelta 累计
     ///
     /// Claude Code 应读取 message_delta 获得最终准确 usage。
     pub fn new(id: String, model: String, input_tokens: usize) -> Self {

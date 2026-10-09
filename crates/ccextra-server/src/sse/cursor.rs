@@ -69,10 +69,10 @@ impl CursorSse {
             }
             ServerMessage::TurnEnded(usage) => {
                 self.turn_ended = true;
-                // field 1 是本轮完整输入(≈ context 大小)。field 3/4 语义
-                // 三份逆向文档一致(本轮 cache 拆分),但实测曾疑累计:
-                // 自校验——read+write==input 时上报真值(Anthropic 口径
-                // input=非缓存部分),否则回退 1%/99% 假拆分
+                // field 1 是本轮总输入(缓存+非缓存),field 3/4 是缓存子集
+                // (2026-10-09 活体样本:11292=11232+0+60、7952=1120+0+6832)。
+                // Anthropic 口径 input=非缓存部分,即 input-read-write;
+                // 守卫 read+write<=input,越界(如累计语义)回退 1%/99% 假拆分
                 // (input 1% + cache_read 99% = 真实 context)。
                 if let Some(input) = usage.input_tokens.filter(|tokens| *tokens > 0) {
                     self.reported_input = Some(input);
@@ -82,9 +82,9 @@ impl CursorSse {
                         (Some(read), Some(write))
                             if read >= 0
                                 && write >= 0
-                                && read.checked_add(write) == Some(input) =>
+                                && read.checked_add(write).is_some_and(|sum| sum <= input) =>
                         {
-                            self.input_tokens = (input - read - write).max(0);
+                            self.input_tokens = input - read - write;
                             self.cache_read_tokens = read;
                             self.cache_creation_tokens = write;
                             tracing::info!(
@@ -311,8 +311,7 @@ mod tests {
         let mut state = CursorSse::new("message-5", "composer-2", 10);
         let mut frames = state.handle(&ServerMessage::TextDelta("answer".into()));
         frames.extend(state.handle(&ServerMessage::TokenDelta(3)));
-        // 文档实例形状:input 6759 = read 5120 + write 1639,恰好整除,
-        // Anthropic 口径非缓存部分为 0(上下文条 = 0+5120+1639 = 6759)
+        // 文档实例形状:input 6759 = read 5120 + write 1639,非缓存部分为 0
         frames.extend(state.handle(&ServerMessage::TurnEnded(TurnUsage {
             input_tokens: Some(6759),
             output_tokens: Some(200),
@@ -333,6 +332,71 @@ mod tests {
     }
 
     #[test]
+    fn turn_ended_real_cache_split_when_sum_below_input() {
+        let mut state = CursorSse::new("message-7", "composer-2", 10);
+        let mut frames = state.handle(&ServerMessage::TextDelta("answer".into()));
+        frames.extend(state.handle(&ServerMessage::TokenDelta(3)));
+        // 活体样本(2026-10-09 探针 E):input 11292 = read 11232 + write 0
+        // + 非缓存 60;input 是总输入,Anthropic 口径取差值
+        frames.extend(state.handle(&ServerMessage::TurnEnded(TurnUsage {
+            input_tokens: Some(11292),
+            output_tokens: Some(58),
+            cache_read_tokens: Some(11232),
+            cache_write_tokens: Some(0),
+        })));
+        frames.extend(state.finish(false));
+        let delta = event(&frames[frames.len() - 2]).1["usage"].clone();
+        assert_eq!(delta["input_tokens"], 60);
+        assert_eq!(delta["output_tokens"], 3);
+        assert_eq!(delta["cache_read_input_tokens"], 11232);
+        // write 为 0 时省略 cache_creation,与 message_delta 形状一致
+        assert!(delta.get("cache_creation_input_tokens").is_none());
+        // 非流式 JSON 路径与流式 message_delta 同源
+        let usage = state.usage_json();
+        assert_eq!(usage["input_tokens"], 60);
+        assert_eq!(usage["cache_read_input_tokens"], 11232);
+        assert!(usage.get("cache_creation_input_tokens").is_none());
+    }
+
+    #[test]
+    fn turn_ended_real_cache_split_when_all_fields_nonzero() {
+        let mut state = CursorSse::new("message-8", "composer-2", 10);
+        let mut frames = state.handle(&ServerMessage::TextDelta("answer".into()));
+        frames.extend(state.handle(&ServerMessage::TokenDelta(3)));
+        // 三项均非零:input 100 = read 60 + write 30 + 非缓存 10
+        frames.extend(state.handle(&ServerMessage::TurnEnded(TurnUsage {
+            input_tokens: Some(100),
+            output_tokens: Some(40),
+            cache_read_tokens: Some(60),
+            cache_write_tokens: Some(30),
+        })));
+        frames.extend(state.finish(false));
+        let delta = event(&frames[frames.len() - 2]).1["usage"].clone();
+        assert_eq!(delta["input_tokens"], 10);
+        assert_eq!(delta["cache_read_input_tokens"], 60);
+        assert_eq!(delta["cache_creation_input_tokens"], 30);
+    }
+
+    #[test]
+    fn turn_ended_falls_back_to_fake_split_on_negative_fields() {
+        let mut state = CursorSse::new("message-9", "composer-2", 10);
+        let mut frames = state.handle(&ServerMessage::TextDelta("answer".into()));
+        frames.extend(state.handle(&ServerMessage::TokenDelta(3)));
+        // varint 溢出成负 i64:负值穿透防御,回退假拆分
+        frames.extend(state.handle(&ServerMessage::TurnEnded(TurnUsage {
+            input_tokens: Some(1000),
+            output_tokens: Some(200),
+            cache_read_tokens: Some(-1),
+            cache_write_tokens: Some(500),
+        })));
+        frames.extend(state.finish(false));
+        let delta = event(&frames[frames.len() - 2]).1["usage"].clone();
+        assert_eq!(delta["input_tokens"], 10);
+        assert_eq!(delta["cache_read_input_tokens"], 990);
+        assert!(delta.get("cache_creation_input_tokens").is_none());
+    }
+
+    #[test]
     fn turn_ended_falls_back_to_fake_split_when_sum_mismatches() {
         let mut state = CursorSse::new("message-6", "composer-2", 10);
         let mut frames = state.handle(&ServerMessage::TextDelta("answer".into()));
@@ -344,7 +408,7 @@ mod tests {
             cache_write_tokens: Some(600),
         })));
         frames.extend(state.finish(false));
-        // 600+600=1200 ≠ 1000(累计语义为真):回退 1%/99% 假拆分
+        // 600+600=1200 > 1000(累计语义为真):越界回退 1%/99% 假拆分
         let delta = event(&frames[frames.len() - 2]).1["usage"].clone();
         assert_eq!(delta["input_tokens"], 10);
         assert_eq!(delta["cache_read_input_tokens"], 990);
