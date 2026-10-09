@@ -39,6 +39,10 @@ pub struct Config {
     /// Cursor 客户端版本头覆盖(可选);默认 cli-2026.10.01-e373342
     #[serde(default)]
     pub cursor_client_version: Option<String>,
+    /// Cursor 传输模式(可选):`bidi`(默认,BiDi Run 单流)或
+    /// `sse`(RunSSE 读 + BidiAppend 写双通道,双向流被掐环境用)
+    #[serde(default)]
+    pub cursor_transport: Option<String>,
     /// Antigravity 连接池配置(可选);默认短连接
     #[serde(default)]
     pub antigravity: Option<AntigravityConfig>,
@@ -85,6 +89,11 @@ impl Config {
                 let hashed = bcrypt::hash(secret, bcrypt::DEFAULT_COST)?;
                 config.secret_key = Some(hashed.clone());
                 persist_secret(path, &content, &hashed)?;
+            }
+        }
+        if let Some(transport) = config.cursor_transport.as_deref() {
+            if !matches!(transport, "bidi" | "sse") {
+                anyhow::bail!("cursor_transport 仅支持 bidi 或 sse,当前: {transport}");
             }
         }
 
@@ -327,6 +336,38 @@ models_file: "custom-models.json"
         file.write_all(yaml.as_bytes()).unwrap();
         let config = Config::load(file.path().to_str().unwrap()).unwrap();
         assert_eq!(config.models_file.as_deref(), Some("custom-models.json"));
+    }
+
+    #[test]
+    fn config_rejects_invalid_cursor_transport() {
+        use std::io::Write;
+        let yaml = r#"
+server: { host: 127.0.0.1, port: 8222 }
+providers: []
+normalize: { enabled: false, drift_detector: false }
+logging: { level: info, request_body: false }
+cursor_transport: websocket
+"#;
+        let mut file = NamedTempFile::new().unwrap();
+        file.write_all(yaml.as_bytes()).unwrap();
+        let error = Config::load(file.path().to_str().unwrap()).unwrap_err();
+        assert!(error.to_string().contains("cursor_transport"));
+    }
+
+    #[test]
+    fn config_accepts_cursor_transport_sse() {
+        use std::io::Write;
+        let yaml = r#"
+server: { host: 127.0.0.1, port: 8222 }
+providers: []
+normalize: { enabled: false, drift_detector: false }
+logging: { level: info, request_body: false }
+cursor_transport: sse
+"#;
+        let mut file = NamedTempFile::new().unwrap();
+        file.write_all(yaml.as_bytes()).unwrap();
+        let config = Config::load(file.path().to_str().unwrap()).unwrap();
+        assert_eq!(config.cursor_transport.as_deref(), Some("sse"));
     }
 
     #[test]

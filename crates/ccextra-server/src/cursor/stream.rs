@@ -21,9 +21,9 @@ const READ_IDLE_TIMEOUT: Duration = Duration::from_secs(90);
 const HEARTBEAT_INTERVAL: Duration = Duration::from_secs(5);
 const H2_DATA_SIZE: usize = 16 * 1024;
 
-trait Transport: AsyncRead + AsyncWrite + Unpin + Send {}
+pub(super) trait Transport: AsyncRead + AsyncWrite + Unpin + Send {}
 impl<T: AsyncRead + AsyncWrite + Unpin + Send> Transport for T {}
-type BoxTransport = Box<dyn Transport>;
+pub(super) type BoxTransport = Box<dyn Transport>;
 
 pub struct CursorStream {
     status: StatusCode,
@@ -162,7 +162,7 @@ impl Drop for CursorStream {
     }
 }
 
-async fn send_bytes(stream: &mut SendStream<Bytes>, mut data: &[u8]) -> Result<()> {
+pub(super) async fn send_bytes(stream: &mut SendStream<Bytes>, mut data: &[u8]) -> Result<()> {
     while !data.is_empty() {
         let wanted = data.len().min(H2_DATA_SIZE);
         stream.reserve_capacity(wanted);
@@ -180,7 +180,7 @@ async fn send_bytes(stream: &mut SendStream<Bytes>, mut data: &[u8]) -> Result<(
     Ok(())
 }
 
-async fn connect(url: &Url, proxy_url: Option<&str>) -> Result<BoxTransport> {
+pub(super) async fn connect(url: &Url, proxy_url: Option<&str>) -> Result<BoxTransport> {
     let host = url
         .host_str()
         .ok_or_else(|| anyhow!("Cursor base_url has no host"))?;
@@ -258,7 +258,7 @@ async fn connect(url: &Url, proxy_url: Option<&str>) -> Result<BoxTransport> {
     Ok(transport)
 }
 
-fn host_port(host: &str, port: u16) -> String {
+pub(super) fn host_port(host: &str, port: u16) -> String {
     if host.contains(':') && !host.starts_with('[') {
         format!("[{host}]:{port}")
     } else {
@@ -266,7 +266,7 @@ fn host_port(host: &str, port: u16) -> String {
     }
 }
 
-async fn tcp_connect(host: &str, port: u16) -> Result<TcpStream> {
+pub(super) async fn tcp_connect(host: &str, port: u16) -> Result<TcpStream> {
     let socket = timeout(CONNECT_TIMEOUT, TcpStream::connect(host_port(host, port)))
         .await
         .context("Cursor TCP connect timed out")??;
@@ -274,7 +274,11 @@ async fn tcp_connect(host: &str, port: u16) -> Result<TcpStream> {
     Ok(socket)
 }
 
-async fn tls(socket: BoxTransport, host: &str, require_h2: bool) -> Result<BoxTransport> {
+pub(super) async fn tls(
+    socket: BoxTransport,
+    host: &str,
+    require_h2: bool,
+) -> Result<BoxTransport> {
     let mut roots = rustls::RootCertStore::empty();
     let native = rustls_native_certs::load_native_certs();
     for certificate in native.certs {

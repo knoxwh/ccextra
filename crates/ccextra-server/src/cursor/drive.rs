@@ -1,9 +1,9 @@
 use super::error::CursorFailure;
 use super::stream::CursorStream;
 use ccextra_core::convert::cursor::proto::{
-    decode_agent_server_message, parse_connect_end_stream, reply, ConnectFrame,
-    ConnectFrameDecoder, ExecKind, ExecRequest, ServerMessage, TurnUsage, CONNECT_END_STREAM_FLAG,
-    DEFAULT_MAX_FRAME_SIZE,
+    decode_agent_server_message, decode_agent_server_message_json, parse_connect_end_stream, reply,
+    ConnectFrame, ConnectFrameDecoder, ExecKind, ExecRequest, ServerMessage, TurnUsage,
+    CONNECT_END_STREAM_FLAG, DEFAULT_MAX_FRAME_SIZE,
 };
 use ccextra_core::convert::cursor::{decode_mcp_args, CursorRunRequest};
 use serde_json::Value;
@@ -19,8 +19,49 @@ pub enum CursorEvent {
     End,
 }
 
+/// 传输选择:BiDi Run 单流(proto 载荷)或 RunSSE+BidiAppend 双通道(JSON 载荷)
+pub enum CursorWire {
+    Run(CursorStream),
+    Sse(super::dual::DualChannel),
+}
+
+impl CursorWire {
+    pub async fn send_message(&self, payload: &[u8]) -> Result<(), anyhow::Error> {
+        match self {
+            CursorWire::Run(stream) => stream.send_message(payload).await,
+            CursorWire::Sse(dual) => dual.send_message(payload).await,
+        }
+    }
+
+    pub async fn next_chunk(&mut self) -> Result<Option<bytes::Bytes>, anyhow::Error> {
+        match self {
+            CursorWire::Run(stream) => stream.next_chunk().await,
+            CursorWire::Sse(dual) => dual.next_chunk().await,
+        }
+    }
+
+    pub fn status(&self) -> axum::http::StatusCode {
+        match self {
+            CursorWire::Run(stream) => stream.status(),
+            CursorWire::Sse(dual) => dual.status(),
+        }
+    }
+
+    pub fn headers(&self) -> &axum::http::HeaderMap {
+        match self {
+            CursorWire::Run(stream) => stream.headers(),
+            CursorWire::Sse(dual) => dual.headers(),
+        }
+    }
+
+    /// 读侧载荷是否为 JSON(双通道 RunSSE)
+    fn json_wire(&self) -> bool {
+        matches!(self, CursorWire::Sse(_))
+    }
+}
+
 pub struct CursorDrive {
-    stream: CursorStream,
+    stream: CursorWire,
     decoder: ConnectFrameDecoder,
     pending: VecDeque<ServerMessage>,
     frames: VecDeque<ConnectFrame>,
@@ -30,7 +71,7 @@ pub struct CursorDrive {
 }
 
 impl CursorDrive {
-    pub fn new(stream: CursorStream, request: CursorRunRequest) -> Self {
+    pub fn new(stream: CursorWire, request: CursorRunRequest) -> Self {
         Self {
             stream,
             decoder: ConnectFrameDecoder::new(DEFAULT_MAX_FRAME_SIZE),
@@ -114,8 +155,13 @@ impl CursorDrive {
             let data = frame
                 .decoded_payload(DEFAULT_MAX_FRAME_SIZE)
                 .map_err(CursorFailure::from_transport)?;
-            self.pending
-                .extend(decode_agent_server_message(&data).map_err(CursorFailure::from_transport)?);
+            let decoded = if self.stream.json_wire() {
+                decode_agent_server_message_json(&data)
+            } else {
+                decode_agent_server_message(&data)
+            }
+            .map_err(CursorFailure::from_transport)?;
+            self.pending.extend(decoded);
         }
     }
 

@@ -129,14 +129,17 @@ Gemini 函数调用模式。Antigravity Claude 模型强制使用；Gemini 直�
 **connect-rpc 双向流**
 Cursor 原生传输：`agent.v1.AgentService/Run`（h2 + rustls 直连 api2.cursor.sh），Connect 帧 `[1B flags][4B len BE][payload]`。请求头含 `content-type: application/connect+proto`、`connect-protocol-version: 1`、`te: trailers`、`x-ghost-mode: true`、`x-cursor-client-version`、`x-cursor-client-type: cli`；无 checksum、无 x-client-key。出站代理复用全局 `proxy`（HTTP CONNECT 隧道）。
 
+**双通道传输**
+`cursor_transport: sse` 启用的 Cursor 备用传输（默认 `bidi` 即上面的双向流）：读 `AgentService/RunSSE`（connect+json 服务端流，响应帧载荷为 JSON）+ 写 `BidiService/BidiAppend`（unary JSON，`data` 为 proto hex，`appendSeqno` 从 0 递增，首条 runRequest），两条独立 h2 连接按 requestId 关联。对应 CLI 的 HTTP/1.1 回退路径，双向流被掐环境用；协议消息层与 BiDi Run 一致，仅读侧载荷格式不同。
+
 **Run**
-一次 `AgentService/Run` 双向流调用，对应一个会话回合。服务端事件归一为 text/thinking 增量、tool 调用、TurnEnded 与 checkpoint。TurnEnded 只表示这一步生成结束，成功终态仍是 Connect end-stream；工具驻留期间忽略 TurnEnded，不取消会话。服务端 InteractionQuery（web_search/ask_question 等）必须回 InteractionResponse，否则挂死整流。用量读 TurnEnded field 1（本轮完整输入，≈ context 大小）与 field 3/4（cache_read/cache_write，三份逆向文档一致但实测曾疑累计）：自校验 `read+write==input` 时上报真值（Anthropic 口径 input 为非缓存部分，通常 0），否则按真值 1%/99% 拆分（input 1% + cache_read 99% 假数据，相加即真实 context），output 为本响应 TokenDelta 累计。
+一次 `AgentService/Run` 双向流调用，对应一个会话回合。服务端事件归一为 text/thinking 增量、tool 调用、TurnEnded 与 checkpoint。TurnEnded 只表示这一步生成结束，成功终态仍是 Connect end-stream；工具驻留期间忽略 TurnEnded，不取消会话。服务端 InteractionQuery（web_search/ask_question 等）必须回 InteractionResponse，否则挂死整流。用量读 TurnEnded field 1（本轮总输入，缓存+非缓存）与 field 3/4（cache_read/cache_write 缓存子集）：自校验 `read+write≤input` 且非负时上报真值（Anthropic 口径 input 为总输入减缓存子集），越界按真值 1%/99% 拆分（input 1% + cache_read 99% 假数据，相加即真实 context），output 为本响应 TokenDelta 累计。
 
 **InteractionQuery**
 服务端下发的交互查询（web_search/ask_question/switch_mode/exa_search/exa_fetch/create_plan/setup_vm）。ccextra 按种类回 reject/error（SetupVm 回空 success），不提供交互能力。
 
 **pending callback**
-Agent 回合中已发起但未收到结果的工具副作用。驻留会话丢失时冷续接 flatten 全量 transcript 重新起跑，崩溃窗口内的 pending callback 可能重复执行，由客户端 tool_result 幂等性兜底。
+Agent 回合中已发起但未收到结果的工具副作用。驻留会话丢失时冷续接走历史伪造（root prompt blob + turns）重新起跑，崩溃窗口内的 pending callback 可能重复执行，由客户端 tool_result 幂等性兜底。
 
 **journal 回放缓存**
 按回合摘要内存缓存的已发布 SSE 帧。同摘要重复请求（断线重连/singleflight）直接回放缓存帧，不重跑上游；进程重启即失效。

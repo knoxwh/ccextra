@@ -35,6 +35,8 @@ pub struct CursorConfig {
     pub base_url: Option<String>,
     /// 客户端版本头覆盖
     pub client_version: Option<String>,
+    /// 传输模式:`bidi`(默认)或 `sse`(RunSSE+BidiAppend 双通道)
+    pub transport: Option<String>,
 }
 
 /// 启用判定:cursor_auth_dir 存在且 trim 后非空
@@ -311,6 +313,9 @@ pub async fn load_cursor_provider(
         super::provider::credential_fingerprint(&credential),
     );
     metadata.insert("client_version".to_string(), client_version);
+    if let Some(transport) = config.transport.as_deref() {
+        metadata.insert("transport".to_string(), transport.to_string());
+    }
     Some(synthesize_cursor_provider(models, &base_url, metadata))
 }
 

@@ -14,6 +14,8 @@ pub enum WireError {
     LengthOverflow,
     #[error("server aborted the session")]
     ServerAbort,
+    #[error("cursor json wire: {0}")]
+    Json(String),
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]

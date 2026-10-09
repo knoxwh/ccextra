@@ -4,6 +4,7 @@ pub mod catalog;
 pub mod constants;
 pub mod credential;
 pub mod drive;
+pub mod dual;
 pub mod error;
 pub mod handler;
 mod journal;

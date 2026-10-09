@@ -572,6 +572,8 @@ pub(crate) async fn handle_cursor(
         .get("client_version")
         .map(String::as_str)
         .unwrap_or(DEFAULT_CLIENT_VERSION);
+    // 传输选择:bidi(默认,BiDi Run 单流)或 sse(RunSSE+BidiAppend 双通道)
+    let use_dual_channel = metadata.get("transport").map(String::as_str) == Some("sse");
     let base_url = prepared
         .upstream_base_urls
         .first()
@@ -707,8 +709,9 @@ pub(crate) async fn handle_cursor(
             }
             Err(TakeError::Lost(reason)) => {
                 // 驻留会话丢失(进程重启/TTL 过期/模型或工具目录变更):对齐 Plus,
-                // 冷分支 flatten 全量 transcript(含 tool_use/tool_result 文本)重新起跑
-                tracing::warn!("Cursor 工具续接会话丢失,回退 flatten: {reason}");
+                // 冷分支走历史伪造(root prompt blob + turns,含 tool_use/tool_result)
+                // 重新起跑,不再 flatten 全量 UserText
+                tracing::warn!("Cursor 工具续接会话丢失,回退历史伪造: {reason}");
                 None
             }
         };
@@ -834,16 +837,31 @@ pub(crate) async fn handle_cursor(
         )
         .map_err(|err| AppError::bad_request(err.to_string()))?;
         let request_id = uuid()?;
-        let opened = CursorStream::open(
-            base_url,
-            &token,
-            client_version,
-            &request_id,
-            run_proxy,
-            &request.payload,
-        )
-        .await
-        .map_err(CursorFailure::from_transport);
+        let opened = if use_dual_channel {
+            super::dual::DualChannel::open(
+                base_url,
+                &token,
+                client_version,
+                &request_id,
+                run_proxy,
+                &request.payload,
+            )
+            .await
+            .map(super::drive::CursorWire::Sse)
+            .map_err(CursorFailure::from_transport)
+        } else {
+            CursorStream::open(
+                base_url,
+                &token,
+                client_version,
+                &request_id,
+                run_proxy,
+                &request.payload,
+            )
+            .await
+            .map(super::drive::CursorWire::Run)
+            .map_err(CursorFailure::from_transport)
+        };
         let result = match opened {
             Ok(stream) if stream.status().is_success() => {
                 let mut drive = CursorDrive::new(stream, request);

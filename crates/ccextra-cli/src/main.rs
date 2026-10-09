@@ -465,6 +465,7 @@ fn cursor_config_from(config_path: &str, cfg: &Config) -> Option<CursorConfig> {
         models: cfg.cursor_models.clone().unwrap_or_default(),
         base_url: cfg.cursor_base_url.clone(),
         client_version: cfg.cursor_client_version.clone(),
+        transport: cfg.cursor_transport.clone(),
     })
 }
 

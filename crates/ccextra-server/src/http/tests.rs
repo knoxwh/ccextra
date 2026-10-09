@@ -2955,6 +2955,7 @@ fn cursor_native_config(
         models: vec![],
         base_url: Some(base_url),
         client_version: Some("cli-test".to_string()),
+        transport: None,
     }
 }
 
