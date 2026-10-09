@@ -140,7 +140,7 @@ fn handle_producer_settle(
         sessions.finish(conversation, identity, generation);
     }
     let snapshot = serde_json::to_vec(&reply.json()).map_err(CursorFailure::from_transport)?;
-    // input 固定为请求体字节/4(count_tokens 与下轮占位复用)
+    // input 优先 TurnEnded 真值,缺省退请求体字节/4(count_tokens 与下轮占位复用)
     let settled_input = reply.estimated_input();
     if let (Some(sid), true) = (session_id, settled_input > 0) {
         let _ = token_cache

@@ -14,8 +14,10 @@ pub struct CursorSse {
     model: String,
     input_tokens: i64,
     output_tokens: i64,
+    // TurnEnded 上报的真实 input(未收到为 None)
+    reported_input: Option<i64>,
+    // 假数据:真实 input 的 99%(input_tokens 占 1%,相加即真实 context)
     cache_read_tokens: i64,
-    cache_write_tokens: i64,
     next_index: i64,
     block: Option<Block>,
     started: bool,
@@ -32,8 +34,8 @@ impl CursorSse {
             model: model.into(),
             input_tokens: i64::try_from(input_tokens).unwrap_or(i64::MAX),
             output_tokens: 0,
+            reported_input: None,
             cache_read_tokens: 0,
-            cache_write_tokens: 0,
             next_index: 0,
             block: None,
             started: false,
@@ -64,12 +66,14 @@ impl CursorSse {
             }
             ServerMessage::TurnEnded(usage) => {
                 self.turn_ended = true;
-                // 提取 TurnEnded 携带的 cache token
-                if let Some(cache_read) = usage.cache_read_tokens {
-                    self.cache_read_tokens = cache_read;
-                }
-                if let Some(cache_write) = usage.cache_write_tokens {
-                    self.cache_write_tokens = cache_write;
+                // field 1 是本轮完整输入(≈ context 大小);上游 cache 字段
+                // 疑似跨回合累计,不采用。按 1%/99% 拆分写假数据:
+                // input_tokens 1% + cache_read 99% = 真实 context,
+                // Claude Code 上下文条正确且显示缓存命中。
+                if let Some(input) = usage.input_tokens.filter(|tokens| *tokens > 0) {
+                    self.reported_input = Some(input);
+                    self.input_tokens = input / 100;
+                    self.cache_read_tokens = input - input / 100;
                 }
                 // output_tokens 优先用 TokenDelta 累计值，TurnEnded 作为兜底
                 if self.output_tokens == 0 {
@@ -151,7 +155,7 @@ impl CursorSse {
             frames.push(emit::content_block_start_text(self.next_index));
             frames.push(emit::content_block_stop(self.next_index));
         }
-        // TurnEnded 现已解析 cache token。input 仍用请求体估算，
+        // input 用 TurnEnded 真值按 1%/99% 拆分(cache_read 为假数据),
         // output 用 TokenDelta 累计（TurnEnded 作兜底）。
         frames.push(emit::message_delta(
             if tool_use || self.has_tool_use {
@@ -163,7 +167,7 @@ impl CursorSse {
             self.input_tokens,
             self.output_tokens,
             self.cache_read_tokens,
-            self.cache_write_tokens,
+            0,
             -1,
         ));
         frames.push(emit::message_stop());
@@ -188,6 +192,11 @@ impl CursorSse {
         self.turn_ended
     }
 
+    /// TurnEnded 上报的真实 input(未收到时 None)
+    pub fn reported_input_tokens(&self) -> Option<i64> {
+        self.reported_input
+    }
+
     /// 导出 usage JSON（供非流式 JSON 响应使用）
     pub fn usage_json(&self) -> serde_json::Value {
         use serde_json::json;
@@ -195,7 +204,7 @@ impl CursorSse {
             "input_tokens": self.input_tokens,
             "output_tokens": self.output_tokens,
             "cache_read_input_tokens": self.cache_read_tokens,
-            "cache_creation_input_tokens": self.cache_write_tokens
+            "cache_creation_input_tokens": 0
         })
     }
 }
@@ -250,46 +259,40 @@ mod tests {
     }
 
     #[test]
-    fn turn_ended_does_not_override_estimate() {
+    fn turn_ended_input_splits_into_fake_cache() {
         let mut state = CursorSse::new("message-3", "composer-2", 10);
         let mut frames = state.handle(&ServerMessage::TextDelta("answer".into()));
         frames.extend(state.handle(&ServerMessage::TokenDelta(3)));
         frames.extend(state.handle(&ServerMessage::TurnEnded(TurnUsage {
             input_tokens: Some(1000),
             output_tokens: Some(200),
-            cache_read_tokens: Some(600),
-            cache_write_tokens: Some(50),
-            reasoning_tokens: Some(30),
         })));
         frames.extend(state.finish(false));
-        // TurnEnded 现已解析 cache token。input 用估算,output 用 TokenDelta。
+        // field 1 真值 1000:input 1% + cache_read 99% = 1000;output 用 TokenDelta
         let delta = event(&frames[frames.len() - 2]).1["usage"].clone();
         assert_eq!(delta["input_tokens"], 10);
         assert_eq!(delta["output_tokens"], 3);
-        assert_eq!(delta["cache_read_input_tokens"], 600);
-        assert_eq!(delta["cache_creation_input_tokens"], 50);
+        assert_eq!(delta["cache_read_input_tokens"], 990);
+        assert!(delta.get("cache_creation_input_tokens").is_none());
         assert!(delta.get("output_tokens_details").is_none());
+        assert_eq!(state.reported_input_tokens(), Some(1000));
     }
 
     #[test]
-    fn continuation_turn_reports_estimate_not_cumulative_usage() {
+    fn continuation_turn_reports_turn_input_not_cumulative_usage() {
         let mut state = CursorSse::new("message-4", "composer-2", 40);
         let mut frames = state.handle(&ServerMessage::TextDelta("answer".into()));
         frames.extend(state.handle(&ServerMessage::TokenDelta(5)));
         frames.extend(state.handle(&ServerMessage::TurnEnded(TurnUsage {
             input_tokens: Some(366671),
             output_tokens: Some(29489),
-            cache_read_tokens: Some(1637760),
-            cache_write_tokens: Some(1000),
-            reasoning_tokens: Some(26578),
         })));
         frames.extend(state.finish(false));
-        // TurnEnded 现已解析 cache token
+        // 上游 cache 字段不采用:usage 只由 field 1 拆分而来
         let delta = event(&frames[frames.len() - 2]).1["usage"].clone();
-        assert_eq!(delta["input_tokens"], 40);
+        assert_eq!(delta["input_tokens"], 3666);
         assert_eq!(delta["output_tokens"], 5);
-        assert_eq!(delta["cache_read_input_tokens"], 1637760);
-        assert_eq!(delta["cache_creation_input_tokens"], 1000);
+        assert_eq!(delta["cache_read_input_tokens"], 363005);
         assert!(delta.get("output_tokens_details").is_none());
     }
 

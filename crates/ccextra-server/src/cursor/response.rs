@@ -20,10 +20,10 @@ pub struct CursorReply {
 impl CursorReply {
     /// 创建新回复（input_tokens 是请求体字节/4 估算）
     ///
-    /// Cursor TurnEnded 不携带用量。策略对齐 CLIProxyAPIPlus：
     /// - message_start.input_tokens: 估算值（请求体字节/4）
     /// - message_start.output_tokens: 0（TokenDelta 流式到达时才累加）
-    /// - message_delta.output_tokens: 本响应 TokenDelta 累计真实值
+    /// - message_delta.usage: TurnEnded field 1 真值按 1%/99% 拆分
+    ///   （input 1% + cache_read 99% = 真实 context），output 用 TokenDelta 累计
     ///
     /// Claude Code 应读取 message_delta 获得最终准确 usage。
     pub fn new(id: String, model: String, input_tokens: usize) -> Self {
@@ -127,9 +127,11 @@ impl CursorReply {
         frames
     }
 
-    /// 请求体字节/4 估算的 input(settle 写 token cache)
+    /// settle 写 token cache 的 input:TurnEnded 真值优先,缺省退请求体字节/4 估算
     pub fn estimated_input(&self) -> i64 {
-        self.input_tokens as i64
+        self.sse
+            .reported_input_tokens()
+            .unwrap_or(self.input_tokens as i64)
     }
 
     /// 回合是否已向上游推进(已产帧或已收 token 增量);失败后不可安全重试
@@ -148,7 +150,8 @@ impl CursorReply {
         } else {
             self.content.clone()
         };
-        // TurnEnded 现已解析 cache token。input 用请求体估算,output 用 TokenDelta 累计。
+        // usage 由 sse.usage_json() 导出:input 按 TurnEnded 真值 1%/99% 拆分,
+        // output 用 TokenDelta 累计。
         let usage = self.sse.usage_json();
         json!({
             "id": self.id, "type": "message", "role": "assistant", "model": self.model,

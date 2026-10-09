@@ -45,14 +45,13 @@ pub enum InteractionQueryKind {
     SetupVm,
 }
 
-/// 回合结束信号上的用量。当前 proto 没有这些字段，解码总是 None。
+/// 回合结束信号上的用量。字段号来自 @cursor/sdk 1.0.32 protobuf-es type info:
+/// 1 input_tokens|2 output_tokens|3 cache_read_tokens|4 cache_write_tokens|5 reasoning_tokens。
+/// 实测 field 1 是本轮完整输入(≈ context 大小);field 3 疑似跨回合累计,不采用。
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
 pub struct TurnUsage {
     pub input_tokens: Option<i64>,
     pub output_tokens: Option<i64>,
-    pub cache_read_tokens: Option<i64>,
-    pub cache_write_tokens: Option<i64>,
-    pub reasoning_tokens: Option<i64>,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]

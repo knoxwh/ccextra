@@ -75,13 +75,11 @@ pub fn decode_mcp(data: &[u8]) -> Result<ExecKind, WireError> {
     })
 }
 
-/// `TurnEndedUpdate` 解析 token usage 字段（逆向工程）。
-/// 根据实测日志与官方 SDK TokenUsage 接口推断字段映射：
-/// - 字段 1: 可能是 input_tokens（但值异常大，需验证）
-/// - 字段 2: output_tokens（与实际输出 token 数匹配）
-/// - 字段 3: cache_read_tokens
-/// - 字段 4: cache_write_tokens
-/// - 字段 5/6: 未知（可能是内部元数据或时间戳）
+/// `TurnEndedUpdate` 解析 token usage 字段。
+/// 字段号来自 @cursor/sdk 1.0.32 protobuf-es type info:
+/// 1 input_tokens|2 output_tokens|3 cache_read_tokens|4 cache_write_tokens|5 reasoning_tokens。
+/// 实测 field 1 是本轮完整输入(≈ context 大小);field 3 疑似跨回合累计,
+/// 上游 cache 值不采用(见 CursorSse TurnEnded 处理)。
 pub fn decode_turn_ended(data: &[u8]) -> Result<TurnUsage, WireError> {
     use crate::convert::cursor::proto::wire::Field;
 
@@ -92,25 +90,12 @@ pub fn decode_turn_ended(data: &[u8]) -> Result<TurnUsage, WireError> {
         if let Field::Varint { number, value } = field {
             match number {
                 1 => {
-                    // 字段 1 值异常大（如 11732），可能是累计或其他含义。
-                    // 暂不使用，避免误报。待验证后启用。
-                    tracing::debug!("TurnEnded 字段 1 (疑似 input): {}", value);
+                    usage.input_tokens = Some(*value as i64);
+                    tracing::info!("TurnEnded input_tokens: {}", value);
                 }
                 2 => {
                     usage.output_tokens = Some(*value as i64);
                     tracing::debug!("TurnEnded output_tokens: {}", value);
-                }
-                3 => {
-                    if *value > 0 {
-                        usage.cache_read_tokens = Some(*value as i64);
-                        tracing::info!("TurnEnded cache_read_tokens: {}", value);
-                    }
-                }
-                4 => {
-                    if *value > 0 {
-                        usage.cache_write_tokens = Some(*value as i64);
-                        tracing::info!("TurnEnded cache_write_tokens: {}", value);
-                    }
                 }
                 _ => {
                     tracing::debug!("TurnEnded 未知字段 {}: {}", number, value);
