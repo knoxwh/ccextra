@@ -47,11 +47,14 @@ pub enum InteractionQueryKind {
 
 /// 回合结束信号上的用量。字段号来自 @cursor/sdk 1.0.32 protobuf-es type info:
 /// 1 input_tokens|2 output_tokens|3 cache_read_tokens|4 cache_write_tokens|5 reasoning_tokens。
-/// 实测 field 1 是本轮完整输入(≈ context 大小);field 3 疑似跨回合累计,不采用。
+/// 实测 field 1 是本轮完整输入(≈ context 大小);field 3/4 语义三份逆向文档一致
+/// (本轮 cache 拆分),是否可信由 CursorSse 自校验(和==input 才采用)。
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
 pub struct TurnUsage {
     pub input_tokens: Option<i64>,
     pub output_tokens: Option<i64>,
+    pub cache_read_tokens: Option<i64>,
+    pub cache_write_tokens: Option<i64>,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]

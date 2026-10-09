@@ -303,9 +303,10 @@ fn mcp_state_and_subagent_exec_decode_and_reply() {
 }
 
 #[test]
-fn turn_ended_payload_decodes_input_and_output_only() {
+fn turn_ended_payload_decodes_all_usage_fields() {
     // 字段号来自 @cursor/sdk 1.0.32:1 input|2 output|3 cache_read|4 cache_write。
-    // 只取 1/2;上游 cache 字段(疑似跨回合累计)不采用。
+    // 三份逆向文档(reverse-cursor-agent 等)一致确认 3/4 语义;
+    // 是否本轮拆分由 CursorSse 自校验,解码层全量上报。
     let mut turn_ended = Vec::new();
     encode_tag(1, 0, &mut turn_ended);
     encode_varint(1000, &mut turn_ended);
@@ -321,6 +322,8 @@ fn turn_ended_payload_decodes_input_and_output_only() {
         vec![ServerMessage::TurnEnded(TurnUsage {
             input_tokens: Some(1000),
             output_tokens: Some(200),
+            cache_read_tokens: Some(600),
+            cache_write_tokens: Some(50),
         })]
     );
 

@@ -22,8 +22,8 @@ impl CursorReply {
     ///
     /// - message_start.input_tokens: 估算值（请求体字节/4）
     /// - message_start.output_tokens: 0（TokenDelta 流式到达时才累加）
-    /// - message_delta.usage: TurnEnded field 1 真值按 1%/99% 拆分
-    ///   （input 1% + cache_read 99% = 真实 context），output 用 TokenDelta 累计
+    /// - message_delta.usage: TurnEnded 自校验——cache 字段与 input 整除时
+    ///   上报真值,否则按 1%/99% 假拆分;output 用 TokenDelta 累计
     ///
     /// Claude Code 应读取 message_delta 获得最终准确 usage。
     pub fn new(id: String, model: String, input_tokens: usize) -> Self {
@@ -150,7 +150,7 @@ impl CursorReply {
         } else {
             self.content.clone()
         };
-        // usage 由 sse.usage_json() 导出:input 按 TurnEnded 真值 1%/99% 拆分,
+        // usage 由 sse.usage_json() 导出:TurnEnded 自校验真值或 1%/99% 假拆分,
         // output 用 TokenDelta 累计。
         let usage = self.sse.usage_json();
         json!({

@@ -78,8 +78,8 @@ pub fn decode_mcp(data: &[u8]) -> Result<ExecKind, WireError> {
 /// `TurnEndedUpdate` 解析 token usage 字段。
 /// 字段号来自 @cursor/sdk 1.0.32 protobuf-es type info:
 /// 1 input_tokens|2 output_tokens|3 cache_read_tokens|4 cache_write_tokens|5 reasoning_tokens。
-/// 实测 field 1 是本轮完整输入(≈ context 大小);field 3 疑似跨回合累计,
-/// 上游 cache 值不采用(见 CursorSse TurnEnded 处理)。
+/// 实测 field 1 是本轮完整输入(≈ context 大小);field 3/4 全量解码,
+/// 是否采用由 CursorSse 自校验(见 TurnEnded 处理)。
 pub fn decode_turn_ended(data: &[u8]) -> Result<TurnUsage, WireError> {
     use crate::convert::cursor::proto::wire::Field;
 
@@ -96,6 +96,14 @@ pub fn decode_turn_ended(data: &[u8]) -> Result<TurnUsage, WireError> {
                 2 => {
                     usage.output_tokens = Some(*value as i64);
                     tracing::debug!("TurnEnded output_tokens: {}", value);
+                }
+                3 => {
+                    usage.cache_read_tokens = Some(*value as i64);
+                    tracing::debug!("TurnEnded cache_read_tokens: {}", value);
+                }
+                4 => {
+                    usage.cache_write_tokens = Some(*value as i64);
+                    tracing::debug!("TurnEnded cache_write_tokens: {}", value);
                 }
                 _ => {
                     tracing::debug!("TurnEnded 未知字段 {}: {}", number, value);
