@@ -377,14 +377,30 @@ fn cache_chunk_metadata(chunk: &Value, state: &mut GeminiStreamState) {
     }
 }
 
-fn stop_reason_of(state: &GeminiStreamState) -> &'static str {
-    if state.saw_tool_call {
-        "tool_use"
-    } else if state.finish_reason == "MAX_TOKENS" {
-        "max_tokens"
-    } else {
-        "end_turn"
+/// 对齐 CPA resolveGeminiClaudeStopReason (a0d31924)
+pub(crate) fn resolve_gemini_claude_stop_reason(
+    finish_reason: &str,
+    saw_tool_call: bool,
+) -> &'static str {
+    if saw_tool_call {
+        return "tool_use";
     }
+    match finish_reason {
+        "MAX_TOKENS" => "max_tokens",
+        "SAFETY"
+        | "RECITATION"
+        | "PROHIBITED_CONTENT"
+        | "SPII"
+        | "BLOCKLIST"
+        | "MALFORMED_FUNCTION_CALL"
+        | "IMAGE_SAFETY" => "refusal",
+        "STOP" | "FINISH_REASON_UNSPECIFIED" | "UNKNOWN" | "" => "end_turn",
+        _ => "end_turn",
+    }
+}
+
+fn stop_reason_of(state: &GeminiStreamState) -> &'static str {
+    resolve_gemini_claude_stop_reason(&state.finish_reason, state.saw_tool_call)
 }
 
 /// 关块 + message_delta(对齐 CPA appendFinalEvents)
@@ -573,15 +589,10 @@ pub fn convert_gemini_response(
             .and_then(|f| f.as_str())
             .filter(|reason| !reason.is_empty())
             .unwrap_or("STOP");
-        let stop_reason = if saw_tool_call {
-            "tool_use"
-        } else {
-            match finish_reason {
-                "MAX_TOKENS" => "max_tokens",
-                _ => "end_turn",
-            }
-        };
-        anthropic["stop_reason"] = json!(stop_reason);
+        anthropic["stop_reason"] = json!(resolve_gemini_claude_stop_reason(
+            finish_reason,
+            saw_tool_call
+        ));
     }
 
     // 使用统计:非流 input = prompt - cached(负数钳 0);cached>0 写 cache_read(对齐 CPA 非流)
@@ -796,6 +807,52 @@ mod tests {
         });
         let anthropic = convert_gemini_response(&gemini, &HashMap::new(), None);
         assert_eq!(anthropic["content"][0]["input"], json!({}));
+    }
+
+    #[test]
+    fn test_convert_gemini_response_refusal_finish_reasons() {
+        // 对齐 CPA a0d31924:SAFETY/RECITATION/MALFORMED_FUNCTION_CALL 等映射为 refusal
+        for reason in [
+            "SAFETY",
+            "RECITATION",
+            "PROHIBITED_CONTENT",
+            "SPII",
+            "BLOCKLIST",
+            "MALFORMED_FUNCTION_CALL",
+            "IMAGE_SAFETY",
+        ] {
+            let gemini = json!({
+                "candidates": [{
+                    "content": {"parts": [{"text": "blocked"}], "role": "model"},
+                    "finishReason": reason
+                }]
+            });
+            let anthropic = convert_gemini_response(&gemini, &HashMap::new(), None);
+            assert_eq!(anthropic["stop_reason"], "refusal");
+        }
+    }
+
+    #[test]
+    fn test_finalize_gemini_stream_maps_refusal() {
+        let chunk = json!({
+            "candidates": [
+                {
+                    "content": {"parts": [{"text": "blocked"}]},
+                    "finishReason": "SAFETY"
+                }
+            ],
+            "usageMetadata": {"promptTokenCount": 10, "candidatesTokenCount": 5}
+        });
+        let mut state = GeminiStreamState {
+            has_content: true,
+            ..Default::default()
+        };
+        let events = finalize_gemini_stream(&chunk, &mut state);
+        let delta = events
+            .iter()
+            .find(|e| e["type"] == "message_delta")
+            .unwrap();
+        assert_eq!(delta["delta"]["stop_reason"], "refusal");
     }
 
     #[test]

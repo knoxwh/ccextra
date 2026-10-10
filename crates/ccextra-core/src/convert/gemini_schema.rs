@@ -110,6 +110,8 @@ fn clean_json_schema(schema: &Value, opts: CleanOptions) -> Value {
     cleanup_required_fields(&mut s);
     // Gemini protobuf 要求声明 items 的节点 type 为 ARRAY(对齐 CPA ffe6ad3c / Issue #6011)
     sanitize_array_items(&mut s);
+    // Gemini protobuf 要求声明 properties 的节点 type 为 OBJECT(对齐 CPA e1e3a811 / Issue #6394)
+    sanitize_object_properties(&mut s);
 
     // Phase 4: 空对象 schema 占位(Claude VALIDATED)
     if opts.add_placeholder {
@@ -647,6 +649,10 @@ fn flatten_any_of_one_of(schema: &mut Value) {
                 if has_null {
                     map.insert("nullable".into(), Value::Bool(true));
                 }
+                // 对齐 CPA e1e3a811:anyOf 分支 properties 合并进父节点后若父节点缺 type,强制补 object
+                if !map.contains_key("type") {
+                    map.insert("type".into(), Value::String("object".to_string()));
+                }
                 map.shift_remove(key);
                 continue;
             }
@@ -860,6 +866,48 @@ fn sanitize_array_items(schema: &mut Value) {
             map.insert("type".into(), Value::String("array".to_string()));
         } else if !schema_type_string(map.get("type")).eq_ignore_ascii_case("array") {
             map.shift_remove("items");
+        }
+    }
+
+    visit(schema, &mut Vec::new());
+}
+
+/// 对齐 CPA sanitizeObjectProperties (e1e3a811 / Issue #6394):
+/// 节点若声明 "properties"(且其值为对象),强制其 "type" 为 "object"。
+/// Gemini protobuf 校验器对 properties 与 required 执行严格断言($type == Type.OBJECT);
+/// 若 type 缺失或非 object,归一化为 object 保障 nested 属性与 required 有效。
+fn sanitize_object_properties(schema: &mut Value) {
+    fn visit(value: &mut Value, path: &mut Vec<String>) {
+        let keys: Vec<String> = match value {
+            Value::Object(map) => map.keys().cloned().collect(),
+            Value::Array(arr) => (0..arr.len()).map(|i| i.to_string()).collect(),
+            _ => return,
+        };
+        for key in keys {
+            let child = match value {
+                Value::Object(map) => map.get_mut(&key),
+                Value::Array(arr) => key.parse::<usize>().ok().and_then(|i| arr.get_mut(i)),
+                _ => None,
+            };
+            if let Some(child) = child {
+                if matches!(child, Value::Object(_) | Value::Array(_)) {
+                    path.push(key);
+                    visit(child, path);
+                    path.pop();
+                }
+            }
+        }
+        let Value::Object(map) = value else {
+            return;
+        };
+        if is_property_definition(path) {
+            return;
+        }
+        let Some(Value::Object(_)) = map.get("properties") else {
+            return;
+        };
+        if !schema_type_string(map.get("type")).eq_ignore_ascii_case("object") {
+            map.insert("type".into(), Value::String("object".to_string()));
         }
     }
 
@@ -1214,6 +1262,11 @@ fn repair_schema_node(
     // 2. 递归修复 properties(仅当 Step 1 未处理时)
     if !skip_step2 {
         if let Some(Value::Object(props_val)) = clone.get("properties").cloned() {
+            // 对齐 CPA e1e3a811:含 properties 但无 type 时显式置 type="object"
+            if !clone.contains_key("type") {
+                clone.insert("type".to_string(), Value::String("object".to_string()));
+                modified = true;
+            }
             let (repaired, promoted, props_mod) =
                 repair_property_map(props_val, add_missing_array_items);
             clone.insert("properties".to_string(), Value::Object(repaired));
@@ -2213,5 +2266,79 @@ mod tests {
         });
         flatten_type_arrays(&mut schema2, false);
         assert_eq!(schema2["type"], "string");
+    }
+
+    #[test]
+    fn test_clean_json_schema_enforces_object_type_for_properties() {
+        // 对齐 CPA e1e3a811 / TestCleanJSONSchema_EnforcesObjectTypeForProperties_Issue6394
+        let input_union = json!({
+            "type": "object",
+            "properties": {
+                "requestBody": {
+                    "type": "object",
+                    "properties": {
+                        "delivery": {
+                            "type": "object",
+                            "properties": {
+                                "endpoint": {
+                                    "type": ["string", "object"],
+                                    "properties": {"traces": {"type": "string"}},
+                                    "required": ["traces"]
+                                }
+                            },
+                            "required": ["endpoint"]
+                        }
+                    },
+                    "required": ["delivery"]
+                }
+            },
+            "required": ["requestBody"]
+        });
+
+        let input_primitive = json!({
+            "type": "object",
+            "properties": {
+                "endpoint": {
+                    "type": "string",
+                    "properties": {"traces": {"type": "string"}},
+                    "required": ["traces"]
+                }
+            }
+        });
+
+        let input_missing_type = json!({
+            "type": "object",
+            "properties": {
+                "endpoint": {
+                    "properties": {"traces": {"type": "string"}},
+                    "required": ["traces"]
+                }
+            }
+        });
+
+        for clean in [
+            clean_json_schema_for_gemini,
+            clean_json_schema_for_antigravity,
+        ] {
+            let out1 = clean(&input_union);
+            assert_eq!(
+                out1["properties"]["requestBody"]["properties"]["delivery"]["properties"]
+                    ["endpoint"]["type"],
+                "object"
+            );
+            assert!(
+                out1["properties"]["requestBody"]["properties"]["delivery"]["properties"]
+                    ["endpoint"]["properties"]["traces"]
+                    .is_object()
+            );
+
+            let out2 = clean(&input_primitive);
+            assert_eq!(out2["properties"]["endpoint"]["type"], "object");
+            assert!(out2["properties"]["endpoint"]["properties"]["traces"].is_object());
+
+            let out3 = clean(&input_missing_type);
+            assert_eq!(out3["properties"]["endpoint"]["type"], "object");
+            assert!(out3["properties"]["endpoint"]["properties"]["traces"].is_object());
+        }
     }
 }
