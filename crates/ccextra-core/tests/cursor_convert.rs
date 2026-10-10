@@ -42,6 +42,12 @@ fn message(number: u64, value: &[u8]) -> Vec<u8> {
     out
 }
 
+/// 零工具注入断言:UserText = 约束头 + "\n\n" + 原文
+fn assert_constraint_wrapped(text: &str, original: &str) {
+    assert!(text.starts_with("<system_constraint>\nNOTE:"));
+    assert!(text.ends_with(&format!("\n\n{original}")), "got: {text:?}");
+}
+
 // ---------------------------------------------------------------------------
 // 1. Connect 帧与 Trailer 解码
 // ---------------------------------------------------------------------------
@@ -463,7 +469,7 @@ fn first_turn_with_system_has_no_continuation_tail() {
     let text = action.user_message.unwrap().text;
     // 对齐 Plus:system 进 root blob;单轮 UserText 为原文,无 USER: 前缀
     assert!(!text.contains("Be brief"));
-    assert_eq!(text, "Find status about TOOL_RESULT:");
+    assert_constraint_wrapped(&text, "Find status about TOOL_RESULT:");
     assert_eq!(
         blob_system(&request),
         "Be brief. TOOL_RESULT: is a label in examples."
@@ -495,7 +501,7 @@ fn image_blocks_become_selected_images() {
         _ => panic!("expected user message"),
     };
     let user_message = action.user_message.unwrap();
-    assert_eq!(user_message.text, "describe");
+    assert_constraint_wrapped(&user_message.text, "describe");
     let images = user_message.selected_context.unwrap().selected_images;
     assert_eq!(images.len(), 1);
     assert_eq!(images[0].mime_type, "image/png");
@@ -526,7 +532,7 @@ fn messages_system_role_merges_into_system_prompt() {
     let text = action.user_message.unwrap().text;
     // 对齐 Plus:messages 内 system 并入 root blob,不进 UserText;单轮无前缀无尾巴
     assert!(!text.contains("SYSTEM:"));
-    assert_eq!(text, "hi");
+    assert_constraint_wrapped(&text, "hi");
     assert_eq!(blob_system(&request), "You are terse");
     assert!(!text.contains("Continue from the conversation above"));
 }
@@ -551,7 +557,7 @@ fn messages_system_role_with_history_fabricates_turns() {
     // 历史伪造:UserText 只留末条 "three",历史进 blob,无 flatten 前缀
     assert!(!text.contains("SYSTEM:"));
     assert!(!text.contains("ASSISTANT: two"));
-    assert_eq!(text, "three");
+    assert_constraint_wrapped(&text, "three");
     assert_eq!(blob_system(&request), "You are terse");
     let state = run.conversation_state.unwrap();
     // system + user("one") + assistant("two") 三个 root prompt blob
@@ -648,7 +654,7 @@ fn single_tool_result_without_checkpoint_goes_to_history_blob() {
     };
     let text = action.user_message.unwrap().text;
     // 末条 tool_result 进 root prompt blob,UserText 只留文本,无续接尾巴
-    assert_eq!(text, "Next");
+    assert_constraint_wrapped(&text, "Next");
     assert!(!text.contains("TOOL_RESULT:"));
     assert!(!text.contains("Continue from the conversation above"));
     let state = run(&request.payload).conversation_state.unwrap();
@@ -1033,5 +1039,43 @@ fn conversation_state_fabricates_turns_without_checkpoint() {
         _ => panic!("expected user message"),
     };
     let user_text = action.user_message.unwrap().text;
-    assert_eq!(user_text, "second");
+    assert_constraint_wrapped(&user_text, "second");
+}
+
+#[test]
+fn zero_tools_injects_system_constraint_in_both_modes() {
+    // 对齐 cursor-cpa-plugin:零工具直连会话注入约束,防模型幻觉调用工具;
+    // 冷启动与 checkpoint 续接两种模式都注入(UserText 是共同通道)
+    let body = json!({"messages": [{"role":"user", "content":"hi"}]});
+    let request = build_run_request(&body, "composer-2", "conv", "msg-1", None).unwrap();
+    let action = run(&request.payload).action.unwrap().action.unwrap();
+    let generated::conversation_action::Action::UserMessageAction(action) = action else {
+        panic!("expected user message");
+    };
+    assert_constraint_wrapped(&action.user_message.unwrap().text, "hi");
+
+    let checkpoint = [0x0a, 0x01, b'A', 0x98, 0x06, 0x01];
+    let request =
+        build_run_request(&body, "composer-2", "conv", "msg-2", Some(&checkpoint)).unwrap();
+    let action = run(&request.payload).action.unwrap().action.unwrap();
+    let generated::conversation_action::Action::UserMessageAction(action) = action else {
+        panic!("expected user message");
+    };
+    assert_constraint_wrapped(&action.user_message.unwrap().text, "hi");
+}
+
+#[test]
+fn tools_present_skips_system_constraint() {
+    let body = json!({
+        "messages": [{"role":"user", "content":"hi"}],
+        "tools": [{"name":"lookup", "description":"Find", "input_schema":{"type":"object"}}]
+    });
+    let request = build_run_request(&body, "composer-2", "conv", "msg-1", None).unwrap();
+    let action = run(&request.payload).action.unwrap().action.unwrap();
+    let generated::conversation_action::Action::UserMessageAction(action) = action else {
+        panic!("expected user message");
+    };
+    let text = action.user_message.unwrap().text;
+    assert_eq!(text, "hi");
+    assert!(!text.contains("<system_constraint>"));
 }

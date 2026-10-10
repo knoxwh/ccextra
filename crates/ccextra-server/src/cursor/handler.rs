@@ -4,8 +4,9 @@ use super::error::CursorFailure;
 use super::journal::ReplayStatus;
 use super::response::CursorReply;
 use super::session::{
-    compute_tool_catalog_fingerprint, compute_turn_digest, BeginOutcome, ConsumerGuard,
-    CursorSessions, InflightRun, RunOutcome, TakeError, ToolResult,
+    canonical_prefix_digest, compute_tool_catalog_fingerprint, compute_turn_digest, BeginOutcome,
+    CheckpointPrefix, ConsumerGuard, CursorSessions, InflightRun, RunOutcome, TakeError,
+    ToolResult,
 };
 use super::{provider, refresh, store, stream::CursorStream};
 use crate::http::error::AppError;
@@ -114,6 +115,7 @@ fn handle_producer_settle(
     stable: bool,
     token_cache: &SessionTokenCacheHandle,
     session_id: Option<&str>,
+    prefix: Option<CheckpointPrefix>,
 ) -> Result<(), CursorFailure> {
     if stable {
         if let Some(raw) = reply.checkpoint.as_ref() {
@@ -123,6 +125,7 @@ fn handle_producer_settle(
                 generation,
                 raw.clone(),
                 drive.blob_store(),
+                prefix.clone(),
             );
         }
     }
@@ -134,6 +137,7 @@ fn handle_producer_settle(
                 generation,
                 drive,
                 reply.pending.clone(),
+                prefix,
             )
             .map_err(CursorFailure::from_transport)?;
     } else {
@@ -183,6 +187,20 @@ impl Drop for SetupGuard {
 type SessionTokenCacheHandle =
     std::sync::Arc<std::sync::Mutex<crate::http::session_tokens::SessionTokenCache>>;
 
+/// 请求 messages 数组切片(缺失时空数组兜底)
+fn request_messages(body: &Value) -> &[Value] {
+    body.get("messages")
+        .and_then(Value::as_array)
+        .map(Vec::as_slice)
+        .unwrap_or(&[])
+}
+
+/// checkpoint 覆盖的历史前缀指纹:全量请求消息的 canonical 摘要
+fn request_prefix(body: &Value) -> Option<CheckpointPrefix> {
+    let messages = request_messages(body);
+    canonical_prefix_digest(messages, messages.len())
+}
+
 #[allow(clippy::too_many_arguments)]
 fn spawn_cursor_producer(
     sessions: CursorSessions,
@@ -197,6 +215,7 @@ fn spawn_cursor_producer(
     stable: bool,
     token_cache: SessionTokenCacheHandle,
     session_id: Option<String>,
+    prefix: Option<CheckpointPrefix>,
 ) {
     tokio::spawn(async move {
         let mut cancelled = false;
@@ -290,6 +309,7 @@ fn spawn_cursor_producer(
             stable,
             &token_cache,
             session_id.as_deref(),
+            prefix,
         ) {
             handle_producer_error(
                 &sessions,
@@ -777,15 +797,17 @@ pub(crate) async fn handle_cursor(
                 stable,
                 state.last_input_tokens.clone(),
                 prepared.session_id.clone(),
+                request_prefix(&prepared.body_json),
             );
             return consumer_response(prepared.is_stream, continuation_digest, inflight, guard)
                 .await;
         }
     }
-    let checkpoint = if stable && !has_results {
+    let mut checkpoint = if stable && !has_results {
+        let incoming = request_messages(&prepared.body_json);
         state
             .cursor_sessions
-            .take_checkpoint(&conversation, identity)
+            .take_checkpoint(&conversation, identity, incoming)
     } else {
         None
     };
@@ -826,6 +848,7 @@ pub(crate) async fn handle_cursor(
             .create_consumer_guard(&conversation, identity, generation, &inflight);
     state.cursor_sessions.cleanup_turn_journal(&turn_digest);
     let mut retried_auth = false;
+    let mut retried_checkpoint = false;
     let started = Instant::now();
     let mut attempt = 0;
     loop {
@@ -926,6 +949,7 @@ pub(crate) async fn handle_cursor(
                         stable,
                         state.last_input_tokens.clone(),
                         prepared.session_id.clone(),
+                        request_prefix(&prepared.body_json),
                     );
                     return consumer_response(prepared.is_stream, turn_digest, inflight, guard)
                         .await;
@@ -954,6 +978,25 @@ pub(crate) async fn handle_cursor(
                 }
                 Err(error) => tracing::warn!("Cursor 401 刷新失败: {error}"),
             }
+        }
+        // checkpoint 续接失败且零输出:丢弃 checkpoint 立即回退历史伪造全量重放一次
+        // (对齐 cursor-cpa-plugin 的 full-replay 回退;checkpoint 已被 take 消费,
+        // 不回退只会让客户端重试继续撞同一坏状态)。401 走上方凭证刷新,
+        // 429 需要退避而非改写请求,均不回退。
+        if checkpoint.is_some()
+            && !failure.progressed
+            && !retried_checkpoint
+            && failure.status != StatusCode::UNAUTHORIZED
+            && failure.status != StatusCode::TOO_MANY_REQUESTS
+        {
+            retried_checkpoint = true;
+            tracing::warn!(
+                conversation,
+                status = %failure.status,
+                "Cursor checkpoint 续接失败,回退历史伪造全量重放"
+            );
+            checkpoint = None;
+            continue;
         }
         if !failure.retryable() || failure.progressed {
             state.cursor_sessions.broadcast_outcome(

@@ -661,10 +661,16 @@ async fn parked_stream_handles_controls_before_multiple_tool_results_resume() {
     let identity = provider::credential_fingerprint(&store::load(dir.path()).unwrap());
     let conversation =
         ccextra_core::convert::cursor::conversation_id(&identity, "cursor-session-1");
+    // 下一轮形态:原 user + assistant 回显 + 新 user,前缀校验须命中
+    let next_turn = json!([
+        { "role": "user", "content": "ping" },
+        { "role": "assistant", "content": [{ "type": "text", "text": "pong" }] },
+        { "role": "user", "content": "next" },
+    ]);
     assert_eq!(
         state
             .cursor_sessions
-            .take_checkpoint(&conversation, &identity)
+            .take_checkpoint(&conversation, &identity, next_turn.as_array().unwrap())
             .unwrap()
             .0,
         CHECKPOINT,

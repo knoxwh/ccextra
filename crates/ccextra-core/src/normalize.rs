@@ -248,7 +248,10 @@ mod tests {
             let counts = normalize_anthropic_pretransform(&mut body, protocol);
             assert!(counts.rstrip_count > 0, "{protocol:?} 转换前应 rstrip");
             let text = body["messages"][0]["content"][0]["text"].as_str().unwrap();
-            assert!(text.ends_with("</system-reminder>"), "{protocol:?} 已折叠: {text:?}");
+            assert!(
+                text.ends_with("</system-reminder>"),
+                "{protocol:?} 已折叠: {text:?}"
+            );
         }
     }
 

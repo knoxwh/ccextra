@@ -2,6 +2,7 @@ use super::drive::{CursorDrive, CursorEvent};
 use super::journal::{CursorEventJournal, JOURNAL_TTL};
 use bytes::Bytes;
 use ccextra_core::convert::cursor::proto::{ExecKind, ExecRequest};
+use serde_json::Value;
 use sha2::{Digest, Sha256};
 use std::collections::{HashMap, HashSet};
 use std::sync::atomic::{AtomicU64, AtomicUsize, Ordering};
@@ -12,6 +13,42 @@ use tokio::sync::{broadcast, oneshot, watch};
 const SESSION_TTL: Duration = Duration::from_secs(5 * 60);
 const CHECKPOINT_TTL: Duration = Duration::from_secs(30 * 60);
 const DISCONNECT_GRACE_PERIOD: Duration = Duration::from_secs(5);
+
+/// checkpoint 覆盖的历史前缀指纹:covered 条消息的 canonical 摘要
+///
+/// 复用 checkpoint 前校验入站历史前缀,防止客户端 compact/重写历史后
+/// 旧 checkpoint 误续接导致上游上下文与客户端视图分叉(对齐
+/// cursor-cpa-plugin 的 PrefixDigests 链校验)。
+#[derive(Debug, Clone)]
+pub struct CheckpointPrefix {
+    pub covered: usize,
+    pub digest: String,
+}
+
+/// 计算前 covered 条消息的 canonical 摘要。
+///
+/// canonical 形态:逐消息克隆后递归排序对象键(吸收客户端重序列化的
+/// 键序抖动),文本内容保持原样(CursorSdk 路径 pretransform 已 rstrip
+/// 尾部空白漂移)。covered 为 0 或超出消息数时返回 None。
+pub fn canonical_prefix_digest(messages: &[Value], covered: usize) -> Option<CheckpointPrefix> {
+    if covered == 0 || covered > messages.len() {
+        return None;
+    }
+    let mut hasher = Sha256::new();
+    for msg in &messages[..covered] {
+        let mut canonical = msg.clone();
+        canonical.sort_all_objects();
+        hasher.update(
+            serde_json::to_vec(&canonical)
+                .as_deref()
+                .unwrap_or_default(),
+        );
+    }
+    Some(CheckpointPrefix {
+        covered,
+        digest: hex::encode(hasher.finalize()),
+    })
+}
 
 /// Singleflight 结果：成功或失败
 #[derive(Clone)]
@@ -207,6 +244,8 @@ struct Checkpoint {
     generation: u64,
     raw: Vec<u8>,
     blobs: HashMap<String, Vec<u8>>,
+    /// 覆盖的历史前缀指纹;None 表示不校验(park 路径无请求消息时)
+    prefix: Option<CheckpointPrefix>,
     deadline: Instant,
 }
 
@@ -385,6 +424,7 @@ impl CursorSessions {
             .retain(|_, checkpoint| Some(checkpoint.identity.as_str()) == identity);
     }
 
+    #[allow(clippy::too_many_arguments)]
     async fn maintain_parked(
         self,
         conversation: String,
@@ -393,6 +433,7 @@ impl CursorSessions {
         mut drive: CursorDrive,
         mut cancelled: watch::Receiver<bool>,
         mut resume: oneshot::Receiver<oneshot::Sender<CursorDrive>>,
+        prefix: Option<CheckpointPrefix>,
     ) {
         loop {
             if *cancelled.borrow() {
@@ -433,6 +474,7 @@ impl CursorSessions {
                         generation,
                         raw,
                         drive.blob_store(),
+                        prefix.clone(),
                     );
                 }
                 // 工具边界已收尾。迟到的输出增量不跨回合发送。
@@ -447,6 +489,7 @@ impl CursorSessions {
         self.cancel(&conversation, &identity, generation);
     }
 
+    #[allow(clippy::too_many_arguments)]
     pub fn park(
         &self,
         conversation: &str,
@@ -454,6 +497,7 @@ impl CursorSessions {
         generation: u64,
         drive: CursorDrive,
         pending: Vec<ExecRequest>,
+        prefix: Option<CheckpointPrefix>,
     ) -> Result<(), &'static str> {
         let mut registry = self.inner.lock().unwrap();
         registry.sweep(Instant::now());
@@ -495,6 +539,7 @@ impl CursorSessions {
             drive,
             cancelled,
             resume_receiver,
+            prefix,
         ));
         Ok(())
     }
@@ -572,6 +617,7 @@ impl CursorSessions {
         ))
     }
 
+    #[allow(clippy::too_many_arguments)]
     pub fn record_checkpoint(
         &self,
         conversation: &str,
@@ -579,6 +625,7 @@ impl CursorSessions {
         generation: u64,
         raw: Vec<u8>,
         blobs: HashMap<String, Vec<u8>>,
+        prefix: Option<CheckpointPrefix>,
     ) -> bool {
         let mut registry = self.inner.lock().unwrap();
         registry.sweep(Instant::now());
@@ -607,6 +654,7 @@ impl CursorSessions {
                 generation,
                 raw,
                 blobs,
+                prefix,
                 deadline: Instant::now() + CHECKPOINT_TTL,
             },
         );
@@ -614,9 +662,15 @@ impl CursorSessions {
     }
 
     /// 获取并删除匹配的 checkpoint(对齐 CPA+ take 语义):
-    /// - 匹配 identity → 返回数据并删除
-    /// - 不匹配 → 返回 None(旧 checkpoint 保留等待 TTL 清理)
-    pub fn take_checkpoint(&self, conversation: &str, identity: &str) -> Option<CheckpointData> {
+    /// - identity 不匹配 → None(旧 checkpoint 保留等待 TTL 清理)
+    /// - 前缀指纹不匹配(客户端 compact/重写历史)或无新增消息(纯重试)
+    ///   → 丢弃 checkpoint 并返回 None,调用方走历史伪造全量重放
+    pub fn take_checkpoint(
+        &self,
+        conversation: &str,
+        identity: &str,
+        incoming: &[Value],
+    ) -> Option<CheckpointData> {
         let mut registry = self.inner.lock().unwrap();
         registry.sweep(Instant::now());
         let checkpoint = registry.checkpoints.get(conversation)?;
@@ -628,6 +682,23 @@ impl CursorSessions {
                 "Cursor checkpoint identity 不匹配,跳过使用"
             );
             return None;
+        }
+        if let Some(stored) = checkpoint.prefix.as_ref() {
+            // 必须有新增消息:长度相等是同请求纯重试,续接会向上游重复
+            // 追加末条用户消息
+            let matched = incoming.len() > stored.covered
+                && canonical_prefix_digest(incoming, stored.covered)
+                    .is_some_and(|p| p.digest == stored.digest);
+            if !matched {
+                tracing::warn!(
+                    conversation,
+                    covered = stored.covered,
+                    incoming = incoming.len(),
+                    "Cursor checkpoint 历史前缀不匹配,丢弃(客户端 compact/重写历史或纯重试)"
+                );
+                registry.checkpoints.remove(conversation);
+                return None;
+            }
         }
         // 匹配则取走并删除
         let checkpoint = registry.checkpoints.remove(conversation)?;
@@ -816,6 +887,7 @@ impl CursorSessions {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use serde_json::json;
 
     fn begin(sessions: &CursorSessions, conversation: &str, identity: &str, digest: &str) -> u64 {
         let BeginOutcome::Started(generation, _) = sessions
@@ -932,6 +1004,112 @@ mod tests {
     }
 
     #[test]
+    fn checkpoint_prefix_verification() {
+        let sessions = CursorSessions::default();
+        let gen = begin(&sessions, "conv", "account-a", "first");
+        let request = json!([
+            { "role": "user", "content": "ping" },
+            { "role": "assistant", "content": [{ "type": "tool_use", "id": "t1", "name": "lookup", "input": {"query": "q", "limit": 3} }] },
+            { "role": "user", "content": [{ "type": "tool_result", "tool_use_id": "t1", "content": "ok" }] }
+        ]);
+        let prefix = canonical_prefix_digest(request.as_array().unwrap(), 3).unwrap();
+        assert!(sessions.record_checkpoint(
+            "conv",
+            "account-a",
+            gen,
+            vec![7],
+            HashMap::new(),
+            Some(prefix)
+        ));
+
+        // 命中:前缀逐字节一致 + 有新增消息
+        let next = json!([
+            { "role": "user", "content": "ping" },
+            { "role": "assistant", "content": [{ "type": "tool_use", "id": "t1", "name": "lookup", "input": {"query": "q", "limit": 3} }] },
+            { "role": "user", "content": [{ "type": "tool_result", "tool_use_id": "t1", "content": "ok" }] },
+            { "role": "assistant", "content": "done" },
+            { "role": "user", "content": "next" }
+        ]);
+        assert_eq!(
+            sessions
+                .take_checkpoint("conv", "account-a", next.as_array().unwrap())
+                .unwrap()
+                .0,
+            vec![7]
+        );
+
+        // compact/重写历史:前缀变化 → 丢弃且不残留
+        sessions.finish("conv", "account-a", gen);
+        let gen2 = begin(&sessions, "conv", "account-a", "second");
+        let prefix2 = canonical_prefix_digest(request.as_array().unwrap(), 3).unwrap();
+        assert!(sessions.record_checkpoint(
+            "conv",
+            "account-a",
+            gen2,
+            vec![8],
+            HashMap::new(),
+            Some(prefix2)
+        ));
+        let compacted = json!([
+            { "role": "user", "content": "summary of earlier turns" },
+            { "role": "user", "content": "next" }
+        ]);
+        assert!(sessions
+            .take_checkpoint("conv", "account-a", compacted.as_array().unwrap())
+            .is_none());
+        assert!(sessions.take_checkpoint("conv", "account-a", &[]).is_none());
+    }
+
+    #[test]
+    fn checkpoint_prefix_rejects_retry_and_accepts_key_order_variance() {
+        let sessions = CursorSessions::default();
+        let gen = begin(&sessions, "conv", "account-a", "first");
+        let request = json!([
+            { "role": "user", "content": [{ "type": "text", "text": "hi" }] },
+            { "role": "assistant", "content": [{ "type": "tool_use", "id": "t1", "name": "lookup", "input": {"query": "q", "limit": 3} }] }
+        ]);
+        let prefix = canonical_prefix_digest(request.as_array().unwrap(), 2).unwrap();
+        assert!(sessions.record_checkpoint(
+            "conv",
+            "account-a",
+            gen,
+            vec![9],
+            HashMap::new(),
+            Some(prefix)
+        ));
+
+        // 纯重试:长度相等(无新增消息)→ 拒绝,避免向上游重复追加末条用户消息
+        assert!(sessions
+            .take_checkpoint("conv", "account-a", request.as_array().unwrap())
+            .is_none());
+
+        // 键序抖动:客户端重序列化改变 tool_use.input 键序 → canonical 摘要仍命中
+        sessions.finish("conv", "account-a", gen);
+        let gen2 = begin(&sessions, "conv", "account-a", "second");
+        let prefix2 = canonical_prefix_digest(request.as_array().unwrap(), 2).unwrap();
+        assert!(sessions.record_checkpoint(
+            "conv",
+            "account-a",
+            gen2,
+            vec![10],
+            HashMap::new(),
+            Some(prefix2)
+        ));
+        let reordered = json!([
+            { "role": "user", "content": [{ "type": "text", "text": "hi" }] },
+            { "role": "assistant", "content": [{ "type": "tool_use", "id": "t1", "name": "lookup", "input": {"limit": 3, "query": "q"} }] },
+            { "role": "user", "content": "next" }
+        ]);
+        assert_eq!(
+            sessions
+                .take_checkpoint("conv", "account-a", reordered.as_array().unwrap())
+                .unwrap()
+                .0,
+            vec![10]
+        );
+    }
+
+    #[test]
     fn checkpoint_rejects_stale_owner_and_account_replacement() {
         let sessions = CursorSessions::default();
         let old = begin(&sessions, "conv", "account-a", "first");
@@ -940,26 +1118,44 @@ mod tests {
             "account-a",
             old,
             vec![1, 2, 3],
-            HashMap::new()
+            HashMap::new(),
+            None,
         ));
-        assert!(sessions.take_checkpoint("conv", "account-b").is_none());
+        assert!(sessions.take_checkpoint("conv", "account-b", &[]).is_none());
         sessions.finish("conv", "account-a", old);
         let new = begin(&sessions, "conv", "account-a", "next");
         assert_ne!(new, old);
-        assert!(!sessions.record_checkpoint("conv", "account-a", old, vec![9], HashMap::new()));
+        assert!(!sessions.record_checkpoint(
+            "conv",
+            "account-a",
+            old,
+            vec![9],
+            HashMap::new(),
+            None
+        ));
         assert_eq!(
-            sessions.take_checkpoint("conv", "account-a").unwrap().0,
+            sessions
+                .take_checkpoint("conv", "account-a", &[])
+                .unwrap()
+                .0,
             vec![1, 2, 3]
         );
         // take_checkpoint 已删除,第二次必须返回 None
-        assert!(sessions.take_checkpoint("conv", "account-a").is_none());
+        assert!(sessions.take_checkpoint("conv", "account-a", &[]).is_none());
         sessions.cancel("conv", "account-a", old);
-        assert!(sessions.record_checkpoint("conv", "account-a", new, vec![4], HashMap::new()));
+        assert!(sessions.record_checkpoint(
+            "conv",
+            "account-a",
+            new,
+            vec![4],
+            HashMap::new(),
+            None
+        ));
         begin(&sessions, "conv", "account-b", "first");
         // account-b 取不到 account-a 的 checkpoint
-        assert!(sessions.take_checkpoint("conv", "account-b").is_none());
+        assert!(sessions.take_checkpoint("conv", "account-b", &[]).is_none());
         // account-a 被 account-b 取代后 checkpoint 也被清理
-        assert!(sessions.take_checkpoint("conv", "account-a").is_none());
+        assert!(sessions.take_checkpoint("conv", "account-a", &[]).is_none());
     }
 
     #[tokio::test]
@@ -996,25 +1192,37 @@ mod tests {
         let sessions = CursorSessions::default();
         let old = begin(&sessions, "old", "account-a", "first");
         let receiver = sessions.cancellation("old", "account-a", old).unwrap();
-        sessions.record_checkpoint("old", "account-a", old, vec![1], HashMap::new());
+        sessions.record_checkpoint("old", "account-a", old, vec![1], HashMap::new(), None);
         let current = begin(&sessions, "current", "account-b", "first");
-        sessions.record_checkpoint("current", "account-b", current, vec![2], HashMap::new());
+        sessions.record_checkpoint(
+            "current",
+            "account-b",
+            current,
+            vec![2],
+            HashMap::new(),
+            None,
+        );
         sessions.retain_identity(Some("account-b"));
         assert!(*receiver.borrow());
-        assert!(sessions.take_checkpoint("old", "account-a").is_none());
+        assert!(sessions.take_checkpoint("old", "account-a", &[]).is_none());
         assert_eq!(
-            sessions.take_checkpoint("current", "account-b").unwrap().0,
+            sessions
+                .take_checkpoint("current", "account-b", &[])
+                .unwrap()
+                .0,
             vec![2]
         );
         sessions.retain_identity(None);
-        assert!(sessions.take_checkpoint("current", "account-b").is_none());
+        assert!(sessions
+            .take_checkpoint("current", "account-b", &[])
+            .is_none());
     }
 
     #[test]
     fn expired_checkpoint_and_owner_cannot_resume() {
         let sessions = CursorSessions::default();
         let owner = begin(&sessions, "conv", "account-a", "first");
-        sessions.record_checkpoint("conv", "account-a", owner, vec![1], HashMap::new());
+        sessions.record_checkpoint("conv", "account-a", owner, vec![1], HashMap::new(), None);
         {
             let mut registry = sessions.inner.lock().unwrap();
             registry.owners.get_mut("conv").unwrap().deadline =
@@ -1022,7 +1230,14 @@ mod tests {
             registry.checkpoints.get_mut("conv").unwrap().deadline =
                 Instant::now() - Duration::from_secs(1);
         }
-        assert!(sessions.take_checkpoint("conv", "account-a").is_none());
-        assert!(!sessions.record_checkpoint("conv", "account-a", owner, vec![2], HashMap::new()));
+        assert!(sessions.take_checkpoint("conv", "account-a", &[]).is_none());
+        assert!(!sessions.record_checkpoint(
+            "conv",
+            "account-a",
+            owner,
+            vec![2],
+            HashMap::new(),
+            None
+        ));
     }
 }

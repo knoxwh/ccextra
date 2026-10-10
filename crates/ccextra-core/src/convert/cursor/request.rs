@@ -39,6 +39,10 @@ fn image_uuid(message_id: &str, index: usize) -> String {
     hex::encode(&Sha256::digest(format!("{message_id}:{index}").as_bytes())[..16])
 }
 
+/// 零工具直连会话约束(对齐 cursor-cpa-plugin request.go 文案):无工具环境
+/// 下防止模型幻觉调用不存在的工具或 web search
+const SYSTEM_CONSTRAINT: &str = "<system_constraint>\nNOTE: This is a direct conversational session with no tool execution environment. Please answer directly in text using your knowledge without attempting to invoke tools or web search.\n</system_constraint>";
+
 /// 无 reasoning 注册表的转换入口(家族模型只按目录等级钳制)
 pub fn build_run_request(
     body: &Value,
@@ -78,6 +82,14 @@ pub fn build_run_request_with(
     if text.is_empty() {
         return Err(CursorConvertError::Invalid("缺少用户消息".into()));
     }
+    let tools = schema::tools(body)?;
+    // 零工具时注入直连会话约束(对齐 cursor-cpa-plugin:两种模式都拼在
+    // UserText 头部;CC 主路径恒带工具,不受影响)
+    let text = if tools.is_empty() {
+        format!("{SYSTEM_CONSTRAINT}\n\n{text}")
+    } else {
+        text
+    };
     // 对齐 Plus:图片进 SelectedContext.selected_images(base64 解码为 bytes)
     let mut decoded_images = Vec::with_capacity(images.len());
     for (index, image) in images.iter().enumerate() {
@@ -202,7 +214,6 @@ pub fn build_run_request_with(
         display_name: upstream_model_id.clone(),
         ..Default::default()
     };
-    let tools = schema::tools(body)?;
     let mut blobs = HashMap::new();
     let state = match checkpoint {
         Some(raw) => raw.to_vec(),

@@ -629,4 +629,3 @@ mod tests {
         assert_eq!(body["tools"][1]["name"].as_str(), Some("a_tool"));
     }
 }
-
