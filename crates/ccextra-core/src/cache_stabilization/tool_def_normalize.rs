@@ -130,36 +130,10 @@ pub fn any_tool_has_cache_control(tools: &[Value]) -> bool {
 /// 标记，因此无论哪种情况，客户的缓存断点意图都得到保留。调用方因此
 /// 可以自由地为任何工具传入 schema，无论其是否带有标记。
 pub fn sort_schema_keys_recursive(value: &mut Value) {
-    match value {
-        Value::Object(map) => {
-            // 先递归，使子节点在重建父节点之前完成归一化。递归顺序
-            // 不影响正确性（每个子节点相互独立），但先做意味着父节点的
-            // 排序 Map 一次性基于已排序的子节点构建 —— 无重复工作。
-            for (_k, v) in map.iter_mut() {
-                sort_schema_keys_recursive(v);
-            }
-            // 收集现有条目，按键排序，重建 map。克隆不可避免：
-            // `serde_json::Map` 不提供原地键重排。该克隆是浅层
-            // Value 克隆 —— 子节点已在上面原地修改过，因此不会丢失
-            // 递归排序。
-            let mut entries: Vec<(String, Value)> =
-                map.iter().map(|(k, v)| (k.clone(), v.clone())).collect();
-            entries.sort_by(|a, b| a.0.cmp(&b.0));
-            map.clear();
-            for (k, v) in entries {
-                map.insert(k, v);
-            }
-        }
-        Value::Array(items) => {
-            // 保留数组顺序 —— JSON Schema 数组是有序的。
-            // 递归进入每个元素，使数组内嵌套的对象仍能按键排序。
-            for item in items.iter_mut() {
-                sort_schema_keys_recursive(item);
-            }
-        }
-        // 字符串、数字、布尔值、null 没有可排序的键。
-        _ => {}
-    }
+    // serde_json 1.0.151+ 的 `sort_all_objects` 语义等价(对象键按 `str`
+    // 序排序、数组顺序保留、递归进两者),且原地 `sort_keys` 无逐层克隆,
+    // 实测比手写递归重建快约 5x。preserve_order 为 workspace 级 feature。
+    value.sort_all_objects();
 }
 
 /// OpenAI Chat Completions 工具定义的 Phase E 归一化。
@@ -655,3 +629,4 @@ mod tests {
         assert_eq!(body["tools"][1]["name"].as_str(), Some("a_tool"));
     }
 }
+

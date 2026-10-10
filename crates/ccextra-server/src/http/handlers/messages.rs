@@ -5,11 +5,6 @@ use axum::{
     response::Response,
 };
 use bytes::Bytes;
-use ccextra_core::cache_stabilization::drift_detector::derive_session_key as drift_derive_session_key;
-use ccextra_core::cache_stabilization::drift_detector::{
-    compute_structural_hash, is_ancillary_request, observe_drift, ApiKind as DriftApiKind,
-    DriftState,
-};
 use ccextra_core::convert::{
     clamp_passthrough_effort, convert_passthrough, convert_to_antigravity_with,
     convert_to_gemini_with_registry, convert_to_openai_chat_with, convert_to_openai_responses_with,
@@ -115,28 +110,6 @@ pub(crate) fn apply_payload_overrides(
             }
         }
     }
-}
-
-/// 观测 body 结构漂移(对齐 openai/anthropic handler 的 drift 检测)。
-/// 辅助请求(标题生成等)跳过——它们共享会话键但 body 形状不同,会比较出假漂移。
-/// `enabled` 接 normalize.drift_detector 开关,关闭时跳过观测。
-pub(crate) fn observe_drift_for(
-    drift: &DriftState,
-    headers: &HeaderMap,
-    body: &Value,
-    kind: DriftApiKind,
-    enabled: bool,
-) {
-    if !enabled {
-        return;
-    }
-    if is_ancillary_request(body, kind) {
-        tracing::debug!(?kind, "skipped drift detection for ancillary request");
-        return;
-    }
-    let identity = drift_derive_session_key(headers, body, kind);
-    let structural_hash = compute_structural_hash(body, kind);
-    observe_drift(drift, &identity, structural_hash);
 }
 
 // ── 上游请求诊断落盘(配合 logs/upstream_request_*)────────
@@ -298,7 +271,6 @@ pub(crate) async fn prepare_message_request(
     config_snapshot: &crate::http::ConfigSnapshot,
 ) -> Result<PreparedMessageRequest, AppError> {
     let normalize_enabled = config_snapshot.runtime.normalize.enabled;
-    let normalize_drift_detector = config_snapshot.runtime.normalize.drift_detector;
     let log_request_body = config_snapshot.runtime.logging.request_body;
     let thinking_registry = &config_snapshot.runtime.thinking_registry;
 
@@ -320,23 +292,16 @@ pub(crate) async fn prepare_message_request(
     let route = resolve_route(&model, providers)?;
     let payload_rules = &config_snapshot.payload_rules;
 
-    // 3. 归一化第一遍(按协议:claude 直通全量 / openai 转换前精简)
+    // 3. 归一化第一遍(按协议:claude 直通全量 / 其他转换前精简)
     if normalize_enabled {
         match route.protocol {
             Protocol::Claude => {
                 let counts = normalize_anthropic_full(&mut body_json);
                 tracing::debug!(?counts, "normalize_anthropic_full");
-                observe_drift_for(
-                    &state.drift,
-                    headers,
-                    &body_json,
-                    DriftApiKind::Anthropic,
-                    normalize_drift_detector,
-                );
             }
             _ => {
-                let counts = normalize_anthropic_pretransform(&mut body_json);
-                tracing::debug!(?counts, "normalize_anthropic_pretransform");
+                let counts = normalize_anthropic_pretransform(&mut body_json, route.protocol);
+                tracing::debug!(?counts, protocol = ?route.protocol, "normalize_anthropic_pretransform");
             }
         }
     }
@@ -387,13 +352,6 @@ pub(crate) async fn prepare_message_request(
             convert_to_openai_chat_with(&mut body_json, &route.upstream_model, thinking_registry)?;
             if normalize_enabled {
                 normalize_target_post(&mut body_json, TargetShape::OpenAiChat);
-                observe_drift_for(
-                    &state.drift,
-                    headers,
-                    &body_json,
-                    DriftApiKind::OpenAiChat,
-                    normalize_drift_detector,
-                );
             }
         }
         Protocol::OpenAiResponses => {
@@ -404,6 +362,9 @@ pub(crate) async fn prepare_message_request(
             )?;
             if !rev.is_empty() {
                 tool_names = Some(Arc::new(rev));
+            }
+            if normalize_enabled {
+                normalize_target_post(&mut body_json, TargetShape::OpenAiResponses);
             }
             if let Some(sess) = cc_session.as_deref() {
                 let key = format!("{}:{}", route.upstream_model, sess);
@@ -420,9 +381,6 @@ pub(crate) async fn prepare_message_request(
                 }
                 request_fingerprint =
                     ccextra_core::convert::compute_input_prefix_fingerprint(&body_json);
-            }
-            if normalize_enabled {
-                normalize_target_post(&mut body_json, TargetShape::OpenAiResponses);
             }
         }
         Protocol::Gemini => {
@@ -489,16 +447,6 @@ pub(crate) async fn prepare_message_request(
 
     let outbound_model =
         resolve_outbound_model(&mut body_json, &route.upstream_model, route.protocol);
-
-    if normalize_enabled && matches!(route.protocol, Protocol::OpenAiResponses) {
-        observe_drift_for(
-            &state.drift,
-            headers,
-            &body_json,
-            DriftApiKind::OpenAiResponses,
-            normalize_drift_detector,
-        );
-    }
 
     if matches!(route.protocol, Protocol::OpenAiResponses) && is_gpt_model(&outbound_model) {
         if let Some(obj) = body_json.as_object_mut() {

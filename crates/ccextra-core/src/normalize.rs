@@ -23,6 +23,7 @@ use crate::cache_stabilization::volatile_detector::{
     detect_volatile_content, emit_volatile_warnings, normalize_client_dateline,
     ApiKind as VolatileApiKind,
 };
+use crate::route::Protocol;
 
 pub use crate::cache_stabilization::truncate_tool_results::UpstreamTruncation;
 
@@ -101,14 +102,23 @@ pub fn normalize_anthropic_full(body: &mut Value) -> NormalizeCounts {
     counts
 }
 
-/// 入站 anthropic 转换前归一化:精简子集(openai 转换链路转换前调用)。
+/// 入站 anthropic 转换前归一化:精简子集(openai/gemini/antigravity 转换链路转换前调用)。
 ///
-/// 跑:tool_def 排序 + schema 键排序 → smoosh → tool_input → sort → rstrip。
+/// 跑:tool_def 排序 + schema 键排序 → smoosh → tool_input。
 /// tool_def 排序提升 gemini/antigravity 隐式前缀缓存命中率(对齐 full 管线)。
 /// schema 键必须在 tool_input 之前排:转换把 `tool_use.input` 冻成
-/// `arguments` 字符串,post 无法再改。跳过 dateline 归一化和 volatile
-/// detect 告警——dateline 留转换后,告警只在全量管线运行。
-pub fn normalize_anthropic_pretransform(body: &mut Value) -> NormalizeCounts {
+/// `arguments` 字符串,post 无法再改。
+///
+/// sort(system reminder 列表块)与 rstrip(尾部空白)按协议分流:
+/// - openai_chat / openai_responses:转换后由 `normalize_target_post` 在
+///   目标 body 上覆盖,转换前不跑(避免双份工作)
+/// - gemini / antigravity / cursor_sdk:无 post-transform 归一化,且
+///   `convert_content_to_parts` 把 message 文本逐字节 verbatim 塞进
+///   parts,转换前必须跑 rstrip 修掉 #48734 尾部空白漂移,否则漂移字节
+///   直通出站 body 打掉隐式前缀缓存
+///
+/// dateline 归一化与 volatile detect 告警仍只在 full 管线运行。
+pub fn normalize_anthropic_pretransform(body: &mut Value, protocol: Protocol) -> NormalizeCounts {
     let mut tool_sorted = false;
 
     // tool_def 排序 + schema 键递归排序
@@ -123,17 +133,27 @@ pub fn normalize_anthropic_pretransform(body: &mut Value) -> NormalizeCounts {
         }
     }
 
+    let smoosh_count = split_smooshed_reminders(body, DriftApiKind::Anthropic);
+    let tool_input_count = normalize_tool_use_inputs(body, DriftApiKind::Anthropic);
+
+    // 无 post-transform 的协议:转换前补 sort + rstrip
+    let (sort_count, rstrip_count) =
+        if matches!(protocol, Protocol::OpenAiChat | Protocol::OpenAiResponses) {
+            (0, 0)
+        } else {
+            (
+                stabilize_block_sort(body, DriftApiKind::Anthropic),
+                normalize_reminder_trailing_whitespace(body, DriftApiKind::Anthropic),
+            )
+        };
+
     NormalizeCounts {
         tool_sorted,
-        // 1. smoosh 拆分
-        smoosh_count: split_smooshed_reminders(body, DriftApiKind::Anthropic),
-        // 2. tool_use.input 键序归一化
-        tool_input_count: normalize_tool_use_inputs(body, DriftApiKind::Anthropic),
-        // 3. system reminder 列表块排序
-        sort_count: stabilize_block_sort(body, DriftApiKind::Anthropic),
-        // 4. 尾部 reminder 空白归一化
-        rstrip_count: normalize_reminder_trailing_whitespace(body, DriftApiKind::Anthropic),
-        ..Default::default()
+        smoosh_count,
+        tool_input_count,
+        sort_count,
+        rstrip_count,
+        volatile_count: 0,
     }
 }
 
@@ -200,8 +220,8 @@ mod tests {
     }
 
     #[test]
-    fn test_pretransform_rstrips_reminder_trailing() {
-        // 转换前:rstrip 折叠尾部空白(独立块,不经 bookkeeping)
+    fn test_pretransform_protocol_gates_sort_and_rstrip() {
+        // openai 两条路径:转换后由 normalize_target_post 覆盖,转换前跳过
         let mut body = json!({
             "messages": [
                 {"role": "user", "content": [
@@ -210,17 +230,26 @@ mod tests {
             ]
         });
 
-        let counts = normalize_anthropic_pretransform(&mut body);
+        let counts = normalize_anthropic_pretransform(&mut body, Protocol::OpenAiChat);
+        assert_eq!(counts.rstrip_count, 0, "openai_chat 转换前跳过 rstrip");
+        assert_eq!(counts.sort_count, 0, "openai_chat 转换前跳过 sort");
+        let text = body["messages"][0]["content"][0]["text"].as_str().unwrap();
+        assert!(text.ends_with("   "), "openai_chat 路径 body 不动");
 
-        assert!(
-            counts.rstrip_count > 0,
-            "trailing whitespace should collapse"
-        );
-        let content = body["messages"][0]["content"][0]["text"].as_str().unwrap();
-        assert!(
-            content.ends_with("</system-reminder>"),
-            "collapsed: {content:?}"
-        );
+        // gemini/antigravity/cursor:无 post-transform,转换前必须跑
+        for protocol in [Protocol::Gemini, Protocol::Antigravity, Protocol::CursorSdk] {
+            let mut body = json!({
+                "messages": [
+                    {"role": "user", "content": [
+                        {"type": "text", "text": "work\n   </system-reminder>   "}
+                    ]}
+                ]
+            });
+            let counts = normalize_anthropic_pretransform(&mut body, protocol);
+            assert!(counts.rstrip_count > 0, "{protocol:?} 转换前应 rstrip");
+            let text = body["messages"][0]["content"][0]["text"].as_str().unwrap();
+            assert!(text.ends_with("</system-reminder>"), "{protocol:?} 已折叠: {text:?}");
+        }
     }
 
     #[test]
@@ -234,7 +263,7 @@ mod tests {
             "messages": [{"role": "user", "content": "hi"}]
         });
 
-        let counts = normalize_anthropic_pretransform(&mut body);
+        let counts = normalize_anthropic_pretransform(&mut body, Protocol::Gemini);
 
         // pretransform 现在排序 tool_def(提升 gemini/antigravity 缓存命中)
         assert!(
@@ -275,8 +304,8 @@ mod tests {
             json!({"path": "/p", "content": "c"}),
         );
 
-        let counts_a = normalize_anthropic_pretransform(&mut a);
-        normalize_anthropic_pretransform(&mut b);
+        let counts_a = normalize_anthropic_pretransform(&mut a, Protocol::Gemini);
+        normalize_anthropic_pretransform(&mut b, Protocol::Gemini);
 
         let keys = |body: &Value| -> Vec<String> {
             body["messages"][0]["content"][0]["input"]
@@ -311,7 +340,7 @@ mod tests {
             "messages": [{"role": "user", "content": "hi"}]
         });
 
-        let counts = normalize_anthropic_pretransform(&mut body);
+        let counts = normalize_anthropic_pretransform(&mut body, Protocol::Gemini);
 
         assert!(counts.tool_sorted, "multiple tools should be sorted");
         assert_eq!(body["tools"][0]["name"], "a_tool");

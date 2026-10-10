@@ -69,6 +69,12 @@ fn split_anthropic_messages(body: &mut Value) -> usize {
             let Some(Value::String(s)) = block.get("content") else {
                 continue;
             };
+            // 廉价预检:剥离的前提是内容以 </system-reminder> 结尾(其后仅
+            // 空白)。绝大多数 tool_result 不含尾部 reminder,直接跳过,
+            // 避免逐块克隆字符串并跑正则。
+            if !s.trim_end().ends_with("</system-reminder>") {
+                continue;
+            }
             let mut current = s.clone();
             let mut reminders: Vec<String> = vec![];
             // 取最右侧的 `\n\n<system-reminder>…</system-reminder>` 块。
