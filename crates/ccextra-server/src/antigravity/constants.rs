@@ -30,8 +30,8 @@ pub const ONBOARD_UA: &str = "antigravity/hub/2.21.1 darwin/arm64 google-api-nod
 pub const GOOG_API_CLIENT: &str = "gl-node/22.21.1";
 pub const TOKEN_REFRESH_UA: &str = "Go-http-client/2.0";
 
-/// 到期前 3000s 视为需刷新
-pub const REFRESH_SKEW_SECS: i64 = 3000;
+/// 到期前 300s 视为需刷新(对齐 CPA antigravityRequestTokenSafetyWindow = 5 * time.Minute)
+pub const REFRESH_SKEW_SECS: i64 = 300;
 
 /// 项目缓存下的凭证目录
 pub const DEFAULT_AUTH_DIR: &str = ".cache/antigravity";

@@ -649,9 +649,9 @@ impl UpstreamClient {
             req = req.header(name, value);
         }
 
-        // Gemini/Antigravity:从 session_id 参数派生确定性 UUID,注入 x-vscode-sessionid
-        // (对齐 CPA 5907285:缓存正交隔离;Responses 已在上方 Session-Id 注入)
-        if matches!(protocol, Protocol::Gemini | Protocol::Antigravity) {
+        // Gemini:从 session_id 参数派生确定性 UUID,注入 x-vscode-sessionid
+        // (对齐 CPA 5907285:缓存正交隔离;Antigravity 对齐官方 Hub 与 CPA 严格不注入自定义头,规避 WAF 特征标记)
+        if matches!(protocol, Protocol::Gemini) {
             if let Some(sid) = session_id {
                 let session_uuid = derive_session_uuid(sid);
                 req = req.header("x-vscode-sessionid", session_uuid);
