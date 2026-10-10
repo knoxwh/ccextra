@@ -22,7 +22,8 @@ ccextra-server = { path = "crates/ccextra-server" }
 # Serialization
 serde = { version = "1.0", features = ["derive"] }
 serde_json = { version = "1.0", features = ["preserve_order", "arbitrary_precision", "raw_value"] }
-serde_yaml = "0.9"
+# serde_yaml 已归档,由 YAML 官方组织的 yaml_serde 接续维护(API 兼容)
+yaml_serde = "0.10"
 
 # HTTP server
 axum = { version = "0.8", features = ["macros"] }
@@ -35,7 +36,7 @@ reqwest = { version = "0.13", features = ["stream", "json", "socks", "http2", "f
 # Async
 futures = "0.3"
 bytes = "1.5"
-zstd = "0.13"
+zstd = "0.14"
 
 
 # Error handling
@@ -47,20 +48,20 @@ tracing = "0.1"
 tracing-subscriber = { version = "0.3", features = ["env-filter", "json", "time"] }
 
 # Crypto (for session key derivation)
-sha2 = "0.10"
+sha2 = "0.11"
 hex = "0.4"
-base64 = "0.22"
+base64 = "0.23"
 
 # Secret key hashing (明文自动转 bcrypt)
-bcrypt = "0.15"
+bcrypt = "0.19"
 
 # Pattern matching (for payload model wildcards)
 globset = "0.4"
 
 # Cursor protobuf
-prost = "0.13"
-prost-types = "0.13"
-prost-build = "0.13"
+prost = "0.14"
+prost-types = "0.14"
+prost-build = "0.14"
 protoc-bin-vendored = "3"
 flate2 = "1"
 

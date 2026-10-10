@@ -81,7 +81,7 @@ pub struct ServerConfig {
 impl Config {
     pub fn load(path: &str) -> Result<Self> {
         let content = fs::read_to_string(path)?;
-        let mut config: Config = serde_yaml::from_str(&content)?;
+        let mut config: Config = yaml_serde::from_str(&content)?;
 
         // secret_key 明文自动转 bcrypt,并回写配置文件(下次启动识别哈希不重复转)
         if let Some(secret) = &config.secret_key {

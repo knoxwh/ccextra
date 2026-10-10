@@ -34,7 +34,7 @@ pub fn save(dir: &Path, credential: &CursorCredential) -> Result<()> {
     let path = credential_path(dir);
     let data = serde_json::to_vec_pretty(credential)?;
     let mut nonce = [0u8; 8];
-    getrandom::getrandom(&mut nonce)?;
+    getrandom::fill(&mut nonce)?;
     let tmp = dir.join(format!(".cursor.{:016x}.tmp", u64::from_be_bytes(nonce)));
     let mut options = OpenOptions::new();
     options.write(true).create_new(true);

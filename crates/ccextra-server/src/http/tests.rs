@@ -274,7 +274,7 @@ fn mock_state() -> AppState {
     - name: gpt-4
       alias: test-gpt
 "#;
-    let providers: Vec<ProviderConfig> = serde_yaml::from_str(providers_yaml).unwrap();
+    let providers: Vec<ProviderConfig> = yaml_serde::from_str(providers_yaml).unwrap();
     let runtime = RuntimeConfig {
         normalize: NormalizeConfig {
             enabled: false,
@@ -360,7 +360,7 @@ models:
 "#,
         upstream_addr
     );
-    let provider: ProviderConfig = serde_yaml::from_str(&provider_yaml).unwrap();
+    let provider: ProviderConfig = yaml_serde::from_str(&provider_yaml).unwrap();
     Arc::make_mut(&mut *state.config.write().await)
         .providers
         .push(provider);
@@ -426,7 +426,7 @@ models:
 "#,
         upstream_addr
     );
-    let provider: ProviderConfig = serde_yaml::from_str(&provider_yaml).unwrap();
+    let provider: ProviderConfig = yaml_serde::from_str(&provider_yaml).unwrap();
     Arc::make_mut(&mut *state.config.write().await)
         .providers
         .push(provider);
@@ -514,7 +514,7 @@ async fn test_first_frame_retry_uses_active_base_url() {
     let good_server = tokio::spawn(async move { axum::serve(good_listener, good).await.unwrap() });
 
     let state = mock_state();
-    let provider: ProviderConfig = serde_yaml::from_str(&format!(
+    let provider: ProviderConfig = yaml_serde::from_str(&format!(
         "name: test-active-url\nprotocol: openai_responses\nbase_url: [http://{}, http://{}]\nkey: sk-test\nproxy_url: direct\nmodels:\n  - name: gpt-5\n    alias: test-active-url\n",
         bad_addr, good_addr
     ))
@@ -600,7 +600,7 @@ async fn test_claude_passthrough_clamps_effort_before_upstream() {
 "#,
         upstream_addr
     );
-    let providers: Vec<ProviderConfig> = serde_yaml::from_str(&providers_yaml).unwrap();
+    let providers: Vec<ProviderConfig> = yaml_serde::from_str(&providers_yaml).unwrap();
     Arc::make_mut(&mut *state.config.write().await)
         .providers
         .extend(providers);
@@ -755,7 +755,7 @@ models:
 "#,
         upstream_addr
     );
-    let provider: ProviderConfig = serde_yaml::from_str(&provider_yaml).unwrap();
+    let provider: ProviderConfig = yaml_serde::from_str(&provider_yaml).unwrap();
     Arc::make_mut(&mut *state.config.write().await)
         .providers
         .push(provider);
@@ -840,7 +840,7 @@ async fn test_openai_responses_retries_valid_encrypted_content_after_upstream_re
     let server = tokio::spawn(async move { axum::serve(listener, upstream).await.unwrap() });
 
     let state = mock_state();
-    let provider: ProviderConfig = serde_yaml::from_str(&format!(
+    let provider: ProviderConfig = yaml_serde::from_str(&format!(
             "name: test-responses-retry\nprotocol: openai_responses\nbase_url: http://{}\nkey: sk-test\nproxy_url: direct\nmodels:\n  - name: gpt-5\n    alias: test-responses-retry\n",
             upstream_addr
         ))
@@ -904,7 +904,7 @@ async fn test_openai_responses_retries_on_422_invalid_encrypted_content() {
     let server = tokio::spawn(async move { axum::serve(listener, upstream).await.unwrap() });
 
     let state = mock_state();
-    let provider: ProviderConfig = serde_yaml::from_str(&format!(
+    let provider: ProviderConfig = yaml_serde::from_str(&format!(
             "name: test-422-retry\nprotocol: openai_responses\nbase_url: http://{}\nkey: sk-test\nproxy_url: direct\nmodels:\n  - name: gpt-5\n    alias: test-422-retry\n",
             upstream_addr
         ))
@@ -968,7 +968,7 @@ async fn test_gpt_responses_strips_execute_only_payload_fields() {
     });
 
     let state = mock_state();
-    let provider: ProviderConfig = serde_yaml::from_str(&format!(
+    let provider: ProviderConfig = yaml_serde::from_str(&format!(
         r#"
 name: test-responses-final
 protocol: openai_responses
@@ -1258,7 +1258,7 @@ fn test_build_models_list() {
     - name: upstream-c
       alias: alias-c
 "#;
-    let providers: Vec<ProviderConfig> = serde_yaml::from_str(providers_yaml).unwrap();
+    let providers: Vec<ProviderConfig> = yaml_serde::from_str(providers_yaml).unwrap();
     let json = build_models_list(&providers);
     let data = json["data"].as_array().unwrap();
     assert_eq!(data.len(), 3);
@@ -1281,7 +1281,7 @@ fn test_build_models_list_custom_context() {
       max_input_tokens: 128000
       max_tokens: 32000
 "#;
-    let providers: Vec<ProviderConfig> = serde_yaml::from_str(providers_yaml).unwrap();
+    let providers: Vec<ProviderConfig> = yaml_serde::from_str(providers_yaml).unwrap();
     let json = build_models_list(&providers);
     let data = json["data"].as_array().unwrap();
     assert_eq!(data[0]["max_input_tokens"], 128000);
@@ -1299,7 +1299,7 @@ fn test_build_models_list_default_context() {
     - name: upstream-a
       alias: alias-a
 "#;
-    let providers: Vec<ProviderConfig> = serde_yaml::from_str(providers_yaml).unwrap();
+    let providers: Vec<ProviderConfig> = yaml_serde::from_str(providers_yaml).unwrap();
     let json = build_models_list(&providers);
     let data = json["data"].as_array().unwrap();
     assert_eq!(data[0]["max_input_tokens"], 200000);
@@ -1977,7 +1977,7 @@ models:
 "#,
         server.url
     );
-    let provider: ProviderConfig = serde_yaml::from_str(&provider_yaml).unwrap();
+    let provider: ProviderConfig = yaml_serde::from_str(&provider_yaml).unwrap();
     Arc::make_mut(&mut *state.config.write().await)
         .providers
         .push(provider);
@@ -2080,7 +2080,7 @@ models:
 "#,
         server.url
     );
-    let provider: ProviderConfig = serde_yaml::from_str(&provider_yaml).unwrap();
+    let provider: ProviderConfig = yaml_serde::from_str(&provider_yaml).unwrap();
     Arc::make_mut(&mut *state.config.write().await)
         .providers
         .push(provider);
@@ -2159,7 +2159,7 @@ models:
 "#,
         server.url
     );
-    let provider: ProviderConfig = serde_yaml::from_str(&provider_yaml).unwrap();
+    let provider: ProviderConfig = yaml_serde::from_str(&provider_yaml).unwrap();
     Arc::make_mut(&mut *state.config.write().await)
         .providers
         .push(provider);
@@ -2246,7 +2246,7 @@ models:
 "#,
         server.url
     );
-    let provider: ProviderConfig = serde_yaml::from_str(&provider_yaml).unwrap();
+    let provider: ProviderConfig = yaml_serde::from_str(&provider_yaml).unwrap();
     Arc::make_mut(&mut *state.config.write().await)
         .providers
         .push(provider);
@@ -2310,7 +2310,7 @@ models:
 "#,
         server.url
     );
-    let provider: ProviderConfig = serde_yaml::from_str(&provider_yaml).unwrap();
+    let provider: ProviderConfig = yaml_serde::from_str(&provider_yaml).unwrap();
     Arc::make_mut(&mut *state.config.write().await)
         .providers
         .push(provider);
@@ -2414,7 +2414,7 @@ async fn test_upstream_429_fails_fast_passes_retry_after() {
     let server = tokio::spawn(async move { axum::serve(listener, upstream).await.unwrap() });
 
     let state = mock_state();
-    let provider: ProviderConfig = serde_yaml::from_str(&format!(
+    let provider: ProviderConfig = yaml_serde::from_str(&format!(
             "name: test-429\nprotocol: openai_chat\nbase_url: http://{}\nkey: sk-test\nproxy_url: direct\nmodels:\n  - name: gpt-4\n    alias: test-429\n",
             upstream_addr
         ))
@@ -2472,7 +2472,7 @@ async fn test_upstream_all_base_urls_5xx_returns_last_error() {
     .await;
 
     let state = mock_state();
-    let provider: ProviderConfig = serde_yaml::from_str(&format!(
+    let provider: ProviderConfig = yaml_serde::from_str(&format!(
         "name: test-all-5xx\nprotocol: openai_chat\nbase_url: [{}, {}]\nkey: sk-test\nproxy_url: direct\nmodels:\n  - name: gpt-4\n    alias: test-all-5xx\n",
         first.url, last.url
     ))
@@ -2503,7 +2503,7 @@ async fn test_upstream_all_base_urls_5xx_returns_last_error() {
 #[tokio::test]
 async fn test_empty_base_url_list_rejected() {
     let state = mock_state();
-    let provider: ProviderConfig = serde_yaml::from_str(
+    let provider: ProviderConfig = yaml_serde::from_str(
         "name: test-empty-url\nprotocol: openai_chat\nbase_url: []\nkey: sk-test\nproxy_url: direct\nmodels:\n  - name: gpt-4\n    alias: test-empty-url\n",
     )
     .unwrap();
@@ -2549,7 +2549,7 @@ async fn fallback_attempts_each_url_once() {
         let first =
             first_url.unwrap_or_else(|| format!("http://{}", listener.local_addr().unwrap()));
         let state = mock_state();
-        let provider: ProviderConfig = serde_yaml::from_str(&format!(
+        let provider: ProviderConfig = yaml_serde::from_str(&format!(
             "name: fallback\nprotocol: openai_chat\nbase_url: [{first}, {}]\nkey: sk-test\nproxy_url: direct\nmodels:\n  - name: gpt-4\n    alias: fallback\n", good.url)).unwrap();
         Arc::make_mut(&mut *state.config.write().await)
             .providers
@@ -2678,14 +2678,14 @@ async fn test_responses_payload_tier_is_serialized_before_input() {
     )
     .await;
     let state = mock_state();
-    let provider: ProviderConfig = serde_yaml::from_str(&format!(
+    let provider: ProviderConfig = yaml_serde::from_str(&format!(
         "name: routing-test\nprotocol: openai_responses\nbase_url: '{}'\nkey: sk-test\nproxy_url: direct\nmodels:\n  - name: gpt-5\n    alias: routing-test\n", server.url
     )).unwrap();
     {
         let mut config = state.config.write().await;
         let snapshot = Arc::make_mut(&mut config);
         snapshot.providers.push(provider);
-        snapshot.payload_rules = serde_yaml::from_str(
+        snapshot.payload_rules = yaml_serde::from_str(
             "- models: ['*']\n  protocol: openai_responses\n  params:\n    service_tier: priority\n"
         ).unwrap();
     }
@@ -2834,7 +2834,7 @@ async fn test_static_gpt_provider_omits_account_id_header() {
     .await;
 
     let state = mock_state();
-    let provider: ProviderConfig = serde_yaml::from_str(&format!(
+    let provider: ProviderConfig = yaml_serde::from_str(&format!(
         r#"
 name: static-gpt
 protocol: openai_responses

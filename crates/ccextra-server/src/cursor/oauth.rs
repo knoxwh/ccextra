@@ -22,7 +22,7 @@ pub struct AuthParams {
 
 pub fn generate_auth_params() -> Result<AuthParams> {
     let mut random = [0u8; 112];
-    getrandom::getrandom(&mut random).context("generate Cursor PKCE random bytes")?;
+    getrandom::fill(&mut random).context("generate Cursor PKCE random bytes")?;
     let verifier = URL_SAFE_NO_PAD.encode(&random[..96]);
     let challenge = URL_SAFE_NO_PAD.encode(Sha256::digest(verifier.as_bytes()));
     let uuid = format!(

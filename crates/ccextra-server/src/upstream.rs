@@ -1477,7 +1477,7 @@ mod tests {
 
         // enabled: true → 默认 2 连接 / 30s
         let cfg: AntigravityConfig =
-            serde_yaml::from_str("connection-pool:\n  enabled: true").unwrap();
+            yaml_serde::from_str("connection-pool:\n  enabled: true").unwrap();
         let s = AntigravityPoolSettings::resolve(Some(&cfg));
         assert!(!s.short_mode);
         assert_eq!(s.max_idle_conns_per_host, 2);
@@ -1485,19 +1485,19 @@ mod tests {
 
         // 超上限钳制:timeout ≤210s,idle ≤100
         let cfg: AntigravityConfig =
-            serde_yaml::from_str("connection-pool:\n  enabled: true\n  idle-conn-timeout: \"600s\"\n  max-idle-conns-per-host: 500").unwrap();
+            yaml_serde::from_str("connection-pool:\n  enabled: true\n  idle-conn-timeout: \"600s\"\n  max-idle-conns-per-host: 500").unwrap();
         let s = AntigravityPoolSettings::resolve(Some(&cfg));
         assert_eq!(s.idle_conn_timeout, Duration::from_secs(210));
         assert_eq!(s.max_idle_conns_per_host, 100);
 
         // 负值 / 0 timeout 回退短连接
-        let cfg: AntigravityConfig = serde_yaml::from_str(
+        let cfg: AntigravityConfig = yaml_serde::from_str(
             "connection-pool:\n  enabled: true\n  max-idle-conns-per-host: -1",
         )
         .unwrap();
         assert!(AntigravityPoolSettings::resolve(Some(&cfg)).short_mode);
         let cfg: AntigravityConfig =
-            serde_yaml::from_str("connection-pool:\n  enabled: true\n  idle-conn-timeout: \"0s\"")
+            yaml_serde::from_str("connection-pool:\n  enabled: true\n  idle-conn-timeout: \"0s\"")
                 .unwrap();
         assert!(AntigravityPoolSettings::resolve(Some(&cfg)).short_mode);
     }

@@ -29,7 +29,7 @@ pub struct PkceCodes {
 
 pub fn generate_pkce_codes() -> Result<PkceCodes> {
     let mut bytes = [0u8; 96];
-    getrandom::getrandom(&mut bytes).context("generate pkce verifier")?;
+    getrandom::fill(&mut bytes).context("generate pkce verifier")?;
     use base64::Engine;
     let engine = base64::engine::general_purpose::URL_SAFE_NO_PAD;
     let code_verifier = engine.encode(bytes);

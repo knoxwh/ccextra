@@ -134,13 +134,14 @@ pub fn compute_turn_digest(
     hasher.update(system.to_string().as_bytes());
     hasher.update(messages.to_string().as_bytes());
     hasher.update(tools.to_string().as_bytes());
-    format!("{:x}", hasher.finalize())
+    // digest 0.11 的 Array 不再实现 LowerHex,改走 hex 编码
+    hex::encode(hasher.finalize())
 }
 
 pub fn compute_tool_catalog_fingerprint(tools: &serde_json::Value) -> String {
     let mut hasher = Sha256::new();
     hasher.update(tools.to_string().as_bytes());
-    format!("{:x}", hasher.finalize())
+    hex::encode(hasher.finalize())
 }
 
 #[derive(Clone)]

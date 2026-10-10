@@ -225,7 +225,7 @@ models:
   - name: claude-opus-5
     alias: test-opus-5
 "#;
-        let provider: ProviderConfig = serde_yaml::from_str(yaml).unwrap();
+        let provider: ProviderConfig = yaml_serde::from_str(yaml).unwrap();
         let providers = vec![provider];
 
         let route = resolve_route("test-opus-5", &providers).unwrap();
@@ -259,7 +259,7 @@ models:
     - name: model-b
       alias: shared-alias
 "#;
-        let providers: Vec<ProviderConfig> = serde_yaml::from_str(yaml).unwrap();
+        let providers: Vec<ProviderConfig> = yaml_serde::from_str(yaml).unwrap();
 
         let err = validate_providers(&providers).unwrap_err();
         assert!(matches!(err, RouteError::AliasConflict(_)));
@@ -277,7 +277,7 @@ models:
   - name: gpt-5.6-terra
     alias: ck-gpt-5.6-terra
 "#;
-        let provider: ProviderConfig = serde_yaml::from_str(yaml).unwrap();
+        let provider: ProviderConfig = yaml_serde::from_str(yaml).unwrap();
         let providers = vec![provider];
 
         // alias 优先
@@ -301,7 +301,7 @@ models:
   - name: gemini-2.0-flash-thinking-exp
     alias: ag-gemini-thinking
 "#;
-        let provider: ProviderConfig = serde_yaml::from_str(yaml).unwrap();
+        let provider: ProviderConfig = yaml_serde::from_str(yaml).unwrap();
         assert_eq!(provider.protocol, Protocol::Gemini);
         assert_eq!(provider.name, "antigravity");
         assert_eq!(provider.base_urls().len(), 1);
@@ -319,7 +319,7 @@ models:
   - name: model-1
     alias: m1
 "#;
-        let provider: ProviderConfig = serde_yaml::from_str(yaml).unwrap();
+        let provider: ProviderConfig = yaml_serde::from_str(yaml).unwrap();
         assert_eq!(provider.base_urls().len(), 1);
         assert_eq!(provider.base_urls()[0], "https://single.com");
     }
@@ -337,7 +337,7 @@ models:
   - name: model-1
     alias: m1
 "#;
-        let provider: ProviderConfig = serde_yaml::from_str(yaml).unwrap();
+        let provider: ProviderConfig = yaml_serde::from_str(yaml).unwrap();
         assert_eq!(provider.base_urls().len(), 2);
         assert_eq!(provider.base_urls()[0], "https://daily.example.com");
         assert_eq!(provider.base_urls()[1], "https://prod.example.com");
@@ -354,7 +354,7 @@ models:
   - name: auto
     alias: auto
 "#;
-        let provider: ProviderConfig = serde_yaml::from_str(yaml).unwrap();
+        let provider: ProviderConfig = yaml_serde::from_str(yaml).unwrap();
         assert_eq!(provider.protocol, Protocol::CursorSdk);
         let route = resolve_route("auto", &[provider]).unwrap();
         assert_eq!(route.protocol, Protocol::CursorSdk);

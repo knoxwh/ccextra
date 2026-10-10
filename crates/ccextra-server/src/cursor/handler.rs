@@ -25,7 +25,7 @@ use std::time::{Duration, Instant};
 
 fn uuid() -> Result<String, AppError> {
     let mut random = [0u8; 16];
-    getrandom::getrandom(&mut random).map_err(|err| AppError::new(anyhow::anyhow!(err)))?;
+    getrandom::fill(&mut random).map_err(|err| AppError::new(anyhow::anyhow!(err)))?;
     random[6] = (random[6] & 0x0f) | 0x40;
     random[8] = (random[8] & 0x3f) | 0x80;
     let digits = format!("{:032x}", u128::from_be_bytes(random));

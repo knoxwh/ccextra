@@ -947,7 +947,7 @@ mod tests {
     fn grok_identity_defaults_to_current_pin_and_preserves_override() {
         assert_eq!(build_user_agents(None).grok_version.as_str(), "1.0.46");
         let config: super::config::UserAgents =
-            serde_yaml::from_str("grok_version: '1.0.44'").unwrap();
+            yaml_serde::from_str("grok_version: '1.0.44'").unwrap();
         assert_eq!(
             build_user_agents(Some(&config)).grok_version.as_str(),
             "1.0.44"
@@ -1060,7 +1060,7 @@ mod tests {
 
     #[test]
     fn refresh_parameters_pin_dirs_and_retain_static_providers() {
-        let config: Config = serde_yaml::from_str(
+        let config: Config = yaml_serde::from_str(
             r#"
 server:
   host: 127.0.0.1
@@ -1171,7 +1171,7 @@ xai_auth_dir: new-xai
              normalize: {{ enabled: false, drift_detector: false }}\n\
              logging: {{ level: info, request_body: false }}\n{extra}"
         );
-        serde_yaml::from_str(&yaml).unwrap()
+        yaml_serde::from_str(&yaml).unwrap()
     }
 
     #[test]

@@ -196,7 +196,7 @@ async fn start_callback(port: u16) -> Result<(u16, oneshot::Receiver<CallbackQue
 /// 16 字节随机 hex
 fn random_state() -> Result<String> {
     let mut bytes = [0u8; 16];
-    getrandom::getrandom(&mut bytes).context("generate oauth state")?;
+    getrandom::fill(&mut bytes).context("generate oauth state")?;
     Ok(bytes.iter().map(|b| format!("{b:02x}")).collect())
 }
 
