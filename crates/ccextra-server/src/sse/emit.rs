@@ -4,16 +4,17 @@
 
 use bytes::Bytes;
 use serde_json::{json, Value};
+use std::io::Write;
 
 /// 序列化一个 SSE 事件(Anthropic 格式)
 pub fn sse(event: &str, data: &Value) -> Bytes {
-    let mut s = String::from("event: ");
-    s.push_str(event);
-    s.push('\n');
-    s.push_str("data: ");
-    s.push_str(&data.to_string());
-    s.push_str("\n\n");
-    Bytes::from(s)
+    let mut buf = Vec::with_capacity(32 + 128);
+    buf.extend_from_slice(b"event: ");
+    buf.extend_from_slice(event.as_bytes());
+    buf.extend_from_slice(b"\ndata: ");
+    serde_json::to_writer(&mut buf, data).expect("序列化 SSE 数据失败");
+    buf.extend_from_slice(b"\n\n");
+    Bytes::from(buf)
 }
 
 /// message_start 事件
@@ -185,64 +186,45 @@ pub fn content_block_start_web_search_result(
     sse("content_block_start", &start)
 }
 
+/// 直写 content_block_delta 格式帧(热路径免去 json! 宏与 Value 分配)
+#[inline]
+fn emit_delta(index: i64, delta_type: &str, field_key: &str, value: &str) -> Bytes {
+    let mut buf = Vec::with_capacity(96 + value.len());
+    buf.extend_from_slice(b"event: content_block_delta\ndata: {\"type\":\"content_block_delta\",\"index\":");
+    let _ = write!(&mut buf, "{index}");
+    buf.extend_from_slice(b",\"delta\":{\"type\":\"");
+    buf.extend_from_slice(delta_type.as_bytes());
+    buf.extend_from_slice(b"\",\"");
+    buf.extend_from_slice(field_key.as_bytes());
+    buf.extend_from_slice(b"\":");
+    serde_json::to_writer(&mut buf, value).expect("序列化 delta 字段失败");
+    buf.extend_from_slice(b"}}\n\n");
+    Bytes::from(buf)
+}
+
 /// content_block_delta 事件(text_delta)
 pub fn content_block_delta_text(index: i64, text: &str) -> Bytes {
-    sse(
-        "content_block_delta",
-        &json!({
-            "type": "content_block_delta",
-            "index": index,
-            "delta": {"type": "text_delta", "text": text}
-        }),
-    )
+    emit_delta(index, "text_delta", "text", text)
 }
 
 /// content_block_delta 事件(thinking_delta)
 pub fn content_block_delta_thinking(index: i64, thinking: &str) -> Bytes {
-    sse(
-        "content_block_delta",
-        &json!({
-            "type": "content_block_delta",
-            "index": index,
-            "delta": {"type": "thinking_delta", "thinking": thinking}
-        }),
-    )
+    emit_delta(index, "thinking_delta", "thinking", thinking)
 }
 
 /// content_block_delta 事件(signature_delta,responses 协议专用)
 pub fn content_block_delta_signature(index: i64, signature: &str) -> Bytes {
-    sse(
-        "content_block_delta",
-        &json!({
-            "type": "content_block_delta",
-            "index": index,
-            "delta": {"type": "signature_delta", "signature": signature}
-        }),
-    )
+    emit_delta(index, "signature_delta", "signature", signature)
 }
 
 /// content_block_delta 事件(redacted_thinking data,responses 协议专用)
 pub fn content_block_delta_redacted_thinking_data(index: i64, data: &str) -> Bytes {
-    sse(
-        "content_block_delta",
-        &json!({
-            "type": "content_block_delta",
-            "index": index,
-            "delta": {"type": "redacted_thinking_data", "data": data}
-        }),
-    )
+    emit_delta(index, "redacted_thinking_data", "data", data)
 }
 
 /// content_block_delta 事件(input_json_delta)
 pub fn content_block_delta_input_json(index: i64, partial_json: &str) -> Bytes {
-    sse(
-        "content_block_delta",
-        &json!({
-            "type": "content_block_delta",
-            "index": index,
-            "delta": {"type": "input_json_delta", "partial_json": partial_json}
-        }),
-    )
+    emit_delta(index, "input_json_delta", "partial_json", partial_json)
 }
 
 /// content_block_stop 事件
@@ -271,3 +253,44 @@ pub fn error_event_typed(err_type: &str, message: &str) -> Bytes {
         &json!({"type": "error", "error": {"type": err_type, "message": message}}),
     )
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn test_emit_delta_matches_json_serialization() {
+        let text_cases = [
+            "hello",
+            "line1\nline2\r\nline3\t\"quoted\"",
+            "Unicode: 🦀 日本語 \u{1F600}",
+            r#"{"nested": "json string"}"#,
+            "",
+        ];
+
+        for (i, case) in text_cases.iter().enumerate() {
+            let actual = content_block_delta_text(i as i64, case);
+            let expected = sse(
+                "content_block_delta",
+                &json!({
+                    "type": "content_block_delta",
+                    "index": i as i64,
+                    "delta": {"type": "text_delta", "text": case}
+                }),
+            );
+            assert_eq!(actual, expected, "case {} failed", case);
+        }
+
+        let thinking_actual = content_block_delta_thinking(0, "thought \n \"quotes\"");
+        let thinking_expected = sse(
+            "content_block_delta",
+            &json!({
+                "type": "content_block_delta",
+                "index": 0,
+                "delta": {"type": "thinking_delta", "thinking": "thought \n \"quotes\""}
+            }),
+        );
+        assert_eq!(thinking_actual, thinking_expected);
+    }
+}
+
