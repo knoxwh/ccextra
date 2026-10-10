@@ -135,7 +135,7 @@ curl -H "Authorization: Bearer $ANTHROPIC_AUTH_TOKEN" \
   http://127.0.0.1:8222/v1/models
 ```
 
-需要后台运行时，使用 `build.sh` 和 `start.sh`、`stop.sh`、`restart.sh`。这些脚本使用根目录 `./ccextra`；`build.sh` 会更新该二进制。
+需要后台运行时，使用 `build.sh`（只构建并更新二进制）和 `deploy.sh`（构建并检测重启）、`start.sh`、`stop.sh`、`restart.sh`。这些脚本使用根目录 `./ccextra`；`build.sh` 和 `deploy.sh` 会更新该二进制。
 
 ## 配置参考
 

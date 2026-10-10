@@ -135,7 +135,7 @@ curl -H "Authorization: Bearer $ANTHROPIC_AUTH_TOKEN" \
   http://127.0.0.1:8222/v1/models
 ```
 
-For background operation, use `build.sh` with `start.sh`, `stop.sh`, and `restart.sh`. These scripts use the root-level `./ccextra` binary, which `build.sh` updates.
+For background operation, use `build.sh` (build and update the binary only) or `deploy.sh` (build, then restart if running), along with `start.sh`, `stop.sh`, and `restart.sh`. These scripts use the root-level `./ccextra` binary, which `build.sh` and `deploy.sh` update.
 
 ## Configuration
 
