@@ -181,7 +181,7 @@ curl -H "Authorization: Bearer $ANTHROPIC_AUTH_TOKEN" \
 
 请求经过入口认证、模型路由、归一化、协议转换和参数覆盖后发送上游。OpenAI 路径按配置注入 `prompt_cache_key`，Gemini 和 Antigravity 不运行 OpenAI 专用处理。
 
-- **请求兼容**：OpenAI Chat/Responses 转换时删除工具 schema 中的 `required: null`，不改 `default` 等实例数据；Chat 另将 schema 位置的 `true` 转为 `{}`，保留 `false` 和布尔 `additionalProperties`。Responses 线上 JSON 前置 `model`、`stream` 与已有的 `service_tier`，其余字段和嵌套内容不变。Antigravity 将 system 开头的 Claude Agent SDK/Claude Code 身份句中和，保留后续指令。Claude 原生直通不受影响。
+- **请求兼容**：OpenAI Chat/Responses 转换时删除工具 schema 中的 `required: null`，不改 `default` 等实例数据；Chat 另将 schema 位置的 `true` 转为 `{}`，保留 `false` 和布尔 `additionalProperties`。Responses 线上 JSON 前置 `model`、`stream` 与已有的 `service_tier`，其余字段和嵌套内容不变。Gemini/Antigravity 声明 `properties` 的 schema 节点必补 `type: object`，阻断因（SAFETY、RECITATION、MALFORMED_FUNCTION_CALL）映射为 `refusal`。Antigravity 将 system 开头的 Claude Agent SDK/Claude Code 身份句中和，保留后续指令，出站清洗非标 session 头。Claude 原生直通不受影响。
 - **Grok 身份**：Chat/Responses 使用 `grok-pager` 标识、`interactive` 模式和双组件 UA；`user_agents.grok_version` 默认 `1.0.46`，显式配置仍优先。仅官方 `cli-chat-proxy.grok.com` 添加 `x-authenticateresponse: authenticate-response`。
 - **流式响应**：Claude 正文字节直通，其他协议转换为 Anthropic SSE；所有流式路径使用 10 秒 `: keepalive`。
 - **重试与回退**：429/5xx（含 52x）与网络错误在同轮内轮转多 `base_url`，耗尽后快速失败，把末次上游错误返给客户端；退避重试交客户端（如 Claude Code），上游 `Retry-After` 头透传。流式首帧预读跳过 `: keepalive` 心跳帧；首帧 error 内部重试一次，仍失败返回 502 错误而非提交 200。正常生成不被截断。
@@ -209,7 +209,7 @@ curl -H "Authorization: Bearer $ANTHROPIC_AUTH_TOKEN" \
 ./scripts/check_cursor_quota.sh
 ```
 
-Antigravity 凭证默认在配置文件旁 `.cache/antigravity`，xAI 在 `.cache/xai`，Codex 在 `.cache/codex`。xAI 和 Codex 启动时自动发现。Antigravity 后台加载并每 3 小时刷新模型。Codex 登录使用 PKCE 浏览器授权（本地回调端口默认 1455，可用 `--callback-port` 覆盖），token 提前 24 小时刷新。
+Antigravity 凭证默认在配置文件旁 `.cache/antigravity`，xAI 在 `.cache/xai`，Codex 在 `.cache/codex`。xAI 和 Codex 启动时自动发现。Antigravity 后台加载并每 3 小时刷新模型，token 提前 5 分钟刷新，出站锁定 daily 节点并清洗非标标头。Codex 登录使用 PKCE 浏览器授权（本地回调端口默认 1455，可用 `--callback-port` 覆盖），token 提前 24 小时刷新。
 
 Cursor 登录自行生成 PKCE 并轮询浏览器授权，不依赖 Cursor IDE 或 `cursor-agent`；可用 `--no-browser` 手动打开 URL，token 到期前 10 分钟刷新。PKCE 凭证（`cursor.json`）驱动原生代理与配额查询（`check_cursor_quota.sh`，默认同时展示额度与模型目录，`--models` 仅列模型）。配置后启动与 `/reload` 时经 GetUsableModels 拉取账户模型目录合成 `cursor` provider，每 3 小时后台刷新，失败保留最近成功目录。`cursor_models` 白名单匹配的就是该目录（脚本输出，含 display name 与 aliases）；配白名单前先跑该命令核对模型 id。思考档配在 `models.json`（按 base id），脚本末尾列出各模型可选档位和可直接粘贴的 `models.json` 条目。
 

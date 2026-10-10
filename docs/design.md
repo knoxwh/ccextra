@@ -130,9 +130,9 @@ Responses 流会收集可回放 reasoning。服务端以模型和会话为键保
 
 Antigravity、xAI、Codex、Cursor 登录命令均在凭证保存成功后调用共享的自动重载逻辑，按当前配置的监听地址发送 `POST /reload`；通配 IPv4/IPv6 地址转回环地址，不走代理、不跟随重定向，连接超时 2 秒、总超时 30 秒。仅 2xx 报告重载成功；配置读取、连接或 HTTP 错误只提示，不改变登录成功结果。服务未启动时下次启动加载；`--auth-dir` 不修改服务配置，需与服务扫描目录一致。
 
-`antigravity-login` 使用浏览器回调登录并保存凭证。运行时后台读取有效凭证、刷新 token、拉取模型并注入 provider；首次加载不阻塞监听，之后每 3 小时刷新，失败时保留现有路由。
+`antigravity-login` 使用浏览器回调登录并保存凭证。运行时后台读取有效凭证、提前 300 秒刷新 token（对齐 CPA 5 分钟安全窗口）、拉取模型并注入 provider；首次加载不阻塞监听，之后每 3 小时刷新，失败时保留现有路由。上游统一锁定单 daily 节点（`daily-cloudcode-pa.googleapis.com`），禁止跨集群回退以防破坏上游前缀缓存。
 
-Antigravity 上游默认短连接：空闲连接在响应结束后立即关闭，防止凭证轮换下 socket 堆积与陈旧连接错误。`antigravity.connection-pool` 显式启用连接池（`idle-conn-timeout` 默认 30s、上限 210s，不超过 Google Frontend 240s keep-alive 截止；`max-idle-conns-per-host` 默认 2、上限 100），其余协议共享全局客户端不受影响。
+Antigravity 上游默认短连接：空闲连接在响应结束后立即关闭，防止凭证轮换下 socket 堆积与陈旧连接错误。`antigravity.connection-pool` 显式启用连接池（`idle-conn-timeout` 默认 30s、上限 210s，不超过 Google Frontend 240s keep-alive 截止；`max-idle-conns-per-host` 默认 2、上限 100），其余协议共享全局客户端不受影响。出站标头严格清洗非标头（如 `x-vscode-sessionid`），保持同构规避 Google WAF。
 
 `xai-login` 使用 OAuth device flow。启动和配置重载扫描 xAI 凭证，必要时提前刷新 token，并为每份有效凭证注入一个 Responses provider。相对 `auth_dir`、`xai_auth_dir` 和 `models_file` 始终相对配置文件目录解析。缺省 `models.json` 与配置同目录。缺文件或模型未收录时不钳 effort；条目可设 `force_effort` 固定档（生效范围与钳制一致，值不钳制）；解析失败则启动或 `/reload` 报错。
 
