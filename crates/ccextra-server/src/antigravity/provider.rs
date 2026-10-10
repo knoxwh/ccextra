@@ -95,11 +95,9 @@ pub async fn load_antigravity_providers(
         let provider = ProviderConfig::new(
             provider_name.clone(),
             Protocol::Antigravity,
-            // 对齐 CLIProxyAPI 回退顺序:daily 优先,prod 兜底
-            vec![
-                constants::DAILY_API_ENDPOINT.to_string(),
-                constants::API_ENDPOINT.to_string(),
-            ],
+            // 对齐 CLIProxyAPI resolveAntigravityRequestBaseURL:
+            // 纯直连主力 daily 端点,禁止跨层回退(cross-tier fallback 会切集群导致对话缓存归 0)
+            vec![constants::DAILY_API_ENDPOINT.to_string()],
             cred.access_token.clone(),
             proxy_url.map(|s| s.to_string()),
             false, // prompt_cache_key

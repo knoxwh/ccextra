@@ -190,7 +190,9 @@ pub fn content_block_start_web_search_result(
 #[inline]
 fn emit_delta(index: i64, delta_type: &str, field_key: &str, value: &str) -> Bytes {
     let mut buf = Vec::with_capacity(96 + value.len());
-    buf.extend_from_slice(b"event: content_block_delta\ndata: {\"type\":\"content_block_delta\",\"index\":");
+    buf.extend_from_slice(
+        b"event: content_block_delta\ndata: {\"type\":\"content_block_delta\",\"index\":",
+    );
     let _ = write!(&mut buf, "{index}");
     buf.extend_from_slice(b",\"delta\":{\"type\":\"");
     buf.extend_from_slice(delta_type.as_bytes());
@@ -293,4 +295,3 @@ mod tests {
         assert_eq!(thinking_actual, thinking_expected);
     }
 }
-
