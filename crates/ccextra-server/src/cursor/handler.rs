@@ -760,7 +760,9 @@ pub(crate) async fn handle_cursor(
                     return Ok(failure_response(err));
                 }
             }
-            let reply = CursorReply::new(response_id, inbound_model, input_estimate(&prepared));
+            // 续接回合:TurnEnded 的 input/read 是整轮聚合值,read 不进 context
+            let reply =
+                CursorReply::new(response_id, inbound_model, input_estimate(&prepared), true);
             setup.handed_off = true;
             spawn_cursor_producer(
                 state.cursor_sessions.clone(),
@@ -872,6 +874,8 @@ pub(crate) async fn handle_cursor(
                     response_id.clone(),
                     inbound_model.clone(),
                     input_estimate(&prepared),
+                    // 冷路径(新会话或历史伪造):TurnEnded 是单请求语义
+                    false,
                 );
                 let first = async {
                     loop {
