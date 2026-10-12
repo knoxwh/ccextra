@@ -557,6 +557,11 @@ fn convert_message_parts(
                     }));
                 }
             }
+            "document" | "container_upload" => {
+                if let Some(file) = document_to_openai_file(part) {
+                    content_items.push(file);
+                }
+            }
             "tool_use" => {
                 if role == "assistant" {
                     let id = part.get("id").and_then(|v| v.as_str()).unwrap_or("");
@@ -713,6 +718,43 @@ fn image_to_url(part: &Value) -> Option<String> {
             .and_then(|v| v.as_str())
             .map(|s| s.to_string())
     })
+}
+
+/// document/container_upload → OpenAI chat file part
+/// (对齐 CPA convertClaudeFilePartToOpenAI:base64 only,任意 mime)
+fn document_to_openai_file(part: &Value) -> Option<Value> {
+    use base64::Engine;
+    let source = part.get("source")?;
+    if source.get("type").and_then(|v| v.as_str()) != Some("base64") {
+        return None;
+    }
+    let data = source
+        .get("data")
+        .and_then(|v| v.as_str())
+        .map(str::trim)
+        .filter(|s| !s.is_empty())?;
+    let decoded = base64::engine::general_purpose::STANDARD
+        .decode(data)
+        .ok()?;
+    if decoded.is_empty() {
+        return None;
+    }
+    let mime_type = source
+        .get("media_type")
+        .or_else(|| source.get("mime_type"))
+        .and_then(|v| v.as_str())
+        .map(str::trim)
+        .filter(|s| !s.is_empty())
+        .unwrap_or("application/octet-stream");
+    let filename = part.get("filename").and_then(|v| v.as_str()).unwrap_or("");
+    let reencoded = base64::engine::general_purpose::STANDARD.encode(&decoded);
+    Some(json!({
+        "type": "file",
+        "file": {
+            "filename": filename,
+            "file_data": format!("data:{mime_type};base64,{reencoded}")
+        }
+    }))
 }
 
 /// tool_choice 映射:auto→auto, any→required, tool→specific function
@@ -1158,6 +1200,76 @@ IMPORTANT: Assist with authorized security testing.
         let content = body["messages"][0]["content"].as_array().unwrap();
         assert_eq!(content.len(), 1);
         assert_eq!(content[0]["text"], "real question");
+    }
+
+    #[test]
+    fn test_document_block_to_openai_file() {
+        let mut body = json!({
+            "model": "test",
+            "messages": [{"role": "user", "content": [
+                {"type": "document", "filename": "doc.pdf",
+                 "source": {"type": "base64", "media_type": "application/pdf", "data": "JVBERi0xLjQK"}}
+            ]}]
+        });
+        convert_to_openai_chat(&mut body, "gpt").unwrap();
+        let part = &body["messages"][0]["content"][0];
+        assert_eq!(part["type"], "file");
+        assert_eq!(part["file"]["filename"], "doc.pdf");
+        assert_eq!(
+            part["file"]["file_data"],
+            "data:application/pdf;base64,JVBERi0xLjQK"
+        );
+    }
+
+    #[test]
+    fn test_document_without_filename_defaults_empty() {
+        let mut body = json!({
+            "model": "test",
+            "messages": [{"role": "user", "content": [
+                {"type": "document",
+                 "source": {"type": "base64", "media_type": "text/plain", "data": "aGVsbG8="}}
+            ]}]
+        });
+        convert_to_openai_chat(&mut body, "gpt").unwrap();
+        let part = &body["messages"][0]["content"][0];
+        assert_eq!(part["type"], "file");
+        assert_eq!(part["file"]["filename"], "");
+        assert_eq!(part["file"]["file_data"], "data:text/plain;base64,aGVsbG8=");
+    }
+
+    #[test]
+    fn test_document_invalid_or_non_base64_dropped() {
+        let mut body = json!({
+            "model": "test",
+            "messages": [{"role": "user", "content": [
+                {"type": "document", "source": {"type": "url", "url": "https://example.com/a.pdf"}},
+                {"type": "document", "source": {"type": "base64", "media_type": "application/pdf", "data": "!!!"}},
+                {"type": "text", "text": "keep"}
+            ]}]
+        });
+        convert_to_openai_chat(&mut body, "gpt").unwrap();
+        let content = body["messages"][0]["content"].as_array().unwrap();
+        assert_eq!(content.len(), 1);
+        assert_eq!(content[0]["text"], "keep");
+    }
+
+    #[test]
+    fn test_container_upload_maps_like_document() {
+        let mut body = json!({
+            "model": "test",
+            "messages": [{"role": "user", "content": [
+                {"type": "container_upload", "filename": "blob.bin",
+                 "source": {"type": "base64", "data": "AQID"}}
+            ]}]
+        });
+        convert_to_openai_chat(&mut body, "gpt").unwrap();
+        let part = &body["messages"][0]["content"][0];
+        assert_eq!(part["type"], "file");
+        assert_eq!(part["file"]["filename"], "blob.bin");
+        assert_eq!(
+            part["file"]["file_data"],
+            "data:application/octet-stream;base64,AQID"
+        );
     }
 
     #[test]
