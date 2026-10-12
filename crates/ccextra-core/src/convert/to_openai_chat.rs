@@ -40,8 +40,9 @@ pub fn convert_to_openai_chat_with(
     // reasoning_effort,messages,tools,tool_choice,user
     openai.insert("model".into(), json!(upstream_model));
     // thinking → reasoning_effort(legacy budget 优先;无 budget 时读取顶层 output_config)
-    // 先解析,能力矩阵按最终 effort 判定采样是否可发。
-    let reasoning_effort = crate::thinking::resolve_effort_from_body(body).map(|effort| {
+    // 发出的 effort 仍可钳制;采样能力按源意图判定(disabled→none 被钳高时不误关 temperature)。
+    let source_effort = crate::thinking::resolve_effort_from_body(body);
+    let reasoning_effort = source_effort.map(|effort| {
         // 对齐 CPA kimi ModeNone:直接走 disabled 形状,不过 clampLevel
         // (clamp 会把 none 钳到最近支持级别,违背显式禁用语义)
         if effort == "none" && is_kimi_upstream_model(upstream_model) {
@@ -54,7 +55,12 @@ pub fn convert_to_openai_chat_with(
             }
         }
     });
-    let capabilities = openai_chat_capabilities(upstream_model, reasoning_effort.unwrap_or(""));
+    let sampling_effort = if source_effort == Some("none") {
+        "none"
+    } else {
+        reasoning_effort.unwrap_or("")
+    };
+    let capabilities = openai_chat_capabilities(upstream_model, sampling_effort);
 
     // max_tokens 透传;o/GPT-5/Astra 改发 max_completion_tokens
     if let Some(val) = body.get("max_tokens") {
@@ -1968,6 +1974,62 @@ IMPORTANT: Assist with authorized security testing.
         assert_eq!(body["reasoning_effort"], Value::Null);
         assert_eq!(body["thinking"]["type"], "enabled");
         assert_eq!(body["thinking"]["effort"], "low");
+    }
+
+    #[test]
+    fn test_disabled_clamped_up_keeps_gpt51_sampling() {
+        // registry 无 none:disabled 钳到 low,但 GPT-5.1 仍放行 temperature
+        let mut body = json!({
+            "model": "test",
+            "thinking": {"type": "disabled"},
+            "temperature": 0.5,
+            "messages": [{"role": "user", "content": "hi"}]
+        });
+        let registry = vec![crate::thinking::ModelCapability {
+            id: "gpt-5.1".into(),
+            reasoning_levels: vec!["low".into(), "medium".into(), "high".into()],
+            force_effort: None,
+        }];
+        convert_to_openai_chat_with(&mut body, "gpt-5.1", &registry).unwrap();
+        assert_eq!(body["reasoning_effort"], "low");
+        assert_eq!(body["temperature"], 0.5);
+    }
+
+    #[test]
+    fn test_real_effort_still_drops_gpt51_sampling() {
+        let mut body = json!({
+            "model": "test",
+            "output_config": {"effort": "medium"},
+            "thinking": {"type": "adaptive"},
+            "temperature": 0.5,
+            "messages": [{"role": "user", "content": "hi"}]
+        });
+        let registry = vec![crate::thinking::ModelCapability {
+            id: "gpt-5.1".into(),
+            reasoning_levels: vec!["low".into(), "medium".into(), "high".into()],
+            force_effort: None,
+        }];
+        convert_to_openai_chat_with(&mut body, "gpt-5.1", &registry).unwrap();
+        assert_eq!(body["reasoning_effort"], "medium");
+        assert!(body.get("temperature").is_none());
+    }
+
+    #[test]
+    fn test_disabled_with_none_in_registry_keeps_none_and_sampling() {
+        let mut body = json!({
+            "model": "test",
+            "thinking": {"type": "disabled"},
+            "temperature": 0.3,
+            "messages": [{"role": "user", "content": "hi"}]
+        });
+        let registry = vec![crate::thinking::ModelCapability {
+            id: "gpt-5.1".into(),
+            reasoning_levels: vec!["none".into(), "low".into(), "high".into()],
+            force_effort: None,
+        }];
+        convert_to_openai_chat_with(&mut body, "gpt-5.1", &registry).unwrap();
+        assert_eq!(body["reasoning_effort"], "none");
+        assert_eq!(body["temperature"], 0.3);
     }
 
     #[test]
