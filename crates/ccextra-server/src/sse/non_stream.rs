@@ -368,11 +368,11 @@ pub fn openai_chat_to_anthropic(body: &Value) -> Option<Value> {
         }
     }
 
-    // usage:prompt_tokens/completion_tokens(对齐 OpenAI Chat API)
-    let (input_tokens, output_tokens, cached) = body
+    // usage:prompt_tokens/completion_tokens(+ cache_write,对齐 CPA extractOpenAIUsage)
+    let (input_tokens, output_tokens, cached, cache_write) = body
         .get("usage")
         .map(super::extract_usage_chat)
-        .unwrap_or((0, 0, 0));
+        .unwrap_or((0, 0, 0, 0));
 
     let stop_reason = if has_tool_use {
         "tool_use"
@@ -387,7 +387,7 @@ pub fn openai_chat_to_anthropic(body: &Value) -> Option<Value> {
         input_tokens,
         output_tokens,
         cached,
-        0,  // chat 路径不透传 cache_write(对齐 CPA:仅 responses 转换映射)
+        cache_write,
         -1, // chat 路径无 thinking_tokens
     )
 }
@@ -519,6 +519,26 @@ mod tests {
         assert_eq!(out["stop_reason"], "end_turn");
         assert_eq!(out["usage"]["input_tokens"], 20);
         assert_eq!(out["usage"]["cache_read_input_tokens"], 80);
+    }
+
+    #[test]
+    fn test_chat_nonstream_cache_write_tokens() {
+        // 对齐 CPA extractOpenAIUsage:cache_write_tokens → cache_creation_input_tokens
+        let body = json!({
+            "id": "chatcmpl_1",
+            "model": "gpt-test",
+            "choices": [{"message": {"role": "assistant", "content": "hi"}, "finish_reason": "stop"}],
+            "usage": {
+                "prompt_tokens": 1000,
+                "completion_tokens": 200,
+                "prompt_tokens_details": {"cached_tokens": 800, "cache_write_tokens": 150}
+            }
+        });
+        let out = openai_chat_to_anthropic(&body).unwrap();
+        assert_eq!(out["usage"]["input_tokens"], 50);
+        assert_eq!(out["usage"]["cache_read_input_tokens"], 800);
+        assert_eq!(out["usage"]["cache_creation_input_tokens"], 150);
+        assert_eq!(out["usage"]["output_tokens"], 200);
     }
 
     #[test]

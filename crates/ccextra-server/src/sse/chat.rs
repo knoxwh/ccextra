@@ -66,6 +66,7 @@ struct ChatRelay {
     usage_input: i64,
     usage_output: i64,
     usage_cached: i64,
+    usage_cache_write: i64,
     // 已发射的 thinking 片段(去重)
     thinking_parts: Vec<String>,
     // 本回合是否发过 text(兜底判定用)
@@ -94,6 +95,7 @@ impl ChatRelay {
             usage_input: 0,
             usage_output: 0,
             usage_cached: 0,
+            usage_cache_write: 0,
             thinking_parts: Vec::new(),
             has_text: false,
             synthetic_tool_ids: 0,
@@ -229,10 +231,11 @@ impl ChatRelay {
 
     /// 缓存 usage 并做 cached 减法(与 extractOpenAIUsage 一致)
     fn cache_usage(&mut self, usage: &Value) {
-        let (input, output, cached) = super::extract_usage_chat(usage);
+        let (input, output, cached, cache_write) = super::extract_usage_chat(usage);
         self.usage_input = input;
         self.usage_output = output;
         self.usage_cached = cached;
+        self.usage_cache_write = cache_write;
         self.usage_seen = true;
     }
 
@@ -295,7 +298,7 @@ impl ChatRelay {
             self.usage_input,
             self.usage_output,
             self.usage_cached,
-            0,  // chat 路径不透传 cache_write(对齐 CPA:仅 responses 转换映射)
+            self.usage_cache_write,
             -1, // chat 路径无 thinking_tokens
         ));
         frames.push(emit::message_stop());
@@ -318,7 +321,9 @@ impl ChatRelay {
             return Vec::new();
         }
         self.started = true;
-        if self.usage_seen && (self.usage_input > 0 || self.usage_cached > 0) {
+        if self.usage_seen
+            && (self.usage_input > 0 || self.usage_cached > 0 || self.usage_cache_write > 0)
+        {
             // 真实 usage 已可用:input 为净值(已扣 cached),cache 如实上报。
             vec![emit::message_start(
                 &self.id,

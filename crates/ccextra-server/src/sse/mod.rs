@@ -151,10 +151,12 @@ where
     with_idle_keepalive(inner)
 }
 
-/// 从 OpenAI Chat usage 提取三元组(input, output, cached),cached 已从 input 扣除。
+/// 从 OpenAI Chat usage 提取四元组(input, output, cached, cache_write),
+/// cached 与 cache_write 均已从 input 扣除(对齐 Anthropic 互斥分项语义)。
 ///
-/// 对齐 extractOpenAIUsage:prompt_tokens - cached (if > 0)。
-pub fn extract_usage_chat(usage: &serde_json::Value) -> (i64, i64, i64) {
+/// 对齐 CPA extractOpenAIUsage:prompt_tokens_details.cached_tokens /
+/// cache_write_tokens(cache_creation_tokens 兜底)。
+pub fn extract_usage_chat(usage: &serde_json::Value) -> (i64, i64, i64, i64) {
     let mut input = usage
         .get("prompt_tokens")
         .and_then(|v| v.as_i64())
@@ -167,10 +169,26 @@ pub fn extract_usage_chat(usage: &serde_json::Value) -> (i64, i64, i64) {
         .pointer("/prompt_tokens_details/cached_tokens")
         .and_then(|v| v.as_i64())
         .unwrap_or(0);
+    let cache_write = usage
+        .pointer("/prompt_tokens_details/cache_write_tokens")
+        .and_then(|v| v.as_i64())
+        .or_else(|| {
+            usage
+                .pointer("/prompt_tokens_details/cache_creation_tokens")
+                .and_then(|v| v.as_i64())
+        })
+        .unwrap_or(0);
+    let mut deduct = 0i64;
     if cached > 0 {
-        input = (input - cached).max(0);
+        deduct = deduct.saturating_add(cached);
     }
-    (input, output, cached)
+    if cache_write > 0 {
+        deduct = deduct.saturating_add(cache_write);
+    }
+    if deduct > 0 {
+        input = (input - deduct).max(0);
+    }
+    (input, output, cached, cache_write)
 }
 
 /// 从 OpenAI Responses usage 提取四元组(input, output, cached, cache_write),
@@ -340,10 +358,40 @@ mod tests {
                 "prompt_tokens_details": {"cached_tokens": 20}
             }
         });
-        let (input, output, cached) = extract_usage_chat(&chunk["usage"]);
+        let (input, output, cached, cache_write) = extract_usage_chat(&chunk["usage"]);
         assert_eq!(input, 80); // 100 - 20
         assert_eq!(output, 50);
         assert_eq!(cached, 20);
+        assert_eq!(cache_write, 0);
+    }
+
+    #[test]
+    fn test_extract_usage_chat_cache_write_and_creation_alias() {
+        let usage = json!({
+            "prompt_tokens": 1000,
+            "completion_tokens": 200,
+            "prompt_tokens_details": {
+                "cached_tokens": 800,
+                "cache_write_tokens": 150
+            }
+        });
+        let (input, output, cached, cache_write) = extract_usage_chat(&usage);
+        assert_eq!(input, 50); // 1000 - 800 - 150
+        assert_eq!(output, 200);
+        assert_eq!(cached, 800);
+        assert_eq!(cache_write, 150);
+
+        let alias = json!({
+            "prompt_tokens": 1000,
+            "completion_tokens": 200,
+            "prompt_tokens_details": {
+                "cached_tokens": 800,
+                "cache_creation_tokens": 150
+            }
+        });
+        let (input, _, _, cache_write) = extract_usage_chat(&alias);
+        assert_eq!(input, 50);
+        assert_eq!(cache_write, 150);
     }
 
     #[test]
