@@ -19,6 +19,27 @@ struct Entry {
     stored_at: Instant,
 }
 
+/// `apply_to_antigravity_body` 结果，便于调用侧区分 miss / 失败 / 未改写 / 命中。
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum AgReplayApplyOutcome {
+    /// 无账本或 TTL 过期
+    Miss,
+    /// body 缺少 `request` 字段
+    MissingRequest,
+    /// 账本存在但规范化失败（超限等）
+    Invalid { items: usize },
+    /// 账本存在且规范化成功，但未改写任何 part（无匹配 / 已有 native 签名）
+    Unchanged { items: usize },
+    /// 成功注入至少一处 thoughtSignature
+    Applied { items: usize },
+}
+
+impl AgReplayApplyOutcome {
+    pub fn applied(self) -> bool {
+        matches!(self, Self::Applied { .. })
+    }
+}
+
 /// Antigravity / Gemini thoughtSignature 账本缓存。
 #[derive(Clone)]
 pub struct AgReplayCache {
@@ -91,14 +112,27 @@ impl AgReplayCache {
     }
 
     /// 将缓存签名回填到 Antigravity 外层 body 的 `request` 对象。
-    pub fn apply_to_antigravity_body(&self, session_key: &str, body: &mut Value) -> bool {
+    pub fn apply_to_antigravity_body(
+        &self,
+        session_key: &str,
+        body: &mut Value,
+    ) -> AgReplayApplyOutcome {
         let Some(items) = self.get_items(session_key) else {
-            return false;
+            return AgReplayApplyOutcome::Miss;
         };
+        let item_count = items.len();
         let Some(request) = body.get_mut("request") else {
-            return false;
+            return AgReplayApplyOutcome::MissingRequest;
         };
-        apply_ag_replay_items(request, &items)
+        // 先探测规范化：失败与「有账本但未匹配」分开，便于日志分级
+        if normalize_ag_replay_items(&items).is_none() {
+            return AgReplayApplyOutcome::Invalid { items: item_count };
+        }
+        if apply_ag_replay_items(request, &items) {
+            AgReplayApplyOutcome::Applied { items: item_count }
+        } else {
+            AgReplayApplyOutcome::Unchanged { items: item_count }
+        }
     }
 
     /// 非流：从上游响应收集并提交账本。
@@ -226,7 +260,7 @@ mod tests {
                 ]
             }
         });
-        assert!(cache.apply_to_antigravity_body(key, &mut body));
+        assert!(cache.apply_to_antigravity_body(key, &mut body).applied());
         assert_eq!(
             body["request"]["contents"][1]["parts"][0]["thoughtSignature"],
             "sig-first-long-enough"
@@ -264,7 +298,7 @@ mod tests {
         // old item 无 targetHash 且 partIndex 可能匹配 model text → 可能注入；
         // 关键是缓存未被 partial 清空。取 items 非空即可。
         assert!(cache.get_items(key).is_some());
-        let _ = cache.apply_to_antigravity_body(key, &mut body);
+        let _ = cache.apply_to_antigravity_body(key, &mut body).applied();
     }
 
     #[test]
@@ -367,5 +401,76 @@ mod tests {
         }
         let items = cache.get_items(&key).expect("Drop commits");
         assert_eq!(items[0]["thoughtSignature"], "sig-drop-long-enough12");
+    }
+
+    #[test]
+    fn apply_outcome_distinguishes_miss_and_applied() {
+        let cache = AgReplayCache::new(Duration::from_secs(60), 128);
+        let key = "gemini-flash:sess-outcome";
+        let mut body = json!({
+            "request": {
+                "contents": [
+                    {"role": "user", "parts": [{"text": "hi"}]},
+                    {"role": "model", "parts": [{
+                        "functionCall": {"id": "id1", "name": "Read", "args": {"file_path": "/a"}}
+                    }]},
+                    {"role": "user", "parts": [{
+                        "functionResponse": {"id": "id1", "name": "Read", "response": {"result": "ok"}}
+                    }]}
+                ]
+            }
+        });
+        assert_eq!(
+            cache.apply_to_antigravity_body(key, &mut body),
+            AgReplayApplyOutcome::Miss
+        );
+        cache.replace_items(
+            key,
+            vec![json!({
+                "type": "function_call_part",
+                "contentIndex": 1,
+                "partIndex": 0,
+                "name": "Read",
+                "call_id": "id1",
+                "args": {"file_path": "/a"},
+                "thoughtSignature": "sig-first-long-enough"
+            })],
+        );
+        assert_eq!(
+            cache.apply_to_antigravity_body(key, &mut body),
+            AgReplayApplyOutcome::Applied { items: 1 }
+        );
+        assert_eq!(
+            body["request"]["contents"][1]["parts"][0]["thoughtSignature"],
+            "sig-first-long-enough"
+        );
+    }
+
+    #[test]
+    fn overflow_store_clears_existing_ledger() {
+        let cache = AgReplayCache::new(Duration::from_secs(60), 128);
+        let key = "gemini-flash:sess-overflow";
+        cache.replace_items(
+            key,
+            vec![json!({
+                "type": "thought_signature",
+                "thoughtSignature": "old-signature-123456789",
+                "contentIndex": 1,
+                "partIndex": 0,
+            })],
+        );
+        assert!(cache.get_items(key).is_some());
+        let request = json!({"contents": [{"role": "user", "parts": [{"text": "hi"}]}]});
+        let huge = "s".repeat(ccextra_core::convert::MAX_BYTES_PER_ENTRY);
+        let response = json!({
+            "response": {"candidates": [{"content": {"parts": [
+                {"thoughtSignature": huge, "functionCall": {"name": "Read", "args": {"p": "/a"}, "id": "id1"}}
+            ]}, "finishReason": "STOP"}]}
+        });
+        cache.store_from_response(key, &request, &response);
+        assert!(
+            cache.get_items(key).is_none(),
+            "terminal overflow must clear ledger"
+        );
     }
 }

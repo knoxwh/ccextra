@@ -474,15 +474,45 @@ pub(crate) async fn prepare_message_request(
             if ccextra_core::antigravity_uses_reasoning_replay(&route.upstream_model) {
                 if let Some(sess) = cc_session.as_deref() {
                     let key = format!("{}:{}", route.upstream_model, sess);
-                    if state
+                    use crate::sse::antigravity_replay_cache::AgReplayApplyOutcome;
+                    match state
                         .ag_replay_cache
                         .apply_to_antigravity_body(&key, &mut body_json)
                     {
-                        tracing::debug!(
-                            session = %sess,
-                            model = %route.upstream_model,
-                            "antigravity reasoning replay 已注入"
-                        );
+                        AgReplayApplyOutcome::Applied { items } => {
+                            tracing::debug!(
+                                session = %sess,
+                                model = %route.upstream_model,
+                                items,
+                                "antigravity reasoning replay 已注入"
+                            );
+                        }
+                        AgReplayApplyOutcome::Unchanged { items } => {
+                            tracing::debug!(
+                                session = %sess,
+                                model = %route.upstream_model,
+                                items,
+                                "antigravity reasoning replay 账本未改写"
+                            );
+                        }
+                        AgReplayApplyOutcome::Invalid { items } => {
+                            tracing::warn!(
+                                session = %sess,
+                                model = %route.upstream_model,
+                                items,
+                                "antigravity reasoning replay 账本规范化失败，跳过注入"
+                            );
+                        }
+                        AgReplayApplyOutcome::MissingRequest => {
+                            tracing::warn!(
+                                session = %sess,
+                                model = %route.upstream_model,
+                                "antigravity reasoning replay 缺少 request 字段，跳过注入"
+                            );
+                        }
+                        AgReplayApplyOutcome::Miss => {
+                            // 对齐 CPA：普通 miss 保持安静，避免每轮刷屏
+                        }
                     }
                 }
             }
