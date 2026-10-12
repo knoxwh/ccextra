@@ -19,7 +19,7 @@ struct GeminiRelayState {
     finished: bool,
     upstream_failed: bool,
     saw_payload: bool,
-    /// 仅 Antigravity 对缺失 finishReason 的 clean EOF 合成终态。
+    /// 缺失 finishReason 的 clean EOF/[DONE] 时合成终态(Gemini 与 AG 均开启)。
     synthesize_missing_finish: bool,
 }
 
@@ -148,7 +148,7 @@ fn process_gemini_events(
 
 /// Gemini SSE 流转 Anthropic SSE。
 ///
-/// 直连 Gemini 不对缺失 finishReason 的流合成终态,仅转发 message_stop。
+/// 缺失 finishReason 时在 clean EOF/[DONE] 合成终态(与 Antigravity 一致)。
 /// 签名原样透传(CPA gemini/claude 响应侧不做归一化)。
 pub fn relay_gemini_to_anthropic<S>(
     stream: S,
@@ -158,7 +158,7 @@ pub fn relay_gemini_to_anthropic<S>(
 where
     S: Stream<Item = Result<Bytes, reqwest::Error>> + Send + 'static,
 {
-    relay_gemini_like_to_anthropic(stream, estimated_input_tokens, tool_names, false, None)
+    relay_gemini_like_to_anthropic(stream, estimated_input_tokens, tool_names, true, None)
 }
 
 /// Antigravity SSE 流转 Anthropic SSE。
@@ -317,12 +317,12 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn test_gemini_done_without_finish_does_not_synthesize_terminal() {
+    async fn test_gemini_done_without_finish_synthesizes_terminal() {
         let output = collect_output(stream::iter(vec![Ok(Bytes::from(
             "data: {\"candidates\":[{\"content\":{\"parts\":[{\"text\":\"hi\"}]} }],\"usageMetadata\":{\"promptTokenCount\":3}}\n\ndata: [DONE]\n\n",
         ))]))
         .await;
-        assert_eq!(output.matches("event: message_delta").count(), 0);
+        assert_eq!(output.matches("event: message_delta").count(), 1);
         assert_eq!(output.matches("event: message_stop").count(), 1);
     }
 
