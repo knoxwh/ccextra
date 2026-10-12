@@ -66,6 +66,20 @@ pub struct ModelCapability {
     /// 非法级别值视为未设置
     #[serde(default)]
     pub force_effort: Option<String>,
+    /// 对齐 CPA max_completion_tokens；Antigravity 用它封顶 maxOutputTokens
+    #[serde(default)]
+    pub max_completion_tokens: Option<i64>,
+}
+
+impl Default for ModelCapability {
+    fn default() -> Self {
+        Self {
+            id: String::new(),
+            reasoning_levels: Vec::new(),
+            force_effort: None,
+            max_completion_tokens: None,
+        }
+    }
 }
 
 #[derive(Deserialize)]
@@ -109,6 +123,13 @@ pub fn forced_effort(model: &str, registry: &[ModelCapability]) -> Option<&'stat
         .and_then(|cap| cap.force_effort.as_deref())
         .and_then(Level::parse)
         .map(Level::as_str)
+}
+
+/// 查询模型 max_completion_tokens（>0 才有效；对齐 CPA registry）
+pub fn max_completion_tokens(model: &str, registry: &[ModelCapability]) -> Option<i64> {
+    find_capability(model, registry)
+        .and_then(|cap| cap.max_completion_tokens)
+        .filter(|&n| n > 0)
 }
 
 /// budget → level
@@ -465,11 +486,13 @@ mod tests {
                 id: "glm-5.3".into(),
                 reasoning_levels: vec!["low".into(), "high".into()],
                 force_effort: Some("high".into()),
+                max_completion_tokens: None,
             },
             ModelCapability {
                 id: "bad".into(),
                 reasoning_levels: vec!["low".into()],
                 force_effort: Some("bogus".into()),
+                max_completion_tokens: None,
             },
         ];
         assert_eq!(forced_effort("glm-5.3", &reg), Some("high"));
@@ -479,6 +502,26 @@ mod tests {
         assert_eq!(forced_effort("bad", &reg), None);
         // 未收录模型
         assert_eq!(forced_effort("missing", &reg), None);
+    }
+
+    #[test]
+    fn test_max_completion_tokens_lookup() {
+        let reg = mock_registry();
+        // mock_registry entries have None — add one with a cap
+        let mut reg = reg;
+        reg.push(ModelCapability {
+            id: "claude-sonnet-4-6".into(),
+            reasoning_levels: vec!["high".into()],
+            force_effort: None,
+            max_completion_tokens: Some(64000),
+        });
+        assert_eq!(
+            max_completion_tokens("claude-sonnet-4-6", &reg),
+            Some(64000)
+        );
+        assert_eq!(max_completion_tokens("missing", &reg), None);
+        reg.last_mut().unwrap().max_completion_tokens = Some(0);
+        assert_eq!(max_completion_tokens("claude-sonnet-4-6", &reg), None);
     }
 
     // mock registry 供测试用(不依赖 models.json 实际内容)
@@ -493,11 +536,13 @@ mod tests {
                     "xhigh".into(),
                 ],
                 force_effort: None,
+                max_completion_tokens: None,
             },
             ModelCapability {
                 id: "glm-5.2".into(),
                 reasoning_levels: vec!["low".into(), "high".into(), "max".into()],
                 force_effort: None,
+                max_completion_tokens: None,
             },
             ModelCapability {
                 id: "gpt-5.6-terra".into(),
@@ -508,6 +553,7 @@ mod tests {
                     "xhigh".into(),
                 ],
                 force_effort: None,
+                max_completion_tokens: None,
             },
             ModelCapability {
                 id: "gpt-5.6-sol".into(),
@@ -518,6 +564,7 @@ mod tests {
                     "xhigh".into(),
                 ],
                 force_effort: None,
+                max_completion_tokens: None,
             },
             ModelCapability {
                 id: "grok-4.6".into(),
@@ -528,16 +575,19 @@ mod tests {
                     "xhigh".into(),
                 ],
                 force_effort: None,
+                max_completion_tokens: None,
             },
             ModelCapability {
                 id: "kimi-k3".into(),
                 reasoning_levels: vec!["low".into(), "high".into(), "max".into()],
                 force_effort: None,
+                max_completion_tokens: None,
             },
             ModelCapability {
                 id: "gemini-3.8-flash-high".into(),
                 reasoning_levels: vec!["high".into()],
                 force_effort: None,
+                max_completion_tokens: None,
             },
         ]
     }

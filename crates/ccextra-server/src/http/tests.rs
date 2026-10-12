@@ -614,6 +614,7 @@ async fn test_claude_passthrough_clamps_effort_before_upstream() {
         id: "glm-5.3".into(),
         reasoning_levels: vec!["low".into(), "high".into(), "max".into()],
         force_effort: None,
+        max_completion_tokens: None,
     }]);
     let app = app(state);
 

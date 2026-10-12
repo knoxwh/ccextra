@@ -812,6 +812,7 @@ async fn family_model_appends_snapshot_registry_effort_to_upstream_model_id() {
         id: "grok-4.7".into(),
         reasoning_levels: vec!["low".into(), "medium".into(), "high".into(), "xhigh".into()],
         force_effort: Some("high".into()),
+        max_completion_tokens: None,
     }];
     let (state, _dir) = fixture_with(
         url,

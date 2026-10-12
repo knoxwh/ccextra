@@ -1933,6 +1933,7 @@ IMPORTANT: Assist with authorized security testing.
             id: "glm-5.1".into(),
             reasoning_levels: vec!["low".into(), "medium".into(), "high".into(), "xhigh".into()],
             force_effort: None,
+            max_completion_tokens: None,
         }];
         convert_to_openai_chat_with(&mut body, "glm-5.1", &registry).unwrap();
         assert_eq!(body["reasoning_effort"], "xhigh");
@@ -1951,6 +1952,7 @@ IMPORTANT: Assist with authorized security testing.
             id: "glm-5.1".into(),
             reasoning_levels: vec!["low".into(), "medium".into(), "high".into(), "xhigh".into()],
             force_effort: Some("low".into()),
+            max_completion_tokens: None,
         }];
         convert_to_openai_chat_with(&mut body, "glm-5.1", &registry).unwrap();
         assert_eq!(body["reasoning_effort"], "low");
@@ -1969,6 +1971,7 @@ IMPORTANT: Assist with authorized security testing.
             id: "kimi-k2.8".into(),
             reasoning_levels: vec!["low".into(), "high".into(), "max".into()],
             force_effort: Some("low".into()),
+            max_completion_tokens: None,
         }];
         convert_to_openai_chat_with(&mut body, "kimi-k2.8", &registry).unwrap();
         assert_eq!(body["reasoning_effort"], Value::Null);
@@ -1989,6 +1992,7 @@ IMPORTANT: Assist with authorized security testing.
             id: "gpt-5.1".into(),
             reasoning_levels: vec!["low".into(), "medium".into(), "high".into()],
             force_effort: None,
+            max_completion_tokens: None,
         }];
         convert_to_openai_chat_with(&mut body, "gpt-5.1", &registry).unwrap();
         assert_eq!(body["reasoning_effort"], "low");
@@ -2008,6 +2012,7 @@ IMPORTANT: Assist with authorized security testing.
             id: "gpt-5.1".into(),
             reasoning_levels: vec!["low".into(), "medium".into(), "high".into()],
             force_effort: None,
+            max_completion_tokens: None,
         }];
         convert_to_openai_chat_with(&mut body, "gpt-5.1", &registry).unwrap();
         assert_eq!(body["reasoning_effort"], "medium");
@@ -2026,6 +2031,7 @@ IMPORTANT: Assist with authorized security testing.
             id: "gpt-5.1".into(),
             reasoning_levels: vec!["none".into(), "low".into(), "high".into()],
             force_effort: None,
+            max_completion_tokens: None,
         }];
         convert_to_openai_chat_with(&mut body, "gpt-5.1", &registry).unwrap();
         assert_eq!(body["reasoning_effort"], "none");
@@ -2145,6 +2151,7 @@ IMPORTANT: Assist with authorized security testing.
             id: "kimi-k2.8".into(),
             reasoning_levels: vec!["low".into(), "high".into(), "max".into()],
             force_effort: None,
+            max_completion_tokens: None,
         }]
     }
 

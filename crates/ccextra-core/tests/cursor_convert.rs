@@ -829,6 +829,7 @@ fn capability(id: &str, levels: &[&str], force: Option<&str>) -> ModelCapability
         id: id.to_string(),
         reasoning_levels: levels.iter().map(|level| level.to_string()).collect(),
         force_effort: force.map(str::to_string),
+        max_completion_tokens: None,
     }
 }
 

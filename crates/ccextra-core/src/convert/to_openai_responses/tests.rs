@@ -9,6 +9,7 @@ fn astra_registry() -> Vec<crate::thinking::ModelCapability> {
         id: "gpt-6-astra".into(),
         reasoning_levels: vec!["low".into(), "medium".into()],
         force_effort: None,
+        max_completion_tokens: None,
     }]
 }
 
@@ -17,6 +18,7 @@ fn glm51_registry() -> Vec<crate::thinking::ModelCapability> {
         id: "glm-5.1".into(),
         reasoning_levels: vec!["low".into(), "medium".into(), "high".into(), "xhigh".into()],
         force_effort: None,
+        max_completion_tokens: None,
     }]
 }
 
@@ -985,6 +987,7 @@ fn test_force_effort_overrides_inbound_and_default() {
         id: "gpt-6-astra".into(),
         reasoning_levels: vec!["low".into(), "medium".into()],
         force_effort: Some("low".into()),
+        max_completion_tokens: None,
     }];
     let mut explicit = json!({
         "model": "test",

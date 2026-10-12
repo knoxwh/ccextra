@@ -89,7 +89,7 @@ pub fn convert_to_antigravity_with(
         }
 
         // 对齐 CPA executor:maxOutputTokens 按 registry max_completion_tokens 封顶
-        if let Some(cap) = antigravity_max_completion_tokens(upstream_model) {
+        if let Some(cap) = crate::thinking::max_completion_tokens(upstream_model, registry) {
             if let Some(Value::Object(gc)) = request_obj.get_mut("generationConfig") {
                 if let Some(v) = gc.get("maxOutputTokens").and_then(|v| v.as_i64()) {
                     if v > cap {
@@ -122,19 +122,6 @@ pub fn convert_to_antigravity_with(
     }
 
     (antigravity, short_to_original)
-}
-
-/// 对齐 CPA registry models.json antigravity 节 max_completion_tokens
-/// 未收录模型返回 None(不封顶)
-fn antigravity_max_completion_tokens(model: &str) -> Option<i64> {
-    Some(match model {
-        "claude-opus-4-6-thinking" | "claude-sonnet-4-6" => 64000,
-        "gemini-3.6-flash-high" | "gemini-3.8-flash-high" | "gemini-3-flash" => 65536,
-        "gemini-pro-agent" | "gemini-3.1-pro-low" | "gemini-3.1-flash-lite" => 65535,
-        "gemini-3.5-flash-lite" => 65535,
-        "gpt-oss-120b-medium" => 32768,
-        _ => return None,
-    })
 }
 
 /// 对齐 CPA dc21a426:归一化 generationConfig.responseJsonSchema → responseSchema
@@ -282,9 +269,25 @@ mod tests {
     }
 
     #[test]
-    fn test_claude_max_output_capped() {
-        let (out, _) = convert_to_antigravity(&base_body(), "claude-sonnet-4-6", None);
+    fn test_claude_max_output_capped_from_registry() {
+        let reg = vec![crate::thinking::ModelCapability {
+            id: "claude-sonnet-4-6".into(),
+            reasoning_levels: vec![],
+            force_effort: None,
+            max_completion_tokens: Some(64000),
+        }];
+        let (out, _) =
+            convert_to_antigravity_with(&base_body(), "claude-sonnet-4-6", None, &reg, None);
         assert_eq!(out["request"]["generationConfig"]["maxOutputTokens"], 64000);
+    }
+
+    #[test]
+    fn test_claude_max_output_uncapped_without_registry() {
+        let (out, _) = convert_to_antigravity(&base_body(), "claude-sonnet-4-6", None);
+        assert_eq!(
+            out["request"]["generationConfig"]["maxOutputTokens"],
+            128000
+        );
     }
 
     #[test]

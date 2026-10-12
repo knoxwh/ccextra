@@ -1011,6 +1011,7 @@ IMPORTANT: Assist with authorized security testing.
             id: "gemini-3.8-flash-high".into(),
             reasoning_levels: vec!["high".into()],
             force_effort: None,
+            max_completion_tokens: None,
         }];
         let (gemini, _) = convert_to_gemini_with_registry(
             &adaptive_max_body(),
@@ -1053,6 +1054,7 @@ IMPORTANT: Assist with authorized security testing.
             id: "gemini-3.8-flash-high".into(),
             reasoning_levels: vec!["high".into()],
             force_effort: Some("low".into()),
+            max_completion_tokens: None,
         }];
         let (gemini, _) = convert_to_gemini_with_registry(
             &adaptive_max_body(),

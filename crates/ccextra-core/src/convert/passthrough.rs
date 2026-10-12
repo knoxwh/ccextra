@@ -235,11 +235,13 @@ mod tests {
                 id: "glm-5.3".into(),
                 reasoning_levels: vec!["low".into(), "high".into(), "max".into()],
                 force_effort: None,
+                max_completion_tokens: None,
             },
             ModelCapability {
                 id: "claude-opus-5".into(),
                 reasoning_levels: vec!["low".into(), "high".into(), "max".into()],
                 force_effort: None,
+                max_completion_tokens: None,
             },
         ]
     }
@@ -453,6 +455,7 @@ mod tests {
             id: "glm-5.3".into(),
             reasoning_levels: vec!["low".into(), "high".into()],
             force_effort: Some("max".into()),
+            max_completion_tokens: None,
         }];
         let mut body = json!({"output_config": {"effort": "high"}});
         assert!(clamp_passthrough_effort(&mut body, "glm-5.3", &reg));
@@ -466,6 +469,7 @@ mod tests {
             id: "glm-5.3".into(),
             reasoning_levels: vec!["low".into(), "high".into(), "max".into()],
             force_effort: Some("high".into()),
+            max_completion_tokens: None,
         }];
         let mut body = json!({"model": "x", "output_config": {"effort": "high"}, "messages": []});
         let before = serde_json::to_string(&body).unwrap();
@@ -480,6 +484,7 @@ mod tests {
             id: "claude-opus-5".into(),
             reasoning_levels: vec!["low".into(), "high".into()],
             force_effort: Some("low".into()),
+            max_completion_tokens: None,
         }];
         let mut body = json!({"output_config": {"effort": "high"}});
         assert!(!clamp_passthrough_effort(&mut body, "claude-opus-5", &reg));
@@ -489,6 +494,7 @@ mod tests {
             id: "glm-5.3".into(),
             reasoning_levels: vec!["low".into(), "high".into()],
             force_effort: Some("low".into()),
+            max_completion_tokens: None,
         }];
         let mut body2 =
             json!({"thinking": {"type": "disabled", "output_config": {"effort": "high"}}});
