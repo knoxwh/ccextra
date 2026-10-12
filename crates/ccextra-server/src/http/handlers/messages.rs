@@ -161,7 +161,8 @@ pub(crate) fn inbound_headers_json(headers: &HeaderMap) -> Value {
 }
 
 /// 仅当带 replay scope 时加提取 tap。
-/// responses 协议与 antigravity 协议都需从流中提取 replay 项。
+/// 目前仅 OpenAI Responses 使用 Responses 形状的 StreamReplayExtractor。
+/// Antigravity 有独立的 thoughtSignature 账本，不走本路径。
 fn relay_with_replay_tap<S>(
     protocol: Protocol,
     stream: S,
@@ -448,21 +449,8 @@ pub(crate) async fn prepare_message_request(
             if !short_to_original.is_empty() {
                 tool_names = Some(Arc::new(short_to_original));
             }
-
-            if ccextra_core::antigravity_uses_reasoning_replay(&route.upstream_model) {
-                if let Some(sess) = cc_session.as_deref() {
-                    let key = format!("{}:{}", route.upstream_model, sess);
-                    if let Some(request) = body_json.get_mut("request") {
-                        if state.replay_cache.apply_to_body(&key, request, false) {
-                            tracing::debug!(
-                                session = %sess,
-                                model = %route.upstream_model,
-                                "antigravity reasoning replay 已注入"
-                            );
-                        }
-                    }
-                }
-            }
+            // Antigravity reasoning replay 不复用 Responses ReplayCache
+            // (input/encrypted_content)；独立账本在后续 commit 接线。
         }
     }
 
@@ -730,18 +718,9 @@ pub(crate) async fn prepare_message_request(
         (None, None)
     };
 
+    // Responses 专用；Antigravity 不占用本 scope（形状不兼容）。
     let replay_scope = if matches!(route.protocol, Protocol::OpenAiResponses) {
         session_id.map(|s| {
-            (
-                state.replay_cache.clone(),
-                format!("{}:{}", route.upstream_model, s),
-                request_fingerprint.clone(),
-            )
-        })
-    } else if matches!(route.protocol, Protocol::Antigravity)
-        && ccextra_core::antigravity_uses_reasoning_replay(&route.upstream_model)
-    {
-        cc_session.as_deref().map(|s| {
             (
                 state.replay_cache.clone(),
                 format!("{}:{}", route.upstream_model, s),
@@ -1069,12 +1048,7 @@ pub(crate) async fn deliver_response(
                             cache.store_from_completed(key, &wrapped, fingerprint);
                         }
                     }
-                    Protocol::Antigravity => {
-                        if let Some(inner) = v.get("response") {
-                            let wrapped = json!({"response": inner});
-                            cache.store_from_completed(key, &wrapped, fingerprint);
-                        }
-                    }
+                    // Antigravity 不经 Responses store_from_completed
                     _ => {}
                 }
             }
