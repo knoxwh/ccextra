@@ -161,11 +161,8 @@ pub(crate) fn inbound_headers_json(headers: &HeaderMap) -> Value {
     Value::Object(map)
 }
 
-/// 按协议旁路提取 replay：Responses 用 StreamReplayExtractor；
-/// Antigravity 用 AgStreamReplayExtractor（thoughtSignature 账本）。
-fn relay_with_replay_tap<S>(
+struct RelayParams {
     protocol: Protocol,
-    stream: S,
     estimated_input_tokens: Option<usize>,
     tool_names: Option<Arc<HashMap<String, String>>>,
     replay_scope: Option<(crate::sse::replay_cache::ReplayCache, String, String)>,
@@ -176,12 +173,17 @@ fn relay_with_replay_tap<S>(
     )>,
     signature_model: Option<Arc<str>>,
     token_scope: Option<crate::http::session_tokens::TokenCacheScope>,
-) -> SseStreamPin
+}
+
+/// 按协议旁路提取 replay：Responses 用 StreamReplayExtractor；
+/// Antigravity 用 AgStreamReplayExtractor（thoughtSignature 账本）。
+fn relay_with_replay_tap<S>(stream: S, params: RelayParams) -> SseStreamPin
 where
     S: futures::Stream<Item = Result<Bytes, reqwest::Error>> + Send + 'static,
 {
-    let stream = crate::http::session_tokens::tap_input_tokens(stream, protocol, token_scope);
-    if let Some((cache, key, request_fingerprint)) = replay_scope {
+    let stream =
+        crate::http::session_tokens::tap_input_tokens(stream, params.protocol, params.token_scope);
+    if let Some((cache, key, request_fingerprint)) = params.replay_scope {
         let mut extractor = StreamReplayExtractor::new(cache, key, request_fingerprint);
         let tapped = stream.inspect(move |result| {
             if let Ok(bytes) = result {
@@ -189,14 +191,14 @@ where
             }
         });
         return crate::sse::relay(
-            protocol,
+            params.protocol,
             tapped,
-            estimated_input_tokens,
-            tool_names,
-            signature_model,
+            params.estimated_input_tokens,
+            params.tool_names,
+            params.signature_model,
         );
     }
-    if let Some((cache, key, request)) = ag_replay_scope {
+    if let Some((cache, key, request)) = params.ag_replay_scope {
         let mut extractor = AgStreamReplayExtractor::new(cache, key, request);
         let tapped = stream.inspect(move |result| {
             if let Ok(bytes) = result {
@@ -204,19 +206,19 @@ where
             }
         });
         return crate::sse::relay(
-            protocol,
+            params.protocol,
             tapped,
-            estimated_input_tokens,
-            tool_names,
-            signature_model,
+            params.estimated_input_tokens,
+            params.tool_names,
+            params.signature_model,
         );
     }
     crate::sse::relay(
-        protocol,
+        params.protocol,
         stream,
-        estimated_input_tokens,
-        tool_names,
-        signature_model,
+        params.estimated_input_tokens,
+        params.tool_names,
+        params.signature_model,
     )
 }
 
@@ -929,14 +931,16 @@ pub(crate) async fn execute_upstream_request(
             let current = upstream.take().expect("上游响应应存在");
             status = current.status;
             let mut out = relay_with_replay_tap(
-                prepared.route.protocol,
                 current.body.bytes_stream(),
-                prepared.estimated_input_tokens,
-                prepared.tool_names.clone(),
-                prepared.replay_scope.clone(),
-                None,
-                prepared.signature_model.clone(),
-                prepared.token_scope.clone(),
+                RelayParams {
+                    protocol: prepared.route.protocol,
+                    estimated_input_tokens: prepared.estimated_input_tokens,
+                    tool_names: prepared.tool_names.clone(),
+                    replay_scope: prepared.replay_scope.clone(),
+                    ag_replay_scope: None,
+                    signature_model: prepared.signature_model.clone(),
+                    token_scope: prepared.token_scope.clone(),
+                },
             );
             // 首帧只认业务帧:跳过心跳注释帧,防 keepalive 骗过错误检测提前提交 200
             let first = next_business_frame(&mut out).await;
@@ -1145,14 +1149,16 @@ pub(crate) async fn deliver_response(
                     )
                 });
                 relay_with_replay_tap(
-                    prepared.route.protocol,
                     upstream.body.bytes_stream(),
-                    prepared.estimated_input_tokens,
-                    prepared.tool_names.clone(),
-                    prepared.replay_scope.clone(),
-                    ag_scope,
-                    prepared.signature_model.clone(),
-                    prepared.token_scope.clone(),
+                    RelayParams {
+                        protocol: prepared.route.protocol,
+                        estimated_input_tokens: prepared.estimated_input_tokens,
+                        tool_names: prepared.tool_names.clone(),
+                        replay_scope: prepared.replay_scope.clone(),
+                        ag_replay_scope: ag_scope,
+                        signature_model: prepared.signature_model.clone(),
+                        token_scope: prepared.token_scope.clone(),
+                    },
                 )
             }
         };
@@ -1167,11 +1173,11 @@ pub(crate) async fn deliver_response(
         let body_bytes = crate::limits::read_success_body_or_anthropic(upstream.body).await?;
         if let Some((cache, key, fingerprint)) = prepared.replay_scope.as_ref() {
             if let Ok(v) = serde_json::from_slice::<Value>(&body_bytes) {
-                if matches!(prepared.route.protocol, Protocol::OpenAiResponses) {
-                    if v.get("object").and_then(|o| o.as_str()) == Some("response") {
-                        let wrapped = json!({"response": v});
-                        cache.store_from_completed(key, &wrapped, fingerprint);
-                    }
+                if matches!(prepared.route.protocol, Protocol::OpenAiResponses)
+                    && v.get("object").and_then(|o| o.as_str()) == Some("response")
+                {
+                    let wrapped = json!({"response": v});
+                    cache.store_from_completed(key, &wrapped, fingerprint);
                 }
             }
         }

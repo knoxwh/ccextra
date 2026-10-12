@@ -85,7 +85,7 @@ pub(crate) fn tool_result_output(content: &Value) -> (Value, Vec<Value>) {
 }
 
 /// 是否为绝对 http(s) URL(对齐 CPA IsHTTPURL:有 host 且 scheme 为 http/https)
-fn is_http_url(value: &str) -> bool {
+pub(super) fn is_http_url(value: &str) -> bool {
     let Ok(uri) = value.trim().parse::<http::Uri>() else {
         return false;
     };
@@ -100,12 +100,13 @@ fn is_http_url(value: &str) -> bool {
 /// base64 → data URL; type=url 且 http(s) → image_url 透传; type=file → file_id
 pub(crate) fn image_to_input_image(part: &Value) -> Option<Value> {
     let source = part.get("source")?;
-    let data = source
+    // 优先处理 base64 data
+    if let Some(data) = source
         .get("data")
         .or_else(|| source.get("base64"))
         .and_then(|v| v.as_str())
-        .unwrap_or("");
-    if !data.is_empty() {
+        .filter(|s| !s.is_empty())
+    {
         let media_type = source
             .get("media_type")
             .and_then(|v| v.as_str())
@@ -116,23 +117,28 @@ pub(crate) fn image_to_input_image(part: &Value) -> Option<Value> {
             "image_url": format!("data:{media_type};base64,{data}")
         }));
     }
+    // 按 source.type 路由其他形式
     match source.get("type").and_then(|v| v.as_str()) {
-        Some("url") => {
-            let url = source.get("url").and_then(|v| v.as_str())?.trim();
-            if !is_http_url(url) {
-                return None;
-            }
-            Some(json!({"type": "input_image", "image_url": url}))
-        }
-        Some("file") => {
-            let file_id = source.get("file_id").and_then(|v| v.as_str())?.trim();
-            if file_id.is_empty() {
-                return None;
-            }
-            Some(json!({"type": "input_image", "file_id": file_id}))
-        }
+        Some("url") => image_from_url(source),
+        Some("file") => image_from_file(source),
         _ => None,
     }
+}
+
+fn image_from_url(source: &Value) -> Option<Value> {
+    let url = source.get("url").and_then(|v| v.as_str())?.trim();
+    if !is_http_url(url) {
+        return None;
+    }
+    Some(json!({"type": "input_image", "image_url": url}))
+}
+
+fn image_from_file(source: &Value) -> Option<Value> {
+    let file_id = source.get("file_id").and_then(|v| v.as_str())?.trim();
+    if file_id.is_empty() {
+        return None;
+    }
+    Some(json!({"type": "input_image", "file_id": file_id}))
 }
 
 /// document/container_upload → input_file(对齐 CPA appendDocumentContent:

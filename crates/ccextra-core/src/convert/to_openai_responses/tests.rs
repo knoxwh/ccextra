@@ -1779,6 +1779,25 @@ fn test_image_block_url_and_file_id() {
 }
 
 #[test]
+fn test_is_http_url_edge_cases() {
+    use crate::convert::to_openai_responses::messages::is_http_url;
+    // 有效 http(s) URL
+    assert!(is_http_url("http://example.com"));
+    assert!(is_http_url("https://example.com/path"));
+    assert!(is_http_url(" https://example.com ")); // trim
+    assert!(is_http_url("HTTP://EXAMPLE.COM")); // 大小写不敏感
+
+    // 无效场景
+    assert!(!is_http_url("ftp://example.com")); // 非 http(s)
+    assert!(!is_http_url("http://")); // 空 host
+    assert!(!is_http_url("http://  ")); // 空白 host
+    assert!(!is_http_url("relative/path")); // 相对路径
+    assert!(!is_http_url("mailto:user@example.com")); // 其他 scheme
+    assert!(!is_http_url("")); // 空字符串
+    assert!(!is_http_url("not a url")); // 非 URL
+}
+
+#[test]
 fn test_document_block_to_input_file() {
     // 对齐 CPA TestConvertClaudeRequestToCodex_PreservesBase64PDFDocumentContent
     let mut body = json!({
