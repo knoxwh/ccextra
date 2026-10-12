@@ -78,7 +78,7 @@ pub fn build_run_request_with(
         system,
         images,
         ..
-    } = input::user_text(body, checkpoint.is_some())?;
+    } = input::user_text(body, checkpoint.is_some(), model)?;
     if text.is_empty() {
         return Err(CursorConvertError::Invalid("缺少用户消息".into()));
     }

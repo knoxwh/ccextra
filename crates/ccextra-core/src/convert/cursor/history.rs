@@ -206,7 +206,7 @@ pub(super) fn fabricate(body: &Value) -> Result<FabricatedHistory, CursorConvert
 }
 
 /// assistant content → (root prompt JSON 条目, turn step 文本)。
-/// thinking/redacted_thinking/image 省略,tool_use 转 tool-call 条目。
+/// thinking/redacted_thinking/image/document/container_upload 省略,tool_use 转 tool-call 条目。
 fn assistant_entries(content: &Value) -> Result<(Vec<Value>, Vec<String>), CursorConvertError> {
     let mut entries = Vec::new();
     let mut step_texts = Vec::new();
@@ -236,7 +236,10 @@ fn assistant_entries(content: &Value) -> Result<(Vec<Value>, Vec<String>), Curso
                             "args": part.get("input").cloned().unwrap_or_else(|| json!({})),
                         }));
                     }
-                    Some("thinking" | "redacted_thinking" | "image") => {}
+                    Some(
+                        "thinking" | "redacted_thinking" | "image" | "document"
+                        | "container_upload",
+                    ) => {}
                     Some(other) => {
                         return Err(CursorConvertError::Unsupported(format!("输入块 {other}")))
                     }

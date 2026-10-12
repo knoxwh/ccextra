@@ -16,7 +16,8 @@ pub(super) fn text(content: &Value) -> Result<String, CursorConvertError> {
                         out.push_str(part.get("text").and_then(Value::as_str).unwrap_or(""))
                     }
                     Some(
-                        "tool_use" | "tool_result" | "thinking" | "redacted_thinking" | "image",
+                        "tool_use" | "tool_result" | "thinking" | "redacted_thinking" | "image"
+                        | "document" | "container_upload",
                     ) => {}
                     Some(other) => {
                         return Err(CursorConvertError::Unsupported(format!("输入块 {other}")))
@@ -79,14 +80,17 @@ fn extract_images(content: &Value) -> Vec<CursorImage> {
         .collect()
 }
 
-pub(super) fn user_text(body: &Value, checkpoint: bool) -> Result<UserInput, CursorConvertError> {
+pub(super) fn user_text(
+    body: &Value,
+    checkpoint: bool,
+    upstream_model: &str,
+) -> Result<UserInput, CursorConvertError> {
     // 对齐 Plus:顶层 system 与 messages 内 system 消息合并为 root blob 的 system prompt,
-    // system 不进 UserText、不算对话轮;无 system 时兜底默认提示词
+    // system 不进 UserText、不算对话轮;无 system 时兜底默认提示词。
+    // 清洗对齐 Chat:strip_claude_system_for_chat + is_ignorable_system_text(upstream_model)
     let mut system_parts: Vec<String> = Vec::new();
-    if let Some(system) = body.get("system").map(text).transpose()? {
-        if !system.is_empty() {
-            system_parts.push(system);
-        }
+    if let Some(system) = body.get("system") {
+        extend_cleaned_system(&mut system_parts, system, upstream_model)?;
     }
     let messages = body
         .get("messages")
@@ -94,10 +98,11 @@ pub(super) fn user_text(body: &Value, checkpoint: bool) -> Result<UserInput, Cur
         .ok_or_else(|| CursorConvertError::Invalid("缺少 messages 数组".into()))?;
     for message in messages {
         if message.get("role").and_then(Value::as_str) == Some("system") {
-            let line = text(message.get("content").unwrap_or(&Value::Null))?;
-            if !line.is_empty() {
-                system_parts.push(line);
-            }
+            extend_cleaned_system(
+                &mut system_parts,
+                message.get("content").unwrap_or(&Value::Null),
+                upstream_model,
+            )?;
         }
     }
     let system = if system_parts.is_empty() {
@@ -163,6 +168,55 @@ pub(super) fn user_text(body: &Value, checkpoint: bool) -> Result<UserInput, Cur
         system,
         images,
     })
+}
+
+/// 清洗后非空 system 片段入列表(对齐 Chat:按块 strip + ignorable)
+fn push_cleaned_system(parts: &mut Vec<String>, raw: &str, upstream_model: &str) {
+    let cleaned = crate::convert::to_openai_responses::strip_claude_system_for_chat(raw);
+    let trimmed = cleaned.trim();
+    if trimmed.is_empty() || crate::convert::is_ignorable_system_text(trimmed, upstream_model) {
+        return;
+    }
+    parts.push(trimmed.to_string());
+}
+
+/// system 字段/消息:字符串整段洗,数组逐 text 块洗(对齐 Chat 不先拼再剥)
+fn extend_cleaned_system(
+    parts: &mut Vec<String>,
+    content: &Value,
+    upstream_model: &str,
+) -> Result<(), CursorConvertError> {
+    match content {
+        Value::Null => Ok(()),
+        Value::String(s) => {
+            push_cleaned_system(parts, s, upstream_model);
+            Ok(())
+        }
+        Value::Array(blocks) => {
+            for part in blocks {
+                match part.get("type").and_then(Value::as_str) {
+                    Some("text") => {
+                        let t = part.get("text").and_then(Value::as_str).unwrap_or("");
+                        push_cleaned_system(parts, t, upstream_model);
+                    }
+                    Some(
+                        "tool_use" | "tool_result" | "thinking" | "redacted_thinking" | "image"
+                        | "document" | "container_upload",
+                    ) => {}
+                    Some(other) => {
+                        return Err(CursorConvertError::Unsupported(format!("输入块 {other}")))
+                    }
+                    None => {
+                        return Err(CursorConvertError::Invalid("content 数组缺少 type".into()))
+                    }
+                }
+            }
+            Ok(())
+        }
+        _ => Err(CursorConvertError::Invalid(
+            "content 必须是文本或块数组".into(),
+        )),
+    }
 }
 
 fn output_constraints(body: &Value) -> Result<String, CursorConvertError> {

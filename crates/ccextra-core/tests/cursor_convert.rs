@@ -1080,3 +1080,84 @@ fn tools_present_skips_system_constraint() {
     assert_eq!(text, "hi");
     assert!(!text.contains("<system_constraint>"));
 }
+
+#[test]
+fn system_strips_attribution_and_claude_identity_for_non_claude() {
+    // 对齐 Chat:非 Claude 上游剥归属行与 Claude 身份声明,保留其余指令
+    let body = json!({
+        "system": [
+            {"type":"text", "text":"x-anthropic-billing-header: fp=xyz"},
+            {"type":"text", "text":"You are Claude Code, Anthropic's official CLI for Claude."},
+            {"type":"text", "text":"You are helpful"}
+        ],
+        "messages": [{"role":"user", "content":"hi"}],
+        "tools": [{"name":"lookup", "description":"Find", "input_schema":{"type":"object"}}]
+    });
+    let request = build_run_request(&body, "composer-2", "conv", "msg-1", None).unwrap();
+    assert_eq!(blob_system(&request), "You are helpful");
+}
+
+#[test]
+fn system_attribution_line_keeps_rest() {
+    let body = json!({
+        "system": "x-anthropic-billing-header: fp=abc\nKeep these instructions.",
+        "messages": [{"role":"user", "content":"hi"}],
+        "tools": [{"name":"lookup", "description":"Find", "input_schema":{"type":"object"}}]
+    });
+    let request = build_run_request(&body, "composer-2", "conv", "msg-1", None).unwrap();
+    assert_eq!(blob_system(&request), "Keep these instructions.");
+}
+
+#[test]
+fn system_all_filtered_falls_back_to_default() {
+    let body = json!({
+        "system": "You are Claude Code, Anthropic's official CLI for Claude.",
+        "messages": [{"role":"user", "content":"hi"}],
+        "tools": [{"name":"lookup", "description":"Find", "input_schema":{"type":"object"}}]
+    });
+    let request = build_run_request(&body, "composer-2", "conv", "msg-1", None).unwrap();
+    assert_eq!(blob_system(&request), "You are a helpful assistant.");
+}
+
+#[test]
+fn document_and_container_upload_skipped_not_unsupported() {
+    // document/container_upload 与 image 一样静默跳过,不再 Unsupported
+    let body = json!({
+        "messages": [{
+            "role":"user",
+            "content": [
+                {"type":"text", "text":"see doc"},
+                {"type":"document", "source":{"type":"base64", "media_type":"application/pdf", "data":"JVBERi0="}},
+                {"type":"container_upload", "source":{"type":"base64", "media_type":"application/octet-stream", "data":"YQ=="}}
+            ]
+        }],
+        "tools": [{"name":"lookup", "description":"Find", "input_schema":{"type":"object"}}]
+    });
+    let request = build_run_request(&body, "composer-2", "conv", "msg-1", None).unwrap();
+    let action = run(&request.payload).action.unwrap().action.unwrap();
+    let generated::conversation_action::Action::UserMessageAction(action) = action else {
+        panic!("expected user message");
+    };
+    assert_eq!(action.user_message.unwrap().text, "see doc");
+}
+
+#[test]
+fn history_document_in_assistant_skipped() {
+    let body = json!({
+        "messages": [
+            {"role":"user", "content":"first"},
+            {"role":"assistant", "content": [
+                {"type":"text", "text":"answer"},
+                {"type":"document", "source":{"type":"base64", "media_type":"application/pdf", "data":"JVBERi0="}}
+            ]},
+            {"role":"user", "content":"second"}
+        ],
+        "tools": [{"name":"lookup", "description":"Find", "input_schema":{"type":"object"}}]
+    });
+    let request = build_run_request(&body, "composer-2", "conv", "msg-1", None).unwrap();
+    let action = run(&request.payload).action.unwrap().action.unwrap();
+    let generated::conversation_action::Action::UserMessageAction(action) = action else {
+        panic!("expected user message");
+    };
+    assert_eq!(action.user_message.unwrap().text, "second");
+}
