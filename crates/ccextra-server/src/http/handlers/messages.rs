@@ -268,6 +268,8 @@ pub(crate) struct PreparedMessageRequest {
     /// 本轮实际生效的 base_url(多 URL 轮转后记录;内部重试用它,不倒退回 [0])
     pub active_base_url: Option<String>,
     pub upstream_key: String,
+    /// Antigravity 连接池 scope 用 refresh_token（稳定跨 access 刷新）；其它协议为 None
+    pub pool_refresh_token: Option<String>,
     pub upstream_proxy: Option<String>,
     pub session_id: Option<String>,
     pub thread_id: Option<String>,
@@ -529,6 +531,7 @@ pub(crate) async fn prepare_message_request(
     let (
         upstream_base_urls,
         mut upstream_key,
+        mut pool_refresh_token,
         upstream_proxy,
         provider_prompt_cache_key,
         antigravity_refresh,
@@ -539,6 +542,13 @@ pub(crate) async fn prepare_message_request(
         let provider = find_provider(providers, &route.provider)
             .ok_or_else(|| AppError::new(anyhow::anyhow!("provider 未找到: {}", route.provider)))?;
         let meta = provider.metadata.as_ref();
+        let pool_refresh_token = if matches!(route.protocol, Protocol::Antigravity) {
+            meta.and_then(|m| m.get("refresh_token"))
+                .map(|s| s.as_str().trim().to_string())
+                .filter(|s| !s.is_empty())
+        } else {
+            None
+        };
         let antigravity_refresh = if matches!(route.protocol, Protocol::Antigravity) {
             match (
                 meta.and_then(|m| m.get("auth_dir")).cloned(),
@@ -577,6 +587,7 @@ pub(crate) async fn prepare_message_request(
         (
             provider.base_urls().to_vec(),
             provider.key.clone(),
+            pool_refresh_token,
             provider.proxy_url.clone(),
             provider.prompt_cache_key,
             antigravity_refresh,
@@ -605,6 +616,9 @@ pub(crate) async fn prepare_message_request(
         {
             Ok(fresh_cred) => {
                 upstream_key = fresh_cred.access_token;
+                if !fresh_cred.refresh_token.trim().is_empty() {
+                    pool_refresh_token = Some(fresh_cred.refresh_token);
+                }
             }
             Err(e) => {
                 tracing::warn!(email = %email, "Antigravity 凭证运行时刷新失败: {e}");
@@ -787,6 +801,7 @@ pub(crate) async fn prepare_message_request(
         upstream_base_urls,
         active_base_url: None,
         upstream_key,
+        pool_refresh_token,
         upstream_proxy,
         session_id: session_id.map(str::to_string),
         thread_id,
@@ -831,6 +846,7 @@ pub(crate) async fn execute_upstream_request(
                     &prepared.extra_headers,
                     user_agents,
                     prepared.inbound_user_agent.as_deref(),
+                    prepared.pool_refresh_token.as_deref(),
                 )
                 .await
             {
@@ -1244,6 +1260,7 @@ impl PreparedMessageRequest {
                 &self.extra_headers,
                 user_agents,
                 self.inbound_user_agent.as_deref(),
+                self.pool_refresh_token.as_deref(),
             )
             .await
     }

@@ -344,21 +344,34 @@ fn parse_go_duration(raw: &str) -> anyhow::Result<Duration> {
 }
 
 /// client 缓存键:(最终代理, 是否 antigravity, 是否禁 redirect, 凭证 scope)
-/// Antigravity 启用连接池时 scope 为 access_token 短摘要，隔离多账号 TCP/TLS 池。
+/// Antigravity 启用连接池时 scope 为凭证短摘要，隔离多账号 TCP/TLS 池。
 type ClientCacheKey = (String, bool, bool, String);
 
 /// 对齐 CPA antigravityCredentialScope：仅在 AG + 连接池启用时按凭证分池。
-fn ant_credential_scope(protocol: Protocol, short_mode: bool, api_key: &str) -> String {
+/// 优先 refresh_token（跨 access 轮换仍稳定）；缺失再回退 access_token。
+fn ant_credential_scope(
+    protocol: Protocol,
+    short_mode: bool,
+    access_token: &str,
+    refresh_token: Option<&str>,
+) -> String {
     if !matches!(protocol, Protocol::Antigravity) || short_mode {
         return String::new();
     }
-    let key = api_key.trim();
-    if key.is_empty() {
+    if let Some(refresh) = refresh_token.map(str::trim).filter(|s| !s.is_empty()) {
+        return digest_credential_scope("refresh:", refresh);
+    }
+    let access = access_token.trim();
+    if access.is_empty() {
         return "anonymous".to_string();
     }
+    digest_credential_scope("token:", access)
+}
+
+fn digest_credential_scope(prefix: &str, secret: &str) -> String {
     use sha2::{Digest, Sha256};
-    let digest = Sha256::digest(key.as_bytes());
-    format!("token:{}", hex::encode(&digest[..8]))
+    let digest = Sha256::digest(secret.as_bytes());
+    format!("{prefix}{}", hex::encode(&digest[..8]))
 }
 
 #[derive(Clone)]
@@ -416,7 +429,7 @@ impl UpstreamClient {
     ///
     /// Antigravity 连接池设置独立生效(对齐 CPA antigravity executor transport):
     /// 缓存键为 (代理, 是否 antigravity, 是否禁 redirect, 凭证 scope) 元组。
-    /// 启用连接池时不同凭证不共享空闲连接；短连接模式 scope 为空。
+    /// 启用连接池时不同凭证（优先 refresh_token）不共享空闲连接；短连接模式 scope 为空。
     ///
     /// `no_redirect`:Codex 订阅请求(带 chatgpt-account-id 头)禁跟随 redirect。
     /// reqwest 跨 host redirect 只剥 Authorization/Cookie 类敏感头,自定义身份头
@@ -508,6 +521,7 @@ impl UpstreamClient {
         extra_headers: &axum::http::HeaderMap,
         user_agents: &crate::http::UserAgentSet,
         inbound_user_agent: Option<&str>,
+        pool_refresh_token: Option<&str>,
     ) -> anyhow::Result<UpstreamResponse> {
         // Cursor SDK 走 sidecar 专用通道,禁止进入通用 upstream
         if matches!(protocol, Protocol::CursorSdk) {
@@ -551,6 +565,7 @@ impl UpstreamClient {
                 extra_headers,
                 user_agents,
                 inbound_user_agent,
+                pool_refresh_token,
             )
             .await
         {
@@ -571,6 +586,7 @@ impl UpstreamClient {
                     extra_headers,
                     user_agents,
                     inbound_user_agent,
+                    pool_refresh_token,
                 )
                 .await
             }
@@ -594,13 +610,19 @@ impl UpstreamClient {
         extra_headers: &axum::http::HeaderMap,
         user_agents: &crate::http::UserAgentSet,
         inbound_user_agent: Option<&str>,
+        pool_refresh_token: Option<&str>,
     ) -> anyhow::Result<UpstreamResponse> {
         #[cfg(test)]
         self.attempts.lock().unwrap().push(base_url.to_owned());
         let proxy_key = self.resolve_proxy(provider_proxy);
         // chatgpt-account-id 仅 Codex OAuth 订阅请求携带:禁 redirect + zstd 压缩标记
         let codex_subscription = extra_headers.contains_key("chatgpt-account-id");
-        let cred_scope = ant_credential_scope(protocol, self.ant_pool.short_mode, api_key);
+        let cred_scope = ant_credential_scope(
+            protocol,
+            self.ant_pool.short_mode,
+            api_key,
+            pool_refresh_token,
+        );
         let client = self.client_for(&proxy_key, protocol, codex_subscription, &cred_scope)?;
 
         // Gemini 端点需要替换 {model} 占位符
@@ -1085,6 +1107,7 @@ mod tests {
                     &axum::http::HeaderMap::new(),
                     &mock_user_agents(),
                     None,
+                    None,
                 )
                 .await
                 .unwrap();
@@ -1250,6 +1273,7 @@ mod tests {
                 &axum::http::HeaderMap::new(),
                 user_agents,
                 None,
+                None,
             )
             .await
     }
@@ -1372,6 +1396,7 @@ mod tests {
                 &extra,
                 &mock_user_agents(),
                 None,
+                None,
             )
             .await
             .unwrap();
@@ -1429,6 +1454,7 @@ mod tests {
                 None,
                 &axum::http::HeaderMap::new(),
                 &mock_user_agents(),
+                None,
                 None,
             )
             .await
@@ -1498,9 +1524,23 @@ mod tests {
             yaml_serde::from_str("connection-pool:\n  enabled: true").unwrap();
         let client = UpstreamClient::with_ant_pool(None, Some(&cfg));
         assert!(!client.ant_pool.short_mode);
-        let scope_a = ant_credential_scope(Protocol::Antigravity, false, "token-a");
-        let scope_b = ant_credential_scope(Protocol::Antigravity, false, "token-b");
+        // refresh 优先：同一 access、不同 refresh → 不同池；access 轮换、refresh 不变 → 同池
+        let scope_a =
+            ant_credential_scope(Protocol::Antigravity, false, "access-a", Some("refresh-a"));
+        let scope_b =
+            ant_credential_scope(Protocol::Antigravity, false, "access-a", Some("refresh-b"));
+        let scope_a_rotated = ant_credential_scope(
+            Protocol::Antigravity,
+            false,
+            "access-a-next",
+            Some("refresh-a"),
+        );
         assert_ne!(scope_a, scope_b);
+        assert_eq!(scope_a, scope_a_rotated);
+        assert!(scope_a.starts_with("refresh:"));
+        let scope_access_only =
+            ant_credential_scope(Protocol::Antigravity, false, "access-only", None);
+        assert!(scope_access_only.starts_with("token:"));
         let _c1 = client
             .client_for("direct", Protocol::Antigravity, false, &scope_a)
             .unwrap();
@@ -1612,6 +1652,7 @@ mod tests {
                     None,
                     &extra,
                     &mock_user_agents(),
+                    None,
                     None,
                 )
                 .await

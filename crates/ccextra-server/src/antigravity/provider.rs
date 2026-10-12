@@ -97,6 +97,10 @@ pub async fn load_antigravity_providers(
         if !cred.project_id.is_empty() {
             metadata.insert("project_id".to_string(), cred.project_id.clone());
         }
+        // 连接池 scope 优先用 refresh_token（跨 access 刷新仍稳定，对齐 CPA）
+        if !cred.refresh_token.trim().is_empty() {
+            metadata.insert("refresh_token".to_string(), cred.refresh_token.clone());
+        }
 
         let provider = ProviderConfig::new(
             provider_name.clone(),
