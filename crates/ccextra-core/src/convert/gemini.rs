@@ -125,9 +125,11 @@ pub fn convert_to_gemini_with_registry(
 
     // 对齐 CPA EnsureGeminiLeadingUserContent:切片历史/工具续跑时首 turn 可能为
     // model,Gemini 侧要求 contents 以 user 开头,前置空 user turn。
-    // 对齐 CPA EnsureGeminiTrailingUserContent(5dc428f3):尾 turn 为 model 且不含
-    // functionResponse 时追加空 user turn;含 functionResponse 则保留(上游期望模型续写)。
-    // Antigravity claude 目标两者皆跳过(adapter 拒空 text part)。
+    // 对齐 CPA DropGeminiTrailingThoughtOnlyContent(a2718314):先剥尾部纯 thought
+    // model turn(防 Antigravity「以 model 结尾」400,#6530)。
+    // 对齐 CPA EnsureGeminiTrailingUserContent(15d2148b):尾 turn 为 model 时补空
+    // user;纯 functionResponse 保留(上游期望模型续写),但 FR 嵌套媒体时仍补
+    // (#6524)。Antigravity claude 目标全部跳过(adapter 拒空 text part)。
     let is_claude_target = upstream_model.to_lowercase().contains("claude");
     if !(flavor == SchemaFlavor::Antigravity && is_claude_target) {
         if let Some(contents) = gemini.get_mut("contents").and_then(|c| c.as_array_mut()) {
@@ -142,14 +144,8 @@ pub fn convert_to_gemini_with_registry(
                     serde_json::json!({"role": "user", "parts": [{"text": ""}]}),
                 );
             }
-            let trailing_is_model = contents
-                .last()
-                .and_then(|c| c.get("role"))
-                .and_then(|r| r.as_str())
-                .is_some_and(|role| role == "model" || role == "assistant");
-            if trailing_is_model && !content_has_function_response(contents.last().unwrap()) {
-                contents.push(serde_json::json!({"role": "user", "parts": [{"text": ""}]}));
-            }
+            drop_gemini_trailing_thought_only_content(contents);
+            ensure_gemini_trailing_user_content(contents);
         }
     }
 
@@ -345,10 +341,82 @@ fn content_has_function_response(content: &Value) -> bool {
         .get("parts")
         .and_then(|p| p.as_array())
         .is_some_and(|parts| {
-            parts
-                .iter()
-                .any(|part| part.get("functionResponse").is_some())
+            parts.iter().any(|part| {
+                part.get("functionResponse").is_some() || part.get("function_response").is_some()
+            })
         })
+}
+
+/// 对齐 CPA contentHasFunctionResponseMedia:functionResponse 是否嵌套
+/// inlineData/fileData(驼峰/蛇形皆认)
+fn content_has_function_response_media(content: &Value) -> bool {
+    content
+        .get("parts")
+        .and_then(|p| p.as_array())
+        .is_some_and(|parts| {
+            parts.iter().any(|part| {
+                let fr = part
+                    .get("functionResponse")
+                    .or_else(|| part.get("function_response"));
+                fr.and_then(|f| f.get("parts"))
+                    .and_then(|p| p.as_array())
+                    .is_some_and(|nested| {
+                        nested.iter().any(|n| {
+                            n.get("inlineData").is_some()
+                                || n.get("inline_data").is_some()
+                                || n.get("fileData").is_some()
+                                || n.get("file_data").is_some()
+                        })
+                    })
+            })
+        })
+}
+
+/// 对齐 CPA contentIsThoughtOnlyModelTurn:model/assistant turn 仅含 thought parts
+fn content_is_thought_only_model_turn(content: &Value) -> bool {
+    let role = content.get("role").and_then(|r| r.as_str()).unwrap_or("");
+    if role != "model" && role != "assistant" {
+        return false;
+    }
+    let Some(parts) = content.get("parts").and_then(|p| p.as_array()) else {
+        return false;
+    };
+    if parts.is_empty() {
+        return false;
+    }
+    parts.iter().all(|part| {
+        part.get("thought")
+            .and_then(|t| t.as_bool())
+            .unwrap_or(false)
+            && part.get("functionCall").is_none()
+            && part.get("functionResponse").is_none()
+            && part.get("function_response").is_none()
+    })
+}
+
+/// 对齐 CPA DropGeminiTrailingThoughtOnlyContent:剥尾部纯 thought model turn,至少留 1
+fn drop_gemini_trailing_thought_only_content(contents: &mut Vec<Value>) {
+    while contents.len() > 1 && content_is_thought_only_model_turn(contents.last().unwrap()) {
+        contents.pop();
+    }
+}
+
+/// 对齐 CPA EnsureGeminiTrailingUserContent(15d2148b):尾 model turn 补空 user;
+/// 纯 FR 不补,FR 嵌套媒体仍补
+fn ensure_gemini_trailing_user_content(contents: &mut Vec<Value>) {
+    let trailing_is_model = contents
+        .last()
+        .and_then(|c| c.get("role"))
+        .and_then(|r| r.as_str())
+        .is_some_and(|role| role == "model" || role == "assistant");
+    if !trailing_is_model {
+        return;
+    }
+    let last = contents.last().unwrap();
+    if content_has_function_response(last) && !content_has_function_response_media(last) {
+        return;
+    }
+    contents.push(serde_json::json!({"role": "user", "parts": [{"text": ""}]}));
 }
 
 /// 转换工具定义: Anthropic tools → Gemini functionDeclarations
@@ -786,7 +854,7 @@ IMPORTANT: Assist with authorized security testing.
 
     #[test]
     fn test_convert_to_gemini_keeps_trailing_function_response_turn() {
-        // 尾 turn 含 functionResponse 时不补空 user turn(上游期望模型续写)
+        // 尾 turn 含纯 functionResponse 时不补空 user turn(上游期望模型续写)
         let anthropic = json!({
             "model": "m", "max_tokens": 100,
             "messages": [
@@ -804,6 +872,127 @@ IMPORTANT: Assist with authorized security testing.
         assert_eq!(contents.len(), 3);
         assert_eq!(contents[2]["role"], "user");
         assert!(contents[2]["parts"][0].get("functionResponse").is_some());
+    }
+
+    #[test]
+    fn test_drop_trailing_thought_only_model_turns() {
+        // 对齐 CPA a2718314:尾部纯 thought model turn 先剥再决定是否补空 user
+        let anthropic = json!({
+            "model": "m", "max_tokens": 100,
+            "messages": [
+                {"role": "user", "content": "hi"},
+                {"role": "assistant", "content": [
+                    {"type": "thinking", "thinking": "only thoughts"}
+                ]}
+            ]
+        });
+        let (gemini, _) = convert_to_gemini_with(
+            &anthropic,
+            "gemini-3.8-flash-high",
+            SchemaFlavor::Antigravity,
+        );
+        let contents = gemini["contents"].as_array().unwrap();
+        assert_eq!(contents.len(), 1);
+        assert_eq!(contents[0]["role"], "user");
+        assert_eq!(contents[0]["parts"][0]["text"], "hi");
+    }
+
+    #[test]
+    fn test_keeps_trailing_model_turn_with_visible_text() {
+        // 含真实文本的 model turn 不剥,仍补空 user
+        let anthropic = json!({
+            "model": "m", "max_tokens": 100,
+            "messages": [
+                {"role": "user", "content": "hi"},
+                {"role": "assistant", "content": [
+                    {"type": "thinking", "thinking": "reason"},
+                    {"type": "text", "text": "answer"}
+                ]}
+            ]
+        });
+        let (gemini, _) = convert_to_gemini_with(
+            &anthropic,
+            "gemini-3.8-flash-high",
+            SchemaFlavor::Antigravity,
+        );
+        let contents = gemini["contents"].as_array().unwrap();
+        assert_eq!(contents.len(), 3);
+        assert_eq!(contents[1]["role"], "model");
+        assert_eq!(contents[1]["parts"][0]["thought"], true);
+        assert_eq!(contents[1]["parts"][1]["text"], "answer");
+        assert_eq!(contents[2]["role"], "user");
+        assert_eq!(contents[2]["parts"][0]["text"], "");
+    }
+
+    #[test]
+    fn test_ensure_trailing_user_for_model_function_response_with_media() {
+        // 对齐 CPA 15d2148b:model 角色 FR 嵌套媒体时仍补空 user
+        let mut contents = vec![
+            json!({"role": "model", "parts": [{"functionCall": {"name": "view_image"}}]}),
+            json!({
+                "role": "model",
+                "parts": [{
+                    "functionResponse": {
+                        "name": "view_image",
+                        "response": {"result": ""},
+                        "parts": [{"inlineData": {"mimeType": "image/png", "data": "AAAA"}}]
+                    }
+                }]
+            }),
+        ];
+        ensure_gemini_trailing_user_content(&mut contents);
+        assert_eq!(contents.len(), 3);
+        assert_eq!(contents[2]["role"], "user");
+        assert_eq!(contents[2]["parts"][0]["text"], "");
+
+        // 纯 FR 不补
+        let mut pure_fr = vec![json!({
+            "role": "model",
+            "parts": [{"functionResponse": {"name": "Read", "response": {"result": "ok"}}}]
+        })];
+        ensure_gemini_trailing_user_content(&mut pure_fr);
+        assert_eq!(pure_fr.len(), 1);
+
+        // user 角色 FR+媒体不变(末角色非 model)
+        let mut user_fr_media = vec![json!({
+            "role": "user",
+            "parts": [{
+                "functionResponse": {
+                    "name": "view_image",
+                    "response": {"result": ""},
+                    "parts": [{"inlineData": {"mimeType": "image/png", "data": "AAAA"}}]
+                }
+            }]
+        })];
+        ensure_gemini_trailing_user_content(&mut user_fr_media);
+        assert_eq!(user_fr_media.len(), 1);
+    }
+
+    #[test]
+    fn test_content_has_function_response_media_detects_nested() {
+        let with_media = json!({
+            "role": "user",
+            "parts": [{
+                "functionResponse": {
+                    "parts": [{"inlineData": {"mimeType": "image/png", "data": "AAAA"}}]
+                }
+            }]
+        });
+        assert!(content_has_function_response_media(&with_media));
+
+        let with_file = json!({
+            "parts": [{
+                "functionResponse": {
+                    "parts": [{"file_data": {"mime_type": "image/png", "file_uri": "gs://b/a.png"}}]
+                }
+            }]
+        });
+        assert!(content_has_function_response_media(&with_file));
+
+        let plain = json!({
+            "parts": [{"functionResponse": {"name": "Read", "response": {"result": "ok"}}}]
+        });
+        assert!(!content_has_function_response_media(&plain));
     }
 
     fn adaptive_max_body() -> Value {
