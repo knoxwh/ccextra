@@ -656,8 +656,8 @@ fn append_block_parts(
                 "inline_data": { "mime_type": mime, "data": data }
             }));
         }
-        "document" => {
-            // base64 文档 → inline_data;Gemini/Antigravity 均支持 PDF 等文档类型
+        "document" | "container_upload" => {
+            // base64 文档/container_upload → inline_data;Gemini/Antigravity 均支持 PDF 等
             let source = block.get("source").cloned().unwrap_or_else(|| json!({}));
             if source.get("type").and_then(|t| t.as_str()) != Some("base64") {
                 return;
@@ -1006,6 +1006,28 @@ mod tests {
             "application/pdf"
         );
         assert_eq!(contents[0]["parts"][0]["inline_data"]["data"], "JVBERi0=");
+    }
+
+    #[test]
+    fn test_convert_messages_container_upload_like_document() {
+        let messages = vec![json!({
+            "role": "user",
+            "content": [{
+                "type": "container_upload",
+                "source": {
+                    "type": "base64",
+                    "media_type": "application/pdf",
+                    "data": "JVBERi0x"
+                }
+            }]
+        })];
+        let contents = convert_messages(&messages, &HashMap::new(), false, "gemini-2.0");
+        assert_eq!(contents.len(), 1);
+        assert_eq!(
+            contents[0]["parts"][0]["inline_data"]["mime_type"],
+            "application/pdf"
+        );
+        assert_eq!(contents[0]["parts"][0]["inline_data"]["data"], "JVBERi0x");
     }
 
     #[test]
