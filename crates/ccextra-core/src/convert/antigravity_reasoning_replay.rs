@@ -676,10 +676,7 @@ impl AgReplayAccumulator {
                 self.pending_signatures.retain(|(_, kind)| !kind.is_empty());
             }
             let name = fc.get("name").and_then(|v| v.as_str()).unwrap_or("");
-            let args_raw = fc
-                .get("args")
-                .map(|a| canonical_json(a))
-                .unwrap_or_default();
+            let args_raw = fc.get("args").map(canonical_json).unwrap_or_default();
             let call_id = fc.get("id").and_then(|v| v.as_str()).unwrap_or("");
             let key = format!("{name}\0{args_raw}\0{call_id}");
             let dedupe = if signature.is_empty() {
@@ -1160,5 +1157,51 @@ mod tests {
         assert!(!is_antigravity_thought_signature_invalid(
             br#"{"error":{"message":"quota exceeded"}}"#
         ));
+    }
+
+    #[test]
+    fn normalize_rejects_when_over_max_bytes() {
+        // 单条序列化后超过 MAX_BYTES_PER_ENTRY → 整批拒绝
+        let sig = "b".repeat(MAX_BYTES_PER_ENTRY);
+        let items = vec![json!({
+            "type": "thought_signature",
+            "thoughtSignature": sig,
+            "contentIndex": 1,
+            "partIndex": 0,
+        })];
+        assert!(normalize_ag_replay_items(&items).is_none());
+    }
+
+    #[test]
+    fn normalize_accepts_under_max_bytes() {
+        let sig = "native-signature-ok-16chars";
+        let items = vec![json!({
+            "type": "thought_signature",
+            "thoughtSignature": sig,
+            "contentIndex": 1,
+            "partIndex": 0,
+            "targetKind": "text",
+        })];
+        let out = normalize_ag_replay_items(&items).expect("under limit");
+        assert_eq!(out.len(), 1);
+    }
+
+    #[test]
+    fn accumulator_byte_overflow_yields_clear_on_terminal() {
+        let request = json!({"contents": [{"role": "user", "parts": [{"text": "hi"}]}]});
+        let mut acc = AgReplayAccumulator::new_from_request(&request);
+        // 超大签名使 append_item 触发 overflow；terminal 后应清空（Some(empty)）
+        let huge = "s".repeat(MAX_BYTES_PER_ENTRY);
+        acc.observe_response(&json!({
+            "response": {"candidates": [{"content": {"parts": [
+                {"thoughtSignature": huge, "functionCall": {"name": "Read", "args": {"p": "/a"}, "id": "id1"}}
+            ]}, "finishReason": "STOP"}]}
+        }));
+        assert!(acc.overflow);
+        let items = acc.take_commit_items().expect("terminal");
+        assert!(
+            items.is_empty(),
+            "overflow must clear ledger, not store partial"
+        );
     }
 }

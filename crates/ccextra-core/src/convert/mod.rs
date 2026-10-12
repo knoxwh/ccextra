@@ -30,7 +30,7 @@ pub use antigravity::{convert_to_antigravity, convert_to_antigravity_with};
 pub use antigravity_reasoning_replay::{
     apply_ag_replay_items, collect_ag_replay_from_response, has_native_thought_signature,
     is_antigravity_thought_signature_invalid, normalize_ag_replay_item, normalize_ag_replay_items,
-    AgReplayAccumulator,
+    AgReplayAccumulator, MAX_BYTES_PER_ENTRY, MAX_ITEMS_PER_ENTRY,
 };
 pub use antigravity_tools::{
     antigravity_tool_name_to_upstream, antigravity_upstream_tool_name_to_client,

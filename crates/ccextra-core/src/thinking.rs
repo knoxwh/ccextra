@@ -58,7 +58,7 @@ const THRESHOLD_MEDIUM: i64 = 8192;
 const THRESHOLD_HIGH: i64 = 24576;
 
 /// 模型能力定义(来自用户 models.json)
-#[derive(Debug, Clone, PartialEq, Eq, Deserialize)]
+#[derive(Debug, Clone, PartialEq, Eq, Deserialize, Default)]
 pub struct ModelCapability {
     pub id: String,
     pub reasoning_levels: Vec<String>,
@@ -69,17 +69,6 @@ pub struct ModelCapability {
     /// 对齐 CPA max_completion_tokens；Antigravity 用它封顶 maxOutputTokens
     #[serde(default)]
     pub max_completion_tokens: Option<i64>,
-}
-
-impl Default for ModelCapability {
-    fn default() -> Self {
-        Self {
-            id: String::new(),
-            reasoning_levels: Vec::new(),
-            force_effort: None,
-            max_completion_tokens: None,
-        }
-    }
 }
 
 #[derive(Deserialize)]
