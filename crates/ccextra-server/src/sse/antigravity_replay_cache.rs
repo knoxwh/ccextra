@@ -123,7 +123,10 @@ impl AgReplayCache {
     }
 }
 
-/// 流式提取：旁路解析上游 Gemini/AG SSE，terminal 后写入缓存。
+/// 流式提取：旁路解析上游 Gemini/AG SSE。
+///
+/// 对齐 CPA：`finishReason` 只标记 terminal，不立即落库；signature / usage
+/// 可能跟在后续帧。仅在流结束（`finish` / `Drop`）时提交。
 pub struct AgStreamReplayExtractor {
     cache: AgReplayCache,
     session_key: String,
@@ -144,23 +147,28 @@ impl AgStreamReplayExtractor {
         }
     }
 
+    /// 只观察，不提交（finishReason 帧之后仍可能有 thoughtSignature）。
     pub fn push(&mut self, bytes: &[u8]) {
         for event in self.parser.push(bytes) {
             let Ok(value) = serde_json::from_str::<Value>(&event.data) else {
                 continue;
             };
             self.accumulator.observe_response(&value);
-            if self.accumulator.terminal && !self.committed {
-                self.commit();
-            }
         }
     }
 
-    /// 流结束时若已 terminal 尚未提交则补提交（非流式 EOF 兜底）。
+    /// 流结束：flush SSE 残留并在 terminal 时提交账本。
     pub fn finish(&mut self) {
-        if !self.committed {
-            self.commit();
+        if self.committed {
+            return;
         }
+        for event in self.parser.finish() {
+            let Ok(value) = serde_json::from_str::<Value>(&event.data) else {
+                continue;
+            };
+            self.accumulator.observe_response(&value);
+        }
+        self.commit();
     }
 
     fn commit(&mut self) {
@@ -171,6 +179,12 @@ impl AgStreamReplayExtractor {
             self.cache.replace_items(&self.session_key, items);
             self.committed = true;
         }
+    }
+}
+
+impl Drop for AgStreamReplayExtractor {
+    fn drop(&mut self) {
+        self.finish();
     }
 }
 
@@ -277,7 +291,7 @@ mod tests {
     }
 
     #[test]
-    fn stream_extractor_commits_on_finish_reason() {
+    fn stream_extractor_commits_on_finish_at_eof() {
         let cache = AgReplayCache::new(Duration::from_secs(60), 128);
         let key = "gemini-flash:sess-stream".to_string();
         let request = json!({"contents": [{"role": "user", "parts": [{"text": "hi"}]}]});
@@ -292,8 +306,66 @@ mod tests {
 
 "#,
         );
-        let items = cache.get_items(&key).expect("committed");
+        // finishReason 到达时尚未落库（对齐 CPA：签名帧可能跟在后面）
+        assert!(cache.get_items(&key).is_none());
+        extractor.finish();
+        let items = cache.get_items(&key).expect("committed at eof");
         assert_eq!(items.len(), 2);
         assert_eq!(items[0]["thoughtSignature"], "sig-first-long-enough");
+    }
+
+    /// 对齐 CPA issue6332_review7：finishReason 先到，thoughtSignature 后到。
+    #[test]
+    fn stream_extractor_keeps_observing_after_finish_reason() {
+        let cache = AgReplayCache::new(Duration::from_secs(60), 128);
+        let key = "gemini-flash:sess-split".to_string();
+        let request = json!({"contents": [{"role": "user", "parts": [{"text": "hi"}]}]});
+        let mut extractor = AgStreamReplayExtractor::new(cache.clone(), key.clone(), request);
+        let sig = "s".repeat(128);
+        extractor.push(
+            br#"data: {"response":{"candidates":[{"content":{"parts":[{"functionCall":{"id":"native-call","name":"lookup","args":{"key":"value"}}}]},"finishReason":"STOP"}]}}
+
+"#,
+        );
+        assert!(
+            cache.get_items(&key).is_none(),
+            "must not commit on first finishReason"
+        );
+        let late_sig = format!(
+            "data: {{\"response\":{{\"candidates\":[{{\"content\":{{\"parts\":[{{\"text\":\"\",\"thoughtSignature\":\"{sig}\"}}]}}}}]}}}}\n\n"
+        );
+        extractor.push(late_sig.as_bytes());
+        extractor.push(
+            br#"data: {"response":{"usageMetadata":{"promptTokenCount":11,"candidatesTokenCount":22,"totalTokenCount":33}}}
+
+"#,
+        );
+        extractor.finish();
+        let items = cache
+            .get_items(&key)
+            .expect("committed with late signature");
+        assert_eq!(items.len(), 1);
+        assert_eq!(items[0]["type"], "function_call_part");
+        assert_eq!(items[0]["thoughtSignature"], sig);
+        assert_eq!(items[0]["name"], "lookup");
+    }
+
+    #[test]
+    fn stream_extractor_drop_commits_terminal() {
+        let cache = AgReplayCache::new(Duration::from_secs(60), 128);
+        let key = "gemini-flash:sess-drop".to_string();
+        let request = json!({"contents": [{"role": "user", "parts": [{"text": "hi"}]}]});
+        {
+            let mut extractor = AgStreamReplayExtractor::new(cache.clone(), key.clone(), request);
+            extractor.push(
+                br#"data: {"response":{"candidates":[{"content":{"parts":[{"thoughtSignature":"sig-drop-long-enough12","functionCall":{"name":"Read","args":{"p":"/a"},"id":"id1"}}]},"finishReason":"STOP"}]}}
+
+"#,
+            );
+            assert!(cache.get_items(&key).is_none());
+            // drop → finish
+        }
+        let items = cache.get_items(&key).expect("Drop commits");
+        assert_eq!(items[0]["thoughtSignature"], "sig-drop-long-enough12");
     }
 }
