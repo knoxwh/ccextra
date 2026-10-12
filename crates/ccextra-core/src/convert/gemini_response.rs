@@ -74,6 +74,60 @@ impl GeminiStreamState {
 /// - ResponseType::Function → 工具调用块
 ///
 /// 状态转换时会发送 content_block_stop 和 content_block_start 事件
+/// 对齐 CPA appendCarrierThinkingBlock:独立空 thinking 块承载签名后立即关闭。
+fn append_carrier_thinking_block(
+    events: &mut Vec<Value>,
+    state: &mut GeminiStreamState,
+    signature: &str,
+) {
+    if signature.is_empty() {
+        return;
+    }
+    if state.response_type != ResponseType::None {
+        events.push(json!({
+            "type": "content_block_stop",
+            "index": state.response_index
+        }));
+        state.response_index += 1;
+        state.response_type = ResponseType::None;
+    }
+    events.push(json!({
+        "type": "content_block_start",
+        "index": state.response_index,
+        "content_block": {
+            "type": "thinking",
+            "thinking": ""
+        }
+    }));
+    events.push(json!({
+        "type": "content_block_delta",
+        "index": state.response_index,
+        "delta": {
+            "type": "signature_delta",
+            "signature": signature
+        }
+    }));
+    events.push(json!({
+        "type": "content_block_stop",
+        "index": state.response_index
+    }));
+    state.response_index += 1;
+    state.response_type = ResponseType::None;
+    state.has_content = true;
+}
+
+fn append_signature_delta(events: &mut Vec<Value>, state: &mut GeminiStreamState, signature: &str) {
+    events.push(json!({
+        "type": "content_block_delta",
+        "index": state.response_index,
+        "delta": {
+            "type": "signature_delta",
+            "signature": signature
+        }
+    }));
+    state.has_content = true;
+}
+
 pub fn convert_gemini_stream_chunk(
     chunk: &Value,
     state: &mut GeminiStreamState,
@@ -100,163 +154,94 @@ pub fn convert_gemini_stream_chunk(
                 .unwrap_or("");
             let has_thought_signature = !thought_signature.is_empty();
             let signature_value = outbound_signature(signature_model, thought_signature);
+            let text_str = text_result.and_then(|t| t.as_str());
+            let text_empty = text_str.map(|t| t.is_empty()).unwrap_or(true);
+            let is_thought = part
+                .get("thought")
+                .and_then(|t| t.as_bool())
+                .unwrap_or(false);
 
-            // 只有 thoughtSignature 的情况
-            if has_thought_signature && text_result.is_none() && function_call_result.is_none() {
+            // 签名-only(无 text / 空 text、无 FC):在 thinking 内挂签名,否则 carrier
+            if has_thought_signature && text_empty && function_call_result.is_none() {
+                if state.response_type == ResponseType::Thinking {
+                    append_signature_delta(&mut events, state, &signature_value);
+                } else {
+                    append_carrier_thinking_block(&mut events, state, &signature_value);
+                }
+                continue;
+            }
+
+            // 仅 thought==true 视为 thinking(对齐 CPA;签名不再单独标记)
+            if is_thought {
+                if has_thought_signature && text_empty {
+                    if state.response_type == ResponseType::Thinking {
+                        append_signature_delta(&mut events, state, &signature_value);
+                    } else {
+                        append_carrier_thinking_block(&mut events, state, &signature_value);
+                    }
+                    continue;
+                }
+
+                let text = text_str.unwrap_or("");
                 if state.response_type == ResponseType::Thinking {
                     events.push(json!({
                         "type": "content_block_delta",
                         "index": state.response_index,
                         "delta": {
-                            "type": "signature_delta",
-                            "signature": signature_value.as_str()
+                            "type": "thinking_delta",
+                            "thinking": text
                         }
                     }));
                     state.has_content = true;
+                } else {
+                    if state.response_type != ResponseType::None {
+                        events.push(json!({
+                            "type": "content_block_stop",
+                            "index": state.response_index
+                        }));
+                        state.response_index += 1;
+                    }
+                    events.push(json!({
+                        "type": "content_block_start",
+                        "index": state.response_index,
+                        "content_block": {
+                            "type": "thinking",
+                            "thinking": "",
+                            "signature": ""
+                        }
+                    }));
+                    events.push(json!({
+                        "type": "content_block_delta",
+                        "index": state.response_index,
+                        "delta": {
+                            "type": "thinking_delta",
+                            "thinking": text
+                        }
+                    }));
+                    state.response_type = ResponseType::Thinking;
+                    state.has_content = true;
+                }
+                if has_thought_signature {
+                    append_signature_delta(&mut events, state, &signature_value);
                 }
                 continue;
             }
 
-            // 处理文本内容
-            if let Some(text) = text_result.and_then(|t| t.as_str()) {
-                let is_thought = part
-                    .get("thought")
-                    .and_then(|t| t.as_bool())
-                    .unwrap_or(false)
-                    || has_thought_signature;
-
-                if is_thought {
-                    // 空文本只有签名的情况
-                    if has_thought_signature && text.is_empty() {
-                        if state.response_type == ResponseType::Thinking {
-                            events.push(json!({
-                                "type": "content_block_delta",
-                                "index": state.response_index,
-                                "delta": {
-                                    "type": "signature_delta",
-                                    "signature": signature_value.as_str()
-                                }
-                            }));
-                            state.has_content = true;
-                        }
-                        continue;
-                    }
-
-                    // Thinking 内容
-                    if state.response_type == ResponseType::Thinking {
-                        // 继续现有 thinking 块
-                        events.push(json!({
-                            "type": "content_block_delta",
-                            "index": state.response_index,
-                            "delta": {
-                                "type": "thinking_delta",
-                                "thinking": text
-                            }
-                        }));
-                        state.has_content = true;
-                    } else {
-                        // 状态转换到 thinking
-                        if state.response_type != ResponseType::None {
-                            events.push(json!({
-                                "type": "content_block_stop",
-                                "index": state.response_index
-                            }));
-                            state.response_index += 1;
-                        }
-
-                        // 开始新的 thinking 块
-                        events.push(json!({
-                            "type": "content_block_start",
-                            "index": state.response_index,
-                            "content_block": {
-                                "type": "thinking",
-                                "thinking": "",
-                                "signature": ""
-                            }
-                        }));
-                        events.push(json!({
-                            "type": "content_block_delta",
-                            "index": state.response_index,
-                            "delta": {
-                                "type": "thinking_delta",
-                                "thinking": text
-                            }
-                        }));
-                        state.response_type = ResponseType::Thinking;
-                        state.has_content = true;
-                    }
-
-                    // 发送签名
-                    if has_thought_signature {
-                        events.push(json!({
-                            "type": "content_block_delta",
-                            "index": state.response_index,
-                            "delta": {
-                                "type": "signature_delta",
-                                "signature": signature_value.as_str()
-                            }
-                        }));
-                    }
-                } else {
-                    // 普通文本内容
-                    if state.response_type == ResponseType::Content {
-                        // 继续现有文本块
-                        events.push(json!({
-                            "type": "content_block_delta",
-                            "index": state.response_index,
-                            "delta": {
-                                "type": "text_delta",
-                                "text": text
-                            }
-                        }));
-                        state.has_content = true;
-                    } else if !text.is_empty() {
-                        // 状态转换到文本(对齐 CPA fd3e6623:只在非空时转换,防止空 text 关闭活动块)
-                        if state.response_type != ResponseType::None {
-                            events.push(json!({
-                                "type": "content_block_stop",
-                                "index": state.response_index
-                            }));
-                            state.response_index += 1;
-                        }
-
-                        // 开始新的文本块
-                        events.push(json!({
-                            "type": "content_block_start",
-                            "index": state.response_index,
-                            "content_block": {
-                                "type": "text",
-                                "text": ""
-                            }
-                        }));
-                        events.push(json!({
-                            "type": "content_block_delta",
-                            "index": state.response_index,
-                            "delta": {
-                                "type": "text_delta",
-                                "text": text
-                            }
-                        }));
-                        state.response_type = ResponseType::Content;
-                        state.has_content = true;
-                    }
-                }
-            } else if let Some(function_call) = function_call_result {
-                // 处理工具调用
+            // 工具调用
+            if let Some(function_call) = function_call_result {
                 state.saw_tool_call = true;
                 let upstream_tool_name = function_call
                     .get("name")
                     .and_then(|n| n.as_str())
                     .unwrap_or("");
 
-                // 对齐 CPA 6a26e92a:Antigravity 响应侧还原工具名
                 let restored_upstream_name = if signature_model.is_some() {
                     antigravity_upstream_tool_name_to_client(upstream_tool_name)
                 } else {
                     upstream_tool_name.to_string()
                 };
 
-                // 处理流式分块：名称为空表示续传
+                // 流式分块:名称为空表示续传
                 if state.response_type == ResponseType::Function && upstream_tool_name.is_empty() {
                     if let Some(args) = function_call.get("args") {
                         events.push(json!({
@@ -268,10 +253,16 @@ pub fn convert_gemini_stream_chunk(
                             }
                         }));
                     }
+                    if has_thought_signature {
+                        append_carrier_thinking_block(&mut events, state, &signature_value);
+                    }
                     continue;
                 }
 
-                // 关闭现有工具调用块
+                if has_thought_signature {
+                    append_carrier_thinking_block(&mut events, state, &signature_value);
+                }
+
                 if state.response_type == ResponseType::Function {
                     events.push(json!({
                         "type": "content_block_stop",
@@ -281,7 +272,6 @@ pub fn convert_gemini_stream_chunk(
                     state.response_type = ResponseType::None;
                 }
 
-                // 关闭其他类型块
                 if state.response_type != ResponseType::None {
                     events.push(json!({
                         "type": "content_block_stop",
@@ -290,19 +280,16 @@ pub fn convert_gemini_stream_chunk(
                     state.response_index += 1;
                 }
 
-                // 还原原始工具名
                 let client_tool_name = short_to_original
                     .get(&restored_upstream_name)
                     .map(|s| s.as_str())
                     .unwrap_or(&restored_upstream_name);
 
-                // 生成唯一工具使用 ID(对齐 CPA:{name}-{counter},可被请求侧反解)
                 let tool_use_id = claude_tool_id_for(
                     &restored_upstream_name,
                     TOOL_USE_ID_COUNTER.fetch_add(1, Ordering::SeqCst),
                 );
 
-                // 开始新工具使用块
                 events.push(json!({
                     "type": "content_block_start",
                     "index": state.response_index,
@@ -314,7 +301,6 @@ pub fn convert_gemini_stream_chunk(
                     }
                 }));
 
-                // 发送参数增量
                 if let Some(args) = function_call.get("args") {
                     events.push(json!({
                         "type": "content_block_delta",
@@ -328,6 +314,61 @@ pub fn convert_gemini_stream_chunk(
 
                 state.response_type = ResponseType::Function;
                 state.has_content = true;
+                continue;
+            }
+
+            // 普通可见文本(签名不单独标 thinking)
+            if let Some(text) = text_str {
+                if has_thought_signature && text.is_empty() {
+                    if state.response_type == ResponseType::Thinking {
+                        append_signature_delta(&mut events, state, &signature_value);
+                    } else {
+                        append_carrier_thinking_block(&mut events, state, &signature_value);
+                    }
+                    continue;
+                }
+                if has_thought_signature {
+                    append_carrier_thinking_block(&mut events, state, &signature_value);
+                }
+
+                if state.response_type == ResponseType::Content {
+                    events.push(json!({
+                        "type": "content_block_delta",
+                        "index": state.response_index,
+                        "delta": {
+                            "type": "text_delta",
+                            "text": text
+                        }
+                    }));
+                    state.has_content = true;
+                } else if !text.is_empty() {
+                    // 对齐 CPA fd3e6623:只在非空时转换,防止空 text 关闭活动块
+                    if state.response_type != ResponseType::None {
+                        events.push(json!({
+                            "type": "content_block_stop",
+                            "index": state.response_index
+                        }));
+                        state.response_index += 1;
+                    }
+                    events.push(json!({
+                        "type": "content_block_start",
+                        "index": state.response_index,
+                        "content_block": {
+                            "type": "text",
+                            "text": ""
+                        }
+                    }));
+                    events.push(json!({
+                        "type": "content_block_delta",
+                        "index": state.response_index,
+                        "delta": {
+                            "type": "text_delta",
+                            "text": text
+                        }
+                    }));
+                    state.response_type = ResponseType::Content;
+                    state.has_content = true;
+                }
             }
         }
     }
@@ -1117,6 +1158,109 @@ mod tests {
         // 空 text 不应关闭 thinking 块
         assert!(events2.iter().all(|e| e["type"] != "content_block_stop"));
         assert_eq!(state.response_type, ResponseType::Thinking);
+    }
+
+    #[test]
+    fn test_gemini_stream_signature_on_visible_text_emits_carrier_not_thinking() {
+        // 对齐 CPA:签名 alone 不把可见文本标成 thinking
+        let chunk = json!({
+            "candidates": [{
+                "content": {"parts": [
+                    {"text": "visible answer", "thoughtSignature": "sig-final-answer"}
+                ]}
+            }]
+        });
+        let mut state = GeminiStreamState::default();
+        let events = convert_gemini_stream_chunk(&chunk, &mut state, &HashMap::new(), None);
+
+        let carrier_start = events
+            .iter()
+            .find(|e| {
+                e["type"] == "content_block_start" && e["content_block"]["type"] == "thinking"
+            })
+            .expect("carrier thinking start");
+        assert_eq!(carrier_start["content_block"]["thinking"], "");
+        assert!(events
+            .iter()
+            .any(|e| e["delta"]["type"] == "signature_delta"));
+        assert!(events
+            .iter()
+            .any(|e| e["delta"]["type"] == "text_delta" && e["delta"]["text"] == "visible answer"));
+        assert!(events
+            .iter()
+            .all(|e| e["delta"]["type"] != "thinking_delta"));
+        assert_eq!(state.response_type, ResponseType::Content);
+    }
+
+    #[test]
+    fn test_gemini_stream_signature_only_emits_carrier_when_not_thinking() {
+        let chunk = json!({
+            "candidates": [{
+                "content": {"parts": [
+                    {"thoughtSignature": "sig-only"}
+                ]}
+            }]
+        });
+        let mut state = GeminiStreamState::default();
+        let events = convert_gemini_stream_chunk(&chunk, &mut state, &HashMap::new(), None);
+        assert!(events.iter().any(
+            |e| e["type"] == "content_block_start" && e["content_block"]["type"] == "thinking"
+        ));
+        assert!(events
+            .iter()
+            .any(|e| e["delta"]["type"] == "signature_delta"));
+        assert!(events.iter().any(|e| e["type"] == "content_block_stop"));
+        assert_eq!(state.response_type, ResponseType::None);
+        assert!(state.has_content);
+    }
+
+    #[test]
+    fn test_gemini_stream_thought_true_still_emits_thinking_delta() {
+        let chunk = json!({
+            "candidates": [{
+                "content": {"parts": [
+                    {"text": "reason", "thought": true, "thoughtSignature": "sig-t"}
+                ]}
+            }]
+        });
+        let mut state = GeminiStreamState::default();
+        let events = convert_gemini_stream_chunk(&chunk, &mut state, &HashMap::new(), None);
+        assert!(events
+            .iter()
+            .any(|e| e["delta"]["type"] == "thinking_delta" && e["delta"]["thinking"] == "reason"));
+        assert!(events
+            .iter()
+            .any(|e| e["delta"]["type"] == "signature_delta"));
+        assert_eq!(state.response_type, ResponseType::Thinking);
+    }
+
+    #[test]
+    fn test_gemini_stream_function_call_signature_emits_carrier_before_tool() {
+        let chunk = json!({
+            "candidates": [{
+                "content": {"parts": [
+                    {"functionCall": {"name": "run_command", "args": {"command": "true"}},
+                     "thoughtSignature": "sig-tool"}
+                ]}
+            }]
+        });
+        let mut state = GeminiStreamState::default();
+        let events = convert_gemini_stream_chunk(&chunk, &mut state, &HashMap::new(), None);
+
+        let carrier_idx = events
+            .iter()
+            .position(|e| {
+                e["type"] == "content_block_start" && e["content_block"]["type"] == "thinking"
+            })
+            .expect("carrier before tool");
+        let tool_idx = events
+            .iter()
+            .position(|e| {
+                e["type"] == "content_block_start" && e["content_block"]["type"] == "tool_use"
+            })
+            .expect("tool_use start");
+        assert!(carrier_idx < tool_idx);
+        assert_eq!(state.response_type, ResponseType::Function);
     }
 
     #[test]
