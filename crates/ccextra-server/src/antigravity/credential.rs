@@ -104,7 +104,7 @@ impl AntigravityCredential {
         None
     }
 
-    /// token 非空且过期时刻晚于 now+skew 才算新鲜(对齐 refreshSkew=3000s)
+    /// token 非空且过期时刻晚于 now+skew 才算新鲜(对齐 REFRESH_SKEW_SECS=300s)
     pub fn is_fresh(&self, now: SystemTime, skew_secs: i64) -> bool {
         if self.access_token.trim().is_empty() {
             return false;
@@ -173,7 +173,8 @@ mod tests {
     }
 
     #[test]
-    fn fresh_respects_3000s_skew() {
+    fn fresh_respects_refresh_skew() {
+        use super::super::constants::REFRESH_SKEW_SECS;
         let now = SystemTime::now();
         let mut cred = AntigravityCredential::new(
             "tok".into(),
@@ -182,12 +183,13 @@ mod tests {
             "a@b.com".into(),
             "p".into(),
         );
-        assert!(cred.is_fresh(now, 3000));
-        cred.expires_in = 2000;
-        cred.expired = rfc3339_from_now(now, 2000);
-        assert!(!cred.is_fresh(now, 3000));
+        assert!(cred.is_fresh(now, REFRESH_SKEW_SECS));
+        // 剩余 TTL 短于安全窗口 → 视为不新鲜
+        cred.expires_in = 200;
+        cred.expired = rfc3339_from_now(now, 200);
+        assert!(!cred.is_fresh(now, REFRESH_SKEW_SECS));
         cred.access_token.clear();
         cred.expired = rfc3339_from_now(now, 10_000);
-        assert!(!cred.is_fresh(now, 3000));
+        assert!(!cred.is_fresh(now, REFRESH_SKEW_SECS));
     }
 }
