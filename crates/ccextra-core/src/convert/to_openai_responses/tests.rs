@@ -1642,6 +1642,28 @@ fn test_web_search_tool_mapping() {
     convert_to_openai_responses(&mut body, "test-model").unwrap();
     assert_eq!(body["tools"][0]["type"], "web_search");
     assert_eq!(body["tools"][1]["type"], "function");
+    // 对齐 CPA:映射 web_search 时 include 追加 sources
+    assert_eq!(
+        body["include"].as_array().unwrap(),
+        &vec![
+            json!("reasoning.encrypted_content"),
+            json!("web_search_call.action.sources")
+        ]
+    );
+}
+
+#[test]
+fn test_include_without_web_search_omits_sources() {
+    let mut body = json!({
+        "model": "test",
+        "messages": [],
+        "tools": [{"type": "function", "name": "f", "input_schema": {"type": "object"}}]
+    });
+    convert_to_openai_responses(&mut body, "test-model").unwrap();
+    assert_eq!(
+        body["include"].as_array().unwrap(),
+        &vec![json!("reasoning.encrypted_content")]
+    );
 }
 
 #[test]
@@ -1731,6 +1753,32 @@ fn test_image_block_to_data_url() {
 }
 
 #[test]
+fn test_image_block_url_and_file_id() {
+    // 对齐 CPA claudeImageInputPart:http(s) url 透传、file_id 走 file_id 字段
+    let mut body = json!({
+        "model": "test",
+        "messages": [{
+            "role": "user",
+            "content": [
+                {"type": "image", "source": {"type": "url", "url": "https://example.com/a.png"}},
+                {"type": "image", "source": {"type": "file", "file_id": "file-img-1"}},
+                {"type": "image", "source": {"type": "url", "url": "ftp://bad.example/x"}},
+                {"type": "image", "source": {"type": "file", "file_id": ""}},
+                {"type": "text", "text": "ok"}
+            ]
+        }]
+    });
+    convert_to_openai_responses(&mut body, "test-model").unwrap();
+    let content = body["input"][0]["content"].as_array().unwrap();
+    assert_eq!(content.len(), 3);
+    assert_eq!(content[0]["type"], "input_image");
+    assert_eq!(content[0]["image_url"], "https://example.com/a.png");
+    assert_eq!(content[1]["type"], "input_image");
+    assert_eq!(content[1]["file_id"], "file-img-1");
+    assert_eq!(content[2]["type"], "input_text");
+}
+
+#[test]
 fn test_document_block_to_input_file() {
     // 对齐 CPA TestConvertClaudeRequestToCodex_PreservesBase64PDFDocumentContent
     let mut body = json!({
@@ -1779,6 +1827,31 @@ fn test_document_non_pdf_or_non_base64_ignored() {
     assert_eq!(content.len(), 1);
     assert_eq!(content[0]["type"], "input_text");
     assert_eq!(content[0]["text"], "only text");
+}
+
+#[test]
+fn test_container_upload_maps_like_document() {
+    // container_upload 与 document 同路径 → input_file(仅 base64 PDF)
+    let mut body = json!({
+        "model": "test",
+        "messages": [{
+            "role": "user",
+            "content": [
+                {"type": "container_upload", "source": {"type": "base64", "media_type": "application/pdf", "data": "JVBERi0="}},
+                {"type": "text", "text": "after"}
+            ]
+        }]
+    });
+    convert_to_openai_responses(&mut body, "gpt-5.6-sol").unwrap();
+    let content = body["input"][1]["content"].as_array().unwrap();
+    assert_eq!(content.len(), 2);
+    assert_eq!(content[0]["type"], "input_file");
+    assert_eq!(
+        content[0]["file_data"],
+        "data:application/pdf;base64,JVBERi0="
+    );
+    assert_eq!(content[0]["filename"], "document.pdf");
+    assert_eq!(content[1]["text"], "after");
 }
 
 #[test]

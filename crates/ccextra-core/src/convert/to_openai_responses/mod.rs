@@ -3,7 +3,8 @@
 // 主要映射(逐条一致):
 // - system → instructions 字段(合并 text blocks,过滤计费归属块,对齐 codex base_instructions)
 // - messages → input[]:text→input_text/output_text、thinking(带签名)→reasoning、
-//   image→input_image、tool_use→function_call、tool_result→function_call_output
+//   image→input_image(data/url/file_id)、document|container_upload→input_file、
+//   tool_use→function_call、tool_result→function_call_output
 //   (遇 thinking/tool_use/tool_result 先 flush 文本 message,对齐 flushMessage 顺序;
 //    tool_result 内嵌 image 抽出到随后 user message,output 不携带图片)
 // - thinking 处理:GPT/Grok 仅回放带签名的 encrypted reasoning,无签名明文丢弃
@@ -13,7 +14,7 @@
 // - thinking.budget_tokens → reasoning.effort(直映射,不钳制)
 // - service_tier: speed=fast → priority
 // - output_config.format(json_schema)→ text.format(name 缺省、strict 默认 true)
-// - store=false;include=["reasoning.encrypted_content"];parallel_tool_calls
+// - store=false;include=["reasoning.encrypted_content"(+web_search sources)];parallel_tool_calls
 //
 // 返回 short→original 工具名映射,响应侧还原原名(对齐 buildReverseMap...)。
 
@@ -279,11 +280,11 @@ pub fn convert_to_openai_responses_with(
                         // ccextra 无该层,且 grok-build 官方参考实现也不回放,故跳过。
                     }
                     "image" => {
-                        if let Some(url) = image_to_data_url(part) {
-                            content_items.push(json!({"type": "input_image", "image_url": url}));
+                        if let Some(img) = image_to_input_image(part) {
+                            content_items.push(img);
                         }
                     }
-                    "document" => {
+                    "document" | "container_upload" => {
                         if let Some(doc) = document_to_input_file(part) {
                             content_items.push(doc);
                         }
@@ -396,6 +397,7 @@ pub fn convert_to_openai_responses_with(
     }
 
     // --- tools → codex tools(对齐 tools 分支) ---
+    let mut has_web_search = false;
     if let Some(tools) = body.get("tools").and_then(|v| v.as_array()) {
         let mut tool_items: Vec<Value> = Vec::new();
         for tool in tools {
@@ -423,6 +425,7 @@ pub fn convert_to_openai_responses_with(
                     }
                 }
                 tool_items.push(ws);
+                has_web_search = true;
                 continue;
             }
 
@@ -557,7 +560,15 @@ pub fn convert_to_openai_responses_with(
     // stream 保留入站值(对齐 to_openai_chat)
     openai["stream"] = body.get("stream").unwrap_or(&json!(false)).clone();
     openai["store"] = json!(false);
-    openai["include"] = json!(["reasoning.encrypted_content"]);
+    // 对齐 CPA:映射了 web_search 时追加 sources include
+    openai["include"] = if has_web_search {
+        json!([
+            "reasoning.encrypted_content",
+            "web_search_call.action.sources"
+        ])
+    } else {
+        json!(["reasoning.encrypted_content"])
+    };
 
     // --- output_config.format(json_schema)→ text.format ---
     // (对齐 convertClaudeRequestToCodex:name 缺省 cli_proxy_structured_output,

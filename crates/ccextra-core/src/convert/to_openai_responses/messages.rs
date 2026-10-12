@@ -84,25 +84,58 @@ pub(crate) fn tool_result_output(content: &Value) -> (Value, Vec<Value>) {
     }
 }
 
-/// image block → data URL(对齐 image 分支)
-pub(crate) fn image_to_data_url(part: &Value) -> Option<String> {
+/// 是否为绝对 http(s) URL(对齐 CPA IsHTTPURL:有 host 且 scheme 为 http/https)
+fn is_http_url(value: &str) -> bool {
+    let Ok(uri) = value.trim().parse::<http::Uri>() else {
+        return false;
+    };
+    let scheme = uri.scheme_str().unwrap_or("");
+    if !scheme.eq_ignore_ascii_case("http") && !scheme.eq_ignore_ascii_case("https") {
+        return false;
+    }
+    uri.host().is_some_and(|h| !h.is_empty())
+}
+
+/// image block → Responses input_image(对齐 CPA claudeImageInputPart):
+/// base64 → data URL; type=url 且 http(s) → image_url 透传; type=file → file_id
+pub(crate) fn image_to_input_image(part: &Value) -> Option<Value> {
     let source = part.get("source")?;
     let data = source
         .get("data")
         .or_else(|| source.get("base64"))
-        .and_then(|v| v.as_str())?;
-    if data.is_empty() {
-        return None;
-    }
-    let media_type = source
-        .get("media_type")
         .and_then(|v| v.as_str())
-        .or_else(|| source.get("mime_type").and_then(|v| v.as_str()))
-        .unwrap_or("application/octet-stream");
-    Some(format!("data:{media_type};base64,{data}"))
+        .unwrap_or("");
+    if !data.is_empty() {
+        let media_type = source
+            .get("media_type")
+            .and_then(|v| v.as_str())
+            .or_else(|| source.get("mime_type").and_then(|v| v.as_str()))
+            .unwrap_or("application/octet-stream");
+        return Some(json!({
+            "type": "input_image",
+            "image_url": format!("data:{media_type};base64,{data}")
+        }));
+    }
+    match source.get("type").and_then(|v| v.as_str()) {
+        Some("url") => {
+            let url = source.get("url").and_then(|v| v.as_str())?.trim();
+            if !is_http_url(url) {
+                return None;
+            }
+            Some(json!({"type": "input_image", "image_url": url}))
+        }
+        Some("file") => {
+            let file_id = source.get("file_id").and_then(|v| v.as_str())?.trim();
+            if file_id.is_empty() {
+                return None;
+            }
+            Some(json!({"type": "input_image", "file_id": file_id}))
+        }
+        _ => None,
+    }
 }
 
-/// document block → input_file(对齐 CPA appendDocumentContent:
+/// document/container_upload → input_file(对齐 CPA appendDocumentContent:
 /// 仅支持 base64 + application/pdf,输出 type=input_file,filename=document.pdf)
 pub(crate) fn document_to_input_file(part: &Value) -> Option<Value> {
     let source = part.get("source")?;
