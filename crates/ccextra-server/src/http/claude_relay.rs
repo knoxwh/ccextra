@@ -1,4 +1,5 @@
-use axum::http::{header, HeaderMap};
+use crate::claude::constants::OAUTH_BETA;
+use axum::http::{header, HeaderMap, HeaderName, HeaderValue};
 
 /// 构建 Claude 中转请求头:保留入站头,排除认证、代理重建及连接管理头。
 pub fn claude_relay_headers(headers: &HeaderMap) -> HeaderMap {
@@ -53,4 +54,87 @@ pub fn claude_inbound_user_agent(headers: &HeaderMap) -> Option<&str> {
         .get(header::USER_AGENT)
         .and_then(|value| value.to_str().ok())
         .filter(|value| !value.is_empty())
+}
+
+/// 订阅 OAuth (`sk-ant-oat*`) 出站时:入站 anthropic-beta 缺 oauth beta 则追加。
+/// 不改写已有 beta 列表顺序以外的内容;已含则不动。
+pub fn ensure_oauth_beta(headers: &mut HeaderMap) {
+    let beta_name = HeaderName::from_static("anthropic-beta");
+    let mut already = false;
+    let mut first: Option<String> = None;
+    for value in headers.get_all(&beta_name) {
+        if let Ok(s) = value.to_str() {
+            if first.is_none() {
+                first = Some(s.to_string());
+            }
+            if beta_list_contains(s, OAUTH_BETA) {
+                already = true;
+                break;
+            }
+        }
+    }
+    if already {
+        return;
+    }
+    match first {
+        Some(existing) => {
+            let merged = if existing.trim().is_empty() {
+                OAUTH_BETA.to_string()
+            } else {
+                format!("{existing},{OAUTH_BETA}")
+            };
+            headers.remove(&beta_name);
+            if let Ok(v) = HeaderValue::from_str(&merged) {
+                headers.insert(beta_name, v);
+            }
+        }
+        None => {
+            if let Ok(v) = HeaderValue::from_str(OAUTH_BETA) {
+                headers.insert(beta_name, v);
+            }
+        }
+    }
+}
+
+fn beta_list_contains(list: &str, needle: &str) -> bool {
+    list.split(',')
+        .map(str::trim)
+        .any(|part| part.eq_ignore_ascii_case(needle))
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn test_ensure_oauth_beta_appends_when_missing() {
+        let mut map = HeaderMap::new();
+        map.insert(
+            HeaderName::from_static("anthropic-beta"),
+            HeaderValue::from_static("claude-code-20250219"),
+        );
+        ensure_oauth_beta(&mut map);
+        let got = map.get("anthropic-beta").unwrap().to_str().unwrap();
+        assert_eq!(got, "claude-code-20250219,oauth-2025-04-20");
+    }
+
+    #[test]
+    fn test_ensure_oauth_beta_noop_when_present() {
+        let mut map = HeaderMap::new();
+        map.insert(
+            HeaderName::from_static("anthropic-beta"),
+            HeaderValue::from_static("claude-code-20250219,oauth-2025-04-20"),
+        );
+        ensure_oauth_beta(&mut map);
+        let got = map.get("anthropic-beta").unwrap().to_str().unwrap();
+        assert_eq!(got, "claude-code-20250219,oauth-2025-04-20");
+    }
+
+    #[test]
+    fn test_ensure_oauth_beta_inserts_when_absent() {
+        let mut map = HeaderMap::new();
+        ensure_oauth_beta(&mut map);
+        let got = map.get("anthropic-beta").unwrap().to_str().unwrap();
+        assert_eq!(got, "oauth-2025-04-20");
+    }
 }

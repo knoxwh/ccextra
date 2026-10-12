@@ -26,7 +26,9 @@ use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::Arc;
 
 use crate::http::auth::check_secret;
-use crate::http::claude_relay::{claude_inbound_user_agent, claude_relay_headers};
+use crate::http::claude_relay::{
+    claude_inbound_user_agent, claude_relay_headers, ensure_oauth_beta,
+};
 use crate::http::error::{to_anthropic_error, AppError};
 use crate::http::retry::parse_retry_after;
 use crate::http::{AppState, PayloadRule};
@@ -511,6 +513,7 @@ pub(crate) async fn prepare_message_request(
         antigravity_refresh,
         xai_refresh,
         codex_refresh,
+        claude_refresh,
     ) = {
         let provider = find_provider(providers, &route.provider)
             .ok_or_else(|| AppError::new(anyhow::anyhow!("provider 未找到: {}", route.provider)))?;
@@ -542,6 +545,14 @@ pub(crate) async fn prepare_message_request(
                 let account_id = m.get("account_id").cloned().unwrap_or_default();
                 Some((auth_dir, email, account_id))
             });
+        let claude_refresh = meta
+            .filter(|m| m.get("provider_type").map(|s| s.as_str()) == Some("claude"))
+            .and_then(|m| {
+                let auth_dir = m.get("auth_dir")?.clone();
+                let email = m.get("email").cloned().unwrap_or_default();
+                let account_uuid = m.get("account_uuid").cloned().unwrap_or_default();
+                Some((auth_dir, email, account_uuid))
+            });
         (
             provider.base_urls().to_vec(),
             provider.key.clone(),
@@ -550,6 +561,7 @@ pub(crate) async fn prepare_message_request(
             antigravity_refresh,
             xai_refresh,
             codex_refresh,
+            claude_refresh,
         )
     };
     // 空 base_url 列表会让轮转循环与内部重试越界,提前拒绝
@@ -619,6 +631,25 @@ pub(crate) async fn prepare_message_request(
         }
     }
 
+    // Claude 订阅运行时 token 校验与自动刷新
+    if let Some((auth_dir_str, email, account_uuid)) = claude_refresh {
+        let auth_dir = std::path::Path::new(&auth_dir_str);
+        let id = if !email.is_empty() {
+            &email
+        } else {
+            &account_uuid
+        };
+        match crate::claude::ensure_credential_fresh(auth_dir, id, upstream_proxy.as_deref()).await
+        {
+            Ok(fresh_cred) => {
+                upstream_key = fresh_cred.access_token;
+            }
+            Err(e) => {
+                tracing::warn!(email = %email, "Claude 凭证运行时刷新失败: {e}");
+            }
+        }
+    }
+
     // prompt_cache_key 注入
     if should_inject_prompt_cache_key(provider_prompt_cache_key, route.protocol, &outbound_model)
         && inject_prompt_cache_key(&mut body_json, cc_session.as_deref())
@@ -663,7 +694,11 @@ pub(crate) async fn prepare_message_request(
         None
     };
     let extra_headers = if matches!(route.protocol, Protocol::Claude) {
-        claude_relay_headers(headers)
+        let mut map = claude_relay_headers(headers);
+        if crate::claude::is_claude_oauth_token(&upstream_key) {
+            ensure_oauth_beta(&mut map);
+        }
+        map
     } else if let Some(account_id) = codex_account_id.as_deref() {
         // Codex 订阅身份头 (对齐 CPA: 仅 OAuth 账号发,API key provider 无 metadata 不发)
         let mut map = HeaderMap::new();

@@ -26,7 +26,8 @@ use handlers::reload::handle_reload;
 
 pub use auth::{check_secret, extract_key, verify_cached};
 pub use claude_relay::{
-    claude_inbound_user_agent, claude_relay_headers, is_claude_relay_header_excluded,
+    claude_inbound_user_agent, claude_relay_headers, ensure_oauth_beta,
+    is_claude_relay_header_excluded,
 };
 pub use error::{extract_upstream_error, to_anthropic_error, AppError};
 pub use retry::{
@@ -86,6 +87,7 @@ pub struct ProviderRefreshConfig {
     pub auth_dir: Option<std::path::PathBuf>,
     pub xai_auth_dir: Option<std::path::PathBuf>,
     pub codex_auth_dir: Option<std::path::PathBuf>,
+    pub claude_auth_dir: Option<std::path::PathBuf>,
     /// Antigravity 模型白名单;空 = 全量
     pub antigravity_models: Option<Vec<String>>,
     /// Cursor 运行时配置;None = 未启用

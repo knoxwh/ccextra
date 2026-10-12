@@ -37,7 +37,7 @@ A single-process Rust proxy. Claude Code sends Anthropic Messages requests; ccex
 - **Route by model**: Claude, OpenAI, Gemini, and Antigravity share one endpoint. Client-facing aliases remain separate from upstream model names.
 - **Stable request content**: Normalize tools, schemas, and history to reduce incidental changes between turns. Actual cache hits depend on the upstream.
 - **Model adaptation**: Translate messages, tool calls, and images; adjust supported reasoning levels through `models.json`.
-- **OAuth providers**: Load and refresh Antigravity, xAI Grok, Codex (OpenAI ChatGPT subscription), and Cursor (native connect-rpc proxy) credentials with dynamic model routing.
+- **OAuth providers**: Load and refresh Antigravity, xAI Grok, Codex (OpenAI ChatGPT subscription), Claude subscription (Anthropic OAuth), and Cursor (native connect-rpc proxy) credentials with dynamic model routing.
 - **Hot reload**: Publish configuration without restarting. In-flight requests keep their original snapshot.
 
 ## Architecture
@@ -201,6 +201,8 @@ Log in to an upstream or inspect saved credential status:
 ./ccextra xai-status
 ./ccextra codex-login
 ./ccextra codex-status
+./ccextra claude-login
+./ccextra claude-status
 ./ccextra cursor-login
 ./ccextra cursor-status
 ./scripts/check_antigravity_quota.sh
@@ -209,7 +211,7 @@ Log in to an upstream or inspect saved credential status:
 ./scripts/check_cursor_quota.sh
 ```
 
-Antigravity credentials default to `.cache/antigravity` next to the config; xAI uses `.cache/xai`, Codex `.cache/codex`. xAI and Codex are discovered at startup. Antigravity loads in the background, refreshes models every three hours, refreshes tokens 5 minutes ahead of expiry, confines requests to the daily endpoint, and sanitizes non-standard headers. Codex login uses PKCE browser authorization (local callback port defaults to 1455, override with `--callback-port`); tokens refresh 24 hours ahead of expiry.
+Antigravity credentials default to `.cache/antigravity` next to the config; xAI uses `.cache/xai`, Codex `.cache/codex`, Claude subscription `.cache/claude`. xAI, Codex, and Claude subscription are discovered at startup. Antigravity loads in the background, refreshes models every three hours, refreshes tokens 5 minutes ahead of expiry, confines requests to the daily endpoint, and sanitizes non-standard headers. Codex login uses PKCE browser authorization (local callback port defaults to 1455, override with `--callback-port`); tokens refresh 24 hours ahead of expiry.
 
 Cursor login uses its own PKCE browser flow and polling; neither the Cursor IDE nor `cursor-agent` is required. Use `--no-browser` to open the login URL manually. Cursor tokens refresh 10 minutes ahead of expiry. The PKCE credential (`cursor.json`) drives the native proxy and quota checks (`check_cursor_quota.sh`, which shows both quota and the model catalog by default; `--models` lists models only). Once configured, startup and `/reload` fetch the account model catalog via GetUsableModels and synthesize the `cursor` provider, a background refresh runs every three hours, and failures keep the last successful catalog. The `cursor_models` whitelist matches that catalog (script output, including display names and aliases); run that command to verify model ids before configuring the whitelist. Thinking levels live in `models.json` (keyed by base id); the script ends with each model's selectable levels and a ready-to-paste `models.json` entry.
 

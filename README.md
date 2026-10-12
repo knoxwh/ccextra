@@ -201,6 +201,8 @@ curl -H "Authorization: Bearer $ANTHROPIC_AUTH_TOKEN" \
 ./ccextra xai-status
 ./ccextra codex-login
 ./ccextra codex-status
+./ccextra claude-login
+./ccextra claude-status
 ./ccextra cursor-login
 ./ccextra cursor-status
 ./scripts/check_antigravity_quota.sh
@@ -209,7 +211,7 @@ curl -H "Authorization: Bearer $ANTHROPIC_AUTH_TOKEN" \
 ./scripts/check_cursor_quota.sh
 ```
 
-Antigravity 凭证默认在配置文件旁 `.cache/antigravity`，xAI 在 `.cache/xai`，Codex 在 `.cache/codex`。xAI 和 Codex 启动时自动发现。Antigravity 后台加载并每 3 小时刷新模型，token 提前 5 分钟刷新，出站锁定 daily 节点并清洗非标标头。Codex 登录使用 PKCE 浏览器授权（本地回调端口默认 1455，可用 `--callback-port` 覆盖），token 提前 24 小时刷新。
+Antigravity 凭证默认在配置文件旁 `.cache/antigravity`，xAI 在 `.cache/xai`，Codex 在 `.cache/codex`，Claude 订阅在 `.cache/claude`。xAI、Codex 与 Claude 订阅启动时自动发现。Antigravity 后台加载并每 3 小时刷新模型，token 提前 5 分钟刷新，出站锁定 daily 节点并清洗非标标头。Codex 登录使用 PKCE 浏览器授权（本地回调端口默认 1455，可用 `--callback-port` 覆盖），token 提前 24 小时刷新。Claude 订阅登录同样 PKCE（回调端口固定 54545，与 Anthropic 注册 RedirectURI 一致），token 提前 4 小时刷新；出站复用 `protocol: claude` 直通，OAuth 凭证缺 `oauth-2025-04-20` beta 时自动补上。
 
 Cursor 登录自行生成 PKCE 并轮询浏览器授权，不依赖 Cursor IDE 或 `cursor-agent`；可用 `--no-browser` 手动打开 URL，token 到期前 10 分钟刷新。PKCE 凭证（`cursor.json`）驱动原生代理与配额查询（`check_cursor_quota.sh`，默认同时展示额度与模型目录，`--models` 仅列模型）。配置后启动与 `/reload` 时经 GetUsableModels 拉取账户模型目录合成 `cursor` provider，每 3 小时后台刷新，失败保留最近成功目录。`cursor_models` 白名单匹配的就是该目录（脚本输出，含 display name 与 aliases）；配白名单前先跑该命令核对模型 id。思考档配在 `models.json`（按 base id），脚本末尾列出各模型可选档位和可直接粘贴的 `models.json` 条目。
 

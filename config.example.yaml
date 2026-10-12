@@ -27,6 +27,11 @@ secret_key: "sk-ccextra-xxx"
 # Codex 凭证目录(可选)。默认配置文件旁 .cache/codex。
 # codex_auth_dir: ".cache/codex"
 
+# Claude 订阅 (Anthropic OAuth) 凭证目录(可选)。默认配置文件旁 .cache/claude。
+# 登录: ./ccextra claude-login → 启动时自动扫描并注入 protocol: claude provider
+# (base_url=https://api.anthropic.com, key=access_token)。与静态 API/中转共用直通管线。
+# claude_auth_dir: ".cache/claude"
+
 # Cursor 原生代理(可选)。配置后以原生 connect-rpc 双向流直连
 # api2.cursor.sh,拉取账户模型目录并合成 name "cursor" provider
 # (protocol: cursor_sdk)。凭证:cursor-login 的 PKCE 凭证(cursor.json)。

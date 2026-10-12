@@ -17,7 +17,7 @@
 | 非流响应 | `stream` 为 `false` 或缺失时的单个 JSON 响应。 |
 | 会话输入用量缓存 | 按 session 保存上游真实输入 token 数，供下一轮流首和 count_tokens 使用。Chat/Responses/Gemini/Antigravity 的原始 SSE 正数输入用量也会写回；缺失或零值不覆盖旧值，占位值不写回。记录写入后 30 分钟过期，最多 512 条。 |
 
-xAI Grok 与 Codex 不是 protocol。它们使用 OAuth 凭证动态创建 `openai_responses` provider。Cursor 同样不是手写 protocol：`cursor_auth_dir` 凭证自动合成 name `cursor` 的 `cursor_sdk` provider。
+xAI Grok 与 Codex 不是独立 protocol。它们使用 OAuth 凭证动态创建 `openai_responses` provider。Claude 订阅 OAuth 动态创建 `protocol: claude` provider（与静态 API/中转同形）。Cursor 同样不是手写 protocol：`cursor_auth_dir` 凭证自动合成 name `cursor` 的 `cursor_sdk` provider。
 
 ## 路由与配置
 

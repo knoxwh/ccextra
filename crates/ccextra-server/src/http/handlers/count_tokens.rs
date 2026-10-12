@@ -9,7 +9,9 @@ use ccextra_core::session::extract_claude_code_session;
 use serde_json::Value;
 
 use crate::http::auth::check_secret;
-use crate::http::claude_relay::{claude_inbound_user_agent, claude_relay_headers};
+use crate::http::claude_relay::{
+    claude_inbound_user_agent, claude_relay_headers, ensure_oauth_beta,
+};
 use crate::http::error::AppError;
 use crate::http::AppState;
 
@@ -52,8 +54,39 @@ pub async fn handle_count_tokens(
         let provider = find_provider(providers, &route.provider)
             .ok_or_else(|| AppError::new(anyhow::anyhow!("provider 未找到")))?;
         let base_url = provider.base_urls()[0].clone(); // 取首个 URL（count_tokens 无需回退）
-        let key = provider.key.clone();
+        let mut key = provider.key.clone();
         let proxy_url = provider.proxy_url.clone();
+
+        // Claude 订阅:运行时刷新 access_token
+        if let Some(meta) = provider.metadata.as_ref() {
+            if meta.get("provider_type").map(|s| s.as_str()) == Some("claude") {
+                if let Some(auth_dir_str) = meta.get("auth_dir") {
+                    let email = meta.get("email").map(|s| s.as_str()).unwrap_or("");
+                    let account_uuid = meta.get("account_uuid").map(|s| s.as_str()).unwrap_or("");
+                    let id = if !email.is_empty() {
+                        email
+                    } else {
+                        account_uuid
+                    };
+                    if !id.is_empty() {
+                        let auth_dir = std::path::Path::new(auth_dir_str);
+                        match crate::claude::ensure_credential_fresh(
+                            auth_dir,
+                            id,
+                            proxy_url.as_deref(),
+                        )
+                        .await
+                        {
+                            Ok(fresh) => key = fresh.access_token,
+                            Err(e) => tracing::warn!(
+                                email = %email,
+                                "Claude count_tokens 凭证刷新失败: {e}"
+                            ),
+                        }
+                    }
+                }
+            }
+        }
 
         let url = format!(
             "{}/v1/messages/count_tokens",
@@ -62,7 +95,10 @@ pub async fn handle_count_tokens(
         let proxy_key = upstream_client.resolve_proxy(proxy_url.as_deref());
         let client = upstream_client.client_for(&proxy_key, Protocol::Claude, false)?;
         let inbound_user_agent = claude_inbound_user_agent(&headers);
-        let extra_headers = claude_relay_headers(&headers);
+        let mut extra_headers = claude_relay_headers(&headers);
+        if crate::claude::is_claude_oauth_token(&key) {
+            ensure_oauth_beta(&mut extra_headers);
+        }
         let mut request = client
             .post(&url)
             .header(

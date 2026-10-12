@@ -6,6 +6,10 @@ use ccextra_server::antigravity::{
     list as list_antigravity, resolve_auth_dir as resolve_antigravity_auth_dir,
     run_login as run_antigravity_login, LoginOptions as AntigravityLoginOptions,
 };
+use ccextra_server::claude::{
+    list as list_claude, resolve_auth_dir as resolve_claude_auth_dir,
+    run_login as run_claude_login, ClaudeLoginOptions,
+};
 use ccextra_server::codex::{
     list as list_codex, resolve_auth_dir as resolve_codex_auth_dir, run_login as run_codex_login,
     CodexLoginOptions,
@@ -109,6 +113,26 @@ enum Commands {
         #[arg(long)]
         auth_dir: Option<String>,
     },
+    /// 浏览器 PKCE 登录 Claude 订阅 (Anthropic OAuth) 并写入凭证
+    #[command(name = "claude-login")]
+    ClaudeLogin {
+        /// 凭证目录,默认配置文件旁 .cache/claude
+        #[arg(long)]
+        auth_dir: Option<String>,
+        /// 不自动打开浏览器,只打印 URL
+        #[arg(long)]
+        no_browser: bool,
+        /// 本地回调端口,默认 54545(须与 Anthropic 注册 RedirectURI 一致)
+        #[arg(long)]
+        callback_port: Option<u16>,
+    },
+    /// 列出已保存的 Claude 订阅凭证(不打印 token)
+    #[command(name = "claude-status")]
+    ClaudeStatus {
+        /// 凭证目录,默认配置文件旁 .cache/claude
+        #[arg(long)]
+        auth_dir: Option<String>,
+    },
     /// 浏览器 PKCE 登录 Cursor 并写入凭证
     #[command(name = "cursor-login")]
     CursorLogin {
@@ -159,6 +183,16 @@ async fn main() -> Result<()> {
         }
         Some(Commands::CodexStatus { auth_dir }) => {
             return cmd_codex_status(&cli.config, auth_dir);
+        }
+        Some(Commands::ClaudeLogin {
+            auth_dir,
+            no_browser,
+            callback_port,
+        }) => {
+            return cmd_claude_login(&cli.config, auth_dir, no_browser, callback_port).await;
+        }
+        Some(Commands::ClaudeStatus { auth_dir }) => {
+            return cmd_claude_status(&cli.config, auth_dir);
         }
         Some(Commands::CursorLogin {
             auth_dir,
@@ -257,6 +291,24 @@ async fn main() -> Result<()> {
         tracing::info!("动态加载 {} 个 Codex providers", codex_providers.len());
     }
 
+    // 动态加载 Claude 订阅 providers
+    let claude_auth_dir = pin_auth_dir(
+        &cli.config,
+        config.claude_auth_dir.as_deref(),
+        resolve_claude_auth_dir,
+    );
+    let claude_providers = ccextra_server::claude::load_claude_providers(
+        &claude_auth_dir,
+        config.server.proxy_url.as_deref(),
+    )
+    .await;
+    if !claude_providers.is_empty() {
+        tracing::info!(
+            "动态加载 {} 个 Claude 订阅 providers",
+            claude_providers.len()
+        );
+    }
+
     // 动态加载 Antigravity providers
     let antigravity_auth_dir = pin_auth_dir(
         &cli.config,
@@ -280,6 +332,7 @@ async fn main() -> Result<()> {
     let mut all_providers = merge_providers(config.providers.clone(), Vec::new());
     all_providers = merge_providers(all_providers, xai_providers);
     all_providers = merge_providers(all_providers, codex_providers);
+    all_providers = merge_providers(all_providers, claude_providers);
     all_providers = merge_providers(all_providers, antigravity_providers);
 
     // Cursor 原生运行时组装(启用判定:cursor_auth_dir 非空)
@@ -336,9 +389,16 @@ async fn main() -> Result<()> {
                 cfg.server.proxy_url.as_deref(),
             )
             .await;
+            let claude_auth_dir = pin_auth_dir(&config_path, cfg.claude_auth_dir.as_deref(), resolve_claude_auth_dir);
+            let claude_providers = ccextra_server::claude::load_claude_providers(
+                &claude_auth_dir,
+                cfg.server.proxy_url.as_deref(),
+            )
+            .await;
             let mut providers = merge_providers(cfg.providers, antigravity_providers);
             providers = merge_providers(providers, xai_providers);
             providers = merge_providers(providers, codex_providers);
+            providers = merge_providers(providers, claude_providers);
 
             let user_agents = build_user_agents(cfg.user_agents.as_ref());
             let thinking_registry = load_thinking_registry(&config_path, cfg.models_file.as_deref())?;
@@ -439,6 +499,15 @@ fn codex_auth_dir_from(config_path: &str, override_dir: Option<String>) -> PathB
         load_optional_config(config_path).and_then(|cfg| cfg.codex_auth_dir)
     };
     pin_auth_dir(config_path, raw.as_deref(), resolve_codex_auth_dir)
+}
+
+fn claude_auth_dir_from(config_path: &str, override_dir: Option<String>) -> PathBuf {
+    let raw = if let Some(dir) = override_dir {
+        Some(dir)
+    } else {
+        load_optional_config(config_path).and_then(|cfg| cfg.claude_auth_dir)
+    };
+    pin_auth_dir(config_path, raw.as_deref(), resolve_claude_auth_dir)
 }
 
 fn cursor_auth_dir_from(config_path: &str, override_dir: Option<String>) -> PathBuf {
@@ -546,6 +615,11 @@ fn provider_refresh_config(config_path: &str, config: &Config) -> ProviderRefres
             config.codex_auth_dir.as_deref(),
             resolve_codex_auth_dir,
         )),
+        claude_auth_dir: Some(pin_auth_dir(
+            config_path,
+            config.claude_auth_dir.as_deref(),
+            resolve_claude_auth_dir,
+        )),
         antigravity_models: config.antigravity_models.clone(),
         cursor: cursor_config_from(config_path, config),
         proxy_url: config.server.proxy_url.clone(),
@@ -569,6 +643,11 @@ async fn load_refreshed_providers(
     } else {
         Vec::new()
     };
+    let claude = if let Some(dir) = refresh.claude_auth_dir.as_ref() {
+        ccextra_server::claude::load_claude_providers(dir, refresh.proxy_url.as_deref()).await
+    } else {
+        Vec::new()
+    };
     let injected = ccextra_server::antigravity::load_antigravity_providers(
         auth_dir,
         refresh.proxy_url.as_deref(),
@@ -581,6 +660,7 @@ async fn load_refreshed_providers(
     }
     let set = merge_providers(refresh.static_providers, xai);
     let set = merge_providers(set, codex);
+    let set = merge_providers(set, claude);
     let set = merge_providers(set, injected);
     // Cursor catalog:成功合成则并入;失败保留快照中现有 cursor provider
     let cursor_set = match refresh.cursor.as_ref() {
@@ -888,6 +968,66 @@ fn cmd_codex_status(config_path: &str, auth_dir: Option<String>) -> Result<()> {
         };
         println!(
             "{}  email={email}  account={account}  plan={plan}  {status}  expired={}",
+            path.file_name().unwrap_or_default().to_string_lossy(),
+            if cred.expired.is_empty() {
+                "-"
+            } else {
+                cred.expired.as_str()
+            }
+        );
+    }
+    Ok(())
+}
+
+async fn cmd_claude_login(
+    config_path: &str,
+    auth_dir: Option<String>,
+    no_browser: bool,
+    callback_port: Option<u16>,
+) -> Result<()> {
+    let cfg = load_optional_config(config_path);
+    let proxy_url = cfg.as_ref().and_then(|c| c.server.proxy_url.clone());
+    let opts = ClaudeLoginOptions {
+        auth_dir: claude_auth_dir_from(config_path, auth_dir),
+        no_browser,
+        callback_port: callback_port
+            .unwrap_or(ccextra_server::claude::constants::DEFAULT_CALLBACK_PORT),
+        proxy_url,
+    };
+    run_claude_login(opts).await?;
+    reload_after_login(config_path).await;
+    Ok(())
+}
+
+fn cmd_claude_status(config_path: &str, auth_dir: Option<String>) -> Result<()> {
+    let dir = claude_auth_dir_from(config_path, auth_dir);
+    let now = SystemTime::now();
+    let entries = list_claude(&dir)?;
+    if entries.is_empty() {
+        println!("无 Claude 订阅凭证: {}", dir.display());
+        return Ok(());
+    }
+    println!("auth_dir: {}", dir.display());
+    for (path, cred) in entries {
+        let status = if cred.disabled {
+            "disabled"
+        } else if cred.is_fresh(now, ccextra_server::claude::constants::REFRESH_SKEW_SECS) {
+            "fresh"
+        } else {
+            "stale"
+        };
+        let email = if cred.email.is_empty() {
+            "-"
+        } else {
+            cred.email.as_str()
+        };
+        let account = if cred.account_uuid.is_empty() {
+            "-"
+        } else {
+            cred.account_uuid.as_str()
+        };
+        println!(
+            "{}  email={email}  account={account}  {status}  expired={}",
             path.file_name().unwrap_or_default().to_string_lossy(),
             if cred.expired.is_empty() {
                 "-"

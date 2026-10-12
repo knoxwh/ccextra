@@ -27,6 +27,9 @@ pub struct Config {
     /// Codex 凭证目录(可选);默认配置文件旁 `.cache/codex`
     #[serde(default)]
     pub codex_auth_dir: Option<String>,
+    /// Claude 订阅凭证目录(可选);默认配置文件旁 `.cache/claude`
+    #[serde(default)]
+    pub claude_auth_dir: Option<String>,
     /// Cursor 凭证目录(可选);默认配置文件旁 `.cache/cursor`
     #[serde(default)]
     pub cursor_auth_dir: Option<String>,
