@@ -5,7 +5,8 @@
 // - tool 调用独立 pending map,不占 active block,完工时 flush 完整 input_json
 // - 对齐 CPA ef99119e:tool 块开启未收尾期间到达的 text/thinking 进缓冲,
 //   收尾后按独立块冲刷,保证 Anthropic 内容块严格顺序
-// - finish 时统一 finalize(close 全部 + 刷缓冲 + message_delta + message_stop)
+// - 尾帧 usage-only / [DONE] / EOF 时统一 finalize(close 全部 + 刷缓冲 + message_delta + message_stop);
+//   finish+usage 同帧只缓存 usage,不提前收尾(对齐 CPA trailing usage)
 //
 // 核心难点:工具调用 index 一致。OpenAI 的 tool_calls[N] 用 index 标识,
 // Anthropic 的 content_block 用连续 index 分配。两者需映射。
@@ -137,10 +138,27 @@ impl ChatRelay {
             }
         }
         // usage 双路径提取(对齐 Moonshot):优先顶层 usage,回退 choices[0].usage
+        let mut has_usage = false;
         if let Some(usage) = root.get("usage").filter(|u| !u.is_null()) {
             self.cache_usage(usage);
+            has_usage = true;
         } else if let Some(usage) = root.pointer("/choices/0/usage").filter(|u| !u.is_null()) {
             self.cache_usage(usage);
+            has_usage = true;
+        }
+
+        // 对齐 CPA:finish+usage 同帧只缓存,权威 token(如 cached_tokens)常在
+        // 尾帧 usage-only(无 choices[0])才到;此时或 [DONE]/EOF 再 finalize。
+        let has_choice0 = root
+            .get("choices")
+            .and_then(|c| c.as_array())
+            .and_then(|arr| arr.first())
+            .is_some();
+        if has_usage && !has_choice0 {
+            if self.can_finalize_on_trailing_usage() {
+                return self.finalize();
+            }
+            return Vec::new();
         }
 
         let Some(delta) = root.pointer("/choices/0/delta") else {
@@ -194,13 +212,19 @@ impl ChatRelay {
             }
         }
 
-        // finish_reason 且 usage 可用 → finalize
-        let usage_in_chunk = root.get("usage").map(|u| !u.is_null()).unwrap_or(false);
-        if !self.finish_reason.is_empty() && (usage_in_chunk || self.usage_seen) {
-            frames.extend(self.finalize());
-        }
+        // finish+usage 同帧不 finalize(等尾帧 usage-only / [DONE] / EOF)
 
         frames
+    }
+
+    /// 尾帧 usage-only 可收尾的前置:已见 finish 或已有可见内容(对齐 CPA)
+    fn can_finalize_on_trailing_usage(&self) -> bool {
+        !self.finish_reason.is_empty()
+            || self.saw_tool_call
+            || self.has_text
+            || !self.thinking_parts.is_empty()
+            || !self.interleaved.is_empty()
+            || self.started
     }
 
     /// 缓存 usage 并做 cached 减法(与 extractOpenAIUsage 一致)
@@ -768,6 +792,27 @@ mod tests {
     use super::*;
     use serde_json::json;
 
+    fn sse_ev(data: impl Into<String>) -> super::super::parser::SseEvent {
+        super::super::parser::SseEvent {
+            event: Some("chat.completion.chunk".into()),
+            data: data.into(),
+        }
+    }
+
+    fn done_ev() -> super::super::parser::SseEvent {
+        super::super::parser::SseEvent {
+            event: None,
+            data: "[DONE]".into(),
+        }
+    }
+
+    /// finish(+usage) 后跟 [DONE] 收尾(对齐生产流;同帧不提前 finalize)
+    fn process_then_done(r: &mut ChatRelay, data: &str) -> Vec<Bytes> {
+        let mut out = r.process(&sse_ev(data));
+        out.extend(r.process(&done_ev()));
+        out
+    }
+
     #[test]
     fn test_sse_format() {
         let b = emit::sse("message_start", &json!({"type": "message_start"}));
@@ -859,12 +904,11 @@ mod tests {
             .iter()
             .any(|b| b.starts_with(b"event: content_block_delta")));
 
-        let ev2 = super::super::parser::SseEvent {
-            event: Some("chat.completion.chunk".into()),
-            data: r#"{"id":"1","choices":[{"delta":{"content":"there"},"finish_reason":"stop"}],"usage":{"prompt_tokens":10,"completion_tokens":5}}"#.into(),
-        };
-        let out2 = r.process(&ev2);
-        // 应发 content_block_stop + message_delta + message_stop
+        let out2 = process_then_done(
+            &mut r,
+            r#"{"id":"1","choices":[{"delta":{"content":"there"},"finish_reason":"stop"}],"usage":{"prompt_tokens":10,"completion_tokens":5}}"#,
+        );
+        // [DONE] 后应发 content_block_stop + message_delta + message_stop
         assert!(out2
             .iter()
             .any(|b| b.starts_with(b"event: content_block_stop")));
@@ -897,10 +941,10 @@ mod tests {
             data: r#"{"choices":[{"delta":{"tool_calls":[{"index":0,"function":{"arguments":"{\"city\":\"SF\"}"}}]}}]}"#.into(),
         });
         // finalize:tool 块收尾后刷缓冲 text,再收尾消息
-        let out3 = r.process(&super::super::parser::SseEvent {
-            event: Some("c".into()),
-            data: r#"{"choices":[{"delta":{},"finish_reason":"tool_calls"}],"usage":{"prompt_tokens":10,"completion_tokens":5}}"#.into(),
-        });
+        let out3 = process_then_done(
+            &mut r,
+            r#"{"choices":[{"delta":{},"finish_reason":"tool_calls"}],"usage":{"prompt_tokens":10,"completion_tokens":5}}"#,
+        );
         let buf3 = out3.concat();
         let s = String::from_utf8_lossy(&buf3);
         assert!(s.contains("tool_use"), "应先收尾 tool 块: {s}");
@@ -934,10 +978,10 @@ mod tests {
         assert!(out2.is_empty());
 
         // chunk3: finish_reason + usage → 关闭块 + 发完整 input_json_delta
-        let out3 = r.process(&super::super::parser::SseEvent {
-            event: Some("c".into()),
-            data: r#"{"choices":[{"delta":{},"finish_reason":"tool_calls"}],"usage":{"prompt_tokens":10,"completion_tokens":5}}"#.into(),
-        });
+        let out3 = process_then_done(
+            &mut r,
+            r#"{"choices":[{"delta":{},"finish_reason":"tool_calls"}],"usage":{"prompt_tokens":10,"completion_tokens":5}}"#,
+        );
         assert!(out3
             .iter()
             .any(|b| b.starts_with(b"event: content_block_stop")));
@@ -951,10 +995,10 @@ mod tests {
     fn test_omitted_tool_call_index_preserves_parallel_calls() {
         // 对齐 CPA be1763e5:同 chunk 并行 tool_calls 缺 index 时按数组下标累积
         let mut r = ChatRelay::new(None);
-        let out = r.process(&super::super::parser::SseEvent {
-            event: Some("c".into()),
-            data: r#"{"id":"c1","model":"m","choices":[{"index":0,"delta":{"role":"assistant","tool_calls":[{"id":"call_weather","type":"function","function":{"name":"get_weather","arguments":"{\"city\":\"Paris\"}"}},{"id":"call_time","type":"function","function":{"name":"get_time","arguments":"{\"tz\":\"UTC\"}"}}]},"finish_reason":"tool_calls"}],"usage":{"prompt_tokens":10,"completion_tokens":5}}"#.into(),
-        });
+        let out = process_then_done(
+            &mut r,
+            r#"{"id":"c1","model":"m","choices":[{"index":0,"delta":{"role":"assistant","tool_calls":[{"id":"call_weather","type":"function","function":{"name":"get_weather","arguments":"{\"city\":\"Paris\"}"}},{"id":"call_time","type":"function","function":{"name":"get_time","arguments":"{\"tz\":\"UTC\"}"}}]},"finish_reason":"tool_calls"}],"usage":{"prompt_tokens":10,"completion_tokens":5}}"#,
+        );
         let buf = out.concat();
         let s = String::from_utf8_lossy(&buf);
         let mut starts = Vec::new();
@@ -1015,10 +1059,10 @@ mod tests {
             event: Some("c".into()),
             data: r#"{"choices":[{"delta":{"tool_calls":[{"index":0,"function":{"arguments":"ing'}"}}]}}]}"#.into(),
         });
-        let out = r.process(&super::super::parser::SseEvent {
-            event: Some("c".into()),
-            data: r#"{"choices":[{"delta":{},"finish_reason":"tool_calls"}],"usage":{"prompt_tokens":10,"completion_tokens":5}}"#.into(),
-        });
+        let out = process_then_done(
+            &mut r,
+            r#"{"choices":[{"delta":{},"finish_reason":"tool_calls"}],"usage":{"prompt_tokens":10,"completion_tokens":5}}"#,
+        );
         let joined = out
             .iter()
             .map(|b| String::from_utf8_lossy(b).into_owned())
@@ -1072,10 +1116,10 @@ mod tests {
             event: Some("c".into()),
             data: r#"{"choices":[{"delta":{"reasoning_content":" think step 2"}}]}"#.into(),
         });
-        let out = r.process(&super::super::parser::SseEvent {
-            event: Some("c".into()),
-            data: r#"{"choices":[{"delta":{},"finish_reason":"stop"}],"usage":{"prompt_tokens":10,"completion_tokens":5}}"#.into(),
-        });
+        let out = process_then_done(
+            &mut r,
+            r#"{"choices":[{"delta":{},"finish_reason":"stop"}],"usage":{"prompt_tokens":10,"completion_tokens":5}}"#,
+        );
         let buf = out.concat();
         let s = String::from_utf8_lossy(&buf);
         // 兜底 text 块输出拼接后的 thinking 内容
@@ -1099,10 +1143,10 @@ mod tests {
             s1.contains("thinking_delta"),
             "thinking 应正常发出,实际: {s1}"
         );
-        let out = r.process(&super::super::parser::SseEvent {
-            event: Some("c".into()),
-            data: r#"{"choices":[{"delta":{"content":"answer"},"finish_reason":"stop"}],"usage":{"prompt_tokens":10,"completion_tokens":5}}"#.into(),
-        });
+        let out = process_then_done(
+            &mut r,
+            r#"{"choices":[{"delta":{"content":"answer"},"finish_reason":"stop"}],"usage":{"prompt_tokens":10,"completion_tokens":5}}"#,
+        );
         let buf = out.concat();
         let s = String::from_utf8_lossy(&buf);
         assert!(s.contains("answer"), "实际: {s}");
@@ -1124,10 +1168,10 @@ mod tests {
             event: Some("c".into()),
             data: r#"{"choices":[{"delta":{"tool_calls":[{"index":0,"id":"call_1","function":{"name":"get_weather","arguments":"{}"}}]}}]}"#.into(),
         });
-        let out = r.process(&super::super::parser::SseEvent {
-            event: Some("c".into()),
-            data: r#"{"choices":[{"delta":{},"finish_reason":"tool_calls"}],"usage":{"prompt_tokens":10,"completion_tokens":5}}"#.into(),
-        });
+        let out = process_then_done(
+            &mut r,
+            r#"{"choices":[{"delta":{},"finish_reason":"tool_calls"}],"usage":{"prompt_tokens":10,"completion_tokens":5}}"#,
+        );
         let buf = out.concat();
         let s = String::from_utf8_lossy(&buf);
         assert!(!s.contains("text_delta"), "工具回合不得兜底 text,实际: {s}");
@@ -1235,19 +1279,62 @@ mod tests {
 
     #[test]
     fn test_done_marker_after_finish_reason_stops() {
-        // 正常完成:finish_reason 已由 process 收尾,后续 [DONE] 幂等为空
+        // finish+usage 同帧不收尾;[DONE] 才 finalize
         let mut r = ChatRelay::new(None);
-        r.process(&super::super::parser::SseEvent {
-            event: None,
-            data: r#"{"id":"1","model":"m","usage":{"prompt_tokens":1,"completion_tokens":1},
-                "choices":[{"delta":{"content":"hi"},"finish_reason":"stop"}]}"#
-                .into(),
-        });
-        let out = r.process(&super::super::parser::SseEvent {
-            event: None,
-            data: "[DONE]".into(),
-        });
-        assert!(out.is_empty(), "已收尾后 [DONE] 应为空,实际: {out:?}");
+        let out1 = r.process(&sse_ev(
+            r#"{"id":"1","model":"m","usage":{"prompt_tokens":1,"completion_tokens":1},
+                "choices":[{"delta":{"content":"hi"},"finish_reason":"stop"}]}"#,
+        ));
+        assert!(
+            !out1.iter().any(|b| b.starts_with(b"event: message_stop")),
+            "同帧不得提前 message_stop,实际: {out1:?}"
+        );
+        let out2 = r.process(&done_ev());
+        assert!(
+            out2.iter().any(|b| b.starts_with(b"event: message_delta")),
+            "[DONE] 应收尾,实际: {out2:?}"
+        );
+        assert!(
+            out2.iter().any(|b| b.starts_with(b"event: message_stop")),
+            "[DONE] 应 message_stop,实际: {out2:?}"
+        );
+        let out3 = r.process(&done_ev());
+        assert!(out3.is_empty(), "重复 [DONE] 应幂等为空,实际: {out3:?}");
+    }
+
+    #[test]
+    fn test_trailing_usage_only_applies_cached_tokens() {
+        // 对齐 CPA:finish 同帧初步 usage 无 cached;尾帧 usage-only 带权威 cached_tokens
+        let mut r = ChatRelay::new(None);
+        let out1 = r.process(&sse_ev(
+            r#"{"id":"c1","model":"m","choices":[{"delta":{"content":"hi"},"finish_reason":"stop"}],
+                "usage":{"prompt_tokens":140025,"completion_tokens":741,"prompt_tokens_details":{}}}"#,
+        ));
+        assert!(
+            !out1.iter().any(|b| b.starts_with(b"event: message_delta")),
+            "同帧不得提前 message_delta"
+        );
+        let out2 = r.process(&sse_ev(
+            r#"{"id":"c1","model":"m","choices":[],"usage":{"prompt_tokens":140025,"completion_tokens":741,
+                "prompt_tokens_details":{"cached_tokens":139136}}}"#,
+        ));
+        let buf = out2.concat();
+        let s = String::from_utf8_lossy(&buf);
+        assert!(
+            s.contains("event: message_delta"),
+            "尾帧应 finalize,实际: {s}"
+        );
+        let delta = out2
+            .iter()
+            .find(|b| b.starts_with(b"event: message_delta"))
+            .unwrap();
+        let payload = String::from_utf8_lossy(delta);
+        let v: Value =
+            serde_json::from_str(payload.split_once("data: ").unwrap().1.trim()).unwrap();
+        assert_eq!(v["usage"]["cache_read_input_tokens"], 139136);
+        assert_eq!(v["usage"]["input_tokens"], 889); // 140025 - 139136
+        assert_eq!(v["usage"]["output_tokens"], 741);
+        assert!(out2.iter().any(|b| b.starts_with(b"event: message_stop")));
     }
 
     #[test]
@@ -1268,10 +1355,10 @@ mod tests {
             event: Some("c".into()),
             data: r#"{"id":"1","choices":[{"delta":{"tool_calls":[{"index":0,"id":"call_1","function":{"name":"write_file","arguments":"{\"path\":\"/tmp/t.txt\",\"content\":\"hello"}}]}}]}"#.into(),
         });
-        let out2 = r.process(&super::super::parser::SseEvent {
-            event: Some("c".into()),
-            data: r#"{"id":"1","choices":[{"delta":{},"finish_reason":"stop"}],"usage":{"prompt_tokens":10,"completion_tokens":400}}"#.into(),
-        });
+        let out2 = process_then_done(
+            &mut r,
+            r#"{"id":"1","choices":[{"delta":{},"finish_reason":"stop"}],"usage":{"prompt_tokens":10,"completion_tokens":400}}"#,
+        );
         let bufs = out2.concat();
         let s = String::from_utf8_lossy(&bufs);
         assert!(s.contains("\"stop_reason\":\"max_tokens\""), "{s}");
@@ -1285,10 +1372,10 @@ mod tests {
             event: Some("c".into()),
             data: r#"{"id":"1","choices":[{"delta":{"tool_calls":[{"index":0,"id":"call_1","function":{"name":"write_file","arguments":"{\"path\":\"/tmp/t.txt\"}"}}]}}]}"#.into(),
         });
-        let out = r.process(&super::super::parser::SseEvent {
-            event: Some("c".into()),
-            data: r#"{"id":"1","choices":[{"delta":{},"finish_reason":"stop"}],"usage":{"prompt_tokens":10,"completion_tokens":20}}"#.into(),
-        });
+        let out = process_then_done(
+            &mut r,
+            r#"{"id":"1","choices":[{"delta":{},"finish_reason":"stop"}],"usage":{"prompt_tokens":10,"completion_tokens":20}}"#,
+        );
         let bufs = out.concat();
         let s = String::from_utf8_lossy(&bufs);
         assert!(s.contains("\"stop_reason\":\"tool_use\""), "{s}");
@@ -1302,10 +1389,10 @@ mod tests {
             event: Some("c".into()),
             data: r#"{"id":"1","choices":[{"delta":{"tool_calls":[{"index":0,"id":"call_1","function":{"name":"f","arguments":"{}"}}]}}]}"#.into(),
         });
-        let out = r.process(&super::super::parser::SseEvent {
-            event: Some("c".into()),
-            data: r#"{"id":"1","choices":[{"delta":{},"finish_reason":"length"}],"usage":{"prompt_tokens":10,"completion_tokens":400}}"#.into(),
-        });
+        let out = process_then_done(
+            &mut r,
+            r#"{"id":"1","choices":[{"delta":{},"finish_reason":"length"}],"usage":{"prompt_tokens":10,"completion_tokens":400}}"#,
+        );
         let bufs = out.concat();
         let s = String::from_utf8_lossy(&bufs);
         assert!(s.contains("\"stop_reason\":\"max_tokens\""), "{s}");
@@ -1315,10 +1402,10 @@ mod tests {
             event: Some("c".into()),
             data: r#"{"id":"1","choices":[{"delta":{"tool_calls":[{"index":0,"id":"call_1","function":{"name":"f","arguments":"{}"}}]}}]}"#.into(),
         });
-        let out = r.process(&super::super::parser::SseEvent {
-            event: Some("c".into()),
-            data: r#"{"id":"1","choices":[{"delta":{},"finish_reason":"content_filter"}],"usage":{"prompt_tokens":10,"completion_tokens":5}}"#.into(),
-        });
+        let out = process_then_done(
+            &mut r,
+            r#"{"id":"1","choices":[{"delta":{},"finish_reason":"content_filter"}],"usage":{"prompt_tokens":10,"completion_tokens":5}}"#,
+        );
         let bufs = out.concat();
         let s = String::from_utf8_lossy(&bufs);
         assert!(s.contains("\"stop_reason\":\"refusal\""), "{s}");
@@ -1332,10 +1419,10 @@ mod tests {
             event: Some("c".into()),
             data: r#"{"id":"1","choices":[{"delta":{"tool_calls":[{"index":0,"id":"call_1","function":{"name":"f","arguments":" \n\t"}}]}}]}"#.into(),
         });
-        let out = r.process(&super::super::parser::SseEvent {
-            event: Some("c".into()),
-            data: r#"{"id":"1","choices":[{"delta":{},"finish_reason":"stop"}],"usage":{"prompt_tokens":1,"completion_tokens":2}}"#.into(),
-        });
+        let out = process_then_done(
+            &mut r,
+            r#"{"id":"1","choices":[{"delta":{},"finish_reason":"stop"}],"usage":{"prompt_tokens":1,"completion_tokens":2}}"#,
+        );
         let bufs = out.concat();
         let s = String::from_utf8_lossy(&bufs);
         assert!(s.contains("\"stop_reason\":\"max_tokens\""), "{s}");
@@ -1350,10 +1437,10 @@ mod tests {
             event: Some("c".into()),
             data: r#"{"id":"1","choices":[{"delta":{"tool_calls":[{"index":0,"id":"call_1","function":{"name":"f"}}]}}]}"#.into(),
         });
-        let out = r.process(&super::super::parser::SseEvent {
-            event: Some("c".into()),
-            data: r#"{"id":"1","choices":[{"delta":{},"finish_reason":"stop"}],"usage":{"prompt_tokens":1,"completion_tokens":2}}"#.into(),
-        });
+        let out = process_then_done(
+            &mut r,
+            r#"{"id":"1","choices":[{"delta":{},"finish_reason":"stop"}],"usage":{"prompt_tokens":1,"completion_tokens":2}}"#,
+        );
         let bufs = out.concat();
         let s = String::from_utf8_lossy(&bufs);
         assert!(s.contains("\"stop_reason\":\"tool_use\""), "{s}");
@@ -1364,18 +1451,16 @@ mod tests {
         // 并行 tool_calls 任一项截断即整体降级(对齐 CPA
         // TestStreamingTool_ParallelCallsOneTruncatedEmitsMaxTokens)
         let mut r = ChatRelay::new(None);
-        let _ = r.process(&super::super::parser::SseEvent {
-            event: Some("c".into()),
-            data: r#"{"id":"1","choices":[{"delta":{"tool_calls":[
+        let _ = r.process(&sse_ev(
+            r#"{"id":"1","choices":[{"delta":{"tool_calls":[
                 {"index":0,"id":"call_1","function":{"name":"f","arguments":"{}"}},
                 {"index":1,"id":"call_2","function":{"name":"g","arguments":"{\"a\":"}}
-            ]}}]}"#
-                .into(),
-        });
-        let out = r.process(&super::super::parser::SseEvent {
-            event: Some("c".into()),
-            data: r#"{"id":"1","choices":[{"delta":{},"finish_reason":"stop"}],"usage":{"prompt_tokens":1,"completion_tokens":2}}"#.into(),
-        });
+            ]}}]}"#,
+        ));
+        let out = process_then_done(
+            &mut r,
+            r#"{"id":"1","choices":[{"delta":{},"finish_reason":"stop"}],"usage":{"prompt_tokens":1,"completion_tokens":2}}"#,
+        );
         let bufs = out.concat();
         let s = String::from_utf8_lossy(&bufs);
         assert!(s.contains("\"stop_reason\":\"max_tokens\""), "{s}");

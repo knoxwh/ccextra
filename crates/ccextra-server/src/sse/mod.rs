@@ -315,9 +315,10 @@ mod tests {
         let joined = drained.join("");
         assert!(joined.contains("event: message_stop"), "{joined}");
 
-        // Chat:finish_reason + usage 已到,无 [DONE] 且上游挂起
+        // Chat:finish+usage 同帧不收尾;尾帧 usage-only 触发 finalize(无 [DONE] 且上游挂起)
         let chat_frames = "data: {\"choices\":[{\"delta\":{\"role\":\"assistant\",\"content\":\"hi\"},\"finish_reason\":null}]}\n\n\
-             data: {\"choices\":[{\"delta\":{},\"finish_reason\":\"stop\"}],\"usage\":{\"prompt_tokens\":10,\"completion_tokens\":5}}\n\n";
+             data: {\"choices\":[{\"delta\":{},\"finish_reason\":\"stop\"}],\"usage\":{\"prompt_tokens\":10,\"completion_tokens\":5}}\n\n\
+             data: {\"choices\":[],\"usage\":{\"prompt_tokens\":10,\"completion_tokens\":5}}\n\n";
         let hanging: Pin<Box<dyn Stream<Item = Result<Bytes, reqwest::Error>> + Send>> = Box::pin(
             futures::stream::once(async move { Ok(Bytes::from(chat_frames)) })
                 .chain(futures::stream::pending()),
