@@ -63,7 +63,7 @@ impl StreamReplayExtractor {
                 .as_deref()
                 .or_else(|| value.get("type").and_then(|v| v.as_str()));
             match event_type {
-                // 上游真实事件名带 response. 前缀(见 sse/responses.rs 的
+                // 上游真实事件名带 response. 前缀(见 sse/responses/state_machine.rs 的
                 // event_type 判别,data.type 同为全名)
                 Some("response.reasoning_text.delta")
                 | Some("response.reasoning_summary_text.delta") => {

@@ -820,7 +820,7 @@ fn filter_turn_items(
                     .unwrap_or("");
                 if enc.is_empty() {
                     // 无加密信封:grok 明文回放开关放行带文本的项,
-                    // 否则丢弃(对齐 to_openai_responses.rs L594 决策)
+                    // 否则丢弃(对齐 to_openai_responses/reasoning.rs 决策)
                     if keep_plain_reasoning && reasoning_has_text(&item) {
                         filtered.push(item);
                     }

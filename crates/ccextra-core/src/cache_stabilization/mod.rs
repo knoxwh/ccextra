@@ -35,7 +35,6 @@ pub mod smoosh_split;
 pub mod sort_stabilization;
 pub mod tool_def_normalize;
 pub mod tool_input_normalize;
-pub mod truncate_tool_results;
 pub mod volatile_detector;
 
 pub use drift_detector::{
@@ -48,5 +47,4 @@ pub use tool_def_normalize::{
     normalize_tool_definitions_openai_chat, normalize_tool_definitions_responses,
 };
 pub use tool_input_normalize::normalize_tool_use_inputs;
-pub use truncate_tool_results::UpstreamTruncation;
 pub use volatile_detector::normalize_client_dateline;

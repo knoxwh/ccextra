@@ -1302,19 +1302,7 @@ pub(crate) mod fixtures {
         claude_native_signature(12, Some(2), "claude-sonnet-4-6", true)
     }
 
-    /// 真实 Fernet 形状 GPT 签名
-    #[allow(dead_code)]
-    pub(crate) fn valid_gpt_reasoning_signature() -> String {
-        let mut raw = vec![0x80u8];
-        raw.extend_from_slice(&[0u8; 8]);
-        raw.extend_from_slice(&[1u8; 16]);
-        raw.extend_from_slice(&[2u8; 16]);
-        raw.extend_from_slice(&[3u8; 32]);
-        base64::engine::general_purpose::URL_SAFE_NO_PAD.encode(raw)
-    }
-
     /// 非 Anthropic 原始签名(48 字节 0x34,无信封)
-    #[allow(dead_code)]
     pub(crate) fn non_claude_raw_signature() -> String {
         STANDARD.encode([0x34u8; 48])
     }

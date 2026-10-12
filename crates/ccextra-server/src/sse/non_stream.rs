@@ -19,7 +19,7 @@ use ccextra_core::convert::{
 };
 use ccextra_core::doom_loop::{is_confident, parse_trigger};
 
-/// redacted_thinking 前缀(对齐 responses.rs)
+/// redacted_thinking 前缀(对齐 sse/responses/thinking.rs)
 const CLAUDE_RESPONSES_REDACTED_THINKING_PREFIX: &str = "claude-redacted-thinking:";
 
 /// OpenAI responses 非流式 body → Anthropic messages body

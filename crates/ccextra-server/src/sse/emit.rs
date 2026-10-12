@@ -1,6 +1,6 @@
 // SSE 帧构造公共函数
 //
-// 从 chat.rs/responses.rs 提取的无状态帧构造器,消除约 200 行重复。
+// 提取自 chat/responses/gemini 状态机的无状态帧构造器。
 
 use bytes::Bytes;
 use serde_json::{json, Value};
@@ -88,18 +88,6 @@ pub fn message_delta(
         event["usage"]["output_tokens_details"] = json!({"thinking_tokens": thinking_tokens});
     }
     sse("message_delta", &event)
-}
-
-/// 流中断终止事件:保留 Anthropic 终态结构,不伪造 stop_reason
-pub fn message_delta_incomplete() -> Bytes {
-    sse(
-        "message_delta",
-        &json!({
-            "type": "message_delta",
-            "delta": {"stop_reason": null, "stop_sequence": null},
-            "usage": {"output_tokens": 0}
-        }),
-    )
 }
 
 /// message_stop 事件

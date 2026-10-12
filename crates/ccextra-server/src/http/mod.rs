@@ -39,7 +39,7 @@ pub type ReloadFn =
     Arc<dyn Fn() -> Pin<Box<dyn Future<Output = anyhow::Result<ReloadData>> + Send>> + Send + Sync>;
 
 /// /reload 可替换的运行时配置。整块写锁替换,单个字段不单独加锁。
-/// 注意 `logging.level` 不生效:EnvFilter 仅启动装载一次(见 cli/main.rs)。
+/// 注意 `logging.level` 不生效:EnvFilter 仅启动装载一次(见 crates/ccextra-cli/src/main.rs)。
 #[derive(Clone)]
 pub struct RuntimeConfig {
     pub normalize: NormalizeConfig,

@@ -6,15 +6,6 @@ pub const BUILTIN_REJECTION: &str =
 
 pub const INTERACTION_REJECTION: &str = "Interaction is not available in this environment.";
 
-pub fn encode_heartbeat() -> Vec<u8> {
-    generated::AgentClientMessage {
-        message: Some(generated::agent_client_message::Message::ClientHeartbeat(
-            generated::ClientHeartbeat {},
-        )),
-    }
-    .encode_to_vec()
-}
-
 /// 回复 InteractionQuery(AgentClientMessage field 6):ccextra 不提供
 /// web_search/ask_question 等交互能力,按查询种类回对应 reject/error,
 /// 避免服务端等回复挂死整流(90s idle 超时杀流)

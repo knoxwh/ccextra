@@ -25,8 +25,6 @@ use crate::cache_stabilization::volatile_detector::{
 };
 use crate::route::Protocol;
 
-pub use crate::cache_stabilization::truncate_tool_results::UpstreamTruncation;
-
 /// 归一化命中的计数,便于测试与日志
 ///
 /// `volatile_count` 现在计 dateline 指纹句改写个数(撇号/分隔符隐写还原,
