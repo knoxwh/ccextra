@@ -32,6 +32,7 @@ use crate::http::claude_relay::{
 use crate::http::error::{to_anthropic_error, AppError};
 use crate::http::retry::parse_retry_after;
 use crate::http::{AppState, PayloadRule};
+use crate::sse::antigravity_replay_cache::AgStreamReplayExtractor;
 use crate::sse::replay_cache::StreamReplayExtractor;
 use crate::sse::SseStreamPin;
 use crate::upstream::{is_gpt_model, is_grok_model, UpstreamResponse};
@@ -160,15 +161,19 @@ pub(crate) fn inbound_headers_json(headers: &HeaderMap) -> Value {
     Value::Object(map)
 }
 
-/// 仅当带 replay scope 时加提取 tap。
-/// 目前仅 OpenAI Responses 使用 Responses 形状的 StreamReplayExtractor。
-/// Antigravity 有独立的 thoughtSignature 账本，不走本路径。
+/// 按协议旁路提取 replay：Responses 用 StreamReplayExtractor；
+/// Antigravity 用 AgStreamReplayExtractor（thoughtSignature 账本）。
 fn relay_with_replay_tap<S>(
     protocol: Protocol,
     stream: S,
     estimated_input_tokens: Option<usize>,
     tool_names: Option<Arc<HashMap<String, String>>>,
     replay_scope: Option<(crate::sse::replay_cache::ReplayCache, String, String)>,
+    ag_replay_scope: Option<(
+        crate::sse::antigravity_replay_cache::AgReplayCache,
+        String,
+        Value,
+    )>,
     signature_model: Option<Arc<str>>,
     token_scope: Option<crate::http::session_tokens::TokenCacheScope>,
 ) -> SseStreamPin
@@ -176,30 +181,43 @@ where
     S: futures::Stream<Item = Result<Bytes, reqwest::Error>> + Send + 'static,
 {
     let stream = crate::http::session_tokens::tap_input_tokens(stream, protocol, token_scope);
-    match replay_scope {
-        Some((cache, key, request_fingerprint)) => {
-            let mut extractor = StreamReplayExtractor::new(cache, key, request_fingerprint);
-            let tapped = stream.inspect(move |result| {
-                if let Ok(bytes) = result {
-                    extractor.push(bytes);
-                }
-            });
-            crate::sse::relay(
-                protocol,
-                tapped,
-                estimated_input_tokens,
-                tool_names,
-                signature_model,
-            )
-        }
-        None => crate::sse::relay(
+    if let Some((cache, key, request_fingerprint)) = replay_scope {
+        let mut extractor = StreamReplayExtractor::new(cache, key, request_fingerprint);
+        let tapped = stream.inspect(move |result| {
+            if let Ok(bytes) = result {
+                extractor.push(bytes);
+            }
+        });
+        return crate::sse::relay(
             protocol,
-            stream,
+            tapped,
             estimated_input_tokens,
             tool_names,
             signature_model,
-        ),
+        );
     }
+    if let Some((cache, key, request)) = ag_replay_scope {
+        let mut extractor = AgStreamReplayExtractor::new(cache, key, request);
+        let tapped = stream.inspect(move |result| {
+            if let Ok(bytes) = result {
+                extractor.push(bytes);
+            }
+        });
+        return crate::sse::relay(
+            protocol,
+            tapped,
+            estimated_input_tokens,
+            tool_names,
+            signature_model,
+        );
+    }
+    crate::sse::relay(
+        protocol,
+        stream,
+        estimated_input_tokens,
+        tool_names,
+        signature_model,
+    )
 }
 
 /// 首个转换帧已是 error 时，尚未向客户端发字节，可安全重试上游一次。
@@ -870,6 +888,7 @@ pub(crate) async fn execute_upstream_request(
                 prepared.estimated_input_tokens,
                 prepared.tool_names.clone(),
                 prepared.replay_scope.clone(),
+                None,
                 prepared.signature_model.clone(),
                 prepared.token_scope.clone(),
             );
@@ -1049,15 +1068,29 @@ pub(crate) async fn deliver_response(
             out
         } else {
             let upstream = executed.upstream.take().expect("上游响应应存在");
-            relay_with_replay_tap(
-                prepared.route.protocol,
-                upstream.body.bytes_stream(),
-                prepared.estimated_input_tokens,
-                prepared.tool_names.clone(),
-                prepared.replay_scope.clone(),
-                prepared.signature_model.clone(),
-                prepared.token_scope.clone(),
-            )
+            {
+                let ag_scope = prepared.ag_replay_scope.as_ref().map(|(cache, key)| {
+                    (
+                        cache.clone(),
+                        key.clone(),
+                        prepared
+                            .body_json
+                            .get("request")
+                            .cloned()
+                            .unwrap_or_else(|| Value::Object(Default::default())),
+                    )
+                });
+                relay_with_replay_tap(
+                    prepared.route.protocol,
+                    upstream.body.bytes_stream(),
+                    prepared.estimated_input_tokens,
+                    prepared.tool_names.clone(),
+                    prepared.replay_scope.clone(),
+                    ag_scope,
+                    prepared.signature_model.clone(),
+                    prepared.token_scope.clone(),
+                )
+            }
         };
         Ok(Response::builder()
             .status(status)
