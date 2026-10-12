@@ -9,6 +9,7 @@
 use thiserror::Error;
 
 pub mod antigravity;
+pub mod antigravity_reasoning_replay;
 pub mod antigravity_tools;
 pub mod cursor;
 pub mod fix_json;
@@ -26,6 +27,10 @@ pub mod tool_id;
 pub mod tool_sanitize;
 
 pub use antigravity::{convert_to_antigravity, convert_to_antigravity_with};
+pub use antigravity_reasoning_replay::{
+    apply_ag_replay_items, collect_ag_replay_from_response, has_native_thought_signature,
+    normalize_ag_replay_item, normalize_ag_replay_items, AgReplayAccumulator,
+};
 pub use antigravity_tools::{
     antigravity_tool_name_to_upstream, antigravity_upstream_tool_name_to_client,
 };
