@@ -544,7 +544,9 @@ fn convert_message_parts(
             "redacted_thinking" => { /* 显式忽略 */ }
             "text" => {
                 if let Some(t) = part.get("text").and_then(|v| v.as_str()) {
-                    if !t.trim().is_empty() && !super::is_attribution_text(t) {
+                    // 对齐 system 路径:只剥前导归属行,同块后续正文保留
+                    let t = super::strip_attribution_line(t);
+                    if !t.trim().is_empty() {
                         content_items.push(json!({"type": "text", "text": t}));
                     }
                 }
@@ -1194,6 +1196,21 @@ IMPORTANT: Assist with authorized security testing.
             "messages": [{"role": "user", "content": [
                 {"type": "text", "text": "x-anthropic-billing-header: fp=xyz"},
                 {"type": "text", "text": "real question"}
+            ]}]
+        });
+        convert_to_openai_chat(&mut body, "gpt").unwrap();
+        let content = body["messages"][0]["content"].as_array().unwrap();
+        assert_eq!(content.len(), 1);
+        assert_eq!(content[0]["text"], "real question");
+    }
+
+    #[test]
+    fn test_message_text_attribution_line_keeps_rest() {
+        // 同块归属行 + 正文:只剥行,不丢整块
+        let mut body = json!({
+            "model": "test",
+            "messages": [{"role": "user", "content": [
+                {"type": "text", "text": "x-anthropic-billing-header: fp=xyz\nreal question"}
             ]}]
         });
         convert_to_openai_chat(&mut body, "gpt").unwrap();
