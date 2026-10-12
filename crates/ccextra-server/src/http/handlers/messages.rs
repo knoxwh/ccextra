@@ -635,17 +635,20 @@ pub(crate) async fn prepare_message_request(
     if let Some((auth_dir_str, email, account_uuid)) = claude_refresh {
         let auth_dir = std::path::Path::new(&auth_dir_str);
         let id = if !email.is_empty() {
-            &email
+            email.as_str()
         } else {
-            &account_uuid
+            account_uuid.as_str()
         };
-        match crate::claude::ensure_credential_fresh(auth_dir, id, upstream_proxy.as_deref()).await
-        {
-            Ok(fresh_cred) => {
-                upstream_key = fresh_cred.access_token;
-            }
-            Err(e) => {
-                tracing::warn!(email = %email, "Claude 凭证运行时刷新失败: {e}");
+        if !id.is_empty() {
+            match crate::claude::ensure_credential_fresh(auth_dir, id, upstream_proxy.as_deref())
+                .await
+            {
+                Ok(fresh_cred) => {
+                    upstream_key = fresh_cred.access_token;
+                }
+                Err(e) => {
+                    tracing::warn!(email = %email, "Claude 凭证运行时刷新失败: {e}");
+                }
             }
         }
     }

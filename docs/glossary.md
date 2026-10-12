@@ -124,7 +124,7 @@ Gemini 函数调用模式。Antigravity Claude 模型强制使用；Gemini 直�
 将 Anthropic `input_schema` 转成 Gemini 或 Antigravity 可接受 JSON Schema 的递归过程。它内联本地引用、移除不支持关键字、归一化布尔 `true` 子 schema、处理 enum 和 required，并为不同目标采用不同规则；Gemini 直连保留 `additionalProperties` 与标准约束，Antigravity 搬入 description 提示。声明 `items` 但缺 `type` 的节点补 `type: array`；`type` 显式不是 `array` 时去掉 `items`。OpenAI Chat/Responses 转换另会删除 schema 节点中的 `required: null`，保留实例数据中的同名字段。Chat 将 schema 位置的 `true` 转为空对象，保留 `false`、布尔 `additionalProperties` 与 `default`/`enum` 实例数据。
 
 **OAuth 动态 provider**
-由保存的 Antigravity、xAI、Codex 或 Cursor 凭证生成的运行时 provider。Antigravity 后台刷新模型；xAI 与 Codex 在启动和重载时扫描、刷新凭证。Codex 请求携带 `Chatgpt-Account-Id` 订阅身份头；Cursor 经 GetUsableModels 拉取目录合成固定 name `cursor` 的 `cursor_sdk` provider。
+由保存的 Antigravity、xAI、Codex、Claude 或 Cursor 凭证生成的运行时 provider。Antigravity 后台刷新模型；xAI、Codex 与 Claude 在启动和重载时扫描、刷新凭证。Codex 请求携带 `Chatgpt-Account-Id` 订阅身份头；Claude 订阅注入 `protocol: claude`（与静态 API/中转同形，OAuth 缺 beta 时补 `oauth-2025-04-20`）；Cursor 经 GetUsableModels 拉取目录合成固定 name `cursor` 的 `cursor_sdk` provider。
 
 **connect-rpc 双向流**
 Cursor 原生传输：`agent.v1.AgentService/Run`（h2 + rustls 直连 api2.cursor.sh），Connect 帧 `[1B flags][4B len BE][payload]`。请求头含 `content-type: application/connect+proto`、`connect-protocol-version: 1`、`te: trailers`、`x-ghost-mode: true`、`x-cursor-client-version`、`x-cursor-client-type: cli`；无 checksum、无 x-client-key。出站代理复用全局 `proxy`（HTTP CONNECT 隧道）。
@@ -145,7 +145,7 @@ Agent 回合中已发起但未收到结果的工具副作用。驻留会话丢�
 按回合摘要内存缓存的已发布 SSE 帧。同摘要重复请求（断线重连/singleflight）直接回放缓存帧，不重跑上游；进程重启即失效。
 
 **热重载**
-四种 OAuth 登录命令保存凭证后自动调用配置地址的 `POST /reload`（直连，通配地址转回环地址，连接超时 2 秒、总超时 30 秒）；失败仅提示，凭证保留，服务未启动时下次启动加载。
+各 OAuth 登录命令保存凭证后自动调用配置地址的 `POST /reload`（直连，通配地址转回环地址，连接超时 2 秒、总超时 30 秒）；失败仅提示，凭证保留，服务未启动时下次启动加载。
 `POST /reload` 串行加载、校验后原子替换统一不可变配置快照；失败不改变已生效版本。旧请求保留旧快照，新请求取得新快照。后台刷新绑定版本，过期结果丢弃；后续轮次使用最新已发布的静态配置、目录及代理。
 
 **配置快照**

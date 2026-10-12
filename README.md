@@ -37,7 +37,7 @@
 - **按模型切换上游**：Claude、OpenAI、Gemini 和 Antigravity 共用一个端口。模型别名与实际模型名分开配置。
 - **请求内容稳定化**：归一化工具、schema 和历史内容，减少无意义的跨轮差异；实际缓存命中由上游决定。
 - **模型能力适配**：转换消息、工具调用与图片，按 `models.json` 调整支持的 reasoning 档位。
-- **OAuth 接入**：支持 Antigravity、xAI Grok、Codex（OpenAI ChatGPT 订阅）和 Cursor（原生 connect-rpc 代理）的凭证加载、刷新与动态模型路由。
+- **OAuth 接入**：支持 Antigravity、xAI Grok、Codex（OpenAI ChatGPT 订阅）、Claude 订阅（Anthropic OAuth）和 Cursor（原生 connect-rpc 代理）的凭证加载、刷新与动态模型路由。
 - **配置热重载**：无需重启即可发布新配置；进行中的请求继续使用原快照。
 
 ## 架构流向
@@ -65,7 +65,7 @@ flowchart LR
 | `antigravity` | Cloud Code Assist | 封装 Gemini 请求，处理工具命名和模型输出上限；默认短连接。 |
 | `cursor_sdk` | Cursor AgentService/Run | 原生 connect-rpc 双向流直连 api2.cursor.sh；自动发现模型目录，支持会话续接。 |
 
-> **提示**：xAI Grok 与 Codex 均通过 OAuth 动态注册为 `openai_responses` provider，无需配置独立协议。Codex 订阅请求自动携带 `Chatgpt-Account-Id` 身份头，请求体自动 zstd 压缩（对齐 codex CLI 默认行为）。Cursor 同样由 `cursor_auth_dir` 凭证自动合成为 `cursor_sdk` provider（name 固定 `cursor`），无需手写 provider 条目。
+> **提示**：xAI Grok 与 Codex 均通过 OAuth 动态注册为 `openai_responses` provider，无需配置独立协议。Codex 订阅请求自动携带 `Chatgpt-Account-Id` 身份头，请求体自动 zstd 压缩（对齐 codex CLI 默认行为）。Claude 订阅动态注册为 `protocol: claude` provider，与静态 API/中转共用直通管线。Cursor 同样由 `cursor_auth_dir` 凭证自动合成为 `cursor_sdk` provider（name 固定 `cursor`），无需手写 provider 条目。
 
 ## 快速开始
 
@@ -186,7 +186,7 @@ curl -H "Authorization: Bearer $ANTHROPIC_AUTH_TOKEN" \
 - **流式响应**：Claude 正文字节直通，其他协议转换为 Anthropic SSE；所有流式路径使用 10 秒 `: keepalive`。
 - **重试与回退**：429/5xx（含 52x）与网络错误在同轮内轮转多 `base_url`，耗尽后快速失败，把末次上游错误返给客户端；退避重试交客户端（如 Claude Code），上游 `Retry-After` 头透传。流式首帧预读跳过 `: keepalive` 心跳帧；首帧 error 内部重试一次，仍失败返回 502 错误而非提交 200。正常生成不被截断。
 - **读取边界**：非流成功正文上限 16 MiB，错误正文最多保留 256 KiB，读取 idle 为 180 秒。成功正文超限返回 502、停顿返回 504；错误正文读取异常保留已知状态，再按统一错误规则映射。OAuth、project 和模型读取仍保留 30 秒总超时。
-- **头透传**：Claude 保留允许透传的身份头，排除认证及连接管理等头；`anthropic-beta` 原样透传，缺失时不补。
+- **头透传**：Claude 保留允许透传的身份头，排除认证及连接管理等头；`anthropic-beta` 默认原样透传。订阅 OAuth（`sk-ant-oat*`）缺 `oauth-2025-04-20` 时自动补上，已有则不动。
 
 </details>
 
@@ -211,7 +211,23 @@ curl -H "Authorization: Bearer $ANTHROPIC_AUTH_TOKEN" \
 ./scripts/check_cursor_quota.sh
 ```
 
-Antigravity 凭证默认在配置文件旁 `.cache/antigravity`，xAI 在 `.cache/xai`，Codex 在 `.cache/codex`，Claude 订阅在 `.cache/claude`。xAI、Codex 与 Claude 订阅启动时自动发现。Antigravity 后台加载并每 3 小时刷新模型，token 提前 5 分钟刷新，出站锁定 daily 节点并清洗非标标头。Codex 登录使用 PKCE 浏览器授权（本地回调端口默认 1455，可用 `--callback-port` 覆盖），token 提前 24 小时刷新。Claude 订阅登录同样 PKCE（回调端口固定 54545，与 Anthropic 注册 RedirectURI 一致），token 提前 4 小时刷新；出站复用 `protocol: claude` 直通，OAuth 凭证缺 `oauth-2025-04-20` beta 时自动补上。
+凭证目录默认在配置文件旁：Antigravity → `.cache/antigravity`，xAI → `.cache/xai`，Codex → `.cache/codex`，Claude 订阅 → `.cache/claude`，Cursor → `.cache/cursor`。xAI、Codex、Claude 订阅启动时自动扫描注入；可用 `*_auth_dir` / `claude_auth_dir` / `cursor_auth_dir` 覆盖。
+
+Antigravity 后台加载并每 3 小时刷新模型，token 提前 5 分钟刷新，出站锁定 daily 节点并清洗非标标头。Codex 登录使用 PKCE 浏览器授权（本地回调端口默认 1455，可用 `--callback-port` 覆盖），token 提前 24 小时刷新。
+
+**Claude 订阅（Anthropic OAuth）** — 单机自用、客户端仅 Claude Code CLI：
+
+```bash
+./ccextra claude-login          # PKCE，回调固定 localhost:54545
+./ccextra claude-status         # 查看凭证，不打印 token
+# 启动或 /reload 后自动注入 protocol: claude provider
+# （base_url=https://api.anthropic.com，key=access_token）
+```
+
+- 出站复用现有 Messages 直通与缓存归一化；不 cloaking、不改 UA、不注入假 system / user_id。
+- Token 提前 4 小时刷新（仅 HTTP 5xx 可重试；传输/解码失败不盲重放 refresh）。
+- `sk-ant-oat*` 出站时，入站 `anthropic-beta` 缺 `oauth-2025-04-20` 则补上。
+- 与静态 `protocol: claude` API/中转同形：以后只换 `base_url` + key 即可共用管线。
 
 Cursor 登录自行生成 PKCE 并轮询浏览器授权，不依赖 Cursor IDE 或 `cursor-agent`；可用 `--no-browser` 手动打开 URL，token 到期前 10 分钟刷新。PKCE 凭证（`cursor.json`）驱动原生代理与配额查询（`check_cursor_quota.sh`，默认同时展示额度与模型目录，`--models` 仅列模型）。配置后启动与 `/reload` 时经 GetUsableModels 拉取账户模型目录合成 `cursor` provider，每 3 小时后台刷新，失败保留最近成功目录。`cursor_models` 白名单匹配的就是该目录（脚本输出，含 display name 与 aliases）；配白名单前先跑该命令核对模型 id。思考档配在 `models.json`（按 base id），脚本末尾列出各模型可选档位和可直接粘贴的 `models.json` 条目。
 
@@ -221,7 +237,7 @@ Cursor 登录自行生成 PKCE 并轮询浏览器授权，不依赖 Cursor IDE �
 - 会话状态（park 驻留、checkpoint、journal 回放缓存）全部在内存中，进程重启即失效；`cursor_auth_dir` 只存 PKCE 凭证（`cursor.json`），请勿提交或分享该目录。
 - 已知限制：驻留会话丢失（重启、TTL 过期、模型或工具目录变更）时，工具续接回退历史伪造（root prompt blob + turns 重建上下文）重新起跑，崩溃窗口内未确认的副作用（如工具调用）可能重复执行，由客户端 tool_result 幂等性兜底。checkpoint 回嵌带前缀校验（覆盖前缀摘要一致才续接，`/compact` 重写历史后自动丢弃回退全量重放）；续接失败（零产出且非 401/429）同轮内自动回退历史伪造重放一次。无工具请求的 UserText 头部注入 `<system_constraint>` 直连会话约束（防模型幻觉调用工具）。
 
-四种登录命令保存凭证后，都会按 `--config` 的 `server.host` / `server.port` 自动发送 `POST /reload`。通配监听地址转为本机回环地址，请求不走代理，连接超时 2 秒、总超时 30 秒。失败只提示，不撤销登录；服务未启动时下次启动加载。使用 `--auth-dir` 时，服务配置也需指向该目录。
+各 OAuth 登录命令保存凭证后，都会按 `--config` 的 `server.host` / `server.port` 自动发送 `POST /reload`。通配监听地址转为本机回环地址，请求不走代理，连接超时 2 秒、总超时 30 秒。失败只提示，不撤销登录；服务未启动时下次启动加载。使用 `--auth-dir` 时，服务配置也需指向该目录。
 
 修改配置或自动重载失败后，可手动重载：
 

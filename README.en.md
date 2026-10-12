@@ -65,7 +65,7 @@ One process listens on one port. Input is always Anthropic-shaped; every path re
 | `antigravity` | Cloud Code Assist | Wrap Gemini requests, adapt tool names and output limits; use short connections by default. |
 | `cursor_sdk` | Cursor AgentService/Run | Native connect-rpc bidirectional stream straight to api2.cursor.sh; auto-discover the model catalog and resume sessions. |
 
-> **Note**: xAI Grok and Codex are automatically injected as `openai_responses` providers via OAuth without requiring a distinct protocol. Codex subscription requests carry the `Chatgpt-Account-Id` identity header automatically, and request bodies are zstd-compressed (matching codex CLI defaults). Cursor is likewise synthesized into a `cursor_sdk` provider (fixed name `cursor`) from the `cursor_auth_dir` credential — no manual provider entry required.
+> **Note**: xAI Grok and Codex are automatically injected as `openai_responses` providers via OAuth without requiring a distinct protocol. Codex subscription requests carry the `Chatgpt-Account-Id` identity header automatically, and request bodies are zstd-compressed (matching codex CLI defaults). Claude subscription injects a `protocol: claude` provider that shares the same Messages passthrough pipeline as static API/proxy keys. Cursor is likewise synthesized into a `cursor_sdk` provider (fixed name `cursor`) from the `cursor_auth_dir` credential — no manual provider entry required.
 
 ## Quick Start
 
@@ -186,7 +186,7 @@ Requests pass through authentication, model routing, normalization, protocol con
 - **Streaming**: Claude response bytes pass through; other protocols are converted to Anthropic SSE. All streaming paths use a 10-second `: keepalive`.
 - **Retries & fallbacks**: 429/5xx (including 52x) and network errors rotate through multiple `base_url` entries within the same round; once exhausted, the last upstream error fails fast back to the client. Backoff and retries belong to the client (e.g. Claude Code); the upstream `Retry-After` header passes through. The streaming first-frame preload skips `: keepalive` comment frames; a first-frame error triggers one internal retry, and a second failure returns 502 instead of committing 200. Normal generation is never truncated.
 - **Read limits**: Non-stream success bodies are capped at 16 MiB, error bodies retain at most 256 KiB, and read idle is 180 seconds. Oversized success bodies return 502; stalls return 504. Error-body read failures retain the known status for normal error mapping. OAuth, project, and model reads retain their 30-second total timeout.
-- **Headers**: Claude forwards permitted identity headers while excluding authentication and connection-management headers. `anthropic-beta` passes through unchanged and is not added when absent.
+- **Headers**: Claude forwards permitted identity headers while excluding authentication and connection-management headers. `anthropic-beta` passes through by default. For subscription OAuth (`sk-ant-oat*`), `oauth-2025-04-20` is appended when missing; existing lists are left unchanged.
 
 </details>
 
@@ -211,7 +211,23 @@ Log in to an upstream or inspect saved credential status:
 ./scripts/check_cursor_quota.sh
 ```
 
-Antigravity credentials default to `.cache/antigravity` next to the config; xAI uses `.cache/xai`, Codex `.cache/codex`, Claude subscription `.cache/claude`. xAI, Codex, and Claude subscription are discovered at startup. Antigravity loads in the background, refreshes models every three hours, refreshes tokens 5 minutes ahead of expiry, confines requests to the daily endpoint, and sanitizes non-standard headers. Codex login uses PKCE browser authorization (local callback port defaults to 1455, override with `--callback-port`); tokens refresh 24 hours ahead of expiry.
+Credential directories default next to the config: Antigravity → `.cache/antigravity`, xAI → `.cache/xai`, Codex → `.cache/codex`, Claude subscription → `.cache/claude`, Cursor → `.cache/cursor`. xAI, Codex, and Claude subscription are scanned and injected at startup; override with `*_auth_dir` / `claude_auth_dir` / `cursor_auth_dir`.
+
+Antigravity loads in the background, refreshes models every three hours, refreshes tokens 5 minutes ahead of expiry, confines requests to the daily endpoint, and sanitizes non-standard headers. Codex login uses PKCE browser authorization (local callback port defaults to 1455, override with `--callback-port`); tokens refresh 24 hours ahead of expiry.
+
+**Claude subscription (Anthropic OAuth)** — single-machine use with Claude Code CLI only:
+
+```bash
+./ccextra claude-login          # PKCE; callback fixed at localhost:54545
+./ccextra claude-status         # inspect credentials (tokens not printed)
+# After start or /reload, injects a protocol: claude provider
+# (base_url=https://api.anthropic.com, key=access_token)
+```
+
+- Outbound reuses existing Messages passthrough and cache normalization; no cloaking, UA rewrite, or fake system / user_id.
+- Tokens refresh 4 hours ahead of expiry (retry only on HTTP 5xx; never blindly replay refresh on transport/decode errors).
+- For `sk-ant-oat*` outbound, append `oauth-2025-04-20` to `anthropic-beta` when missing.
+- Same shape as static `protocol: claude` API/proxy entries — later switch `base_url` + key on the same pipeline.
 
 Cursor login uses its own PKCE browser flow and polling; neither the Cursor IDE nor `cursor-agent` is required. Use `--no-browser` to open the login URL manually. Cursor tokens refresh 10 minutes ahead of expiry. The PKCE credential (`cursor.json`) drives the native proxy and quota checks (`check_cursor_quota.sh`, which shows both quota and the model catalog by default; `--models` lists models only). Once configured, startup and `/reload` fetch the account model catalog via GetUsableModels and synthesize the `cursor` provider, a background refresh runs every three hours, and failures keep the last successful catalog. The `cursor_models` whitelist matches that catalog (script output, including display names and aliases); run that command to verify model ids before configuring the whitelist. Thinking levels live in `models.json` (keyed by base id); the script ends with each model's selectable levels and a ready-to-paste `models.json` entry.
 
@@ -221,7 +237,7 @@ Cursor login uses its own PKCE browser flow and polling; neither the Cursor IDE 
 - Session state (parked sessions, checkpoints, journal replay cache) lives in memory only and is lost on restart; `cursor_auth_dir` stores only PKCE credentials (`cursor.json`) — do not commit or share that directory.
 - Known limitation: when a parked session is lost (restart, TTL expiry, model or tool-catalog change), tool continuation falls back to history fabrication (rebuilding context as root prompt blobs + turns) in a fresh run; side effects (such as tool calls) not yet acknowledged inside a crash window may re-execute, with client-side tool_result idempotency as the backstop. Checkpoint reuse is prefix-verified (continues only when the covered-prefix digest matches; a `/compact` history rewrite drops the checkpoint and falls back to full replay), and a zero-output checkpoint failure (non-401/429) transparently retries once via history fabrication. Tool-less requests get a `<system_constraint>` prefix in UserText (prevents the model from hallucinating tool calls).
 
-After saving credentials, all four login commands automatically send `POST /reload` to `server.host` / `server.port` from `--config`. Wildcard bind addresses map to loopback; the request bypasses proxies, with a 2-second connection timeout and a 30-second total timeout. Failure prints a warning without undoing login; a stopped service loads credentials on its next startup. When using `--auth-dir`, the service configuration must point to that directory too.
+After saving credentials, each OAuth login command automatically sends `POST /reload` to `server.host` / `server.port` from `--config`. Wildcard bind addresses map to loopback; the request bypasses proxies, with a 2-second connection timeout and a 30-second total timeout. Failure prints a warning without undoing login; a stopped service loads credentials on its next startup. When using `--auth-dir`, the service configuration must point to that directory too.
 
 After editing configuration or if automatic reload fails, reload manually:
 

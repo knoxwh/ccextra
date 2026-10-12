@@ -57,7 +57,7 @@ ccextra 将 Anthropic Messages 入口接到不同上游协议，同时尽量保�
 
 ### Claude
 
-`convert_passthrough` 只改 `model`，再对非 Claude 模型做两件事。一是 system 清洗（对齐 chat/responses/gemini）：顶层 `system` 与 `messages` 内 `role: system` 项剥掉计费归属指纹（逐请求变化，破坏上游缓存前缀；归属行与指令同块时只剥前导行、保留剩余指令，对齐 sub2api）、Claude 身份声明与 `<identity>`/`<rules>`/`# Output Style:` 等 Claude 触发段，保留白名单段与 `cache_control`，清空后移除该块或消息。二是越档 effort 钳制：命中 glob `*claude*` 的模型、`thinking.type: disabled` 或注册表未命中的请求跳过；写回优先顶层 `output_config.effort`，回退 `thinking.output_config.effort`，值不变不写回。条目设置 `force_effort` 时改写为该固定值（不钳制），跳过条件不变。`*claude*` 模型两项都跳过，保持逐字节直通。身份头按排除表透传，`anthropic-beta` 原样转发、缺失时不补。
+`convert_passthrough` 只改 `model`，再对非 Claude 模型做两件事。一是 system 清洗（对齐 chat/responses/gemini）：顶层 `system` 与 `messages` 内 `role: system` 项剥掉计费归属指纹（逐请求变化，破坏上游缓存前缀；归属行与指令同块时只剥前导行、保留剩余指令，对齐 sub2api）、Claude 身份声明与 `<identity>`/`<rules>`/`# Output Style:` 等 Claude 触发段，保留白名单段与 `cache_control`，清空后移除该块或消息。二是越档 effort 钳制：命中 glob `*claude*` 的模型、`thinking.type: disabled` 或注册表未命中的请求跳过；写回优先顶层 `output_config.effort`，回退 `thinking.output_config.effort`，值不变不写回。条目设置 `force_effort` 时改写为该固定值（不钳制），跳过条件不变。`*claude*` 模型两项都跳过，保持逐字节直通。身份头按排除表透传，`anthropic-beta` 默认原样转发；订阅 OAuth（`sk-ant-oat*`）缺 `oauth-2025-04-20` 时补上，已有则不动。
 
 ### OpenAI Chat
 
@@ -128,7 +128,7 @@ Responses 流会收集可回放 reasoning。服务端以模型和会话为键保
 
 ## OAuth provider
 
-Antigravity、xAI、Codex、Cursor 登录命令均在凭证保存成功后调用共享的自动重载逻辑，按当前配置的监听地址发送 `POST /reload`；通配 IPv4/IPv6 地址转回环地址，不走代理、不跟随重定向，连接超时 2 秒、总超时 30 秒。仅 2xx 报告重载成功；配置读取、连接或 HTTP 错误只提示，不改变登录成功结果。服务未启动时下次启动加载；`--auth-dir` 不修改服务配置，需与服务扫描目录一致。
+Antigravity、xAI、Codex、Claude、Cursor 登录命令均在凭证保存成功后调用共享的自动重载逻辑，按当前配置的监听地址发送 `POST /reload`；通配 IPv4/IPv6 地址转回环地址，不走代理、不跟随重定向，连接超时 2 秒、总超时 30 秒。仅 2xx 报告重载成功；配置读取、连接或 HTTP 错误只提示，不改变登录成功结果。服务未启动时下次启动加载；`--auth-dir` 不修改服务配置，需与服务扫描目录一致。
 
 `antigravity-login` 使用浏览器回调登录并保存凭证。运行时后台读取有效凭证、提前 300 秒刷新 token（对齐 CPA 5 分钟安全窗口）、拉取模型并注入 provider；首次加载不阻塞监听，之后每 3 小时刷新，失败时保留现有路由。上游统一锁定单 daily 节点（`daily-cloudcode-pa.googleapis.com`），禁止跨集群回退以防破坏上游前缀缓存。
 
@@ -148,7 +148,7 @@ providers、payload、运行时配置及后台刷新参数保存在统一不可�
 
 并发 `/reload` 按取得专用互斥锁的顺序串行执行完整加载、校验和发布；不按网络完成顺序覆盖。只有成功发布推进版本，加载或校验失败保留整个旧快照及版本。加载期间不持有配置写锁，请求读取和后台刷新不被配置 IO 阻塞。成功 reload 仍清空认证缓存，并沿用每次重建 UpstreamClient 的行为；本批不加入客户端复用优化，避免沿用旧代理或旧 Antigravity 连接策略。`logging.level` 仍仅启动生效。
 
-后台每轮从当前快照复制版本、静态 providers、Antigravity/xAI/Codex 凭证目录和全局代理，再无锁执行凭证及模型读取。静态配置和刷新参数只在启动或成功 reload 时更新；后台不再重读未发布的磁盘配置。最终集合先校验，再在同一写锁内比较版本并发布；版本变化则丢弃旧轮次。集合未变化时不替换快照、不推进版本。后台只更新 providers，保留同版本的 payload、runtime 和刷新输入。
+后台每轮从当前快照复制版本、静态 providers、Antigravity/xAI/Codex/Claude 凭证目录和全局代理，再无锁执行凭证及模型读取。静态配置和刷新参数只在启动或成功 reload 时更新；后台不再重读未发布的磁盘配置。最终集合先校验，再在同一写锁内比较版本并发布；版本变化则丢弃旧轮次。集合未变化时不替换快照、不推进版本。后台只更新 providers，保留同版本的 payload、runtime 和刷新输入。
 
 后台 Antigravity 返回空集合时，沿用整个 provider 集合保旧策略，本轮 xAI 结果也不发布。显式 reload 优先应用新配置：移除的静态 provider、切换目录或禁用凭证不从旧快照补回；动态加载器沿用既有跳过不可用凭证的语义，可能返回部分或空集合。该集合通过校验后随 reload 整体发布。之后的后台只扫描新目录，旧轮次不能恢复被移除的 provider。凭证刷新等磁盘副作用不属于配置快照事务。
 
