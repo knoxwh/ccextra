@@ -7,13 +7,13 @@
 // - system → messages[0] {role: system|developer}
 // - thinking.budget_tokens → reasoning_effort
 // - content 块逐项转换:thinking→reasoning_content, image→data URL,
-//   tool_use→tool_calls, tool_result→role=tool(tool_result 先发保相邻,
+//   tool_use→tool_calls, tool_result→role=tool(+name 来自 tool_use;tool_result 先发保相邻,
 //   文本 "\n\n" join 留 tool 消息;内嵌 image 抽出到随后 user 消息 parts)
 // - tools input_schema → parameters
 // - tool_choice 映射
 // - stop_sequences → stop
 
-use std::collections::HashSet;
+use std::collections::{HashMap, HashSet};
 
 use serde_json::{json, Value};
 
@@ -155,6 +155,8 @@ pub fn convert_to_openai_chat_with(
     if let Some(message_arr) = body.get("messages").and_then(|v| v.as_array()) {
         let mut pending_tool_use_ids: Vec<String> = Vec::new();
         let mut pending_system_reminders: Vec<Value> = Vec::new();
+        // 对齐 CPA toolNameByID:tool_result 回填 name
+        let mut tool_name_by_id: HashMap<String, String> = HashMap::new();
 
         for msg in message_arr {
             let role = msg
@@ -189,7 +191,8 @@ pub fn convert_to_openai_chat_with(
             let preceding_tool_calls_pending = !pending_tool_use_ids.is_empty();
             pending_tool_use_ids.clear();
 
-            let (tool_results, main_msg, new_tool_use_ids) = convert_message_parts(role, &content)?;
+            let (tool_results, main_msg, new_tool_use_ids) =
+                convert_message_parts(role, &content, &mut tool_name_by_id)?;
             pending_tool_use_ids.extend(new_tool_use_ids);
 
             // 若前序有 pending tool call 且本条未回 tool_result,先 flush 暂存 reminder
@@ -508,6 +511,7 @@ fn should_map_thinking_to_reasoning(part: &Value) -> bool {
 fn convert_message_parts(
     role: &str,
     content: &Value,
+    tool_name_by_id: &mut HashMap<String, String>,
 ) -> Result<(Vec<Value>, Option<Value>, Vec<String>)> {
     if let Some(s) = content.as_str() {
         if s.is_empty() {
@@ -573,10 +577,13 @@ fn convert_message_parts(
             "tool_use" => {
                 if role == "assistant" {
                     let id = part.get("id").and_then(|v| v.as_str()).unwrap_or("");
+                    let name = part.get("name").and_then(|v| v.as_str()).unwrap_or("");
                     if !id.is_empty() {
                         new_tool_use_ids.push(id.to_string());
+                        if !name.is_empty() {
+                            tool_name_by_id.insert(id.to_string(), name.to_string());
+                        }
                     }
-                    let name = part.get("name").and_then(|v| v.as_str()).unwrap_or("");
                     let args = part
                         .get("input")
                         .map(|i| i.to_string())
@@ -596,11 +603,16 @@ fn convert_message_parts(
                 let content_val = part.get("content").cloned().unwrap_or(json!(""));
                 let (out_content, images) = convert_tool_result_content(&content_val);
                 deferred_images.extend(images);
-                tool_results.push(json!({
+                let mut tool_msg = json!({
                     "role": "tool",
                     "tool_call_id": tool_call_id,
                     "content": out_content
-                }));
+                });
+                // 对齐 CPA:已知 tool_use 名时回填 name
+                if let Some(name) = tool_name_by_id.get(tool_call_id) {
+                    tool_msg["name"] = json!(name);
+                }
+                tool_results.push(tool_msg);
             }
             _ => {}
         }
@@ -968,6 +980,38 @@ IMPORTANT: Assist with authorized security testing.
         assert_eq!(msgs[1]["tool_calls"][0]["function"]["name"], "get_weather");
         assert_eq!(msgs[2]["role"], "tool");
         assert_eq!(msgs[2]["tool_call_id"], "t1");
+        // 对齐 CPA toolNameByID:回填 name
+        assert_eq!(msgs[2]["name"], "get_weather");
+    }
+
+    #[test]
+    fn test_tool_result_name_from_prior_tool_use() {
+        // 跨消息累计:name 来自前面的 tool_use id 映射
+        let mut body = json!({
+            "model": "test",
+            "messages": [
+                {"role": "assistant", "content": [
+                    {"type": "tool_use", "id": "c1", "name": "Read", "input": {"p": "a"}},
+                    {"type": "tool_use", "id": "c2", "name": "Write", "input": {"p": "b"}}
+                ]},
+                {"role": "user", "content": [
+                    {"type": "tool_result", "tool_use_id": "c2", "content": "ok"},
+                    {"type": "tool_result", "tool_use_id": "c1", "content": "data"},
+                    {"type": "tool_result", "tool_use_id": "orphan", "content": "nope"}
+                ]}
+            ]
+        });
+        convert_to_openai_chat(&mut body, "gpt").unwrap();
+        let msgs = body["messages"].as_array().unwrap();
+        // assistant + three tool messages
+        let tools: Vec<_> = msgs.iter().filter(|m| m["role"] == "tool").collect();
+        assert_eq!(tools.len(), 3);
+        assert_eq!(tools[0]["tool_call_id"], "c2");
+        assert_eq!(tools[0]["name"], "Write");
+        assert_eq!(tools[1]["tool_call_id"], "c1");
+        assert_eq!(tools[1]["name"], "Read");
+        assert_eq!(tools[2]["tool_call_id"], "orphan");
+        assert!(tools[2].get("name").is_none());
     }
 
     #[test]
