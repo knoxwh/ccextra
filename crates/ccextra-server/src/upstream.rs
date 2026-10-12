@@ -343,8 +343,23 @@ fn parse_go_duration(raw: &str) -> anyhow::Result<Duration> {
     Ok(Duration::from_secs_f64(secs))
 }
 
-/// client 缓存键:(最终代理, 是否 antigravity, 是否禁 redirect)
-type ClientCacheKey = (String, bool, bool);
+/// client 缓存键:(最终代理, 是否 antigravity, 是否禁 redirect, 凭证 scope)
+/// Antigravity 启用连接池时 scope 为 access_token 短摘要，隔离多账号 TCP/TLS 池。
+type ClientCacheKey = (String, bool, bool, String);
+
+/// 对齐 CPA antigravityCredentialScope：仅在 AG + 连接池启用时按凭证分池。
+fn ant_credential_scope(protocol: Protocol, short_mode: bool, api_key: &str) -> String {
+    if !matches!(protocol, Protocol::Antigravity) || short_mode {
+        return String::new();
+    }
+    let key = api_key.trim();
+    if key.is_empty() {
+        return "anonymous".to_string();
+    }
+    use sha2::{Digest, Sha256};
+    let digest = Sha256::digest(key.as_bytes());
+    format!("token:{}", hex::encode(&digest[..8]))
+}
 
 #[derive(Clone)]
 pub struct UpstreamClient {
@@ -400,7 +415,8 @@ impl UpstreamClient {
     /// 按最终代理 + 协议取(或构建)client
     ///
     /// Antigravity 连接池设置独立生效(对齐 CPA antigravity executor transport):
-    /// 缓存键为 (代理, 是否 antigravity, 是否禁 redirect) 元组,专属 transport 不影响其他协议共享池。
+    /// 缓存键为 (代理, 是否 antigravity, 是否禁 redirect, 凭证 scope) 元组。
+    /// 启用连接池时不同凭证不共享空闲连接；短连接模式 scope 为空。
     ///
     /// `no_redirect`:Codex 订阅请求(带 chatgpt-account-id 头)禁跟随 redirect。
     /// reqwest 跨 host redirect 只剥 Authorization/Cookie 类敏感头,自定义身份头
@@ -411,9 +427,15 @@ impl UpstreamClient {
         proxy_key: &str,
         protocol: Protocol,
         no_redirect: bool,
+        credential_scope: &str,
     ) -> anyhow::Result<Client> {
         let ant = matches!(protocol, Protocol::Antigravity);
-        let cache_key: ClientCacheKey = (proxy_key.to_string(), ant, no_redirect);
+        let scope = if ant && !self.ant_pool.short_mode {
+            credential_scope.trim().to_string()
+        } else {
+            String::new()
+        };
+        let cache_key: ClientCacheKey = (proxy_key.to_string(), ant, no_redirect, scope);
         let mut clients = self
             .clients
             .lock()
@@ -578,7 +600,8 @@ impl UpstreamClient {
         let proxy_key = self.resolve_proxy(provider_proxy);
         // chatgpt-account-id 仅 Codex OAuth 订阅请求携带:禁 redirect + zstd 压缩标记
         let codex_subscription = extra_headers.contains_key("chatgpt-account-id");
-        let client = self.client_for(&proxy_key, protocol, codex_subscription)?;
+        let cred_scope = ant_credential_scope(protocol, self.ant_pool.short_mode, api_key);
+        let client = self.client_for(&proxy_key, protocol, codex_subscription, &cred_scope)?;
 
         // Gemini 端点需要替换 {model} 占位符
         let endpoint = endpoint_path(protocol, is_stream);
@@ -1042,7 +1065,7 @@ mod tests {
                 server.url.trim_start_matches("http://").parse().unwrap();
             let client = UpstreamClient::new(None);
             client.clients.lock().unwrap().insert(
-                ("direct".into(), false, false),
+                ("direct".into(), false, false, String::new()),
                 Client::builder()
                     .no_proxy()
                     .resolve(&host.to_ascii_lowercase(), addr)
@@ -1245,7 +1268,7 @@ mod tests {
             };
             let client = UpstreamClient::new(None);
             client.clients.lock().unwrap().insert(
-                ("direct".into(), false, false),
+                ("direct".into(), false, false, String::new()),
                 Client::builder()
                     .no_proxy()
                     .timeout(std::time::Duration::from_millis(100))
@@ -1422,16 +1445,16 @@ mod tests {
     fn test_client_caching() {
         let client = UpstreamClient::new(None);
         let _c1 = client
-            .client_for("direct", Protocol::OpenAiChat, false)
+            .client_for("direct", Protocol::OpenAiChat, false, "")
             .unwrap();
         let _c2 = client
-            .client_for("direct", Protocol::OpenAiChat, false)
+            .client_for("direct", Protocol::OpenAiChat, false, "")
             .unwrap();
         // 同一 proxy_key 应返回相同 client(Arc clone)
         // 通过计数验证缓存命中
         let count_before = client.clients.lock().unwrap().len();
         let _c3 = client
-            .client_for("direct", Protocol::OpenAiChat, false)
+            .client_for("direct", Protocol::OpenAiChat, false, "")
             .unwrap();
         let count_after = client.clients.lock().unwrap().len();
         assert_eq!(count_before, count_after, "缓存应命中,不应重建 client");
@@ -1441,13 +1464,13 @@ mod tests {
     fn test_client_different_proxies() {
         let client = UpstreamClient::new(None);
         let _c1 = client
-            .client_for("direct", Protocol::OpenAiChat, false)
+            .client_for("direct", Protocol::OpenAiChat, false, "")
             .unwrap();
         let _c2 = client
-            .client_for("http://proxy1:8080", Protocol::OpenAiChat, false)
+            .client_for("http://proxy1:8080", Protocol::OpenAiChat, false, "")
             .unwrap();
         let _c3 = client
-            .client_for("http://proxy2:9090", Protocol::OpenAiChat, false)
+            .client_for("http://proxy2:9090", Protocol::OpenAiChat, false, "")
             .unwrap();
         assert_eq!(client.clients.lock().unwrap().len(), 3);
     }
@@ -1457,15 +1480,46 @@ mod tests {
         // Antigravity 默认短连接:缓存键独立于其他协议(#ant 后缀)
         let client = UpstreamClient::new(None);
         let _c1 = client
-            .client_for("direct", Protocol::Antigravity, false)
+            .client_for("direct", Protocol::Antigravity, false, "")
             .unwrap();
         let _c2 = client
-            .client_for("direct", Protocol::OpenAiChat, false)
+            .client_for("direct", Protocol::OpenAiChat, false, "")
             .unwrap();
         assert_eq!(client.clients.lock().unwrap().len(), 2);
 
         // 默认(未启用连接池)解析为短连接
         assert!(client.ant_pool.short_mode);
+    }
+
+    #[test]
+    fn test_antigravity_pool_scopes_by_credential() {
+        use super::AntigravityConfig;
+        let cfg: AntigravityConfig =
+            yaml_serde::from_str("connection-pool:\n  enabled: true").unwrap();
+        let client = UpstreamClient::with_ant_pool(None, Some(&cfg));
+        assert!(!client.ant_pool.short_mode);
+        let scope_a = ant_credential_scope(Protocol::Antigravity, false, "token-a");
+        let scope_b = ant_credential_scope(Protocol::Antigravity, false, "token-b");
+        assert_ne!(scope_a, scope_b);
+        let _c1 = client
+            .client_for("direct", Protocol::Antigravity, false, &scope_a)
+            .unwrap();
+        let _c2 = client
+            .client_for("direct", Protocol::Antigravity, false, &scope_b)
+            .unwrap();
+        let _c1b = client
+            .client_for("direct", Protocol::Antigravity, false, &scope_a)
+            .unwrap();
+        assert_eq!(client.clients.lock().unwrap().len(), 2);
+        // 短连接模式忽略 scope，共用一个 AG 短连接条目
+        let short = UpstreamClient::new(None);
+        let _s1 = short
+            .client_for("direct", Protocol::Antigravity, false, &scope_a)
+            .unwrap();
+        let _s2 = short
+            .client_for("direct", Protocol::Antigravity, false, &scope_b)
+            .unwrap();
+        assert_eq!(short.clients.lock().unwrap().len(), 1);
     }
 
     #[test]
