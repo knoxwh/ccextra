@@ -9,8 +9,8 @@ use ccextra_core::cache_stabilization::{maybe_observe_request_drift, DriftApiKin
 use ccextra_core::convert::{
     clamp_passthrough_effort, convert_passthrough, convert_to_antigravity_with,
     convert_to_gemini_with_registry, convert_to_openai_chat_with, convert_to_openai_responses_with,
-    is_thinking_signature_invalid, sanitize_gpt_reasoning_items, sanitize_passthrough_prompt,
-    trim_encrypted_reasoning_items,
+    is_antigravity_thought_signature_invalid, is_thinking_signature_invalid,
+    sanitize_gpt_reasoning_items, sanitize_passthrough_prompt, trim_encrypted_reasoning_items,
 };
 use ccextra_core::normalize::{
     normalize_anthropic_full, normalize_anthropic_pretransform, normalize_target_post, TargetShape,
@@ -987,6 +987,9 @@ pub(crate) async fn deliver_response(
                     if let Some((cache, key, _)) = prepared.replay_scope.as_ref() {
                         cache.invalidate(key);
                     }
+                    if let Some((cache, key)) = prepared.ag_replay_scope.as_ref() {
+                        cache.invalidate(key);
+                    }
                     let retry = prepared.send_retry(upstream_client, user_agents).await?;
                     final_status = retry.status;
                     if retry.status.is_success() {
@@ -1002,6 +1005,21 @@ pub(crate) async fn deliver_response(
                         final_truncated = truncated;
                     }
                 }
+            }
+        }
+
+        if !retried_ok
+            && !final_truncated
+            && (status.as_u16() == 400 || status.as_u16() == 422)
+            && matches!(prepared.route.protocol, Protocol::Antigravity)
+            && is_antigravity_thought_signature_invalid(&final_bytes)
+        {
+            tracing::warn!(
+                protocol = ?prepared.route.protocol,
+                "antigravity thoughtSignature 无效,清空 replay 账本"
+            );
+            if let Some((cache, key)) = prepared.ag_replay_scope.as_ref() {
+                cache.invalidate(key);
             }
         }
 

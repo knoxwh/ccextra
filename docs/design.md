@@ -126,6 +126,8 @@ Claude Code 会话 ID 优先取 `x-claude-code-session-id`，其次从 `metadata
 
 Responses 流会收集可回放 reasoning。服务端以模型和会话为键保存完整回合，在下一请求中按 tool call 和输入锚点插回兼容的 reasoning 项，防止 `store=false` 上游丢失推理上下文。签名检查按目标提供方族执行；支持 CAQS Envelope v4 容器 field 5 signature 回退与 v4+ 豁免；无效或不兼容的 thinking 不会发到上游。
 
+Antigravity（gemini/flash/agent，不含 claude）使用**独立的** thoughtSignature 账本（`AgReplayCache`），与 Responses 的 `input`/`encrypted_content` 缓存分离。流式与非流式从上游 `candidates[].parts` 累积 `thought_signature` / `function_call_part`；仅出现 `finishReason` 时提交。下一轮在已有 `request.contents` part 上补回 `thoughtSignature`（MVP 不插入缺失的 functionCall）。unfit 重试或上游 400 判定为 thoughtSignature 无效时清空该会话账本。
+
 ## OAuth provider
 
 Antigravity、xAI、Codex、Claude、Cursor 登录命令均在凭证保存成功后调用共享的自动重载逻辑，按当前配置的监听地址发送 `POST /reload`；通配 IPv4/IPv6 地址转回环地址，不走代理、不跟随重定向，连接超时 2 秒、总超时 30 秒。仅 2xx 报告重载成功；配置读取、连接或 HTTP 错误只提示，不改变登录成功结果。服务未启动时下次启动加载；`--auth-dir` 不修改服务配置，需与服务扫描目录一致。

@@ -914,6 +914,16 @@ pub fn collect_ag_replay_from_response(
     acc.take_commit_items()
 }
 
+/// 上游 400 是否像 thoughtSignature 校验失败（对齐 CPA
+/// clearAntigravityReasoningReplayOnInvalidSignature 的文案探测）。
+pub fn is_antigravity_thought_signature_invalid(body: &[u8]) -> bool {
+    let lower = String::from_utf8_lossy(body).to_ascii_lowercase();
+    lower.contains("thoughtsignature")
+        || lower.contains("thought_signature")
+        || (lower.contains("signature")
+            && (lower.contains("invalid") || lower.contains("failed") || lower.contains("error")))
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -1138,5 +1148,17 @@ mod tests {
         }));
         let items = acc.take_commit_items().unwrap();
         assert!(items.is_empty());
+    }
+    #[test]
+    fn detects_invalid_thought_signature_errors() {
+        assert!(is_antigravity_thought_signature_invalid(
+            br#"{"error":{"message":"Invalid thoughtSignature"}}"#
+        ));
+        assert!(is_antigravity_thought_signature_invalid(
+            br#"{"error":{"message":"thought_signature validation failed"}}"#
+        ));
+        assert!(!is_antigravity_thought_signature_invalid(
+            br#"{"error":{"message":"quota exceeded"}}"#
+        ));
     }
 }
