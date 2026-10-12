@@ -2,126 +2,337 @@
   "models": [
     {
       "id": "gpt-6-astra",
-      "reasoning_levels": ["low", "medium", "high", "xhigh", "max"],
-      "force_effort": "medium"
+      "reasoning_levels": [
+        "low",
+        "medium",
+        "high",
+        "xhigh",
+        "max"
+      ],
+      "force_effort": "medium",
+      "max_completion_tokens": 128000
     },
     {
       "id": "gpt-5.6-terra",
-      "reasoning_levels": ["none", "low", "medium", "high", "xhigh", "max"]
+      "reasoning_levels": [
+        "none",
+        "low",
+        "medium",
+        "high",
+        "xhigh",
+        "max"
+      ],
+      "max_completion_tokens": 128000
     },
     {
       "id": "gpt-5.6-sol",
-      "reasoning_levels": ["none", "low", "medium", "high", "xhigh", "max"],
-      "force_effort": "xhigh"
+      "reasoning_levels": [
+        "none",
+        "low",
+        "medium",
+        "high",
+        "xhigh",
+        "max"
+      ],
+      "force_effort": "xhigh",
+      "max_completion_tokens": 128000
     },
     {
       "id": "glm-5.1",
-      "reasoning_levels": ["low", "medium", "high", "xhigh"]
+      "reasoning_levels": [
+        "low",
+        "medium",
+        "high",
+        "xhigh"
+      ]
     },
     {
       "id": "glm-5.2",
-      "reasoning_levels": ["low", "medium", "high", "xhigh", "max"]
+      "reasoning_levels": [
+        "low",
+        "medium",
+        "high",
+        "xhigh",
+        "max"
+      ]
     },
     {
       "id": "glm-5.3",
-      "reasoning_levels": ["low", "high", "max"]
+      "reasoning_levels": [
+        "low",
+        "high",
+        "max"
+      ]
     },
     {
       "id": "glm-5.3-flash",
-      "reasoning_levels": ["low", "high", "max"]
+      "reasoning_levels": [
+        "low",
+        "high",
+        "max"
+      ]
     },
     {
       "id": "ZHIPU/GLM-5.3-Flash",
-      "reasoning_levels": ["low", "high", "max"]
+      "reasoning_levels": [
+        "low",
+        "high",
+        "max"
+      ]
     },
     {
       "id": "qwen3.8-max",
-      "reasoning_levels": ["low", "medium", "high", "xhigh", "max"]
+      "reasoning_levels": [
+        "low",
+        "medium",
+        "high",
+        "xhigh",
+        "max"
+      ]
     },
     {
       "id": "qwen3.8-max-0902",
-      "reasoning_levels": ["low", "medium", "high", "xhigh", "max"]
+      "reasoning_levels": [
+        "low",
+        "medium",
+        "high",
+        "xhigh",
+        "max"
+      ]
     },
     {
       "id": "qwen3.8-flash",
-      "reasoning_levels": ["low", "medium", "high", "xhigh", "max"]
+      "reasoning_levels": [
+        "low",
+        "medium",
+        "high",
+        "xhigh",
+        "max"
+      ]
     },
     {
       "id": "deepseek-v4-flash",
-      "reasoning_levels": ["low", "medium", "high", "xhigh", "max"]
+      "reasoning_levels": [
+        "low",
+        "medium",
+        "high",
+        "xhigh",
+        "max"
+      ]
     },
     {
       "id": "deepseek-v4-flash-0731",
-      "reasoning_levels": ["low", "medium", "high", "xhigh", "max"]
+      "reasoning_levels": [
+        "low",
+        "medium",
+        "high",
+        "xhigh",
+        "max"
+      ]
     },
     {
       "id": "deepseek-v4.1-flash",
-      "reasoning_levels": ["low", "medium", "high", "xhigh", "max"]
+      "reasoning_levels": [
+        "low",
+        "medium",
+        "high",
+        "xhigh",
+        "max"
+      ]
     },
     {
       "id": "kimi-k3",
-      "reasoning_levels": ["low", "high", "max"]
+      "reasoning_levels": [
+        "low",
+        "high",
+        "max"
+      ],
+      "max_completion_tokens": 65536
     },
     {
       "id": "kimi/kimi-k3",
-      "reasoning_levels": ["low", "high", "max"]
+      "reasoning_levels": [
+        "low",
+        "high",
+        "max"
+      ],
+      "max_completion_tokens": 65536
     },
     {
       "id": "kimi-k2.8",
-      "reasoning_levels": ["low", "high", "max"]
+      "reasoning_levels": [
+        "low",
+        "high",
+        "max"
+      ],
+      "max_completion_tokens": 65536
     },
     {
       "id": "kimi-k2.8-code",
-      "reasoning_levels": ["low", "high", "max"]
+      "reasoning_levels": [
+        "low",
+        "high",
+        "max"
+      ],
+      "max_completion_tokens": 65536
     },
     {
       "id": "doubao-seed-2-1-pro",
-      "reasoning_levels": ["low", "medium", "high"]
+      "reasoning_levels": [
+        "low",
+        "medium",
+        "high"
+      ]
     },
     {
       "id": "doubao-seed-2-1-pro-260628",
-      "reasoning_levels": ["low", "medium", "high"]
+      "reasoning_levels": [
+        "low",
+        "medium",
+        "high"
+      ]
     },
     {
       "id": "claude-opus-5",
-      "reasoning_levels": ["low", "medium", "high", "xhigh", "max"]
+      "reasoning_levels": [
+        "low",
+        "medium",
+        "high",
+        "xhigh",
+        "max"
+      ],
+      "max_completion_tokens": 128000
     },
     {
       "id": "claude-sonnet-5",
-      "reasoning_levels": ["low", "medium", "high", "xhigh", "max"]
+      "reasoning_levels": [
+        "low",
+        "medium",
+        "high",
+        "xhigh",
+        "max"
+      ],
+      "max_completion_tokens": 128000
     },
     {
       "id": "claude-fable-5",
-      "reasoning_levels": ["low", "medium", "high", "xhigh", "max"]
+      "reasoning_levels": [
+        "low",
+        "medium",
+        "high",
+        "xhigh",
+        "max"
+      ],
+      "max_completion_tokens": 128000
     },
     {
       "id": "claude-fable-5-1",
-      "reasoning_levels": ["low", "medium", "high", "xhigh", "max"]
+      "reasoning_levels": [
+        "low",
+        "medium",
+        "high",
+        "xhigh",
+        "max"
+      ],
+      "max_completion_tokens": 128000
     },
     {
       "id": "grok-4.6",
-      "reasoning_levels": ["low", "medium", "high", "xhigh"],
-      "force_effort": "xhigh"
+      "reasoning_levels": [
+        "low",
+        "medium",
+        "high",
+        "xhigh"
+      ],
+      "force_effort": "xhigh",
+      "max_completion_tokens": 65536
     },
     {
       "id": "gemini-3.7-flash-high",
-      "reasoning_levels": ["high"],
-      "force_effort": "high"
+      "reasoning_levels": [
+        "high"
+      ],
+      "force_effort": "high",
+      "max_completion_tokens": 65536
     },
     {
       "id": "gemini-3.7-flash-medium",
-      "reasoning_levels": ["medium"],
-      "force_effort": "medium"
+      "reasoning_levels": [
+        "medium"
+      ],
+      "force_effort": "medium",
+      "max_completion_tokens": 65536
     },
     {
       "id": "gemini-3.8-flash-high",
-      "reasoning_levels": ["high"],
-      "force_effort": "high"
+      "reasoning_levels": [
+        "high"
+      ],
+      "force_effort": "high",
+      "max_completion_tokens": 65536
     },
     {
       "id": "gemini-3.8-flash-medium",
-      "reasoning_levels": ["medium"],
-      "force_effort": "medium"
+      "reasoning_levels": [
+        "medium"
+      ],
+      "force_effort": "medium",
+      "max_completion_tokens": 65536
+    },
+    {
+      "id": "claude-opus-4-6-thinking",
+      "reasoning_levels": [],
+      "max_completion_tokens": 64000
+    },
+    {
+      "id": "claude-sonnet-4-6",
+      "reasoning_levels": [],
+      "max_completion_tokens": 64000
+    },
+    {
+      "id": "claude-opus-5-5-high",
+      "reasoning_levels": [],
+      "max_completion_tokens": 128000
+    },
+    {
+      "id": "claude-sonnet-5-5-high",
+      "reasoning_levels": [],
+      "max_completion_tokens": 128000
+    },
+    {
+      "id": "gemini-3.6-flash-high",
+      "reasoning_levels": [],
+      "max_completion_tokens": 65536
+    },
+    {
+      "id": "gemini-3-flash",
+      "reasoning_levels": [],
+      "max_completion_tokens": 65536
+    },
+    {
+      "id": "gemini-pro-agent",
+      "reasoning_levels": [],
+      "max_completion_tokens": 65535
+    },
+    {
+      "id": "gemini-3.1-pro-low",
+      "reasoning_levels": [],
+      "max_completion_tokens": 65535
+    },
+    {
+      "id": "gemini-3.1-flash-lite",
+      "reasoning_levels": [],
+      "max_completion_tokens": 65535
+    },
+    {
+      "id": "gemini-3.5-flash-lite",
+      "reasoning_levels": [],
+      "max_completion_tokens": 65535
+    },
+    {
+      "id": "gpt-oss-120b-medium",
+      "reasoning_levels": [],
+      "max_completion_tokens": 32768
     }
   ]
 }
