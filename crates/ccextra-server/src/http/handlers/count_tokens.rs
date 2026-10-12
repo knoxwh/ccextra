@@ -56,8 +56,9 @@ pub async fn handle_count_tokens(
         let base_url = provider.base_urls()[0].clone(); // 取首个 URL（count_tokens 无需回退）
         let mut key = provider.key.clone();
         let proxy_url = provider.proxy_url.clone();
+        let mut claude_oauth: Option<(String, String)> = None; // (auth_dir, id)
 
-        // Claude 订阅:运行时刷新 access_token
+        // Claude 订阅:运行时刷新 access_token;失败硬失败
         if let Some(meta) = provider.metadata.as_ref() {
             if meta.get("provider_type").map(|s| s.as_str()) == Some("claude") {
                 if let Some(auth_dir_str) = meta.get("auth_dir") {
@@ -74,14 +75,19 @@ pub async fn handle_count_tokens(
                             auth_dir,
                             id,
                             proxy_url.as_deref(),
+                            None,
                         )
                         .await
                         {
-                            Ok(fresh) => key = fresh.access_token,
-                            Err(e) => tracing::warn!(
-                                email = %email,
-                                "Claude count_tokens 凭证刷新失败: {e}"
-                            ),
+                            Ok(fresh) => {
+                                key = fresh.access_token;
+                                claude_oauth = Some((auth_dir_str.clone(), id.to_string()));
+                            }
+                            Err(e) => {
+                                return Err(AppError::unauthorized(format!(
+                                    "Claude count_tokens 凭证刷新失败,拒绝使用旧 token: {e}"
+                                )));
+                            }
                         }
                     }
                 }
@@ -99,48 +105,78 @@ pub async fn handle_count_tokens(
         if crate::claude::is_claude_oauth_token(&key) {
             ensure_oauth_beta(&mut extra_headers);
         }
-        let mut request = client
-            .post(&url)
-            .header(
-                header::USER_AGENT,
-                inbound_user_agent.unwrap_or(user_agents.claude_cli.as_str()),
-            )
-            .bearer_auth(&key);
-        for (name, value) in &extra_headers {
-            request = request.header(name, value);
-        }
-        let resp = crate::upstream::send_with_timeout(request.json(&body_json))
-            .await
-            .map_err(|e| AppError::new(anyhow::anyhow!("上游请求失败: {e}")))?;
 
-        let status = resp.status();
-        if status.is_success() {
-            // 成功 body 有界读取:16 MiB 上限 + 180s idle;
-            // 超限 502、停顿 504(Anthropic api_error),传输错误维持 500
-            let body_bytes = crate::limits::read_success_body_or_anthropic(resp).await?;
+        let mut attempt_key = key;
+        for auth_attempt in 0..=1 {
+            let mut request = client
+                .post(&url)
+                .header(
+                    header::USER_AGENT,
+                    inbound_user_agent.unwrap_or(user_agents.claude_cli.as_str()),
+                )
+                .bearer_auth(&attempt_key);
+            for (name, value) in &extra_headers {
+                request = request.header(name, value);
+            }
+            let resp = crate::upstream::send_with_timeout(request.json(&body_json))
+                .await
+                .map_err(|e| AppError::new(anyhow::anyhow!("上游请求失败: {e}")))?;
+
+            let status = resp.status();
+            if status.is_success() {
+                // 成功 body 有界读取:16 MiB 上限 + 180s idle;
+                // 超限 502、停顿 504(Anthropic api_error),传输错误维持 500
+                let body_bytes = crate::limits::read_success_body_or_anthropic(resp).await?;
+                return Response::builder()
+                    .status(status)
+                    .header(header::CONTENT_TYPE, "application/json")
+                    .body(Body::from(body_bytes))
+                    .map_err(|e| AppError::new(anyhow::anyhow!("构造响应失败: {e}")));
+            }
+
+            // 401:强制刷新后重试一次
+            if status.as_u16() == 401 && auth_attempt == 0 {
+                if let Some((ref auth_dir_str, ref id)) = claude_oauth {
+                    let rejected = attempt_key.clone();
+                    match crate::claude::ensure_credential_fresh(
+                        std::path::Path::new(auth_dir_str),
+                        id,
+                        proxy_url.as_deref(),
+                        Some(&rejected),
+                    )
+                    .await
+                    {
+                        Ok(fresh) => {
+                            tracing::info!("Claude count_tokens 401,凭证已刷新,重试一次");
+                            attempt_key = fresh.access_token;
+                            continue;
+                        }
+                        Err(e) => {
+                            return Err(AppError::unauthorized(format!(
+                                "Claude count_tokens 401 后刷新失败,拒绝使用旧 token: {e}"
+                            )));
+                        }
+                    }
+                }
+            }
+
+            // 错误 body 有界读取(256 KiB + 180s idle):截断或读取失败保留已知
+            // 上游状态(429/401 等不被改成 502/504/500),生成有界 Anthropic error;
+            // 未截断的错误 body 按原语义原样转发
+            let (body_bytes, truncated) =
+                crate::limits::read_error_body_or_anthropic(resp, status).await?;
+            if truncated {
+                return Err(AppError::with_status(
+                    status,
+                    "上游错误 body 超过 256 KiB,已截断",
+                ));
+            }
             return Response::builder()
                 .status(status)
                 .header(header::CONTENT_TYPE, "application/json")
                 .body(Body::from(body_bytes))
                 .map_err(|e| AppError::new(anyhow::anyhow!("构造响应失败: {e}")));
         }
-
-        // 错误 body 有界读取(256 KiB + 180s idle):截断或读取失败保留已知
-        // 上游状态(429/401 等不被改成 502/504/500),生成有界 Anthropic error;
-        // 未截断的错误 body 按原语义原样转发
-        let (body_bytes, truncated) =
-            crate::limits::read_error_body_or_anthropic(resp, status).await?;
-        if truncated {
-            return Err(AppError::with_status(
-                status,
-                "上游错误 body 超过 256 KiB,已截断",
-            ));
-        }
-        return Response::builder()
-            .status(status)
-            .header(header::CONTENT_TYPE, "application/json")
-            .body(Body::from(body_bytes))
-            .map_err(|e| AppError::new(anyhow::anyhow!("构造响应失败: {e}")));
     }
 
     // 非 Claude 协议:读缓存(有上轮真实值返回,无缓存返回 0)

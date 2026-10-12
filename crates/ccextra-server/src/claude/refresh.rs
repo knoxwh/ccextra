@@ -83,15 +83,23 @@ pub async fn refresh_if_needed(
     ))
 }
 
+fn usable(cred: &ClaudeCredential, rejected_token: Option<&str>) -> bool {
+    cred.is_fresh(std::time::SystemTime::now(), REFRESH_SKEW_SECS)
+        && rejected_token != Some(cred.access_token.as_str())
+}
+
 /// 运行时获取新鲜凭证 (单飞锁 + Double-Check + 自动落盘)
+///
+/// `rejected_token`:上游 401 后传入被拒的 access_token,即使未过期也强制刷新。
 pub async fn ensure_credential_fresh(
     auth_dir: &Path,
     email_or_account: &str,
     proxy_url: Option<&str>,
+    rejected_token: Option<&str>,
 ) -> Result<ClaudeCredential> {
     let path = store::credential_path(auth_dir, email_or_account);
     if let Ok(cred) = store::load(&path) {
-        if cred.is_fresh(std::time::SystemTime::now(), REFRESH_SKEW_SECS) {
+        if usable(&cred, rejected_token) {
             return Ok(cred);
         }
     }
@@ -99,8 +107,13 @@ pub async fn ensure_credential_fresh(
     let _guard = refresh_lock().lock().await;
 
     let mut cred = store::load(&path)?;
-    if cred.is_fresh(std::time::SystemTime::now(), REFRESH_SKEW_SECS) {
+    if usable(&cred, rejected_token) {
         return Ok(cred);
+    }
+
+    // 被拒 token 仍落在盘上时,临时视为过期以走 refresh_if_needed
+    if rejected_token == Some(cred.access_token.as_str()) {
+        cred.expired = "1970-01-01T00:00:00Z".into();
     }
 
     if refresh_if_needed(&mut cred, proxy_url, REFRESH_SKEW_SECS).await? {
@@ -108,4 +121,32 @@ pub async fn ensure_credential_fresh(
     }
 
     Ok(cred)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::claude::credential::ClaudeCredential;
+
+    #[test]
+    fn rejected_token_is_not_usable_even_if_unexpired() {
+        let cred = ClaudeCredential {
+            r#type: "claude".into(),
+            id_token: String::new(),
+            access_token: "sk-ant-oat-live".into(),
+            refresh_token: "refresh".into(),
+            last_refresh: String::new(),
+            email: "a@b.c".into(),
+            account_uuid: String::new(),
+            organization_uuid: String::new(),
+            organization_name: String::new(),
+            claude_device_ids: vec![],
+            // 遥远的未来 → 时钟新鲜
+            expired: "2099-01-01T00:00:00Z".into(),
+            disabled: false,
+        };
+        assert!(usable(&cred, None));
+        assert!(!usable(&cred, Some("sk-ant-oat-live")));
+        assert!(usable(&cred, Some("other-token")));
+    }
 }

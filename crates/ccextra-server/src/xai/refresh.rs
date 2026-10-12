@@ -56,15 +56,23 @@ pub async fn refresh_if_needed(
     Ok(true)
 }
 
+fn usable(cred: &XAICredential, rejected_token: Option<&str>) -> bool {
+    cred.is_fresh(std::time::SystemTime::now(), REFRESH_SKEW_SECS)
+        && rejected_token != Some(cred.access_token.as_str())
+}
+
 /// 运行时获取新鲜凭证 (对齐 CLIProxyAPI ensureAccessToken: 单飞锁 + Double-Check + 自动落盘)
+///
+/// `rejected_token`:上游 401 后传入被拒的 access_token,即使未过期也强制刷新。
 pub async fn ensure_credential_fresh(
     auth_dir: &Path,
     email_or_sub: &str,
     proxy_url: Option<&str>,
+    rejected_token: Option<&str>,
 ) -> Result<XAICredential> {
     let path = store::credential_path(auth_dir, email_or_sub);
     if let Ok(cred) = store::load(&path) {
-        if cred.is_fresh(std::time::SystemTime::now(), REFRESH_SKEW_SECS) {
+        if usable(&cred, rejected_token) {
             return Ok(cred);
         }
     }
@@ -73,8 +81,12 @@ pub async fn ensure_credential_fresh(
 
     // 获取锁后 double-check
     let mut cred = store::load(&path)?;
-    if cred.is_fresh(std::time::SystemTime::now(), REFRESH_SKEW_SECS) {
+    if usable(&cred, rejected_token) {
         return Ok(cred);
+    }
+
+    if rejected_token == Some(cred.access_token.as_str()) {
+        cred.expired = "1970-01-01T00:00:00Z".into();
     }
 
     if refresh_if_needed(&mut cred, proxy_url, REFRESH_SKEW_SECS).await? {

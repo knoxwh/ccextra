@@ -262,6 +262,15 @@ fn prepend_sse_frame(first: Result<Bytes, std::io::Error>, rest: SseStreamPin) -
     Box::pin(futures::stream::once(async move { first }).chain(rest))
 }
 
+/// OAuth 订阅凭证刷新目标(预刷新失败硬失败;上游 401 强制刷新后重试一次)
+#[derive(Debug, Clone)]
+pub(crate) enum OAuthRefreshTarget {
+    Antigravity { auth_dir: String, email: String },
+    Claude { auth_dir: String, id: String },
+    Codex { auth_dir: String, id: String },
+    Xai { auth_dir: String, id: String },
+}
+
 pub(crate) struct PreparedMessageRequest {
     pub route: ccextra_core::route::RouteDecision,
     pub body_json: Value,
@@ -273,6 +282,8 @@ pub(crate) struct PreparedMessageRequest {
     /// Antigravity 连接池 scope 用 refresh_token（稳定跨 access 刷新）；其它协议为 None
     pub pool_refresh_token: Option<String>,
     pub upstream_proxy: Option<String>,
+    /// 可刷新的 OAuth 订阅凭证;API key provider 为 None
+    pub oauth_refresh: Option<OAuthRefreshTarget>,
     pub session_id: Option<String>,
     pub thread_id: Option<String>,
     pub extra_headers: HeaderMap,
@@ -636,13 +647,17 @@ pub(crate) async fn prepare_message_request(
         )));
     }
 
-    // Antigravity 运行时 token 校验与自动刷新
+    // OAuth 订阅:运行时 token 校验与自动刷新;失败硬失败,不得继续打旧 token
+    let mut oauth_refresh: Option<OAuthRefreshTarget> = None;
+    let mut codex_account_id: Option<String> = None;
+
     if let Some((auth_dir_str, email)) = antigravity_refresh {
         let auth_dir = std::path::Path::new(&auth_dir_str);
         match crate::antigravity::ensure_credential_fresh(
             auth_dir,
             &email,
             upstream_proxy.as_deref(),
+            None,
         )
         .await
         {
@@ -651,70 +666,99 @@ pub(crate) async fn prepare_message_request(
                 if !fresh_cred.refresh_token.trim().is_empty() {
                     pool_refresh_token = Some(fresh_cred.refresh_token);
                 }
+                oauth_refresh = Some(OAuthRefreshTarget::Antigravity {
+                    auth_dir: auth_dir_str,
+                    email,
+                });
             }
             Err(e) => {
-                tracing::warn!(email = %email, "Antigravity 凭证运行时刷新失败: {e}");
+                return Err(AppError::unauthorized(format!(
+                    "Antigravity 凭证刷新失败,拒绝使用旧 token: {e}"
+                )));
             }
         }
     }
 
-    // xAI 运行时 token 校验与自动刷新
     if let Some((auth_dir_str, email, sub)) = xai_refresh {
         let auth_dir = std::path::Path::new(&auth_dir_str);
-        let id = if !email.is_empty() { &email } else { &sub };
-        match crate::xai::ensure_credential_fresh(auth_dir, id, upstream_proxy.as_deref()).await {
+        let id = if !email.is_empty() {
+            email.clone()
+        } else {
+            sub.clone()
+        };
+        match crate::xai::ensure_credential_fresh(auth_dir, &id, upstream_proxy.as_deref(), None)
+            .await
+        {
             Ok(fresh_cred) => {
                 upstream_key = fresh_cred.access_token;
+                oauth_refresh = Some(OAuthRefreshTarget::Xai {
+                    auth_dir: auth_dir_str,
+                    id,
+                });
             }
             Err(e) => {
-                tracing::warn!(email = %email, sub = %sub, "xAI 凭证运行时刷新失败: {e}");
+                return Err(AppError::unauthorized(format!(
+                    "xAI 凭证刷新失败,拒绝使用旧 token: {e}"
+                )));
             }
         }
     }
 
-    // Codex 运行时 token 校验与自动刷新;account_id 供 Chatgpt-Account-Id 头
-    let mut codex_account_id: Option<String> = None;
     if let Some((auth_dir_str, email, account_id)) = codex_refresh {
         let auth_dir = std::path::Path::new(&auth_dir_str);
         let id = if !email.is_empty() {
-            &email
+            email.clone()
         } else {
-            &account_id
+            account_id.clone()
         };
-        match crate::codex::ensure_credential_fresh(auth_dir, id, upstream_proxy.as_deref()).await {
+        match crate::codex::ensure_credential_fresh(auth_dir, &id, upstream_proxy.as_deref(), None)
+            .await
+        {
             Ok(fresh_cred) => {
                 upstream_key = fresh_cred.access_token;
                 if !fresh_cred.account_id.is_empty() {
                     codex_account_id = Some(fresh_cred.account_id);
                 }
+                oauth_refresh = Some(OAuthRefreshTarget::Codex {
+                    auth_dir: auth_dir_str,
+                    id,
+                });
             }
             Err(e) => {
-                tracing::warn!(email = %email, "Codex 凭证运行时刷新失败: {e}");
-                // 刷新失败仍用落盘 account_id 发请求
-                if !account_id.is_empty() {
-                    codex_account_id = Some(account_id);
-                }
+                return Err(AppError::unauthorized(format!(
+                    "Codex 凭证刷新失败,拒绝使用旧 token: {e}"
+                )));
             }
         }
     }
 
-    // Claude 订阅运行时 token 校验与自动刷新
     if let Some((auth_dir_str, email, account_uuid)) = claude_refresh {
         let auth_dir = std::path::Path::new(&auth_dir_str);
         let id = if !email.is_empty() {
-            email.as_str()
+            email.clone()
         } else {
-            account_uuid.as_str()
+            account_uuid.clone()
         };
         if !id.is_empty() {
-            match crate::claude::ensure_credential_fresh(auth_dir, id, upstream_proxy.as_deref())
-                .await
+            match crate::claude::ensure_credential_fresh(
+                auth_dir,
+                &id,
+                upstream_proxy.as_deref(),
+                None,
+            )
+            .await
             {
                 Ok(fresh_cred) => {
                     upstream_key = fresh_cred.access_token;
+                    oauth_refresh = Some(OAuthRefreshTarget::Claude {
+                        auth_dir: auth_dir_str,
+                        id,
+                    });
                 }
                 Err(e) => {
-                    tracing::warn!(email = %email, "Claude 凭证运行时刷新失败: {e}");
+                    return Err(AppError::unauthorized(format!(
+                        "Claude 凭证刷新失败,拒绝使用旧 token: {e}"
+                    )));
                 }
             }
         }
@@ -835,6 +879,7 @@ pub(crate) async fn prepare_message_request(
         upstream_key,
         pool_refresh_token,
         upstream_proxy,
+        oauth_refresh,
         session_id: session_id.map(str::to_string),
         thread_id,
         extra_headers,
@@ -1007,6 +1052,41 @@ pub(crate) async fn deliver_response(
         let mut final_bytes = err_bytes;
         let mut final_truncated = err_truncated;
         let mut retried_ok = false;
+
+        // 上游 401:OAuth 凭证强制刷新后重试一次;刷新失败硬失败,不得继续打旧 token
+        if !retried_ok && status.as_u16() == 401 {
+            match prepared.refresh_rejected_token().await {
+                Ok(true) => {
+                    tracing::info!(
+                        protocol = ?prepared.route.protocol,
+                        provider = %prepared.route.provider,
+                        "上游 401,凭证已刷新,重试一次"
+                    );
+                    if let Some((cache, key, _)) = prepared.replay_scope.as_ref() {
+                        cache.invalidate(key);
+                    }
+                    if let Some((cache, key)) = prepared.ag_replay_scope.as_ref() {
+                        cache.invalidate(key);
+                    }
+                    let retry = prepared.send_retry(upstream_client, user_agents).await?;
+                    final_status = retry.status;
+                    if retry.status.is_success() {
+                        status = retry.status;
+                        executed.upstream = Some(retry);
+                        retried_ok = true;
+                    } else {
+                        retry_after = parse_retry_after(retry.body.headers());
+                        let (bytes, truncated) =
+                            crate::limits::read_error_body_or_anthropic(retry.body, final_status)
+                                .await?;
+                        final_bytes = bytes;
+                        final_truncated = truncated;
+                    }
+                }
+                Ok(false) => {}
+                Err(e) => return Err(e),
+            }
+        }
 
         // Unfit 探测与自适应降级(对齐 magpie gateway.go:3440-3490)
         if !final_truncated && (status.as_u16() == 400 || status.as_u16() == 422) {
@@ -1299,6 +1379,85 @@ impl PreparedMessageRequest {
                 self.pool_refresh_token.as_deref(),
             )
             .await
+    }
+
+    /// 上游 401 后强制刷新被拒 token。
+    /// Ok(true)=已换新 access_token;Ok(false)=非 OAuth/无可刷新目标;Err=刷新失败(硬失败)。
+    async fn refresh_rejected_token(&mut self) -> Result<bool, AppError> {
+        let Some(target) = self.oauth_refresh.clone() else {
+            return Ok(false);
+        };
+        let rejected = self.upstream_key.clone();
+        let proxy = self.upstream_proxy.as_deref();
+        match target {
+            OAuthRefreshTarget::Antigravity { auth_dir, email } => {
+                let auth_dir = std::path::Path::new(&auth_dir);
+                let fresh = crate::antigravity::ensure_credential_fresh(
+                    auth_dir,
+                    &email,
+                    proxy,
+                    Some(&rejected),
+                )
+                .await
+                .map_err(|e| {
+                    AppError::unauthorized(format!(
+                        "Antigravity 401 后刷新失败,拒绝使用旧 token: {e}"
+                    ))
+                })?;
+                self.upstream_key = fresh.access_token;
+                if !fresh.refresh_token.trim().is_empty() {
+                    self.pool_refresh_token = Some(fresh.refresh_token);
+                }
+                Ok(true)
+            }
+            OAuthRefreshTarget::Claude { auth_dir, id } => {
+                let auth_dir = std::path::Path::new(&auth_dir);
+                let fresh =
+                    crate::claude::ensure_credential_fresh(auth_dir, &id, proxy, Some(&rejected))
+                        .await
+                        .map_err(|e| {
+                            AppError::unauthorized(format!(
+                                "Claude 401 后刷新失败,拒绝使用旧 token: {e}"
+                            ))
+                        })?;
+                self.upstream_key = fresh.access_token;
+                Ok(true)
+            }
+            OAuthRefreshTarget::Codex { auth_dir, id } => {
+                let auth_dir = std::path::Path::new(&auth_dir);
+                let fresh =
+                    crate::codex::ensure_credential_fresh(auth_dir, &id, proxy, Some(&rejected))
+                        .await
+                        .map_err(|e| {
+                            AppError::unauthorized(format!(
+                                "Codex 401 后刷新失败,拒绝使用旧 token: {e}"
+                            ))
+                        })?;
+                self.upstream_key = fresh.access_token;
+                if !fresh.account_id.is_empty() {
+                    if let Ok(value) = axum::http::HeaderValue::from_str(&fresh.account_id) {
+                        self.extra_headers.insert(
+                            axum::http::HeaderName::from_static("chatgpt-account-id"),
+                            value,
+                        );
+                    }
+                }
+                Ok(true)
+            }
+            OAuthRefreshTarget::Xai { auth_dir, id } => {
+                let auth_dir = std::path::Path::new(&auth_dir);
+                let fresh =
+                    crate::xai::ensure_credential_fresh(auth_dir, &id, proxy, Some(&rejected))
+                        .await
+                        .map_err(|e| {
+                            AppError::unauthorized(format!(
+                                "xAI 401 后刷新失败,拒绝使用旧 token: {e}"
+                            ))
+                        })?;
+                self.upstream_key = fresh.access_token;
+                Ok(true)
+            }
+        }
     }
 }
 
