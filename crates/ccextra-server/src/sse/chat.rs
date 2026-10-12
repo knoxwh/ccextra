@@ -725,7 +725,8 @@ where
             match crate::sse::next_upstream_chunk(&mut stream).await {
                 Ok(Some(Ok(chunk))) => yield Ok(chunk),
                 Ok(Some(Err(e))) => {
-                    yield Err(std::io::Error::other(e));
+                    // 读失败发 Anthropic error 事件,避免下游只见 io::Error 断流
+                    yield Ok(crate::sse::emit::error_event(&format!("上游流中断: {e}")));
                     return;
                 }
                 Ok(None) => return,
@@ -1487,5 +1488,27 @@ mod tests {
         let bufs = out.concat();
         let s = String::from_utf8_lossy(&bufs);
         assert!(s.contains("\"stop_reason\":\"max_tokens\""), "{s}");
+    }
+
+    #[tokio::test]
+    async fn test_claude_passthrough_read_error_emits_error_event() {
+        use futures::StreamExt;
+        let request_error = reqwest::Client::new()
+            .get("not a url")
+            .build()
+            .expect_err("invalid URL must produce reqwest error");
+        let stream = futures::stream::iter(vec![
+            Ok(Bytes::from(
+                "event: message_start\ndata: {\"type\":\"message_start\"}\n\n",
+            )),
+            Err(request_error),
+        ]);
+        let out: Vec<_> = relay_claude_passthrough(stream).collect().await;
+        assert_eq!(out.len(), 2, "应先转发字节再发 error: {out:?}");
+        assert!(out[0].is_ok());
+        let err_frame = out[1].as_ref().expect("读失败应变 Ok(error_event)");
+        let s = String::from_utf8_lossy(err_frame);
+        assert!(s.contains("event: error"), "实际: {s}");
+        assert!(s.contains("上游流中断"), "实际: {s}");
     }
 }
