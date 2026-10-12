@@ -30,6 +30,8 @@ pub struct LoginOptions {
     pub callback_port: u16,
     /// 空则继承环境代理
     pub proxy_url: Option<String>,
+    /// 覆盖 chat/hub UA；onboard 由其派生。None = REQUEST_UA 缺省。
+    pub user_agent: Option<String>,
 }
 
 impl Default for LoginOptions {
@@ -39,6 +41,7 @@ impl Default for LoginOptions {
             no_browser: false,
             callback_port: CALLBACK_PORT,
             proxy_url: None,
+            user_agent: None,
         }
     }
 }
@@ -72,7 +75,15 @@ pub async fn run_login(opts: LoginOptions) -> Result<PathBuf> {
         .await
         .map_err(|_| anyhow!("antigravity: authentication timed out"))?
         .map_err(|_| anyhow!("antigravity: callback channel closed"))?;
-    finish_login(&client, &opts.auth_dir, &state, &redirect, cb).await
+    finish_login(
+        &client,
+        &opts.auth_dir,
+        &state,
+        &redirect,
+        cb,
+        opts.user_agent.as_deref(),
+    )
+    .await
 }
 
 async fn finish_login(
@@ -81,6 +92,7 @@ async fn finish_login(
     expected_state: &str,
     redirect: &str,
     cb: CallbackQuery,
+    user_agent: Option<&str>,
 ) -> Result<PathBuf> {
     let code = cb.code.trim();
     let state = cb.state.trim();
@@ -95,8 +107,8 @@ async fn finish_login(
         return Err(anyhow!("antigravity: missing authorization code"));
     }
     let token = exchange_code(client, code, redirect).await?;
-    let email = fetch_user_email(client, &token.access_token).await?;
-    let project_id = fetch_project_id(client, &token.access_token).await?;
+    let email = fetch_user_email(client, &token.access_token, user_agent).await?;
+    let project_id = fetch_project_id(client, &token.access_token, user_agent).await?;
     if project_id.trim().is_empty() {
         return Err(anyhow!(
             "antigravity: project ID discovery returned empty project"
@@ -135,6 +147,7 @@ pub async fn ensure_fresh(
     client: &Client,
     dir: &std::path::Path,
     cred: &mut AntigravityCredential,
+    request_ua: Option<&str>,
 ) -> Result<()> {
     if !cred.is_fresh(SystemTime::now(), REFRESH_SKEW_SECS) {
         let token = refresh_token(client, &cred.refresh_token).await?;
@@ -146,7 +159,7 @@ pub async fn ensure_fresh(
         cred.apply_tokens(token.access_token, new_refresh, token.expires_in);
     }
     if cred.project_id.trim().is_empty() {
-        match fetch_project_id(client, &cred.access_token).await {
+        match fetch_project_id(client, &cred.access_token, request_ua).await {
             Ok(id) if !id.is_empty() => cred.project_id = id,
             Ok(_) => {}
             Err(err) => tracing::warn!("antigravity: ensure project id failed: {err}"),

@@ -95,19 +95,32 @@ pub async fn exchange_code(
     decode_token(resp, "token exchange").await
 }
 
-pub async fn fetch_user_email(client: &Client, access_token: &str) -> Result<String> {
-    fetch_user_email_at(client, access_token, USERINFO_ENDPOINT).await
+pub async fn fetch_user_email(
+    client: &Client,
+    access_token: &str,
+    request_ua: Option<&str>,
+) -> Result<String> {
+    fetch_user_email_at(client, access_token, USERINFO_ENDPOINT, request_ua).await
 }
 
-async fn fetch_user_email_at(client: &Client, access_token: &str, url: &str) -> Result<String> {
+async fn fetch_user_email_at(
+    client: &Client,
+    access_token: &str,
+    url: &str,
+    request_ua: Option<&str>,
+) -> Result<String> {
     let token = access_token.trim();
     if token.is_empty() {
         return Err(anyhow!("antigravity userinfo: missing access token"));
     }
+    let ua = request_ua
+        .map(str::trim)
+        .filter(|s| !s.is_empty())
+        .unwrap_or(super::constants::REQUEST_UA);
     let resp = client
         .get(url)
         .header("Authorization", format!("Bearer {token}"))
-        .header("User-Agent", super::constants::REQUEST_UA)
+        .header("User-Agent", ua)
         .send()
         .await
         .context("antigravity userinfo")?;
@@ -257,7 +270,7 @@ mod tests {
                 padded_json(r#"{"email":" test@example.com "}"#, len),
             )
             .await;
-            let result = fetch_user_email_at(&client, "tok", &server.url).await;
+            let result = fetch_user_email_at(&client, "tok", &server.url, None).await;
             if expected.is_empty() {
                 assert_eq!(result.unwrap(), "test@example.com");
             } else {

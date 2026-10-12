@@ -821,11 +821,18 @@ async fn cmd_antigravity_login(
 ) -> Result<()> {
     let cfg = load_optional_config(config_path);
     let proxy_url = cfg.as_ref().and_then(|c| c.server.proxy_url.clone());
+    let user_agent = Some(
+        build_user_agents(cfg.as_ref().and_then(|c| c.user_agents.as_ref()))
+            .antigravity
+            .as_str()
+            .to_string(),
+    );
     let opts = AntigravityLoginOptions {
         auth_dir: antigravity_auth_dir_from(config_path, auth_dir),
         no_browser,
         callback_port: callback_port.unwrap_or(CALLBACK_PORT),
         proxy_url,
+        user_agent,
     };
     run_antigravity_login(opts).await?;
     reload_after_login(config_path).await;

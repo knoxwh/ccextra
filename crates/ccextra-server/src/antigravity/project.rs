@@ -1,7 +1,7 @@
 // project_id:loadCodeAssist,空则 daily onboardUser 轮询
 
 use super::constants::{
-    API_ENDPOINT, API_VERSION, DAILY_API_ENDPOINT, GOOG_API_CLIENT, ONBOARD_UA, REQUEST_UA,
+    onboard_ua, API_ENDPOINT, API_VERSION, DAILY_API_ENDPOINT, GOOG_API_CLIENT, REQUEST_UA,
 };
 use anyhow::{anyhow, Context, Result};
 use reqwest::Client;
@@ -53,9 +53,20 @@ pub fn default_tier_id(load: &Value) -> String {
     "free-tier".into()
 }
 
-pub async fn fetch_project_id(client: &Client, access_token: &str) -> Result<String> {
+fn resolve_request_ua(request_ua: Option<&str>) -> &str {
+    request_ua
+        .map(str::trim)
+        .filter(|s| !s.is_empty())
+        .unwrap_or(REQUEST_UA)
+}
+
+pub async fn fetch_project_id(
+    client: &Client,
+    access_token: &str,
+    request_ua: Option<&str>,
+) -> Result<String> {
     let url = format!("{API_ENDPOINT}/{API_VERSION}:loadCodeAssist");
-    fetch_project_id_at(client, &url, access_token).await
+    fetch_project_id_at(client, &url, access_token, request_ua).await
 }
 
 /// 按给定端点获取 project id;URL 参数化便于接线测试
@@ -63,14 +74,16 @@ pub(crate) async fn fetch_project_id_at(
     client: &Client,
     url: &str,
     access_token: &str,
+    request_ua: Option<&str>,
 ) -> Result<String> {
+    let ua = resolve_request_ua(request_ua);
     let body = json!({"metadata": {"ideType": "ANTIGRAVITY"}});
     let resp = client
         .post(url)
         .header("Authorization", format!("Bearer {access_token}"))
         .header("Accept", "*/*")
         .header("Content-Type", "application/json")
-        .header("User-Agent", REQUEST_UA)
+        .header("User-Agent", ua)
         .json(&body)
         .send()
         .await
@@ -93,7 +106,7 @@ pub(crate) async fn fetch_project_id_at(
     if !project.is_empty() {
         return Ok(project);
     }
-    let project = onboard_user(client, access_token, &default_tier_id(&load)).await?;
+    let project = onboard_user(client, access_token, &default_tier_id(&load), Some(ua)).await?;
     if project.is_empty() {
         return Err(anyhow!(
             "project id not found in loadCodeAssist or onboardUser response"
@@ -102,9 +115,14 @@ pub(crate) async fn fetch_project_id_at(
     Ok(project)
 }
 
-pub async fn onboard_user(client: &Client, access_token: &str, tier_id: &str) -> Result<String> {
+pub async fn onboard_user(
+    client: &Client,
+    access_token: &str,
+    tier_id: &str,
+    request_ua: Option<&str>,
+) -> Result<String> {
     let url = format!("{DAILY_API_ENDPOINT}/{API_VERSION}:onboardUser");
-    onboard_user_at(client, &url, access_token, tier_id).await
+    onboard_user_at(client, &url, access_token, tier_id, request_ua).await
 }
 
 /// 按给定端点执行 onboardUser 轮询;URL 参数化便于接线测试
@@ -113,7 +131,9 @@ pub(crate) async fn onboard_user_at(
     url: &str,
     access_token: &str,
     tier_id: &str,
+    request_ua: Option<&str>,
 ) -> Result<String> {
+    let onboard = onboard_ua(resolve_request_ua(request_ua));
     let body = json!({
         "tier_id": tier_id,
         "metadata": {
@@ -128,7 +148,7 @@ pub(crate) async fn onboard_user_at(
             .header("Authorization", format!("Bearer {access_token}"))
             .header("Accept", "*/*")
             .header("Content-Type", "application/json")
-            .header("User-Agent", ONBOARD_UA)
+            .header("User-Agent", &onboard)
             .header("X-Goog-Api-Client", GOOG_API_CLIENT)
             .json(&body)
             .send()
@@ -228,9 +248,9 @@ mod tests {
             ] {
                 let server = TestServer::reply(status, padded_json(json, len)).await;
                 let result = if onboard {
-                    onboard_user_at(&client, &server.url, "tok", "free-tier").await
+                    onboard_user_at(&client, &server.url, "tok", "free-tier", None).await
                 } else {
-                    fetch_project_id_at(&client, &server.url, "tok").await
+                    fetch_project_id_at(&client, &server.url, "tok", None).await
                 };
                 if expected.is_empty() {
                     assert_eq!(result.unwrap(), "proj-1");
