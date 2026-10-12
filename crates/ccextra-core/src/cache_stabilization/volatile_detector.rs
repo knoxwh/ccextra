@@ -199,14 +199,31 @@ fn is_responses_direct_tool(tool: &Value) -> bool {
 }
 
 fn walk_openai(body: &Value, out: &mut Vec<VolatileFinding>) {
-    // 只扫描缓存的 PREFIX 区域：instructions（Responses 的 system prompt）
-    // + tools。messages[] / input[] 中的条目故意不扫描：
-    // cache prefix 仅由 instructions + tools 派生，扫描只会产生噪音
-    // （历史 tool_result 时间戳/UUID）。
+    // 只扫描缓存的 PREFIX 区域：instructions（Responses）+ Chat/Responses
+    // 的 system|developer 消息 + tools。user/assistant/tool 条目不扫描，
+    // 避免历史 tool_result 时间戳/UUID 噪音。
     if let Some(Value::String(instructions)) = body.get("instructions") {
         scan_string(instructions, "instructions", out);
     } else if let Some(instructions) = body.get("instructions") {
         scan_value_for_strings(instructions, "instructions", out);
+    }
+    // Chat: messages[role=system|developer]；Responses: input[] 同角色
+    for key in ["messages", "input"] {
+        if let Some(Value::Array(items)) = body.get(key) {
+            for (i, item) in items.iter().enumerate() {
+                if out.len() >= MAX_FINDINGS_PER_REQUEST {
+                    return;
+                }
+                let role = item.get("role").and_then(|r| r.as_str()).unwrap_or("");
+                if role != "system" && role != "developer" {
+                    continue;
+                }
+                if let Some(content) = item.get("content") {
+                    let loc = format!("{key}[{i}].content");
+                    scan_value_for_strings(content, &loc, out);
+                }
+            }
+        }
     }
     // tools[].function.description + tools[].function.parameters
     // Responses 直接 tool 形态：tools[].description + tools[].parameters
@@ -1267,6 +1284,48 @@ mod tests {
                 .contains("2026/03/04"),
             "user content outside reminder stays"
         );
+    }
+
+    #[test]
+    fn openai_walker_scans_system_and_developer_messages() {
+        let body = json!({
+            "messages": [
+                {"role": "system", "content": "Today is 2026-05-04T14:30:00Z."},
+                {"role": "developer", "content": [{"type": "text", "text": "trace 550e8400-e29b-41d4-a716-446655440000"}]},
+                {"role": "user", "content": "user has 2026-05-04T99:99:99Z and 550e8400-e29b-41d4-a716-446655440001"},
+            ],
+        });
+        let findings = detect_volatile_content(&body, ApiKind::OpenAi);
+        assert!(
+            findings.iter().any(|f| f.kind == VolatileKind::Timestamp && f.location.starts_with("messages[0]")),
+            "system message timestamp: {findings:?}"
+        );
+        assert!(
+            findings
+                .iter()
+                .any(|f| f.kind == VolatileKind::Uuid && f.location.starts_with("messages[1]")),
+            "developer message uuid: {findings:?}"
+        );
+        assert!(
+            findings
+                .iter()
+                .all(|f| !f.location.starts_with("messages[2]")),
+            "user messages must not be scanned: {findings:?}"
+        );
+    }
+
+    #[test]
+    fn openai_walker_scans_input_system_roles() {
+        let body = json!({
+            "input": [
+                {"role": "system", "content": "started at 2026-05-04T10:00:00Z"},
+                {"role": "user", "content": "ignore 2026-05-04T11:00:00Z"},
+            ],
+        });
+        let findings = detect_volatile_content(&body, ApiKind::OpenAi);
+        assert_eq!(findings.len(), 1);
+        assert_eq!(findings[0].kind, VolatileKind::Timestamp);
+        assert!(findings[0].location.starts_with("input[0]"));
     }
 
     // ─── input[] 中的 system/developer 消息会被剥离 ─────────

@@ -28,8 +28,9 @@ use crate::route::Protocol;
 /// 归一化命中的计数,便于测试与日志
 ///
 /// `volatile_count` 现在计 dateline 指纹句改写个数(撇号/分隔符隐写还原,
-/// 对齐 sub2api);占位符式 volatile strip 已下线。检测告警仍跑(full
-/// 管线只读 WARN)。pretransform 不跑 dateline,该字段恒 0。
+/// 对齐 sub2api);占位符式 volatile strip 已下线。检测告警只读 WARN。
+/// OpenAI pretransform 不跑 dateline(改由 post),该字段恒 0;
+/// Gemini/Antigravity/Cursor pre 与 full/post 会写入改写数。
 #[derive(Debug, Default, Clone, Copy, PartialEq, Eq)]
 pub struct NormalizeCounts {
     pub tool_sorted: bool,
@@ -61,7 +62,7 @@ pub enum TargetShape {
 ///
 /// drift 观测(compute_structural_hash + observe_drift)需要 DriftState,
 /// 由 server 层在调用本函数后单独执行。
-pub fn normalize_anthropic_full(body: &mut Value) -> NormalizeCounts {
+pub fn normalize_anthropic_full(body: &mut Value, request_id: &str) -> NormalizeCounts {
     let mut counts = NormalizeCounts::default();
 
     // 1. tool_def 排序 + schema 键递归排序
@@ -94,7 +95,7 @@ pub fn normalize_anthropic_full(body: &mut Value) -> NormalizeCounts {
     // 7. volatile 检测→告警(只读,不改 body)
     let findings = detect_volatile_content(body, VolatileApiKind::Anthropic);
     if !findings.is_empty() {
-        emit_volatile_warnings(&findings, "unknown");
+        emit_volatile_warnings(&findings, request_id);
     }
 
     counts
@@ -115,8 +116,14 @@ pub fn normalize_anthropic_full(body: &mut Value) -> NormalizeCounts {
 ///   parts,转换前必须跑 rstrip 修掉 #48734 尾部空白漂移,否则漂移字节
 ///   直通出站 body 打掉隐式前缀缓存
 ///
-/// dateline 归一化与 volatile detect 告警仍只在 full 管线运行。
-pub fn normalize_anthropic_pretransform(body: &mut Value, protocol: Protocol) -> NormalizeCounts {
+/// dateline 与 volatile detect：
+/// - openai_chat / openai_responses：转换后由 `normalize_target_post` 覆盖
+/// - gemini / antigravity / cursor_sdk：转换前补跑（body 仍为 Anthropic 形）
+pub fn normalize_anthropic_pretransform(
+    body: &mut Value,
+    protocol: Protocol,
+    request_id: &str,
+) -> NormalizeCounts {
     let mut tool_sorted = false;
 
     // tool_def 排序 + schema 键递归排序
@@ -134,16 +141,20 @@ pub fn normalize_anthropic_pretransform(body: &mut Value, protocol: Protocol) ->
     let smoosh_count = split_smooshed_reminders(body, DriftApiKind::Anthropic);
     let tool_input_count = normalize_tool_use_inputs(body, DriftApiKind::Anthropic);
 
-    // 无 post-transform 的协议:转换前补 sort + rstrip
-    let (sort_count, rstrip_count) =
-        if matches!(protocol, Protocol::OpenAiChat | Protocol::OpenAiResponses) {
-            (0, 0)
-        } else {
-            (
-                stabilize_block_sort(body, DriftApiKind::Anthropic),
-                normalize_reminder_trailing_whitespace(body, DriftApiKind::Anthropic),
-            )
-        };
+    // 无 post-transform 的协议:转换前补 sort + rstrip + dateline + volatile WARN
+    let is_openai = matches!(protocol, Protocol::OpenAiChat | Protocol::OpenAiResponses);
+    let (sort_count, rstrip_count, volatile_count) = if is_openai {
+        (0, 0, 0)
+    } else {
+        let sort_count = stabilize_block_sort(body, DriftApiKind::Anthropic);
+        let rstrip_count = normalize_reminder_trailing_whitespace(body, DriftApiKind::Anthropic);
+        let volatile_count = normalize_client_dateline(body, VolatileApiKind::Anthropic);
+        let findings = detect_volatile_content(body, VolatileApiKind::Anthropic);
+        if !findings.is_empty() {
+            emit_volatile_warnings(&findings, request_id);
+        }
+        (sort_count, rstrip_count, volatile_count)
+    };
 
     NormalizeCounts {
         tool_sorted,
@@ -151,20 +162,25 @@ pub fn normalize_anthropic_pretransform(body: &mut Value, protocol: Protocol) ->
         tool_input_count,
         sort_count,
         rstrip_count,
-        volatile_count: 0,
+        volatile_count,
     }
 }
 
-/// 转换后目标 body 二次归一化:tool_def + sort + rstrip + dateline 归一化
+/// 转换后目标 body 二次归一化:tool_def + sort + rstrip + dateline + volatile WARN
 ///
 /// 顺序(post-transform):
 /// 1. tool_def 归一化(按 chat / responses 形状区分)
 /// 2. system reminder 列表块排序(CC 注入的 skills/deferred 列表顺序不稳定)
 /// 3. 尾部 reminder 空白归一化(CC 重序列化历史内容时字节漂移 #48734)
 /// 4. 客户端 dateline 归一化(撇号/分隔符隐写还原,对齐 sub2api)
+/// 5. volatile 检测→告警(只读,不改 body)
 ///
 /// 排序在 rstrip 前,两条归一化都落在 drift 检测前。
-pub fn normalize_target_post(body: &mut Value, shape: TargetShape) -> NormalizeCounts {
+pub fn normalize_target_post(
+    body: &mut Value,
+    shape: TargetShape,
+    request_id: &str,
+) -> NormalizeCounts {
     let mut counts = NormalizeCounts::default();
 
     // 1. tool_def 归一化
@@ -192,6 +208,12 @@ pub fn normalize_target_post(body: &mut Value, shape: TargetShape) -> NormalizeC
     // 4. 客户端 dateline 归一化(openai 两种形状共用;对齐 sub2api)
     counts.volatile_count = normalize_client_dateline(body, VolatileApiKind::OpenAi);
 
+    // 5. volatile 检测→告警(只读,不改 body)
+    let findings = detect_volatile_content(body, VolatileApiKind::OpenAi);
+    if !findings.is_empty() {
+        emit_volatile_warnings(&findings, request_id);
+    }
+
     counts
 }
 
@@ -211,7 +233,7 @@ mod tests {
             "messages": [{"role": "user", "content": "hi"}]
         });
 
-        let counts = normalize_anthropic_full(&mut body);
+        let counts = normalize_anthropic_full(&mut body, "test");
 
         assert!(counts.tool_sorted);
         assert_eq!(body["tools"][0]["name"], "a_tool");
@@ -228,7 +250,7 @@ mod tests {
             ]
         });
 
-        let counts = normalize_anthropic_pretransform(&mut body, Protocol::OpenAiChat);
+        let counts = normalize_anthropic_pretransform(&mut body, Protocol::OpenAiChat, "test");
         assert_eq!(counts.rstrip_count, 0, "openai_chat 转换前跳过 rstrip");
         assert_eq!(counts.sort_count, 0, "openai_chat 转换前跳过 sort");
         let text = body["messages"][0]["content"][0]["text"].as_str().unwrap();
@@ -243,7 +265,7 @@ mod tests {
                     ]}
                 ]
             });
-            let counts = normalize_anthropic_pretransform(&mut body, protocol);
+            let counts = normalize_anthropic_pretransform(&mut body, protocol, "test");
             assert!(counts.rstrip_count > 0, "{protocol:?} 转换前应 rstrip");
             let text = body["messages"][0]["content"][0]["text"].as_str().unwrap();
             assert!(
@@ -264,7 +286,7 @@ mod tests {
             "messages": [{"role": "user", "content": "hi"}]
         });
 
-        let counts = normalize_anthropic_pretransform(&mut body, Protocol::Gemini);
+        let counts = normalize_anthropic_pretransform(&mut body, Protocol::Gemini, "test");
 
         // pretransform 现在排序 tool_def(提升 gemini/antigravity 缓存命中)
         assert!(
@@ -305,8 +327,8 @@ mod tests {
             json!({"path": "/p", "content": "c"}),
         );
 
-        let counts_a = normalize_anthropic_pretransform(&mut a, Protocol::Gemini);
-        normalize_anthropic_pretransform(&mut b, Protocol::Gemini);
+        let counts_a = normalize_anthropic_pretransform(&mut a, Protocol::Gemini, "test");
+        normalize_anthropic_pretransform(&mut b, Protocol::Gemini, "test");
 
         let keys = |body: &Value| -> Vec<String> {
             body["messages"][0]["content"][0]["input"]
@@ -341,7 +363,7 @@ mod tests {
             "messages": [{"role": "user", "content": "hi"}]
         });
 
-        let counts = normalize_anthropic_pretransform(&mut body, Protocol::Gemini);
+        let counts = normalize_anthropic_pretransform(&mut body, Protocol::Gemini, "test");
 
         assert!(counts.tool_sorted, "multiple tools should be sorted");
         assert_eq!(body["tools"][0]["name"], "a_tool");
@@ -360,7 +382,7 @@ mod tests {
             "messages": [{"role": "user", "content": "hi"}]
         });
 
-        let counts = normalize_target_post(&mut body, TargetShape::OpenAiChat);
+        let counts = normalize_target_post(&mut body, TargetShape::OpenAiChat, "test");
 
         assert!(counts.tool_sorted);
     }
@@ -376,7 +398,7 @@ mod tests {
             ]
         });
 
-        let counts = normalize_target_post(&mut body, TargetShape::OpenAiChat);
+        let counts = normalize_target_post(&mut body, TargetShape::OpenAiChat, "test");
 
         assert!(counts.sort_count > 0, "skill listing should be sorted");
         let content = body["messages"][0]["content"].as_str().unwrap();
@@ -396,7 +418,7 @@ mod tests {
             ]
         });
 
-        let counts = normalize_target_post(&mut body, TargetShape::OpenAiChat);
+        let counts = normalize_target_post(&mut body, TargetShape::OpenAiChat, "test");
 
         assert!(
             counts.rstrip_count > 0,
@@ -419,14 +441,69 @@ mod tests {
             ]
         });
 
-        let c1 = normalize_target_post(&mut body, TargetShape::OpenAiChat);
+        let c1 = normalize_target_post(&mut body, TargetShape::OpenAiChat, "test");
         let snapshot = body.clone();
-        let c2 = normalize_target_post(&mut body, TargetShape::OpenAiChat);
+        let c2 = normalize_target_post(&mut body, TargetShape::OpenAiChat, "test");
 
         assert!(c1.sort_count > 0, "skill listing should sort");
         assert!(c1.rstrip_count > 0, "trailing whitespace should collapse");
         assert_eq!(c2.sort_count, 0, "second pass must not re-sort");
         assert_eq!(c2.rstrip_count, 0, "second pass must not re-rstrip");
         assert_eq!(body, snapshot, "second pass must be byte-identical");
+    }
+
+    #[test]
+    fn test_pretransform_non_openai_runs_dateline() {
+        let stego = "Today\u{2019}s date is 2026/07/01.";
+        for protocol in [Protocol::Gemini, Protocol::Antigravity, Protocol::CursorSdk] {
+            let mut body = json!({
+                "system": stego,
+                "messages": [{"role": "user", "content": "hi"}]
+            });
+            let counts = normalize_anthropic_pretransform(&mut body, protocol, "test");
+            assert!(
+                counts.volatile_count > 0,
+                "{protocol:?} should rewrite dateline"
+            );
+            assert_eq!(body["system"], "Today's date is 2026-07-01.");
+        }
+
+        let mut openai_body = json!({
+            "system": stego,
+            "messages": [{"role": "user", "content": "hi"}]
+        });
+        let counts =
+            normalize_anthropic_pretransform(&mut openai_body, Protocol::OpenAiChat, "test");
+        assert_eq!(counts.volatile_count, 0, "openai pre skips dateline");
+        assert_eq!(
+            openai_body["system"], stego,
+            "openai pre must not touch dateline"
+        );
+    }
+
+    #[test]
+    fn test_target_post_detects_volatile_in_chat_system() {
+        use crate::cache_stabilization::volatile_detector::{detect_volatile_content, ApiKind};
+        let mut body = json!({
+            "model": "test",
+            "messages": [
+                {"role": "system", "content": "Today is 2026-05-04T14:30:00Z."},
+                {"role": "user", "content": "hi"}
+            ]
+        });
+        let _ = normalize_target_post(&mut body, TargetShape::OpenAiChat, "req-test");
+        let findings = detect_volatile_content(&body, ApiKind::OpenAi);
+        assert!(
+            !findings.is_empty(),
+            "chat system timestamp should be detectable after post: {findings:?}"
+        );
+        // detect is read-only; body system text unchanged by detect itself
+        assert!(
+            body["messages"][0]["content"]
+                .as_str()
+                .unwrap()
+                .contains("2026-05-04T14:30:00"),
+            "volatile detect must not strip timestamps"
+        );
     }
 }

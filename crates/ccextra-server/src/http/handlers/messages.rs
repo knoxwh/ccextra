@@ -275,6 +275,10 @@ pub(crate) async fn prepare_message_request(
     let drift_enabled = config_snapshot.runtime.normalize.drift_detector;
     let log_request_body = config_snapshot.runtime.logging.request_body;
     let thinking_registry = &config_snapshot.runtime.thinking_registry;
+    let request_id = headers
+        .get("x-request-id")
+        .and_then(|v| v.to_str().ok())
+        .unwrap_or("unknown");
 
     if log_request_body {
         tracing::debug!("请求体: {}", String::from_utf8_lossy(body_bytes));
@@ -298,11 +302,12 @@ pub(crate) async fn prepare_message_request(
     if normalize_enabled {
         match route.protocol {
             Protocol::Claude => {
-                let counts = normalize_anthropic_full(&mut body_json);
+                let counts = normalize_anthropic_full(&mut body_json, request_id);
                 tracing::debug!(?counts, "normalize_anthropic_full");
             }
             _ => {
-                let counts = normalize_anthropic_pretransform(&mut body_json, route.protocol);
+                let counts =
+                    normalize_anthropic_pretransform(&mut body_json, route.protocol, request_id);
                 tracing::debug!(?counts, protocol = ?route.protocol, "normalize_anthropic_pretransform");
             }
         }
@@ -361,7 +366,7 @@ pub(crate) async fn prepare_message_request(
         Protocol::OpenAiChat => {
             convert_to_openai_chat_with(&mut body_json, &route.upstream_model, thinking_registry)?;
             if normalize_enabled {
-                normalize_target_post(&mut body_json, TargetShape::OpenAiChat);
+                normalize_target_post(&mut body_json, TargetShape::OpenAiChat, request_id);
             }
             // drift 仅观测：转换 + post-normalize 之后（与 normalize.enabled 独立）
             maybe_observe_request_drift(
@@ -382,7 +387,7 @@ pub(crate) async fn prepare_message_request(
                 tool_names = Some(Arc::new(rev));
             }
             if normalize_enabled {
-                normalize_target_post(&mut body_json, TargetShape::OpenAiResponses);
+                normalize_target_post(&mut body_json, TargetShape::OpenAiResponses, request_id);
             }
             // drift 仅观测：post-normalize 之后、replay 注入之前
             maybe_observe_request_drift(
