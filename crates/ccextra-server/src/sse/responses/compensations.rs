@@ -169,10 +169,10 @@ pub fn map_stop_reason(stop_reason: &str, has_tool_use: bool) -> String {
     }
 }
 
-/// tool id 清洗:非法字符 → _,超 64 截断
+/// tool id 清洗:非法字符 → _,超 64 用 hash shorten
 /// (对齐 SanitizeClaudeToolID + shortenCodexCallIDIfNeeded)
 pub fn sanitize_tool_id(id: &str) -> String {
-    let mut out: String = id
+    let out: String = id
         .chars()
         .map(|c| {
             if c.is_ascii_alphanumeric() || c == '_' || c == '-' {
@@ -182,8 +182,21 @@ pub fn sanitize_tool_id(id: &str) -> String {
             }
         })
         .collect();
-    if out.len() > 64 {
-        out.truncate(64);
+    shorten_if_needed(&out)
+}
+
+/// 超 64 字符确定性截短(对齐 shortenCodexCallIDIfNeeded / shorten_call_id)
+fn shorten_if_needed(id: &str) -> String {
+    const LIMIT: usize = 64;
+    if id.len() <= LIMIT {
+        return id.to_string();
     }
-    out
+    use sha2::{Digest, Sha256};
+    let digest = Sha256::digest(id.as_bytes());
+    let suffix = format!("_{}", hex::encode(&digest[..8]));
+    let mut prefix_len = LIMIT.saturating_sub(suffix.len());
+    while prefix_len > 0 && !id.is_char_boundary(prefix_len) {
+        prefix_len -= 1;
+    }
+    format!("{}{}", &id[..prefix_len], suffix)
 }

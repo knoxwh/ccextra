@@ -618,7 +618,21 @@ fn test_sanitize_tool_id() {
     assert_eq!(sanitize_tool_id("call_abc-123"), "call_abc-123");
     assert_eq!(sanitize_tool_id("a.b/c"), "a_b_c");
     let long = "x".repeat(100);
-    assert_eq!(sanitize_tool_id(&long).len(), 64);
+    let short = sanitize_tool_id(&long);
+    assert_eq!(short.len(), 64);
+    assert!(
+        short.contains('_'),
+        "hash shorten should insert _suffix: {short}"
+    );
+    // 确定性:同输入同输出
+    assert_eq!(sanitize_tool_id(&long), short);
+    // 不同长输入不碰撞
+    let other = sanitize_tool_id(&"y".repeat(100));
+    assert_ne!(short, other);
+    // 后缀为 _ + 16 hex
+    let suffix = short.rsplit_once('_').expect("suffix").1;
+    assert_eq!(suffix.len(), 16);
+    assert!(suffix.chars().all(|c| c.is_ascii_hexdigit()));
 }
 
 #[test]
