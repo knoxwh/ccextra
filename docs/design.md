@@ -49,9 +49,9 @@ ccextra 将 Anthropic Messages 入口接到不同上游协议，同时尽量保�
 
 ## 缓存稳定化
 
-归一化保持幂等。Claude 直通运行完整流程：工具和 schema 排序、历史 reminder 拆分、`tool_use.input` 键序、system 列表、尾部空白和客户端日期指纹。转换路径先运行适合 Anthropic 输入的确定性子集；OpenAI 输出随后排序工具/schema、system reminder 和日期字段。
+归一化保持幂等。Claude 直通运行完整流程：工具和 schema 排序、历史 reminder 拆分、`tool_use.input` 键序、system 列表、尾部空白、客户端日期指纹，以及对前缀的 volatile 只读 WARN。转换路径先运行适合 Anthropic 输入的确定性子集；Gemini / Antigravity / Cursor 在转换前补跑日期指纹与 volatile WARN。OpenAI 输出随后排序工具/schema、system reminder、日期字段，并做 volatile WARN（Chat 的 system/developer 消息计入前缀扫描）。
 
-`drift_detector` 对同一会话的结构哈希发出告警，不修改请求。Gemini 与 Antigravity 不做转换后归一化或 drift 观测，避免将 Anthropic 规则施加到 Gemini 形状。
+`drift_detector` 对同一会话的结构哈希发出告警，不修改请求；仅 Claude 与 OpenAI 路径接线。Gemini、Antigravity 与 Cursor 不做转换后归一化或 drift 观测，避免将 Anthropic/OpenAI 规则施加到 Gemini 或 Cursor 出站形状。
 
 ## 协议转换
 
