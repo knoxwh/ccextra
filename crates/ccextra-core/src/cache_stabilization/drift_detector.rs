@@ -644,6 +644,29 @@ pub fn observe_drift(state: &DriftState, identity: &SessionIdentity, current: St
     }
 }
 
+/// 热路径入口：按开关观测结构漂移。**绝不修改** `body`。
+///
+/// - `enabled == false`：直接返回
+/// - [`is_ancillary_request`]：跳过（避免标题生成等后台请求污染会话基线）
+/// - 否则：`derive_session_key` → `compute_structural_hash` → [`observe_drift`]
+pub fn maybe_observe_request_drift(
+    enabled: bool,
+    state: &DriftState,
+    headers: &HeaderMap,
+    body: &Value,
+    kind: ApiKind,
+) {
+    if !enabled {
+        return;
+    }
+    if is_ancillary_request(body, kind) {
+        return;
+    }
+    let identity = derive_session_key(headers, body, kind);
+    let hash = compute_structural_hash(body, kind);
+    observe_drift(state, &identity, hash);
+}
+
 /// 记录会话级漂移（early_messages 变化）。
 /// 在可用时发出带详细差异信息的 DEBUG 级日志。
 fn log_conversation_drift(
@@ -1873,5 +1896,45 @@ mod tests {
                 case.name
             );
         }
+    }
+
+    #[test]
+    fn maybe_observe_disabled_is_noop() {
+        let state = make_state();
+        let headers = anthropic_headers();
+        let body = anthropic_body("sys", json!([{"name": "bash"}]), vec!["hi", "more"]);
+        let before = serde_json::to_vec(&body).unwrap();
+        maybe_observe_request_drift(false, &state, &headers, &body, ApiKind::Anthropic);
+        assert_eq!(state.cache.lock().unwrap().0.len(), 0);
+        assert_eq!(serde_json::to_vec(&body).unwrap(), before);
+    }
+
+    #[test]
+    fn maybe_observe_skips_ancillary() {
+        let state = make_state();
+        let headers = anthropic_headers();
+        let body = json!({
+            "model": "claude-3-5-sonnet-20241022",
+            "system": "you are an assistant",
+            "tools": [],
+            "messages": [{"role": "user", "content": "Write the title"}],
+        });
+        let before = serde_json::to_vec(&body).unwrap();
+        maybe_observe_request_drift(true, &state, &headers, &body, ApiKind::Anthropic);
+        assert_eq!(state.cache.lock().unwrap().0.len(), 0);
+        assert_eq!(serde_json::to_vec(&body).unwrap(), before);
+    }
+
+    #[test]
+    fn maybe_observe_records_and_does_not_mutate() {
+        let state = make_state();
+        let headers = anthropic_headers();
+        let body = anthropic_body("sys", json!([{"name": "bash"}]), vec!["hi", "more"]);
+        let before = serde_json::to_vec(&body).unwrap();
+        maybe_observe_request_drift(true, &state, &headers, &body, ApiKind::Anthropic);
+        assert_eq!(state.cache.lock().unwrap().0.len(), 1);
+        maybe_observe_request_drift(true, &state, &headers, &body, ApiKind::Anthropic);
+        assert_eq!(state.cache.lock().unwrap().0.len(), 1);
+        assert_eq!(serde_json::to_vec(&body).unwrap(), before);
     }
 }

@@ -38,7 +38,8 @@ pub mod tool_input_normalize;
 pub mod volatile_detector;
 
 pub use drift_detector::{
-    compute_structural_hash, derive_session_key, observe_drift, ApiKind as DriftApiKind, DriftState,
+    compute_structural_hash, derive_session_key, maybe_observe_request_drift, observe_drift,
+    ApiKind as DriftApiKind, DriftState,
 };
 pub use reminder_rstrip::normalize_reminder_trailing_whitespace;
 pub use smoosh_split::split_smooshed_reminders;

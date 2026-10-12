@@ -5,6 +5,7 @@ use axum::{
     response::Response,
 };
 use bytes::Bytes;
+use ccextra_core::cache_stabilization::{maybe_observe_request_drift, DriftApiKind};
 use ccextra_core::convert::{
     clamp_passthrough_effort, convert_passthrough, convert_to_antigravity_with,
     convert_to_gemini_with_registry, convert_to_openai_chat_with, convert_to_openai_responses_with,
@@ -271,6 +272,7 @@ pub(crate) async fn prepare_message_request(
     config_snapshot: &crate::http::ConfigSnapshot,
 ) -> Result<PreparedMessageRequest, AppError> {
     let normalize_enabled = config_snapshot.runtime.normalize.enabled;
+    let drift_enabled = config_snapshot.runtime.normalize.drift_detector;
     let log_request_body = config_snapshot.runtime.logging.request_body;
     let thinking_registry = &config_snapshot.runtime.thinking_registry;
 
@@ -347,12 +349,28 @@ pub(crate) async fn prepare_message_request(
                     "claude 直通 effort 已钳制到模型支持档"
                 );
             }
+            // drift 仅观测：sanitize/effort 之后，避免计费指纹造成假 system 漂移
+            maybe_observe_request_drift(
+                drift_enabled,
+                &state.drift,
+                headers,
+                &body_json,
+                DriftApiKind::Anthropic,
+            );
         }
         Protocol::OpenAiChat => {
             convert_to_openai_chat_with(&mut body_json, &route.upstream_model, thinking_registry)?;
             if normalize_enabled {
                 normalize_target_post(&mut body_json, TargetShape::OpenAiChat);
             }
+            // drift 仅观测：转换 + post-normalize 之后（与 normalize.enabled 独立）
+            maybe_observe_request_drift(
+                drift_enabled,
+                &state.drift,
+                headers,
+                &body_json,
+                DriftApiKind::OpenAiChat,
+            );
         }
         Protocol::OpenAiResponses => {
             let rev = convert_to_openai_responses_with(
@@ -366,6 +384,14 @@ pub(crate) async fn prepare_message_request(
             if normalize_enabled {
                 normalize_target_post(&mut body_json, TargetShape::OpenAiResponses);
             }
+            // drift 仅观测：post-normalize 之后、replay 注入之前
+            maybe_observe_request_drift(
+                drift_enabled,
+                &state.drift,
+                headers,
+                &body_json,
+                DriftApiKind::OpenAiResponses,
+            );
             if let Some(sess) = cc_session.as_deref() {
                 let key = format!("{}:{}", route.upstream_model, sess);
                 if state.replay_cache.apply_to_body(
