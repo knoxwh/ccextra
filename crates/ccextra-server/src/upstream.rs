@@ -468,6 +468,7 @@ impl UpstreamClient {
             // 禁 Nagle:SSE 首帧/心跳/delta 都是小包,不等积压直接发,压 TTFT
             .tcp_nodelay(true)
             // HTTP/2 探活与空闲 Ping，防静默掉线(对齐 grok shared_http)
+            // 优先协商 HTTP/2，谈不上再走 HTTP/1.1（reqwest 默认 ALPN）
             .http2_keep_alive_interval(std::time::Duration::from_secs(15))
             .http2_keep_alive_timeout(std::time::Duration::from_secs(5))
             .http2_keep_alive_while_idle(true);
@@ -694,15 +695,7 @@ impl UpstreamClient {
             req = req.header(name, value);
         }
 
-        // Gemini:从 session_id 参数派生确定性 UUID,注入 x-vscode-sessionid
-        // (对齐 CPA 5907285:缓存正交隔离;Antigravity 对齐官方 Hub 与 CPA 严格不注入自定义头,规避 WAF 特征标记)
-        if matches!(protocol, Protocol::Gemini) {
-            if let Some(sid) = session_id {
-                let session_uuid = derive_session_uuid(sid);
-                req = req.header("x-vscode-sessionid", session_uuid);
-            }
-        }
-
+        // Gemini / Antigravity 均不注入 x-vscode-sessionid(现 CPA 与官方路径已无此硬编码头)
         for (name, value) in extra_headers {
             req = req.header(name, value);
         }
@@ -747,24 +740,6 @@ fn is_stale_connection(err: &anyhow::Error) -> bool {
         None => (false, false),
     };
     stale_by_classification(is_connect, is_timeout, err)
-}
-
-/// 从 Claude 入站头 x-session-id 派生确定性 UUID v4(对齐 CPA 5907285)
-fn derive_session_uuid(seed: &str) -> String {
-    use sha2::{Digest, Sha256};
-    let mut hasher = Sha256::new();
-    hasher.update(b"antigravity-session-v1:");
-    hasher.update(seed.as_bytes());
-    let hash = hasher.finalize();
-    // RFC 4122 v4 格式
-    format!(
-        "{:02x}{:02x}{:02x}{:02x}-{:02x}{:02x}-4{:01x}{:02x}-{:02x}{:02x}-{:02x}{:02x}{:02x}{:02x}{:02x}{:02x}",
-        hash[0], hash[1], hash[2], hash[3],
-        hash[4], hash[5],
-        hash[6] & 0x0f, hash[7],
-        (hash[8] & 0x3f) | 0x80, hash[9],
-        hash[10], hash[11], hash[12], hash[13], hash[14], hash[15]
-    )
 }
 
 /// 分类优先级:显式 connect/timeout 标志先判——建连失败/建连超时一律非
@@ -1003,36 +978,6 @@ mod tests {
         let padded = "  sess-abc  ";
         let h = grok_header_map(Protocol::OpenAiChat, "grok-4.6", Some(padded));
         assert_eq!(h.get("x-grok-conv-id").map(String::as_str), Some(padded));
-    }
-
-    #[test]
-    fn test_derive_session_uuid_deterministic() {
-        // 对齐 CPA 5907285:从 x-session-id 派生确定性 UUID v4
-        let uuid1 = derive_session_uuid("test-session-123");
-        let uuid2 = derive_session_uuid("test-session-123");
-        assert_eq!(uuid1, uuid2, "相同 session ID 必须派生相同 UUID");
-        assert_eq!(uuid1.len(), 36, "UUID 格式");
-        assert!(uuid1.contains('-'), "UUID 包含短横线");
-
-        // 验证 v4 格式（第3组第1字节高4位为4）
-        let parts: Vec<&str> = uuid1.split('-').collect();
-        assert_eq!(parts.len(), 5);
-        assert!(parts[2].starts_with('4'), "UUID v4 格式");
-
-        // 不同 session ID 派生不同 UUID
-        let uuid3 = derive_session_uuid("different");
-        assert_ne!(uuid1, uuid3);
-
-        // 验证盐前缀影响结果
-        let no_prefix = {
-            use sha2::{Digest, Sha256};
-            let hash = Sha256::digest(b"test-session-123");
-            format!(
-                "{:02x}{:02x}{:02x}{:02x}",
-                hash[0], hash[1], hash[2], hash[3]
-            )
-        };
-        assert!(!uuid1.starts_with(&no_prefix), "必须使用盐前缀");
     }
 
     #[test]
