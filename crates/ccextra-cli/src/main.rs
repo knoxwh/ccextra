@@ -309,7 +309,8 @@ async fn main() -> Result<()> {
         );
     }
 
-    // 动态加载 Antigravity providers
+    // 动态加载 Antigravity providers（UA 与 chat 同源）
+    let user_agents_early = build_user_agents(config.user_agents.as_ref());
     let antigravity_auth_dir = pin_auth_dir(
         &cli.config,
         config.auth_dir.as_deref(),
@@ -319,6 +320,7 @@ async fn main() -> Result<()> {
         &antigravity_auth_dir,
         config.server.proxy_url.as_deref(),
         config.antigravity_models.as_deref().unwrap_or(&[]),
+        Some(user_agents_early.antigravity.as_str()),
     )
     .await;
     if !antigravity_providers.is_empty() {
@@ -369,10 +371,12 @@ async fn main() -> Result<()> {
 
             // 重载时重新解析 auth_dir 并加载动态 providers
             let antigravity_auth_dir = pin_auth_dir(&config_path, cfg.auth_dir.as_deref(), resolve_antigravity_auth_dir);
+            let reload_ua = build_user_agents(cfg.user_agents.as_ref());
             let antigravity_providers = ccextra_server::antigravity::load_antigravity_providers(
                 &antigravity_auth_dir,
                 cfg.server.proxy_url.as_deref(),
                 cfg.antigravity_models.as_deref().unwrap_or(&[]),
+                Some(reload_ua.antigravity.as_str()),
             )
             .await;
 
@@ -625,6 +629,12 @@ fn provider_refresh_config(config_path: &str, config: &Config) -> ProviderRefres
             resolve_claude_auth_dir,
         )),
         antigravity_models: config.antigravity_models.clone(),
+        antigravity_user_agent: Some(
+            build_user_agents(config.user_agents.as_ref())
+                .antigravity
+                .as_str()
+                .to_string(),
+        ),
         cursor: cursor_config_from(config_path, config),
         proxy_url: config.server.proxy_url.clone(),
         static_providers: config.providers.clone(),
@@ -656,6 +666,7 @@ async fn load_refreshed_providers(
         auth_dir,
         refresh.proxy_url.as_deref(),
         refresh.antigravity_models.as_deref().unwrap_or(&[]),
+        refresh.antigravity_user_agent.as_deref(),
     )
     .await;
     if injected.is_empty() {
@@ -1048,7 +1059,8 @@ fn build_user_agents(config: Option<&config::UserAgents>) -> UserAgentSet {
     const DEFAULT_CLAUDE_CLI: &str = "claude-cli/2.1.258";
     const DEFAULT_CODEX_TUI: &str = "codex_cli_rs/0.153.3 (Mac OS 26.6.2; arm64)";
     const DEFAULT_GROK_VERSION: &str = "1.0.46";
-    const DEFAULT_ANTIGRAVITY: &str = "antigravity/hub/2.21.1 darwin/arm64";
+    // 与 antigravity::constants::REQUEST_UA 同源，禁止再写死一份版本
+    use ccextra_server::antigravity::constants::REQUEST_UA;
 
     UserAgentSet {
         claude_cli: Arc::new(
@@ -1069,7 +1081,7 @@ fn build_user_agents(config: Option<&config::UserAgents>) -> UserAgentSet {
         antigravity: Arc::new(
             config
                 .and_then(|c| c.antigravity.clone())
-                .unwrap_or_else(|| DEFAULT_ANTIGRAVITY.to_string()),
+                .unwrap_or_else(|| REQUEST_UA.to_string()),
         ),
     }
 }
@@ -1086,6 +1098,17 @@ mod tests {
     use ccextra_server::xai::resolve_auth_dir as resolve_xai_auth_dir;
     use std::io::Write;
     use std::path::PathBuf;
+
+    #[test]
+    fn antigravity_ua_defaults_to_request_ua_constant() {
+        use ccextra_server::antigravity::constants::{onboard_ua, ONBOARD_UA, REQUEST_UA};
+        assert_eq!(build_user_agents(None).antigravity.as_str(), REQUEST_UA);
+        assert!(ONBOARD_UA.starts_with(REQUEST_UA));
+        assert_eq!(
+            onboard_ua("antigravity/hub/9.9.9 linux/x64"),
+            "antigravity/hub/9.9.9 linux/x64 google-api-nodejs-client/10.3.0"
+        );
+    }
 
     #[test]
     fn grok_identity_defaults_to_current_pin_and_preserves_override() {

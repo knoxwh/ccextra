@@ -90,6 +90,8 @@ pub struct ProviderRefreshConfig {
     pub claude_auth_dir: Option<std::path::PathBuf>,
     /// Antigravity 模型白名单;空 = 全量
     pub antigravity_models: Option<Vec<String>>,
+    /// Antigravity hub UA（与 user_agents.antigravity / REQUEST_UA 同源）
+    pub antigravity_user_agent: Option<String>,
     /// Cursor 运行时配置;None = 未启用
     pub cursor: Option<crate::cursor::CursorConfig>,
     pub proxy_url: Option<String>,

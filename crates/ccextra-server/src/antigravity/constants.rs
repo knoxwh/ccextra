@@ -24,11 +24,26 @@ pub const API_VERSION: &str = "v1internal";
 
 /// 写死 hub 回退版本,不拉 updater manifest
 /// Cloud Code 拒绝 <2.9.0 客户端访问新模型,此版本必须 ≥2.9.0
-/// fetch_models 可传入自定义 UA,缺省回退此常量
-pub const REQUEST_UA: &str = "antigravity/hub/2.21.1 darwin/arm64";
-pub const ONBOARD_UA: &str = "antigravity/hub/2.21.1 darwin/arm64 google-api-nodejs-client/10.3.0";
+/// 聊天 UA（user_agents.antigravity）与 fetch_models / login 缺省同源，避免版本分裂。
+macro_rules! antigravity_hub_ua {
+    () => {
+        "antigravity/hub/2.21.1 darwin/arm64"
+    };
+}
+pub const REQUEST_UA: &str = antigravity_hub_ua!();
+/// 由同一 hub UA 字面量派生，禁止再手写一份版本号。
+pub const ONBOARD_UA: &str = concat!(antigravity_hub_ua!(), " google-api-nodejs-client/10.3.0");
 pub const GOOG_API_CLIENT: &str = "gl-node/22.21.1";
 pub const TOKEN_REFRESH_UA: &str = "Go-http-client/2.0";
+
+/// 配置覆盖 chat/hub UA 时，按同规则派生 onboard UA。
+pub fn onboard_ua(request_ua: &str) -> String {
+    let base = request_ua.trim();
+    if base.is_empty() {
+        return ONBOARD_UA.to_string();
+    }
+    format!("{base} google-api-nodejs-client/10.3.0")
+}
 
 /// 到期前 300s 视为需刷新(对齐 CPA antigravityRequestTokenSafetyWindow = 5 * time.Minute)
 pub const REFRESH_SKEW_SECS: i64 = 300;
