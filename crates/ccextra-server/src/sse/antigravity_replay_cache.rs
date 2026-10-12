@@ -138,10 +138,10 @@ impl AgReplayCache {
     /// 非流：从上游响应收集并提交账本。
     /// `request` 为 Antigravity body 的 `request` 子对象（含 contents）。
     pub fn store_from_response(&self, session_key: &str, request: &Value, response_body: &Value) {
-        match collect_ag_replay_from_response(request, response_body) {
-            Some(items) => self.replace_items(session_key, items),
-            None => {} // 非 terminal：不动缓存
+        if let Some(items) = collect_ag_replay_from_response(request, response_body) {
+            self.replace_items(session_key, items);
         }
+        // None: 非 terminal，不动缓存
     }
 
     fn evict_oldest_locked(map: &mut HashMap<String, Entry>, count: usize) {
