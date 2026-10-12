@@ -95,6 +95,10 @@ fn fixture_with(
         reload,
         drift: ccextra_core::cache_stabilization::drift_detector::DriftState::new(100),
         replay_cache: crate::sse::replay_cache::ReplayCache::new(Duration::from_secs(60), 100),
+        ag_replay_cache: crate::sse::antigravity_replay_cache::AgReplayCache::new(
+            Duration::from_secs(60),
+            100,
+        ),
         cursor: Arc::new(std::sync::RwLock::new(None)),
         cursor_sessions: super::session::CursorSessions::default(),
         last_input_tokens: Arc::new(Mutex::new(http::session_tokens::SessionTokenCache::new())),

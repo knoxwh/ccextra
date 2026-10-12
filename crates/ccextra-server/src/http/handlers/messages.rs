@@ -258,6 +258,8 @@ pub(crate) struct PreparedMessageRequest {
     pub estimated_input_tokens: Option<usize>,
     pub tool_names: Option<Arc<HashMap<String, String>>>,
     pub replay_scope: Option<(crate::sse::replay_cache::ReplayCache, String, String)>,
+    /// Antigravity thoughtSignature 账本 scope：(cache, "{model}:{session}")
+    pub ag_replay_scope: Option<(crate::sse::antigravity_replay_cache::AgReplayCache, String)>,
     pub signature_model: Option<Arc<str>>,
     pub token_scope: Option<crate::http::session_tokens::TokenCacheScope>,
 }
@@ -449,8 +451,21 @@ pub(crate) async fn prepare_message_request(
             if !short_to_original.is_empty() {
                 tool_names = Some(Arc::new(short_to_original));
             }
-            // Antigravity reasoning replay 不复用 Responses ReplayCache
-            // (input/encrypted_content)；独立账本在后续 commit 接线。
+            if ccextra_core::antigravity_uses_reasoning_replay(&route.upstream_model) {
+                if let Some(sess) = cc_session.as_deref() {
+                    let key = format!("{}:{}", route.upstream_model, sess);
+                    if state
+                        .ag_replay_cache
+                        .apply_to_antigravity_body(&key, &mut body_json)
+                    {
+                        tracing::debug!(
+                            session = %sess,
+                            model = %route.upstream_model,
+                            "antigravity reasoning replay 已注入"
+                        );
+                    }
+                }
+            }
         }
     }
 
@@ -731,6 +746,19 @@ pub(crate) async fn prepare_message_request(
         None
     };
 
+    let ag_replay_scope = if matches!(route.protocol, Protocol::Antigravity)
+        && ccextra_core::antigravity_uses_reasoning_replay(&route.upstream_model)
+    {
+        cc_session.as_deref().map(|s| {
+            (
+                state.ag_replay_cache.clone(),
+                format!("{}:{}", route.upstream_model, s),
+            )
+        })
+    } else {
+        None
+    };
+
     let signature_model: Option<Arc<str>> = matches!(route.protocol, Protocol::Antigravity)
         .then(|| Arc::from(route.upstream_model.as_str()));
 
@@ -749,6 +777,7 @@ pub(crate) async fn prepare_message_request(
         estimated_input_tokens,
         tool_names,
         replay_scope,
+        ag_replay_scope,
         signature_model,
         token_scope: session_id
             .map(|session| (Arc::clone(&state.last_input_tokens), session.to_string())),
@@ -1041,15 +1070,20 @@ pub(crate) async fn deliver_response(
         let body_bytes = crate::limits::read_success_body_or_anthropic(upstream.body).await?;
         if let Some((cache, key, fingerprint)) = prepared.replay_scope.as_ref() {
             if let Ok(v) = serde_json::from_slice::<Value>(&body_bytes) {
-                match prepared.route.protocol {
-                    Protocol::OpenAiResponses => {
-                        if v.get("object").and_then(|o| o.as_str()) == Some("response") {
-                            let wrapped = json!({"response": v});
-                            cache.store_from_completed(key, &wrapped, fingerprint);
-                        }
+                if matches!(prepared.route.protocol, Protocol::OpenAiResponses) {
+                    if v.get("object").and_then(|o| o.as_str()) == Some("response") {
+                        let wrapped = json!({"response": v});
+                        cache.store_from_completed(key, &wrapped, fingerprint);
                     }
-                    // Antigravity 不经 Responses store_from_completed
-                    _ => {}
+                }
+            }
+        }
+        if let Some((cache, key)) = prepared.ag_replay_scope.as_ref() {
+            if matches!(prepared.route.protocol, Protocol::Antigravity) {
+                if let Ok(v) = serde_json::from_slice::<Value>(&body_bytes) {
+                    if let Some(request) = prepared.body_json.get("request") {
+                        cache.store_from_response(key, request, &v);
+                    }
                 }
             }
         }

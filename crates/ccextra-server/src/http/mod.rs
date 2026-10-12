@@ -118,6 +118,8 @@ pub struct AppState {
     /// reasoning replay 缓存(会话 → 上一轮 replay 项;responses+grok 用,
     /// 对齐 CPA xai reasoning replay;server 层持有,core 无 IO)
     pub replay_cache: crate::sse::replay_cache::ReplayCache,
+    /// Antigravity thoughtSignature 账本(与 Responses ReplayCache 分离)
+    pub ag_replay_cache: crate::sse::antigravity_replay_cache::AgReplayCache,
     /// session_id → 最新 input_tokens(避免非 Claude 上游 count_tokens 估算不准导致 context 跳动)
     pub last_input_tokens: Arc<std::sync::Mutex<session_tokens::SessionTokenCache>>,
     /// Cursor 原生运行时(会话表 + 可重载配置);None = 未启用。

@@ -6,6 +6,7 @@
 // - emit:     无状态帧构造函数(chat/responses 共用)
 // - relay:    按协议分派响应流
 
+pub mod antigravity_replay_cache;
 pub mod chat;
 pub mod cursor;
 pub mod emit;

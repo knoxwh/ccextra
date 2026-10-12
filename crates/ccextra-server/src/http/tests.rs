@@ -305,6 +305,10 @@ fn mock_state() -> AppState {
             std::time::Duration::from_secs(3600),
             1024,
         ),
+        ag_replay_cache: crate::sse::antigravity_replay_cache::AgReplayCache::new(
+            std::time::Duration::from_secs(3600),
+            1024,
+        ),
         last_input_tokens: Arc::new(std::sync::Mutex::new(
             crate::http::session_tokens::SessionTokenCache::new(),
         )),
