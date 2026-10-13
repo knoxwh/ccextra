@@ -199,6 +199,11 @@ fn mock_state() -> AppState {
             std::time::Duration::from_secs(3600),
             1024,
         ),
+        kimi_thinking_replay_cache:
+            crate::sse::kimi_thinking_replay_cache::KimiThinkingReplayCache::new(
+                std::time::Duration::from_secs(3600),
+                1024,
+            ),
         last_input_tokens: Arc::new(std::sync::Mutex::new(
             crate::http::session_tokens::SessionTokenCache::new(),
         )),

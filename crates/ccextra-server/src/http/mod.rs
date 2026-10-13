@@ -122,6 +122,8 @@ pub struct AppState {
     pub replay_cache: crate::sse::replay_cache::ReplayCache,
     /// Antigravity thoughtSignature 账本(与 Responses ReplayCache 分离)
     pub ag_replay_cache: crate::sse::antigravity_replay_cache::AgReplayCache,
+    /// Kimi thinking 回放(protocol:claude Messages；与 AG/Responses 分离)
+    pub kimi_thinking_replay_cache: crate::sse::kimi_thinking_replay_cache::KimiThinkingReplayCache,
     /// session_id → 最新 input_tokens(避免非 Claude 上游 count_tokens 估算不准导致 context 跳动)
     pub last_input_tokens: Arc<std::sync::Mutex<session_tokens::SessionTokenCache>>,
     /// Cursor 原生运行时(会话表 + 可重载配置);None = 未启用。

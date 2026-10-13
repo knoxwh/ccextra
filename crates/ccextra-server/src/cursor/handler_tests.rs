@@ -99,6 +99,11 @@ fn fixture_with(
             Duration::from_secs(60),
             100,
         ),
+        kimi_thinking_replay_cache:
+            crate::sse::kimi_thinking_replay_cache::KimiThinkingReplayCache::new(
+                Duration::from_secs(60),
+                100,
+            ),
         cursor: Arc::new(std::sync::RwLock::new(None)),
         cursor_sessions: super::session::CursorSessions::default(),
         last_input_tokens: Arc::new(Mutex::new(http::session_tokens::SessionTokenCache::new())),

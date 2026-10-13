@@ -11,6 +11,7 @@ pub mod chat;
 pub mod cursor;
 pub mod emit;
 pub mod gemini;
+pub mod kimi_thinking_replay_cache;
 pub mod non_stream;
 pub mod parser;
 pub mod replay_cache;

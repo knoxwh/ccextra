@@ -16,6 +16,7 @@ pub mod fix_json;
 pub mod gemini;
 pub mod gemini_response;
 pub mod gemini_schema;
+pub mod kimi_thinking_replay;
 pub mod message_convert;
 pub mod passthrough;
 pub mod reasoning_replay;
@@ -44,6 +45,11 @@ pub use gemini_response::{
 pub use gemini_schema::{
     clean_json_schema_for_antigravity, clean_json_schema_for_gemini,
     clean_nested_schema_for_antigravity,
+};
+pub use kimi_thinking_replay::{
+    content_from_message_response, content_is_replayable, is_kimi_thinking_replay_model,
+    kimi_thinking_replay_model_family, normalize_cached_content, restore_kimi_thinking_replay,
+    KimiThinkingReplayStreamAccumulator,
 };
 pub use passthrough::{clamp_passthrough_effort, convert_passthrough, sanitize_passthrough_prompt};
 pub use reasoning_replay::{

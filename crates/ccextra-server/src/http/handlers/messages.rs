@@ -9,8 +9,9 @@ use ccextra_core::cache_stabilization::{maybe_observe_request_drift, DriftApiKin
 use ccextra_core::convert::{
     clamp_passthrough_effort, convert_passthrough, convert_to_antigravity_with,
     convert_to_gemini_with_registry, convert_to_openai_chat_with, convert_to_openai_responses_with,
-    is_antigravity_thought_signature_invalid, is_thinking_signature_invalid,
-    sanitize_gpt_reasoning_items, sanitize_passthrough_prompt, trim_encrypted_reasoning_items,
+    is_antigravity_thought_signature_invalid, is_kimi_thinking_replay_model,
+    is_thinking_signature_invalid, kimi_thinking_replay_model_family, sanitize_gpt_reasoning_items,
+    sanitize_passthrough_prompt, trim_encrypted_reasoning_items,
 };
 use ccextra_core::normalize::{
     normalize_anthropic_full, normalize_anthropic_pretransform, normalize_target_post, TargetShape,
@@ -33,6 +34,7 @@ use crate::http::error::{to_anthropic_error, AppError};
 use crate::http::retry::parse_retry_after;
 use crate::http::{AppState, PayloadRule};
 use crate::sse::antigravity_replay_cache::AgStreamReplayExtractor;
+use crate::sse::kimi_thinking_replay_cache::KimiStreamReplayExtractor;
 use crate::sse::replay_cache::StreamReplayExtractor;
 use crate::sse::SseStreamPin;
 use crate::upstream::{is_gpt_model, is_grok_model, UpstreamResponse};
@@ -171,6 +173,12 @@ struct RelayParams {
         String,
         Value,
     )>,
+    /// Kimi thinking：(cache, key, replay_applied)
+    kimi_replay_scope: Option<(
+        crate::sse::kimi_thinking_replay_cache::KimiThinkingReplayCache,
+        String,
+        bool,
+    )>,
     signature_model: Option<Arc<str>>,
     token_scope: Option<crate::http::session_tokens::TokenCacheScope>,
 }
@@ -200,6 +208,21 @@ where
     }
     if let Some((cache, key, request)) = params.ag_replay_scope {
         let mut extractor = AgStreamReplayExtractor::new(cache, key, request);
+        let tapped = stream.inspect(move |result| {
+            if let Ok(bytes) = result {
+                extractor.push(bytes);
+            }
+        });
+        return crate::sse::relay(
+            params.protocol,
+            tapped,
+            params.estimated_input_tokens,
+            params.tool_names,
+            params.signature_model,
+        );
+    }
+    if let Some((cache, key, applied)) = params.kimi_replay_scope {
+        let mut extractor = KimiStreamReplayExtractor::new(cache, key, applied);
         let tapped = stream.inspect(move |result| {
             if let Ok(bytes) = result {
                 extractor.push(bytes);
@@ -295,6 +318,12 @@ pub(crate) struct PreparedMessageRequest {
     pub replay_scope: Option<(crate::sse::replay_cache::ReplayCache, String, String)>,
     /// Antigravity thoughtSignature 账本 scope：(cache, "{model}:{session}")
     pub ag_replay_scope: Option<(crate::sse::antigravity_replay_cache::AgReplayCache, String)>,
+    /// Kimi thinking replay：(cache, "{family}:{session}", applied)
+    pub kimi_replay_scope: Option<(
+        crate::sse::kimi_thinking_replay_cache::KimiThinkingReplayCache,
+        String,
+        bool,
+    )>,
     pub signature_model: Option<Arc<str>>,
     pub token_scope: Option<crate::http::session_tokens::TokenCacheScope>,
 }
@@ -377,6 +406,7 @@ pub(crate) async fn prepare_message_request(
 
     let mut tool_names: Option<Arc<HashMap<String, String>>> = None;
     let mut request_fingerprint = String::new();
+    let mut kimi_replay_applied = false;
 
     match route.protocol {
         // Cursor 原生:handler 内部完成 Anthropic → RunRequest 转换,此处不动 body
@@ -394,6 +424,36 @@ pub(crate) async fn prepare_message_request(
                     model = %route.upstream_model,
                     "claude 直通 effort 已钳制到模型支持档"
                 );
+            }
+            // Kimi thinking 回放：Claude Code 会剥掉非 Anthropic 签名的 thinking，
+            // 在第三方 Claude-compatible（Moonshot 等）多轮工具续接前补回。
+            if is_kimi_thinking_replay_model(&route.upstream_model) {
+                if let Some(sess) = cc_session.as_deref() {
+                    let family = kimi_thinking_replay_model_family(&route.upstream_model);
+                    let key = format!("{family}:{sess}");
+                    use crate::sse::kimi_thinking_replay_cache::KimiReplayApplyOutcome;
+                    match state
+                        .kimi_thinking_replay_cache
+                        .apply_to_claude_body(&key, &mut body_json)
+                    {
+                        KimiReplayApplyOutcome::Applied => {
+                            kimi_replay_applied = true;
+                            tracing::debug!(
+                                session = %sess,
+                                family = %family,
+                                "kimi thinking replay 已注入"
+                            );
+                        }
+                        KimiReplayApplyOutcome::Unchanged => {
+                            tracing::debug!(
+                                session = %sess,
+                                family = %family,
+                                "kimi thinking replay 账本未改写"
+                            );
+                        }
+                        KimiReplayApplyOutcome::Miss => {}
+                    }
+                }
             }
             // drift 仅观测：sanitize/effort 之后，避免计费指纹造成假 system 漂移
             maybe_observe_request_drift(
@@ -871,6 +931,21 @@ pub(crate) async fn prepare_message_request(
         None
     };
 
+    let kimi_replay_scope = if matches!(route.protocol, Protocol::Claude)
+        && is_kimi_thinking_replay_model(&route.upstream_model)
+    {
+        cc_session.as_deref().map(|s| {
+            let family = kimi_thinking_replay_model_family(&route.upstream_model);
+            (
+                state.kimi_thinking_replay_cache.clone(),
+                format!("{family}:{s}"),
+                kimi_replay_applied,
+            )
+        })
+    } else {
+        None
+    };
+
     let signature_model: Option<Arc<str>> = matches!(route.protocol, Protocol::Antigravity)
         .then(|| Arc::from(route.upstream_model.as_str()));
 
@@ -896,6 +971,7 @@ pub(crate) async fn prepare_message_request(
         tool_names,
         replay_scope,
         ag_replay_scope,
+        kimi_replay_scope,
         signature_model,
         token_scope: session_id
             .map(|session| (Arc::clone(&state.last_input_tokens), session.to_string())),
@@ -992,6 +1068,7 @@ pub(crate) async fn execute_upstream_request(
                     tool_names: prepared.tool_names.clone(),
                     replay_scope: prepared.replay_scope.clone(),
                     ag_replay_scope: None,
+                    kimi_replay_scope: None,
                     signature_model: prepared.signature_model.clone(),
                     token_scope: prepared.token_scope.clone(),
                 },
@@ -1077,6 +1154,9 @@ pub(crate) async fn deliver_response(
                     if let Some((cache, key)) = prepared.ag_replay_scope.as_ref() {
                         cache.invalidate(key);
                     }
+                    if let Some((cache, key, _)) = prepared.kimi_replay_scope.as_ref() {
+                        cache.invalidate(key);
+                    }
                     let retry = prepared.send_retry(upstream_client, user_agents).await?;
                     final_status = retry.status;
                     if retry.status.is_success() {
@@ -1129,6 +1209,9 @@ pub(crate) async fn deliver_response(
                     if let Some((cache, key)) = prepared.ag_replay_scope.as_ref() {
                         cache.invalidate(key);
                     }
+                    if let Some((cache, key, _)) = prepared.kimi_replay_scope.as_ref() {
+                        cache.invalidate(key);
+                    }
                     let retry = prepared.send_retry(upstream_client, user_agents).await?;
                     final_status = retry.status;
                     if retry.status.is_success() {
@@ -1159,6 +1242,19 @@ pub(crate) async fn deliver_response(
             );
             if let Some((cache, key)) = prepared.ag_replay_scope.as_ref() {
                 cache.invalidate(key);
+            }
+        }
+
+        // Kimi：注入后仍 400/422 → 清账本（对齐 CPA shouldClearKimiThinkingReplayAfterError）
+        if !retried_ok && !final_truncated && (status.as_u16() == 400 || status.as_u16() == 422) {
+            if let Some((cache, key, applied)) = prepared.kimi_replay_scope.as_ref() {
+                if *applied {
+                    tracing::warn!(
+                        protocol = ?prepared.route.protocol,
+                        "kimi thinking replay 注入后上游 400/422,清空账本"
+                    );
+                    cache.invalidate(key);
+                }
             }
         }
 
@@ -1245,6 +1341,7 @@ pub(crate) async fn deliver_response(
                         tool_names: prepared.tool_names.clone(),
                         replay_scope: prepared.replay_scope.clone(),
                         ag_replay_scope: ag_scope,
+                        kimi_replay_scope: prepared.kimi_replay_scope.clone(),
                         signature_model: prepared.signature_model.clone(),
                         token_scope: prepared.token_scope.clone(),
                     },
@@ -1276,6 +1373,13 @@ pub(crate) async fn deliver_response(
                     if let Some(request) = prepared.body_json.get("request") {
                         cache.store_from_response(key, request, &v);
                     }
+                }
+            }
+        }
+        if let Some((cache, key, _)) = prepared.kimi_replay_scope.as_ref() {
+            if matches!(prepared.route.protocol, Protocol::Claude) {
+                if let Ok(v) = serde_json::from_slice::<Value>(&body_bytes) {
+                    cache.store_from_message_response(key, &v);
                 }
             }
         }
