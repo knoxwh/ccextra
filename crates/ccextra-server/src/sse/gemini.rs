@@ -156,7 +156,7 @@ pub fn relay_gemini_to_anthropic<S>(
     tool_names: Option<Arc<HashMap<String, String>>>,
 ) -> SseStreamPin
 where
-    S: Stream<Item = Result<Bytes, reqwest::Error>> + Send + 'static,
+    S: Stream<Item = Result<Bytes, std::io::Error>> + Send + 'static,
 {
     relay_gemini_like_to_anthropic(stream, estimated_input_tokens, tool_names, true, None)
 }
@@ -173,7 +173,7 @@ pub fn relay_antigravity_to_anthropic<S>(
     signature_model: Arc<str>,
 ) -> SseStreamPin
 where
-    S: Stream<Item = Result<Bytes, reqwest::Error>> + Send + 'static,
+    S: Stream<Item = Result<Bytes, std::io::Error>> + Send + 'static,
 {
     relay_gemini_like_to_anthropic(
         stream,
@@ -192,7 +192,7 @@ fn relay_gemini_like_to_anthropic<S>(
     signature_model: Option<Arc<str>>,
 ) -> SseStreamPin
 where
-    S: Stream<Item = Result<Bytes, reqwest::Error>> + Send + 'static,
+    S: Stream<Item = Result<Bytes, std::io::Error>> + Send + 'static,
 {
     let tool_map = tool_names.unwrap_or_default();
 
@@ -283,7 +283,7 @@ mod tests {
 
     async fn collect_output<S>(stream: S) -> String
     where
-        S: Stream<Item = Result<Bytes, reqwest::Error>> + Send + 'static,
+        S: Stream<Item = Result<Bytes, std::io::Error>> + Send + 'static,
     {
         relay_gemini_to_anthropic(stream, None, None)
             .collect::<Vec<_>>()
@@ -295,7 +295,7 @@ mod tests {
 
     async fn collect_antigravity_output<S>(stream: S) -> String
     where
-        S: Stream<Item = Result<Bytes, reqwest::Error>> + Send + 'static,
+        S: Stream<Item = Result<Bytes, std::io::Error>> + Send + 'static,
     {
         relay_antigravity_to_anthropic(stream, None, None, Arc::from("gemini-2.5-pro"))
             .collect::<Vec<_>>()
@@ -390,15 +390,11 @@ mod tests {
     }
     #[tokio::test]
     async fn test_read_error_does_not_finalize_successfully() {
-        let request_error = reqwest::Client::new()
-            .get("not a url")
-            .build()
-            .expect_err("invalid URL must produce reqwest error");
         let output = collect_output(stream::iter(vec![
             Ok(Bytes::from(
                 "data: {\"candidates\":[{\"content\":{\"parts\":[{\"text\":\"hi\"}]}}]}\n\n",
             )),
-            Err(request_error),
+            Err(std::io::Error::other("upstream read failed")),
         ]))
         .await;
         assert!(output.contains("event: error"));

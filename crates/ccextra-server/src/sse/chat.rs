@@ -717,7 +717,7 @@ pub(super) fn map_finish_reason(reason: &str) -> &'static str {
 /// Claude 直通:字节级转发,不解析
 pub fn relay_claude_passthrough<S>(stream: S) -> SseStreamPin
 where
-    S: Stream<Item = Result<Bytes, reqwest::Error>> + Send + 'static,
+    S: Stream<Item = Result<Bytes, std::io::Error>> + Send + 'static,
 {
     Box::pin(stream! {
         let mut stream = Box::pin(stream);
@@ -745,7 +745,7 @@ pub fn relay_openai_chat_to_anthropic<S>(
     estimated_input_tokens: Option<usize>,
 ) -> SseStreamPin
 where
-    S: Stream<Item = Result<Bytes, reqwest::Error>> + Send + 'static,
+    S: Stream<Item = Result<Bytes, std::io::Error>> + Send + 'static,
 {
     let mut stream = Box::pin(stream);
     let mut parser = SseParser::new();
@@ -1493,15 +1493,11 @@ mod tests {
     #[tokio::test]
     async fn test_claude_passthrough_read_error_emits_error_event() {
         use futures::StreamExt;
-        let request_error = reqwest::Client::new()
-            .get("not a url")
-            .build()
-            .expect_err("invalid URL must produce reqwest error");
         let stream = futures::stream::iter(vec![
             Ok(Bytes::from(
                 "event: message_start\ndata: {\"type\":\"message_start\"}\n\n",
             )),
-            Err(request_error),
+            Err(std::io::Error::other("upstream read failed")),
         ]);
         let out: Vec<_> = relay_claude_passthrough(stream).collect().await;
         assert_eq!(out.len(), 2, "应先转发字节再发 error: {out:?}");

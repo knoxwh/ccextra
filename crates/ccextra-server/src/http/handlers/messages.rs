@@ -179,7 +179,7 @@ struct RelayParams {
 /// Antigravity 用 AgStreamReplayExtractor（thoughtSignature 账本）。
 fn relay_with_replay_tap<S>(stream: S, params: RelayParams) -> SseStreamPin
 where
-    S: futures::Stream<Item = Result<Bytes, reqwest::Error>> + Send + 'static,
+    S: futures::Stream<Item = Result<Bytes, std::io::Error>> + Send + 'static,
 {
     let stream =
         crate::http::session_tokens::tap_input_tokens(stream, params.protocol, params.token_scope);

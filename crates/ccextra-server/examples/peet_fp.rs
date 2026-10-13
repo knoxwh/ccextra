@@ -4,9 +4,8 @@
 //! cargo run -p ccextra-server --example peet_fp
 //! ```
 //!
-//! Compares returned JA3/JA4 against `claude_tls_fp` baseline. Today this is
-//! expected to **fail** the JA3 assert until BLOCKER.md is resolved; exit code
-//! is non-zero on mismatch so CI/scripts can gate.
+//! Compares returned JA3/JA4 against `claude_tls_fp` baseline (wreq/BoringSSL Bun Hello).
+//! Exit non-zero on mismatch.
 
 use ccextra_server::claude_tls_fp::{
     build_fingerprint_client, PROFILE_ID, TARGET_JA3_HASH, TARGET_JA4,

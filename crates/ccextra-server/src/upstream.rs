@@ -20,11 +20,44 @@ const CONNECT_TIMEOUT: Duration = Duration::from_secs(10);
 /// 无 Client::timeout,避免掐整条 SSE。
 const SEND_TIMEOUT: Duration = Duration::from_secs(60);
 
-/// 上游请求结果
+/// 上游请求结果(默认 reqwest 或 Claude Bun 指纹 wreq)。
 #[derive(Debug)]
 pub struct UpstreamResponse {
     pub status: reqwest::StatusCode,
-    pub body: reqwest::Response,
+    pub body: UpstreamBody,
+}
+
+/// 双栈响应体:默认车道 reqwest,Claude oat 指纹车道 wreq。
+#[derive(Debug)]
+pub enum UpstreamBody {
+    Reqwest(reqwest::Response),
+    Wreq(wreq::Response),
+}
+
+impl UpstreamBody {
+    pub fn headers(&self) -> &axum::http::HeaderMap {
+        match self {
+            Self::Reqwest(r) => r.headers(),
+            Self::Wreq(r) => r.headers(),
+        }
+    }
+
+    pub fn bytes_stream(
+        self,
+    ) -> std::pin::Pin<Box<dyn futures::Stream<Item = Result<bytes::Bytes, std::io::Error>> + Send>>
+    {
+        use futures::StreamExt;
+        match self {
+            Self::Reqwest(r) => Box::pin(
+                r.bytes_stream()
+                    .map(|item| item.map_err(std::io::Error::other)),
+            ),
+            Self::Wreq(r) => Box::pin(
+                r.bytes_stream()
+                    .map(|item| item.map_err(std::io::Error::other)),
+            ),
+        }
+    }
 }
 
 /// 每个请求都要用到的流式头集合,避免在 request 里内联判断
@@ -354,7 +387,11 @@ pub(crate) enum TlsLane {
 
 /// client 缓存键:(最终代理, 是否 antigravity, 是否禁 redirect, 凭证 scope, TLS 车道)
 /// Antigravity 启用连接池时 scope 为凭证短摘要，隔离多账号 TCP/TLS 池。
+/// `TlsLane::ClaudeBunFp` 不进此表,见 `FpClientCacheKey` / `fp_clients`。
 type ClientCacheKey = (String, bool, bool, String, TlsLane);
+
+/// Claude Bun 指纹车道缓存键:(代理, 是否禁 redirect)
+type FpClientCacheKey = (String, bool);
 
 /// 对齐 CPA antigravityCredentialScope：仅在 AG + 连接池启用时按凭证分池。
 /// 优先 refresh_token（跨 access 轮换仍稳定）；缺失再回退 access_token。
@@ -387,6 +424,8 @@ fn digest_credential_scope(prefix: &str, secret: &str) -> String {
 pub struct UpstreamClient {
     global_proxy: Option<String>,
     clients: std::sync::Arc<Mutex<HashMap<ClientCacheKey, Client>>>,
+    /// Claude oat→anthropic 指纹车道(wreq/BoringSSL),与 rustls 池隔离
+    fp_clients: std::sync::Arc<Mutex<HashMap<FpClientCacheKey, wreq::Client>>>,
     /// Antigravity 连接池设置(短连接默认,对齐 CPA antigravity.executor)
     ant_pool: AntigravityPoolSettings,
     #[cfg(test)]
@@ -405,6 +444,7 @@ impl UpstreamClient {
         Self {
             global_proxy,
             clients: std::sync::Arc::new(Mutex::new(HashMap::new())),
+            fp_clients: std::sync::Arc::new(Mutex::new(HashMap::new())),
             ant_pool: AntigravityPoolSettings::resolve(ant_cfg),
             #[cfg(test)]
             attempts: Default::default(),
@@ -466,11 +506,8 @@ impl UpstreamClient {
         if let Some(c) = clients.get(&cache_key) {
             return Ok(c.clone());
         }
-        // Claude Bun 指纹车道:独立池,不与默认 rustls/H2 客户端混用
         if matches!(tls_lane, TlsLane::ClaudeBunFp) {
-            let client = crate::claude_tls_fp::build_fingerprint_client(proxy_key, no_redirect)?;
-            clients.insert(cache_key, client.clone());
-            return Ok(client);
+            anyhow::bail!("ClaudeBunFp 车道请用 fp_client_for (wreq)");
         }
         let mut builder = Client::builder()
             // 限制单个 host 最大空闲连接数，防毒化池
@@ -511,6 +548,25 @@ impl UpstreamClient {
         let client = builder
             .build()
             .map_err(|e| anyhow::anyhow!("构建上游 HTTP client 失败: {e}"))?;
+        clients.insert(cache_key, client.clone());
+        Ok(client)
+    }
+
+    /// Claude Bun 指纹车道 client(wreq + BoringSSL),独立池。
+    pub(crate) fn fp_client_for(
+        &self,
+        proxy_key: &str,
+        no_redirect: bool,
+    ) -> anyhow::Result<wreq::Client> {
+        let cache_key: FpClientCacheKey = (proxy_key.to_string(), no_redirect);
+        let mut clients = self
+            .fp_clients
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
+        if let Some(c) = clients.get(&cache_key) {
+            return Ok(c.clone());
+        }
+        let client = crate::claude_tls_fp::build_fingerprint_client(proxy_key, no_redirect)?;
         clients.insert(cache_key, client.clone());
         Ok(client)
     }
@@ -649,6 +705,19 @@ impl UpstreamClient {
         } else {
             TlsLane::Default
         };
+        if matches!(tls_lane, TlsLane::ClaudeBunFp) {
+            return self
+                .request_once_fp(
+                    base_url,
+                    api_key,
+                    &proxy_key,
+                    body,
+                    extra_headers,
+                    user_agents,
+                    inbound_user_agent,
+                )
+                .await;
+        }
         let client = self.client_for(
             &proxy_key,
             protocol,
@@ -743,7 +812,92 @@ impl UpstreamClient {
         .await?;
 
         let status = resp.status();
-        Ok(UpstreamResponse { status, body: resp })
+        Ok(UpstreamResponse {
+            status,
+            body: UpstreamBody::Reqwest(resp),
+        })
+    }
+
+    /// Claude 官方 oat 指纹车道(wreq):仅 Protocol::Claude messages 路径。
+    #[allow(clippy::too_many_arguments)]
+    async fn request_once_fp(
+        &self,
+        base_url: &str,
+        api_key: &str,
+        proxy_key: &str,
+        body: &bytes::Bytes,
+        extra_headers: &axum::http::HeaderMap,
+        user_agents: &crate::http::UserAgentSet,
+        inbound_user_agent: Option<&str>,
+    ) -> anyhow::Result<UpstreamResponse> {
+        let client = self.fp_client_for(proxy_key, false)?;
+        let url = format!("{}/v1/messages", base_url.trim_end_matches('/'));
+        let ua = user_agent(Protocol::Claude, "", user_agents, inbound_user_agent);
+        let mut req = client
+            .post(&url)
+            .header(wreq::header::USER_AGENT, ua)
+            .bearer_auth(api_key);
+        for (name, value) in extra_headers {
+            req = req.header(name, value);
+        }
+        let resp = send_with_timeout_wreq(
+            req.header(wreq::header::CONTENT_TYPE, "application/json")
+                .body(bytes::Bytes::clone(body)),
+        )
+        .await?;
+        let status = resp.status();
+        Ok(UpstreamResponse {
+            status,
+            body: UpstreamBody::Wreq(resp),
+        })
+    }
+}
+
+fn scrub_outbound_request_headers_wreq(req: &mut wreq::Request) {
+    use wreq::header::{HeaderValue, ACCEPT, CONTENT_TYPE, USER_AGENT};
+
+    if req.headers().contains_key(CONTENT_TYPE) {
+        req.headers_mut()
+            .insert(CONTENT_TYPE, HeaderValue::from_static("application/json"));
+    }
+
+    let accept_count = req.headers().get_all(ACCEPT).iter().count();
+    if accept_count == 0 {
+        req.headers_mut()
+            .insert(ACCEPT, HeaderValue::from_static("application/json"));
+    } else if accept_count > 1 {
+        let first = req.headers().get(ACCEPT).expect("accept present").clone();
+        req.headers_mut().insert(ACCEPT, first);
+    }
+    if req.headers().get(ACCEPT).and_then(|v| v.to_str().ok()) == Some("*/*") {
+        req.headers_mut()
+            .insert(ACCEPT, HeaderValue::from_static("application/json"));
+    }
+
+    let ua_count = req.headers().get_all(USER_AGENT).iter().count();
+    if ua_count > 1 {
+        let first = req
+            .headers()
+            .get(USER_AGENT)
+            .expect("user-agent present")
+            .clone();
+        req.headers_mut().insert(USER_AGENT, first);
+    }
+}
+
+pub(crate) async fn send_with_timeout_wreq(
+    request: wreq::RequestBuilder,
+) -> anyhow::Result<wreq::Response> {
+    let (client, built) = request.build_split();
+    let mut built = built.map_err(|e| anyhow::anyhow!("构建 fingerprint 上游请求失败: {e}"))?;
+    scrub_outbound_request_headers_wreq(&mut built);
+    match tokio::time::timeout(SEND_TIMEOUT, client.execute(built)).await {
+        Ok(Ok(resp)) => Ok(resp),
+        Ok(Err(e)) => Err(e.into()),
+        Err(_) => Err(anyhow::anyhow!(
+            "上游请求超时 ({}s)",
+            SEND_TIMEOUT.as_secs()
+        )),
     }
 }
 
@@ -1715,10 +1869,9 @@ mod tests {
         let _default = client
             .client_for("direct", Protocol::Claude, false, "", TlsLane::Default)
             .unwrap();
-        let _fp = client
-            .client_for("direct", Protocol::Claude, false, "", TlsLane::ClaudeBunFp)
-            .unwrap();
-        assert_eq!(client.clients.lock().unwrap().len(), 2);
+        let _fp = client.fp_client_for("direct", false).unwrap();
+        assert_eq!(client.clients.lock().unwrap().len(), 1);
+        assert_eq!(client.fp_clients.lock().unwrap().len(), 1);
     }
 
     #[test]

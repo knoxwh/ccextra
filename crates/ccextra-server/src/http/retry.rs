@@ -31,8 +31,11 @@ pub fn jitter_backoff(base: Duration) -> Duration {
 }
 
 /// Retry-After 头解析:仅支持秒数形式(HTTP-date 忽略,按退避公式兜底)
-pub fn parse_retry_after(headers: &reqwest::header::HeaderMap) -> Option<Duration> {
-    let raw = headers.get(reqwest::header::RETRY_AFTER)?.to_str().ok()?;
+pub fn parse_retry_after(headers: &axum::http::HeaderMap) -> Option<Duration> {
+    let raw = headers
+        .get(axum::http::header::RETRY_AFTER)?
+        .to_str()
+        .ok()?;
     let secs = raw.trim().parse::<u64>().ok()?;
     Some(Duration::from_secs(secs))
 }

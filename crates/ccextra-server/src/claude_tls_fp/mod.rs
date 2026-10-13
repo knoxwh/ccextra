@@ -1,7 +1,6 @@
-//! Claude official OAuth TLS fingerprint lane (Bun ClientHello target).
+//! Claude official OAuth TLS fingerprint lane (Bun ClientHello via wreq/BoringSSL).
 //!
-//! Profile + lane gating land first; exact JA3 match is blocked on stock rustls
-//! (see [`BLOCKER.md`](BLOCKER.md)). Live peet probe: `cargo run -p ccextra-server --example peet_fp`.
+//! Live peet probe: `cargo run -p ccextra-server --example peet_fp`.
 
 mod client;
 mod profile;

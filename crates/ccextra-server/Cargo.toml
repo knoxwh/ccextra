@@ -32,6 +32,7 @@ tokio-rustls = "0.26"
 rustls = { version = "0.23", default-features = false, features = ["aws_lc_rs", "std", "tls12", "logging", "prefer-post-quantum"] }
 rustls-native-certs = "0.8"
 md-5 = "0.10"
+wreq = { version = "0.16.1", default-features = true, features = ["json", "stream", "socks"] }
 percent-encoding = "2"
 
 time = { version = "0.3", features = ["formatting", "parsing", "std"] }

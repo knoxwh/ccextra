@@ -90,10 +90,17 @@ where
     }
 }
 
-async fn read_body_bounded(
+async fn read_body_bounded_reqwest(
     resp: reqwest::Response,
     limit: usize,
 ) -> Result<BoundedBody, BodyReadError<reqwest::Error>> {
+    read_stream_bounded(resp.bytes_stream(), limit).await
+}
+
+async fn read_body_bounded_upstream(
+    resp: crate::upstream::UpstreamBody,
+    limit: usize,
+) -> Result<BoundedBody, BodyReadError<std::io::Error>> {
     read_stream_bounded(resp.bytes_stream(), limit).await
 }
 
@@ -101,7 +108,7 @@ async fn read_body_bounded(
 pub(crate) async fn read_success_body(
     resp: reqwest::Response,
 ) -> Result<Bytes, BodyReadError<reqwest::Error>> {
-    match read_body_bounded(resp, SUCCESS_BODY_LIMIT).await {
+    match read_body_bounded_reqwest(resp, SUCCESS_BODY_LIMIT).await {
         Ok(body) if body.truncated => Err(BodyReadError::OverLimit {
             limit: SUCCESS_BODY_LIMIT,
         }),
@@ -114,7 +121,7 @@ pub(crate) async fn read_success_body(
 pub(crate) async fn read_error_body(
     resp: reqwest::Response,
 ) -> Result<BoundedBody, BodyReadError<reqwest::Error>> {
-    read_body_bounded(resp, ERROR_BODY_LIMIT).await
+    read_body_bounded_reqwest(resp, ERROR_BODY_LIMIT).await
 }
 
 /// 按状态选上限:成功 16 MiB(截断即 OverLimit),错误 256 KiB(截断保留)。
@@ -135,29 +142,36 @@ pub(crate) async fn read_body_by_status(
 /// Messages/count_tokens 成功 body:超限 502、停顿 504(Anthropic api_error),
 /// 传输错误维持 500(原 .bytes() 错误语义)
 pub(crate) async fn read_success_body_or_anthropic(
-    resp: reqwest::Response,
+    resp: crate::upstream::UpstreamBody,
 ) -> Result<Bytes, AppError> {
-    read_success_body(resp).await.map_err(|e| match e {
-        BodyReadError::OverLimit { .. } => AppError::with_status(
+    match read_body_bounded_upstream(resp, SUCCESS_BODY_LIMIT).await {
+        Ok(body) if body.truncated => Err(AppError::with_status(
             StatusCode::BAD_GATEWAY,
-            format!("上游响应超过大小上限: {e}"),
-        ),
-        BodyReadError::Idle => AppError::with_status(
+            format!("上游响应超过大小上限: limit={}", SUCCESS_BODY_LIMIT),
+        )),
+        Ok(body) => Ok(body.bytes),
+        Err(BodyReadError::Idle) => Err(AppError::with_status(
             StatusCode::GATEWAY_TIMEOUT,
-            format!("上游响应读取停顿: {e}"),
-        ),
-        BodyReadError::Transport(e) => AppError::new(anyhow::anyhow!("读上游响应失败: {e}")),
-    })
+            "上游响应读取停顿: idle timeout".to_string(),
+        )),
+        Err(BodyReadError::Transport(e)) => {
+            Err(AppError::new(anyhow::anyhow!("读上游响应失败: {e}")))
+        }
+        Err(BodyReadError::OverLimit { limit }) => Err(AppError::with_status(
+            StatusCode::BAD_GATEWAY,
+            format!("上游响应超过大小上限: limit={limit}"),
+        )),
+    }
 }
 
 /// Messages/count_tokens 错误 body:读取失败保留已知上游状态(不重新获得
 /// 重试预算)。返回 (bytes, truncated):截断标志必须传到调用层,截断前缀
 /// 不得交给完整 JSON 解析或触发依赖其字段的恢复逻辑。
 pub(crate) async fn read_error_body_or_anthropic(
-    resp: reqwest::Response,
+    resp: crate::upstream::UpstreamBody,
     status: StatusCode,
 ) -> Result<(Bytes, bool), AppError> {
-    match read_error_body(resp).await {
+    match read_body_bounded_upstream(resp, ERROR_BODY_LIMIT).await {
         Ok(body) => {
             if body.truncated {
                 tracing::warn!(
@@ -310,9 +324,10 @@ mod tests {
             let stream = chunks(vec![Bytes::from_static(b"partial error")])
                 .chain(futures::stream::pending());
             let resp = crate::test_support::response(status, reqwest::Body::wrap_stream(stream));
-            let err = read_error_body_or_anthropic(resp, status)
-                .await
-                .unwrap_err();
+            let err =
+                read_error_body_or_anthropic(crate::upstream::UpstreamBody::Reqwest(resp), status)
+                    .await
+                    .unwrap_err();
             assert!(err.err.to_string().contains("停顿"));
             assert_eq!(err.into_response().status(), status);
         }

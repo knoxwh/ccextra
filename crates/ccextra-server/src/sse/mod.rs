@@ -47,9 +47,9 @@ pub(crate) const STREAM_IDLE_MESSAGE: &str = "upstream stream idle timeout (180s
 /// 等到下一上游 chunk;超时返回 Idle。
 pub(crate) async fn next_upstream_chunk<S>(
     stream: &mut Pin<Box<S>>,
-) -> Result<Option<Result<Bytes, reqwest::Error>>, &'static str>
+) -> Result<Option<Result<Bytes, std::io::Error>>, &'static str>
 where
-    S: Stream<Item = Result<Bytes, reqwest::Error>> + ?Sized,
+    S: Stream<Item = Result<Bytes, std::io::Error>> + ?Sized,
 {
     match tokio::time::timeout(STREAM_IDLE_TIMEOUT, stream.next()).await {
         Ok(item) => Ok(item),
@@ -121,7 +121,7 @@ pub fn relay<S>(
     signature_model: Option<Arc<str>>,
 ) -> SseStreamPin
 where
-    S: Stream<Item = Result<Bytes, reqwest::Error>> + Send + 'static,
+    S: Stream<Item = Result<Bytes, std::io::Error>> + Send + 'static,
 {
     // 空闲心跳在分派后统一注入:所有转换路径(含 claude 直通)共享
     let inner: SseStreamPin = match protocol {
@@ -300,7 +300,7 @@ mod tests {
 
     #[tokio::test(start_paused = true)]
     async fn upstream_chunk_idle_timeout_is_three_minutes() {
-        let mut stream = Box::pin(futures::stream::pending::<Result<Bytes, reqwest::Error>>());
+        let mut stream = Box::pin(futures::stream::pending::<Result<Bytes, std::io::Error>>());
         let pending = next_upstream_chunk(&mut stream);
         tokio::pin!(pending);
 
@@ -322,7 +322,7 @@ mod tests {
         // relay 必须立即收尾,不得空等上游 EOF。
         let responses_frames = "data: {\"type\":\"response.created\",\"response\":{\"id\":\"r1\",\"model\":\"gpt-5\"}}\n\n\
              data: {\"type\":\"response.completed\",\"response\":{\"id\":\"r1\",\"output\":[],\"usage\":{\"input_tokens\":10,\"output_tokens\":5}}}\n\n";
-        let hanging: Pin<Box<dyn Stream<Item = Result<Bytes, reqwest::Error>> + Send>> = Box::pin(
+        let hanging: Pin<Box<dyn Stream<Item = Result<Bytes, std::io::Error>> + Send>> = Box::pin(
             futures::stream::once(async move { Ok(Bytes::from(responses_frames)) })
                 .chain(futures::stream::pending()),
         );
@@ -337,7 +337,7 @@ mod tests {
         let chat_frames = "data: {\"choices\":[{\"delta\":{\"role\":\"assistant\",\"content\":\"hi\"},\"finish_reason\":null}]}\n\n\
              data: {\"choices\":[{\"delta\":{},\"finish_reason\":\"stop\"}],\"usage\":{\"prompt_tokens\":10,\"completion_tokens\":5}}\n\n\
              data: {\"choices\":[],\"usage\":{\"prompt_tokens\":10,\"completion_tokens\":5}}\n\n";
-        let hanging: Pin<Box<dyn Stream<Item = Result<Bytes, reqwest::Error>> + Send>> = Box::pin(
+        let hanging: Pin<Box<dyn Stream<Item = Result<Bytes, std::io::Error>> + Send>> = Box::pin(
             futures::stream::once(async move { Ok(Bytes::from(chat_frames)) })
                 .chain(futures::stream::pending()),
         );

@@ -99,40 +99,62 @@ pub async fn handle_count_tokens(
             base_url.trim_end_matches('/')
         );
         let proxy_key = upstream_client.resolve_proxy(proxy_url.as_deref());
-        let tls_lane = if crate::claude_tls_fp::should_use_fingerprint_lane(true, &key, &base_url) {
-            crate::upstream::TlsLane::ClaudeBunFp
-        } else {
-            crate::upstream::TlsLane::Default
-        };
-        let client =
-            upstream_client.client_for(&proxy_key, Protocol::Claude, false, "", tls_lane)?;
+        let use_fp = crate::claude_tls_fp::should_use_fingerprint_lane(true, &key, &base_url);
         let inbound_user_agent = claude_inbound_user_agent(&headers);
         let mut extra_headers = claude_relay_headers(&headers);
         if crate::claude::is_claude_oauth_token(&key) {
             ensure_oauth_beta(&mut extra_headers);
         }
+        let ua = inbound_user_agent.unwrap_or(user_agents.claude_cli.as_str());
 
         let mut attempt_key = key;
         for auth_attempt in 0..=1 {
-            let mut request = client
-                .post(&url)
-                .header(
-                    header::USER_AGENT,
-                    inbound_user_agent.unwrap_or(user_agents.claude_cli.as_str()),
-                )
-                .bearer_auth(&attempt_key);
-            for (name, value) in &extra_headers {
-                request = request.header(name, value);
-            }
-            let resp = crate::upstream::send_with_timeout(request.json(&body_json))
-                .await
-                .map_err(|e| AppError::new(anyhow::anyhow!("上游请求失败: {e}")))?;
+            let upstream = if use_fp {
+                let client = upstream_client.fp_client_for(&proxy_key, false)?;
+                let mut request = client
+                    .post(&url)
+                    .header(wreq::header::USER_AGENT, ua)
+                    .bearer_auth(&attempt_key);
+                for (name, value) in &extra_headers {
+                    request = request.header(name, value);
+                }
+                let resp = crate::upstream::send_with_timeout_wreq(request.json(&body_json))
+                    .await
+                    .map_err(|e| AppError::new(anyhow::anyhow!("上游请求失败: {e}")))?;
+                crate::upstream::UpstreamResponse {
+                    status: resp.status(),
+                    body: crate::upstream::UpstreamBody::Wreq(resp),
+                }
+            } else {
+                let client = upstream_client.client_for(
+                    &proxy_key,
+                    Protocol::Claude,
+                    false,
+                    "",
+                    crate::upstream::TlsLane::Default,
+                )?;
+                let mut request = client
+                    .post(&url)
+                    .header(header::USER_AGENT, ua)
+                    .bearer_auth(&attempt_key);
+                for (name, value) in &extra_headers {
+                    request = request.header(name, value);
+                }
+                let resp = crate::upstream::send_with_timeout(request.json(&body_json))
+                    .await
+                    .map_err(|e| AppError::new(anyhow::anyhow!("上游请求失败: {e}")))?;
+                crate::upstream::UpstreamResponse {
+                    status: resp.status(),
+                    body: crate::upstream::UpstreamBody::Reqwest(resp),
+                }
+            };
 
-            let status = resp.status();
+            let status = upstream.status;
             if status.is_success() {
                 // 成功 body 有界读取:16 MiB 上限 + 180s idle;
                 // 超限 502、停顿 504(Anthropic api_error),传输错误维持 500
-                let body_bytes = crate::limits::read_success_body_or_anthropic(resp).await?;
+                let body_bytes =
+                    crate::limits::read_success_body_or_anthropic(upstream.body).await?;
                 return Response::builder()
                     .status(status)
                     .header(header::CONTENT_TYPE, "application/json")
@@ -170,7 +192,7 @@ pub async fn handle_count_tokens(
             // 上游状态(429/401 等不被改成 502/504/500),生成有界 Anthropic error;
             // 未截断的错误 body 按原语义原样转发
             let (body_bytes, truncated) =
-                crate::limits::read_error_body_or_anthropic(resp, status).await?;
+                crate::limits::read_error_body_or_anthropic(upstream.body, status).await?;
             if truncated {
                 return Err(AppError::with_status(
                     status,

@@ -55,7 +55,7 @@ pub fn relay_responses_to_anthropic<S>(
     tool_names: Option<Arc<HashMap<String, String>>>,
 ) -> SseStreamPin
 where
-    S: Stream<Item = Result<Bytes, reqwest::Error>> + Send + 'static,
+    S: Stream<Item = Result<Bytes, std::io::Error>> + Send + 'static,
 {
     let mut stream = Box::pin(stream);
     let mut parser = SseParser::new();

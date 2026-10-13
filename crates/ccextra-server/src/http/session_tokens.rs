@@ -13,9 +13,9 @@ pub(crate) fn tap_input_tokens<S>(
     stream: S,
     protocol: ccextra_core::route::Protocol,
     scope: Option<TokenCacheScope>,
-) -> impl futures::Stream<Item = Result<bytes::Bytes, reqwest::Error>> + Send
+) -> impl futures::Stream<Item = Result<bytes::Bytes, std::io::Error>> + Send
 where
-    S: futures::Stream<Item = Result<bytes::Bytes, reqwest::Error>> + Send,
+    S: futures::Stream<Item = Result<bytes::Bytes, std::io::Error>> + Send,
 {
     use ccextra_core::route::Protocol;
     use futures::StreamExt;
