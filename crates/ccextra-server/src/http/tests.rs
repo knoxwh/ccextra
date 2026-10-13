@@ -1429,7 +1429,6 @@ fn reload_returning_secret(secret: Option<String>) -> ReloadFn {
                 secret,
                 proxy_url: None,
                 antigravity: None,
-                claude_tls_fingerprint: false,
                 user_agents: test_user_agents(),
                 thinking_registry: Arc::new(vec![]),
             })
@@ -1498,7 +1497,6 @@ async fn test_reload_applies_normalize_and_proxy() {
                 secret: None,
                 proxy_url: Some("socks5://127.0.0.1:1080".into()),
                 antigravity: None,
-                claude_tls_fingerprint: false,
                 user_agents: test_user_agents(),
                 thinking_registry: Arc::new(vec![]),
             })

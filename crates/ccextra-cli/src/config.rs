@@ -49,10 +49,6 @@ pub struct Config {
     /// Antigravity 连接池配置(可选);默认短连接
     #[serde(default)]
     pub antigravity: Option<AntigravityConfig>,
-    /// Claude 官方 OAuth 是否走 Bun TLS 指纹车道(可选,默认 false)。
-    /// 精确 JA3 对齐尚未就绪(见 claude_tls_fp/BLOCKER.md);打开后仅隔离 HTTP/1.1 车道。
-    #[serde(default)]
-    pub claude_tls_fingerprint: Option<bool>,
     /// Antigravity 模型白名单(可选);glob 或精确名,缺省/空 = 全量
     #[serde(default)]
     pub antigravity_models: Option<Vec<String>>,

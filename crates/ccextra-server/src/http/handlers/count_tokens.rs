@@ -99,12 +99,7 @@ pub async fn handle_count_tokens(
             base_url.trim_end_matches('/')
         );
         let proxy_key = upstream_client.resolve_proxy(proxy_url.as_deref());
-        let tls_lane = if crate::claude_tls_fp::should_use_fingerprint_lane(
-            upstream_client.claude_tls_fingerprint(),
-            true,
-            &key,
-            &base_url,
-        ) {
+        let tls_lane = if crate::claude_tls_fp::should_use_fingerprint_lane(true, &key, &base_url) {
             crate::upstream::TlsLane::ClaudeBunFp
         } else {
             crate::upstream::TlsLane::Default

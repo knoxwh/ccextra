@@ -86,16 +86,14 @@ pub fn is_official_anthropic_base_url(base_url: &str) -> bool {
 
 /// Whether this outbound hop should use the Claude Bun fingerprint TLS lane.
 ///
-/// Gate: feature/config enabled + Claude protocol + OAuth oat token + official Anthropic host.
+/// Always on for Claude protocol + OAuth oat token + official Anthropic host.
 /// Third-party Claude-compatible relays stay on the default rustls lane (scrub only).
 pub fn should_use_fingerprint_lane(
-    enabled: bool,
     protocol_is_claude: bool,
     api_key: &str,
     base_url: &str,
 ) -> bool {
-    enabled
-        && protocol_is_claude
+    protocol_is_claude
         && crate::claude::is_claude_oauth_token(api_key)
         && is_official_anthropic_base_url(base_url)
 }
@@ -125,30 +123,20 @@ mod tests {
     fn lane_gate_official_oauth_only() {
         assert!(should_use_fingerprint_lane(
             true,
-            true,
             "sk-ant-oat01-abc",
             "https://api.anthropic.com"
         ));
         assert!(!should_use_fingerprint_lane(
-            false,
-            true,
-            "sk-ant-oat01-abc",
-            "https://api.anthropic.com"
-        ));
-        assert!(!should_use_fingerprint_lane(
-            true,
             true,
             "sk-ant-api03-abc",
             "https://api.anthropic.com"
         ));
         assert!(!should_use_fingerprint_lane(
             true,
-            true,
             "sk-ant-oat01-abc",
             "https://relay.example.com"
         ));
         assert!(!should_use_fingerprint_lane(
-            true,
             false,
             "sk-ant-oat01-abc",
             "https://api.anthropic.com"

@@ -415,7 +415,6 @@ async fn main() -> Result<()> {
                 secret: cfg.secret_key,
                 proxy_url: cfg.server.proxy_url,
                 antigravity: cfg.antigravity,
-                claude_tls_fingerprint: cfg.claude_tls_fingerprint.unwrap_or(false),
                 user_agents,
                 thinking_registry,
                 refresh,
@@ -430,10 +429,9 @@ async fn main() -> Result<()> {
         normalize: config.normalize,
         logging: config.logging,
         secret: config.secret_key,
-        upstream: UpstreamClient::with_ant_pool_and_claude_fp(
+        upstream: UpstreamClient::with_ant_pool(
             config.server.proxy_url,
             config.antigravity.as_ref(),
-            config.claude_tls_fingerprint.unwrap_or(false),
         ),
         user_agents,
         thinking_registry,

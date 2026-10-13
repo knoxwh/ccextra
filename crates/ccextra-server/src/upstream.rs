@@ -389,8 +389,6 @@ pub struct UpstreamClient {
     clients: std::sync::Arc<Mutex<HashMap<ClientCacheKey, Client>>>,
     /// Antigravity 连接池设置(短连接默认,对齐 CPA antigravity.executor)
     ant_pool: AntigravityPoolSettings,
-    /// Claude 官方 OAuth 是否走 Bun TLS 指纹车道(默认关;JA3 对齐见 BLOCKER.md)
-    claude_tls_fingerprint: bool,
     #[cfg(test)]
     pub(crate) attempts: std::sync::Arc<Mutex<Vec<String>>>,
 }
@@ -404,32 +402,13 @@ impl UpstreamClient {
         global_proxy: Option<String>,
         ant_cfg: Option<&AntigravityConfig>,
     ) -> Self {
-        Self::with_ant_pool_and_claude_fp(global_proxy, ant_cfg, false)
-    }
-
-    /// 同 [`Self::with_ant_pool`],可打开 Claude 官方 OAuth TLS 指纹车道。
-    pub fn with_ant_pool_and_claude_fp(
-        global_proxy: Option<String>,
-        ant_cfg: Option<&AntigravityConfig>,
-        claude_tls_fingerprint: bool,
-    ) -> Self {
         Self {
             global_proxy,
             clients: std::sync::Arc::new(Mutex::new(HashMap::new())),
             ant_pool: AntigravityPoolSettings::resolve(ant_cfg),
-            claude_tls_fingerprint,
             #[cfg(test)]
             attempts: Default::default(),
         }
-    }
-
-    /// 运行时开关(测试 / reload 用)。
-    pub fn set_claude_tls_fingerprint(&mut self, enabled: bool) {
-        self.claude_tls_fingerprint = enabled;
-    }
-
-    pub fn claude_tls_fingerprint(&self) -> bool {
-        self.claude_tls_fingerprint
     }
 
     /// 全局代理(供 cursor 目录刷新等不经 upstream 的路径复用)
@@ -662,7 +641,6 @@ impl UpstreamClient {
             pool_refresh_token,
         );
         let tls_lane = if crate::claude_tls_fp::should_use_fingerprint_lane(
-            self.claude_tls_fingerprint,
             matches!(protocol, Protocol::Claude),
             api_key,
             base_url,
@@ -1733,8 +1711,7 @@ mod tests {
 
     #[test]
     fn test_claude_fp_lane_isolates_client_pool() {
-        let mut client = UpstreamClient::new(None);
-        client.set_claude_tls_fingerprint(true);
+        let client = UpstreamClient::new(None);
         let _default = client
             .client_for("direct", Protocol::Claude, false, "", TlsLane::Default)
             .unwrap();

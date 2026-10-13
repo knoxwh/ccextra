@@ -13,7 +13,7 @@ Match peet baseline:
 ## What works today (scaffolding)
 
 - Distilled profile + offline JA3 string/hash unit tests (`profile.rs`).
-- Dual-lane wiring in `UpstreamClient`: Claude official OAuth can select `TlsLane::ClaudeBunFp`.
+- Dual-lane wiring in `UpstreamClient`: Claude official OAuth → `api.anthropic.com` always selects `TlsLane::ClaudeBunFp`.
 - Fingerprint lane forces **HTTP/1.1** (`http1_only`) and a best-effort rustls `CryptoProvider`
   (cipher / kx group order nudged toward Bun). This improves ALPN/h1 parity vs default H2-prefer
   client, but **does not** produce the Bun JA3.
@@ -41,8 +41,8 @@ Even with a custom `CryptoProvider`:
    this profile JSON (still no Bun preset — must craft cipher/extension lists).
 2. Or revive/maintain a rustls fork at **0.23.45** with ClientHello override (ja-tools-style).
 
-Until then: keep flag **off by default**; lane scaffolding + profile stay ready; refresh profile
-from `/Users/wanghao/tools/claude-tls-fp-sampler` when CLI upgrades.
+Fingerprint lane is **always on** for Claude official OAuth → `api.anthropic.com` (no config flag).
+Exact JA3 still blocked; refresh profile from `/Users/wanghao/tools/claude-tls-fp-sampler` when CLI upgrades.
 
 ## Acceptance when unblocked
 
