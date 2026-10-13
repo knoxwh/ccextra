@@ -98,7 +98,7 @@ fn clean_json_schema(schema: &Value, opts: CleanOptions) -> Value {
     // Phase 2: 展平复杂结构
     merge_conditionals(&mut s);
     merge_all_of(&mut s);
-    flatten_any_of_one_of(&mut s);
+    flatten_any_of_one_of(&mut s, opts.preserve_json_schema_constraints);
     flatten_type_arrays(&mut s, opts.antigravity_semantics);
 
     // Phase 3: 清理
@@ -613,93 +613,282 @@ fn merge_missing_schema(map: &mut Map<String, Value>, field: &str, incoming: &Va
     }
 }
 
-/// 对齐 CPA flattenAnyOfOneOf:选最强分支,null 分支转 nullable,
-/// 父 description 并入,多类型追加 "Accepts: a | b"
-fn flatten_any_of_one_of(schema: &mut Value) {
-    let mut path = Vec::new();
-    walk_objects(schema, &mut path, &mut |_, map| {
-        for key in ["anyOf", "oneOf"] {
-            let Some(Value::Array(arr)) = map.get(key) else {
-                continue;
-            };
-            if arr.is_empty() {
-                continue;
-            }
-            let arr = arr.clone();
+/// 对齐 CPA flattenAnyOfOneOf(a0fd8448):多分支 anyOf/oneOf 保留;
+/// 单分支 / [T,null] 仍投影; native Schema 载体将 oneOf→anyOf;
+/// required-only 分支用父 properties 具化后留在 union 里。
+fn flatten_any_of_one_of(schema: &mut Value, preserve_one_of: bool) {
+    flatten_any_of_one_of_at(schema, &mut Vec::new(), preserve_one_of);
+}
 
-            // 父节点已有 properties(如对象 schema 带 anyOf/oneOf 约束):
-            // 不替换父节点,各分支 properties 并入父节点后删 union 关键字(对齐 CPA)
-            if map.get("properties").is_some_and(|p| p.is_object()) {
-                let mut has_null = false;
-                for item in &arr {
-                    if item.get("type").and_then(|t| t.as_str()) == Some("null") {
-                        has_null = true;
-                    }
-                    let Some(Value::Object(branch_props)) = item.get("properties") else {
-                        continue;
-                    };
-                    let branch_props = branch_props.clone();
-                    let Value::Object(parent_props) = map.get_mut("properties").unwrap() else {
-                        continue;
-                    };
-                    for (k, v) in branch_props {
-                        merge_missing_schema(parent_props, &k, &v);
+/// 子节点优先(对齐 CPA sortByDepth 深路径先处理),再处理当前节点的 union。
+fn flatten_any_of_one_of_at(value: &mut Value, path: &mut Vec<String>, preserve_one_of: bool) {
+    match value {
+        Value::Object(map) => {
+            let keys: Vec<String> = map.keys().cloned().collect();
+            for key in keys {
+                if let Some(child) = map.get_mut(&key) {
+                    if matches!(child, Value::Object(_) | Value::Array(_)) {
+                        path.push(key);
+                        flatten_any_of_one_of_at(child, path, preserve_one_of);
+                        path.pop();
                     }
                 }
-                if has_null {
-                    map.insert("nullable".into(), Value::Bool(true));
+            }
+            if !is_property_definition(path) {
+                process_union_keywords(map, preserve_one_of);
+            }
+        }
+        Value::Array(arr) => {
+            for (i, item) in arr.iter_mut().enumerate() {
+                if matches!(item, Value::Object(_) | Value::Array(_)) {
+                    path.push(i.to_string());
+                    flatten_any_of_one_of_at(item, path, preserve_one_of);
+                    path.pop();
                 }
-                // 对齐 CPA e1e3a811:anyOf 分支 properties 合并进父节点后若父节点缺 type,强制补 object
-                if !map.contains_key("type") {
-                    map.insert("type".into(), Value::String("object".to_string()));
+            }
+        }
+        _ => {}
+    }
+}
+
+fn is_required_only_union_branch(item: &Value) -> bool {
+    let Some(obj) = item.as_object() else {
+        return false;
+    };
+    if !obj.contains_key("required") {
+        return false;
+    }
+    for key in [
+        "type",
+        "properties",
+        "items",
+        "enum",
+        "anyOf",
+        "oneOf",
+        "allOf",
+    ] {
+        if obj.contains_key(key) {
+            return false;
+        }
+    }
+    true
+}
+
+fn materialize_required_only_branch(
+    item: &Value,
+    parent_props: &Map<String, Value>,
+) -> Option<Value> {
+    let obj = item.as_object()?;
+    let reqs = obj.get("required")?.as_array()?;
+    if reqs.is_empty() {
+        return None;
+    }
+    let mut out = obj.clone();
+    let mut props = Map::new();
+    for req in reqs {
+        let name = req.as_str()?;
+        let prop = parent_props.get(name)?.clone();
+        props.insert(name.to_string(), prop);
+    }
+    out.insert("properties".into(), Value::Object(props));
+    out.insert("type".into(), Value::String("object".to_string()));
+    Some(Value::Object(out))
+}
+
+fn is_null_only_branch(item: &Value) -> bool {
+    let Some(obj) = item.as_object() else {
+        return false;
+    };
+    if obj.contains_key("properties") || obj.contains_key("items") {
+        return false;
+    }
+    match obj.get("type") {
+        Some(Value::String(t)) => t == "null",
+        Some(Value::Array(arr)) if !arr.is_empty() => {
+            arr.iter().all(|e| e.as_str() == Some("null"))
+        }
+        _ => false,
+    }
+}
+
+/// 对齐 CPA partitionUnionBranches:剥 null / false,true→{},required-only 具化。
+fn partition_union_branches(
+    items: &[Value],
+    parent_props: Option<&Map<String, Value>>,
+) -> (Vec<Value>, bool, bool) {
+    let mut non_null = Vec::new();
+    let mut has_null = false;
+    let mut has_filtered = false;
+    for item in items {
+        match item {
+            Value::Bool(true) => {
+                non_null.push(json!({}));
+                has_filtered = true;
+            }
+            Value::Bool(false)
+            | Value::Null
+            | Value::Number(_)
+            | Value::String(_)
+            | Value::Array(_) => {
+                has_filtered = true;
+            }
+            Value::Object(_) if is_null_only_branch(item) => {
+                has_null = true;
+            }
+            Value::Object(_) if is_required_only_union_branch(item) => {
+                if let Some(props) = parent_props {
+                    if let Some(materialized) = materialize_required_only_branch(item, props) {
+                        non_null.push(materialized);
+                        has_filtered = true;
+                        continue;
+                    }
                 }
+                has_filtered = true;
+            }
+            Value::Object(_) => {
+                non_null.push(item.clone());
+            }
+        }
+    }
+    (non_null, has_null, has_filtered)
+}
+
+fn merge_parent_description_into(selected: &mut Map<String, Value>, parent_desc: &str) {
+    if parent_desc.is_empty() {
+        return;
+    }
+    let child_desc = selected
+        .get("description")
+        .and_then(|d| d.as_str())
+        .unwrap_or("")
+        .to_string();
+    let merged = if child_desc.is_empty() {
+        parent_desc.to_string()
+    } else if child_desc == parent_desc {
+        child_desc
+    } else {
+        format!("{} ({})", parent_desc, child_desc)
+    };
+    selected.insert("description".into(), Value::String(merged));
+}
+
+fn process_union_keywords(map: &mut Map<String, Value>, preserve_one_of: bool) {
+    // oneOf 先于 anyOf(对齐 CPA paths 收集顺序),以便 sibling 时把 oneOf 收成 hint
+    for key in ["oneOf", "anyOf"] {
+        let Some(Value::Array(arr)) = map.get(key) else {
+            continue;
+        };
+        if arr.is_empty() {
+            continue;
+        }
+        let arr = arr.clone();
+
+        // native Schema 同时有 anyOf+oneOf:保留 anyOf,oneOf 搬 description hint
+        if key == "oneOf" && !preserve_one_of && map.get("anyOf").is_some_and(|v| v.is_array()) {
+            append_hint(map, &format!("oneOf: {}", Value::Array(arr)));
+            map.shift_remove(key);
+            continue;
+        }
+
+        let parent_props = map.get("properties").and_then(|p| p.as_object());
+        let (non_null_items, has_null, has_filtered) = partition_union_branches(&arr, parent_props);
+
+        // 多分支保留;!preserve_one_of 时 oneOf→anyOf
+        if non_null_items.len() >= 2 {
+            let target_key = if key == "oneOf" && !preserve_one_of {
+                "anyOf"
+            } else {
+                key
+            };
+            if target_key != key || has_null || has_filtered {
+                map.insert(target_key.into(), Value::Array(non_null_items));
+                if target_key != key {
+                    map.shift_remove(key);
+                }
+            }
+            if has_null {
+                map.insert("nullable".into(), Value::Bool(true));
+                append_hint(map, "(nullable)");
+            }
+            continue;
+        }
+
+        // 父已有 properties:不整体替换父节点;合并分支 properties 后删 union
+        if map.get("properties").is_some_and(|p| p.is_object()) {
+            for item in &non_null_items {
+                let Some(Value::Object(branch_props)) = item.get("properties") else {
+                    continue;
+                };
+                let branch_props = branch_props.clone();
+                let Value::Object(parent_props_mut) = map.get_mut("properties").unwrap() else {
+                    continue;
+                };
+                for (k, v) in branch_props {
+                    merge_missing_schema(parent_props_mut, &k, &v);
+                }
+            }
+            if has_null {
+                map.insert("nullable".into(), Value::Bool(true));
+            }
+            if !map.contains_key("type") {
+                map.insert("type".into(), Value::String("object".to_string()));
+            }
+            map.shift_remove(key);
+            continue;
+        }
+
+        if non_null_items.is_empty() {
+            if !has_null {
                 map.shift_remove(key);
                 continue;
             }
-
             let parent_desc = map
                 .get("description")
                 .and_then(|d| d.as_str())
                 .unwrap_or("")
                 .to_string();
-
-            let (best_idx, all_types) = select_best(&arr);
-            let Some(Value::Object(mut selected)) = arr.into_iter().nth(best_idx) else {
-                continue;
-            };
-            let has_null = all_types.iter().any(|t| t == "null");
-            let best_is_null = selected.get("type").and_then(|t| t.as_str()) == Some("null");
-            if has_null && !best_is_null {
-                selected.insert("nullable".into(), Value::Bool(true));
-            }
-
-            let child_desc = selected
-                .get("description")
-                .and_then(|d| d.as_str())
-                .unwrap_or("")
-                .to_string();
+            let mut selected = Map::new();
+            selected.insert("type".into(), Value::String("null".to_string()));
             if !parent_desc.is_empty() {
-                let merged = if child_desc.is_empty() {
-                    parent_desc
-                } else if child_desc == parent_desc {
-                    child_desc
-                } else {
-                    format!("{} ({})", parent_desc, child_desc)
-                };
-                selected.insert("description".into(), Value::String(merged));
+                selected.insert("description".into(), Value::String(parent_desc));
             }
-
-            if all_types.len() > 1 {
-                append_hint(
-                    &mut selected,
-                    &format!("Accepts: {}", all_types.join(" | ")),
-                );
-            }
-
-            // 父节点整体替换为选中分支(对齐 CPA setRawAt parentPath)
             *map = selected;
+            continue;
         }
-    });
+
+        // 单非空分支:投影为该分支(对齐 CPA 取 nonNullItems[0],非 selectBest)
+        let parent_desc = map
+            .get("description")
+            .and_then(|d| d.as_str())
+            .unwrap_or("")
+            .to_string();
+
+        let mut candidate_items = arr.clone();
+        if has_filtered {
+            candidate_items = non_null_items.clone();
+            if has_null {
+                candidate_items.push(json!({"type": "null"}));
+            }
+        }
+        let (_, all_types) = select_best(&candidate_items);
+
+        let Some(Value::Object(mut selected)) = non_null_items.into_iter().next() else {
+            continue;
+        };
+        if has_null {
+            selected.insert("nullable".into(), Value::Bool(true));
+        }
+        merge_parent_description_into(&mut selected, &parent_desc);
+        if all_types.len() > 1 {
+            append_hint(
+                &mut selected,
+                &format!("Accepts: {}", all_types.join(" | ")),
+            );
+        } else if has_null {
+            append_hint(&mut selected, "(nullable)");
+        }
+        *map = selected;
+    }
 }
 
 /// 对齐 CPA selectBest:object=3, array=2, 具名非 null=1, 其余 0;同分取先
@@ -1795,7 +1984,8 @@ mod tests {
     }
 
     #[test]
-    fn test_anyof_flatten_picks_strongest() {
+    fn test_anyof_single_non_null_with_null_still_projects() {
+        // [T, null] 仍投影为 T;(nullable)/Accepts 提示保留。多分支则不再 flatten。
         let schema = json!({"anyOf": [{"type": "null"}, {"type": "object", "properties": {"x": {"type": "string"}}}]});
         let out = clean_json_schema_for_gemini(&schema);
         assert_eq!(out["type"], "object");
@@ -1904,8 +2094,8 @@ mod tests {
     }
 
     #[test]
-    fn test_anyof_required_only_branches_keep_parent_properties() {
-        // 对齐 CPA issue 5219 #2:required-only 分支不得覆盖父节点 type/properties
+    fn test_anyof_required_only_branches_materialized_and_preserved() {
+        // 对齐 CPA a0fd8448:required-only 分支用父 properties 具化后保留在 anyOf
         let input = json!({
             "type": "object",
             "anyOf": [
@@ -1922,7 +2112,13 @@ mod tests {
         assert_eq!(out["type"], "object");
         assert!(out["properties"]["left"].is_object());
         assert!(out["properties"]["right"].is_object());
-        assert!(out.get("anyOf").is_none());
+        let branches = out["anyOf"].as_array().expect("anyOf preserved");
+        assert_eq!(branches.len(), 2);
+        assert_eq!(branches[0]["type"], "object");
+        assert_eq!(branches[0]["properties"]["left"]["type"], "integer");
+        assert_eq!(branches[0]["required"], json!(["left"]));
+        assert_eq!(branches[1]["properties"]["right"]["type"], "integer");
+        assert_eq!(branches[1]["required"], json!(["right"]));
     }
 
     #[test]
@@ -2007,6 +2203,203 @@ mod tests {
     }
 
     #[test]
+    fn test_multibranch_anyof_preserved() {
+        // 对齐 CPA a0fd8448:多分支 anyOf 不再 select_best 展平
+        let input = json!({
+            "type": "object",
+            "properties": {
+                "item": {
+                    "anyOf": [
+                        {"type": "string"},
+                        {
+                            "type": "object",
+                            "properties": {"image": {"type": "string"}},
+                            "required": ["image"]
+                        },
+                        {
+                            "type": "object",
+                            "properties": {"audio": {"type": "string"}},
+                            "required": ["audio"]
+                        }
+                    ]
+                }
+            },
+            "required": ["item"]
+        });
+        let ag = clean_json_schema_for_antigravity(&input);
+        let branches = ag["properties"]["item"]["anyOf"].as_array().unwrap();
+        assert_eq!(branches.len(), 3);
+        assert!(branches[2]["properties"].get("audio").is_some());
+
+        let gem = clean_json_schema_for_gemini(&input);
+        assert_eq!(
+            gem["properties"]["item"]["anyOf"].as_array().unwrap().len(),
+            3
+        );
+    }
+
+    #[test]
+    fn test_oneof_normalized_to_anyof_on_antigravity_preserved_on_gemini() {
+        // AG/native:!preserve → oneOf→anyOf; Gemini JSON Schema:保留 oneOf
+        let input = json!({
+            "type": "object",
+            "properties": {
+                "item": {
+                    "oneOf": [
+                        {"type": "string"},
+                        {
+                            "type": "object",
+                            "properties": {"image": {"type": "string"}},
+                            "required": ["image"]
+                        },
+                        {
+                            "type": "object",
+                            "properties": {"audio": {"type": "string"}},
+                            "required": ["audio"]
+                        }
+                    ]
+                }
+            },
+            "required": ["item"]
+        });
+        let ag = clean_json_schema_for_antigravity(&input);
+        assert!(ag["properties"]["item"].get("oneOf").is_none());
+        assert_eq!(
+            ag["properties"]["item"]["anyOf"].as_array().unwrap().len(),
+            3
+        );
+
+        let gem = clean_json_schema_for_gemini(&input);
+        assert_eq!(
+            gem["properties"]["item"]["oneOf"].as_array().unwrap().len(),
+            3
+        );
+        assert!(gem["properties"]["item"].get("anyOf").is_none());
+    }
+
+    #[test]
+    fn test_nullable_multibranch_anyof_sets_hint() {
+        let input = json!({
+            "type": "object",
+            "properties": {
+                "item": {
+                    "anyOf": [
+                        {"type": "string"},
+                        {
+                            "type": "object",
+                            "properties": {"image": {"type": "string"}},
+                            "required": ["image"]
+                        },
+                        {
+                            "type": "object",
+                            "properties": {"audio": {"type": "string"}},
+                            "required": ["audio"]
+                        },
+                        {"type": "null"}
+                    ]
+                }
+            }
+        });
+        let ag = clean_json_schema_for_antigravity(&input);
+        let item = &ag["properties"]["item"];
+        assert_eq!(item["anyOf"].as_array().unwrap().len(), 3);
+        assert_eq!(item["nullable"], true);
+        assert!(item["description"].as_str().unwrap().contains("(nullable)"));
+
+        let gem = clean_json_schema_for_gemini(&input);
+        let item = &gem["properties"]["item"];
+        assert_eq!(item["anyOf"].as_array().unwrap().len(), 3);
+        assert!(item.get("nullable").is_none()); // remove_gemini_metadata
+        assert!(item["description"].as_str().unwrap().contains("(nullable)"));
+    }
+
+    #[test]
+    fn test_sibling_oneof_hinted_away_on_antigravity() {
+        let input = json!({
+            "type": "object",
+            "properties": {
+                "value": {
+                    "anyOf": [{"type": "string"}, {"type": "integer"}],
+                    "oneOf": [{"type": "string"}, {"type": "boolean"}]
+                }
+            }
+        });
+        let ag = clean_json_schema_for_antigravity(&input);
+        let value = &ag["properties"]["value"];
+        assert!(value.get("oneOf").is_none());
+        assert_eq!(value["anyOf"].as_array().unwrap().len(), 2);
+        assert!(value["description"].as_str().unwrap().contains("oneOf:"));
+
+        let gem = clean_json_schema_for_gemini(&input);
+        let value = &gem["properties"]["value"];
+        assert_eq!(value["anyOf"].as_array().unwrap().len(), 2);
+        assert_eq!(value["oneOf"].as_array().unwrap().len(), 2);
+    }
+
+    #[test]
+    fn test_false_union_branch_stripped() {
+        let single =
+            json!({"type":"object","properties":{"value":{"anyOf":[false,{"type":"string"}]}}});
+        let out = clean_json_schema_for_antigravity(&single);
+        assert!(out["properties"]["value"].get("anyOf").is_none());
+        assert_eq!(out["properties"]["value"]["type"], "string");
+
+        let multi = json!({"type":"object","properties":{"value":{"oneOf":[false,{"type":"string"},{"type":"integer"}]}}});
+        let out = clean_json_schema_for_antigravity(&multi);
+        assert!(out["properties"]["value"].get("oneOf").is_none());
+        assert_eq!(
+            out["properties"]["value"]["anyOf"]
+                .as_array()
+                .unwrap()
+                .len(),
+            2
+        );
+    }
+
+    #[test]
+    fn test_nested_nullable_union_unwraps_to_inner() {
+        for nested in [
+            json!({"type":"object","properties":{"item":{"anyOf":[{"type":"null"},{"anyOf":[{"type":"string"},{"type":"integer"}]}]}}}),
+            json!({"type":"object","properties":{"item":{"anyOf":[{"anyOf":[{"type":"string"},{"type":"integer"}]},{"type":"null"}]}}}),
+        ] {
+            let once = clean_json_schema_for_antigravity(&nested);
+            let item = &once["properties"]["item"];
+            assert_eq!(item["anyOf"].as_array().unwrap().len(), 2);
+            assert_eq!(item["nullable"], true);
+            assert!(item["description"].as_str().unwrap().contains("(nullable)"));
+            let twice = clean_json_schema_for_antigravity(&once);
+            assert_eq!(once, twice);
+        }
+    }
+
+    #[test]
+    fn test_parent_props_multibranch_union_not_merged_away() {
+        let input = json!({
+            "type": "object",
+            "properties": {},
+            "anyOf": [
+                {
+                    "type": "object",
+                    "properties": {"image": {"type": "string"}},
+                    "required": ["image"]
+                },
+                {
+                    "type": "object",
+                    "properties": {"audio": {"type": "string"}},
+                    "required": ["audio"]
+                }
+            ]
+        });
+        for out in [
+            clean_json_schema_for_antigravity(&input),
+            clean_json_schema_for_gemini(&input),
+        ] {
+            assert_eq!(out["anyOf"].as_array().unwrap().len(), 2);
+            assert!(out["anyOf"][1]["properties"].get("audio").is_some());
+        }
+    }
+
+    #[test]
     fn test_boolean_true_subschemas_normalized_to_empty_object() {
         // 对齐 CPA c93978c4:布尔 true 子 schema 归一化为 {}
         let input = json!({
@@ -2027,10 +2420,12 @@ mod tests {
             assert_eq!(out["properties"]["open"], json!({}));
             assert_eq!(out["properties"]["closed"]["type"], "string");
             assert_eq!(out["properties"]["list"]["items"], json!({}));
-            // anyOf 布尔分支归一化后被展平,取最强对象分支
+            // 对齐 CPA a0fd8448:true→{} 后与 string 构成多分支,anyOf 保留
             let branchy = &out["properties"]["branchy"];
-            assert!(branchy.get("anyOf").is_none());
-            assert_eq!(branchy["type"], "string");
+            let branches = branchy["anyOf"].as_array().expect("anyOf preserved");
+            assert_eq!(branches.len(), 2);
+            assert_eq!(branches[0], json!({}));
+            assert_eq!(branches[1]["type"], "string");
             // $defs / dependencies 归一化发生在剥离前,最终输出均剥离
             assert!(out.get("$defs").is_none());
             assert!(out.get("dependencies").is_none());
