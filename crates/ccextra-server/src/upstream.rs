@@ -428,7 +428,7 @@ fn digest_credential_scope(prefix: &str, secret: &str) -> String {
 pub struct UpstreamClient {
     global_proxy: Option<String>,
     clients: std::sync::Arc<Mutex<HashMap<ClientCacheKey, Client>>>,
-    /// Claude oat→anthropic 指纹车道(wreq/BoringSSL),与 rustls 池隔离
+    /// Claude protocol 指纹车道(wreq/BoringSSL),与 rustls 池隔离
     fp_clients: std::sync::Arc<Mutex<HashMap<FpClientCacheKey, wreq::Client>>>,
     /// Antigravity 连接池设置(短连接默认,对齐 CPA antigravity.executor)
     ant_pool: AntigravityPoolSettings,
@@ -705,11 +705,8 @@ impl UpstreamClient {
             api_key,
             pool_refresh_token,
         );
-        if crate::claude_tls_fp::should_use_fingerprint_lane(
-            matches!(protocol, Protocol::Claude),
-            api_key,
-            base_url,
-        ) {
+        if crate::claude_tls_fp::should_use_fingerprint_lane(matches!(protocol, Protocol::Claude,))
+        {
             return self
                 .request_once_fp(
                     base_url,

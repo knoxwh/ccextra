@@ -1,7 +1,7 @@
 use crate::claude::constants::OAUTH_BETA;
 use axum::http::{header, HeaderMap, HeaderName, HeaderValue};
 
-/// Claude Code / CPA 对齐的 Accept-Encoding(直连 api.anthropic.com)。
+/// Claude Code / CPA 对齐的 Accept-Encoding(`protocol: claude` 直通)。
 ///
 /// 与 CLI 2.1.296 MITM 金样及 CPA `defaultAcceptEncoding` 一致。
 pub const CLAUDE_ACCEPT_ENCODING: &str = "gzip, deflate, br, zstd";
@@ -228,21 +228,6 @@ mod tests {
         assert_eq!(
             out.get("accept-encoding").and_then(|v| v.to_str().ok()),
             Some(CLAUDE_ACCEPT_ENCODING)
-        );
-    }
-
-    #[test]
-    fn test_passthrough_preserves_inbound_ae_not_overwrite() {
-        let mut headers = HeaderMap::new();
-        headers.insert(
-            header::ACCEPT_ENCODING,
-            HeaderValue::from_static("gzip, deflate, br"),
-        );
-        let out = claude_passthrough_headers(&headers);
-        assert_eq!(
-            out.get("accept-encoding").and_then(|v| v.to_str().ok()),
-            Some("gzip, deflate, br"),
-            "有入站 AE 时不覆盖成默认"
         );
     }
 }

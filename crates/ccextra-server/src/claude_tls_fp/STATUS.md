@@ -16,8 +16,9 @@ Fingerprint lane uses **wreq 0.16 + BoringSSL (`btls`)** with a hand-tuned `TlsO
 spec from the sampler peet JSON (cipher list, curves, sigalgs, key shares, extension
 order, GREASE off, OCSP + SCT on, ALPN `http/1.1` only).
 
-Default protocols stay on **reqwest + rustls**. Lane is always on for Claude official
-OAuth (`sk-ant-oat*`) → `api.anthropic.com` (no config flag).
+Non-Claude protocols stay on **reqwest + rustls**. Lane is always on for every
+config `protocol: claude` provider (official Anthropic and third-party Claude-compatible;
+no config flag).
 
 ## Acceptance
 

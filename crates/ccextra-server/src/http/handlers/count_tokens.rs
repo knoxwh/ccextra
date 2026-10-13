@@ -99,7 +99,6 @@ pub async fn handle_count_tokens(
             crate::upstream::append_inbound_query("/v1/messages/count_tokens", uri.query());
         let url = format!("{}{}", base_url.trim_end_matches('/'), endpoint);
         let proxy_key = upstream_client.resolve_proxy(proxy_url.as_deref());
-        let use_fp = crate::claude_tls_fp::should_use_fingerprint_lane(true, &key, &base_url);
         let inbound_user_agent = claude_inbound_user_agent(&headers);
         let mut extra_headers = claude_passthrough_headers(&headers);
         if crate::claude::is_claude_oauth_token(&key) {
@@ -109,38 +108,21 @@ pub async fn handle_count_tokens(
 
         let mut attempt_key = key;
         for auth_attempt in 0..=1 {
-            let upstream = if use_fp {
-                let client = upstream_client.fp_client_for(&proxy_key, false)?;
-                let mut request = client
-                    .post(&url)
-                    .header(wreq::header::USER_AGENT, ua)
-                    .bearer_auth(&attempt_key);
-                for (name, value) in &extra_headers {
-                    request = request.header(name, value);
-                }
-                let resp = crate::upstream::send_with_timeout_wreq(request.json(&body_json))
-                    .await
-                    .map_err(|e| AppError::new(anyhow::anyhow!("上游请求失败: {e}")))?;
-                crate::upstream::UpstreamResponse {
-                    status: resp.status(),
-                    body: crate::upstream::UpstreamBody::Wreq(resp),
-                }
-            } else {
-                let client = upstream_client.client_for(&proxy_key, Protocol::Claude, false, "")?;
-                let mut request = client
-                    .post(&url)
-                    .header(header::USER_AGENT, ua)
-                    .bearer_auth(&attempt_key);
-                for (name, value) in &extra_headers {
-                    request = request.header(name, value);
-                }
-                let resp = crate::upstream::send_with_timeout(request.json(&body_json))
-                    .await
-                    .map_err(|e| AppError::new(anyhow::anyhow!("上游请求失败: {e}")))?;
-                crate::upstream::UpstreamResponse {
-                    status: resp.status(),
-                    body: crate::upstream::UpstreamBody::Reqwest(resp),
-                }
+            // protocol: claude 一律走 Bun 指纹车道(wreq)
+            let client = upstream_client.fp_client_for(&proxy_key, false)?;
+            let mut request = client
+                .post(&url)
+                .header(wreq::header::USER_AGENT, ua)
+                .bearer_auth(&attempt_key);
+            for (name, value) in &extra_headers {
+                request = request.header(name, value);
+            }
+            let resp = crate::upstream::send_with_timeout_wreq(request.json(&body_json))
+                .await
+                .map_err(|e| AppError::new(anyhow::anyhow!("上游请求失败: {e}")))?;
+            let upstream = crate::upstream::UpstreamResponse {
+                status: resp.status(),
+                body: crate::upstream::UpstreamBody::Wreq(resp),
             };
 
             let status = upstream.status;

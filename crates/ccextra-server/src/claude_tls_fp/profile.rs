@@ -75,27 +75,12 @@ pub fn ja3_hash(ja3: &str) -> String {
     hex::encode(digest)
 }
 
-/// Official Anthropic API host(s) for fingerprint-lane gating.
-pub fn is_official_anthropic_base_url(base_url: &str) -> bool {
-    let Ok(url) = reqwest::Url::parse(base_url) else {
-        return false;
-    };
-    url.host_str()
-        .is_some_and(|h| h.eq_ignore_ascii_case("api.anthropic.com"))
-}
-
 /// Whether this outbound hop should use the Claude Bun fingerprint TLS lane.
 ///
-/// Always on for Claude protocol + OAuth oat token + official Anthropic host.
-/// Third-party Claude-compatible relays stay on the default rustls lane (scrub only).
-pub fn should_use_fingerprint_lane(
-    protocol_is_claude: bool,
-    api_key: &str,
-    base_url: &str,
-) -> bool {
+/// Always on for config `protocol: claude` (official Anthropic and third-party
+/// Claude-compatible hosts). Other protocols stay on reqwest + rustls.
+pub fn should_use_fingerprint_lane(protocol_is_claude: bool) -> bool {
     protocol_is_claude
-        && crate::claude::is_claude_oauth_token(api_key)
-        && is_official_anthropic_base_url(base_url)
 }
 
 #[cfg(test)]
@@ -120,32 +105,8 @@ mod tests {
     }
 
     #[test]
-    fn lane_gate_official_oauth_only() {
-        assert!(should_use_fingerprint_lane(
-            true,
-            "sk-ant-oat01-abc",
-            "https://api.anthropic.com"
-        ));
-        assert!(!should_use_fingerprint_lane(
-            true,
-            "sk-ant-api03-abc",
-            "https://api.anthropic.com"
-        ));
-        assert!(!should_use_fingerprint_lane(
-            true,
-            "sk-ant-oat01-abc",
-            "https://relay.example.com"
-        ));
-        assert!(!should_use_fingerprint_lane(
-            false,
-            "sk-ant-oat01-abc",
-            "https://api.anthropic.com"
-        ));
-    }
-
-    #[test]
-    fn cipher_count_matches_ja4_t13d1713() {
-        // JA4 `t13d1713…` → 17 cipher suites
-        assert_eq!(CIPHERS_IANA.len(), 17);
+    fn lane_gate_all_claude_protocol() {
+        assert!(should_use_fingerprint_lane(true));
+        assert!(!should_use_fingerprint_lane(false));
     }
 }

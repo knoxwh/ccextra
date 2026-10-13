@@ -69,5 +69,5 @@
     "TLS1.3",
     "TLS1.2"
   ],
-  "notes": "Target for Claude official OAuth fingerprint lane. Re-capture via sampler when Claude upgrades."
+  "notes": "Target for protocol:claude fingerprint lane. Re-capture via sampler when Claude upgrades."
 }

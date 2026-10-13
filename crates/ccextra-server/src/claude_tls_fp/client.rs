@@ -1,7 +1,7 @@
 //! Claude Bun fingerprint-lane HTTP client (wreq + BoringSSL).
 //!
 //! Matches Claude Code 2.1.296 / Bun 1.4.3 peet baseline (JA3/JA4 + HTTP/1.1).
-//! Default protocols keep reqwest+rustls; only oat→api.anthropic.com uses this lane.
+//! Default (non-Claude) protocols keep reqwest+rustls; all `protocol: claude` use this lane.
 
 use std::borrow::Cow;
 
