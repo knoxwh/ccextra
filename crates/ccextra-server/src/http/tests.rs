@@ -1927,10 +1927,10 @@ models:
         ua.starts_with("grok-pager/1.0.46 grok-shell/1.0.46 ("),
         "UA 应为交互式 Grok CLI,实际 {ua}"
     );
-    assert_eq!(
-        captured.header("x-xai-token-auth").as_deref(),
-        Some("xai-grok-cli")
-    );
+    // 非官方 host:Token-Auth/mode/authenticateresponse 均不发(对齐 host gate)
+    assert!(!captured.has_header("x-xai-token-auth"));
+    assert!(!captured.has_header("x-grok-client-mode"));
+    assert!(!captured.has_header("x-authenticateresponse"));
     assert_eq!(
         captured.header("x-grok-client-version").as_deref(),
         Some("1.0.46")
@@ -1939,11 +1939,6 @@ models:
         captured.header("x-grok-client-identifier").as_deref(),
         Some("grok-pager")
     );
-    assert_eq!(
-        captured.header("x-grok-client-mode").as_deref(),
-        Some("interactive")
-    );
-    assert!(!captured.has_header("x-authenticateresponse"));
     assert_eq!(
         captured.header("x-grok-model-override").as_deref(),
         Some("grok-4.6")
@@ -2027,10 +2022,9 @@ models:
     assert_eq!(status, StatusCode::OK);
     let ua = captured.header("user-agent").unwrap_or_default();
     assert!(ua.starts_with("grok-pager/1.0.46 grok-shell/1.0.46 ("));
-    assert_eq!(
-        captured.header("x-xai-token-auth").as_deref(),
-        Some("xai-grok-cli")
-    );
+    assert!(!captured.has_header("x-xai-token-auth"));
+    assert!(!captured.has_header("x-grok-client-mode"));
+    assert!(!captured.has_header("x-authenticateresponse"));
     assert_eq!(
         captured.header("x-grok-doom-loop-check").as_deref(),
         Some("1024")

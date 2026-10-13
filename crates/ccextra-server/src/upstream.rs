@@ -201,9 +201,11 @@ pub(crate) fn is_grok_model(upstream_model: &str) -> bool {
 }
 
 /// grok chat/responses 出站头(会话语义对齐 grok-build，交互身份对齐 sub2api)
-/// Token-Auth 来自 GrokAuthCredentials，version/identifier/mode 来自 CLI 身份;
-/// conv-id/model-override 来自 GrokRequestHeaders(不发 req-id/session-id/agent-id/turn-idx)
-/// 非 grok 或非 chat/responses 返回空,conv-id 仅 session trim 非空才带,doom-loop 仅 responses
+/// version/identifier/model-override 始终带; Token-Auth/mode/authenticateresponse
+/// 仅官方 cli-chat-proxy host 在 request() 注入(对齐 grok-build inject_proxy_headers /
+/// sub2api ApplyCLIProxyHeaders)。
+/// conv-id 仅 session trim 非空才带,doom-loop 仅 responses;
+/// 非 grok 或非 chat/responses 返回空(不发 req-id/session-id/agent-id/turn-idx)
 fn grok_cli_headers(
     protocol: Protocol,
     upstream_model: &str,
@@ -216,13 +218,11 @@ fn grok_cli_headers(
         return Vec::new();
     }
     let mut headers = vec![
-        ("X-XAI-Token-Auth", GROK_TOKEN_AUTH.to_string()),
         ("x-grok-client-version", grok_version.to_string()),
         (
             "x-grok-client-identifier",
             GROK_CLIENT_IDENTIFIER.to_string(),
         ),
-        ("x-grok-client-mode", GROK_CLIENT_MODE.to_string()),
         ("x-grok-model-override", upstream_model.to_string()),
     ];
     if let Some(sid) = session_id {
@@ -778,12 +778,15 @@ impl UpstreamClient {
             &user_agents.grok_version,
         );
         if !grok_headers.is_empty() {
-            // 对齐 sub2api ApplyCLIProxyHeaders:仅官方 host 请求携带响应认证标记。
+            // 对齐 grok-build inject_proxy_headers / sub2api ApplyCLIProxyHeaders:
+            // Token-Auth、client-mode、authenticateresponse 仅官方 cli-chat-proxy host。
             if reqwest::Url::parse(&url).is_ok_and(|parsed| {
                 parsed
                     .host_str()
                     .is_some_and(|host| host.eq_ignore_ascii_case("cli-chat-proxy.grok.com"))
             }) {
+                req = req.header("X-XAI-Token-Auth", GROK_TOKEN_AUTH);
+                req = req.header("x-grok-client-mode", GROK_CLIENT_MODE);
                 req = req.header("x-authenticateresponse", "authenticate-response");
             }
             tracing::debug!(
@@ -1195,10 +1198,9 @@ mod tests {
     }
 
     fn assert_identity(h: &std::collections::HashMap<String, String>, model: &str) {
-        assert_eq!(
-            h.get("X-XAI-Token-Auth").map(String::as_str),
-            Some("xai-grok-cli")
-        );
+        // Token-Auth / client-mode 走 host gate,不在 grok_cli_headers 里
+        assert!(!h.contains_key("X-XAI-Token-Auth"));
+        assert!(!h.contains_key("x-grok-client-mode"));
         assert_eq!(
             h.get("x-grok-client-version").map(String::as_str),
             Some("1.0.5")
@@ -1206,10 +1208,6 @@ mod tests {
         assert_eq!(
             h.get("x-grok-client-identifier").map(String::as_str),
             Some("grok-pager")
-        );
-        assert_eq!(
-            h.get("x-grok-client-mode").map(String::as_str),
-            Some("interactive")
         );
         assert_eq!(
             h.get("x-grok-model-override").map(String::as_str),
@@ -1270,7 +1268,7 @@ mod tests {
             let h = grok_header_map(Protocol::OpenAiChat, "grok-4.6", session);
             assert_identity(&h, "grok-4.6");
             assert!(!h.contains_key("x-grok-conv-id"));
-            assert!(h.contains_key("X-XAI-Token-Auth"));
+            assert!(h.contains_key("x-grok-client-version"));
         }
     }
 
@@ -1319,12 +1317,8 @@ mod tests {
                 "gpt-5",
                 None,
             ),
-            (
-                "cli-chat-proxy.grok.com",
-                Protocol::Claude,
-                "grok-4.7",
-                None,
-            ),
+            // Protocol::Claude 走 fingerprint 车道(无 reqwest resolve),不进本表;
+            // 空头已由 test_grok_cli_headers_chat_gpt_empty 覆盖。
         ] {
             let (server, captured) = spawn_captured_server(
                 &endpoint_path(protocol, false),
@@ -1365,8 +1359,29 @@ mod tests {
             assert_eq!(
                 captured.header("x-authenticateresponse").as_deref(),
                 expected,
-                "{host} {protocol:?} {model}"
+                "authenticateresponse {host} {protocol:?} {model}"
             );
+            let expect_proxy = expected.is_some();
+            assert_eq!(
+                captured.header("x-xai-token-auth").as_deref(),
+                expect_proxy.then_some("xai-grok-cli"),
+                "Token-Auth {host} {protocol:?} {model}"
+            );
+            assert_eq!(
+                captured.header("x-grok-client-mode").as_deref(),
+                expect_proxy.then_some("interactive"),
+                "client-mode {host} {protocol:?} {model}"
+            );
+            if expect_proxy {
+                assert_eq!(
+                    captured.header("x-grok-client-version").as_deref(),
+                    Some("1.0.5")
+                );
+                assert_eq!(
+                    captured.header("x-grok-client-identifier").as_deref(),
+                    Some("grok-pager")
+                );
+            }
         }
     }
 
