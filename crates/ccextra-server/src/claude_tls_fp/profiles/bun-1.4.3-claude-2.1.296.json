@@ -1,0 +1,73 @@
+{
+  "profile_id": "bun-1.4.3-claude-2.1.296",
+  "claude_code": "2.1.296",
+  "runtime": "Bun 1.4.3",
+  "source": "claude-tls-fp-sampler/baselines/claude-code-2.1.296-peet-api-all.json",
+  "http_version": "HTTP/1.1",
+  "alpn": [
+    "http/1.1"
+  ],
+  "ja3": "771,4865-4866-4867-49195-49199-49196-49200-52393-52392-49161-49171-49162-49172-156-157-47-53,0-23-65281-10-11-35-16-5-13-18-51-45-43,4588-29-23-24,0",
+  "ja3_hash": "1523504b38f0fae0d881d4b6554aac1b",
+  "ja4": "t13d1713h1_5b57614c22b0_6a3d802a7139",
+  "ja4_r": "t13d1713h1_002f,0035,009c,009d,1301,1302,1303,c009,c00a,c013,c014,c02b,c02c,c02f,c030,cca8,cca9_0005,000a,000b,000d,0012,0017,0023,002b,002d,0033,ff01_0403,0804,0401,0503,0805,0501,0806,0601,0201",
+  "ciphers_iana": [
+    4865,
+    4866,
+    4867,
+    49195,
+    49199,
+    49196,
+    49200,
+    52393,
+    52392,
+    49161,
+    49171,
+    49162,
+    49172,
+    156,
+    157,
+    47,
+    53
+  ],
+  "extensions": [
+    0,
+    23,
+    65281,
+    10,
+    11,
+    35,
+    16,
+    5,
+    13,
+    18,
+    51,
+    45,
+    43
+  ],
+  "supported_groups": [
+    4588,
+    29,
+    23,
+    24
+  ],
+  "ec_point_formats": [
+    0
+  ],
+  "signature_algorithms": [
+    "ecdsa_secp256r1_sha256",
+    "rsa_pss_rsae_sha256",
+    "rsa_pkcs1_sha256",
+    "ecdsa_secp384r1_sha384",
+    "rsa_pss_rsae_sha384",
+    "rsa_pkcs1_sha384",
+    "rsa_pss_rsae_sha512",
+    "rsa_pkcs1_sha512",
+    "rsa_pkcs1_sha1"
+  ],
+  "supported_versions": [
+    "TLS1.3",
+    "TLS1.2"
+  ],
+  "notes": "Target for Claude official OAuth fingerprint lane. Re-capture via sampler when Claude upgrades."
+}
