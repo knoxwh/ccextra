@@ -149,7 +149,8 @@ fn endpoint_path(protocol: Protocol, is_stream: bool) -> String {
         Protocol::OpenAiResponses => "/responses".to_string(),
         Protocol::Gemini => {
             if is_stream {
-                "/v1beta/models/{model}:streamGenerateContent".to_string()
+                // 对齐 Gemini CLI / CPA / sub2api:流式必须 ?alt=sse
+                "/v1beta/models/{model}:streamGenerateContent?alt=sse".to_string()
             } else {
                 "/v1beta/models/{model}:generateContent".to_string()
             }
@@ -1043,7 +1044,7 @@ mod tests {
         );
         assert_eq!(
             endpoint_path(Protocol::Gemini, true),
-            "/v1beta/models/{model}:streamGenerateContent"
+            "/v1beta/models/{model}:streamGenerateContent?alt=sse"
         );
     }
 
