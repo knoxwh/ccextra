@@ -32,8 +32,10 @@ secret_key: "sk-ccextra-xxx"
 # (base_url=https://api.anthropic.com, key=access_token)。与静态 API/中转共用直通管线。
 # claude_auth_dir: ".cache/claude"
 
-# Claude 官方 OAuth 出站默认走 Bun TLS 指纹车道(仅 api.anthropic.com + oat token)。
-# 精确 JA3 尚未对齐,见 crates/ccextra-server/src/claude_tls_fp/BLOCKER.md。
+# Claude 官方 OAuth 出站默认走 Bun TLS 指纹车道(仅 api.anthropic.com + oat token;
+# wreq/BoringSSL,对齐 Claude Code / Bun peet JA3/JA4 + HTTP/1.1)。
+# 验收: cargo run -p ccextra-server --example peet_fp
+# 说明: crates/ccextra-server/src/claude_tls_fp/STATUS.md
 
 # Cursor 原生代理(可选)。配置后以原生 connect-rpc 双向流直连
 # api2.cursor.sh,拉取账户模型目录并合成 name "cursor" provider

@@ -10,7 +10,7 @@ Match peet baseline:
 - JA4 `t13d1713h1_5b57614c22b0_6a3d802a7139`
 - HTTP/1.1 only (ALPN `http/1.1`)
 
-## Current solution (Option B — BoringSSL / wreq)
+## Current solution (wreq / BoringSSL)
 
 Fingerprint lane uses **wreq 0.16 + BoringSSL (`btls`)** with a hand-tuned `TlsOptions`
 spec from the sampler peet JSON (cipher list, curves, sigalgs, key shares, extension
@@ -31,7 +31,8 @@ OAuth (`sk-ant-oat*`) → `api.anthropic.com` (no config flag).
 | ja3_hash | `1523504b38f0fae0d881d4b6554aac1b` (**match**) |
 | ja4 | `t13d1713h1_5b57614c22b0_6a3d802a7139` (**match**) |
 
-Stock rustls CryptoProvider nudge path was removed; it could not advertise CBC/RSA suites
-or Bun extension order (see git history / prior notes).
+Stock rustls CryptoProvider nudge could not advertise CBC/RSA suites or Bun extension
+order; that path was removed in favor of wreq/BoringSSL.
 
-Refresh profile from `/Users/wanghao/tools/claude-tls-fp-sampler` when Claude upgrades.
+Refresh the vendored profile from the local `claude-tls-fp-sampler` baselines when
+Claude Code upgrades (see that tool's README / `sample.sh`).

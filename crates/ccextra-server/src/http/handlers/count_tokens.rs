@@ -126,13 +126,7 @@ pub async fn handle_count_tokens(
                     body: crate::upstream::UpstreamBody::Wreq(resp),
                 }
             } else {
-                let client = upstream_client.client_for(
-                    &proxy_key,
-                    Protocol::Claude,
-                    false,
-                    "",
-                    crate::upstream::TlsLane::Default,
-                )?;
+                let client = upstream_client.client_for(&proxy_key, Protocol::Claude, false, "")?;
                 let mut request = client
                     .post(&url)
                     .header(header::USER_AGENT, ua)

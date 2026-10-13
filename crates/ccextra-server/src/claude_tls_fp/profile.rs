@@ -1,7 +1,7 @@
 //! Distilled Bun / Claude Code TLS ClientHello profile (offline JA3 target).
 //!
 //! Source of truth for wire capture:
-//! `/Users/wanghao/tools/claude-tls-fp-sampler/baselines/claude-code-2.1.296-peet-api-all.json`
+//! `claude-tls-fp-sampler` baselines (e.g. `claude-code-2.1.296-peet-api-all.json`)
 //!
 //! This module does **not** forge a live Hello; it pins acceptance constants and builds the
 //! canonical JA3 string from profile fields so upgrades fail tests loudly.

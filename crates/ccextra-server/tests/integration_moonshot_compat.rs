@@ -18,7 +18,7 @@ async fn test_moonshot_streaming_usage_extraction() {
         Bytes::from("data: [DONE]\n\n"),
     ];
 
-    let stream = futures::stream::iter(chunks.into_iter().map(Ok::<_, reqwest::Error>));
+    let stream = futures::stream::iter(chunks.into_iter().map(Ok::<_, std::io::Error>));
     let mut relay_stream = relay_openai_chat_to_anthropic(stream, Some(100));
 
     let mut frames = Vec::new();

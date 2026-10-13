@@ -8,7 +8,7 @@ use std::borrow::Cow;
 use wreq::tls::{AlpnProtocol, ExtensionType, KeyShare, TlsOptions, TlsVersion};
 use wreq::Client;
 
-/// Build a wreq client for `TlsLane::ClaudeBunFp`.
+/// Build a wreq client for the Claude Bun fingerprint lane.
 pub fn build_fingerprint_client(proxy_key: &str, no_redirect: bool) -> anyhow::Result<Client> {
     let mut builder = Client::builder()
         .pool_max_idle_per_host(4)

@@ -45,9 +45,7 @@ async fn main() -> anyhow::Result<()> {
     if ja3_hash == TARGET_JA3_HASH {
         eprintln!("OK ja3_hash match");
     } else {
-        eprintln!(
-            "FAIL ja3_hash mismatch (see crates/ccextra-server/src/claude_tls_fp/BLOCKER.md)"
-        );
+        eprintln!("FAIL ja3_hash mismatch (see crates/ccextra-server/src/claude_tls_fp/STATUS.md)");
         ok = false;
     }
     if ja4 == TARGET_JA4 {
