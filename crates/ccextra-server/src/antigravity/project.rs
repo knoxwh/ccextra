@@ -1,7 +1,8 @@
 // project_id:loadCodeAssist,空则 daily onboardUser 轮询
 
 use super::constants::{
-    onboard_ua, API_ENDPOINT, API_VERSION, DAILY_API_ENDPOINT, GOOG_API_CLIENT, REQUEST_UA,
+    onboard_ua, version_from_user_agent, API_ENDPOINT, API_VERSION, DAILY_API_ENDPOINT,
+    GOOG_API_CLIENT, REQUEST_UA,
 };
 use anyhow::{anyhow, Context, Result};
 use reqwest::Client;
@@ -133,12 +134,14 @@ pub(crate) async fn onboard_user_at(
     tier_id: &str,
     request_ua: Option<&str>,
 ) -> Result<String> {
-    let onboard = onboard_ua(resolve_request_ua(request_ua));
+    let request_ua = resolve_request_ua(request_ua);
+    let onboard = onboard_ua(request_ua);
+    let ide_version = version_from_user_agent(&onboard);
     let body = json!({
         "tier_id": tier_id,
         "metadata": {
             "ide_type": "ANTIGRAVITY",
-            "ide_version": "2.9.1",
+            "ide_version": ide_version,
             "ide_name": "antigravity",
         }
     });

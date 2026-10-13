@@ -807,9 +807,17 @@ impl UpstreamClient {
         if codex_subscription {
             req = req.header(reqwest::header::CONTENT_ENCODING, "zstd");
         }
+        // Antigravity: CPA chat 不设 Accept; scrub 不强制 application/json,
+        // 留给 reqwest Client::execute 默认 */*(真·无 Accept 需改 client,留 IDE 抓包)。
+        let accept_policy = if matches!(protocol, Protocol::Antigravity) {
+            AcceptScrubPolicy::LeaveClientDefault
+        } else {
+            AcceptScrubPolicy::ForceApplicationJson
+        };
         let resp = send_with_timeout(
             req.header(reqwest::header::CONTENT_TYPE, "application/json")
                 .body(bytes::Bytes::clone(body)),
+            accept_policy,
         )
         .await?;
 
@@ -912,18 +920,28 @@ pub(crate) async fn send_with_timeout_wreq(
     }
 }
 
+/// Antigravity chat 对齐 CPA:不强制 `Accept: application/json`。
+/// 其余协议仍堵住 reqwest 默认 `*/*`。
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum AcceptScrubPolicy {
+    /// 缺省 / `*/*` → `application/json`(Claude / Gemini / OpenAI 等)。
+    ForceApplicationJson,
+    /// 不注入、不改写 `*/*`;缺省留给 Client::execute 填 `*/*`(Antigravity)。
+    LeaveClientDefault,
+}
+
 /// 出站头 scrub:去掉 reqwest 叠头/默认多余头,保留鉴权与协议必需头。
 ///
 /// - `Content-Type`:RequestBuilder::header 是 append;透传+显式声明会双头,
 ///   一律折叠为单一 `application/json`(本路径 body 均为 JSON;有意丢掉
 ///   charset 等参数,与上游显式声明对齐)。
-/// - `Accept`:reqwest 在 `Client::execute` 时才把 Client 默认 `*/*` 填进
-///   Vacant 槽(`build`/`build_split` 时尚无)。此处若缺省或值为 `*/*`
-///   则改为 `application/json`,堵住默认上线;SSE / 入站透传的非 `*/*`
-///   Accept 原样保留。
-/// - 多值 `Accept` / `User-Agent`:保留首个,去掉叠出来的重复项;若首个
-///   仍是 `*/*` 则同上改为 `application/json`。
-fn scrub_outbound_request_headers(req: &mut reqwest::Request) {
+/// - `Accept`:
+///   - [`AcceptScrubPolicy::ForceApplicationJson`]:缺省或 `*/*` → `application/json`;
+///     SSE / 入站透传的非 `*/*` Accept 原样保留。
+///   - [`AcceptScrubPolicy::LeaveClientDefault`]:不注入、不把 `*/*` 改成 json
+///     (Antigravity;CPA chat 不设 Accept;reqwest 随后仍可能补 `*/*`)。
+/// - 多值 `Accept` / `User-Agent`:保留首个,去掉叠出来的重复项。
+fn scrub_outbound_request_headers(req: &mut reqwest::Request, accept_policy: AcceptScrubPolicy) {
     use reqwest::header::{HeaderValue, ACCEPT, CONTENT_TYPE, USER_AGENT};
 
     if req.headers().contains_key(CONTENT_TYPE) {
@@ -934,14 +952,18 @@ fn scrub_outbound_request_headers(req: &mut reqwest::Request) {
 
     let accept_count = req.headers().get_all(ACCEPT).iter().count();
     if accept_count == 0 {
-        req.headers_mut()
-            .insert(ACCEPT, HeaderValue::from_static("application/json"));
+        if matches!(accept_policy, AcceptScrubPolicy::ForceApplicationJson) {
+            req.headers_mut()
+                .insert(ACCEPT, HeaderValue::from_static("application/json"));
+        }
     } else if accept_count > 1 {
         let first = req.headers().get(ACCEPT).expect("accept present").clone();
         req.headers_mut().insert(ACCEPT, first);
     }
-    // 单值或折叠后的首值若仍是 */*,视同缺省(堵住 Client execute 默认 / 入站透传)
-    if req.headers().get(ACCEPT).and_then(|v| v.to_str().ok()) == Some("*/*") {
+    // ForceApplicationJson:单值或折叠后的首值若仍是 */*,视同缺省
+    if matches!(accept_policy, AcceptScrubPolicy::ForceApplicationJson)
+        && req.headers().get(ACCEPT).and_then(|v| v.to_str().ok()) == Some("*/*")
+    {
         req.headers_mut()
             .insert(ACCEPT, HeaderValue::from_static("application/json"));
     }
@@ -961,10 +983,11 @@ fn scrub_outbound_request_headers(req: &mut reqwest::Request) {
 /// 发送前 scrub 出站头(双 Content-Type / 默认 Accept: */* 等)。
 pub(crate) async fn send_with_timeout(
     request: reqwest::RequestBuilder,
+    accept_policy: AcceptScrubPolicy,
 ) -> anyhow::Result<reqwest::Response> {
     let (client, built) = request.build_split();
     let mut built = built.map_err(|e| anyhow::anyhow!("构建上游请求失败: {e}"))?;
-    scrub_outbound_request_headers(&mut built);
+    scrub_outbound_request_headers(&mut built, accept_policy);
     match tokio::time::timeout(SEND_TIMEOUT, client.execute(built)).await {
         Ok(Ok(resp)) => Ok(resp),
         Ok(Err(e)) => Err(e.into()),
@@ -1391,7 +1414,7 @@ mod tests {
             2
         );
         assert!(!built.headers().contains_key(reqwest::header::ACCEPT));
-        scrub_outbound_request_headers(&mut built);
+        scrub_outbound_request_headers(&mut built, AcceptScrubPolicy::ForceApplicationJson);
         let cts: Vec<_> = built
             .headers()
             .get_all(reqwest::header::CONTENT_TYPE)
@@ -1418,7 +1441,7 @@ mod tests {
             .body("{}")
             .build()
             .unwrap();
-        scrub_outbound_request_headers(&mut built);
+        scrub_outbound_request_headers(&mut built, AcceptScrubPolicy::ForceApplicationJson);
         assert_eq!(
             built
                 .headers()
@@ -1438,13 +1461,45 @@ mod tests {
             .body("{}")
             .build()
             .unwrap();
-        scrub_outbound_request_headers(&mut built);
+        scrub_outbound_request_headers(&mut built, AcceptScrubPolicy::ForceApplicationJson);
         assert_eq!(
             built
                 .headers()
                 .get(reqwest::header::ACCEPT)
                 .and_then(|v| v.to_str().ok()),
             Some("application/json")
+        );
+    }
+
+    #[test]
+    fn test_scrub_ag_leaves_default_accept() {
+        let client = Client::new();
+        let mut built = client
+            .post("http://example.com/v1internal:generateContent")
+            .header(reqwest::header::CONTENT_TYPE, "application/json")
+            .body("{}")
+            .build()
+            .unwrap();
+        assert!(!built.headers().contains_key(reqwest::header::ACCEPT));
+        scrub_outbound_request_headers(&mut built, AcceptScrubPolicy::LeaveClientDefault);
+        assert!(
+            !built.headers().contains_key(reqwest::header::ACCEPT),
+            "AG scrub must not inject Accept; Client::execute may still add */*"
+        );
+
+        let mut star = client
+            .post("http://example.com/v1internal:generateContent")
+            .header(reqwest::header::ACCEPT, "*/*")
+            .header(reqwest::header::CONTENT_TYPE, "application/json")
+            .body("{}")
+            .build()
+            .unwrap();
+        scrub_outbound_request_headers(&mut star, AcceptScrubPolicy::LeaveClientDefault);
+        assert_eq!(
+            star.headers()
+                .get(reqwest::header::ACCEPT)
+                .and_then(|v| v.to_str().ok()),
+            Some("*/*")
         );
     }
 
@@ -1565,7 +1620,8 @@ mod tests {
                 "/v1internal:generateContent",
                 "gemini-cli",
                 false,
-                "application/json",
+                // CPA chat 不设 Accept;reqwest execute 缺省补 */*
+                "*/*",
             ),
         ] {
             let (server, captured) =
