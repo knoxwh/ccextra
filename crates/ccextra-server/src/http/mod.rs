@@ -77,6 +77,8 @@ pub struct ReloadData {
     pub proxy_url: Option<String>,
     /// Antigravity 连接池配置(默认短连接,对齐 CPA connection-pool)
     pub antigravity: Option<crate::upstream::AntigravityConfig>,
+    /// Claude 官方 OAuth Bun TLS 指纹车道(默认 false)
+    pub claude_tls_fingerprint: bool,
     pub user_agents: UserAgentSet,
     pub thinking_registry: Arc<Vec<ccextra_core::thinking::ModelCapability>>,
 }

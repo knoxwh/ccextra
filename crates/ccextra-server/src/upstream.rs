@@ -343,9 +343,18 @@ fn parse_go_duration(raw: &str) -> anyhow::Result<Duration> {
     Ok(Duration::from_secs_f64(secs))
 }
 
-/// client 缓存键:(最终代理, 是否 antigravity, 是否禁 redirect, 凭证 scope)
+/// TLS 出站车道(指纹池与默认 rustls 池隔离)。
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
+pub(crate) enum TlsLane {
+    /// 现有 reqwest + rustls(可协商 H2)
+    Default,
+    /// Claude 官方 OAuth:HTTP/1.1 + Bun Hello 目标(见 claude_tls_fp)
+    ClaudeBunFp,
+}
+
+/// client 缓存键:(最终代理, 是否 antigravity, 是否禁 redirect, 凭证 scope, TLS 车道)
 /// Antigravity 启用连接池时 scope 为凭证短摘要，隔离多账号 TCP/TLS 池。
-type ClientCacheKey = (String, bool, bool, String);
+type ClientCacheKey = (String, bool, bool, String, TlsLane);
 
 /// 对齐 CPA antigravityCredentialScope：仅在 AG + 连接池启用时按凭证分池。
 /// 优先 refresh_token（跨 access 轮换仍稳定）；缺失再回退 access_token。
@@ -380,6 +389,8 @@ pub struct UpstreamClient {
     clients: std::sync::Arc<Mutex<HashMap<ClientCacheKey, Client>>>,
     /// Antigravity 连接池设置(短连接默认,对齐 CPA antigravity.executor)
     ant_pool: AntigravityPoolSettings,
+    /// Claude 官方 OAuth 是否走 Bun TLS 指纹车道(默认关;JA3 对齐见 BLOCKER.md)
+    claude_tls_fingerprint: bool,
     #[cfg(test)]
     pub(crate) attempts: std::sync::Arc<Mutex<Vec<String>>>,
 }
@@ -393,13 +404,32 @@ impl UpstreamClient {
         global_proxy: Option<String>,
         ant_cfg: Option<&AntigravityConfig>,
     ) -> Self {
+        Self::with_ant_pool_and_claude_fp(global_proxy, ant_cfg, false)
+    }
+
+    /// 同 [`Self::with_ant_pool`],可打开 Claude 官方 OAuth TLS 指纹车道。
+    pub fn with_ant_pool_and_claude_fp(
+        global_proxy: Option<String>,
+        ant_cfg: Option<&AntigravityConfig>,
+        claude_tls_fingerprint: bool,
+    ) -> Self {
         Self {
             global_proxy,
             clients: std::sync::Arc::new(Mutex::new(HashMap::new())),
             ant_pool: AntigravityPoolSettings::resolve(ant_cfg),
+            claude_tls_fingerprint,
             #[cfg(test)]
             attempts: Default::default(),
         }
+    }
+
+    /// 运行时开关(测试 / reload 用)。
+    pub fn set_claude_tls_fingerprint(&mut self, enabled: bool) {
+        self.claude_tls_fingerprint = enabled;
+    }
+
+    pub fn claude_tls_fingerprint(&self) -> bool {
+        self.claude_tls_fingerprint
     }
 
     /// 全局代理(供 cursor 目录刷新等不经 upstream 的路径复用)
@@ -441,6 +471,7 @@ impl UpstreamClient {
         protocol: Protocol,
         no_redirect: bool,
         credential_scope: &str,
+        tls_lane: TlsLane,
     ) -> anyhow::Result<Client> {
         let ant = matches!(protocol, Protocol::Antigravity);
         let scope = if ant && !self.ant_pool.short_mode {
@@ -448,13 +479,19 @@ impl UpstreamClient {
         } else {
             String::new()
         };
-        let cache_key: ClientCacheKey = (proxy_key.to_string(), ant, no_redirect, scope);
+        let cache_key: ClientCacheKey = (proxy_key.to_string(), ant, no_redirect, scope, tls_lane);
         let mut clients = self
             .clients
             .lock()
             .unwrap_or_else(|poisoned| poisoned.into_inner());
         if let Some(c) = clients.get(&cache_key) {
             return Ok(c.clone());
+        }
+        // Claude Bun 指纹车道:独立池,不与默认 rustls/H2 客户端混用
+        if matches!(tls_lane, TlsLane::ClaudeBunFp) {
+            let client = crate::claude_tls_fp::build_fingerprint_client(proxy_key, no_redirect)?;
+            clients.insert(cache_key, client.clone());
+            return Ok(client);
         }
         let mut builder = Client::builder()
             // 限制单个 host 最大空闲连接数，防毒化池
@@ -624,7 +661,23 @@ impl UpstreamClient {
             api_key,
             pool_refresh_token,
         );
-        let client = self.client_for(&proxy_key, protocol, codex_subscription, &cred_scope)?;
+        let tls_lane = if crate::claude_tls_fp::should_use_fingerprint_lane(
+            self.claude_tls_fingerprint,
+            matches!(protocol, Protocol::Claude),
+            api_key,
+            base_url,
+        ) {
+            TlsLane::ClaudeBunFp
+        } else {
+            TlsLane::Default
+        };
+        let client = self.client_for(
+            &proxy_key,
+            protocol,
+            codex_subscription,
+            &cred_scope,
+            tls_lane,
+        )?;
 
         // Gemini 端点需要替换 {model} 占位符
         let endpoint = endpoint_path(protocol, is_stream);
@@ -1081,7 +1134,13 @@ mod tests {
                 server.url.trim_start_matches("http://").parse().unwrap();
             let client = UpstreamClient::new(None);
             client.clients.lock().unwrap().insert(
-                ("direct".into(), false, false, String::new()),
+                (
+                    "direct".into(),
+                    false,
+                    false,
+                    String::new(),
+                    TlsLane::Default,
+                ),
                 Client::builder()
                     .no_proxy()
                     .resolve(&host.to_ascii_lowercase(), addr)
@@ -1445,7 +1504,13 @@ mod tests {
             };
             let client = UpstreamClient::new(None);
             client.clients.lock().unwrap().insert(
-                ("direct".into(), false, false, String::new()),
+                (
+                    "direct".into(),
+                    false,
+                    false,
+                    String::new(),
+                    TlsLane::Default,
+                ),
                 Client::builder()
                     .no_proxy()
                     .timeout(std::time::Duration::from_millis(100))
@@ -1624,16 +1689,16 @@ mod tests {
     fn test_client_caching() {
         let client = UpstreamClient::new(None);
         let _c1 = client
-            .client_for("direct", Protocol::OpenAiChat, false, "")
+            .client_for("direct", Protocol::OpenAiChat, false, "", TlsLane::Default)
             .unwrap();
         let _c2 = client
-            .client_for("direct", Protocol::OpenAiChat, false, "")
+            .client_for("direct", Protocol::OpenAiChat, false, "", TlsLane::Default)
             .unwrap();
         // 同一 proxy_key 应返回相同 client(Arc clone)
         // 通过计数验证缓存命中
         let count_before = client.clients.lock().unwrap().len();
         let _c3 = client
-            .client_for("direct", Protocol::OpenAiChat, false, "")
+            .client_for("direct", Protocol::OpenAiChat, false, "", TlsLane::Default)
             .unwrap();
         let count_after = client.clients.lock().unwrap().len();
         assert_eq!(count_before, count_after, "缓存应命中,不应重建 client");
@@ -1643,15 +1708,40 @@ mod tests {
     fn test_client_different_proxies() {
         let client = UpstreamClient::new(None);
         let _c1 = client
-            .client_for("direct", Protocol::OpenAiChat, false, "")
+            .client_for("direct", Protocol::OpenAiChat, false, "", TlsLane::Default)
             .unwrap();
         let _c2 = client
-            .client_for("http://proxy1:8080", Protocol::OpenAiChat, false, "")
+            .client_for(
+                "http://proxy1:8080",
+                Protocol::OpenAiChat,
+                false,
+                "",
+                TlsLane::Default,
+            )
             .unwrap();
         let _c3 = client
-            .client_for("http://proxy2:9090", Protocol::OpenAiChat, false, "")
+            .client_for(
+                "http://proxy2:9090",
+                Protocol::OpenAiChat,
+                false,
+                "",
+                TlsLane::Default,
+            )
             .unwrap();
         assert_eq!(client.clients.lock().unwrap().len(), 3);
+    }
+
+    #[test]
+    fn test_claude_fp_lane_isolates_client_pool() {
+        let mut client = UpstreamClient::new(None);
+        client.set_claude_tls_fingerprint(true);
+        let _default = client
+            .client_for("direct", Protocol::Claude, false, "", TlsLane::Default)
+            .unwrap();
+        let _fp = client
+            .client_for("direct", Protocol::Claude, false, "", TlsLane::ClaudeBunFp)
+            .unwrap();
+        assert_eq!(client.clients.lock().unwrap().len(), 2);
     }
 
     #[test]
@@ -1659,10 +1749,10 @@ mod tests {
         // Antigravity 默认短连接:缓存键独立于其他协议(#ant 后缀)
         let client = UpstreamClient::new(None);
         let _c1 = client
-            .client_for("direct", Protocol::Antigravity, false, "")
+            .client_for("direct", Protocol::Antigravity, false, "", TlsLane::Default)
             .unwrap();
         let _c2 = client
-            .client_for("direct", Protocol::OpenAiChat, false, "")
+            .client_for("direct", Protocol::OpenAiChat, false, "", TlsLane::Default)
             .unwrap();
         assert_eq!(client.clients.lock().unwrap().len(), 2);
 
@@ -1695,22 +1785,52 @@ mod tests {
             ant_credential_scope(Protocol::Antigravity, false, "access-only", None);
         assert!(scope_access_only.starts_with("token:"));
         let _c1 = client
-            .client_for("direct", Protocol::Antigravity, false, &scope_a)
+            .client_for(
+                "direct",
+                Protocol::Antigravity,
+                false,
+                &scope_a,
+                TlsLane::Default,
+            )
             .unwrap();
         let _c2 = client
-            .client_for("direct", Protocol::Antigravity, false, &scope_b)
+            .client_for(
+                "direct",
+                Protocol::Antigravity,
+                false,
+                &scope_b,
+                TlsLane::Default,
+            )
             .unwrap();
         let _c1b = client
-            .client_for("direct", Protocol::Antigravity, false, &scope_a)
+            .client_for(
+                "direct",
+                Protocol::Antigravity,
+                false,
+                &scope_a,
+                TlsLane::Default,
+            )
             .unwrap();
         assert_eq!(client.clients.lock().unwrap().len(), 2);
         // 短连接模式忽略 scope，共用一个 AG 短连接条目
         let short = UpstreamClient::new(None);
         let _s1 = short
-            .client_for("direct", Protocol::Antigravity, false, &scope_a)
+            .client_for(
+                "direct",
+                Protocol::Antigravity,
+                false,
+                &scope_a,
+                TlsLane::Default,
+            )
             .unwrap();
         let _s2 = short
-            .client_for("direct", Protocol::Antigravity, false, &scope_b)
+            .client_for(
+                "direct",
+                Protocol::Antigravity,
+                false,
+                &scope_b,
+                TlsLane::Default,
+            )
             .unwrap();
         assert_eq!(short.clients.lock().unwrap().len(), 1);
     }

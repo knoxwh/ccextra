@@ -117,7 +117,11 @@ fn build_runtime_config(data: &crate::http::ReloadData) -> anyhow::Result<Runtim
         normalize: data.normalize.clone(),
         logging: data.logging.clone(),
         secret: data.secret.clone(),
-        upstream: UpstreamClient::with_ant_pool(data.proxy_url.clone(), data.antigravity.as_ref()),
+        upstream: UpstreamClient::with_ant_pool_and_claude_fp(
+            data.proxy_url.clone(),
+            data.antigravity.as_ref(),
+            data.claude_tls_fingerprint,
+        ),
         user_agents: data.user_agents.clone(),
         thinking_registry: data.thinking_registry.clone(),
     })
