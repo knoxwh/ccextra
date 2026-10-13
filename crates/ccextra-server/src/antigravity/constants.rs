@@ -132,10 +132,7 @@ mod tests {
             version_from_user_agent("antigravity/1.23.2 windows/amd64"),
             "1.23.2"
         );
-        assert_eq!(
-            version_from_user_agent(ONBOARD_UA),
-            "2.21.1"
-        );
+        assert_eq!(version_from_user_agent(ONBOARD_UA), "2.21.1");
         assert_eq!(version_from_user_agent("curl/8"), IDE_VERSION_FALLBACK);
     }
 }
