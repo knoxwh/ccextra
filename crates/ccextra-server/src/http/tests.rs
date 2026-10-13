@@ -165,7 +165,7 @@ fn test_outbound_model_keeps_nonempty_payload_override() {
 }
 
 #[test]
-fn test_claude_relay_header_filtering() {
+fn test_claude_passthrough_header_filtering() {
     let headers = headers_with(&[
         ("x-custom-header", "custom-value"),
         ("anthropic-beta", "beta-a,beta-a"),
@@ -180,7 +180,7 @@ fn test_claude_relay_header_filtering() {
         ("user-agent", "claude-code/inbound"),
         ("x-remove-me", "remove-me"),
     ]);
-    let out = claude_relay_headers(&headers);
+    let out = claude_passthrough_headers(&headers);
     assert!(relay_has_header_value(
         &out,
         "x-custom-header",
@@ -191,6 +191,17 @@ fn test_claude_relay_header_filtering() {
         "anthropic-beta",
         "beta-a,beta-a"
     ));
+    // 直通保留 UA / AE;只剥身份、CT、hop-by-hop 及 Connection 点名头
+    assert!(relay_has_header_value(
+        &out,
+        "user-agent",
+        "claude-code/inbound"
+    ));
+    assert!(relay_has_header_value(
+        &out,
+        "accept-encoding",
+        "gzip, deflate, br"
+    ));
     for excluded in [
         "x-api-key",
         "authorization",
@@ -199,8 +210,6 @@ fn test_claude_relay_header_filtering() {
         "content-type",
         "connection",
         "transfer-encoding",
-        "accept-encoding",
-        "user-agent",
         "x-remove-me",
     ] {
         assert!(!out.contains_key(excluded), "{excluded}");
@@ -208,8 +217,8 @@ fn test_claude_relay_header_filtering() {
 }
 
 #[test]
-fn test_claude_relay_beta_matrix() {
-    // 矩阵覆盖:重合值保留、普通值保留、缺失不补
+fn test_claude_passthrough_beta_matrix() {
+    // 矩阵覆盖:重合值保留、普通值保留、缺失不补(oauth beta 由 ensure_oauth_beta 另补)
     let cases: [(&[&str], Option<&str>); 3] = [
         (
             &["custom-beta,custom-beta"],
@@ -226,7 +235,7 @@ fn test_claude_relay_beta_matrix() {
                 axum::http::HeaderValue::from_str(val).unwrap(),
             );
         }
-        let out = claude_relay_headers(&map);
+        let out = claude_passthrough_headers(&map);
         match expected {
             Some(exp) => assert!(
                 relay_has_header_value(&out, "anthropic-beta", exp),
@@ -238,13 +247,13 @@ fn test_claude_relay_beta_matrix() {
 }
 
 #[test]
-fn test_claude_relay_identity_headers_passthrough_only() {
+fn test_claude_passthrough_identity_headers_only() {
     let headers = headers_with(&[
         ("anthropic-version", "2023-06-01"),
         ("x-app", "cli"),
         ("x-stainless-os", "macOS"),
     ]);
-    let out = claude_relay_headers(&headers);
+    let out = claude_passthrough_headers(&headers);
     assert!(relay_has_header_value(
         &out,
         "anthropic-version",
@@ -253,9 +262,20 @@ fn test_claude_relay_identity_headers_passthrough_only() {
     assert!(relay_has_header_value(&out, "x-app", "cli"));
     assert!(relay_has_header_value(&out, "x-stainless-os", "macOS"));
     assert!(!out.contains_key("x-stainless-arch"));
+    // 缺 AE 时补默认
+    assert!(relay_has_header_value(
+        &out,
+        "accept-encoding",
+        CLAUDE_ACCEPT_ENCODING
+    ));
 
-    let out2 = claude_relay_headers(&HeaderMap::new());
-    assert!(out2.is_empty());
+    let out2 = claude_passthrough_headers(&HeaderMap::new());
+    assert_eq!(out2.len(), 1);
+    assert!(relay_has_header_value(
+        &out2,
+        "accept-encoding",
+        CLAUDE_ACCEPT_ENCODING
+    ));
 }
 
 #[test]
@@ -289,10 +309,6 @@ fn test_claude_passthrough_keeps_ua_ae_and_strips_identity() {
     for excluded in ["authorization", "x-api-key", "content-type"] {
         assert!(!out.contains_key(excluded), "{excluded}");
     }
-    // 完整 relay 仍剥 UA 与 AE
-    let full = claude_relay_headers(&headers);
-    assert!(!full.contains_key("user-agent"));
-    assert!(!full.contains_key("accept-encoding"));
 }
 
 fn mock_state() -> AppState {

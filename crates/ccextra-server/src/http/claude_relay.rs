@@ -6,59 +6,7 @@ use axum::http::{header, HeaderMap, HeaderName, HeaderValue};
 /// 与 CLI 2.1.296 MITM 金样及 CPA `defaultAcceptEncoding` 一致。
 pub const CLAUDE_ACCEPT_ENCODING: &str = "gzip, deflate, br, zstd";
 
-/// 构建 Claude 中转请求头:保留入站头,排除认证、代理重建及连接管理头。
-///
-/// 完整 relay 仍剥 AE:留给转换 / cloak 路径;直通见 [`claude_passthrough_headers`]。
-pub fn claude_relay_headers(headers: &HeaderMap) -> HeaderMap {
-    let connection_header_names: Vec<String> = headers
-        .get_all(header::CONNECTION)
-        .iter()
-        .filter_map(|value| value.to_str().ok())
-        .flat_map(|value| value.split(','))
-        .map(str::trim)
-        .filter(|name| !name.is_empty())
-        .map(str::to_ascii_lowercase)
-        .collect();
-    let mut relay_headers = HeaderMap::new();
-    for (name, value) in headers.iter() {
-        if !is_claude_relay_header_excluded(name.as_str(), &connection_header_names) {
-            relay_headers.append(name.clone(), value.clone());
-        }
-    }
-    relay_headers
-}
-
-pub fn is_claude_relay_header_excluded(name: &str, connection_header_names: &[String]) -> bool {
-    let name = name.to_ascii_lowercase();
-    connection_header_names.iter().any(|item| item == &name)
-        || matches!(
-            name.as_str(),
-            "authorization"
-                | "x-api-key"
-                // ccextra 出站订阅身份头,入站同名头不得透传或触发禁 redirect
-                | "chatgpt-account-id"
-                | "user-agent"
-                | "host"
-                | "content-length"
-                // upstream.rs 统一声明 application/json;reqwest .header 为 append,
-                // 透传入站 Content-Type 会与之叠成双头
-                | "content-type"
-                // 完整 relay 仍剥 AE;直通路径见 passthrough(保留/补齐)
-                | "accept-encoding"
-                | "connection"
-                | "keep-alive"
-                | "proxy-connection"
-                | "proxy-authenticate"
-                | "proxy-authorization"
-                | "te"
-                | "trailer"
-                | "transfer-encoding"
-                | "upgrade"
-                | "http2-settings"
-        )
-}
-
-/// Claude 原生直通(入站已是 Anthropic messages)的最小出站头。
+/// Claude 原生直通(`protocol: claude`,入站已是 Anthropic messages)的最小出站头。
 ///
 /// 只剥身份 / Host / CL / hop-by-hop / 误带的 chatgpt-account-id / CT:
 /// Stainless、`anthropic-*`、入站 UA/Accept/AE 尽量原样。
@@ -66,7 +14,7 @@ pub fn is_claude_relay_header_excluded(name: &str, connection_header_names: &[St
 /// gzip/br/deflate/zstd 自动解压,与广告能力一致。
 /// CT 仍剥,由 upstream 统一写单条 `application/json`。
 ///
-/// 协议转换 / compat 路径继续用 [`claude_relay_headers`](fn@claude_relay_headers)(完整剥 UA/AE 等再重建)。
+/// 协议转换出站不是 Anthropic 头组装,不走本函数。
 pub fn claude_passthrough_headers(headers: &HeaderMap) -> HeaderMap {
     let connection_header_names: Vec<String> = headers
         .get_all(header::CONNECTION)
@@ -272,11 +220,6 @@ mod tests {
         ] {
             assert!(!out.contains_key(excluded), "{excluded}");
         }
-        // 完整 relay 仍剥 UA 与 AE;直通保留
-        let full = claude_relay_headers(&headers);
-        assert!(!full.contains_key("user-agent"));
-        assert!(!full.contains_key("accept-encoding"));
-        assert!(full.contains_key("x-stainless-os"));
     }
 
     #[test]

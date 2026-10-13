@@ -582,7 +582,7 @@ impl UpstreamClient {
     /// - `session_id`:responses 链路发 `session-id` 头(对齐 cacheHelper,
     ///   值为 prompt_cache_key,上游按它做缓存亲和);grok 模型(chat/responses)
     ///   发 `x-grok-conv-id` 会话路由头(xAI 服务器缓存亲和)
-    /// - `extra_headers`:Claude 直通为最小透传头;转换/compat 仍可用完整 relay
+    /// - `extra_headers`:Claude 直通为 [`crate::http::claude_passthrough_headers`] 最小透传头
     /// - `inbound_user_agent`:Claude 协议优先使用入站值,缺失时回退配置值
     /// - `query`:入站 URI query(不含 `?`);仅 Claude 直通接到 `/v1/messages`
     #[allow(clippy::too_many_arguments)]
