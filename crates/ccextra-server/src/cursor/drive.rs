@@ -315,4 +315,11 @@ impl CursorDrive {
             .await
             .map_err(CursorFailure::from_transport)
     }
+
+    /// 客户端断连/取消时先发空 CancelAction,再由 Drop 掐传输。
+    pub async fn send_cancel_action(&self) -> Result<(), anyhow::Error> {
+        self.stream
+            .send_message(&reply::encode_cancel_action())
+            .await
+    }
 }

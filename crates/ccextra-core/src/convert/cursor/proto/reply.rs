@@ -212,6 +212,26 @@ pub fn encode_builtin_rejection(id: u32, exec_id: &str, field: u64) -> Option<Ve
     Some(encode_exec(id, exec_id, result_field, &result))
 }
 
+/// 客户端取消:AgentClientMessage.conversation_action(4) →
+/// ConversationAction.cancel_action(3) → 空 CancelAction。
+///
+/// 对齐 reverse-cursor-agent docs/proto(CancelAction) 与 SummarizeAction 同构空消息;
+/// reverse 另有可选 `string reason = 1`,本仓库 proto 仍为空消息,无抓包前不填 reason。
+pub fn encode_cancel_action() -> Vec<u8> {
+    generated::AgentClientMessage {
+        message: Some(
+            generated::agent_client_message::Message::ConversationAction(
+                generated::ConversationAction {
+                    action: Some(generated::conversation_action::Action::CancelAction(
+                        generated::CancelAction {},
+                    )),
+                },
+            ),
+        ),
+    }
+    .encode_to_vec()
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -249,6 +269,24 @@ mod tests {
             panic!()
         };
         assert!(result.is_error);
+    }
+
+    #[test]
+    fn cancel_action_is_empty_conversation_action() {
+        let data = encode_cancel_action();
+        // AgentClientMessage field 4 + ConversationAction field 3 empty:
+        // 0x22 0x02 0x1a 0x00
+        assert_eq!(data, [0x22, 0x02, 0x1a, 0x00]);
+        let message = generated::AgentClientMessage::decode(data.as_slice()).unwrap();
+        let generated::agent_client_message::Message::ConversationAction(action) =
+            message.message.unwrap()
+        else {
+            panic!("expected conversation_action");
+        };
+        assert!(matches!(
+            action.action,
+            Some(generated::conversation_action::Action::CancelAction(_))
+        ));
     }
 
     #[test]

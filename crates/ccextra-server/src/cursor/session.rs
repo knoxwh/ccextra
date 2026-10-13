@@ -435,8 +435,10 @@ impl CursorSessions {
         mut resume: oneshot::Receiver<oneshot::Sender<CursorDrive>>,
         prefix: Option<CheckpointPrefix>,
     ) {
+        let mut send_cancel = false;
         loop {
             if *cancelled.borrow() {
+                send_cancel = true;
                 break;
             }
             let event = match drive.next_ready_event().await {
@@ -444,7 +446,10 @@ impl CursorSessions {
                 Ok(None) => {
                     tokio::select! {
                         biased;
-                        _ = cancelled.changed() => break,
+                        _ = cancelled.changed() => {
+                            send_cancel = true;
+                            break;
+                        }
                         handoff = &mut resume => {
                             if let Ok(sender) = handoff {
                                 let _ = sender.send(drive);
@@ -484,6 +489,11 @@ impl CursorSessions {
                 | CursorEvent::Tokens(_)
                 | CursorEvent::TurnEnded(_) => {}
                 CursorEvent::End | CursorEvent::ToolUse { .. } => break,
+            }
+        }
+        if send_cancel {
+            if let Err(error) = drive.send_cancel_action().await {
+                tracing::debug!("Cursor CancelAction 发送失败(连接可能已断): {error}");
             }
         }
         self.cancel(&conversation, &identity, generation);

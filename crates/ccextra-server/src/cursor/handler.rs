@@ -286,6 +286,11 @@ fn spawn_cursor_producer(
         }
 
         if cancelled {
+            // 礼貌取消:先发 CancelAction 再让 drive Drop 掐 H2(对齐 CLI ConversationActionManager)
+            if let Err(error) = drive.send_cancel_action().await {
+                tracing::debug!("Cursor CancelAction 发送失败(连接可能已断): {error}");
+            }
+            drop(drive);
             handle_producer_error(
                 &sessions,
                 &conversation,
