@@ -942,6 +942,10 @@ fn remove_unsupported_keywords(schema: &mut Value, opts: CleanOptions) {
         "$dynamicAnchor",
         "propertyNames",
         "patternProperties",
+        // 对齐 CPA 9126772d / Issue #6539: Gemini/Antigravity 拒识 dependent* 关键字
+        "dependentRequired",
+        "dependentSchemas",
+        "dependencies",
         "if",
         "then",
         "else",
@@ -2027,10 +2031,9 @@ mod tests {
             let branchy = &out["properties"]["branchy"];
             assert!(branchy.get("anyOf").is_none());
             assert_eq!(branchy["type"], "string");
-            // $defs 归一化发生在剥离前,最终输出仍剥离 $defs;
-            // dependencies 不剥离,布尔条目归一化可观测
+            // $defs / dependencies 归一化发生在剥离前,最终输出均剥离
             assert!(out.get("$defs").is_none());
-            assert_eq!(out["dependencies"]["dep"], json!({}));
+            assert!(out.get("dependencies").is_none());
         }
     }
 
@@ -2070,6 +2073,93 @@ mod tests {
             assert!(p.get("unevaluatedProperties").is_none());
             assert!(p.get("unevaluatedItems").is_none());
             assert!(p.get("contentSchema").is_none());
+        }
+    }
+
+    #[test]
+    fn test_dependent_keywords_stripped_issue_6539() {
+        // 对齐 CPA 9126772d / TestCleanJSONSchema_RemovesDependentKeywords_Issue6539:
+        // dependentRequired / dependentSchemas / dependencies 作为 schema 关键字剥离,
+        // properties 下同名合法属性名保留。
+        let input = json!({
+            "type": "object",
+            "properties": {
+                "baseline_url": {"type": "string"},
+                "candidate_url": {"type": "string"},
+                "options": {
+                    "type": "object",
+                    "properties": {
+                        "threshold": {"type": "number"},
+                        "diff_color": {"type": "string"}
+                    },
+                    "dependentRequired": {
+                        "threshold": ["diff_color"]
+                    },
+                    "dependentSchemas": {
+                        "threshold": {
+                            "properties": {
+                                "diff_color": {"type": "string"}
+                            }
+                        }
+                    },
+                    "dependencies": {
+                        "threshold": ["diff_color"]
+                    }
+                },
+                "dependentRequired": {
+                    "type": "string",
+                    "description": "Legitimate property named dependentRequired"
+                },
+                "dependentSchemas": {
+                    "type": "object",
+                    "properties": {
+                        "nested": {"type": "string"}
+                    },
+                    "dependentRequired": {
+                        "nested": ["other"]
+                    }
+                },
+                "dependencies": {
+                    "type": "string",
+                    "description": "Legitimate property named dependencies"
+                }
+            },
+            "dependentRequired": {
+                "baseline_url": ["candidate_url"]
+            },
+            "dependentSchemas": {
+                "baseline_url": {
+                    "required": ["candidate_url"]
+                }
+            },
+            "dependencies": {
+                "baseline_url": ["candidate_url"]
+            }
+        });
+
+        for out in [
+            clean_json_schema_for_gemini(&input),
+            clean_json_schema_for_antigravity(&input),
+        ] {
+            for kw in ["dependentRequired", "dependentSchemas", "dependencies"] {
+                assert!(out.get(kw).is_none(), "root {kw} was not removed: {out}");
+                assert!(
+                    out["properties"]["options"].get(kw).is_none(),
+                    "nested properties.options.{kw} was not removed: {out}"
+                );
+            }
+            assert!(
+                out["properties"]["dependentSchemas"]
+                    .get("dependentRequired")
+                    .is_none(),
+                "properties.dependentSchemas.dependentRequired was not removed: {out}"
+            );
+            for prop in ["dependentRequired", "dependentSchemas", "dependencies"] {
+                assert!(
+                    out["properties"].get(prop).is_some(),
+                    "legitimate property {prop} was removed: {out}"
+                );
+            }
         }
     }
 
