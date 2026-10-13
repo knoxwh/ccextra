@@ -173,6 +173,7 @@ fn test_claude_relay_header_filtering() {
         ("authorization", "Bearer inbound"),
         ("host", "inbound.example"),
         ("content-length", "99"),
+        ("content-type", "application/json; charset=utf-8"),
         ("connection", "keep-alive, x-remove-me"),
         ("transfer-encoding", "chunked"),
         ("accept-encoding", "gzip, deflate, br"),
@@ -195,6 +196,7 @@ fn test_claude_relay_header_filtering() {
         "authorization",
         "host",
         "content-length",
+        "content-type",
         "connection",
         "transfer-encoding",
         "accept-encoding",
@@ -1774,6 +1776,16 @@ async fn test_claude_relay_forwards_headers_and_overrides_auth() {
     assert_eq!(
         captured.header_values("user-agent"),
         vec!["claude-code/inbound"]
+    );
+    assert_eq!(
+        captured.header_values("content-type"),
+        vec!["application/json"],
+        "入站 Content-Type 不得与 upstream 声明叠成双头"
+    );
+    assert_eq!(
+        captured.header_values("accept"),
+        vec!["application/json"],
+        "未透传 Accept 时不得残留 reqwest 默认 */*"
     );
     assert!(!captured.has_header("x-api-key"));
     assert!(!captured.has_header("x-remove-me"));

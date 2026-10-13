@@ -506,7 +506,7 @@ impl UpstreamClient {
     /// - `session_id`:responses 链路发 `session-id` 头(对齐 cacheHelper,
     ///   值为 prompt_cache_key,上游按它做缓存亲和);grok 模型(chat/responses)
     ///   发 `x-grok-conv-id` 会话路由头(xAI 服务器缓存亲和)
-    /// - `extra_headers`:Claude 入站头;已排除入站认证、User-Agent、传输与连接管理头
+    /// - `extra_headers`:Claude 入站头;已排除入站认证、User-Agent、Content-Type、传输与连接管理头(Content-Type 由本层统一声明)
     /// - `inbound_user_agent`:Claude 协议优先使用入站值,缺失时回退配置值
     #[allow(clippy::too_many_arguments)]
     pub async fn request(
@@ -716,11 +716,60 @@ impl UpstreamClient {
     }
 }
 
+/// 出站头 scrub:去掉 reqwest 叠头/默认多余头,保留鉴权与协议必需头。
+///
+/// - `Content-Type`:RequestBuilder::header 是 append;透传+显式声明会双头,
+///   一律折叠为单一 `application/json`(本路径 body 均为 JSON;有意丢掉
+///   charset 等参数,与上游显式声明对齐)。
+/// - `Accept`:reqwest 在 `Client::execute` 时才把 Client 默认 `*/*` 填进
+///   Vacant 槽(`build`/`build_split` 时尚无)。此处若缺省或值为 `*/*`
+///   则改为 `application/json`,堵住默认上线;SSE / 入站透传的非 `*/*`
+///   Accept 原样保留。
+/// - 多值 `Accept` / `User-Agent`:保留首个,去掉叠出来的重复项;若首个
+///   仍是 `*/*` 则同上改为 `application/json`。
+fn scrub_outbound_request_headers(req: &mut reqwest::Request) {
+    use reqwest::header::{HeaderValue, ACCEPT, CONTENT_TYPE, USER_AGENT};
+
+    if req.headers().contains_key(CONTENT_TYPE) {
+        // 有意规范为裸 application/json(丢 charset 等),与显式声明一致
+        req.headers_mut()
+            .insert(CONTENT_TYPE, HeaderValue::from_static("application/json"));
+    }
+
+    let accept_count = req.headers().get_all(ACCEPT).iter().count();
+    if accept_count == 0 {
+        req.headers_mut()
+            .insert(ACCEPT, HeaderValue::from_static("application/json"));
+    } else if accept_count > 1 {
+        let first = req.headers().get(ACCEPT).expect("accept present").clone();
+        req.headers_mut().insert(ACCEPT, first);
+    }
+    // 单值或折叠后的首值若仍是 */*,视同缺省(堵住 Client execute 默认 / 入站透传)
+    if req.headers().get(ACCEPT).and_then(|v| v.to_str().ok()) == Some("*/*") {
+        req.headers_mut()
+            .insert(ACCEPT, HeaderValue::from_static("application/json"));
+    }
+
+    let ua_count = req.headers().get_all(USER_AGENT).iter().count();
+    if ua_count > 1 {
+        let first = req
+            .headers()
+            .get(USER_AGENT)
+            .expect("user-agent present")
+            .clone();
+        req.headers_mut().insert(USER_AGENT, first);
+    }
+}
+
 /// send() 等到响应头。流式之后读 body 走 chunk idle,不套 Client::timeout。
+/// 发送前 scrub 出站头(双 Content-Type / 默认 Accept: */* 等)。
 pub(crate) async fn send_with_timeout(
     request: reqwest::RequestBuilder,
 ) -> anyhow::Result<reqwest::Response> {
-    match tokio::time::timeout(SEND_TIMEOUT, request.send()).await {
+    let (client, built) = request.build_split();
+    let mut built = built.map_err(|e| anyhow::anyhow!("构建上游请求失败: {e}"))?;
+    scrub_outbound_request_headers(&mut built);
+    match tokio::time::timeout(SEND_TIMEOUT, client.execute(built)).await {
         Ok(Ok(resp)) => Ok(resp),
         Ok(Err(e)) => Err(e.into()),
         Err(_) => Err(anyhow::anyhow!(
@@ -1084,6 +1133,165 @@ mod tests {
         assert!(stream_headers(Protocol::OpenAiResponses, false).is_empty());
         // claude 直通字节原样转发,不掺头
         assert!(stream_headers(Protocol::Claude, true).is_empty());
+    }
+
+    #[test]
+    fn test_scrub_collapses_duplicate_content_type_and_default_accept() {
+        let client = Client::new();
+        let mut built = client
+            .post("http://example.com/v1/messages")
+            .header(
+                reqwest::header::CONTENT_TYPE,
+                "application/json; charset=utf-8",
+            )
+            .header(reqwest::header::CONTENT_TYPE, "application/json")
+            .header(reqwest::header::USER_AGENT, "claude-cli/test")
+            .body("{}")
+            .build()
+            .unwrap();
+        assert_eq!(
+            built
+                .headers()
+                .get_all(reqwest::header::CONTENT_TYPE)
+                .iter()
+                .count(),
+            2
+        );
+        assert!(!built.headers().contains_key(reqwest::header::ACCEPT));
+        scrub_outbound_request_headers(&mut built);
+        let cts: Vec<_> = built
+            .headers()
+            .get_all(reqwest::header::CONTENT_TYPE)
+            .iter()
+            .map(|v| v.to_str().unwrap())
+            .collect();
+        assert_eq!(cts, vec!["application/json"]);
+        assert_eq!(
+            built
+                .headers()
+                .get(reqwest::header::ACCEPT)
+                .and_then(|v| v.to_str().ok()),
+            Some("application/json")
+        );
+    }
+
+    #[test]
+    fn test_scrub_preserves_intentional_accept() {
+        let client = Client::new();
+        let mut built = client
+            .post("http://example.com/chat/completions")
+            .header(reqwest::header::ACCEPT, "text/event-stream")
+            .header(reqwest::header::CONTENT_TYPE, "application/json")
+            .body("{}")
+            .build()
+            .unwrap();
+        scrub_outbound_request_headers(&mut built);
+        assert_eq!(
+            built
+                .headers()
+                .get(reqwest::header::ACCEPT)
+                .and_then(|v| v.to_str().ok()),
+            Some("text/event-stream")
+        );
+    }
+
+    #[test]
+    fn test_scrub_replaces_star_accept() {
+        let client = Client::new();
+        let mut built = client
+            .post("http://example.com/v1/messages")
+            .header(reqwest::header::ACCEPT, "*/*")
+            .header(reqwest::header::CONTENT_TYPE, "application/json")
+            .body("{}")
+            .build()
+            .unwrap();
+        scrub_outbound_request_headers(&mut built);
+        assert_eq!(
+            built
+                .headers()
+                .get(reqwest::header::ACCEPT)
+                .and_then(|v| v.to_str().ok()),
+            Some("application/json")
+        );
+    }
+
+    #[tokio::test]
+    async fn outbound_headers_single_content_type_and_json_accept() {
+        use crate::test_support::spawn_captured_server;
+        // 模拟旧 bug:extra_headers 带 Content-Type,与 upstream 再 append 叠双头
+        for (protocol, path, model, stream, expect_accept) in [
+            (
+                Protocol::Claude,
+                "/v1/messages",
+                "claude-opus-5",
+                false,
+                "application/json",
+            ),
+            (
+                Protocol::OpenAiChat,
+                "/chat/completions",
+                "gpt-4",
+                false,
+                "application/json",
+            ),
+            (
+                Protocol::OpenAiChat,
+                "/chat/completions",
+                "gpt-4",
+                true,
+                "text/event-stream",
+            ),
+            (
+                Protocol::Gemini,
+                "/v1beta/models/gemini-2.5-pro:generateContent",
+                "gemini-2.5-pro",
+                false,
+                "application/json",
+            ),
+            (
+                Protocol::Antigravity,
+                "/v1internal:generateContent",
+                "gemini-cli",
+                false,
+                "application/json",
+            ),
+        ] {
+            let (server, captured) =
+                spawn_captured_server(path, axum::http::StatusCode::OK, "{}").await;
+            let mut extra = axum::http::HeaderMap::new();
+            extra.insert(
+                axum::http::header::CONTENT_TYPE,
+                "application/json; charset=utf-8".parse().unwrap(),
+            );
+            let result = UpstreamClient::new(None)
+                .request(
+                    &server.url,
+                    "sk-test",
+                    protocol,
+                    Some("direct"),
+                    &serde_json::json!({"model": model}),
+                    stream,
+                    None,
+                    None,
+                    &extra,
+                    &mock_user_agents(),
+                    None,
+                    None,
+                )
+                .await
+                .unwrap();
+            assert_eq!(result.status, axum::http::StatusCode::OK, "{protocol:?}");
+            assert_eq!(
+                captured.header_values("content-type"),
+                vec!["application/json"],
+                "{protocol:?} content-type"
+            );
+            assert_eq!(
+                captured.header_values("accept"),
+                vec![expect_accept],
+                "{protocol:?} accept"
+            );
+        }
     }
 
     #[test]
