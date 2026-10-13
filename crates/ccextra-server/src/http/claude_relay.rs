@@ -1,7 +1,14 @@
 use crate::claude::constants::OAUTH_BETA;
 use axum::http::{header, HeaderMap, HeaderName, HeaderValue};
 
+/// Claude Code / CPA 对齐的 Accept-Encoding(直连 api.anthropic.com)。
+///
+/// 与 CLI 2.1.296 MITM 金样及 CPA `defaultAcceptEncoding` 一致。
+pub const CLAUDE_ACCEPT_ENCODING: &str = "gzip, deflate, br, zstd";
+
 /// 构建 Claude 中转请求头:保留入站头,排除认证、代理重建及连接管理头。
+///
+/// 完整 relay 仍剥 AE:留给转换 / cloak 路径;直通见 [`claude_passthrough_headers`]。
 pub fn claude_relay_headers(headers: &HeaderMap) -> HeaderMap {
     let connection_header_names: Vec<String> = headers
         .get_all(header::CONNECTION)
@@ -36,8 +43,7 @@ pub fn is_claude_relay_header_excluded(name: &str, connection_header_names: &[St
                 // upstream.rs 统一声明 application/json;reqwest .header 为 append,
                 // 透传入站 Content-Type 会与之叠成双头
                 | "content-type"
-                // reqwest 未启用解压 feature:转发客户端 accept-encoding 会让上游
-                // 返回压缩 body,错误路径按原始字节解析会得到乱码,故剥掉
+                // 完整 relay 仍剥 AE;直通路径见 passthrough(保留/补齐)
                 | "accept-encoding"
                 | "connection"
                 | "keep-alive"
@@ -54,11 +60,13 @@ pub fn is_claude_relay_header_excluded(name: &str, connection_header_names: &[St
 
 /// Claude 原生直通(入站已是 Anthropic messages)的最小出站头。
 ///
-/// 只剥身份 / Host / CL / hop-by-hop / 误带的 chatgpt-account-id / AE / CT:
-/// Stainless、`anthropic-*`、入站 UA/Accept 尽量原样。AE 本轮仍剥(解压未接线)。
+/// 只剥身份 / Host / CL / hop-by-hop / 误带的 chatgpt-account-id / CT:
+/// Stainless、`anthropic-*`、入站 UA/Accept/AE 尽量原样。
+/// AE 缺省时补 [`CLAUDE_ACCEPT_ENCODING`](对齐 CLI/CPA);reqwest/wreq 已开
+/// gzip/br/deflate/zstd 自动解压,与广告能力一致。
 /// CT 仍剥,由 upstream 统一写单条 `application/json`。
 ///
-/// 协议转换 / compat 路径继续用 [`claude_relay_headers`](fn@claude_relay_headers)(完整剥 UA 等再重建)。
+/// 协议转换 / compat 路径继续用 [`claude_relay_headers`](fn@claude_relay_headers)(完整剥 UA/AE 等再重建)。
 pub fn claude_passthrough_headers(headers: &HeaderMap) -> HeaderMap {
     let connection_header_names: Vec<String> = headers
         .get_all(header::CONNECTION)
@@ -75,6 +83,7 @@ pub fn claude_passthrough_headers(headers: &HeaderMap) -> HeaderMap {
             out.append(name.clone(), value.clone());
         }
     }
+    ensure_claude_accept_encoding(&mut out);
     out
 }
 
@@ -93,8 +102,7 @@ pub fn is_claude_passthrough_header_excluded(
                 | "content-length"
                 // upstream 统一声明 application/json,避免双 CT
                 | "content-type"
-                // 解压未接线前仍剥 AE(与完整 relay 同策略)
-                | "accept-encoding"
+                // AE 直通保留;缺省由 ensure_claude_accept_encoding 补齐
                 | "connection"
                 | "keep-alive"
                 | "proxy-connection"
@@ -106,6 +114,17 @@ pub fn is_claude_passthrough_header_excluded(
                 | "upgrade"
                 | "http2-settings"
         )
+}
+
+/// 缺 Accept-Encoding 时补 CLI/CPA 金样;已有则不动(透传入站值)。
+pub fn ensure_claude_accept_encoding(headers: &mut HeaderMap) {
+    if headers.contains_key(header::ACCEPT_ENCODING) {
+        return;
+    }
+    headers.insert(
+        header::ACCEPT_ENCODING,
+        HeaderValue::from_static(CLAUDE_ACCEPT_ENCODING),
+    );
 }
 
 pub fn claude_inbound_user_agent(headers: &HeaderMap) -> Option<&str> {
@@ -198,7 +217,7 @@ mod tests {
     }
 
     #[test]
-    fn test_passthrough_keeps_ua_and_stainless_strips_identity_ae_ct() {
+    fn test_passthrough_keeps_ua_stainless_and_ae() {
         let mut headers = HeaderMap::new();
         for (k, v) in [
             ("authorization", "Bearer inbound"),
@@ -206,7 +225,7 @@ mod tests {
             ("host", "inbound.example"),
             ("content-length", "99"),
             ("content-type", "application/json; charset=utf-8"),
-            ("accept-encoding", "gzip, br"),
+            ("accept-encoding", "gzip, deflate, br, zstd"),
             ("user-agent", "claude-cli/2.1.296 (external, sdk-cli)"),
             ("accept", "application/json"),
             ("anthropic-version", "2023-06-01"),
@@ -238,21 +257,49 @@ mod tests {
             Some("MacOS")
         );
         assert_eq!(out.get("x-app").and_then(|v| v.to_str().ok()), Some("cli"));
+        assert_eq!(
+            out.get("accept-encoding").and_then(|v| v.to_str().ok()),
+            Some("gzip, deflate, br, zstd")
+        );
         for excluded in [
             "authorization",
             "x-api-key",
             "host",
             "content-length",
             "content-type",
-            "accept-encoding",
             "connection",
             "x-hop",
         ] {
             assert!(!out.contains_key(excluded), "{excluded}");
         }
-        // 完整 relay 仍剥 UA;直通保留
+        // 完整 relay 仍剥 UA 与 AE;直通保留
         let full = claude_relay_headers(&headers);
         assert!(!full.contains_key("user-agent"));
+        assert!(!full.contains_key("accept-encoding"));
         assert!(full.contains_key("x-stainless-os"));
+    }
+
+    #[test]
+    fn test_passthrough_fills_default_ae_when_missing() {
+        let out = claude_passthrough_headers(&HeaderMap::new());
+        assert_eq!(
+            out.get("accept-encoding").and_then(|v| v.to_str().ok()),
+            Some(CLAUDE_ACCEPT_ENCODING)
+        );
+    }
+
+    #[test]
+    fn test_passthrough_preserves_inbound_ae_not_overwrite() {
+        let mut headers = HeaderMap::new();
+        headers.insert(
+            header::ACCEPT_ENCODING,
+            HeaderValue::from_static("gzip, deflate, br"),
+        );
+        let out = claude_passthrough_headers(&headers);
+        assert_eq!(
+            out.get("accept-encoding").and_then(|v| v.to_str().ok()),
+            Some("gzip, deflate, br"),
+            "有入站 AE 时不覆盖成默认"
+        );
     }
 }

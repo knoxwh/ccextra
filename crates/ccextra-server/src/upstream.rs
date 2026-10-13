@@ -510,6 +510,8 @@ impl UpstreamClient {
             return Ok(c.clone());
         }
         let mut builder = Client::builder()
+            // gzip/br/deflate/zstd feature 开启后默认自动解压;Claude 直通会显式
+            // 带 Accept-Encoding(见 claude_passthrough_headers),与解压能力对齐
             // 限制单个 host 最大空闲连接数，防毒化池
             .pool_max_idle_per_host(4)
             // 池空闲 90s(对齐 grok);流 chunk idle 为服务当前设置 180s,不是池寿命。

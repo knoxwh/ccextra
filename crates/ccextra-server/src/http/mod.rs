@@ -26,8 +26,9 @@ use handlers::reload::handle_reload;
 
 pub use auth::{check_secret, extract_key, verify_cached};
 pub use claude_relay::{
-    claude_inbound_user_agent, claude_passthrough_headers, claude_relay_headers, ensure_oauth_beta,
-    is_claude_passthrough_header_excluded, is_claude_relay_header_excluded,
+    claude_inbound_user_agent, claude_passthrough_headers, claude_relay_headers,
+    ensure_claude_accept_encoding, ensure_oauth_beta, is_claude_passthrough_header_excluded,
+    is_claude_relay_header_excluded, CLAUDE_ACCEPT_ENCODING,
 };
 pub use error::{extract_upstream_error, to_anthropic_error, AppError};
 pub use retry::{

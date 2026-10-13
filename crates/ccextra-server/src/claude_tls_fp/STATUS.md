@@ -36,3 +36,10 @@ order; that path was removed in favor of wreq/BoringSSL.
 
 Refresh the vendored profile from the local `claude-tls-fp-sampler` baselines when
 Claude Code upgrades (see that tool's README / `sample.sh`).
+
+## HTTP Accept-Encoding (L7)
+
+Claude passthrough keeps inbound `Accept-Encoding`, or fills `gzip, deflate, br, zstd`
+(CLI/CPA). Both the wreq fingerprint lane and default reqwest client enable
+gzip/brotli/deflate/zstd auto-decompress so SSE/JSON stay readable.
+

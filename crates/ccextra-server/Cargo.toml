@@ -31,7 +31,7 @@ h2 = "0.4"
 tokio-rustls = "0.26"
 rustls-native-certs = "0.8"
 md-5 = "0.10"
-wreq = { version = "0.16.1", default-features = true, features = ["json", "stream", "socks"] }
+wreq = { version = "0.16.1", default-features = true, features = ["json", "stream", "socks", "gzip", "brotli", "deflate", "zstd"] }
 percent-encoding = "2"
 
 time = { version = "0.3", features = ["formatting", "parsing", "std"] }

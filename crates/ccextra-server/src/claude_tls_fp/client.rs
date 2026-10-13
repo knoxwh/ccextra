@@ -10,6 +10,7 @@ use wreq::Client;
 
 /// Build a wreq client for the Claude Bun fingerprint lane.
 pub fn build_fingerprint_client(proxy_key: &str, no_redirect: bool) -> anyhow::Result<Client> {
+    // gzip/br/deflate/zstd feature:自动解压 Content-Encoding,与 Claude AE 金样对齐
     let mut builder = Client::builder()
         .pool_max_idle_per_host(4)
         .pool_idle_timeout(std::time::Duration::from_secs(90))

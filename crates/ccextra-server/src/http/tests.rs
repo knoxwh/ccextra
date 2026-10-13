@@ -259,10 +259,10 @@ fn test_claude_relay_identity_headers_passthrough_only() {
 }
 
 #[test]
-fn test_claude_passthrough_keeps_ua_strips_ae_and_identity() {
+fn test_claude_passthrough_keeps_ua_ae_and_strips_identity() {
     let headers = headers_with(&[
         ("user-agent", "claude-cli/2.1.296 (external, sdk-cli)"),
-        ("accept-encoding", "gzip, deflate, br"),
+        ("accept-encoding", "gzip, deflate, br, zstd"),
         ("authorization", "Bearer inbound"),
         ("x-api-key", "inbound-key"),
         ("content-type", "application/json; charset=utf-8"),
@@ -281,17 +281,18 @@ fn test_claude_passthrough_keeps_ua_strips_ae_and_identity() {
         "anthropic-beta",
         "claude-code-20250219"
     ));
-    for excluded in [
+    assert!(relay_has_header_value(
+        &out,
         "accept-encoding",
-        "authorization",
-        "x-api-key",
-        "content-type",
-    ] {
+        "gzip, deflate, br, zstd"
+    ));
+    for excluded in ["authorization", "x-api-key", "content-type"] {
         assert!(!out.contains_key(excluded), "{excluded}");
     }
-    // 完整 relay 仍剥 UA
+    // 完整 relay 仍剥 UA 与 AE
     let full = claude_relay_headers(&headers);
     assert!(!full.contains_key("user-agent"));
+    assert!(!full.contains_key("accept-encoding"));
 }
 
 fn mock_state() -> AppState {
@@ -1836,7 +1837,11 @@ async fn test_claude_relay_forwards_headers_and_overrides_auth() {
     );
     assert!(!captured.has_header("x-api-key"));
     assert!(!captured.has_header("x-remove-me"));
-    assert!(!captured.has_header("accept-encoding"));
+    assert_eq!(
+        captured.header("accept-encoding").as_deref(),
+        Some("gzip, deflate, br, zstd"),
+        "Claude 直通缺入站 AE 时应补 CLI/CPA 金样"
+    );
     assert_eq!(captured.body()["model"], "claude-opus-5");
 }
 
