@@ -258,6 +258,42 @@ fn test_claude_relay_identity_headers_passthrough_only() {
     assert!(out2.is_empty());
 }
 
+#[test]
+fn test_claude_passthrough_keeps_ua_strips_ae_and_identity() {
+    let headers = headers_with(&[
+        ("user-agent", "claude-cli/2.1.296 (external, sdk-cli)"),
+        ("accept-encoding", "gzip, deflate, br"),
+        ("authorization", "Bearer inbound"),
+        ("x-api-key", "inbound-key"),
+        ("content-type", "application/json; charset=utf-8"),
+        ("x-stainless-os", "MacOS"),
+        ("anthropic-beta", "claude-code-20250219"),
+    ]);
+    let out = claude_passthrough_headers(&headers);
+    assert!(relay_has_header_value(
+        &out,
+        "user-agent",
+        "claude-cli/2.1.296 (external, sdk-cli)"
+    ));
+    assert!(relay_has_header_value(&out, "x-stainless-os", "MacOS"));
+    assert!(relay_has_header_value(
+        &out,
+        "anthropic-beta",
+        "claude-code-20250219"
+    ));
+    for excluded in [
+        "accept-encoding",
+        "authorization",
+        "x-api-key",
+        "content-type",
+    ] {
+        assert!(!out.contains_key(excluded), "{excluded}");
+    }
+    // 完整 relay 仍剥 UA
+    let full = claude_relay_headers(&headers);
+    assert!(!full.contains_key("user-agent"));
+}
+
 fn mock_state() -> AppState {
     let providers_yaml = r#"
 - name: test-claude
@@ -1737,7 +1773,7 @@ async fn test_claude_relay_forwards_headers_and_overrides_auth() {
         .set_base_url_for_test(server.url.clone());
     let app = app(state);
     let request = Request::builder()
-        .uri("/v1/messages")
+        .uri("/v1/messages?beta=true")
         .method("POST")
         .header("content-type", "application/json")
         .header("x-custom-header", "custom-value")
@@ -1746,6 +1782,7 @@ async fn test_claude_relay_forwards_headers_and_overrides_auth() {
         .header("x-api-key", "inbound-key")
         .header("authorization", "Bearer inbound")
         .header("user-agent", "claude-code/inbound")
+        .header("x-stainless-os", "MacOS")
         .header("connection", "x-remove-me")
         .header("x-remove-me", "remove-me")
         .body(Body::from(
@@ -1762,12 +1799,22 @@ async fn test_claude_relay_forwards_headers_and_overrides_auth() {
 
     assert_eq!(response.status(), StatusCode::OK);
     assert_eq!(
+        captured.path_and_query().as_deref(),
+        Some("/v1/messages?beta=true"),
+        "Claude 直通应保留入站 query"
+    );
+    assert_eq!(
         captured.header("authorization").as_deref(),
         Some("Bearer sk-test")
     );
     assert_eq!(
         captured.header("x-custom-header").as_deref(),
         Some("custom-value")
+    );
+    assert_eq!(
+        captured.header("x-stainless-os").as_deref(),
+        Some("MacOS"),
+        "最小直通应保留 Stainless"
     );
     assert_eq!(
         captured.header_values("anthropic-beta"),
@@ -1789,6 +1836,7 @@ async fn test_claude_relay_forwards_headers_and_overrides_auth() {
     );
     assert!(!captured.has_header("x-api-key"));
     assert!(!captured.has_header("x-remove-me"));
+    assert!(!captured.has_header("accept-encoding"));
     assert_eq!(captured.body()["model"], "claude-opus-5");
 }
 

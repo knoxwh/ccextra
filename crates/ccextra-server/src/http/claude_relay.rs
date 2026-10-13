@@ -52,6 +52,62 @@ pub fn is_claude_relay_header_excluded(name: &str, connection_header_names: &[St
         )
 }
 
+/// Claude 原生直通(入站已是 Anthropic messages)的最小出站头。
+///
+/// 只剥身份 / Host / CL / hop-by-hop / 误带的 chatgpt-account-id / AE / CT:
+/// Stainless、`anthropic-*`、入站 UA/Accept 尽量原样。AE 本轮仍剥(解压未接线)。
+/// CT 仍剥,由 upstream 统一写单条 `application/json`。
+///
+/// 协议转换 / compat 路径继续用 [`claude_relay_headers`](fn@claude_relay_headers)(完整剥 UA 等再重建)。
+pub fn claude_passthrough_headers(headers: &HeaderMap) -> HeaderMap {
+    let connection_header_names: Vec<String> = headers
+        .get_all(header::CONNECTION)
+        .iter()
+        .filter_map(|value| value.to_str().ok())
+        .flat_map(|value| value.split(','))
+        .map(str::trim)
+        .filter(|name| !name.is_empty())
+        .map(str::to_ascii_lowercase)
+        .collect();
+    let mut out = HeaderMap::new();
+    for (name, value) in headers.iter() {
+        if !is_claude_passthrough_header_excluded(name.as_str(), &connection_header_names) {
+            out.append(name.clone(), value.clone());
+        }
+    }
+    out
+}
+
+pub fn is_claude_passthrough_header_excluded(
+    name: &str,
+    connection_header_names: &[String],
+) -> bool {
+    let name = name.to_ascii_lowercase();
+    connection_header_names.iter().any(|item| item == &name)
+        || matches!(
+            name.as_str(),
+            "authorization"
+                | "x-api-key"
+                | "chatgpt-account-id"
+                | "host"
+                | "content-length"
+                // upstream 统一声明 application/json,避免双 CT
+                | "content-type"
+                // 解压未接线前仍剥 AE(与完整 relay 同策略)
+                | "accept-encoding"
+                | "connection"
+                | "keep-alive"
+                | "proxy-connection"
+                | "proxy-authenticate"
+                | "proxy-authorization"
+                | "te"
+                | "trailer"
+                | "transfer-encoding"
+                | "upgrade"
+                | "http2-settings"
+        )
+}
+
 pub fn claude_inbound_user_agent(headers: &HeaderMap) -> Option<&str> {
     headers
         .get(header::USER_AGENT)
@@ -139,5 +195,64 @@ mod tests {
         ensure_oauth_beta(&mut map);
         let got = map.get("anthropic-beta").unwrap().to_str().unwrap();
         assert_eq!(got, "oauth-2025-04-20");
+    }
+
+    #[test]
+    fn test_passthrough_keeps_ua_and_stainless_strips_identity_ae_ct() {
+        let mut headers = HeaderMap::new();
+        for (k, v) in [
+            ("authorization", "Bearer inbound"),
+            ("x-api-key", "inbound-key"),
+            ("host", "inbound.example"),
+            ("content-length", "99"),
+            ("content-type", "application/json; charset=utf-8"),
+            ("accept-encoding", "gzip, br"),
+            ("user-agent", "claude-cli/2.1.296 (external, sdk-cli)"),
+            ("accept", "application/json"),
+            ("anthropic-version", "2023-06-01"),
+            ("x-stainless-os", "MacOS"),
+            ("x-app", "cli"),
+            ("connection", "keep-alive, x-hop"),
+            ("x-hop", "drop-me"),
+        ] {
+            headers.append(
+                HeaderName::from_bytes(k.as_bytes()).unwrap(),
+                HeaderValue::from_str(v).unwrap(),
+            );
+        }
+        let out = claude_passthrough_headers(&headers);
+        assert_eq!(
+            out.get("user-agent").and_then(|v| v.to_str().ok()),
+            Some("claude-cli/2.1.296 (external, sdk-cli)")
+        );
+        assert_eq!(
+            out.get("accept").and_then(|v| v.to_str().ok()),
+            Some("application/json")
+        );
+        assert_eq!(
+            out.get("anthropic-version").and_then(|v| v.to_str().ok()),
+            Some("2023-06-01")
+        );
+        assert_eq!(
+            out.get("x-stainless-os").and_then(|v| v.to_str().ok()),
+            Some("MacOS")
+        );
+        assert_eq!(out.get("x-app").and_then(|v| v.to_str().ok()), Some("cli"));
+        for excluded in [
+            "authorization",
+            "x-api-key",
+            "host",
+            "content-length",
+            "content-type",
+            "accept-encoding",
+            "connection",
+            "x-hop",
+        ] {
+            assert!(!out.contains_key(excluded), "{excluded}");
+        }
+        // 完整 relay 仍剥 UA;直通保留
+        let full = claude_relay_headers(&headers);
+        assert!(!full.contains_key("user-agent"));
+        assert!(full.contains_key("x-stainless-os"));
     }
 }

@@ -60,6 +60,8 @@ pub(crate) struct CapturedUpstream {
     pub body: std::sync::Arc<std::sync::Mutex<Option<serde_json::Value>>>,
     /// 原始字节(压缩断言用;JSON 解析失败时 body() 为空)
     pub raw_body: std::sync::Arc<std::sync::Mutex<Option<Bytes>>>,
+    /// 上游收到的 path+query(如 `/v1/messages?beta=true`)
+    pub path_and_query: std::sync::Arc<std::sync::Mutex<Option<String>>>,
 }
 
 impl CapturedUpstream {
@@ -67,6 +69,18 @@ impl CapturedUpstream {
         *self.headers.lock().unwrap() = Some(headers);
         *self.body.lock().unwrap() = serde_json::from_slice(&body).ok();
         *self.raw_body.lock().unwrap() = Some(body);
+    }
+
+    pub fn record_uri(&self, uri: &axum::http::Uri) {
+        let pq = uri
+            .path_and_query()
+            .map(|pq| pq.as_str().to_string())
+            .unwrap_or_else(|| uri.path().to_string());
+        *self.path_and_query.lock().unwrap() = Some(pq);
+    }
+
+    pub fn path_and_query(&self) -> Option<String> {
+        self.path_and_query.lock().unwrap().clone()
     }
 
     pub fn header(&self, name: &str) -> Option<String> {
@@ -120,18 +134,21 @@ pub(crate) async fn spawn_captured_server(
     let resp_body = resp_body.into();
     let router = Router::new().route(
         route,
-        axum::routing::post(move |headers: axum::http::HeaderMap, body: Bytes| {
-            let cap = cap.clone();
-            let resp_body = resp_body.clone();
-            async move {
-                cap.record(headers, body);
-                (
-                    status,
-                    [(axum::http::header::CONTENT_TYPE, "application/json")],
-                    resp_body,
-                )
-            }
-        }),
+        axum::routing::post(
+            move |uri: axum::http::Uri, headers: axum::http::HeaderMap, body: Bytes| {
+                let cap = cap.clone();
+                let resp_body = resp_body.clone();
+                async move {
+                    cap.record_uri(&uri);
+                    cap.record(headers, body);
+                    (
+                        status,
+                        [(axum::http::header::CONTENT_TYPE, "application/json")],
+                        resp_body,
+                    )
+                }
+            },
+        ),
     );
     (TestServer::spawn(router).await, captured)
 }

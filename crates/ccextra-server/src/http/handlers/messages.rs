@@ -27,7 +27,7 @@ use std::sync::Arc;
 
 use crate::http::auth::check_secret;
 use crate::http::claude_relay::{
-    claude_inbound_user_agent, claude_relay_headers, ensure_oauth_beta,
+    claude_inbound_user_agent, claude_passthrough_headers, ensure_oauth_beta,
 };
 use crate::http::error::{to_anthropic_error, AppError};
 use crate::http::retry::parse_retry_after;
@@ -288,6 +288,8 @@ pub(crate) struct PreparedMessageRequest {
     pub thread_id: Option<String>,
     pub extra_headers: HeaderMap,
     pub inbound_user_agent: Option<String>,
+    /// 入站 URI query(不含 `?`);Claude 直通原样接到上游 path。
+    pub inbound_query: Option<String>,
     pub estimated_input_tokens: Option<usize>,
     pub tool_names: Option<Arc<HashMap<String, String>>>,
     pub replay_scope: Option<(crate::sse::replay_cache::ReplayCache, String, String)>,
@@ -308,6 +310,7 @@ pub(crate) async fn prepare_message_request(
     headers: &HeaderMap,
     body_bytes: &[u8],
     config_snapshot: &crate::http::ConfigSnapshot,
+    inbound_query: Option<&str>,
 ) -> Result<PreparedMessageRequest, AppError> {
     let normalize_enabled = config_snapshot.runtime.normalize.enabled;
     let drift_enabled = config_snapshot.runtime.normalize.drift_detector;
@@ -808,7 +811,8 @@ pub(crate) async fn prepare_message_request(
         None
     };
     let extra_headers = if matches!(route.protocol, Protocol::Claude) {
-        let mut map = claude_relay_headers(headers);
+        // 原生 Claude 直通:最小透传(保留 UA/Stainless);转换路径不走这里
+        let mut map = claude_passthrough_headers(headers);
         if crate::claude::is_claude_oauth_token(&upstream_key) {
             ensure_oauth_beta(&mut map);
         }
@@ -884,6 +888,10 @@ pub(crate) async fn prepare_message_request(
         thread_id,
         extra_headers,
         inbound_user_agent: inbound_user_agent.map(str::to_string),
+        inbound_query: inbound_query
+            .map(str::trim)
+            .filter(|q| !q.is_empty())
+            .map(str::to_string),
         estimated_input_tokens,
         tool_names,
         replay_scope,
@@ -924,6 +932,7 @@ pub(crate) async fn execute_upstream_request(
                     user_agents,
                     prepared.inbound_user_agent.as_deref(),
                     prepared.pool_refresh_token.as_deref(),
+                    prepared.inbound_query.as_deref(),
                 )
                 .await
             {
@@ -1377,6 +1386,7 @@ impl PreparedMessageRequest {
                 user_agents,
                 self.inbound_user_agent.as_deref(),
                 self.pool_refresh_token.as_deref(),
+                self.inbound_query.as_deref(),
             )
             .await
     }
@@ -1463,6 +1473,7 @@ impl PreparedMessageRequest {
 
 pub async fn handle_messages(
     State(state): State<AppState>,
+    uri: axum::http::Uri,
     headers: HeaderMap,
     body: Body,
 ) -> Result<Response, AppError> {
@@ -1474,7 +1485,7 @@ pub async fn handle_messages(
         .map_err(|e| AppError::new(anyhow::anyhow!("读请求体失败: {e}")))?;
 
     let mut prepared =
-        prepare_message_request(&state, &headers, &bytes, &effective_snapshot).await?;
+        prepare_message_request(&state, &headers, &bytes, &effective_snapshot, uri.query()).await?;
 
     // Cursor 原生路径:双向流会话由 handler 全权管理,不经通用 upstream
     if matches!(prepared.route.protocol, Protocol::CursorSdk) {

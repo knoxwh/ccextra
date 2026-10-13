@@ -10,7 +10,7 @@ use serde_json::Value;
 
 use crate::http::auth::check_secret;
 use crate::http::claude_relay::{
-    claude_inbound_user_agent, claude_relay_headers, ensure_oauth_beta,
+    claude_inbound_user_agent, claude_passthrough_headers, ensure_oauth_beta,
 };
 use crate::http::error::AppError;
 use crate::http::AppState;
@@ -25,6 +25,7 @@ fn find_provider<'a>(providers: &'a [ProviderConfig], name: &str) -> Option<&'a 
 /// 获取精确计数；非 Claude 协议一律本地估算(O200kBase)。
 pub async fn handle_count_tokens(
     State(state): State<AppState>,
+    uri: axum::http::Uri,
     headers: HeaderMap,
     body: Body,
 ) -> Result<Response, AppError> {
@@ -94,14 +95,13 @@ pub async fn handle_count_tokens(
             }
         }
 
-        let url = format!(
-            "{}/v1/messages/count_tokens",
-            base_url.trim_end_matches('/')
-        );
+        let endpoint =
+            crate::upstream::append_inbound_query("/v1/messages/count_tokens", uri.query());
+        let url = format!("{}{}", base_url.trim_end_matches('/'), endpoint);
         let proxy_key = upstream_client.resolve_proxy(proxy_url.as_deref());
         let use_fp = crate::claude_tls_fp::should_use_fingerprint_lane(true, &key, &base_url);
         let inbound_user_agent = claude_inbound_user_agent(&headers);
-        let mut extra_headers = claude_relay_headers(&headers);
+        let mut extra_headers = claude_passthrough_headers(&headers);
         if crate::claude::is_claude_oauth_token(&key) {
             ensure_oauth_beta(&mut extra_headers);
         }

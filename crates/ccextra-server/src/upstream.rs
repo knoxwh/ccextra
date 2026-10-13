@@ -169,6 +169,19 @@ fn endpoint_path(protocol: Protocol, is_stream: bool) -> String {
     }
 }
 
+/// 把入站 query(不含 `?`)接到上游 path。Claude 直通保留 `?beta=true` 等。
+/// path 已含 `?` 时用 `&` 拼接。
+pub(crate) fn append_inbound_query(path: &str, query: Option<&str>) -> String {
+    let Some(q) = query.map(str::trim).filter(|q| !q.is_empty()) else {
+        return path.to_string();
+    };
+    if path.contains('?') {
+        format!("{path}&{q}")
+    } else {
+        format!("{path}?{q}")
+    }
+}
+
 /// Grok CLI 身份头常量
 /// Token-Auth 对齐 grok-build GrokAuthCredentials (`xai-grok-cli`);
 /// identifier/mode 对齐 sub2api ad05eda15 的官方交互式 CLI 抓包。
@@ -567,8 +580,9 @@ impl UpstreamClient {
     /// - `session_id`:responses 链路发 `session-id` 头(对齐 cacheHelper,
     ///   值为 prompt_cache_key,上游按它做缓存亲和);grok 模型(chat/responses)
     ///   发 `x-grok-conv-id` 会话路由头(xAI 服务器缓存亲和)
-    /// - `extra_headers`:Claude 入站头;已排除入站认证、User-Agent、Content-Type、传输与连接管理头(Content-Type 由本层统一声明)
+    /// - `extra_headers`:Claude 直通为最小透传头;转换/compat 仍可用完整 relay
     /// - `inbound_user_agent`:Claude 协议优先使用入站值,缺失时回退配置值
+    /// - `query`:入站 URI query(不含 `?`);仅 Claude 直通接到 `/v1/messages`
     #[allow(clippy::too_many_arguments)]
     pub async fn request(
         &self,
@@ -584,6 +598,7 @@ impl UpstreamClient {
         user_agents: &crate::http::UserAgentSet,
         inbound_user_agent: Option<&str>,
         pool_refresh_token: Option<&str>,
+        query: Option<&str>,
     ) -> anyhow::Result<UpstreamResponse> {
         // Cursor SDK 走 sidecar 专用通道,禁止进入通用 upstream
         if matches!(protocol, Protocol::CursorSdk) {
@@ -628,6 +643,7 @@ impl UpstreamClient {
                 user_agents,
                 inbound_user_agent,
                 pool_refresh_token,
+                query,
             )
             .await
         {
@@ -649,6 +665,7 @@ impl UpstreamClient {
                     user_agents,
                     inbound_user_agent,
                     pool_refresh_token,
+                    query,
                 )
                 .await
             }
@@ -673,6 +690,7 @@ impl UpstreamClient {
         user_agents: &crate::http::UserAgentSet,
         inbound_user_agent: Option<&str>,
         pool_refresh_token: Option<&str>,
+        query: Option<&str>,
     ) -> anyhow::Result<UpstreamResponse> {
         #[cfg(test)]
         self.attempts.lock().unwrap().push(base_url.to_owned());
@@ -699,6 +717,7 @@ impl UpstreamClient {
                     extra_headers,
                     user_agents,
                     inbound_user_agent,
+                    query,
                 )
                 .await;
         }
@@ -712,6 +731,11 @@ impl UpstreamClient {
             endpoint
         };
 
+        let endpoint = if matches!(protocol, Protocol::Claude) {
+            append_inbound_query(&endpoint, query)
+        } else {
+            endpoint
+        };
         let url = format!("{}{}", base_url.trim_end_matches('/'), endpoint);
         // 认证头按协议:Gemini 直连用 x-goog-api-key(对齐 CPA gemini_executor,
         // generativelanguage 不收 Bearer);其余 Bearer
@@ -807,9 +831,11 @@ impl UpstreamClient {
         extra_headers: &axum::http::HeaderMap,
         user_agents: &crate::http::UserAgentSet,
         inbound_user_agent: Option<&str>,
+        query: Option<&str>,
     ) -> anyhow::Result<UpstreamResponse> {
         let client = self.fp_client_for(proxy_key, false)?;
-        let url = format!("{}/v1/messages", base_url.trim_end_matches('/'));
+        let endpoint = append_inbound_query("/v1/messages", query);
+        let url = format!("{}{}", base_url.trim_end_matches('/'), endpoint);
         let ua = user_agent(Protocol::Claude, "", user_agents, inbound_user_agent);
         let mut req = client
             .post(&url)
@@ -1019,6 +1045,30 @@ mod tests {
         assert_eq!(
             endpoint_path(Protocol::Gemini, true),
             "/v1beta/models/{model}:streamGenerateContent"
+        );
+    }
+
+    #[test]
+    fn test_append_inbound_query() {
+        assert_eq!(
+            append_inbound_query("/v1/messages", Some("beta=true")),
+            "/v1/messages?beta=true"
+        );
+        assert_eq!(
+            append_inbound_query("/v1/messages", Some("")),
+            "/v1/messages"
+        );
+        assert_eq!(append_inbound_query("/v1/messages", None), "/v1/messages");
+        assert_eq!(
+            append_inbound_query(
+                "/v1internal:streamGenerateContent?alt=sse",
+                Some("beta=true")
+            ),
+            "/v1internal:streamGenerateContent?alt=sse&beta=true"
+        );
+        assert_eq!(
+            append_inbound_query("/v1/messages", Some("  beta=true  ")),
+            "/v1/messages?beta=true"
         );
     }
 
@@ -1284,6 +1334,7 @@ mod tests {
                     &mock_user_agents(),
                     None,
                     None,
+                    None,
                 )
                 .await
                 .unwrap();
@@ -1538,6 +1589,7 @@ mod tests {
                     &mock_user_agents(),
                     None,
                     None,
+                    None,
                 )
                 .await
                 .unwrap();
@@ -1688,6 +1740,7 @@ mod tests {
                 user_agents,
                 None,
                 None,
+                None,
             )
             .await
     }
@@ -1811,6 +1864,7 @@ mod tests {
                 &mock_user_agents(),
                 None,
                 None,
+                None,
             )
             .await
             .unwrap();
@@ -1868,6 +1922,7 @@ mod tests {
                 None,
                 &axum::http::HeaderMap::new(),
                 &mock_user_agents(),
+                None,
                 None,
                 None,
             )
@@ -2077,6 +2132,7 @@ mod tests {
                     None,
                     &extra,
                     &mock_user_agents(),
+                    None,
                     None,
                     None,
                 )
