@@ -30,7 +30,7 @@ lru = "0.18"
 h2 = "0.4"
 tokio-rustls = "0.26"
 rustls-native-certs = "0.8"
-md-5 = "0.10"
+md-5 = "0.11"
 wreq = { version = "0.16.1", default-features = true, features = ["json", "stream", "socks", "gzip", "brotli", "deflate", "zstd"] }
 percent-encoding = "2"
 
