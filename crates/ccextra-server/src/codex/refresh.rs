@@ -1,18 +1,26 @@
 // Codex Token 刷新与运行时单飞锁
-// (对齐 CPA RefreshTokensWithRetry 重试策略 + ensureAccessToken 单飞)
+// (对齐 CPA RefreshTokensWithRetry + 按 refresh_token singleflight)
 
 use super::constants::{REFRESH_MAX_RETRIES, REFRESH_SKEW_SECS};
 use super::credential::CodexCredential;
 use super::{oauth, store};
 use anyhow::{anyhow, Result};
+use std::collections::HashMap;
 use std::path::Path;
-use std::sync::OnceLock;
+use std::sync::{Arc, OnceLock};
 use tokio::sync::Mutex;
 
-static REFRESH_LOCK: OnceLock<Mutex<()>> = OnceLock::new();
+static REFRESH_LOCKS: OnceLock<Mutex<HashMap<String, Arc<Mutex<()>>>>> = OnceLock::new();
 
-fn refresh_lock() -> &'static Mutex<()> {
-    REFRESH_LOCK.get_or_init(|| Mutex::new(()))
+async fn lock_for_refresh_token(refresh_token: &str) -> Arc<Mutex<()>> {
+    let key = refresh_token.trim().to_string();
+    let mut map = REFRESH_LOCKS
+        .get_or_init(|| Mutex::new(HashMap::new()))
+        .lock()
+        .await;
+    map.entry(key)
+        .or_insert_with(|| Arc::new(Mutex::new(())))
+        .clone()
 }
 
 /// 检查并刷新凭证(如果需要);失败按 CPA 策略重试
@@ -69,7 +77,6 @@ pub async fn refresh_if_needed(
     Err(last_err.unwrap_or_else(|| anyhow!("codex token refresh failed")))
 }
 
-/// `refresh_token_reused` 属不可恢复错误,直接失败 (对齐 CPA isNonRetryableRefreshErr)
 fn is_non_retryable_refresh_err(err: &anyhow::Error) -> bool {
     err.to_string()
         .to_ascii_lowercase()
@@ -81,7 +88,7 @@ fn usable(cred: &CodexCredential, rejected_token: Option<&str>) -> bool {
         && rejected_token != Some(cred.access_token.as_str())
 }
 
-/// 运行时获取新鲜凭证 (单飞锁 + Double-Check + 自动落盘)
+/// 运行时获取新鲜凭证 (按 refresh_token 单飞 + Double-Check + 自动落盘)
 ///
 /// `rejected_token`:上游 401 后传入被拒的 access_token,即使未过期也强制刷新。
 pub async fn ensure_credential_fresh(
@@ -97,9 +104,15 @@ pub async fn ensure_credential_fresh(
         }
     }
 
-    let _guard = refresh_lock().lock().await;
+    let prelim = store::load(&path)?;
+    let lock_key = if prelim.refresh_token.trim().is_empty() {
+        format!("path:{}", path.display())
+    } else {
+        prelim.refresh_token.clone()
+    };
+    let lock = lock_for_refresh_token(&lock_key).await;
+    let _guard = lock.lock().await;
 
-    // 获取锁后 double-check
     let mut cred = store::load(&path)?;
     if usable(&cred, rejected_token) {
         return Ok(cred);
