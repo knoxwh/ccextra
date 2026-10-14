@@ -11,9 +11,10 @@ use ccextra_core::route::Protocol;
 use reqwest::Client;
 use serde::Deserialize;
 
-/// 连接池空闲淘汰(对齐 grok `GROK_POOL_IDLE_TIMEOUT_SECS` 默认 90s)。
-/// 当前服务流 chunk idle 为 180s,不是池寿命。
-const POOL_IDLE_TIMEOUT: Duration = Duration::from_secs(90);
+/// 连接池空闲淘汰(短于常见 NAT/LB 静默掐线窗口;流 chunk idle 180s 不是池寿命)。
+const POOL_IDLE_TIMEOUT: Duration = Duration::from_secs(45);
+/// TCP keepalive 首探间隔:半开连接更快被内核发现(指纹 H1 无 h2 ping 时尤其有用)。
+const TCP_KEEPALIVE: Duration = Duration::from_secs(30);
 const CONNECT_TIMEOUT: Duration = Duration::from_secs(10);
 /// send() 上限(等到响应头)。60s:上游收连不回头时快速失败交客户端退避;
 /// 流式之后的 chunk idle 走 STREAM_IDLE_TIMEOUT。
@@ -515,12 +516,12 @@ impl UpstreamClient {
             // 带 Accept-Encoding(见 claude_passthrough_headers),与解压能力对齐
             // 限制单个 host 最大空闲连接数，防毒化池
             .pool_max_idle_per_host(4)
-            // 池空闲 90s(对齐 grok);流 chunk idle 为服务当前设置 180s,不是池寿命。
+            // 池空闲 45s;流 chunk idle 为服务当前设置 180s,不是池寿命。
             .pool_idle_timeout(POOL_IDLE_TIMEOUT)
             // 建连超时 10s，防 DNS/TLS 握手卡死
             .connect_timeout(CONNECT_TIMEOUT)
             // TCP 层探活,防死连接滞留/中间设备静默断
-            .tcp_keepalive(std::time::Duration::from_secs(60))
+            .tcp_keepalive(TCP_KEEPALIVE)
             // 禁 Nagle:SSE 首帧/心跳/delta 都是小包,不等积压直接发,压 TTFT
             .tcp_nodelay(true)
             // HTTP/2 探活与空闲 Ping，防静默掉线(对齐 grok shared_http)
@@ -574,6 +575,40 @@ impl UpstreamClient {
         let client = crate::claude_tls_fp::build_fingerprint_client(proxy_key, no_redirect)?;
         clients.insert(cache_key, client.clone());
         Ok(client)
+    }
+
+    /// stale 重试前丢掉缓存 Client,迫使重建空池,避免毒化连接再被借出。
+    fn drop_pooled_client(
+        &self,
+        provider_proxy: Option<&str>,
+        protocol: Protocol,
+        extra_headers: &axum::http::HeaderMap,
+        api_key: &str,
+        pool_refresh_token: Option<&str>,
+    ) {
+        let proxy_key = self.resolve_proxy(provider_proxy);
+        if crate::claude_tls_fp::should_use_fingerprint_lane(matches!(protocol, Protocol::Claude)) {
+            // 指纹车道 request_once_fp 固定 no_redirect=false
+            let key: FpClientCacheKey = (proxy_key, false);
+            self.fp_clients
+                .lock()
+                .unwrap_or_else(|poisoned| poisoned.into_inner())
+                .remove(&key);
+            return;
+        }
+        let ant = matches!(protocol, Protocol::Antigravity);
+        let no_redirect = extra_headers.contains_key("chatgpt-account-id");
+        let scope = ant_credential_scope(
+            protocol,
+            self.ant_pool.short_mode,
+            api_key,
+            pool_refresh_token,
+        );
+        let key: ClientCacheKey = (proxy_key, ant, no_redirect, scope);
+        self.clients
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner())
+            .remove(&key);
     }
 
     /// 发起上游请求,返回原始响应(字节或流由调用方决定)
@@ -652,7 +687,14 @@ impl UpstreamClient {
         {
             Ok(resp) => Ok(resp),
             Err(e) if is_stale_connection(&e) => {
-                tracing::warn!(error = %e, "上游连接失效,重试一次");
+                tracing::warn!(error = %e, "上游连接失效,丢缓存 Client 后重试一次");
+                self.drop_pooled_client(
+                    provider_proxy,
+                    protocol,
+                    extra_headers,
+                    api_key,
+                    pool_refresh_token,
+                );
                 self.request_once(
                     base_url,
                     api_key,
@@ -1740,6 +1782,37 @@ mod tests {
                 "global={global:?}, provider={provider:?}"
             );
         }
+    }
+
+    #[test]
+    fn drop_pooled_client_removes_cached_reqwest_and_fp() {
+        let client = UpstreamClient::new(None);
+        client
+            .client_for("direct", Protocol::OpenAiChat, false, "")
+            .unwrap();
+        assert_eq!(client.clients.lock().unwrap().len(), 1);
+        client.drop_pooled_client(
+            None,
+            Protocol::OpenAiChat,
+            &axum::http::HeaderMap::new(),
+            "sk-test",
+            None,
+        );
+        assert!(client.clients.lock().unwrap().is_empty());
+
+        client.fp_client_for("direct", false).unwrap();
+        assert_eq!(client.fp_clients.lock().unwrap().len(), 1);
+        client.drop_pooled_client(
+            None,
+            Protocol::Claude,
+            &axum::http::HeaderMap::new(),
+            "sk-test",
+            None,
+        );
+        assert!(
+            client.fp_clients.lock().unwrap().is_empty(),
+            "Claude fingerprint lane must drop fp_clients"
+        );
     }
 
     #[test]
