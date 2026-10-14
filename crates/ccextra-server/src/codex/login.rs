@@ -53,7 +53,7 @@ pub async fn run_login(opts: CodexLoginOptions) -> Result<PathBuf> {
     let client = http_client(opts.proxy_url.as_deref())?;
     let state = random_state()?;
     let pkce = generate_pkce_codes()?;
-    let (port, rx) = start_callback(opts.callback_port).await?;
+    let (port, rx, shutdown_tx) = start_callback(opts.callback_port).await?;
     let redirect = format!("http://localhost:{port}{CALLBACK_PATH}");
     let auth_url = build_auth_url(&state, &redirect, &pkce);
 
@@ -67,6 +67,7 @@ pub async fn run_login(opts: CodexLoginOptions) -> Result<PathBuf> {
         .await
         .map_err(|_| anyhow!("codex: authentication timed out"))?
         .map_err(|_| anyhow!("codex: callback channel closed"))?;
+    let _ = shutdown_tx.send(());
     finish_login(&client, &opts.auth_dir, &state, &redirect, cb, &pkce).await
 }
 
@@ -137,8 +138,11 @@ async fn finish_login(
     Ok(path)
 }
 
-async fn start_callback(port: u16) -> Result<(u16, oneshot::Receiver<CallbackQuery>)> {
+async fn start_callback(
+    port: u16,
+) -> Result<(u16, oneshot::Receiver<CallbackQuery>, oneshot::Sender<()>)> {
     let (tx, rx) = oneshot::channel();
+    let (shutdown_tx, shutdown_rx) = oneshot::channel::<()>();
     let tx = Arc::new(std::sync::Mutex::new(Some(tx)));
     let app = Router::new().route(
         CALLBACK_PATH,
@@ -162,16 +166,19 @@ async fn start_callback(port: u16) -> Result<(u16, oneshot::Receiver<CallbackQue
             }
         }),
     );
-    // 全接口监听,SSH/隧道可打进
-    let addr = SocketAddr::from(([0, 0, 0, 0], port));
+    let addr = SocketAddr::from(([127, 0, 0, 1], port));
     let listener = tokio::net::TcpListener::bind(addr)
         .await
         .with_context(|| format!("bind oauth callback {addr}"))?;
     let bound = listener.local_addr()?.port();
     tokio::spawn(async move {
-        let _ = axum::serve(listener, app).await;
+        let _ = axum::serve(listener, app)
+            .with_graceful_shutdown(async move {
+                let _ = shutdown_rx.await;
+            })
+            .await;
     });
-    Ok((bound, rx))
+    Ok((bound, rx, shutdown_tx))
 }
 
 /// 16 字节随机 hex
