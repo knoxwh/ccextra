@@ -19,10 +19,10 @@ fn find_provider<'a>(providers: &'a [ProviderConfig], name: &str) -> Option<&'a 
     providers.iter().find(|p| p.name == name)
 }
 
-/// POST /v1/messages/count_tokens:本地 token 估算(带 secret 认证)
+/// POST /v1/messages/count_tokens(带 secret 认证)
 ///
-/// Claude Code 的 /context 记账会调此端点。Claude 协议上游转发到真实 API
-/// 获取精确计数；非 Claude 协议一律本地估算(O200kBase)。
+/// Claude Code 的 /context 记账会调此端点。Claude 协议转发上游精确计数；
+/// 非 Claude 协议返回该会话上轮记录的 input_tokens,未命中返回 0。
 pub async fn handle_count_tokens(
     State(state): State<AppState>,
     uri: axum::http::Uri,
@@ -98,7 +98,6 @@ pub async fn handle_count_tokens(
         let endpoint =
             crate::upstream::append_inbound_query("/v1/messages/count_tokens", uri.query());
         let url = format!("{}{}", base_url.trim_end_matches('/'), endpoint);
-        let proxy_key = upstream_client.resolve_proxy(proxy_url.as_deref());
         let inbound_user_agent = claude_inbound_user_agent(&headers);
         let mut extra_headers = claude_passthrough_headers(&headers);
         if crate::claude::is_claude_oauth_token(&key) {
@@ -108,16 +107,16 @@ pub async fn handle_count_tokens(
 
         let mut attempt_key = key;
         for auth_attempt in 0..=1 {
-            // protocol: claude 一律走 Bun 指纹车道(wreq)
-            let client = upstream_client.fp_client_for(&proxy_key, false)?;
-            let mut request = client
-                .post(&url)
-                .header(wreq::header::USER_AGENT, ua)
-                .bearer_auth(&attempt_key);
-            for (name, value) in &extra_headers {
-                request = request.header(name, value);
-            }
-            let resp = crate::upstream::send_with_timeout_wreq(request.json(&body_json))
+            // protocol: claude 一律走 Bun 指纹车道(wreq);stale 时丢池再建一次
+            let resp = upstream_client
+                .send_fp_json_with_stale_retry(
+                    proxy_url.as_deref(),
+                    &url,
+                    ua,
+                    &attempt_key,
+                    &extra_headers,
+                    &body_json,
+                )
                 .await
                 .map_err(|e| AppError::new(anyhow::anyhow!("上游请求失败: {e}")))?;
             let upstream = crate::upstream::UpstreamResponse {

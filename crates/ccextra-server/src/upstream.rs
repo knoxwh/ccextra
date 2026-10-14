@@ -577,6 +577,48 @@ impl UpstreamClient {
         Ok(client)
     }
 
+    /// Claude 指纹车道 POST JSON;stale 时丢缓存 Client 再建一次。
+    /// count_tokens 等不走通用 `request()` 的 Claude 出口复用同款语义。
+    pub(crate) async fn send_fp_json_with_stale_retry(
+        &self,
+        provider_proxy: Option<&str>,
+        url: &str,
+        user_agent: &str,
+        bearer: &str,
+        extra_headers: &axum::http::HeaderMap,
+        body: &serde_json::Value,
+    ) -> anyhow::Result<wreq::Response> {
+        let proxy_key = self.resolve_proxy(provider_proxy);
+        let mut stale_retried = false;
+        loop {
+            #[cfg(test)]
+            self.attempts.lock().unwrap().push(url.to_owned());
+            let client = self.fp_client_for(&proxy_key, false)?;
+            let mut req = client
+                .post(url)
+                .header(wreq::header::USER_AGENT, user_agent)
+                .bearer_auth(bearer);
+            for (name, value) in extra_headers {
+                req = req.header(name, value);
+            }
+            match send_with_timeout_wreq(req.json(body)).await {
+                Ok(resp) => return Ok(resp),
+                Err(e) if !stale_retried && is_stale_connection(&e) => {
+                    tracing::warn!(error = %e, "上游连接失效,丢缓存 Client 后重试一次");
+                    self.drop_pooled_client(
+                        provider_proxy,
+                        Protocol::Claude,
+                        extra_headers,
+                        bearer,
+                        None,
+                    );
+                    stale_retried = true;
+                }
+                Err(e) => return Err(e),
+            }
+        }
+    }
+
     /// stale 重试前丢掉缓存 Client,迫使重建空池,避免毒化连接再被借出。
     fn drop_pooled_client(
         &self,
@@ -1953,6 +1995,46 @@ mod tests {
                 *client.attempts.lock().unwrap(),
                 vec![format!("http://{addr}"); 2]
             );
+        }
+    }
+
+    /// count_tokens 同款指纹出口:stale 丢池后至多重试一次
+    #[tokio::test]
+    async fn fp_stale_connection_retries_at_most_once() {
+        use tokio::io::AsyncReadExt;
+        for recover in [false, true] {
+            let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+            let addr = listener.local_addr().unwrap();
+            let server = tokio::spawn(async move {
+                for _ in 0..if recover { 1 } else { 2 } {
+                    let (mut socket, _) = listener.accept().await.unwrap();
+                    let _ = socket.read(&mut [0; 4096]).await.unwrap();
+                }
+                if recover {
+                    axum::serve(listener, axum::Router::new().fallback(|| async { "ok" }))
+                        .await
+                        .unwrap();
+                }
+            });
+            let client = UpstreamClient::new(None);
+            let url = format!("http://{addr}/v1/messages/count_tokens");
+            let body = serde_json::json!({"model": "claude-sonnet-4-5", "messages": []});
+            let result = tokio::time::timeout(
+                std::time::Duration::from_secs(5),
+                client.send_fp_json_with_stale_retry(
+                    None,
+                    &url,
+                    "claude-cli/test",
+                    "sk-test",
+                    &axum::http::HeaderMap::new(),
+                    &body,
+                ),
+            )
+            .await;
+            server.abort();
+            let result = result.expect("指纹车道重试必须有界完成");
+            assert_eq!(result.is_ok(), recover);
+            assert_eq!(*client.attempts.lock().unwrap(), vec![url; 2]);
         }
     }
 
