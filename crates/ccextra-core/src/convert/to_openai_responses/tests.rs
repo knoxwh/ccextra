@@ -2178,3 +2178,206 @@ fn test_tool_schema_union_type_array_keeps_properties() {
     assert_eq!(scalar["type"], "string");
     assert!(scalar.get("properties").is_none());
 }
+
+#[test]
+fn test_strips_out_of_range_int64_bounds() {
+    // 对齐 CPA 57d005fe TestNormalizeCodexToolSchemas_StripsOutOfRangeInt64Bounds
+    // 必须 from_str 保留 arbitrary_precision 数字字面量,不能用 json! 宏(会丢精度)
+    let schema: Value = serde_json::from_str(
+        r#"{
+            "type": "object",
+            "properties": {
+                "options": {
+                    "type": "object",
+                    "properties": {
+                        "seed": {
+                            "type": "integer",
+                            "minimum": 0,
+                            "maximum": 18446744073709552000
+                        },
+                        "over_max_int64": {
+                            "type": "integer",
+                            "minimum": -9223372036854775809,
+                            "maximum": 9223372036854775808,
+                            "exclusiveMinimum": -9223372036854775809,
+                            "exclusiveMaximum": 9223372036854775808
+                        },
+                        "exact_int64_limits": {
+                            "type": "integer",
+                            "minimum": -9223372036854775808,
+                            "maximum": 9223372036854775807,
+                            "exclusiveMinimum": -9223372036854775808,
+                            "exclusiveMaximum": 9223372036854775807
+                        },
+                        "float_bounds": {
+                            "type": "number",
+                            "minimum": -0.5,
+                            "maximum": 3.14,
+                            "exclusiveMinimum": 0.25,
+                            "exclusiveMaximum": 99.95
+                        },
+                        "scientific_bounds": {
+                            "type": "number",
+                            "minimum": 1e5,
+                            "maximum": 1e100,
+                            "exclusiveMinimum": -1.8446744073709552e+19,
+                            "exclusiveMaximum": 18446744073709552000.0
+                        },
+                        "high_precision_fraction": {
+                            "type": "number",
+                            "maximum": 18446744073709552000.00000000000000000000000000000000000000000000000000000000000000000000000000000001
+                        },
+                        "extreme_exponents": {
+                            "type": "number",
+                            "minimum": 1.1e-9223372036854775808,
+                            "maximum": 10e9223372036854775807
+                        },
+                        "user_data": {
+                            "type": "object",
+                            "default": {
+                                "maximum": 18446744073709552000
+                            },
+                            "enum": [
+                                {"maximum": 18446744073709552000}
+                            ]
+                        },
+                        "maximum": {
+                            "type": "integer",
+                            "minimum": 0
+                        }
+                    }
+                }
+            },
+            "$defs": {
+                "uint64_id": {
+                    "type": "integer",
+                    "maximum": 18446744073709551615
+                }
+            }
+        }"#,
+    )
+    .unwrap();
+
+    let out = normalize_tool_parameters(&schema);
+    let opts = &out["properties"]["options"]["properties"];
+
+    // Issue #6579: u64::MAX 量级 bound 删除,minimum:0 与 type 保留
+    assert!(opts["seed"].get("maximum").is_none());
+    assert_eq!(opts["seed"]["minimum"].as_number().unwrap().as_str(), "0");
+    assert_eq!(opts["seed"]["type"], "integer");
+
+    // 四个 bound 关键字均超 int64 → 删除
+    for kw in ["minimum", "maximum", "exclusiveMinimum", "exclusiveMaximum"] {
+        assert!(
+            opts["over_max_int64"].get(kw).is_none(),
+            "expected over_max_int64.{kw} removed"
+        );
+    }
+
+    // 精确 int64 边界保留(arbitrary_precision 字面量)
+    assert_eq!(
+        opts["exact_int64_limits"]["minimum"]
+            .as_number()
+            .unwrap()
+            .as_str(),
+        "-9223372036854775808"
+    );
+    assert_eq!(
+        opts["exact_int64_limits"]["maximum"]
+            .as_number()
+            .unwrap()
+            .as_str(),
+        "9223372036854775807"
+    );
+    assert_eq!(
+        opts["exact_int64_limits"]["exclusiveMinimum"]
+            .as_number()
+            .unwrap()
+            .as_str(),
+        "-9223372036854775808"
+    );
+    assert_eq!(
+        opts["exact_int64_limits"]["exclusiveMaximum"]
+            .as_number()
+            .unwrap()
+            .as_str(),
+        "9223372036854775807"
+    );
+
+    // 分数 float bound 保留
+    assert_eq!(
+        opts["float_bounds"]["minimum"]
+            .as_number()
+            .unwrap()
+            .as_str(),
+        "-0.5"
+    );
+    assert_eq!(
+        opts["float_bounds"]["maximum"]
+            .as_number()
+            .unwrap()
+            .as_str(),
+        "3.14"
+    );
+
+    // 科学计数:范围内保留,超范围删除
+    // serde_json arbitrary_precision 可能把 1e5 规范成 1e+5;语义同 CPA 保留 in-range
+    let sci_min = opts["scientific_bounds"]["minimum"]
+        .as_number()
+        .unwrap()
+        .as_str();
+    assert!(
+        sci_min == "1e5" || sci_min == "1e+5",
+        "expected scientific_bounds.minimum preserved as 1e5/1e+5, got {sci_min}"
+    );
+    for kw in ["maximum", "exclusiveMinimum", "exclusiveMaximum"] {
+        assert!(
+            opts["scientific_bounds"].get(kw).is_none(),
+            "expected scientific_bounds.{kw} removed"
+        );
+    }
+
+    // 高精度非整数不得被当成整数丢掉
+    let want_high = "18446744073709552000.00000000000000000000000000000000000000000000000000000000000000000000000000000001";
+    assert_eq!(
+        opts["high_precision_fraction"]["maximum"]
+            .as_number()
+            .unwrap()
+            .as_str(),
+        want_high
+    );
+
+    // 极端指数:负向超大指数保留,正向超大指数删除
+    assert_eq!(
+        opts["extreme_exponents"]["minimum"]
+            .as_number()
+            .unwrap()
+            .as_str(),
+        "1.1e-9223372036854775808"
+    );
+    assert!(opts["extreme_exponents"].get("maximum").is_none());
+
+    // default/enum 用户数据与名为 maximum 的 property 不动
+    assert_eq!(
+        opts["user_data"]["default"]["maximum"]
+            .as_number()
+            .unwrap()
+            .as_str(),
+        "18446744073709552000"
+    );
+    assert_eq!(
+        opts["user_data"]["enum"][0]["maximum"]
+            .as_number()
+            .unwrap()
+            .as_str(),
+        "18446744073709552000"
+    );
+    assert_eq!(opts["maximum"]["type"], "integer");
+
+    // $defs 子 schema 同样剥离
+    assert!(out["$defs"]["uint64_id"].get("maximum").is_none());
+
+    // 幂等
+    let again = normalize_tool_parameters(&out);
+    assert_eq!(again, out);
+}

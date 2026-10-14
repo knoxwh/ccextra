@@ -1,5 +1,6 @@
 use serde_json::{json, Value};
 use std::collections::HashSet;
+use std::num::IntErrorKind;
 
 use crate::convert::gemini_schema::inline_local_refs;
 use crate::convert::has_unsupported_unicode_property_escape;
@@ -88,7 +89,8 @@ pub(crate) fn normalize_tool_parameters(schema: &Value) -> Value {
 }
 
 /// 递归删除 $schema/$id dialect 关键字(对齐 CPA 7fac6b15 stripDialectKeywordsFromSchema),
-/// 并剥离含 \p{...}/\P{...} 的 pattern(对齐 CPA e56abd56)
+/// 剥离含 \p{...}/\P{...} 的 pattern(对齐 CPA e56abd56),
+/// 以及超出 int64 的 numeric bounds(对齐 CPA 57d005fe)
 fn strip_dialect_keywords_from_schema(v: &mut Value) {
     match v {
         Value::Object(map) => {
@@ -103,6 +105,21 @@ fn strip_dialect_keywords_from_schema(v: &mut Value) {
                 if has_unsupported_unicode_property_escape(p) {
                     map.shift_remove("pattern");
                 }
+            }
+
+            // 对齐 CPA 57d005fe:Codex 拒绝超出 int64 的 integer numeric bounds → HTTP 500
+            let out_of_range: Vec<&str> = CODEX_NUMERIC_BOUND_KEYWORDS
+                .iter()
+                .copied()
+                .filter(|k| {
+                    matches!(
+                        map.get(*k),
+                        Some(Value::Number(n)) if is_numeric_bound_out_of_i64(n.as_str())
+                    )
+                })
+                .collect();
+            for k in out_of_range {
+                map.shift_remove(k);
             }
 
             // 对齐 CPA 37ce368c:patternProperties 正则键含 \p{...} 时整键删除
@@ -148,6 +165,104 @@ fn strip_dialect_keywords_from_schema(v: &mut Value) {
         }
         _ => {}
     }
+}
+
+/// Codex 会因超出 int64 的 numeric bound 返回 HTTP 500 的关键字(对齐 CPA 57d005fe)
+const CODEX_NUMERIC_BOUND_KEYWORDS: &[&str] =
+    &["minimum", "maximum", "exclusiveMinimum", "exclusiveMaximum"];
+
+/// 判断 JSON number 字面量是否为「整数且超出 signed int64」(对齐 CPA isNumericBoundOutOfInt64)。
+/// 分数 / 非整数科学计数保留;仅当语义上是整数且 ParseInt 溢出时返回 true。
+fn is_numeric_bound_out_of_i64(raw_number: &str) -> bool {
+    let raw = raw_number.trim();
+    if raw.is_empty() {
+        return false;
+    }
+    if !raw.contains(['.', 'e', 'E']) {
+        return matches!(
+            raw.parse::<i64>(),
+            Err(e) if matches!(e.kind(), IntErrorKind::PosOverflow | IntErrorKind::NegOverflow)
+        );
+    }
+
+    let mut s = raw;
+    let mut negative = false;
+    if let Some(rest) = s.strip_prefix('-') {
+        negative = true;
+        s = rest;
+    } else if let Some(rest) = s.strip_prefix('+') {
+        s = rest;
+    }
+
+    let mut mantissa = s;
+    let mut exp: i64 = 0;
+    if let Some(idx) = s.find(['e', 'E']) {
+        mantissa = &s[..idx];
+        let exp_str = &s[idx + 1..];
+        match exp_str.parse::<i64>() {
+            Ok(parsed) => exp = parsed,
+            Err(err) => {
+                if matches!(
+                    err.kind(),
+                    IntErrorKind::PosOverflow | IntErrorKind::NegOverflow
+                ) {
+                    return !exp_str.starts_with('-')
+                        && mantissa.trim_matches(|c| c == '0' || c == '.') != "";
+                }
+                return false;
+            }
+        }
+    }
+
+    let (int_part, frac_part) = if let Some(dot_idx) = mantissa.find('.') {
+        let int_part = &mantissa[..dot_idx];
+        let frac_part = &mantissa[dot_idx + 1..];
+        if frac_part.contains('.') {
+            return false;
+        }
+        (int_part, frac_part)
+    } else {
+        (mantissa, "")
+    };
+    if int_part.is_empty() && frac_part.is_empty() {
+        return false;
+    }
+    if !int_part.bytes().all(|b| b.is_ascii_digit()) {
+        return false;
+    }
+    if !frac_part.bytes().all(|b| b.is_ascii_digit()) {
+        return false;
+    }
+
+    let all_digits = format!("{int_part}{frac_part}");
+    let sig = all_digits.trim_start_matches('0');
+    if sig.is_empty() {
+        return false;
+    }
+    if exp < -(raw.len() as i64) {
+        return false;
+    }
+    if exp > raw.len() as i64 + 20 {
+        return true;
+    }
+    let trimmed = sig.trim_end_matches('0');
+    let trailing_zeros = (sig.len() - trimmed.len()) as i64;
+    let effective_exp = exp - (frac_part.len() as i64) + trailing_zeros;
+    if effective_exp < 0 {
+        return false;
+    }
+    if effective_exp > 19 || (trimmed.len() as i64) + effective_exp > 19 {
+        return true;
+    }
+
+    let mut int_str = format!("{trimmed}{}", "0".repeat(effective_exp as usize));
+    if negative {
+        int_str = format!("-{int_str}");
+    }
+    matches!(
+        int_str.parse::<i64>(),
+        Err(e) if matches!(e.kind(), IntErrorKind::PosOverflow | IntErrorKind::NegOverflow)
+    )
 }
 
 /// 纯 const union → enum(对齐 CPA helps/codex_tool_schema.go NormalizeCodexToolSchemas)
