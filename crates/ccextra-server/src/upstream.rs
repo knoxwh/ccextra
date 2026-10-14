@@ -835,16 +835,17 @@ impl UpstreamClient {
         for (name, value) in stream_headers(protocol, is_stream) {
             req = req.header(name, value);
         }
-        // responses 协议:Session-Id/Thread-Id 始终带;Originator 仅 *gpt*
+        // responses 协议:Session-Id/Thread-Id 有则带;Originator 仅 *gpt*
+        // Window-Id 对齐官方 `{thread_id}:{window_number}`;无 thread 则不造(对齐 CPA 透传)
         if matches!(protocol, Protocol::OpenAiResponses) {
             if let Some(sid) = session_id {
                 req = req.header("Session-Id", sid);
-                if is_gpt_model(upstream_model) {
-                    req = req.header("X-Codex-Window-Id", format!("{sid}:0"));
-                }
             }
             if let Some(tid) = thread_id {
                 req = req.header("Thread-Id", tid);
+                if is_gpt_model(upstream_model) {
+                    req = req.header("X-Codex-Window-Id", format!("{tid}:0"));
+                }
             }
             if is_gpt_model(upstream_model) {
                 req = req.header("Originator", "codex_cli_rs");
