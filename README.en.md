@@ -2,43 +2,36 @@
 
 # ccextra
 
-<p align="center">
-  <strong>Use models from different providers in Claude Code.</strong><br>
-  One local endpoint for Claude, OpenAI, Gemini, and OAuth providers.
-</p>
+**Use models from different providers in Claude Code**
 
-<p align="center">
-  <a href="LICENSE"><img src="https://img.shields.io/badge/License-MIT-black.svg?style=flat-square" alt="License"></a>
-  <a href="Cargo.toml"><img src="https://img.shields.io/badge/Rust-1.75+-black.svg?style=flat-square&logo=rust" alt="Rust"></a>
-  <img src="https://img.shields.io/badge/Version-1.0.0-black.svg?style=flat-square" alt="Version">
-</p>
+Local Anthropic Messages proxy · one port for Claude / OpenAI / Gemini / OAuth
 
-<p align="center">
-  <a href="README.md">中文</a> • <b>English</b>
-</p>
+<br>
 
-<p align="center">
-  <a href="#key-features">Key Features</a> •
-  <a href="#architecture">Architecture</a> •
-  <a href="#upstream-matrix">Upstream Matrix</a> •
-  <a href="#quick-start">Quick Start</a> •
-  <a href="#configuration">Configuration</a> •
-  <a href="docs/design.md">Design Spec</a>
-</p>
+[![License](https://img.shields.io/badge/License-MIT-black.svg?style=flat-square)](LICENSE)
+[![Rust](https://img.shields.io/badge/Rust-1.75+-black.svg?style=flat-square&logo=rust)](Cargo.toml)
+[![Version](https://img.shields.io/badge/Version-1.0.0-black.svg?style=flat-square)](Cargo.toml)
 
----
+[中文](README.md) · **English**
+
+[Features](#features) · [Architecture](#architecture) · [Protocols](#protocol-matrix) · [Quick start](#quick-start) · [Config](#configuration-highlights) · [API](#http-api) · [Design](docs/design.md)
 
 </div>
 
-A single-process Rust proxy. Claude Code sends Anthropic Messages requests; ccextra selects an upstream by model alias, translates the request, and returns Anthropic-format JSON or SSE responses.
+---
 
-## Key Features
+Claude Code sends Anthropic Messages requests; ccextra picks an upstream by model alias, translates the protocol, and returns Anthropic JSON / SSE. One process, one port.
 
-- **Route by model**: Claude, OpenAI, Gemini, and Antigravity share one endpoint. Client-facing aliases remain separate from upstream model names.
-- **Stable request content**: Normalize tools, schemas, and history to reduce incidental changes between turns. Actual cache hits depend on the upstream.
-- **Model adaptation**: Translate messages, tool calls, and images; adjust supported reasoning levels through `models.json`.
-- **OAuth providers**: Load and refresh Antigravity, xAI Grok, Codex (OpenAI ChatGPT subscription), Claude subscription (Anthropic OAuth), and Cursor (native connect-rpc proxy) credentials with dynamic model routing.
-- **Hot reload**: Publish configuration without restarting. In-flight requests keep their original snapshot.
+## Features
+
+| | |
+| :--- | :--- |
+| **Route by model** | Claude, OpenAI, Gemini, Antigravity, and Cursor share one port; `alias` stays separate from upstream `name` |
+| **Request stabilization** | Normalize tools, schemas, and history to cut incidental cross-turn drift (hit rate still depends on the upstream) |
+| **Capability adaptation** | Message / tool / image conversion; `models.json` clamps reasoning levels |
+| **OAuth providers** | Antigravity, xAI Grok, Codex, Claude subscription, Cursor — credential load, refresh, dynamic models |
+| **Claude fingerprint lane** | `protocol: claude` defaults to wreq/BoringSSL (Bun-aligned TLS + HTTP/1.1) |
+| **Hot reload** | `POST /reload` publishes atomically; in-flight requests keep the old snapshot |
 
 ## Architecture
 
@@ -52,22 +45,22 @@ flowchart LR
     P -->|cursor_sdk| E["Cursor AgentService/Run"]
 ```
 
-One process listens on one port. Input is always Anthropic-shaped; every path returns Anthropic responses (including SSE). See [architecture](docs/design.md).
+Inbound is always Anthropic-shaped; outbound is restored to Anthropic responses. Details in [architecture](docs/design.md).
 
-## Upstream Matrix
+## Protocol matrix
 
-| Protocol (`protocol`) | Upstream API Target | Core Adaptation Strategy |
+| `protocol` | Upstream shape | Adaptation notes |
 | :--- | :--- | :--- |
-| `claude` | Anthropic Messages | Replace the target model; also sanitize system content and adjust effort for non-Claude models. Response bodies pass through. |
-| `openai_chat` | Chat Completions | Translate messages, tools, and images; adapt Kimi K2.8 thinking parameters and temperature constraints. |
-| `openai_responses` | Responses | Map `instructions` and `input`; support reasoning replay and search domain filtering. |
-| `gemini` | Gemini GenerateContent | Translate content blocks, tool results, and schemas. |
-| `antigravity` | Cloud Code Assist | Wrap Gemini requests, adapt tool names and output limits; use short connections by default. |
-| `cursor_sdk` | Cursor AgentService/Run | Native connect-rpc bidirectional stream straight to api2.cursor.sh; auto-discover the model catalog and resume sessions. |
+| `claude` | Anthropic Messages | Swap model; sanitize system / effort for non-Claude; response passthrough |
+| `openai_chat` | Chat Completions | Messages / tools / images; Kimi thinking params and temperature constraints |
+| `openai_responses` | Responses | `instructions` + `input`; reasoning replay, search-domain filtering |
+| `gemini` | Gemini GenerateContent | Content blocks, tool results, schema |
+| `antigravity` | Cloud Code Assist | Gemini wrapper; tool names and output caps; short connections by default |
+| `cursor_sdk` | Cursor AgentService/Run | connect-rpc dual-stream to `api2.cursor.sh`; auto model discovery, session resume |
 
-> **Note**: xAI Grok and Codex are automatically injected as `openai_responses` providers via OAuth without requiring a distinct protocol. Codex subscription requests carry the `Chatgpt-Account-Id` identity header automatically, and request bodies are zstd-compressed (matching codex CLI defaults). Claude subscription injects a `protocol: claude` provider that shares the same Messages passthrough pipeline as static API/proxy keys. Cursor is likewise synthesized into a `cursor_sdk` provider (fixed name `cursor`) from the `cursor_auth_dir` credential — no manual provider entry required.
+> **OAuth synthesis**: xAI / Codex → `openai_responses`; Claude subscription → `claude` (same passthrough as static API); Cursor → fixed-name `cursor` `cursor_sdk`. Codex auto-attaches `Chatgpt-Account-Id` and zstd request bodies (CLI-aligned).
 
-## Quick Start
+## Quick start
 
 ### 1. Build
 
@@ -75,11 +68,9 @@ One process listens on one port. Input is always Anthropic-shaped; every path re
 cargo build --release
 ```
 
-Cursor uses the native connect-rpc path with no Node prerequisite; `cargo build --release` is enough.
+### 2. Configure
 
-### 2. Configure an upstream
-
-Copy and edit the [configuration template](config.example.yaml), or save the minimal example below as `config.yaml`. Replace `base_url`, `key`, and `models[].name` with values supported by your upstream.
+Copy [config.example.yaml](config.example.yaml) to `config.yaml`, or start from a minimal example:
 
 ```yaml
 server:
@@ -107,162 +98,148 @@ logging:
 secret_key: "replace-with-your-local-key"
 ```
 
-For OpenAI protocols, include the version prefix (such as `/v1`) in `base_url`, but not `/responses` or `/chat/completions`. For the Claude protocol, omit `/v1`.
+`base_url`: include the version prefix for OpenAI protocols (e.g. `/v1`); do not append `/responses` or `/chat/completions`. Claude protocol omits `/v1`.
 
-### 3. Start and connect
-
-Start the proxy:
+### 3. Start and connect Claude Code
 
 ```bash
 ./target/release/ccextra --config config.yaml
 ```
 
-In another terminal, use the local key from your configuration. This key is separate from the upstream `providers[].key`:
-
 ```bash
 export ANTHROPIC_BASE_URL=http://127.0.0.1:8222
-export ANTHROPIC_AUTH_TOKEN=replace-with-your-local-key
+export ANTHROPIC_AUTH_TOKEN=replace-with-your-local-key   # local secret, not the upstream key
 claude --model coding
 ```
 
-On first load, `secret_key` is hashed with bcrypt and written back to the config. Clients continue to use the original plaintext key.
-
-Check the service and available models:
+On first load, `secret_key` is bcrypt-hashed and written back; clients keep using the plaintext value.
 
 ```bash
 curl http://127.0.0.1:8222/health
-curl -H "Authorization: Bearer $ANTHROPIC_AUTH_TOKEN" \
-  http://127.0.0.1:8222/v1/models
+curl -H "Authorization: Bearer $ANTHROPIC_AUTH_TOKEN" http://127.0.0.1:8222/v1/models
 ```
 
-For background operation, use `build.sh` (build and update the binary only) or `deploy.sh` (build, then restart if running), along with `start.sh`, `stop.sh`, and `restart.sh`. These scripts use the root-level `./ccextra` binary, which `build.sh` and `deploy.sh` update.
+Daemon helpers: `build.sh` / `deploy.sh` / `start.sh` / `stop.sh` / `restart.sh` (operate on `./ccextra` in the repo root).
 
-## Configuration
+## Configuration highlights
 
-See [config.example.yaml](config.example.yaml) for every field. Key points:
+Full fields: [config.example.yaml](config.example.yaml). Common items:
 
-- `models[].alias` is the inbound model name and cannot duplicate across providers; `base_url` accepts an ordered fallback array.
-- Provider `proxy_url` overrides `server.proxy_url`; `"direct"` disables proxy use.
-- `secret_key` enables ingress authentication: plaintext keys become bcrypt hashes on load and are written back; requests accept `x-api-key` or `Authorization: Bearer`.
-- `payload` applies model-glob top-level overrides, optionally scoped by `protocol`.
-- `prompt_cache_key` applies only to OpenAI paths, uses Claude Code session ID, and never replaces a nonempty key.
-- `models_file` points at the reasoning-level table (default `models.json` next to the config; not tracked by git — copy [models.json.example](models.json.example) and edit as needed). Exact `id` match clamps inbound effort to the nearest supported level; missing file or unknown models leave effort unchanged. An entry may set `force_effort`: wherever clamping would apply, effort is rewritten to this fixed value (unclamped); native `*claude*` models and requests with thinking explicitly disabled are unaffected.
-- `antigravity_models` is a model allowlist (top-level, glob or exact names, e.g. `["claude-opus-5-5-*", "gpt-5.2"]`); absent or empty publishes the full catalog. Filtering happens at dynamic catalog load against upstream model names; an empty result makes Antigravity publish an empty model list for that credential. Applies to `/reload` and the three-hour background refresh.
-- Cursor fields: `cursor_auth_dir` enables the native proxy (credential directory, default `.cache/cursor` next to the config); `cursor_models` is an allowlist (glob or exact names, both `default` and `auto` match the catalog `default` entry, absent means full catalog), and entries may pin fixed parameters as `"id:param=value"` (e.g. `"auto-smart:optimize_for=intelligence"`, appended to the model name). Thinking level: when a bare allowlist base matches a catalog variant family (e.g. `grok-4.7` maps to `grok-4.7-low/…/xhigh`), a single model is synthesized and its level is not set in the allowlist but comes from the `models.json` entry with the same id (exact match on the base, e.g. `grok-4.7`): `force_effort` fixes the level outright (even when thinking is explicitly disabled); otherwise the inbound effort (`thinking.budget_tokens` threshold mapping, `output_config.effort`, `reasoning_effort`; `thinking.type: disabled` counts as `none`; `auto` leaves it untouched) is clamped to `reasoning_levels`. The result is then clamped to the levels the catalog actually offers and appended to the upstream model id (e.g. `grok-4.7-high`), so the variant always exists upstream; without a `models.json` entry only the catalog levels clamp; when no effort is given, a default level applies (medium preferred, otherwise the median level — the family has no bare id, so the bare base is rejected upstream). Stale `reasoning_effort`/`effort` pins left in the allowlist are ignored for family models. Models whose bare id already exists in the catalog (`default`, `composer-2.5`) skip family expansion and send effort through `RequestedModel.parameters`, where a pinned allowlist parameter wins over the inbound effort. `cursor_base_url` (default `https://api2.cursor.sh`) and `cursor_client_version` (default `cli-2026.10.01-e373342`) are overridable; `cursor_transport` selects the transport mode: `bidi` (default, single BiDi Run stream) or `sse` (dual-channel RunSSE read + BidiAppend write, for environments where bidirectional streams are cut by proxies/firewalls — the CLI's HTTP/1.1 fallback path). When enabled, a `cursor_sdk` provider named `cursor` is synthesized automatically; models whose alias conflicts with an existing provider are skipped with a warning (names may repeat across providers). Failed refreshes keep the last successful catalog.
+| Item | Notes |
+| :--- | :--- |
+| `models[].alias` | Inbound model name; must be unique across providers; `base_url` may be a fallback array |
+| `server.proxy_url` / provider `proxy_url` | Provider overrides server; `"direct"` = no proxy |
+| `secret_key` | Entry auth; bcrypt-written on load; requests use `x-api-key` or `Bearer` |
+| `payload` | Glob overrides for top-level params; optional `protocol` scope |
+| `prompt_cache_key` | OpenAI paths only; takes Claude Code session ID; does not overwrite a non-empty value |
+| `models_file` | Reasoning table (default sibling `models.json`; copy from [models.json.example](models.json.example)) |
+| `antigravity_models` / `cursor_models` | Model whitelist (glob / exact); default = all |
+| `*_auth_dir` | OAuth credential dirs; default `.cache/<provider>` next to config |
 
 <details>
 <summary>Advanced options</summary>
 
-- `user_agents` overrides Claude, Codex, Grok, and Antigravity identifiers.
-- `logging.request_body` writes diagnostic requests under `logs/`.
-- `POST /reload` validates and atomically publishes providers, payload, normalization, auth, proxy, User-Agent, the reasoning registry, and background refresh settings. Existing requests keep their snapshot; new requests use the new snapshot. Concurrent reloads serialize loading and publication; load or validation failures leave the snapshot and version unchanged. Restart for `logging.level` changes.
-- Background refresh uses the last successfully published static configuration, credential directories, and proxy, without reading config file edits awaiting reload. Stale refresh results are discarded; an empty Antigravity result preserves the entire provider set. Explicit reload applies removals, disabled credentials, and directory changes without restoring old dynamic providers; dynamic loaders retain their existing behavior of skipping unavailable credentials.
-- `antigravity.connection-pool` controls the Antigravity upstream connection pool: short connections by default; with `enabled: true`, idle connections are kept per `idle-conn-timeout` (default 30s, capped at 210s) and `max-idle-conns-per-host` (default 2, capped at 100).
-- Edits to `models.json` take effect after `POST /reload`; no rebuild needed.
+- `user_agents` — override Claude / Codex / Grok / Antigravity identifiers
+- `logging.request_body` — write diagnostic requests under `logs/`
+- `POST /reload` — atomically publish providers, payload, normalize, auth, proxy, UA, reasoning table, and refresh params; failed loads leave the snapshot unchanged; `logging.level` needs a restart
+- Background refresh uses the last successfully published static config; explicit reload prefers removals / disables / directory switches
+- `antigravity.connection-pool` — short connections by default; with `enabled: true`, keep the pool per idle / per-host caps
+- Cursor: `cursor_base_url`, `cursor_client_version`, `cursor_transport` (`bidi` default / `sse` dual-channel fallback); thinking levels live in `models.json` (by base id); details in [design.md](docs/design.md)
 
 </details>
 
-## API Endpoints
+## HTTP API
 
-| Method & Endpoint | Auth Required* | Description |
-| :--- | :--- | :--- |
-| `POST /v1/messages` | Required* | Accept Anthropic Messages and return JSON or SSE. |
-| `POST /v1/messages/count_tokens` | Required* | Forward Claude counting upstream; use session records for other protocols, returning 0 on a miss. Real streaming input usage from Chat/Responses/Gemini/Antigravity also updates these records; missing or zero values preserve the previous value. |
-| `GET /v1/models` | Required* | List available models in Anthropic format. |
-| `GET /health` | Public | Return `ok`; does not check upstream availability. |
-| `POST /reload` | Public | Load, validate, and publish configuration without restarting. |
+| Endpoint | Auth | Role |
+| :--- | :---: | :--- |
+| `POST /v1/messages` | \* | Anthropic Messages → JSON / SSE |
+| `POST /v1/messages/count_tokens` | \* | Claude forwards upstream count; others read session records, miss → 0 |
+| `GET /v1/models` | \* | Anthropic-format model list |
+| `GET /health` | — | Returns `ok` (does not probe upstream) |
+| `POST /reload` | — | Validate and publish new config |
 
-> `*` Note: When `secret_key` is set, endpoints marked with `*` require `x-api-key` or `Authorization: Bearer`.
-
-## Runtime Pipeline
+\* When `secret_key` is set, use `x-api-key` or `Authorization: Bearer`.
 
 <details>
-<summary>Request processing, retries, and resource limits</summary>
+<summary>Request pipeline and boundaries</summary>
 
-Requests pass through authentication, model routing, normalization, protocol conversion, and parameter overrides before reaching the upstream. OpenAI paths can inject `prompt_cache_key`; Gemini and Antigravity skip OpenAI-specific processing.
+Pipeline: auth → route → normalize → protocol convert → payload override → upstream.
 
-- **Request compatibility**: OpenAI Chat/Responses conversions remove `required: null` from tool schemas without changing instance data such as `default`. Chat also converts schema-position `true` to `{}`, preserving `false` and boolean `additionalProperties`. Responses wire JSON starts with `model`, `stream`, and an existing `service_tier`; other fields and nested content remain unchanged. Gemini/Antigravity enforces `type: object` on schema nodes declaring `properties`, and maps blockage finish reasons (SAFETY, RECITATION, MALFORMED_FUNCTION_CALL) to `refusal`. Antigravity neutralizes leading Claude Agent SDK/Claude Code identity sentences in system blocks while keeping later instructions, and sanitizes non-standard session headers. Native Claude passthrough is unchanged.
-- **Grok identity**: Chat/Responses use the `grok-pager` identifier, `interactive` mode, and a two-component UA. `user_agents.grok_version` defaults to `1.0.46`; explicit configuration takes precedence. Only the official `cli-chat-proxy.grok.com` host receives `x-authenticateresponse: authenticate-response`.
-- **Streaming**: Claude response bytes pass through; other protocols are converted to Anthropic SSE. All streaming paths use a 10-second `: keepalive`.
-- **Retries & fallbacks**: 429/5xx (including 52x) and network errors rotate through multiple `base_url` entries within the same round; once exhausted, the last upstream error fails fast back to the client. Backoff and retries belong to the client (e.g. Claude Code); the upstream `Retry-After` header passes through. The streaming first-frame preload skips `: keepalive` comment frames; a first-frame error triggers one internal retry, and a second failure returns 502 instead of committing 200. Normal generation is never truncated.
-- **Read limits**: Non-stream success bodies are capped at 16 MiB, error bodies retain at most 256 KiB, and read idle is 180 seconds. Oversized success bodies return 502; stalls return 504. Error-body read failures retain the known status for normal error mapping. OAuth, project, and model reads retain their 30-second total timeout.
-- **Headers**: Claude forwards permitted identity headers while excluding authentication and connection-management headers. `anthropic-beta` passes through by default. For subscription OAuth (`sk-ant-oat*`), `oauth-2025-04-20` is appended when missing; existing lists are left unchanged.
+- **Compatibility**: OpenAI strips `required: null`; Chat maps schema-position `true`→`{}`; Gemini/AG fills `type: object`; blockage codes map to `refusal`; AG neutralizes Claude Code identity sentences and sanitizes non-standard session headers
+- **Streaming**: Claude body passthrough; others convert to Anthropic SSE; 10s `: keepalive`
+- **Retries**: same-round multi-`base_url` rotation on 429/5xx/network errors; exhaust → fail fast and pass through `Retry-After`; streaming first-frame error retries once internally
+- **Read limits**: success body 16 MiB, error 256 KiB, idle 180s; OAuth / project / model reads 30s total timeout
+- **Claude headers**: keep permitted identity headers; `anthropic-beta` passthrough by default; append `oauth-2025-04-20` for `sk-ant-oat*` when missing
 
 </details>
 
 ## OAuth and operations
 
-Log in to an upstream or inspect saved credential status:
+```bash
+./ccextra antigravity-login && ./ccextra antigravity-status
+./ccextra xai-login         && ./ccextra xai-status
+./ccextra codex-login       && ./ccextra codex-status
+./ccextra claude-login      && ./ccextra claude-status
+./ccextra cursor-login      && ./ccextra cursor-status
+```
+
+| Provider | Default credential dir | Refresh window | Notes |
+| :--- | :--- | :--- | :--- |
+| Antigravity | `.cache/antigravity` | 5 minutes early | Model catalog ~3h background refresh |
+| xAI Grok | `.cache/xai` | 5 minutes early | Injected on startup scan |
+| Codex | `.cache/codex` | 24 hours early | PKCE; callback port default 1455 |
+| Claude subscription | `.cache/claude` | 4 hours early | PKCE; callback fixed `localhost:54545`; no cloaking / UA rewrite |
+| Cursor | `.cache/cursor` | 10 minutes early | Native connect-rpc; `--no-browser` supported |
+
+Quota / model catalog:
 
 ```bash
-./ccextra antigravity-login
-./ccextra antigravity-status
-./ccextra xai-login
-./ccextra xai-status
-./ccextra codex-login
-./ccextra codex-status
-./ccextra claude-login
-./ccextra claude-status
-./ccextra cursor-login
-./ccextra cursor-status
 ./scripts/check_antigravity_quota.sh
 ./scripts/check_grok_quota.sh
 ./scripts/check_codex_quota.sh
-./scripts/check_cursor_quota.sh
+./scripts/check_cursor_quota.sh          # default: quota + catalog; --models = models only
 ```
 
-Credential directories default next to the config: Antigravity → `.cache/antigravity`, xAI → `.cache/xai`, Codex → `.cache/codex`, Claude subscription → `.cache/claude`, Cursor → `.cache/cursor`. xAI, Codex, and Claude subscription are scanned and injected at startup; override with `*_auth_dir` / `claude_auth_dir` / `cursor_auth_dir`.
-
-Antigravity loads in the background, refreshes models every three hours, refreshes tokens 5 minutes ahead of expiry, confines requests to the daily endpoint, and sanitizes non-standard headers. Codex login uses PKCE browser authorization (local callback port defaults to 1455, override with `--callback-port`); tokens refresh 24 hours ahead of expiry.
-
-**Claude subscription (Anthropic OAuth)** — single-machine use with Claude Code CLI only:
-
-```bash
-./ccextra claude-login          # PKCE; callback fixed at localhost:54545
-./ccextra claude-status         # inspect credentials (tokens not printed)
-# After start or /reload, injects a protocol: claude provider
-# (base_url=https://api.anthropic.com, key=access_token)
-```
-
-- Outbound reuses existing Messages passthrough and cache normalization; no cloaking, UA rewrite, or fake system / user_id.
-- Tokens refresh 4 hours ahead of expiry (retry only on HTTP 5xx; never blindly replay refresh on transport/decode errors).
-- For `sk-ant-oat*` outbound, append `oauth-2025-04-20` to `anthropic-beta` when missing.
-- Same shape as static `protocol: claude` API/proxy entries — later switch `base_url` + key on the same pipeline.
-
-Cursor login uses its own PKCE browser flow and polling; neither the Cursor IDE nor `cursor-agent` is required. Use `--no-browser` to open the login URL manually. Cursor tokens refresh 10 minutes ahead of expiry. The PKCE credential (`cursor.json`) drives the native proxy and quota checks (`check_cursor_quota.sh`, which shows both quota and the model catalog by default; `--models` lists models only). Once configured, startup and `/reload` fetch the account model catalog via GetUsableModels and synthesize the `cursor` provider, a background refresh runs every three hours, and failures keep the last successful catalog. The `cursor_models` whitelist matches that catalog (script output, including display names and aliases); run that command to verify model ids before configuring the whitelist. Thinking levels live in `models.json` (keyed by base id); the script ends with each model's selectable levels and a ready-to-paste `models.json` entry.
-
-**Cursor native proxy operations**:
-
-- Outbound traffic goes through Rust h2 + rustls straight to `api2.cursor.sh`; proxying reuses the global `proxy` (HTTP CONNECT tunnel with Basic auth support), and `"direct"` disables it. Region-restricted models (e.g. `muse-spark-1.3`) require fully proxied egress.
-- Session state (parked sessions, checkpoints, journal replay cache) lives in memory only and is lost on restart; `cursor_auth_dir` stores only PKCE credentials (`cursor.json`) — do not commit or share that directory.
-- Known limitation: when a parked session is lost (restart, TTL expiry, model or tool-catalog change), tool continuation falls back to history fabrication (rebuilding context as root prompt blobs + turns) in a fresh run; side effects (such as tool calls) not yet acknowledged inside a crash window may re-execute, with client-side tool_result idempotency as the backstop. Checkpoint reuse is prefix-verified (continues only when the covered-prefix digest matches; a `/compact` history rewrite drops the checkpoint and falls back to full replay), and a zero-output checkpoint failure (non-401/429) transparently retries once via history fabrication. Tool-less requests get a `<system_constraint>` prefix in UserText (prevents the model from hallucinating tool calls).
-
-After saving credentials, each OAuth login command automatically sends `POST /reload` to `server.host` / `server.port` from `--config`. Wildcard bind addresses map to loopback; the request bypasses proxies, with a 2-second connection timeout and a 30-second total timeout. Failure prints a warning without undoing login; a stopped service loads credentials on its next startup. When using `--auth-dir`, the service configuration must point to that directory too.
-
-After editing configuration or if automatic reload fails, reload manually:
+Successful login auto `POST /reload` against `--config` `host`/`port` (failure is a warning only). Manual reload:
 
 ```bash
 curl -X POST http://127.0.0.1:8222/reload
 ```
 
-Configuration load or validation failures preserve the previous configuration. See “Advanced options” above for refresh and removal rules.
+<details>
+<summary>Claude subscription / Cursor notes</summary>
 
-## Development & Architecture
+**Claude subscription** — single-machine, Claude Code CLI clients only:
+
+- `./ccextra claude-login` → injects `protocol: claude` (`base_url=https://api.anthropic.com`)
+- Outbound reuses Messages passthrough and cache normalization; refresh retries only on 5xx
+- Same shape as static Claude API / proxy — swap `base_url` + key
+
+**Cursor** — no Cursor IDE / `cursor-agent` required:
+
+- Outbound h2 + rustls straight to `api2.cursor.sh`; proxy uses global `proxy` (`"direct"` disables)
+- Session state is in-memory and lost on restart; do not commit `cursor.json`
+- Parked-session loss falls back to history fabrication; checkpoints use prefix checks; tool-less requests get `<system_constraint>`
+- Thinking levels in `models.json` (by base id); run `check_cursor_quota.sh --models` before setting a whitelist
+
+More in [design.md](docs/design.md).
+
+</details>
+
+## Development
 
 ```bash
-# Run full test suite
 cargo test --workspace
-
-# Strict clippy lints
 cargo clippy --workspace --all-targets -- -D warnings
 ```
 
-Decoupled three-tier architecture:
-- `ccextra-cli`: CLI interface, daemon lifecycle, and configuration loading.
-- `ccextra-server`: HTTP layer, OAuth handlers, SSE state machines, and connection pools.
-- `ccextra-core`: Pure IO-free core logic (routing algorithms, normalization, protocol converters, reasoning registry).
+| Crate | Role |
+| :--- | :--- |
+| `ccextra-cli` | CLI, startup, config load |
+| `ccextra-server` | HTTP, OAuth, SSE, connection pools, fingerprint lane |
+| `ccextra-core` | IO-free: routing, normalize, protocol convert, reasoning table |
 
-For detailed specifications, see [Architecture (design.md)](docs/design.md) and [Glossary (glossary.md)](docs/glossary.md).
+Terms: [glossary.md](docs/glossary.md).
 
 ## License
 
