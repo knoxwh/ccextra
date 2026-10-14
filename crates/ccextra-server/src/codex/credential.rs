@@ -40,12 +40,13 @@ impl CodexCredential {
         if self.access_token.trim().is_empty() {
             return false;
         }
+        // 空/坏 expired 视为不新鲜,强制走刷新(对齐 CPA 有明确 Expire 才可信)
         if self.expired.trim().is_empty() {
-            return true;
+            return false;
         }
         let exp_time = match OffsetDateTime::parse(self.expired.trim(), &Rfc3339) {
             Ok(dt) => SystemTime::from(dt),
-            Err(_) => return true,
+            Err(_) => return false,
         };
         let skew = Duration::from_secs(skew_secs.max(0) as u64);
         match now.checked_add(skew) {
@@ -98,18 +99,16 @@ pub fn parse_jwt_identity(id_token: &str) -> (String, String, String) {
         return (String::new(), String::new(), String::new());
     }
     use base64::Engine;
-    let engine = base64::engine::general_purpose::URL_SAFE_NO_PAD;
+    // 对齐 CPA base64URLDecode:补 pad 后用 URL_SAFE(接受 padding)
     let padded = match parts[1].len() % 4 {
         2 => format!("{}==", parts[1]),
         3 => format!("{}=", parts[1]),
+        1 => return (String::new(), String::new(), String::new()),
         _ => parts[1].to_string(),
     };
-    let payload_bytes = match engine.decode(padded.as_bytes()) {
-        Ok(b) => b,
-        Err(_) => match base64::engine::general_purpose::STANDARD.decode(padded.as_bytes()) {
-            Ok(b) => b,
-            Err(_) => return (String::new(), String::new(), String::new()),
-        },
+    let Ok(payload_bytes) = base64::engine::general_purpose::URL_SAFE.decode(padded.as_bytes())
+    else {
+        return (String::new(), String::new(), String::new());
     };
     let Ok(val) = serde_json::from_slice::<serde_json::Value>(&payload_bytes) else {
         return (String::new(), String::new(), String::new());
@@ -188,5 +187,52 @@ mod tests {
         assert_eq!(email, "test@example.com");
         assert_eq!(account_id, "acct-123");
         assert_eq!(plan_type, "pro");
+    }
+
+    #[test]
+    fn parse_jwt_identity_urlsafe_chars_and_padding() {
+        use base64::Engine;
+        // 强制编码含 '-' 且 len%4==2(补 pad 路径);旧实现会空身份
+        let payload = serde_json::json!({
+            "email": "t@e.com",
+            "k": String::from_utf8_lossy(&[0xff, 0xfe, 0xfd, 0x00, 0x7f]).to_string(),
+            "https://api.openai.com/auth": {
+                "chatgpt_account_id": "acct-1",
+                "chatgpt_plan_type": "pro"
+            }
+        });
+        let raw = serde_json::to_vec(&payload).unwrap();
+        let enc = base64::engine::general_purpose::URL_SAFE_NO_PAD.encode(&raw);
+        assert!(
+            enc.contains('-') || enc.contains('_'),
+            "fixture must use urlsafe alphabet"
+        );
+        assert_ne!(enc.len() % 4, 0, "fixture must need padding");
+        let (email, account_id, plan_type) = parse_jwt_identity(&format!("h.{enc}.s"));
+        assert_eq!(email, "t@e.com");
+        assert_eq!(account_id, "acct-1");
+        assert_eq!(plan_type, "pro");
+    }
+
+    #[test]
+    fn is_fresh_rejects_empty_or_bad_expired() {
+        let mut cred = CodexCredential {
+            r#type: "codex".into(),
+            id_token: String::new(),
+            access_token: "tok".into(),
+            refresh_token: "r".into(),
+            account_id: "a".into(),
+            last_refresh: String::new(),
+            email: "u@e.com".into(),
+            plan_type: "pro".into(),
+            expired: String::new(),
+            disabled: false,
+        };
+        let now = SystemTime::now();
+        assert!(!cred.is_fresh(now, 0));
+        cred.expired = "not-rfc3339".into();
+        assert!(!cred.is_fresh(now, 0));
+        cred.expired = "2999-01-01T00:00:00Z".into();
+        assert!(cred.is_fresh(now, 0));
     }
 }
