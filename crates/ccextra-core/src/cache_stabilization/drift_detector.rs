@@ -103,9 +103,12 @@ const EARLY_MESSAGES_WINDOW: usize = 8;
 ///
 /// **此函数从不修改输入。**
 pub fn compute_structural_hash(body: &Value, kind: ApiKind) -> StructuralHash {
-    let system = hash_value(&extract_system(body, kind));
+    // system / early：只排对象键（sort_schema_keys），不做 reminder/cache_control
+    // 全量 canonicalize——消除键序假阳，成本远低于完整判别器规范化。
+    let system = hash_value_canonical_keys(extract_system(body, kind));
     let tools = stable_tool_fingerprint_hash(&extract_tools(body));
-    let early_messages_value = extract_early_messages(body, kind);
+    let mut early_messages_value = extract_early_messages(body, kind);
+    sort_schema_keys_recursive(&mut early_messages_value);
     let early_messages = hash_value(&early_messages_value);
     let early_message_item_hashes = early_message_item_hashes(&early_messages_value);
     StructuralHash {
@@ -406,6 +409,13 @@ fn hash_value(value: &Value) -> [u8; 32] {
     let mut out = [0u8; 32];
     out.copy_from_slice(&digest);
     out
+}
+
+/// 对 owned JSON 递归排对象键后再哈希。仅用于 drift 观测路径的 system/early，
+/// 不修改调用方持有的请求体；数组元素顺序保留。
+fn hash_value_canonical_keys(mut value: Value) -> [u8; 32] {
+    sort_schema_keys_recursive(&mut value);
+    hash_value(&value)
 }
 
 /// early-messages 窗口中每条消息的逐条 12 位十六进制 SHA-256 前缀。
@@ -1901,7 +1911,29 @@ mod tests {
     }
 
     #[test]
-    fn maybe_observe_disabled_is_noop() {
+    #[test]
+    fn system_and_early_hashes_ignore_object_key_order() {
+        let a = json!({
+            "model": "m",
+            "system": [{"type": "text", "text": "hi", "extra": {"b": 2, "a": 1}}],
+            "tools": [{"name": "bash", "input_schema": {"type": "object", "properties": {"z": {}, "a": {}}}}],
+            "messages": [{"role": "user", "content": "x", "meta": {"b": 1, "a": 2}}],
+        });
+        let b = json!({
+            "model": "m",
+            "system": [{"extra": {"a": 1, "b": 2}, "text": "hi", "type": "text"}],
+            "tools": [{"name": "bash", "input_schema": {"properties": {"a": {}, "z": {}}, "type": "object"}}],
+            "messages": [{"meta": {"a": 2, "b": 1}, "content": "x", "role": "user"}],
+        });
+        let ha = compute_structural_hash(&a, ApiKind::Anthropic);
+        let hb = compute_structural_hash(&b, ApiKind::Anthropic);
+        assert_eq!(ha.system, hb.system);
+        assert_eq!(ha.tools, hb.tools);
+        assert_eq!(ha.early_messages, hb.early_messages);
+        assert_eq!(ha.early_message_item_hashes, hb.early_message_item_hashes);
+    }
+
+        fn maybe_observe_disabled_is_noop() {
         let state = make_state();
         let headers = anthropic_headers();
         let body = anthropic_body("sys", json!([{"name": "bash"}]), vec!["hi", "more"]);
