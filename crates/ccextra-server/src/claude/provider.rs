@@ -42,7 +42,8 @@ pub async fn load_claude_providers(
                 tracing::debug!("Claude token 仍然有效: {}", cred.email);
             }
             Err(e) => {
-                tracing::warn!("刷新 Claude token 失败: {}: {}", cred.email, e);
+                tracing::warn!("刷新 Claude token 失败,跳过该凭证: {}: {}", cred.email, e);
+                continue;
             }
         }
 
