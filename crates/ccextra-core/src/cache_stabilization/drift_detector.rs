@@ -21,6 +21,8 @@
 //!
 //! - **父级 `system`/`tools` 漂移 → WARN。** 跨轮对 system prompt 或
 //!   tool 集合的真实变更值得呈现：它可能破坏 cache prefix，且可操作。
+//! - **会话首次基线 `cache_drift_first_request` → DEBUG。** 只是为新会话
+//!   播种结构指纹，不表示异常；默认 INFO 下静默，避免误当成告警。
 //! - **会话级 `early_messages` 漂移 → DEBUG。** early 窗口包含当轮新的
 //!   user 消息，它 *预期* 每轮都会变化——那是正常的会话更替，不是缓存破坏。
 //!   上游响应中的 cache_read token 数才是判断前缀是否真正破坏的真相来源；
@@ -52,7 +54,7 @@
 //! - 对 (system, tools, early_messages) 各做一次 SHA-256 更新。
 //!   在 8 KB 的 system prompt 上总计约 200us。
 //! - 一次 LRU 查找 + 插入。`lru = "0.12"` 摊还 O(1)。
-//! - 一次 `tracing::info!`、`tracing::debug!` 或 `tracing::warn!`。
+//! - 一次 `tracing::debug!` 或 `tracing::warn!`。
 
 use std::num::NonZeroUsize;
 use std::sync::{Arc, Mutex};
@@ -626,7 +628,7 @@ pub fn observe_drift(state: &DriftState, identity: &SessionIdentity, current: St
 
     match cache.get(session_key).cloned() {
         None => {
-            tracing::info!(
+            tracing::debug!(
                 event = "cache_drift_first_request",
                 session_key_hash = %session_prefix,
                 current_hash_prefix = %structural_hash_log_prefix(&current),
