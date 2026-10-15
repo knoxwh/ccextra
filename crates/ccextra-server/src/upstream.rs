@@ -16,10 +16,10 @@ const POOL_IDLE_TIMEOUT: Duration = Duration::from_secs(45);
 /// TCP keepalive 首探间隔:半开连接更快被内核发现(指纹 H1 无 h2 ping 时尤其有用)。
 const TCP_KEEPALIVE: Duration = Duration::from_secs(30);
 const CONNECT_TIMEOUT: Duration = Duration::from_secs(10);
-/// send() 上限(等到响应头)。60s:上游收连不回头时快速失败交客户端退避;
+/// send() 上限(等到响应头)。30s:上游收连不回头时快速失败交客户端退避;
 /// 流式之后的 chunk idle 走 STREAM_IDLE_TIMEOUT。
 /// 无 Client::timeout,避免掐整条 SSE。
-const SEND_TIMEOUT: Duration = Duration::from_secs(60);
+const SEND_TIMEOUT: Duration = Duration::from_secs(30);
 
 /// 上游请求结果(默认 reqwest 或 Claude Bun 指纹 wreq)。
 #[derive(Debug)]
@@ -1879,7 +1879,7 @@ mod tests {
         )));
         assert!(is_stale_connection(&anyhow::anyhow!("Broken pipe")));
         assert!(
-            !is_stale_connection(&anyhow::anyhow!("上游请求超时 (60s)")),
+            !is_stale_connection(&anyhow::anyhow!("上游请求超时 (30s)")),
             "send 超时不得进入死连接重试"
         );
         assert!(!is_stale_connection(&anyhow::anyhow!("invalid api key")));
