@@ -26,10 +26,10 @@ Claude Code 发来 Anthropic Messages 请求；ccextra 按模型别名选上游�
 
 | | |
 | :--- | :--- |
-| **按模型路由** | Claude、OpenAI、Gemini、Antigravity、Cursor 共用一个端口；`alias` 与上游 `name` 分开配 |
+| **按模型路由** | Claude、OpenAI、Gemini、Antigravity 共用一个端口；`alias` 与上游 `name` 分开配 |
 | **请求稳定化** | 归一化工具、schema、历史，降低无意义跨轮差异（命中率仍看上游） |
 | **能力适配** | 消息 / 工具 / 图片转换；`models.json` 钳制 reasoning 档位 |
-| **OAuth 接入** | Antigravity、xAI Grok、Codex、Claude 订阅、Cursor — 凭证加载、刷新、动态模型 |
+| **OAuth 接入** | Antigravity、xAI Grok、Codex、Claude 订阅 — 凭证加载、刷新、动态模型 |
 | **Claude 指纹车道** | `protocol: claude` 默认走 wreq/BoringSSL（Bun 对齐 TLS + HTTP/1.1） |
 | **热重载** | `POST /reload` 原子发布；进行中的请求继续用旧快照 |
 
@@ -42,7 +42,6 @@ flowchart LR
     P -->|openai_chat| B["Chat Completions"]
     P -->|openai_responses| C["Responses"]
     P -->|gemini / antigravity| D["Gemini GenerateContent"]
-    P -->|cursor_sdk| E["Cursor AgentService/Run"]
 ```
 
 入站始终是 Anthropic 形状；出口统一还原为 Anthropic 响应。细节见 [架构设计](docs/design.md)。
@@ -56,9 +55,8 @@ flowchart LR
 | `openai_responses` | Responses | `instructions` + `input`；reasoning replay、搜索域过滤 |
 | `gemini` | Gemini GenerateContent | 内容块、工具结果、schema |
 | `antigravity` | Cloud Code Assist | 封装 Gemini；工具名与输出上限；默认短连接 |
-| `cursor_sdk` | Cursor AgentService/Run | connect-rpc 双流直连 `api2.cursor.sh`；自动发现模型、会话续接 |
 
-> **OAuth 合成**：xAI / Codex → `openai_responses`；Claude 订阅 → `claude`（与静态 API 共用直通）；Cursor → 固定 name `cursor` 的 `cursor_sdk`。Codex 自动带 `Chatgpt-Account-Id`，请求体 zstd（对齐 CLI）。
+> **OAuth 合成**：xAI / Codex → `openai_responses`；Claude 订阅 → `claude`（与静态 API 共用直通）。Codex 自动带 `Chatgpt-Account-Id`，请求体 zstd（对齐 CLI）。
 
 ## 快速开始
 
@@ -133,7 +131,7 @@ curl -H "Authorization: Bearer $ANTHROPIC_AUTH_TOKEN" http://127.0.0.1:8222/v1/m
 | `payload` | 按模型 glob 覆盖顶层参数，可用 `protocol` 限定 |
 | `prompt_cache_key` | 仅 OpenAI 路径；取 Claude Code 会话 ID，不覆盖已有非空值 |
 | `models_file` | reasoning 表（默认旁路 `models.json`，可从 [models.json.example](models.json.example) 复制） |
-| `antigravity_models` / `cursor_models` | 模型白名单（glob / 精确名）；缺省全量 |
+| `antigravity_models` | 模型白名单（glob / 精确名）；缺省全量 |
 | `*_auth_dir` | OAuth 凭证目录；默认配置旁 `.cache/<provider>` |
 
 <details>
@@ -144,7 +142,6 @@ curl -H "Authorization: Bearer $ANTHROPIC_AUTH_TOKEN" http://127.0.0.1:8222/v1/m
 - `POST /reload` — 原子发布 providers、payload、归一化、认证、代理、UA、reasoning 表与刷新参数；失败不改快照；`logging.level` 需重启
 - 后台刷新用最近成功发布的静态配置；显式 reload 优先应用删除 / 禁用 / 目录切换
 - `antigravity.connection-pool` — 默认短连接；`enabled: true` 后按 idle / per-host 上限保留池
-- Cursor：`cursor_base_url`、`cursor_client_version`、`cursor_transport`（`bidi` 默认 / `sse` 双通道回退）；思考档配在 `models.json`（按 base id），细节见 [design.md](docs/design.md)
 
 </details>
 
@@ -180,7 +177,6 @@ curl -H "Authorization: Bearer $ANTHROPIC_AUTH_TOKEN" http://127.0.0.1:8222/v1/m
 ./ccextra xai-login         && ./ccextra xai-status
 ./ccextra codex-login       && ./ccextra codex-status
 ./ccextra claude-login      && ./ccextra claude-status
-./ccextra cursor-login      && ./ccextra cursor-status
 ```
 
 | Provider | 默认凭证目录 | 刷新窗口 | 备注 |
@@ -189,7 +185,6 @@ curl -H "Authorization: Bearer $ANTHROPIC_AUTH_TOKEN" http://127.0.0.1:8222/v1/m
 | xAI Grok | `.cache/xai` | 提前 5 分钟 | 启动扫描注入 |
 | Codex | `.cache/codex` | 提前 24 小时 | PKCE，回调端口默认 1455 |
 | Claude 订阅 | `.cache/claude` | 提前 4 小时 | PKCE，回调固定 `localhost:54545`；不 cloaking / 不改 UA |
-| Cursor | `.cache/cursor` | 提前 10 分钟 | 原生 connect-rpc；可用 `--no-browser` |
 
 配额 / 模型目录：
 
@@ -197,7 +192,6 @@ curl -H "Authorization: Bearer $ANTHROPIC_AUTH_TOKEN" http://127.0.0.1:8222/v1/m
 ./scripts/check_antigravity_quota.sh
 ./scripts/check_grok_quota.sh
 ./scripts/check_codex_quota.sh
-./scripts/check_cursor_quota.sh          # 默认同列额度与目录；--models 仅列模型
 ```
 
 登录成功后会按 `--config` 的 `host`/`port` 自动 `POST /reload`（失败只提示）。手动重载：
@@ -207,20 +201,13 @@ curl -X POST http://127.0.0.1:8222/reload
 ```
 
 <details>
-<summary>Claude 订阅 / Cursor 要点</summary>
+<summary>Claude 订阅要点</summary>
 
 **Claude 订阅** — 单机自用、客户端仅 Claude Code CLI：
 
 - `./ccextra claude-login` → 注入 `protocol: claude`（`base_url=https://api.anthropic.com`）
 - 出站复用 Messages 直通与缓存归一化；仅 5xx 可重试 refresh
 - 与静态 Claude API / 中转同形，换 `base_url` + key 即可
-
-**Cursor** — 不依赖 Cursor IDE / `cursor-agent`：
-
-- 出站 h2 + rustls 直连 `api2.cursor.sh`；代理走全局 `proxy`（`"direct"` 禁用）
-- 会话状态在内存，重启即失效；`cursor.json` 勿提交
-- 驻留丢失时回退历史伪造重跑；checkpoint 带前缀校验；无工具请求注入 `<system_constraint>`
-- 思考档配在 `models.json`（按 base id）；配白名单前先跑 `check_cursor_quota.sh --models`
 
 更多见 [design.md](docs/design.md)。
 

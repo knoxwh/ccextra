@@ -26,10 +26,10 @@ Claude Code sends Anthropic Messages requests; ccextra picks an upstream by mode
 
 | | |
 | :--- | :--- |
-| **Route by model** | Claude, OpenAI, Gemini, Antigravity, and Cursor share one port; `alias` stays separate from upstream `name` |
+| **Route by model** | Claude, OpenAI, Gemini, and Antigravity share one port; `alias` stays separate from upstream `name` |
 | **Request stabilization** | Normalize tools, schemas, and history to cut incidental cross-turn drift (hit rate still depends on the upstream) |
 | **Capability adaptation** | Message / tool / image conversion; `models.json` clamps reasoning levels |
-| **OAuth providers** | Antigravity, xAI Grok, Codex, Claude subscription, Cursor — credential load, refresh, dynamic models |
+| **OAuth providers** | Antigravity, xAI Grok, Codex, Claude subscription — credential load, refresh, dynamic models |
 | **Claude fingerprint lane** | `protocol: claude` defaults to wreq/BoringSSL (Bun-aligned TLS + HTTP/1.1) |
 | **Hot reload** | `POST /reload` publishes atomically; in-flight requests keep the old snapshot |
 
@@ -42,7 +42,6 @@ flowchart LR
     P -->|openai_chat| B["Chat Completions"]
     P -->|openai_responses| C["Responses"]
     P -->|gemini / antigravity| D["Gemini GenerateContent"]
-    P -->|cursor_sdk| E["Cursor AgentService/Run"]
 ```
 
 Inbound is always Anthropic-shaped; outbound is restored to Anthropic responses. Details in [architecture](docs/design.md).
@@ -56,9 +55,8 @@ Inbound is always Anthropic-shaped; outbound is restored to Anthropic responses.
 | `openai_responses` | Responses | `instructions` + `input`; reasoning replay, search-domain filtering |
 | `gemini` | Gemini GenerateContent | Content blocks, tool results, schema |
 | `antigravity` | Cloud Code Assist | Gemini wrapper; tool names and output caps; short connections by default |
-| `cursor_sdk` | Cursor AgentService/Run | connect-rpc dual-stream to `api2.cursor.sh`; auto model discovery, session resume |
 
-> **OAuth synthesis**: xAI / Codex → `openai_responses`; Claude subscription → `claude` (same passthrough as static API); Cursor → fixed-name `cursor` `cursor_sdk`. Codex auto-attaches `Chatgpt-Account-Id` and zstd request bodies (CLI-aligned).
+> **OAuth synthesis**: xAI / Codex → `openai_responses`; Claude subscription → `claude` (same passthrough as static API). Codex auto-attaches `Chatgpt-Account-Id` and zstd request bodies (CLI-aligned).
 
 ## Quick start
 
@@ -133,7 +131,7 @@ Full fields: [config.example.yaml](config.example.yaml). Common items:
 | `payload` | Glob overrides for top-level params; optional `protocol` scope |
 | `prompt_cache_key` | OpenAI paths only; takes Claude Code session ID; does not overwrite a non-empty value |
 | `models_file` | Reasoning table (default sibling `models.json`; copy from [models.json.example](models.json.example)) |
-| `antigravity_models` / `cursor_models` | Model whitelist (glob / exact); default = all |
+| `antigravity_models` | Model whitelist (glob / exact); default = all |
 | `*_auth_dir` | OAuth credential dirs; default `.cache/<provider>` next to config |
 
 <details>
@@ -144,7 +142,6 @@ Full fields: [config.example.yaml](config.example.yaml). Common items:
 - `POST /reload` — atomically publish providers, payload, normalize, auth, proxy, UA, reasoning table, and refresh params; failed loads leave the snapshot unchanged; `logging.level` needs a restart
 - Background refresh uses the last successfully published static config; explicit reload prefers removals / disables / directory switches
 - `antigravity.connection-pool` — short connections by default; with `enabled: true`, keep the pool per idle / per-host caps
-- Cursor: `cursor_base_url`, `cursor_client_version`, `cursor_transport` (`bidi` default / `sse` dual-channel fallback); thinking levels live in `models.json` (by base id); details in [design.md](docs/design.md)
 
 </details>
 
@@ -180,7 +177,6 @@ Pipeline: auth → route → normalize → protocol convert → payload override
 ./ccextra xai-login         && ./ccextra xai-status
 ./ccextra codex-login       && ./ccextra codex-status
 ./ccextra claude-login      && ./ccextra claude-status
-./ccextra cursor-login      && ./ccextra cursor-status
 ```
 
 | Provider | Default credential dir | Refresh window | Notes |
@@ -189,7 +185,6 @@ Pipeline: auth → route → normalize → protocol convert → payload override
 | xAI Grok | `.cache/xai` | 5 minutes early | Injected on startup scan |
 | Codex | `.cache/codex` | 24 hours early | PKCE; callback port default 1455 |
 | Claude subscription | `.cache/claude` | 4 hours early | PKCE; callback fixed `localhost:54545`; no cloaking / UA rewrite |
-| Cursor | `.cache/cursor` | 10 minutes early | Native connect-rpc; `--no-browser` supported |
 
 Quota / model catalog:
 
@@ -197,7 +192,6 @@ Quota / model catalog:
 ./scripts/check_antigravity_quota.sh
 ./scripts/check_grok_quota.sh
 ./scripts/check_codex_quota.sh
-./scripts/check_cursor_quota.sh          # default: quota + catalog; --models = models only
 ```
 
 Successful login auto `POST /reload` against `--config` `host`/`port` (failure is a warning only). Manual reload:
@@ -207,20 +201,13 @@ curl -X POST http://127.0.0.1:8222/reload
 ```
 
 <details>
-<summary>Claude subscription / Cursor notes</summary>
+<summary>Claude subscription notes</summary>
 
 **Claude subscription** — single-machine, Claude Code CLI clients only:
 
 - `./ccextra claude-login` → injects `protocol: claude` (`base_url=https://api.anthropic.com`)
 - Outbound reuses Messages passthrough and cache normalization; refresh retries only on 5xx
 - Same shape as static Claude API / proxy — swap `base_url` + key
-
-**Cursor** — no Cursor IDE / `cursor-agent` required:
-
-- Outbound h2 + rustls straight to `api2.cursor.sh`; proxy uses global `proxy` (`"direct"` disables)
-- Session state is in-memory and lost on restart; do not commit `cursor.json`
-- Parked-session loss falls back to history fabrication; checkpoints use prefix checks; tool-less requests get `<system_constraint>`
-- Thinking levels in `models.json` (by base id); run `check_cursor_quota.sh --models` before setting a whitelist
 
 More in [design.md](docs/design.md).
 

@@ -1,4 +1,4 @@
-// Codex 凭证持久化 (对齐 cursor/store 原子写 + CPA 文件锁精神)
+// Codex 凭证持久化 (对齐原子写 + CPA 文件锁精神)
 
 use super::credential::{credential_file_name, CodexCredential};
 use anyhow::{Context, Result};

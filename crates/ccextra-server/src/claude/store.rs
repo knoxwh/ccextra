@@ -1,4 +1,4 @@
-// Claude 凭证持久化 (对齐 Codex/cursor 原子写 + CPA 文件锁精神)
+// Claude 凭证持久化 (对齐 Codex 原子写 + CPA 文件锁精神)
 
 use super::credential::{credential_file_name, ClaudeCredential};
 use anyhow::{Context, Result};

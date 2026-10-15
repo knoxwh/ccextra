@@ -410,8 +410,6 @@ pub(crate) async fn prepare_message_request(
     let mut kimi_replay_applied = false;
 
     match route.protocol {
-        // Cursor 原生:handler 内部完成 Anthropic → RunRequest 转换,此处不动 body
-        Protocol::CursorSdk => {}
         Protocol::Claude => {
             convert_passthrough(&mut body_json, &route.upstream_model)?;
             if sanitize_passthrough_prompt(&mut body_json, &route.upstream_model) {
@@ -946,9 +944,6 @@ pub(crate) async fn prepare_message_request(
         || matches!(route.protocol, Protocol::Antigravity)
     {
         (cc_session.as_deref(), None)
-    } else if matches!(route.protocol, Protocol::CursorSdk) {
-        // 会话亲和:conversation_id 派生自 session_id(无则每轮新会话)
-        (cc_session.as_deref(), None)
     } else {
         (None, None)
     };
@@ -1441,7 +1436,6 @@ pub(crate) async fn deliver_response(
                         Protocol::OpenAiResponses => {
                             v.pointer("/usage/input_tokens").and_then(|t| t.as_i64())
                         }
-                        Protocol::CursorSdk => None,
                         Protocol::Gemini | Protocol::Antigravity => {
                             let inner = if prepared.route.protocol == Protocol::Antigravity {
                                 v.get("response").unwrap_or(&v)
@@ -1452,7 +1446,6 @@ pub(crate) async fn deliver_response(
                                 .pointer("/usageMetadata/promptTokenCount")
                                 .and_then(|t| t.as_i64())
                         }
-                        // Cursor usage 由 relay/非流聚合写入;此处不可达
                         Protocol::Claude => None,
                     };
                     if let Some(tokens) = input_tokens {
@@ -1466,8 +1459,6 @@ pub(crate) async fn deliver_response(
                 }
                 match prepared.route.protocol {
                     Protocol::Claude => None,
-                    // Cursor 原生 handler 早返回;此处不可达
-                    Protocol::CursorSdk => None,
                     Protocol::OpenAiChat => crate::sse::non_stream::openai_chat_to_anthropic(&v),
                     Protocol::OpenAiResponses => crate::sse::non_stream::responses_to_anthropic(
                         &v,
@@ -1519,11 +1510,11 @@ pub(crate) async fn deliver_response(
                     }))
                     .unwrap_or_default()
                 });
-                return Ok(Response::builder()
+                return Response::builder()
                     .status(axum::http::StatusCode::BAD_GATEWAY)
                     .header(header::CONTENT_TYPE, "application/json")
                     .body(Body::from(payload))
-                    .map_err(|e| AppError::new(anyhow::anyhow!("构造响应失败: {e}")))?);
+                    .map_err(|e| AppError::new(anyhow::anyhow!("构造响应失败: {e}")));
             }
         }
         let payload = converted
@@ -1664,11 +1655,6 @@ pub async fn handle_messages(
 
     let mut prepared =
         prepare_message_request(&state, &headers, &bytes, &effective_snapshot, uri.query()).await?;
-
-    // Cursor 原生路径:双向流会话由 handler 全权管理,不经通用 upstream
-    if matches!(prepared.route.protocol, Protocol::CursorSdk) {
-        return crate::cursor::handler::handle_cursor(&state, &effective_snapshot, prepared).await;
-    }
 
     let executed = execute_upstream_request(
         &mut prepared,

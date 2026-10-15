@@ -92,8 +92,6 @@ pub struct ProviderRefreshConfig {
     pub antigravity_models: Option<Vec<String>>,
     /// Antigravity hub UA（与 user_agents.antigravity / REQUEST_UA 同源）
     pub antigravity_user_agent: Option<String>,
-    /// Cursor 运行时配置;None = 未启用
-    pub cursor: Option<crate::cursor::CursorConfig>,
     pub proxy_url: Option<String>,
     pub static_providers: Vec<ProviderConfig>,
 }
@@ -126,11 +124,6 @@ pub struct AppState {
     pub kimi_thinking_replay_cache: crate::sse::kimi_thinking_replay_cache::KimiThinkingReplayCache,
     /// session_id → 最新 input_tokens(避免非 Claude 上游 count_tokens 估算不准导致 context 跳动)
     pub last_input_tokens: Arc<std::sync::Mutex<session_tokens::SessionTokenCache>>,
-    /// Cursor 原生运行时(会话表 + 可重载配置);None = 未启用。
-    /// reload 可启停,故用共享读写锁持有,不进 ConfigSnapshot
-    pub cursor: Arc<std::sync::RwLock<Option<Arc<crate::cursor::CursorRuntime>>>>,
-    /// Cursor 双向流会话表(始终存在;未启用时为空表,handler 侧按凭证身份过滤)
-    pub cursor_sessions: crate::cursor::session::CursorSessions,
 }
 
 #[derive(Clone, Debug, serde::Deserialize)]

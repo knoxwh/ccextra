@@ -84,16 +84,7 @@ pub async fn handle_reload(State(state): State<AppState>) -> Result<Json<ReloadR
         });
     }
 
-    // 5. Cursor 运行时对齐新配置(失败记录但不阻塞主流程)
-    match reconcile_cursor_runtime(&state, data.refresh.cursor).await {
-        Ok(_) => result.reloaded.push("cursor".into()),
-        Err(e) => result.failed.push(ReloadError {
-            component: "cursor".into(),
-            reason: e.to_string(),
-        }),
-    }
-
-    // 6. 清认证缓存(失败无碍)
+    // 5. 清认证缓存(失败无碍)
     if auth_cache().lock().ok().map(|mut c| c.clear()).is_some() {
         result.reloaded.push("auth_cache".into());
     } else {
@@ -121,71 +112,4 @@ fn build_runtime_config(data: &crate::http::ReloadData) -> anyhow::Result<Runtim
         user_agents: data.user_agents.clone(),
         thinking_registry: data.thinking_registry.clone(),
     })
-}
-
-/// Cursor 运行时与新配置对齐
-///
-/// - (None, None):无操作
-/// - (None, Some):组装运行时 + 拉取 catalog 合成 provider
-/// - (Some, None):停用(cursor provider 已不在新 providers)
-/// - (Some, Some):配置原子更新;catalog 刷新
-pub(crate) async fn reconcile_cursor_runtime(
-    state: &AppState,
-    desired: Option<crate::cursor::CursorConfig>,
-) -> anyhow::Result<()> {
-    let current = state.cursor.read().ok().and_then(|guard| guard.clone());
-    match (current, desired) {
-        (None, None) => Ok(()),
-        (None, Some(config)) => {
-            let runtime = crate::cursor::new_cursor_runtime(config.clone());
-            if let Ok(mut guard) = state.cursor.write() {
-                *guard = Some(runtime);
-            }
-            refresh_cursor_provider(state, &config).await;
-            Ok(())
-        }
-        (Some(_runtime), None) => {
-            if let Ok(mut guard) = state.cursor.write() {
-                *guard = None;
-            }
-            tracing::info!("Cursor 原生路径已停用");
-            Ok(())
-        }
-        (Some(runtime), Some(config)) => {
-            *runtime.config.write().await = config.clone();
-            refresh_cursor_provider(state, &config).await;
-            Ok(())
-        }
-    }
-}
-
-/// 拉取 cursor catalog 并按版本保护发布(失败保留现有 provider)
-async fn refresh_cursor_provider(state: &AppState, config: &crate::cursor::CursorConfig) {
-    let snapshot = state.config.read().await.clone();
-    // 旧 cursor provider 不算冲突源:其模型集即将被新 catalog 整体替换
-    let existing: Vec<_> = snapshot
-        .providers
-        .iter()
-        .filter(|p| p.name != "cursor")
-        .cloned()
-        .collect();
-    let proxy_url = snapshot.runtime.upstream.global_proxy().map(str::to_string);
-    let Some(provider) =
-        crate::cursor::load_cursor_provider(config, &existing, proxy_url.as_deref()).await
-    else {
-        return;
-    };
-    let mut providers = snapshot
-        .providers
-        .iter()
-        .filter(|p| p.name != "cursor")
-        .cloned()
-        .collect::<Vec<_>>();
-    providers.push(provider);
-    match crate::http::publish_refreshed_providers(&state.config, snapshot.version, providers).await
-    {
-        Ok(true) => tracing::info!("Cursor catalog 已随 reload 更新"),
-        Ok(false) => {}
-        Err(error) => tracing::warn!("Cursor catalog 发布校验失败,保持现有: {error:#}"),
-    }
 }

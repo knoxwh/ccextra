@@ -37,31 +37,6 @@ secret_key: "sk-ccextra-xxx"
 # 验收: cargo run -p ccextra-server --example peet_fp
 # 说明: crates/ccextra-server/src/claude_tls_fp/STATUS.md
 
-# Cursor 原生代理(可选)。配置后以原生 connect-rpc 双向流直连
-# api2.cursor.sh,拉取账户模型目录并合成 name "cursor" provider
-# (protocol: cursor_sdk)。凭证:cursor-login 的 PKCE 凭证(cursor.json)。
-# cursor_auth_dir: ".cache/cursor"
-
-# Cursor 模型白名单(可选)。glob 或精确名;default 等价 auto;缺省/空 = 全量发布。
-# 条目可钉固定参数 "id:param=value,param=value",如
-# "auto-smart:optimize_for=intelligence"。
-# 变体家族模型的思考档不在这里配,配在 models.json(按 base id 精确匹配,如 grok-4.7):
-# 目录是 base-low / base-high 变体(grok-4.7-high 等)时,入站 effort 先按
-# reasoning_levels 钳制,force_effort 则直接固定档位,结果再钳到目录实际
-# 等级并拼进上游 model id(如 grok-4.7-high)。可选档位用
-# scripts/check_cursor_quota.sh --models 查看。
-# cursor_models:
-#   - "default"
-#   - "composer-2.5"
-#   - "grok-4.7"
-#   - "muse-spark-1.3"
-#   - "auto-smart:optimize_for=intelligence"
-
-# Cursor 上游地址(可选,默认 https://api2.cursor.sh)。
-# cursor_base_url: "https://api2.cursor.sh"
-
-# Cursor 客户端版本头(可选,默认 cli-2026.10.01-e373342)。
-# cursor_client_version: "cli-2026.10.01-e373342"
 
 # Antigravity 模型白名单(可选)。glob 或精确名;缺省/空 = 全量发布。
 # antigravity_models:

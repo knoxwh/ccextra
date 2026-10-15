@@ -38,7 +38,7 @@ ccextra 将 Anthropic Messages 入口接到不同上游协议，同时尽量保�
 5. OpenAI 路径执行转换后归一化；Gemini 和 Antigravity 跳过该步骤。
 6. 应用 `payload` 顶层参数覆盖，保留已有非空 `prompt_cache_key`。
 7. 为符合条件的 OpenAI 请求注入会话 cache key，必要时写诊断日志。
-8. 选择 URL、代理、认证头和 User-Agent，发送上游请求并处理重试。`cursor_sdk` 例外：不经通用 upstream，由 cursor handler 以原生 connect-rpc 双向流直连 api2.cursor.sh。
+8. 选择 URL、代理、认证头和 User-Agent，发送上游请求并处理重试。
 9. 直通或转换流式 SSE；非流响应也恢复为 Anthropic 形状。
 
 ## 路由与配置
@@ -49,9 +49,9 @@ ccextra 将 Anthropic Messages 入口接到不同上游协议，同时尽量保�
 
 ## 缓存稳定化
 
-归一化保持幂等。Claude 直通运行完整流程：工具和 schema 排序、历史 reminder 拆分、`tool_use.input` 键序、system 列表、尾部空白、客户端日期指纹，以及对前缀的 volatile 只读 WARN。转换路径先运行适合 Anthropic 输入的确定性子集；Gemini / Antigravity / Cursor 在转换前补跑日期指纹与 volatile WARN。OpenAI 输出随后排序工具/schema、system reminder、日期字段，并做 volatile WARN（Chat 的 system/developer 消息计入前缀扫描）。
+归一化保持幂等。Claude 直通运行完整流程：工具和 schema 排序、历史 reminder 拆分、`tool_use.input` 键序、system 列表、尾部空白、客户端日期指纹，以及对前缀的 volatile 只读 WARN。转换路径先运行适合 Anthropic 输入的确定性子集；Gemini / Antigravity 在转换前补跑日期指纹与 volatile WARN。OpenAI 输出随后排序工具/schema、system reminder、日期字段，并做 volatile WARN（Chat 的 system/developer 消息计入前缀扫描）。
 
-`drift_detector` 对同一会话的结构哈希发出告警，不修改请求；仅 Claude 与 OpenAI 路径接线。Gemini、Antigravity 与 Cursor 不做转换后归一化或 drift 观测，避免将 Anthropic/OpenAI 规则施加到 Gemini 或 Cursor 出站形状。
+`drift_detector` 对同一会话的结构哈希发出告警，不修改请求；仅 Claude 与 OpenAI 路径接线。Gemini 与 Antigravity 不做转换后归一化或 drift 观测，避免将 Anthropic/OpenAI 规则施加到 Gemini 出站形状。
 
 ## 协议转换
 
@@ -71,22 +71,6 @@ Anthropic `system` 成为 system message；o 系列（`o1-mini`/`o1-preview` 除
 
 两条路径共享 Gemini `contents`、`parts`、`functionCall` 和 `functionResponse` 模型，剥离 Claude system triggers。Antigravity 另外将 system 块开头的 Claude Agent SDK/Claude Code 身份句改为 `You are an AI agent.`，保留句后指令；Gemini 直连不做此改写。工具 schema 会清理本地引用和不支持关键字（含 `additionalItems`/`unevaluated*`/`contentSchema`），布尔 `true` 子 schema 归一化为空对象；Gemini 直连的 `parametersJsonSchema` 保留 `additionalProperties` 与 `pattern`/`minLength` 等标准约束，Antigravity 仍搬入 description 提示。任一工具带 `strict: true` 且 tool_choice 为 auto/缺省时，Gemini 直连使用 `VALIDATED` 工具模式（Antigravity 的 `VALIDATED` 仅由 Claude 模型触发）。规范化 `responseJsonSchema` 为 `responseSchema`；工具结果强制字符串化为 `response.result`；user turn 尾部文本重排至 `functionResponse` 前。Antigravity 的 Claude 模型先拆分混合 user 回合并把 `functionResponse` 回合提升到紧跟含 `functionCall` 的 model 回合（system reminder 与普通文本顺延），再仅合并不含 `functionResponse` 的相邻 user 回合；非 Claude 模型维持合并加重排。Gemini 使用 API key 和 Google 端点。Antigravity 额外套 `model`、`request`、`project`、`requestId` 等信封；Claude 模型使用 `VALIDATED` 工具模式，冲突工具名加 `external_` 前缀；`gemini-3.5-flash-lite` 限制 `max_completion_tokens` 上限为 65535。
 
-### Cursor
-
-Cursor 走原生 connect-rpc 双向流（`agent.v1.AgentService/Run`，默认 `https://api2.cursor.sh`，Rust h2 + rustls 直连），不经 Node sidecar。凭证是 `cursor.json`（`cursor-login` PKCE 写入，token 到期前 10 分钟刷新，CLIProxyAPIPlus 实证）。`cursor_auth_dir`（默认配置文件旁 `.cache/cursor`）非空即启用。
-
-**传输**：Connect 帧 `[1B flags][4B len BE][payload]`，请求头 `content-type: application/connect+proto`、`connect-protocol-version: 1`、`te: trailers`、`x-ghost-mode: true`、`x-cursor-client-version`（`cursor_client_version`，默认 `cli-2026.10.01-e373342`）、`x-cursor-client-type: cli`、`x-request-id`；无 checksum、无 x-client-key。模型目录走 `GetUsableModels` unary（`application/proto`，无帧信封）。出站代理复用全局 `proxy`：HTTP CONNECT 隧道（支持 Basic 认证与 https 代理）上建 TLS，`direct` 禁用；凭证刷新与目录拉取走同一代理。`cursor_base_url` 可覆盖上游地址。
-
-**双通道传输**（`cursor_transport: sse`，默认 `bidi` 单流）：CLI 的 HTTP/1.1 回退路径（`network.useHttp1ForAgent`），双向流被代理/防火墙掐断的环境用。读侧 `agent.v1.AgentService/RunSSE`（connect+json，h2 服务端流，请求体是 Connect 信封包 JSON `{"requestId":...}`，响应帧载荷为 JSON 而非 proto，经 `raw_wire::json` 解码）；写侧 `aiserver.v1.BidiService/BidiAppend`（unary JSON，`data` 为 AgentClientMessage proto hex，`appendSeqno` 从 0 单调递增，首条必须是 runRequest，响应为空确认）。两条独立 h2 连接，requestId 关联；以 RunSSE 响应头到达为确定性注册信号再发首条 append；客户端心跳（field 7 空子消息）每 5 秒经 BidiAppend 发送。协议消息层与 BiDi Run 完全一致，仅读侧载荷格式不同。
-
-**请求形状**：`build_run_request`（core 纯函数）将 Anthropic body 编为 AgentRunRequest：system 块进 root blob（sha256 键，`root_prompt_messages_json`）；多轮历史经 `history::fabricate` 编为 root prompt blob 序列（`{"role","content"}` JSON：user 文本裹 `<user_query>`、assistant 产 text/tool-call 条目、tool_result 产 `role:"tool"` 条目）加结构化 turns（`ConversationTurnStructure` 引用 blob id），UserText 只留末条消息文本（末条纯 tool_result 时用续接尾巴）。此为 2026-10-09 探针 F/G 实证配方：模型上下文来自 root prompt blob，服务端经 kv getBlob 取回未知 blob，伪造历史被模型接受；替代旧 flatten 全量 UserText 重放（64KiB 起上游 RST_STREAM）。assistant thinking 无法伪造（真实流量是服务端加密 redacted-reasoning），省略。checkpoint 续接时原样回嵌 conversation_state，免历史重放。工具经 McpTools（field 4）声明（provider_identifier `proxy`）：服务端 requestContextArgs/mcpState 查询回工具表，mcpArgs 调用回 mcpResult；上游把声明工具渲染为 `{provider_identifier}-{name}` 回传，对账声明表改写回声明名。思考等级：家族变体模型（name 带 `effort_levels` 标记）的档位由 models.json 决定（`build_run_request_with` 接收热重载快照里的注册表，按 base 精确匹配）：`force_effort` 固定档优先且不受 `reasoning_levels` 钳制（显式禁用也改写，同 `openai_responses`；Claude 直通与 Gemini 对禁用请求不改写）；否则入站 effort（`thinking.budget_tokens` 阈值映射、`output_config.effort`、顶层 `reasoning_effort` 回退；`thinking.type: disabled` 视为 `none`，`auto` 不干预；都没有时取 `effort_default` 缺省等级，目录无裸 base 条目，裸 id 会被上游 not_found）按 `reasoning_levels` 钳制；最后再钳到目录实际等级（`effort_levels`），保证拼进 ModelDetails 的 model id（如 `grok-4.7-high`）上游存在。查不到注册表条目则只按目录等级钳制。家族模型的档位不由白名单决定，其上遗留的 `reasoning_effort`/`effort` 钉参既不生效也不下发。非家族模型 effort 与白名单钉参（`id:param=value` 拼在模型 name）合并进 RequestedModel（field 9）`parameters`；钉住 `reasoning_effort` 或目录参数 `effort` 时覆盖入站档，不再另发 body effort。KV 交互：服务端 get_blob 以 32B sha 为 key 时查本地 blob store 回内容；以 UserMessage 序列化字节等非 sha 形态为 key 时（内容即 key），回显 key 字节作为 blob_data 确认内容，空回复会被上游 failed_precondition 拒绝。
-
-**交互查询**：服务端 InteractionQuery（AgentServerMessage field 7：web_search/ask_question/switch_mode/exa_search/exa_fetch/create_plan/setup_vm）必须回 InteractionResponse，否则服务端等回复挂死整流（90s idle 超时杀流，旧实现移除的导火索）；ccextra 按种类回 reject/error（SetupVm 只有 success variant，回空 success 解锁）。内置工具（server-side exec）一律回 rejection，子代理回 error，不中断流。服务端主动中止（ExecServerControlMessage，field 5）立即失败，不等 idle 超时。
-
-**SSE 与 usage**：`CursorSse` 状态机自动开合 content block（text/thinking 增量、tool_use 单次 `input_json_delta`），成功终态（含工具边界）发 `message_delta` + `message_stop`。`TurnEnded` 只表示这一步生成结束，不闭合 SSE，工具驻留期间也不取消会话。EOF 无终态或错误：已开始流先闭合活动块再发 error，不补 `message_delta` / `message_stop`（半截输出不能当成成功回合）；未开始流只发 error。`TurnEnded` 用量字段号来自 @cursor/sdk 1.0.32 protobuf-es type info（1 input|2 output|3 cache_read|4 cache_write|5 reasoning）。field 1 语义随回合形状不同：单请求回合（新 user 消息起跑，含会话丢失回退历史伪造）field 1 是本次总输入（缓存+非缓存，2026-10-09 活体样本 11292=11232+0+60、7952=1120+0+6832），field 3/4 是缓存子集；工具续接回合（多请求）field 1 是整轮各次输入总和、field 3 是整轮累计命中（2026-10-10 活体样本：11 请求回合 input=176986 read=157056，最终 context≈20k=input-read）。自校验——`cache_read + cache_write ≤ input` 且非负时上报真值（Anthropic 口径 `input_tokens` = 总输入减缓存子集；单请求 `cache_read`/`cache_creation` 用 field 3/4，续接回合把 context（input−read）按 1%/99% 假拆分——read≈最终调用命中，整轮累计 read 不可进 context，中间请求的缓存消耗由估算假拆分累计；聚合语义的 context 远超请求体估算时（如 R=0 异常形态）退回估算拆分），越界回退 1%/99% 假拆分（单请求按 field 1 真值、续接按请求体估算拆分，`input_tokens` 1% + `cache_read_input_tokens` 99%，相加即 context，Claude Code 上下文条正确且显示缓存命中，`cache_creation` 恒 0）；未收到 TurnEnded 的流（工具边界提前收尾）同样按估算 1%/99% 假拆分。output 用本响应 TokenDelta 累计（TurnEnded 兜底）。`message_start.input_tokens` 仍用请求体字节/4 估算（对齐 Plus `setInputEstimate`，序列化失败退 1）。settle 将 TurnEnded 真实 input（缺省退估算）写入 session token cache（`count_tokens` 与下轮占位复用）。
-
-**会话与恢复**：conversation_id 维持会话亲和；checkpoint（conversation_checkpoint_update）服务端存 30 分钟，ccextra 原样回嵌不重编码。回嵌前做前缀校验：记录 checkpoint 时对覆盖前缀（前 N 条消息逐条 clone + 键序排序 + sha256 链式摘要）存档，取用时要求当前消息数严格多于覆盖数且前缀摘要一致，防客户端 `/compact` 重写历史（session_id 不变）后误用旧 checkpoint 续接错位上下文；键序抖动不影响摘要，校验失败丢弃 checkpoint 回退历史伪造。checkpoint 续接失败（零产出且非 401/429）时同轮内丢弃 checkpoint 重试一次，走历史伪造全量重放，对客户端透明。journal 按回合摘要内存缓存已发布 SSE 帧，同摘要重复请求（断线重连/singleflight）直接回放缓存；驻留会话丢失时工具续接回退历史伪造（root prompt blob + turns）重新起跑。请求无工具时 UserText 头部注入 `<system_constraint>` 直连会话约束（对齐 cursor-cpa-plugin，防模型幻觉调用不存在的工具；Claude Code 主路径恒带工具不受影响）。模型目录经 GetUsableModels 拉取，按 `cursor_models` 白名单（`default` 归一仅用于白名单匹配，上游 model id 保持目录原值 `default`——上游拒绝 `auto`；条目可钉 `"id:param=value"` 固定参数拼进模型 name）过滤后合成 name `cursor` 的 `cursor_sdk` provider；白名单裸 base 未命中任何目录 id 但存在 `base-{level}` 变体家族时（如 `grok-4.7` 对应 `grok-4.7-low/…/xhigh`），合成携带 `effort_levels` 与 `effort_default` 标记的单模型，转换层按 models.json 的 `force_effort` / `reasoning_levels` 处理入站 effort（`thinking.budget_tokens` 阈值映射等，经 `crate::thinking::resolve_effort_from_body`），再钳到目录等级后拼进上游 model id，无 effort 时用缺省等级（优先 medium，否则等级中位）；家族模型的思考档不由白名单决定；目录已有裸 id 的模型不经家族展开。与现有 provider alias 冲突的模型跳过并告警（name 可跨 provider 重复）。启动、`/reload` 与每 3 小时后台刷新；失败保留最近成功目录。
-
 ### 各协议 System 提示词清洗差异矩阵
 
 | 目标协议 / 模型 | 计费归属指纹 (`x-anthropic-billing-header`) | Claude 身份声明与品牌块 (`<identity>`) | 行为策略与冗长触发块 (`<rules>` / `<response_style>` 等) | 简洁样式触发块 (`# Output Style:` / `# Concise Style Active`) | 白名单段落 (`# Memory` / `# Environment` / `# Language` / CLAUDE.md) | 目标承载位置与行为适配块 |
@@ -100,7 +84,6 @@ Cursor 走原生 connect-rpc 双向流（`agent.v1.AgentService/Run`，默认 `h
 | **OpenAI Responses** (其他上游，如 GLM/DeepSeek) | 剥离 | 剥离 | 剥离 | 剥离 | 保留 | 仅合并白名单段落直入 `instructions` 字段；无 developer 适配块注入 |
 | **Gemini 直连** | 剥离 | 剥离 | 剥离 | 剥离 | 保留 | 转换为 `systemInstruction.parts` |
 | **Antigravity** | 剥离 | system 前导 Claude 身份句中和为 `You are an AI agent.`，保留后文 | 剥离 | 剥离 | 保留 | 转换为 `request.systemInstruction.parts`；不改 user 内容 |
-| **Cursor SDK** | 剥离 | 剥离 | 剥离 | 剥离 | 保留 | system 块进 root blob（`root_prompt_messages_json`，sha256 键），多轮历史同编 root prompt blob + turns，不进 UserText |
 
 ## 传输与可靠性
 
@@ -138,7 +121,7 @@ Antigravity（gemini/flash/agent，不含 claude）使用**独立的** thoughtSi
 
 ## OAuth provider
 
-Antigravity、xAI、Codex、Claude、Cursor 登录命令均在凭证保存成功后调用共享的自动重载逻辑，按当前配置的监听地址发送 `POST /reload`；通配 IPv4/IPv6 地址转回环地址，不走代理、不跟随重定向，连接超时 2 秒、总超时 30 秒。仅 2xx 报告重载成功；配置读取、连接或 HTTP 错误只提示，不改变登录成功结果。服务未启动时下次启动加载；`--auth-dir` 不修改服务配置，需与服务扫描目录一致。
+Antigravity、xAI、Codex、Claude 登录命令均在凭证保存成功后调用共享的自动重载逻辑，按当前配置的监听地址发送 `POST /reload`；通配 IPv4/IPv6 地址转回环地址，不走代理、不跟随重定向，连接超时 2 秒、总超时 30 秒。仅 2xx 报告重载成功；配置读取、连接或 HTTP 错误只提示，不改变登录成功结果。服务未启动时下次启动加载；`--auth-dir` 不修改服务配置，需与服务扫描目录一致。
 
 `antigravity-login` 使用浏览器回调登录并保存凭证。运行时后台读取有效凭证、提前 300 秒刷新 token（对齐 CPA 5 分钟安全窗口）、拉取模型并注入 provider；首次加载不阻塞监听，之后每 3 小时刷新，失败时保留现有路由。上游统一锁定单 daily 节点（`daily-cloudcode-pa.googleapis.com`），禁止跨集群回退以防破坏上游前缀缓存。
 
@@ -148,9 +131,8 @@ Antigravity 上游默认短连接：空闲连接在响应结束后立即关闭�
 
 `codex-login` 使用 PKCE 浏览器授权（本地回调端口默认 1455）。凭证保存 `chatgpt_account_id` 与 `chatgpt_plan_type`（取自 ID token 的 `https://api.openai.com/auth` claim）。启动和配置重载扫描 Codex 凭证，token 提前 24 小时刷新（失败重试 3 次，`refresh_token_reused` 不重试），并为每份有效凭证注入一个 Responses provider，上游为 `https://chatgpt.com/backend-api/codex/responses`。请求时自动携带 `Chatgpt-Account-Id` 订阅身份头与 `X-Codex-Routing-Hint: model=<解析后模型>[;tier=<service_tier>]`（对齐 codex CLI `build_routing_hint_header`，hint 在压缩前从最终 body 构造，入站同名头可覆盖），并对请求体做 zstd 压缩（level 3，对齐 codex CLI `enable_request_compression` 默认行为；压缩在序列化后执行一次，退避重试共享压缩字节）；静态 API key provider 无该 metadata 不发头也不压缩。`codex_auth_dir` 相对配置文件目录解析。
 
-`claude-login` 使用 PKCE 浏览器授权（本地回调端口默认 54545，RedirectURI 固定 `http://localhost:54545/callback`）。凭证保存 access/refresh、email、account/org UUID 与单个 device id。启动和配置重载扫描 `claude_auth_dir`（默认配置文件旁 `.cache/claude`），token 提前 4 小时刷新（仅 HTTP 5xx 可重试，传输/解码错误不盲重放 refresh），并为每份有效凭证注入一个 `protocol: claude` provider（`base_url: https://api.anthropic.com`，key=access_token）。出站走现有 Claude 直通与缓存归一化；OAuth token 缺 `oauth-2025-04-20` 时补 beta。不做 cloaking / 假 user_id / 改 UA。OAuth 订阅（Claude / Antigravity / Codex / xAI）预请求刷新失败时硬失败，拒绝继续打旧 token；上游 401 时强制刷新被拒 access_token 后重试一次，刷新仍失败则返回 `authentication_error`（Cursor 路径沿用既有 401 刷新）。
+`claude-login` 使用 PKCE 浏览器授权（本地回调端口默认 54545，RedirectURI 固定 `http://localhost:54545/callback`）。凭证保存 access/refresh、email、account/org UUID 与单个 device id。启动和配置重载扫描 `claude_auth_dir`（默认配置文件旁 `.cache/claude`），token 提前 4 小时刷新（仅 HTTP 5xx 可重试，传输/解码错误不盲重放 refresh），并为每份有效凭证注入一个 `protocol: claude` provider（`base_url: https://api.anthropic.com`，key=access_token）。出站走现有 Claude 直通与缓存归一化；OAuth token 缺 `oauth-2025-04-20` 时补 beta。不做 cloaking / 假 user_id / 改 UA。OAuth 订阅（Claude / Antigravity / Codex / xAI）预请求刷新失败时硬失败，拒绝继续打旧 token；上游 401 时强制刷新被拒 access_token 后重试一次，刷新仍失败则返回 `authentication_error`。
 
-Cursor 运行时独立于配置快照：`CursorRuntime`（会话表 + 配置 RwLock）挂在 `AppState.cursor` 的进程级 RwLock 中，不进 `ConfigSnapshot`。启动时若 `cursor_auth_dir` 启用则拉取目录合入 providers；`/reload` 发布新快照后按新旧配置对齐——禁用变启用、启用变禁用、配置变化时重建 runtime 并刷新目录，其余字段原子更新。3 小时后台刷新失败时，从当前快照保留 name `cursor` 的 provider，不移除路由。
 
 ## 并发、安全与诊断
 

@@ -164,10 +164,6 @@ fn endpoint_path(protocol: Protocol, is_stream: bool) -> String {
                 "/v1internal:generateContent".to_string()
             }
         }
-        // Cursor SDK 走 sidecar 专用通道,不经通用 upstream
-        Protocol::CursorSdk => {
-            unreachable!("CursorSdk must bypass generic upstream")
-        }
     }
 }
 
@@ -467,7 +463,7 @@ impl UpstreamClient {
         }
     }
 
-    /// 全局代理(供 cursor 目录刷新等不经 upstream 的路径复用)
+    /// 全局代理(供目录刷新等不经 upstream 的路径复用)
     pub fn global_proxy(&self) -> Option<&str> {
         self.global_proxy.as_deref()
     }
@@ -690,10 +686,6 @@ impl UpstreamClient {
         pool_refresh_token: Option<&str>,
         query: Option<&str>,
     ) -> anyhow::Result<UpstreamResponse> {
-        // Cursor SDK 走 sidecar 专用通道,禁止进入通用 upstream
-        if matches!(protocol, Protocol::CursorSdk) {
-            anyhow::bail!("cursor_sdk must bypass generic upstream");
-        }
         // 对齐 codex EncodedJsonBody:一次序列化,Bytes 共享分配;
         // stale-connection 重试复用同一份字节,不重复序列化
         let body_bytes = bytes::Bytes::from(

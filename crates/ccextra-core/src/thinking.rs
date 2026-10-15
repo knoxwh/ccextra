@@ -244,7 +244,7 @@ pub fn level_rank(level: Level) -> u8 {
 
 /// 将 effort 钳制到给定级别字符串集合(最近邻,tie 取低)
 ///
-/// 供目录驱动的变体家族使用(如 Cursor `grok-4.7-{low,high}`):
+/// 供目录驱动的变体家族使用(如 `grok-4.7-{low,high}`):
 /// 非法 effort 或空集合原样返回,不钳制。
 pub fn clamp_effort_to_levels(effort: &str, supported: &[&str]) -> String {
     let Some(level) = Level::parse(effort) else {

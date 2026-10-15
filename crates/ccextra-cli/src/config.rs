@@ -30,22 +30,6 @@ pub struct Config {
     /// Claude 订阅凭证目录(可选);默认配置文件旁 `.cache/claude`
     #[serde(default)]
     pub claude_auth_dir: Option<String>,
-    /// Cursor 凭证目录(可选);默认配置文件旁 `.cache/cursor`
-    #[serde(default)]
-    pub cursor_auth_dir: Option<String>,
-    /// Cursor 模型白名单(可选);glob 或精确名,缺省/空 = 全量
-    #[serde(default)]
-    pub cursor_models: Option<Vec<String>>,
-    /// Cursor 上游 base_url 覆盖(可选);默认 https://api2.cursor.sh
-    #[serde(default)]
-    pub cursor_base_url: Option<String>,
-    /// Cursor 客户端版本头覆盖(可选);默认 cli-2026.10.01-e373342
-    #[serde(default)]
-    pub cursor_client_version: Option<String>,
-    /// Cursor 传输模式(可选):`bidi`(默认,BiDi Run 单流)或
-    /// `sse`(RunSSE 读 + BidiAppend 写双通道,双向流被掐环境用)
-    #[serde(default)]
-    pub cursor_transport: Option<String>,
     /// Antigravity 连接池配置(可选);默认短连接
     #[serde(default)]
     pub antigravity: Option<AntigravityConfig>,
@@ -94,12 +78,6 @@ impl Config {
                 persist_secret(path, &content, &hashed)?;
             }
         }
-        if let Some(transport) = config.cursor_transport.as_deref() {
-            if !matches!(transport, "bidi" | "sse") {
-                anyhow::bail!("cursor_transport 仅支持 bidi 或 sse,当前: {transport}");
-            }
-        }
-
         Ok(config)
     }
 }
@@ -342,38 +320,6 @@ models_file: "custom-models.json"
     }
 
     #[test]
-    fn config_rejects_invalid_cursor_transport() {
-        use std::io::Write;
-        let yaml = r#"
-server: { host: 127.0.0.1, port: 8222 }
-providers: []
-normalize: { enabled: false, drift_detector: false }
-logging: { level: info, request_body: false }
-cursor_transport: websocket
-"#;
-        let mut file = NamedTempFile::new().unwrap();
-        file.write_all(yaml.as_bytes()).unwrap();
-        let error = Config::load(file.path().to_str().unwrap()).unwrap_err();
-        assert!(error.to_string().contains("cursor_transport"));
-    }
-
-    #[test]
-    fn config_accepts_cursor_transport_sse() {
-        use std::io::Write;
-        let yaml = r#"
-server: { host: 127.0.0.1, port: 8222 }
-providers: []
-normalize: { enabled: false, drift_detector: false }
-logging: { level: info, request_body: false }
-cursor_transport: sse
-"#;
-        let mut file = NamedTempFile::new().unwrap();
-        file.write_all(yaml.as_bytes()).unwrap();
-        let config = Config::load(file.path().to_str().unwrap()).unwrap();
-        assert_eq!(config.cursor_transport.as_deref(), Some("sse"));
-    }
-
-    #[test]
     fn test_load_missing_file() {
         let result = Config::load("/nonexistent/config.yaml");
         assert!(result.is_err());
@@ -482,26 +428,5 @@ normalize:
         // 缺少 logging 字段,应解析失败
         let result = Config::load(file.path().to_str().unwrap());
         assert!(result.is_err());
-    }
-
-    #[test]
-    fn config_loads_cursor_native_fields() {
-        use std::io::Write;
-        let yaml = r#"
-server: { host: 127.0.0.1, port: 8222 }
-providers: []
-normalize: { enabled: false, drift_detector: false }
-logging: { level: info, request_body: false }
-cursor_base_url: https://api2.example.com
-cursor_client_version: cli-test
-"#;
-        let mut file = NamedTempFile::new().unwrap();
-        file.write_all(yaml.as_bytes()).unwrap();
-        let config = Config::load(file.path().to_str().unwrap()).unwrap();
-        assert_eq!(
-            config.cursor_base_url.as_deref(),
-            Some("https://api2.example.com")
-        );
-        assert_eq!(config.cursor_client_version.as_deref(), Some("cli-test"));
     }
 }

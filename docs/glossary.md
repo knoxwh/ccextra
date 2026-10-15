@@ -12,12 +12,11 @@
 | `openai_responses` | OpenAI Responses 协议，端点为 `/responses`。 |
 | `gemini` | Google Gemini GenerateContent 协议。 |
 | `antigravity` | Cloud Code Assist 运输协议，内部携带 Gemini 请求。 |
-| `cursor_sdk` | Cursor 原生 connect-rpc 协议（`AgentService/Run` 双向流）；不经通用 upstream，由 cursor handler 直连 api2.cursor.sh。 |
 | SSE | `text/event-stream` 响应格式；ccextra 将所有流式路径输出为 Anthropic SSE。 |
 | 非流响应 | `stream` 为 `false` 或缺失时的单个 JSON 响应。 |
 | 会话输入用量缓存 | 按 session 保存上游真实输入 token 数，供下一轮流首和 count_tokens 使用。Chat/Responses/Gemini/Antigravity 的原始 SSE 正数输入用量也会写回；缺失或零值不覆盖旧值，占位值不写回。记录写入后 30 分钟过期，最多 512 条。 |
 
-xAI Grok 与 Codex 不是独立 protocol。它们使用 OAuth 凭证动态创建 `openai_responses` provider。Claude 订阅 OAuth 动态创建 `protocol: claude` provider（与静态 API/中转同形）。Cursor 同样不是手写 protocol：`cursor_auth_dir` 凭证自动合成 name `cursor` 的 `cursor_sdk` provider。
+xAI Grok 与 Codex 不是独立 protocol。它们使用 OAuth 凭证动态创建 `openai_responses` provider。Claude 订阅 OAuth 动态创建 `protocol: claude` provider（与静态 API/中转同形）。
 
 ## 路由与配置
 
@@ -37,7 +36,7 @@ xAI Grok 与 Codex 不是独立 protocol。它们使用 OAuth 凭证动态创建
 `payload` 中按模型 glob 匹配的顶层 JSON 覆盖。规则可用 `protocol` 限定；Claude 直通必须显式限定才接受覆盖。
 
 **reasoning 注册表**
-用户 `models.json`（路径由 `models_file` 指定，默认同目录）。按上游模型 `id` 精确匹配，把 effort 钳到该模型支持的最近档。缺文件或未收录不钳。条目可设 `force_effort` 固定档：凡钳制介入处改写为该值（不钳制）。Cursor 家族变体模型按 base id（如 `grok-4.7`）查此表，得到的档位拼进上游 model id（`grok-4.7-high`）。core 不读文件。
+用户 `models.json`（路径由 `models_file` 指定，默认同目录）。按上游模型 `id` 精确匹配，把 effort 钳到该模型支持的最近档。缺文件或未收录不钳。条目可设 `force_effort` 固定档：凡钳制介入处改写为该值（不钳制）。core 不读文件。
 
 **全局代理与 provider 代理**
 `server.proxy_url` 是默认值；provider `proxy_url` 优先。`"direct"` 或空值表示不走代理。
@@ -124,25 +123,8 @@ Gemini 函数调用模式。Antigravity Claude 模型强制使用；Gemini 直�
 将 Anthropic `input_schema` 转成 Gemini 或 Antigravity 可接受 JSON Schema 的递归过程。它内联本地引用、移除不支持关键字、归一化布尔 `true` 子 schema、处理 enum 和 required，并为不同目标采用不同规则；Gemini 直连保留 `additionalProperties` 与标准约束，Antigravity 搬入 description 提示。声明 `items` 但缺 `type` 的节点补 `type: array`；`type` 显式不是 `array` 时去掉 `items`。OpenAI Chat/Responses 转换另会删除 schema 节点中的 `required: null`，保留实例数据中的同名字段。Chat 将 schema 位置的 `true` 转为空对象，保留 `false`、布尔 `additionalProperties` 与 `default`/`enum` 实例数据。
 
 **OAuth 动态 provider**
-由保存的 Antigravity、xAI、Codex、Claude 或 Cursor 凭证生成的运行时 provider。Antigravity 后台刷新模型；xAI、Codex 与 Claude 在启动和重载时扫描、刷新凭证。Codex 请求携带 `Chatgpt-Account-Id` 订阅身份头；Claude 订阅注入 `protocol: claude`（与静态 API/中转同形，OAuth 缺 beta 时补 `oauth-2025-04-20`）；Cursor 经 GetUsableModels 拉取目录合成固定 name `cursor` 的 `cursor_sdk` provider。
+由保存的 Antigravity、xAI、Codex 或 Claude 凭证生成的运行时 provider。Antigravity 后台刷新模型；xAI、Codex 与 Claude 在启动和重载时扫描、刷新凭证。Codex 请求携带 `Chatgpt-Account-Id` 订阅身份头；Claude 订阅注入 `protocol: claude`（与静态 API/中转同形，OAuth 缺 beta 时补 `oauth-2025-04-20`）。
 
-**connect-rpc 双向流**
-Cursor 原生传输：`agent.v1.AgentService/Run`（h2 + rustls 直连 api2.cursor.sh），Connect 帧 `[1B flags][4B len BE][payload]`。请求头含 `content-type: application/connect+proto`、`connect-protocol-version: 1`、`te: trailers`、`x-ghost-mode: true`、`x-cursor-client-version`、`x-cursor-client-type: cli`；无 checksum、无 x-client-key。出站代理复用全局 `proxy`（HTTP CONNECT 隧道）。
-
-**双通道传输**
-`cursor_transport: sse` 启用的 Cursor 备用传输（默认 `bidi` 即上面的双向流）：读 `AgentService/RunSSE`（connect+json 服务端流，响应帧载荷为 JSON）+ 写 `BidiService/BidiAppend`（unary JSON，`data` 为 proto hex，`appendSeqno` 从 0 递增，首条 runRequest），两条独立 h2 连接按 requestId 关联。对应 CLI 的 HTTP/1.1 回退路径，双向流被掐环境用；协议消息层与 BiDi Run 一致，仅读侧载荷格式不同。
-
-**Run**
-一次 `AgentService/Run` 双向流调用，对应一个会话回合。服务端事件归一为 text/thinking 增量、tool 调用、TurnEnded 与 checkpoint。TurnEnded 只表示这一步生成结束，成功终态仍是 Connect end-stream；工具驻留期间忽略 TurnEnded，不取消会话。服务端 InteractionQuery（web_search/ask_question 等）必须回 InteractionResponse，否则挂死整流。用量读 TurnEnded field 1（本轮总输入，缓存+非缓存）与 field 3/4（cache_read/cache_write 缓存子集）：自校验 `read+write≤input` 且非负时上报真值（Anthropic 口径 input 为总输入减缓存子集），越界按真值 1%/99% 拆分（input 1% + cache_read 99% 假数据，相加即真实 context），output 为本响应 TokenDelta 累计。
-
-**InteractionQuery**
-服务端下发的交互查询（web_search/ask_question/switch_mode/exa_search/exa_fetch/create_plan/setup_vm）。ccextra 按种类回 reject/error（SetupVm 回空 success），不提供交互能力。
-
-**pending callback**
-Agent 回合中已发起但未收到结果的工具副作用。驻留会话丢失时冷续接走历史伪造（root prompt blob + turns）重新起跑，崩溃窗口内的 pending callback 可能重复执行，由客户端 tool_result 幂等性兜底。
-
-**journal 回放缓存**
-按回合摘要内存缓存的已发布 SSE 帧。同摘要重复请求（断线重连/singleflight）直接回放缓存帧，不重跑上游；进程重启即失效。
 
 **热重载**
 各 OAuth 登录命令保存凭证后自动调用配置地址的 `POST /reload`（直连，通配地址转回环地址，连接超时 2 秒、总超时 30 秒）；失败仅提示，凭证保留，服务未启动时下次启动加载。

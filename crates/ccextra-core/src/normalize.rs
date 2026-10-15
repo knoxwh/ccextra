@@ -30,7 +30,7 @@ use crate::route::Protocol;
 /// `volatile_count` 现在计 dateline 指纹句改写个数(撇号/分隔符隐写还原,
 /// 对齐 sub2api);占位符式 volatile strip 已下线。检测告警只读 WARN。
 /// OpenAI pretransform 不跑 dateline(改由 post),该字段恒 0;
-/// Gemini/Antigravity/Cursor pre 与 full/post 会写入改写数。
+/// Gemini/Antigravity pre 与 full/post 会写入改写数。
 #[derive(Debug, Default, Clone, Copy, PartialEq, Eq)]
 pub struct NormalizeCounts {
     pub tool_sorted: bool,
@@ -111,14 +111,14 @@ pub fn normalize_anthropic_full(body: &mut Value, request_id: &str) -> Normalize
 /// sort(system reminder 列表块)与 rstrip(尾部空白)按协议分流:
 /// - openai_chat / openai_responses:转换后由 `normalize_target_post` 在
 ///   目标 body 上覆盖,转换前不跑(避免双份工作)
-/// - gemini / antigravity / cursor_sdk:无 post-transform 归一化,且
+/// - gemini / antigravity:无 post-transform 归一化,且
 ///   `convert_content_to_parts` 把 message 文本逐字节 verbatim 塞进
 ///   parts,转换前必须跑 rstrip 修掉 #48734 尾部空白漂移,否则漂移字节
 ///   直通出站 body 打掉隐式前缀缓存
 ///
 /// dateline 与 volatile detect：
 /// - openai_chat / openai_responses：转换后由 `normalize_target_post` 覆盖
-/// - gemini / antigravity / cursor_sdk：转换前补跑（body 仍为 Anthropic 形）
+/// - gemini / antigravity：转换前补跑（body 仍为 Anthropic 形）
 pub fn normalize_anthropic_pretransform(
     body: &mut Value,
     protocol: Protocol,
@@ -256,8 +256,8 @@ mod tests {
         let text = body["messages"][0]["content"][0]["text"].as_str().unwrap();
         assert!(text.ends_with("   "), "openai_chat 路径 body 不动");
 
-        // gemini/antigravity/cursor:无 post-transform,转换前必须跑
-        for protocol in [Protocol::Gemini, Protocol::Antigravity, Protocol::CursorSdk] {
+        // gemini/antigravity:无 post-transform,转换前必须跑
+        for protocol in [Protocol::Gemini, Protocol::Antigravity] {
             let mut body = json!({
                 "messages": [
                     {"role": "user", "content": [
@@ -455,7 +455,7 @@ mod tests {
     #[test]
     fn test_pretransform_non_openai_runs_dateline() {
         let stego = "Today\u{2019}s date is 2026/07/01.";
-        for protocol in [Protocol::Gemini, Protocol::Antigravity, Protocol::CursorSdk] {
+        for protocol in [Protocol::Gemini, Protocol::Antigravity] {
             let mut body = json!({
                 "system": stego,
                 "messages": [{"role": "user", "content": "hi"}]

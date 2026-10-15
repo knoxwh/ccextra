@@ -5,7 +5,7 @@ if [ -z "${BASH_VERSION:-}" ]; then
 fi
 set -euo pipefail
 
-# 检查并更新 config.yaml 中的 user_agents 与 cursor_client_version
+# 检查并更新 config.yaml 中的 user_agents
 
 BASE_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
 DEFAULT_CONFIG="${BASE_DIR}/config.yaml"
@@ -24,7 +24,6 @@ usage() {
   - codex_tui:             npm @openai/codex
   - grok_version:          npm @xai-official/grok
   - antigravity:           Google Antigravity Hub updater manifest
-  - cursor_client_version: Cursor upstream build version (api2.cursor.sh)
 
 选项:
   -c, --config <path>    指定配置文件路径 (默认: config.yaml)
@@ -158,24 +157,11 @@ fi
 ANTIGRAVITY_MANIFEST="$(http_get "https://antigravity-hub-auto-updater-974169037036.us-central1.run.app/manifest/latest-arm64-mac.yml")"
 LATEST_ANTIGRAVITY_VER="$(echo "$ANTIGRAVITY_MANIFEST" | sed -n 's/^version:[[:space:]]*//p' | head -n 1 | tr -d '\r\n ')"
 
-# 1.5 cursor_client_version
-parse_cursor_version() {
-    local body="$1"
-    if [[ "$body" =~ ([0-9]{4})([0-9]{2})([0-9]{2})-[0-9]{6}-([a-f0-9]{7}) ]]; then
-        echo "cli-${BASH_REMATCH[1]}.${BASH_REMATCH[2]}.${BASH_REMATCH[3]}-${BASH_REMATCH[4]}"
-    fi
-}
-LATEST_CURSOR_VERSION="$(parse_cursor_version "$(http_get "https://api2.cursor.sh")")"
-if [[ -z "$LATEST_CURSOR_VERSION" ]]; then
-    LATEST_CURSOR_VERSION="$(parse_cursor_version "$(http_get "https://api.cursor.com")")"
-fi
-
 # 2. 读取配置当前值
 CURRENT_CLAUDE="$(read_yaml_val "claude_cli" "user_agents")"
 CURRENT_CODEX="$(read_yaml_val "codex_tui" "user_agents")"
 CURRENT_GROK="$(read_yaml_val "grok_version" "user_agents")"
 CURRENT_ANTIGRAVITY="$(read_yaml_val "antigravity" "user_agents")"
-CURRENT_CURSOR="$(read_yaml_val "cursor_client_version" "")"
 
 # 组装新目标值
 NEW_CLAUDE=""
@@ -206,11 +192,6 @@ if [[ -n "$LATEST_ANTIGRAVITY_VER" ]]; then
     fi
 fi
 
-NEW_CURSOR=""
-if [[ -n "$LATEST_CURSOR_VERSION" ]]; then
-    NEW_CURSOR="${LATEST_CURSOR_VERSION}"
-fi
-
 # 3. 对比展示
 CHANGES=0
 
@@ -235,7 +216,6 @@ report_item "claude_cli" "$CURRENT_CLAUDE" "$NEW_CLAUDE"
 report_item "codex_tui" "$CURRENT_CODEX" "$NEW_CODEX"
 report_item "grok_version" "$CURRENT_GROK" "$NEW_GROK"
 report_item "antigravity" "$CURRENT_ANTIGRAVITY" "$NEW_ANTIGRAVITY"
-report_item "cursor_client_version" "$CURRENT_CURSOR" "$NEW_CURSOR"
 
 if [[ $CHANGES -eq 0 ]]; then
     echo "✅ 全部标头已是最新，无须更新。"
@@ -271,9 +251,7 @@ section_updates = {
         "antigravity": (sys.argv[5], make_pattern("antigravity")),
     },
 }
-top_updates = {
-    "cursor_client_version": (sys.argv[6], make_pattern("cursor_client_version")),
-}
+top_updates = {}
 
 top_key_re = re.compile(r"^([^\s#][^:\r\n]*):")
 section_header_re = re.compile(r"^[ \t]*(#.*)?\r?\n?$")
@@ -323,6 +301,6 @@ except Exception:
     if os.path.exists(tmp_path):
         os.remove(tmp_path)
     raise
-' "$CONFIG_FILE" "$NEW_CLAUDE" "$NEW_CODEX" "$NEW_GROK" "$NEW_ANTIGRAVITY" "$NEW_CURSOR"
+' "$CONFIG_FILE" "$NEW_CLAUDE" "$NEW_CODEX" "$NEW_GROK" "$NEW_ANTIGRAVITY"
 
 echo "✨ 已更新 $CHANGES 项到 $CONFIG_FILE"

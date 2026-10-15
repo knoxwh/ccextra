@@ -2,7 +2,7 @@
 //
 // 职责:
 // - cache_stabilization/ & normalize: 缓存稳定化与归一化管线
-// - convert/: Claude / OpenAI Chat / Responses / Gemini / Antigravity / Cursor 协议转换
+// - convert/: Claude / OpenAI Chat / Responses / Gemini / Antigravity 协议转换
 // - route/: model → provider 路由决策
 // - session/: 会话身份派生
 // - doom_loop: Grok doom loop 检测纯逻辑

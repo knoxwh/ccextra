@@ -1,4 +1,4 @@
-// 协议转换:三条独立 body-to-body 转换
+// 协议转换:独立 body-to-body 转换
 //
 // - passthrough: claude → claude 只改 model
 // - to_openai_chat: anthropic → openai chat
@@ -11,7 +11,6 @@ use thiserror::Error;
 pub mod antigravity;
 pub mod antigravity_reasoning_replay;
 pub mod antigravity_tools;
-pub mod cursor;
 pub mod fix_json;
 pub mod gemini;
 pub mod gemini_response;

@@ -58,13 +58,6 @@ bcrypt = "0.19"
 # Pattern matching (for payload model wildcards)
 globset = "0.4"
 
-# Cursor protobuf
-prost = "0.14"
-prost-types = "0.14"
-prost-build = "0.14"
-protoc-bin-vendored = "3"
-flate2 = "1"
-
 # CLI
 clap = { version = "4.4", features = ["derive"] }
 

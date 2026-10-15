@@ -13,8 +13,6 @@ pub enum Protocol {
     OpenAiResponses,
     Gemini,
     Antigravity,
-    /// Cursor 原生 connect-rpc(不经通用 upstream,直连 api2.cursor.sh)
-    CursorSdk,
 }
 
 #[derive(Debug, Clone)]
@@ -341,23 +339,5 @@ models:
         assert_eq!(provider.base_urls().len(), 2);
         assert_eq!(provider.base_urls()[0], "https://daily.example.com");
         assert_eq!(provider.base_urls()[1], "https://prod.example.com");
-    }
-
-    #[test]
-    fn cursor_sdk_route_deserializes_and_resolves() {
-        let yaml = r#"
-name: cursor
-protocol: cursor_sdk
-base_url: ""
-key: managed
-models:
-  - name: auto
-    alias: auto
-"#;
-        let provider: ProviderConfig = yaml_serde::from_str(yaml).unwrap();
-        assert_eq!(provider.protocol, Protocol::CursorSdk);
-        let route = resolve_route("auto", &[provider]).unwrap();
-        assert_eq!(route.protocol, Protocol::CursorSdk);
-        assert_eq!(route.upstream_model, "auto");
     }
 }

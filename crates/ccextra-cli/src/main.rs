@@ -14,11 +14,6 @@ use ccextra_server::codex::{
     list as list_codex, resolve_auth_dir as resolve_codex_auth_dir, run_login as run_codex_login,
     CodexLoginOptions,
 };
-use ccextra_server::cursor::{
-    load as load_cursor_credential, new_cursor_runtime,
-    resolve_auth_dir as resolve_cursor_auth_dir, run_login as run_cursor_login, CursorConfig,
-    CursorLoginOptions,
-};
 use ccextra_server::http::{
     publish_refreshed_providers, AppState, ConfigSnapshot, ProviderRefreshConfig, ReloadData,
     RuntimeConfig, UserAgentSet,
@@ -133,22 +128,6 @@ enum Commands {
         #[arg(long)]
         auth_dir: Option<String>,
     },
-    /// 浏览器 PKCE 登录 Cursor 并写入凭证
-    #[command(name = "cursor-login")]
-    CursorLogin {
-        /// 凭证目录,默认配置文件旁 .cache/cursor
-        #[arg(long)]
-        auth_dir: Option<String>,
-        /// 不自动打开浏览器,只打印 URL
-        #[arg(long)]
-        no_browser: bool,
-    },
-    /// 显示已保存的 Cursor 凭证状态(不打印 token)
-    #[command(name = "cursor-status")]
-    CursorStatus {
-        #[arg(long)]
-        auth_dir: Option<String>,
-    },
 }
 
 #[tokio::main]
@@ -193,40 +172,6 @@ async fn main() -> Result<()> {
         }
         Some(Commands::ClaudeStatus { auth_dir }) => {
             return cmd_claude_status(&cli.config, auth_dir);
-        }
-        Some(Commands::CursorLogin {
-            auth_dir,
-            no_browser,
-        }) => {
-            let cfg = load_optional_config(&cli.config);
-            let options = CursorLoginOptions {
-                auth_dir: cursor_auth_dir_from(&cli.config, auth_dir),
-                no_browser,
-                proxy_url: cfg.and_then(|c| c.server.proxy_url),
-            };
-            run_cursor_login(options).await?;
-            reload_after_login(&cli.config).await;
-            return Ok(());
-        }
-        Some(Commands::CursorStatus { auth_dir }) => {
-            let dir = cursor_auth_dir_from(&cli.config, auth_dir);
-            match load_cursor_credential(&dir) {
-                Ok(credential) => println!(
-                    "Cursor sub={} status={}",
-                    credential.sub,
-                    if credential.is_fresh(SystemTime::now(), 0) {
-                        "valid"
-                    } else {
-                        "expired"
-                    }
-                ),
-                Err(error) if !ccextra_server::cursor::store::credential_path(&dir).exists() => {
-                    println!("无 Cursor 凭证: {}", dir.display());
-                    tracing::debug!("{error}");
-                }
-                Err(error) => return Err(error),
-            }
-            return Ok(());
         }
         None => {}
     }
@@ -337,26 +282,6 @@ async fn main() -> Result<()> {
     all_providers = merge_providers(all_providers, claude_providers);
     all_providers = merge_providers(all_providers, antigravity_providers);
 
-    // Cursor 原生运行时组装(启用判定:cursor_auth_dir 非空)
-    let cursor_runtime = cursor_config_from(&cli.config, &config).map(new_cursor_runtime);
-    if let Some(runtime) = cursor_runtime.as_ref() {
-        let cursor_cfg = runtime.config.read().await.clone();
-        match ccextra_server::cursor::load_cursor_provider(
-            &cursor_cfg,
-            &all_providers,
-            config.server.proxy_url.as_deref(),
-        )
-        .await
-        {
-            Some(provider) => {
-                let count = provider.models.len();
-                all_providers = merge_providers(all_providers, vec![provider]);
-                tracing::info!("Cursor 目录合成 {} 个模型", count);
-            }
-            None => tracing::warn!("Cursor 模型目录拉取失败,先以无 cursor provider 启动"),
-        }
-    }
-
     // 启动时验证配置
     ccextra_core::route::validate_providers(&all_providers)?;
     tracing::info!("配置验证通过");
@@ -466,8 +391,6 @@ async fn main() -> Result<()> {
         last_input_tokens: Arc::new(std::sync::Mutex::new(
             ccextra_server::http::session_tokens::SessionTokenCache::new(),
         )),
-        cursor: Arc::new(std::sync::RwLock::new(cursor_runtime)),
-        cursor_sessions: ccextra_server::cursor::session::CursorSessions::default(),
     };
 
     // Antigravity 后台注入(对齐 CPA 启动模式:listening 不等在线模型列表;
@@ -521,34 +444,6 @@ fn claude_auth_dir_from(config_path: &str, override_dir: Option<String>) -> Path
         load_optional_config(config_path).and_then(|cfg| cfg.claude_auth_dir)
     };
     pin_auth_dir(config_path, raw.as_deref(), resolve_claude_auth_dir)
-}
-
-fn cursor_auth_dir_from(config_path: &str, override_dir: Option<String>) -> PathBuf {
-    let raw = if let Some(dir) = override_dir {
-        Some(dir)
-    } else {
-        load_optional_config(config_path).and_then(|cfg| cfg.cursor_auth_dir)
-    };
-    pin_auth_dir(config_path, raw.as_deref(), resolve_cursor_auth_dir)
-}
-
-/// CursorConfig 组装:启用判定(cursor_auth_dir 非空)+ 目录钉定 + 默认值
-fn cursor_config_from(config_path: &str, cfg: &Config) -> Option<CursorConfig> {
-    if !ccextra_server::cursor::cursor_enabled(cfg.cursor_auth_dir.as_deref()) {
-        return None;
-    }
-    let auth_dir = pin_auth_dir(
-        config_path,
-        cfg.cursor_auth_dir.as_deref(),
-        resolve_cursor_auth_dir,
-    );
-    Some(CursorConfig {
-        auth_dir,
-        models: cfg.cursor_models.clone().unwrap_or_default(),
-        base_url: cfg.cursor_base_url.clone(),
-        client_version: cfg.cursor_client_version.clone(),
-        transport: cfg.cursor_transport.clone(),
-    })
 }
 
 /// 读用户 models.json。缺文件 = 空表不钳;解析失败则启动/reload 报错。
@@ -640,7 +535,6 @@ fn provider_refresh_config(config_path: &str, config: &Config) -> ProviderRefres
                 .as_str()
                 .to_string(),
         ),
-        cursor: cursor_config_from(config_path, config),
         proxy_url: config.server.proxy_url.clone(),
         static_providers: config.providers.clone(),
     }
@@ -649,7 +543,7 @@ fn provider_refresh_config(config_path: &str, config: &Config) -> ProviderRefres
 /// 动态拉取失败时保留整个已发布集合;静态配置仅由成功的 reload 更新。
 async fn load_refreshed_providers(
     refresh: ProviderRefreshConfig,
-    current_providers: Vec<ProviderConfig>,
+    _current_providers: Vec<ProviderConfig>,
 ) -> Option<Vec<ProviderConfig>> {
     let auth_dir = refresh.auth_dir.as_ref()?;
     let xai = if let Some(dir) = refresh.xai_auth_dir.as_ref() {
@@ -682,27 +576,7 @@ async fn load_refreshed_providers(
     let set = merge_providers(set, codex);
     let set = merge_providers(set, claude);
     let set = merge_providers(set, injected);
-    // Cursor catalog:成功合成则并入;失败保留快照中现有 cursor provider
-    let cursor_set = match refresh.cursor.as_ref() {
-        Some(cursor_cfg) => {
-            match ccextra_server::cursor::load_cursor_provider(
-                cursor_cfg,
-                &set,
-                refresh.proxy_url.as_deref(),
-            )
-            .await
-            {
-                Some(provider) => vec![provider],
-                None => current_providers
-                    .into_iter()
-                    .filter(|p| p.name == "cursor")
-                    .collect(),
-            }
-        }
-        // 未启用:不合成也不保留(禁用后旧 provider 应移除)
-        None => Vec::new(),
-    };
-    Some(merge_providers(set, cursor_set))
+    Some(set)
 }
 
 async fn refresh_providers<F, Fut>(
@@ -722,7 +596,6 @@ where
 
 /// Antigravity 注入任务:启动即拉取,成功注入后每 3 小时刷新;失败保旧。
 /// 每轮从当前快照获取参数,不发布尚未成功 reload 的磁盘配置。
-/// Cursor catalog 同周期刷新(失败保留现有 cursor provider)。
 async fn run_antigravity_injection(state: AppState) {
     /// 刷新周期(对齐 CPA modelsRefreshInterval = 3h)
     const REFRESH_INTERVAL: std::time::Duration = std::time::Duration::from_secs(3 * 3600);
@@ -1101,12 +974,11 @@ fn build_user_agents(config: Option<&config::UserAgents>) -> UserAgentSet {
 #[cfg(test)]
 mod tests {
     use super::{
-        build_user_agents, cursor_config_from, load_refreshed_providers, load_thinking_registry,
-        pin_auth_dir, pin_path, provider_refresh_config, refresh_providers, Arc, Config,
-        ProviderConfig, RuntimeConfig, RwLock, UpstreamClient,
+        build_user_agents, load_refreshed_providers, load_thinking_registry, pin_auth_dir,
+        pin_path, provider_refresh_config, refresh_providers, Arc, Config, ProviderConfig,
+        RuntimeConfig, RwLock, UpstreamClient,
     };
     use ccextra_server::antigravity::resolve_auth_dir as resolve_antigravity_auth_dir;
-    use ccextra_server::cursor::resolve_auth_dir as resolve_cursor_auth_dir;
     use ccextra_server::xai::resolve_auth_dir as resolve_xai_auth_dir;
     use std::io::Write;
     use std::path::PathBuf;
@@ -1280,8 +1152,6 @@ xai_auth_dir: new-xai
 
         let xai_dir = pin_auth_dir("/tmp/proj/config.yaml", None, resolve_xai_auth_dir);
         assert_eq!(xai_dir, PathBuf::from("/tmp/proj/.cache/xai"));
-        let cursor_dir = pin_auth_dir("/tmp/proj/config.yaml", None, resolve_cursor_auth_dir);
-        assert_eq!(cursor_dir, PathBuf::from("/tmp/proj/.cache/cursor"));
     }
 
     #[test]
@@ -1341,48 +1211,5 @@ xai_auth_dir: new-xai
         let reg = load_thinking_registry(cfg.to_str().unwrap(), None).unwrap();
         assert_eq!(reg.len(), 1);
         assert_eq!(reg[0].id, "gpt-6-astra");
-    }
-
-    fn cursor_test_config(extra: &str) -> Config {
-        let yaml = format!(
-            "server: {{ host: 127.0.0.1, port: 8222 }}\n\
-             providers: []\n\
-             normalize: {{ enabled: false, drift_detector: false }}\n\
-             logging: {{ level: info, request_body: false }}\n{extra}"
-        );
-        yaml_serde::from_str(&yaml).unwrap()
-    }
-
-    #[test]
-    fn cursor_config_from_disabled_when_auth_dir_blank() {
-        assert!(cursor_config_from("/tmp/proj/config.yaml", &cursor_test_config("")).is_none());
-        let cfg = cursor_test_config("cursor_auth_dir: \"  \"\n");
-        assert!(cursor_config_from("/tmp/proj/config.yaml", &cfg).is_none());
-    }
-
-    #[test]
-    fn cursor_config_from_applies_defaults_and_pins_auth_dir() {
-        let cfg = cursor_test_config("cursor_auth_dir: .cache/cursor\n");
-        let config = cursor_config_from("/tmp/proj/config.yaml", &cfg).unwrap();
-        assert_eq!(config.auth_dir, PathBuf::from("/tmp/proj/.cache/cursor"));
-        assert!(config.models.is_empty());
-        assert_eq!(config.base_url, None);
-        assert_eq!(config.client_version, None);
-    }
-
-    #[test]
-    fn cursor_config_from_reads_overrides() {
-        let cfg = cursor_test_config(
-            "cursor_auth_dir: /abs/cursor\ncursor_models: [\"default\", \"composer-*\"]\n\
-             cursor_base_url: https://api2.example.com\ncursor_client_version: cli-test\n",
-        );
-        let config = cursor_config_from("/tmp/proj/config.yaml", &cfg).unwrap();
-        assert_eq!(config.auth_dir, PathBuf::from("/abs/cursor"));
-        assert_eq!(
-            config.models,
-            vec!["default".to_string(), "composer-*".to_string()]
-        );
-        assert_eq!(config.base_url.as_deref(), Some("https://api2.example.com"));
-        assert_eq!(config.client_version.as_deref(), Some("cli-test"));
     }
 }
