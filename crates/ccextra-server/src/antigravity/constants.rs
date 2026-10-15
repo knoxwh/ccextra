@@ -23,11 +23,11 @@ pub const SANDBOX_DAILY_API_ENDPOINT: &str = "https://daily-cloudcode-pa.sandbox
 pub const API_VERSION: &str = "v1internal";
 
 /// 写死 hub 回退版本,不拉 updater manifest
-/// Cloud Code 拒绝 <2.9.0 客户端访问新模型,此版本必须 ≥2.9.0
+/// Cloud Code 拒绝 <2.23.0 客户端访问新模型,此版本必须 ≥2.23.0(对齐 CPA 8fb633c9)
 /// 聊天 UA（user_agents.antigravity）与 fetch_models / login 缺省同源，避免版本分裂。
 macro_rules! antigravity_hub_ua {
     () => {
-        "antigravity/hub/2.21.1 darwin/arm64"
+        "antigravity/hub/2.23.0 darwin/arm64"
     };
 }
 pub const REQUEST_UA: &str = antigravity_hub_ua!();
@@ -37,8 +37,8 @@ pub const GOOG_API_CLIENT: &str = "gl-node/22.21.1";
 pub const TOKEN_REFRESH_UA: &str = "Go-http-client/2.0";
 
 const NODE_API_CLIENT_UA: &str = "google-api-nodejs-client/10.3.0";
-/// Cloud Code 拒绝 <2.9.0；解析失败时回退（对齐 CPA antigravityFallbackVersion）。
-pub const IDE_VERSION_FALLBACK: &str = "2.9.1";
+/// Cloud Code 拒绝 <2.23.0；解析失败时回退（对齐 CPA antigravityFallbackVersion / 8fb633c9）。
+pub const IDE_VERSION_FALLBACK: &str = "2.23.0";
 
 fn is_antigravity_family_ua(lower: &str) -> bool {
     lower.starts_with("antigravity/hub/") || lower.starts_with("antigravity/")
@@ -125,14 +125,28 @@ mod tests {
     #[test]
     fn version_from_hub_and_legacy_ua() {
         assert_eq!(
-            version_from_user_agent("antigravity/hub/2.21.1 darwin/arm64"),
-            "2.21.1"
+            version_from_user_agent("antigravity/hub/2.23.0 darwin/arm64"),
+            "2.23.0"
         );
         assert_eq!(
             version_from_user_agent("antigravity/1.23.2 windows/amd64"),
             "1.23.2"
         );
-        assert_eq!(version_from_user_agent(ONBOARD_UA), "2.21.1");
+        assert_eq!(version_from_user_agent(ONBOARD_UA), "2.23.0");
         assert_eq!(version_from_user_agent("curl/8"), IDE_VERSION_FALLBACK);
+    }
+
+    #[test]
+    fn fallback_version_meets_backend_floor() {
+        // 对齐 CPA TestAntigravityFallbackVersionMeetsBackendFloor(8fb633c9):≥2.23.0
+        let parts: Vec<_> = IDE_VERSION_FALLBACK.split('.').collect();
+        assert!(parts.len() >= 2, "{IDE_VERSION_FALLBACK}");
+        let major: i32 = parts[0].parse().unwrap();
+        let minor: i32 = parts[1].parse().unwrap();
+        assert!(
+            major > 2 || (major == 2 && minor >= 23),
+            "fallback {IDE_VERSION_FALLBACK} below 2.23.0 floor"
+        );
+        assert!(REQUEST_UA.contains("2.23.0"), "{REQUEST_UA}");
     }
 }
