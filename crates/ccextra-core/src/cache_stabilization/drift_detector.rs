@@ -26,7 +26,7 @@
 //! - **会话级 `early_messages` 漂移 → DEBUG。** early 窗口包含当轮新的
 //!   user 消息，它 *预期* 每轮都会变化——那是正常的会话更替，不是缓存破坏。
 //!   上游响应中的 cache_read token 数才是判断前缀是否真正破坏的真相来源；
-//!   检测器的 early_messages WARN 只是噪音。
+//!   检测器的 early_messages DEBUG 只是诊断噪音，默认 INFO 下不刷。
 //!
 //! # 会话身份
 //!
@@ -588,9 +588,9 @@ impl std::fmt::Debug for DriftState {
 ///
 /// 会话级（完整三维，以 `identity.conversation` 为键）：
 ///
-/// - 首次：`cache_drift_first_request`
+/// - 首次：DEBUG `cache_drift_first_request`（播种基线，非告警）
 /// - 哈希相同：无事件
-/// - 任一维度不同：`cache_drift_observed`
+/// - 任一维度不同：DEBUG `cache_drift_observed`
 ///
 /// 父级（仅 system/tools，以 `identity.parent` 为键）：
 ///

@@ -14,8 +14,9 @@
 //!   下线并移除（替换改变上游可见语义）。
 //! - [`drift_detector`] — PR-E6：对每个会话的 cache 热区
 //!   （system / tools / early messages）计算结构哈希。首次见到时发出
-//!   `cache_drift_first_request`，同一会话的连续请求在任一维度上不一致时
-//!   发出 `cache_drift_observed`。
+//!   DEBUG `cache_drift_first_request`；父级 `system`/`tools` 不一致时
+//!   WARN `cache_drift_observed`；会话级（含 `early_messages`）不一致时
+//!   DEBUG `cache_drift_observed`。
 //! - [`tool_def_normalize`] — PR-E1 / PR-E2：按名称对 `tools[]` 进行
 //!   字母排序，并递归排序每个 tool 的 `input_schema` / `function.parameters`
 //!   内部的 JSON Schema 对象键。
