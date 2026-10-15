@@ -87,7 +87,7 @@ impl std::fmt::Display for ApiKind {
     }
 }
 
-/// cache 热区的三轴结构指纹。
+/// cache 热区结构指纹（system / tools / early_messages；可选 soft-dim）。
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct StructuralHash {
     pub system: [u8; 32],
@@ -645,16 +645,12 @@ type DriftCaches = (
 /// - `parent_cache`：父级 bucket → [`ParentBaseline`]。
 /// 不稳定父级 DEBUG 的最小间隔（毫秒）。
 const UNSTABLE_PARENT_LOG_INTERVAL_MS: u64 = 5_000;
-/// usage 关联 DEBUG 的最小间隔（毫秒）。
-const USAGE_CORR_LOG_INTERVAL_MS: u64 = 1_000;
 
 #[derive(Clone)]
 pub struct DriftState {
     cache: Arc<Mutex<DriftCaches>>,
-    /// 上次发出 `cache_drift_unstable_parent` 的单调毫秒（限速）。
+    /// 上次发出 `cache_drift_unstable_parent` 的墙钟毫秒（限速）。
     last_unstable_log_ms: Arc<AtomicU64>,
-    /// 上次发出 `cache_drift_usage_correlated` 的单调毫秒（限速）。
-    last_usage_corr_log_ms: Arc<AtomicU64>,
     /// 跳过的不稳定父级次数（可选计数，无锁）。
     pub unstable_parent_skips: Arc<AtomicU64>,
 }
@@ -674,7 +670,6 @@ impl DriftState {
                 LruCache::new(cap),
             ))),
             last_unstable_log_ms: Arc::new(AtomicU64::new(0)),
-            last_usage_corr_log_ms: Arc::new(AtomicU64::new(0)),
             unstable_parent_skips: Arc::new(AtomicU64::new(0)),
         }
     }
@@ -682,7 +677,7 @@ impl DriftState {
     /// 不稳定父级：计数 + 限速 DEBUG，不写 LRU。
     fn note_unstable_parent(&self, parent: &str) {
         self.unstable_parent_skips.fetch_add(1, Ordering::Relaxed);
-        let now_ms = monotonic_ms();
+        let now_ms = unix_ms_now();
         let prev = self.last_unstable_log_ms.load(Ordering::Relaxed);
         if now_ms.saturating_sub(prev) < UNSTABLE_PARENT_LOG_INTERVAL_MS {
             return;
@@ -710,7 +705,7 @@ impl DriftState {
     }
 }
 
-fn monotonic_ms() -> u64 {
+fn unix_ms_now() -> u64 {
     use std::time::{SystemTime, UNIX_EPOCH};
     SystemTime::now()
         .duration_since(UNIX_EPOCH)
@@ -738,7 +733,13 @@ impl std::fmt::Debug for DriftState {
 /// - 不匹配：当会话基线也是新的（压缩 / 新会话）时，发出带
 ///   `identity_rotated=true` 的 `cache_drift_observed`，
 ///   使真实的 system/tools 变更无法藏在身份轮换背后。
-pub fn observe_drift(state: &DriftState, identity: &SessionIdentity, current: StructuralHash) {
+///
+/// 返回是否写入了 usage 关联 pending（即父级 WARN 是否发生）。
+pub fn observe_drift(
+    state: &DriftState,
+    identity: &SessionIdentity,
+    current: StructuralHash,
+) -> bool {
     let session_key = identity.conversation.as_str();
     let session_prefix = session_key_log_prefix(session_key);
     let mut caches = match state.cache.lock() {
@@ -756,7 +757,8 @@ pub fn observe_drift(state: &DriftState, identity: &SessionIdentity, current: St
     let parent_dims = update_parent_baseline(parent_cache, identity, &current);
 
     let conversation_is_new = !cache.contains(session_key);
-    if !parent_dims.is_empty() {
+    let wrote_pending = !parent_dims.is_empty();
+    if wrote_pending {
         let dims_joined = parent_dims.join(",");
         tracing::warn!(
             event = "cache_drift_observed",
@@ -796,6 +798,7 @@ pub fn observe_drift(state: &DriftState, identity: &SessionIdentity, current: St
             cache.put(session_key.to_string(), current);
         }
     }
+    wrote_pending
 }
 
 /// 热路径入口：按开关观测结构漂移。**绝不修改** `body`。
@@ -828,6 +831,10 @@ pub struct DriftObserveOptions {
 }
 
 /// [`maybe_observe_request_drift`] 的可选项版本。
+///
+/// 仅在父级 WARN 写入 usage pending 时返回 `Some(parent)`，供响应路径
+/// 按需接线 `tap_drift_cache_usage`；稳定会话的播种/无漂移请求返回 `None`
+///（避免每请求打开 SSE 解析旁路）。
 pub fn maybe_observe_request_drift_with(
     enabled: bool,
     state: &DriftState,
@@ -850,14 +857,18 @@ pub fn maybe_observe_request_drift_with(
     }
     let hash = compute_structural_hash_with(body, kind, options);
     let parent = identity.parent.clone();
-    observe_drift(state, &identity, hash);
-    Some(parent)
+    if observe_drift(state, &identity, hash) {
+        Some(parent)
+    } else {
+        None
+    }
 }
 
 /// 用上游 `cache_read` / `cache_creation` 对照先前父级结构漂移（O(1) pending 弹出）。
 ///
 /// - 无 pending：立即返回（热路径无分配）。
-/// - 有 pending：限速 DEBUG `cache_drift_usage_correlated`。
+/// - 有 pending：弹出并**必定**发出 DEBUG `cache_drift_usage_correlated`
+///   （父级 WARN 已稀有，不再限速丢弃，避免 pop 后丢关联）。
 /// - **不修改请求**；可在响应路径调用。
 pub fn observe_cache_usage(
     state: &DriftState,
@@ -878,18 +889,6 @@ pub fn observe_cache_usage(
     let Some(pending) = pending else {
         return;
     };
-
-    let now_ms = monotonic_ms();
-    let prev = state.last_usage_corr_log_ms.load(Ordering::Relaxed);
-    if now_ms.saturating_sub(prev) < USAGE_CORR_LOG_INTERVAL_MS {
-        return;
-    }
-    let _ = state.last_usage_corr_log_ms.compare_exchange(
-        prev,
-        now_ms,
-        Ordering::Relaxed,
-        Ordering::Relaxed,
-    );
 
     let cache_miss_suspected = cache_read == 0 && cache_creation > 0;
     tracing::debug!(
@@ -2269,12 +2268,69 @@ mod tests {
             &anthropic_body("sys-B", json!([]), vec!["m1"]),
             ApiKind::Anthropic,
         );
-        observe_drift(&state, &id, h1);
-        observe_drift(&state, &id, h2);
+        assert!(!observe_drift(&state, &id, h1));
+        assert!(observe_drift(&state, &id, h2));
         assert!(state.cache.lock().unwrap().2.contains(&id.parent));
         observe_cache_usage(&state, &id.parent, 0, 120);
         assert!(!state.cache.lock().unwrap().2.contains(&id.parent));
         // second call is no-op
         observe_cache_usage(&state, &id.parent, 0, 120);
+    }
+
+    #[test]
+    fn maybe_observe_returns_parent_only_when_pending_written() {
+        let state = make_state();
+        let headers = anthropic_headers();
+        let body1 = anthropic_body("sys-A", json!([{"name": "bash"}]), vec!["hi", "more"]);
+        let body2 = anthropic_body("sys-B", json!([{"name": "bash"}]), vec!["hi", "more"]);
+        // seed: no parent WARN → None (do not wire usage tap)
+        assert!(
+            maybe_observe_request_drift(true, &state, &headers, &body1, ApiKind::Anthropic)
+                .is_none()
+        );
+        // unchanged: None
+        assert!(
+            maybe_observe_request_drift(true, &state, &headers, &body1, ApiKind::Anthropic)
+                .is_none()
+        );
+        // parent system drift: Some(parent)
+        let parent =
+            maybe_observe_request_drift(true, &state, &headers, &body2, ApiKind::Anthropic);
+        assert!(parent.is_some());
+        assert!(is_stable_parent_bucket(parent.as_deref().unwrap()));
+        assert!(state
+            .cache
+            .lock()
+            .unwrap()
+            .2
+            .contains(parent.as_ref().unwrap()));
+    }
+
+    #[test]
+    fn observe_cache_usage_emits_even_when_called_back_to_back() {
+        // Regression: must not pop pending then rate-limit-drop the correlated log.
+        let state = make_state();
+        let id = identity("sess-rapid");
+        let h1 = compute_structural_hash(
+            &anthropic_body("sys-A", json!([]), vec!["m1"]),
+            ApiKind::Anthropic,
+        );
+        let h2 = compute_structural_hash(
+            &anthropic_body("sys-B", json!([]), vec!["m1"]),
+            ApiKind::Anthropic,
+        );
+        let h3 = compute_structural_hash(
+            &anthropic_body("sys-C", json!([]), vec!["m1"]),
+            ApiKind::Anthropic,
+        );
+        observe_drift(&state, &id, h1);
+        observe_drift(&state, &id, h2);
+        observe_cache_usage(&state, &id.parent, 0, 10);
+        assert!(!state.cache.lock().unwrap().2.contains(&id.parent));
+        // immediate second parent drift + correlate must still consume pending
+        observe_drift(&state, &id, h3);
+        assert!(state.cache.lock().unwrap().2.contains(&id.parent));
+        observe_cache_usage(&state, &id.parent, 5, 0);
+        assert!(!state.cache.lock().unwrap().2.contains(&id.parent));
     }
 }

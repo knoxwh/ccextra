@@ -67,7 +67,8 @@ pub(crate) type DriftUsageScope = (
 );
 
 /// 旁路观测上游 cache_read / cache_creation，关联 drift pending。
-/// `scope == None` 时零成本透传（不解析）。不改写 `tap_input_tokens`。
+/// `scope == None` 时零成本透传（不解析）；仅在父级 WARN 写过 pending 时接线。
+/// 不改写 `tap_input_tokens`。
 pub(crate) fn tap_drift_cache_usage<S>(
     stream: S,
     protocol: ccextra_core::route::Protocol,
