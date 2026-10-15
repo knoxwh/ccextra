@@ -1,18 +1,26 @@
 // Claude Token 刷新与运行时单飞锁
-// (对齐 CPA RefreshTokensWithRetry:仅 5xx 可重试,传输/解码不盲重放)
+// (对齐 CPA RefreshTokensWithRetry:仅 5xx 可重试;按 refresh_token singleflight)
 
 use super::constants::{REFRESH_MAX_RETRIES, REFRESH_SKEW_SECS};
 use super::credential::ClaudeCredential;
 use super::{oauth, store};
 use anyhow::{anyhow, Result};
+use std::collections::HashMap;
 use std::path::Path;
-use std::sync::OnceLock;
+use std::sync::{Arc, OnceLock};
 use tokio::sync::Mutex;
 
-static REFRESH_LOCK: OnceLock<Mutex<()>> = OnceLock::new();
+static REFRESH_LOCKS: OnceLock<Mutex<HashMap<String, Arc<Mutex<()>>>>> = OnceLock::new();
 
-fn refresh_lock() -> &'static Mutex<()> {
-    REFRESH_LOCK.get_or_init(|| Mutex::new(()))
+async fn lock_for_refresh_token(refresh_token: &str) -> Arc<Mutex<()>> {
+    let key = refresh_token.trim().to_string();
+    let mut map = REFRESH_LOCKS
+        .get_or_init(|| Mutex::new(HashMap::new()))
+        .lock()
+        .await;
+    map.entry(key)
+        .or_insert_with(|| Arc::new(Mutex::new(())))
+        .clone()
 }
 
 /// 检查并刷新凭证(如果需要);仅对明确可重试 HTTP 错误退避重试
@@ -88,7 +96,7 @@ fn usable(cred: &ClaudeCredential, rejected_token: Option<&str>) -> bool {
         && rejected_token != Some(cred.access_token.as_str())
 }
 
-/// 运行时获取新鲜凭证 (单飞锁 + Double-Check + 自动落盘)
+/// 运行时获取新鲜凭证 (按 refresh_token 单飞 + Double-Check + 自动落盘)
 ///
 /// `rejected_token`:上游 401 后传入被拒的 access_token,即使未过期也强制刷新。
 pub async fn ensure_credential_fresh(
@@ -104,7 +112,14 @@ pub async fn ensure_credential_fresh(
         }
     }
 
-    let _guard = refresh_lock().lock().await;
+    let prelim = store::load(&path)?;
+    let lock_key = if prelim.refresh_token.trim().is_empty() {
+        format!("path:{}", path.display())
+    } else {
+        prelim.refresh_token.clone()
+    };
+    let lock = lock_for_refresh_token(&lock_key).await;
+    let _guard = lock.lock().await;
 
     let mut cred = store::load(&path)?;
     if usable(&cred, rejected_token) {
