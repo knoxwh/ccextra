@@ -367,6 +367,26 @@ mod tests {
     }
 
     #[test]
+    fn test_flash_model_skips_validated_placeholder() {
+        // 对齐 CPA requirePlaceholder=false:gemini-3.8-flash 不加 reason/_
+        let body = json!({
+            "model": "m", "max_tokens": 100,
+            "tools": [{
+                "name": "Flag",
+                "input_schema": {
+                    "type": "object",
+                    "properties": {"flag": {"type": "string"}}
+                }
+            }],
+            "messages": [{"role": "user", "content": "hi"}]
+        });
+        let (out, _) = convert_to_antigravity(&body, "gemini-3.8-flash-high", None);
+        let schema = &out["request"]["tools"][0]["functionDeclarations"][0]["parametersJsonSchema"];
+        assert!(schema.get("required").is_none(), "{schema}");
+        assert!(schema["properties"].get("_").is_none());
+    }
+
+    #[test]
     fn test_normalize_response_json_schema_key_variants() {
         for (container, schema_key, schema, property, expected_type) in [
             (

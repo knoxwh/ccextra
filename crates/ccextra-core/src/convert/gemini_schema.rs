@@ -15,6 +15,8 @@ use serde_json::{json, Map, Value};
 struct CleanOptions {
     /// Claude VALIDATED 模式:空对象 schema 补占位属性
     add_placeholder: bool,
+    /// 非 VALIDATED Antigravity:仅剥 title(对齐 CPA removeToolTitle=!requirePlaceholder)
+    remove_tool_title: bool,
     /// 工具 array 缺 items 时补 string items(对齐 CPA addMissingArrayItems / b5cde4ba)
     add_missing_array_items: bool,
     /// Antigravity 语义:内联 $ref、drop 全部 enum、not 转 description、nullable 原生保留
@@ -51,10 +53,16 @@ pub fn clean_json_schema_for_gemini(schema: &Value) -> Value {
 
 /// Antigravity 工具 schema 清洗(对齐 CleanJSONSchemaForAntigravity = Tool + requirePlaceholder)
 pub fn clean_json_schema_for_antigravity(schema: &Value) -> Value {
+    clean_json_schema_for_antigravity_tool(schema, true)
+}
+
+/// 对齐 CPA CleanJSONSchemaForAntigravityTool(requirePlaceholder)。
+pub fn clean_json_schema_for_antigravity_tool(schema: &Value, require_placeholder: bool) -> Value {
     clean_json_schema(
         schema,
         CleanOptions {
-            add_placeholder: true,
+            add_placeholder: require_placeholder,
+            remove_tool_title: !require_placeholder,
             add_missing_array_items: true,
             antigravity_semantics: true,
             ..Default::default()
@@ -65,11 +73,19 @@ pub fn clean_json_schema_for_antigravity(schema: &Value) -> Value {
 /// 对齐 CPA cleanNestedSchema:套一层 `"schema"` 再清洗再 unwrap。
 /// cleaner 顶层跳过 `_` 占位;套一层后工具 schema 根非顶层,全可选 properties 补 `_`。
 pub fn clean_nested_schema_for_antigravity(schema: &Value) -> Value {
+    clean_nested_schema_for_antigravity_tool(schema, true)
+}
+
+/// 对齐 CPA cleanNestedSchema + CleanJSONSchemaForAntigravityTool(requirePlaceholder)。
+pub fn clean_nested_schema_for_antigravity_tool(
+    schema: &Value,
+    require_placeholder: bool,
+) -> Value {
     let wrapped = json!({"schema": schema});
-    let cleaned = clean_json_schema_for_antigravity(&wrapped);
+    let cleaned = clean_json_schema_for_antigravity_tool(&wrapped, require_placeholder);
     match cleaned.get("schema") {
         Some(inner) => inner.clone(),
-        None => clean_json_schema_for_antigravity(schema),
+        None => clean_json_schema_for_antigravity_tool(schema, require_placeholder),
     }
 }
 
@@ -138,6 +154,8 @@ fn clean_json_schema(schema: &Value, opts: CleanOptions) -> Value {
     if opts.remove_gemini_metadata {
         remove_keywords(&mut s, &["nullable", "title"]);
         remove_placeholder_fields(&mut s);
+    } else if opts.remove_tool_title {
+        remove_keywords(&mut s, &["title"]);
     }
     cleanup_required_fields(&mut s);
     // Gemini protobuf 要求声明 items 的节点 type 为 ARRAY(对齐 CPA ffe6ad3c / Issue #6011)
@@ -1995,6 +2013,25 @@ mod tests {
         let out = clean_json_schema_for_antigravity(&schema);
         assert_eq!(out["required"], json!(["reason"]));
         assert_eq!(out["properties"]["reason"]["type"], "string");
+    }
+
+    #[test]
+    fn test_antigravity_tool_skips_placeholder_when_disabled() {
+        // 对齐 CPA requirePlaceholder=false(非 claude / 非 gemini-3-pro 族)
+        let schema = json!({"type": "object", "properties": {}, "title": "T"});
+        let out = clean_json_schema_for_antigravity_tool(&schema, false);
+        assert!(out.get("required").is_none(), "{out}");
+        assert!(out
+            .get("properties")
+            .and_then(|p| p.get("reason"))
+            .is_none());
+        assert!(out.get("title").is_none(), "{out}");
+        let nested = clean_nested_schema_for_antigravity_tool(
+            &json!({"type": "object", "properties": {"flag": {"type": "string"}}}),
+            false,
+        );
+        assert!(nested.get("required").is_none(), "{nested}");
+        assert!(nested["properties"].get("_").is_none());
     }
 
     #[test]
