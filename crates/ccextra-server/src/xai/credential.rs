@@ -54,12 +54,13 @@ impl XAICredential {
         if self.access_token.trim().is_empty() {
             return false;
         }
+        // 空/坏 expired 视为不新鲜,强制走刷新(对齐 Codex/CPA)
         if self.expired.trim().is_empty() {
-            return true;
+            return false;
         }
         let exp_time = match OffsetDateTime::parse(self.expired.trim(), &Rfc3339) {
             Ok(dt) => SystemTime::from(dt),
-            Err(_) => return true,
+            Err(_) => return false,
         };
         let skew = Duration::from_secs(skew_secs.max(0) as u64);
         match now.checked_add(skew) {
@@ -109,18 +110,16 @@ pub fn parse_jwt_identity(id_token: &str) -> (String, String) {
         return (String::new(), String::new());
     }
     use base64::Engine;
-    let engine = base64::engine::general_purpose::URL_SAFE_NO_PAD;
+    // 对齐 CPA base64URLDecode:补 pad 后用 URL_SAFE(接受 padding)
     let padded = match parts[1].len() % 4 {
         2 => format!("{}==", parts[1]),
         3 => format!("{}=", parts[1]),
+        1 => return (String::new(), String::new()),
         _ => parts[1].to_string(),
     };
-    let payload_bytes = match engine.decode(padded.as_bytes()) {
-        Ok(b) => b,
-        Err(_) => match base64::engine::general_purpose::STANDARD.decode(padded.as_bytes()) {
-            Ok(b) => b,
-            Err(_) => return (String::new(), String::new()),
-        },
+    let Ok(payload_bytes) = base64::engine::general_purpose::URL_SAFE.decode(padded.as_bytes())
+    else {
+        return (String::new(), String::new());
     };
     let Ok(val) = serde_json::from_slice::<serde_json::Value>(&payload_bytes) else {
         return (String::new(), String::new());
@@ -189,5 +188,66 @@ mod tests {
         let (email, sub) = parse_jwt_identity(&token);
         assert_eq!(email, "test@example.com");
         assert_eq!(sub, "user-123");
+    }
+
+    #[test]
+    fn parse_jwt_identity_urlsafe_chars_and_padding() {
+        use base64::Engine;
+        // 对齐 Codex 回归:强制含 urlsafe 字符且需 padding
+        let payload = serde_json::json!({
+            "email": "t@e.com",
+            "sub": "user-1",
+            "k": String::from_utf8_lossy(&[0xff, 0xfe, 0xfd, 0x00, 0x7f]).to_string(),
+        });
+        let mut raw = serde_json::to_vec(&payload).unwrap();
+        while raw.len() % 3 != 1 {
+            raw.push(b'0');
+        }
+        // trailing junk breaks JSON — rebuild with n padding field
+        let enc = {
+            let mut n = 0usize;
+            loop {
+                let payload = serde_json::json!({
+                    "email": "t@e.com",
+                    "sub": "user-1",
+                    "k": String::from_utf8_lossy(&[0xff, 0xfe, 0xfd, 0x00, 0x7f]).to_string(),
+                    "n": n,
+                });
+                let raw = serde_json::to_vec(&payload).unwrap();
+                let enc = base64::engine::general_purpose::URL_SAFE_NO_PAD.encode(&raw);
+                if (enc.contains('-') || enc.contains('_')) && enc.len() % 4 != 0 {
+                    break enc;
+                }
+                n += 1;
+                assert!(n < 64);
+            }
+        };
+        let (email, sub) = parse_jwt_identity(&format!("h.{enc}.s"));
+        assert_eq!(email, "t@e.com");
+        assert_eq!(sub, "user-1");
+    }
+
+    #[test]
+    fn is_fresh_rejects_empty_or_bad_expired() {
+        let mut cred = XAICredential {
+            r#type: "xai".into(),
+            auth_kind: "oauth".into(),
+            access_token: "at".into(),
+            refresh_token: "rt".into(),
+            id_token: String::new(),
+            token_type: "Bearer".into(),
+            expires_in: 3600,
+            expired: String::new(),
+            last_refresh: String::new(),
+            email: "u@x.ai".into(),
+            sub: "sub".into(),
+            base_url: "https://cli-chat-proxy.grok.com/v1".into(),
+            token_endpoint: String::new(),
+            disabled: false,
+        };
+        let now = SystemTime::now();
+        assert!(!cred.is_fresh(now, 300));
+        cred.expired = "not-a-date".into();
+        assert!(!cred.is_fresh(now, 300));
     }
 }
