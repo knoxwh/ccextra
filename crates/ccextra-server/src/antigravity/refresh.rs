@@ -138,10 +138,10 @@ pub async fn ensure_credential_fresh_with_ua(
         cred.expired = "1970-01-01T00:00:00Z".into();
     }
 
-    if !usable(&cred, rejected_token) {
-        if refresh_if_needed(&mut cred, proxy_url, REFRESH_SKEW_SECS).await? {
-            dirty = true;
-        }
+    if !usable(&cred, rejected_token)
+        && refresh_if_needed(&mut cred, proxy_url, REFRESH_SKEW_SECS).await?
+    {
+        dirty = true;
     }
 
     if ensure_project_id(&mut cred, proxy_url, request_ua).await {

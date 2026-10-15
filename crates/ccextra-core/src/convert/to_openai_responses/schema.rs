@@ -207,7 +207,7 @@ fn is_numeric_bound_out_of_i64(raw_number: &str) -> bool {
                     IntErrorKind::PosOverflow | IntErrorKind::NegOverflow
                 ) {
                     return !exp_str.starts_with('-')
-                        && mantissa.trim_matches(|c| c == '0' || c == '.') != "";
+                        && !mantissa.trim_matches(|c| c == '0' || c == '.').is_empty();
                 }
                 return false;
             }

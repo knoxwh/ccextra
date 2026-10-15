@@ -91,25 +91,23 @@ pub fn content_is_replayable(content: &Value) -> bool {
             .unwrap_or("")
             .trim()
         {
-            "thinking" => {
+            "thinking"
                 if part
                     .get("signature")
                     .and_then(|v| v.as_str())
                     .map(str::trim)
-                    .is_some_and(|s| !s.is_empty())
-                {
-                    has_signed_thinking = true;
-                }
+                    .is_some_and(|s| !s.is_empty()) =>
+            {
+                has_signed_thinking = true;
             }
-            "tool_use" => {
+            "tool_use"
                 if part
                     .get("id")
                     .and_then(|v| v.as_str())
                     .map(str::trim)
-                    .is_some_and(|s| !s.is_empty())
-                {
-                    has_tool_use = true;
-                }
+                    .is_some_and(|s| !s.is_empty()) =>
+            {
+                has_tool_use = true;
             }
             _ => {}
         }
@@ -158,11 +156,11 @@ fn non_thinking_parts(content: &Value) -> Option<Vec<Value>> {
         {
             "thinking" | "redacted_thinking" => continue,
             "tool_use" => {
-                if part
+                if !part
                     .get("id")
                     .and_then(|v| v.as_str())
                     .map(str::trim)
-                    .is_none_or(|s| s.is_empty())
+                    .is_some_and(|s| !s.is_empty())
                 {
                     return None;
                 }
