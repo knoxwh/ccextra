@@ -11,7 +11,8 @@ use ccextra_core::convert::{
     convert_to_gemini_with_registry, convert_to_openai_chat_with, convert_to_openai_responses_with,
     is_antigravity_thought_signature_invalid, is_kimi_thinking_replay_model,
     is_thinking_signature_invalid, kimi_thinking_replay_model_family, sanitize_gpt_reasoning_items,
-    sanitize_passthrough_prompt, trim_encrypted_reasoning_items,
+    sanitize_openai_chat_after_payload, sanitize_passthrough_prompt,
+    trim_encrypted_reasoning_items,
 };
 use ccextra_core::normalize::{
     normalize_anthropic_full, normalize_anthropic_pretransform, normalize_target_post, TargetShape,
@@ -660,6 +661,11 @@ pub(crate) async fn prepare_message_request(
                 obj.remove(key);
             }
         }
+    }
+
+    // OpenAI Chat:payload 后再守卫(kimi 温度 / 非 qwen|glm 剥 tool_stream / MCT 键对齐)
+    if matches!(route.protocol, Protocol::OpenAiChat) {
+        sanitize_openai_chat_after_payload(&mut body_json, &outbound_model);
     }
 
     // 6. 对齐 StripPromptCacheRetention

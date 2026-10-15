@@ -5,6 +5,9 @@
 //! - Claude Code 剥掉非法 Anthropic 签名的 thinking 后，按下轮非 thinking 块指纹还原
 //! - 仅签名非空即可入库（不强制固定长度校验；长度门留给 signature.rs）
 //!
+//! **不挂 `openai_chat`**：chat 线走 `reasoning_content` 往返，空签门禁保持
+//! `to_openai_chat` 现状；完整 replay 需要独立设计，本模块刻意只服务 claude 直通。
+//!
 //! 纯函数，无 IO；server 层持有缓存。
 
 use serde_json::{json, Map, Value};

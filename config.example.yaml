@@ -136,7 +136,9 @@ providers:
   # 为每份有效凭证注入一个 xai provider(OpenAI Responses 协议)。
   # 凭证获取: ./ccextra xai-login → 写入 .cache/xai
 
-# Payload 参数覆盖(按模型名模式匹配)
+# Payload 参数覆盖(按模型名模式匹配;protocol 限定生效目标协议)
+# openai_chat 出站会在 payload 后再守卫:kimi 非法 temperature 剥掉;
+# tool_stream 仅保留 qwen/glm(百炼文档);gpt-5/o 等把 max_tokens 迁为 max_completion_tokens。
 payload:
   - models:
       - "*glm*"
@@ -145,6 +147,24 @@ payload:
     params:
       max_tokens: 32000
       temperature: 0.1
+
+  # tool_stream:百炼可选字段(默认 false,仅 stream=true);文档支持 Qwen/GLM,勿打到 kimi/doubao
+  # clear_thinking 仍偏智谱 Chat
+  - models:
+      - "*glm*"
+      - "*GLM*"
+      - "*qwen*"
+      - "*Qwen*"
+    protocol: openai_chat
+    params:
+      tool_stream: true
+
+  - models:
+      - "*glm*"
+      - "*GLM*"
+    protocol: openai_chat
+    params:
+      clear_thinking: false
 
   - models:
       - "*gpt*"

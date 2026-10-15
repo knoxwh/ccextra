@@ -429,6 +429,63 @@ fn normalize_kimi_temperature(openai: &mut serde_json::Map<String, Value>) {
     }
 }
 
+/// 百炼 `tool_stream` 支持族:Qwen / GLM(文档:非 OpenAI 标准,仅 stream=true 时可选;
+/// 默认 false)。kimi/doubao 等不支持,出站应剥掉。
+fn keeps_bailian_tool_stream(model_name: &str) -> bool {
+    let lower = model_name.trim().to_ascii_lowercase();
+    lower.contains("qwen") || lower.contains("glm")
+}
+
+/// payload 覆盖之后再跑一遍 OpenAI Chat 出站守卫。
+///
+/// - kimi:再跑 [`normalize_kimi_temperature`](防 payload 写回非法 temperature)
+/// - 非 qwen/glm:剥 `tool_stream`(百炼文档仅 Qwen/GLM 支持;其它上游可能拒未知键)
+/// - 需要 `max_completion_tokens` 的模型:把 payload 的 `max_tokens` 迁过去
+///   (语义对齐 CPA `NormalizeOpenAIMaxTokens`;双字段并存时以 payload 的
+///   `max_tokens` 为准覆盖 MCT,因为本函数专跑在 overrides 之后)
+///
+/// 不做 kimi thinking replay:账本只挂 `protocol:claude` 直通(Claude Code 剥签
+/// 场景)。`openai_chat` 走 `reasoning_content` 往返,空签门禁保持 convert 现状。
+pub fn sanitize_openai_chat_after_payload(body: &mut Value, upstream_model: &str) {
+    let Some(obj) = body.as_object_mut() else {
+        return;
+    };
+    if is_kimi_upstream_model(upstream_model) {
+        normalize_kimi_temperature(obj);
+    }
+    if !keeps_bailian_tool_stream(upstream_model) {
+        obj.remove("tool_stream");
+    }
+    // sampling_effort 只影响 temperature 能力,与 MCT 键选择无关;传空即可。
+    let use_mct = openai_chat_capabilities(upstream_model, "").use_max_completion_tokens;
+    normalize_openai_chat_max_tokens(obj, use_mct);
+}
+
+/// 对齐 CPA `NormalizeOpenAIMaxTokens`;payload 后以 `max_tokens` 覆盖 MCT。
+fn normalize_openai_chat_max_tokens(
+    openai: &mut serde_json::Map<String, Value>,
+    use_max_completion_tokens: bool,
+) {
+    let has_max_tokens = openai.contains_key("max_tokens");
+    let has_mct = openai.contains_key("max_completion_tokens");
+    if !has_max_tokens && !has_mct {
+        return;
+    }
+    if use_max_completion_tokens {
+        if has_max_tokens {
+            if let Some(val) = openai.remove("max_tokens") {
+                openai.insert("max_completion_tokens".into(), val);
+            }
+        }
+    } else if has_mct {
+        if has_max_tokens {
+            openai.remove("max_completion_tokens");
+        } else if let Some(val) = openai.remove("max_completion_tokens") {
+            openai.insert("max_tokens".into(), val);
+        }
+    }
+}
+
 fn is_date_only(s: &str) -> bool {
     let bytes = s.as_bytes();
     if bytes.len() != 10 || bytes[4] != b'-' || bytes[7] != b'-' {
@@ -2282,5 +2339,63 @@ IMPORTANT: Assist with authorized security testing.
         assert_eq!(body["reasoning_effort"], "medium");
         assert!(body.get("thinking").is_none());
         assert_eq!(body["temperature"], 0.6);
+    }
+
+    #[test]
+    fn test_sanitize_after_payload_strips_illegal_kimi_temperature() {
+        let mut body = json!({
+            "model": "kimi/kimi-k3",
+            "thinking": {"type": "enabled", "effort": "high"},
+            "temperature": 0.2,
+            "max_tokens": 32000,
+            "tool_stream": true
+        });
+        sanitize_openai_chat_after_payload(&mut body, "kimi/kimi-k3");
+        assert!(body.get("temperature").is_none());
+        assert!(body.get("tool_stream").is_none());
+        assert_eq!(body["max_tokens"], 32000);
+    }
+
+    #[test]
+    fn test_sanitize_after_payload_keeps_qwen_glm_tool_stream() {
+        for model in ["ZHIPU/GLM-5.3-Flash", "qwen3.8-max", "Qwen-Plus"] {
+            let mut body = json!({
+                "model": model,
+                "temperature": 0.2,
+                "tool_stream": true,
+                "max_tokens": 32000
+            });
+            sanitize_openai_chat_after_payload(&mut body, model);
+            assert_eq!(body["tool_stream"], true, "{model}");
+            assert_eq!(body["temperature"], 0.2, "{model}");
+            assert_eq!(body["max_tokens"], 32000, "{model}");
+        }
+    }
+
+    #[test]
+    fn test_sanitize_after_payload_strips_tool_stream_for_doubao() {
+        let mut body = json!({
+            "model": "doubao-seed-2-1-pro",
+            "tool_stream": true,
+            "max_tokens": 32000
+        });
+        sanitize_openai_chat_after_payload(&mut body, "doubao-seed-2-1-pro");
+        assert!(body.get("tool_stream").is_none());
+        assert_eq!(body["max_tokens"], 32000);
+    }
+
+    #[test]
+    fn test_sanitize_after_payload_moves_max_tokens_for_gpt5() {
+        // convert 已写 MCT 后 payload 又注入 max_tokens:以 payload 覆盖迁到 MCT
+        let mut body = json!({
+            "model": "gpt-5.2",
+            "max_completion_tokens": 1024,
+            "max_tokens": 32000,
+            "tool_stream": true
+        });
+        sanitize_openai_chat_after_payload(&mut body, "gpt-5.2");
+        assert_eq!(body["max_completion_tokens"], 32000);
+        assert!(body.get("max_tokens").is_none());
+        assert!(body.get("tool_stream").is_none());
     }
 }

@@ -63,7 +63,9 @@ pub use signature::{
     format_claude_signature_value, is_valid_gpt_reasoning_signature,
     is_valid_grok_encrypted_content, model_group,
 };
-pub use to_openai_chat::{convert_to_openai_chat, convert_to_openai_chat_with};
+pub use to_openai_chat::{
+    convert_to_openai_chat, convert_to_openai_chat_with, sanitize_openai_chat_after_payload,
+};
 pub use to_openai_responses::{
     convert_to_openai_responses, convert_to_openai_responses_with, is_thinking_signature_invalid,
     sanitize_gpt_reasoning_items, trim_encrypted_reasoning_items,
