@@ -26,6 +26,9 @@ struct CleanOptions {
     /// Gemini 直连 parametersJsonSchema 载体:保留 additionalProperties 与
     /// 标准约束关键字(对齐 CPA CleanJSONSchemaForGeminiJSONSchema / b532db9c)
     preserve_json_schema_constraints: bool,
+    /// 多分支 anyOf/oneOf 强制展平为最强单分支(对齐 CPA flattenMultiBranchUnions /
+    /// CleanJSONSchemaForAntigravityClaudeTool / 5efe9758);仅 AG Claude 工具参数启用
+    flatten_multi_branch_unions: bool,
 }
 
 /// 占位 reason 属性的描述文本(对齐 CPA placeholderReasonDescription)
@@ -70,6 +73,31 @@ pub fn clean_nested_schema_for_antigravity(schema: &Value) -> Value {
     }
 }
 
+/// Antigravity Claude 工具 parameters 清洗(对齐 CPA CleanJSONSchemaForAntigravityClaudeTool /
+/// 5efe9758):在 AG Tool 清洗基础上强制展平多分支 anyOf/oneOf。
+pub fn clean_json_schema_for_antigravity_claude_tool(schema: &Value) -> Value {
+    clean_json_schema(
+        schema,
+        CleanOptions {
+            add_placeholder: true,
+            add_missing_array_items: true,
+            antigravity_semantics: true,
+            flatten_multi_branch_unions: true,
+            ..Default::default()
+        },
+    )
+}
+
+/// 对齐 CPA cleanNestedSchema + CleanJSONSchemaForAntigravityClaudeTool。
+pub fn clean_nested_schema_for_antigravity_claude(schema: &Value) -> Value {
+    let wrapped = json!({"schema": schema});
+    let cleaned = clean_json_schema_for_antigravity_claude_tool(&wrapped);
+    match cleaned.get("schema") {
+        Some(inner) => inner.clone(),
+        None => clean_json_schema_for_antigravity_claude_tool(schema),
+    }
+}
+
 /// 主编排(对齐 cleanJSONSchema 四阶段)
 fn clean_json_schema(schema: &Value, opts: CleanOptions) -> Value {
     let mut s = schema.clone();
@@ -98,7 +126,11 @@ fn clean_json_schema(schema: &Value, opts: CleanOptions) -> Value {
     // Phase 2: 展平复杂结构
     merge_conditionals(&mut s);
     merge_all_of(&mut s);
-    flatten_any_of_one_of(&mut s, opts.preserve_json_schema_constraints);
+    flatten_any_of_one_of(
+        &mut s,
+        opts.preserve_json_schema_constraints,
+        opts.flatten_multi_branch_unions,
+    );
     flatten_type_arrays(&mut s, opts.antigravity_semantics);
 
     // Phase 3: 清理
@@ -616,12 +648,22 @@ fn merge_missing_schema(map: &mut Map<String, Value>, field: &str, incoming: &Va
 /// 对齐 CPA flattenAnyOfOneOf(a0fd8448):多分支 anyOf/oneOf 保留;
 /// 单分支 / [T,null] 仍投影; native Schema 载体将 oneOf→anyOf;
 /// required-only 分支用父 properties 具化后留在 union 里。
-fn flatten_any_of_one_of(schema: &mut Value, preserve_one_of: bool) {
-    flatten_any_of_one_of_at(schema, &mut Vec::new(), preserve_one_of);
+fn flatten_any_of_one_of(schema: &mut Value, preserve_one_of: bool, flatten_multi_branch: bool) {
+    flatten_any_of_one_of_at(
+        schema,
+        &mut Vec::new(),
+        preserve_one_of,
+        flatten_multi_branch,
+    );
 }
 
 /// 子节点优先(对齐 CPA sortByDepth 深路径先处理),再处理当前节点的 union。
-fn flatten_any_of_one_of_at(value: &mut Value, path: &mut Vec<String>, preserve_one_of: bool) {
+fn flatten_any_of_one_of_at(
+    value: &mut Value,
+    path: &mut Vec<String>,
+    preserve_one_of: bool,
+    flatten_multi_branch: bool,
+) {
     match value {
         Value::Object(map) => {
             let keys: Vec<String> = map.keys().cloned().collect();
@@ -629,20 +671,25 @@ fn flatten_any_of_one_of_at(value: &mut Value, path: &mut Vec<String>, preserve_
                 if let Some(child) = map.get_mut(&key) {
                     if matches!(child, Value::Object(_) | Value::Array(_)) {
                         path.push(key);
-                        flatten_any_of_one_of_at(child, path, preserve_one_of);
+                        flatten_any_of_one_of_at(
+                            child,
+                            path,
+                            preserve_one_of,
+                            flatten_multi_branch,
+                        );
                         path.pop();
                     }
                 }
             }
             if !is_property_definition(path) {
-                process_union_keywords(map, preserve_one_of);
+                process_union_keywords(map, preserve_one_of, flatten_multi_branch);
             }
         }
         Value::Array(arr) => {
             for (i, item) in arr.iter_mut().enumerate() {
                 if matches!(item, Value::Object(_) | Value::Array(_)) {
                     path.push(i.to_string());
-                    flatten_any_of_one_of_at(item, path, preserve_one_of);
+                    flatten_any_of_one_of_at(item, path, preserve_one_of, flatten_multi_branch);
                     path.pop();
                 }
             }
@@ -772,7 +819,11 @@ fn merge_parent_description_into(selected: &mut Map<String, Value>, parent_desc:
     selected.insert("description".into(), Value::String(merged));
 }
 
-fn process_union_keywords(map: &mut Map<String, Value>, preserve_one_of: bool) {
+fn process_union_keywords(
+    map: &mut Map<String, Value>,
+    preserve_one_of: bool,
+    flatten_multi_branch: bool,
+) {
     // oneOf 先于 anyOf(对齐 CPA paths 收集顺序),以便 sibling 时把 oneOf 收成 hint
     for key in ["oneOf", "anyOf"] {
         let Some(Value::Array(arr)) = map.get(key) else {
@@ -784,7 +835,12 @@ fn process_union_keywords(map: &mut Map<String, Value>, preserve_one_of: bool) {
         let arr = arr.clone();
 
         // native Schema 同时有 anyOf+oneOf:保留 anyOf,oneOf 搬 description hint
-        if key == "oneOf" && !preserve_one_of && map.get("anyOf").is_some_and(|v| v.is_array()) {
+        // flatten_multi_branch 时跳过(对齐 CPA 5efe9758)
+        if key == "oneOf"
+            && !flatten_multi_branch
+            && !preserve_one_of
+            && map.get("anyOf").is_some_and(|v| v.is_array())
+        {
             append_hint(map, &format!("oneOf: {}", Value::Array(arr)));
             map.shift_remove(key);
             continue;
@@ -792,9 +848,15 @@ fn process_union_keywords(map: &mut Map<String, Value>, preserve_one_of: bool) {
 
         let parent_props = map.get("properties").and_then(|p| p.as_object());
         let (non_null_items, has_null, has_filtered) = partition_union_branches(&arr, parent_props);
+        // 上游已剥 null 并写 nullable:true 时继承(对齐 CPA 5efe9758)
+        let nullable = has_null
+            || map
+                .get("nullable")
+                .and_then(|v| v.as_bool())
+                .unwrap_or(false);
 
-        // 多分支保留;!preserve_one_of 时 oneOf→anyOf
-        if non_null_items.len() >= 2 {
+        // 多分支保留; flatten_multi_branch 时落到最强单分支展平(AG Claude)
+        if non_null_items.len() >= 2 && !flatten_multi_branch {
             let target_key = if key == "oneOf" && !preserve_one_of {
                 "anyOf"
             } else {
@@ -806,7 +868,7 @@ fn process_union_keywords(map: &mut Map<String, Value>, preserve_one_of: bool) {
                     map.shift_remove(key);
                 }
             }
-            if has_null {
+            if nullable {
                 map.insert("nullable".into(), Value::Bool(true));
                 append_hint(map, "(nullable)");
             }
@@ -827,7 +889,7 @@ fn process_union_keywords(map: &mut Map<String, Value>, preserve_one_of: bool) {
                     merge_missing_schema(parent_props_mut, &k, &v);
                 }
             }
-            if has_null {
+            if nullable {
                 map.insert("nullable".into(), Value::Bool(true));
             }
             if !map.contains_key("type") {
@@ -838,7 +900,7 @@ fn process_union_keywords(map: &mut Map<String, Value>, preserve_one_of: bool) {
         }
 
         if non_null_items.is_empty() {
-            if !has_null {
+            if !nullable {
                 map.shift_remove(key);
                 continue;
             }
@@ -856,7 +918,7 @@ fn process_union_keywords(map: &mut Map<String, Value>, preserve_one_of: bool) {
             continue;
         }
 
-        // 单非空分支:投影为该分支(对齐 CPA 取 nonNullItems[0],非 selectBest)
+        // 单非空分支,或 flatten_multi_branch 下多分支:投影为最强分支
         let parent_desc = map
             .get("description")
             .and_then(|d| d.as_str())
@@ -864,7 +926,7 @@ fn process_union_keywords(map: &mut Map<String, Value>, preserve_one_of: bool) {
             .to_string();
 
         let mut candidate_items = arr.clone();
-        if has_filtered {
+        if has_filtered || non_null_items.len() >= 2 {
             candidate_items = non_null_items.clone();
             if has_null {
                 candidate_items.push(json!({"type": "null"}));
@@ -872,10 +934,19 @@ fn process_union_keywords(map: &mut Map<String, Value>, preserve_one_of: bool) {
         }
         let (_, all_types) = select_best(&candidate_items);
 
-        let Some(Value::Object(mut selected)) = non_null_items.into_iter().next() else {
+        let selected_value = if non_null_items.len() >= 2 {
+            let (best_idx, _) = select_best(&non_null_items);
+            non_null_items
+                .get(best_idx)
+                .cloned()
+                .unwrap_or_else(|| non_null_items[0].clone())
+        } else {
+            non_null_items[0].clone()
+        };
+        let Value::Object(mut selected) = selected_value else {
             continue;
         };
-        if has_null {
+        if nullable {
             selected.insert("nullable".into(), Value::Bool(true));
         }
         merge_parent_description_into(&mut selected, &parent_desc);
@@ -884,7 +955,7 @@ fn process_union_keywords(map: &mut Map<String, Value>, preserve_one_of: bool) {
                 &mut selected,
                 &format!("Accepts: {}", all_types.join(" | ")),
             );
-        } else if has_null {
+        } else if nullable {
             append_hint(&mut selected, "(nullable)");
         }
         *map = selected;
@@ -2235,6 +2306,84 @@ mod tests {
         assert_eq!(
             gem["properties"]["item"]["anyOf"].as_array().unwrap().len(),
             3
+        );
+    }
+
+    #[test]
+    fn test_antigravity_claude_flattens_multibranch_anyof() {
+        // 对齐 CPA 5efe9758:AG Claude 工具清洗展平多分支 → 最强 object 分支
+        let input = json!({
+            "type": "object",
+            "properties": {
+                "item": {
+                    "anyOf": [
+                        {"type": "string"},
+                        {
+                            "type": "object",
+                            "properties": {"image": {"type": "string"}},
+                            "required": ["image"]
+                        },
+                        {
+                            "type": "object",
+                            "properties": {"audio": {"type": "string"}},
+                            "required": ["audio"]
+                        }
+                    ]
+                }
+            },
+            "required": ["item"]
+        });
+        let claude = clean_json_schema_for_antigravity_claude_tool(&input);
+        let item = &claude["properties"]["item"];
+        assert!(item.get("anyOf").is_none(), "{item}");
+        assert!(item.get("oneOf").is_none(), "{item}");
+        assert_eq!(item["type"], "object");
+        assert!(
+            item["properties"].get("image").is_some() || item["properties"].get("audio").is_some(),
+            "{item}"
+        );
+        let desc = item
+            .get("description")
+            .and_then(|d| d.as_str())
+            .unwrap_or("");
+        assert!(desc.contains("Accepts:"), "{desc}");
+        let again = clean_json_schema_for_antigravity_claude_tool(&claude);
+        assert!(again["properties"]["item"].get("anyOf").is_none());
+    }
+
+    #[test]
+    fn test_antigravity_claude_flattens_oneof_and_inherits_nullable() {
+        // 对齐 CPA 5efe9758:oneOf 多分支展平;已有 nullable 继承
+        let input = json!({
+            "type": "object",
+            "properties": {
+                "value": {
+                    "oneOf": [
+                        {"type": "string"},
+                        {"type": "integer"}
+                    ],
+                    "nullable": true
+                }
+            }
+        });
+        let out = clean_json_schema_for_antigravity_claude_tool(&input);
+        let value = &out["properties"]["value"];
+        assert!(
+            value.get("oneOf").is_none() && value.get("anyOf").is_none(),
+            "{value}"
+        );
+        assert_eq!(value["type"], "string");
+        assert_eq!(value["nullable"], true);
+        let desc = value
+            .get("description")
+            .and_then(|d| d.as_str())
+            .unwrap_or("");
+        assert!(desc.contains("Accepts:"), "{desc}");
+
+        let ag = clean_json_schema_for_antigravity(&input);
+        assert_eq!(
+            ag["properties"]["value"]["anyOf"].as_array().unwrap().len(),
+            2
         );
     }
 

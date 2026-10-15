@@ -43,8 +43,9 @@ pub use gemini_response::{
     force_finalize_gemini_stream, GeminiStreamState,
 };
 pub use gemini_schema::{
-    clean_json_schema_for_antigravity, clean_json_schema_for_gemini,
-    clean_nested_schema_for_antigravity,
+    clean_json_schema_for_antigravity, clean_json_schema_for_antigravity_claude_tool,
+    clean_json_schema_for_gemini, clean_nested_schema_for_antigravity,
+    clean_nested_schema_for_antigravity_claude,
 };
 pub use kimi_thinking_replay::{
     content_from_message_response, content_is_replayable, is_kimi_thinking_replay_model,

@@ -7,7 +7,10 @@ use std::sync::OnceLock;
 use regex::Regex;
 
 use super::antigravity_tools::antigravity_tool_name_to_upstream;
-use super::gemini_schema::{clean_json_schema_for_gemini, clean_nested_schema_for_antigravity};
+use super::gemini_schema::{
+    clean_json_schema_for_gemini, clean_nested_schema_for_antigravity,
+    clean_nested_schema_for_antigravity_claude,
+};
 use super::is_ignorable_system_text;
 use super::message_convert::convert_messages;
 use super::tool_sanitize::{sanitize_function_name, sanitized_function_name_map};
@@ -49,7 +52,9 @@ pub fn convert_to_gemini_with_registry(
     let (short_to_original, original_to_short) = match body.get("tools").and_then(|t| t.as_array())
     {
         Some(tools_arr) => {
-            let (gemini_tools, short_map) = convert_tool_definitions(tools_arr, flavor);
+            let is_claude_target = upstream_model.to_lowercase().contains("claude");
+            let (gemini_tools, short_map) =
+                convert_tool_definitions(tools_arr, flavor, is_claude_target);
             if !gemini_tools.is_empty() {
                 gemini["tools"] = serde_json::json!([{ "functionDeclarations": gemini_tools }]);
             }
@@ -426,9 +431,11 @@ fn ensure_gemini_trailing_user_content(contents: &mut Vec<Value>) {
 /// web_search 服务端工具剥离(对齐 CPA:无 input_schema 自然排除)
 ///
 /// 返回 (转换后的定义数组, 短名→原名映射)
+/// `is_claude_target`:Antigravity Claude 时展平 parameters 多分支 anyOf/oneOf(对齐 CPA 5efe9758)
 pub fn convert_tool_definitions(
     tools: &[Value],
     flavor: SchemaFlavor,
+    is_claude_target: bool,
 ) -> (Vec<Value>, HashMap<String, String>) {
     let mut gemini_tools = Vec::new();
     let mut short_to_original = HashMap::new();
@@ -478,6 +485,10 @@ pub fn convert_tool_definitions(
         if let Some(input_schema) = tool.get("input_schema") {
             let mut schema = match flavor {
                 SchemaFlavor::Gemini => clean_json_schema_for_gemini(input_schema),
+                // 对齐 CPA 5efe9758:仅 AG+claude 参数 schema 展平多分支 union
+                SchemaFlavor::Antigravity if is_claude_target => {
+                    clean_nested_schema_for_antigravity_claude(input_schema)
+                }
                 SchemaFlavor::Antigravity => clean_nested_schema_for_antigravity(input_schema),
             };
 
@@ -1174,7 +1185,8 @@ IMPORTANT: Assist with authorized security testing.
                 "properties": {"path": {"type": "STRING"}}
             }
         })];
-        let (gemini_tools, short_map) = convert_tool_definitions(&tools, SchemaFlavor::Gemini);
+        let (gemini_tools, short_map) =
+            convert_tool_definitions(&tools, SchemaFlavor::Gemini, false);
 
         assert_eq!(gemini_tools.len(), 1);
         assert_eq!(gemini_tools[0]["name"], "Read");
@@ -1204,7 +1216,7 @@ IMPORTANT: Assist with authorized security testing.
                 "required": ["command", "description"]
             }
         })];
-        let (gemini_tools, _) = convert_tool_definitions(&tools, SchemaFlavor::Gemini);
+        let (gemini_tools, _) = convert_tool_definitions(&tools, SchemaFlavor::Gemini, false);
 
         let schema = &gemini_tools[0]["parametersJsonSchema"];
         let props = schema["properties"].as_object().unwrap();
@@ -1237,7 +1249,7 @@ IMPORTANT: Assist with authorized security testing.
                 "required": ["query", "description"]
             }
         })];
-        let (gemini_tools, _) = convert_tool_definitions(&tools, SchemaFlavor::Gemini);
+        let (gemini_tools, _) = convert_tool_definitions(&tools, SchemaFlavor::Gemini, false);
 
         let schema = &gemini_tools[0]["parametersJsonSchema"];
         let props = schema["properties"].as_object().unwrap();
@@ -1253,12 +1265,54 @@ IMPORTANT: Assist with authorized security testing.
     }
 
     #[test]
+    fn test_convert_tool_definitions_claude_flattens_multibranch() {
+        // 对齐 CPA 5efe9758:仅 AG+claude 展平 parameters 多分支 union
+        let tools = vec![json!({
+            "name": "submit",
+            "description": "d",
+            "input_schema": {
+                "type": "object",
+                "properties": {
+                    "item": {
+                        "anyOf": [
+                            {"type": "string"},
+                            {
+                                "type": "object",
+                                "properties": {"image": {"type": "string"}},
+                                "required": ["image"]
+                            }
+                        ]
+                    }
+                },
+                "required": ["item"]
+            }
+        })];
+        let (claude_tools, _) = convert_tool_definitions(&tools, SchemaFlavor::Antigravity, true);
+        let schema = &claude_tools[0]["parametersJsonSchema"];
+        assert!(
+            schema["properties"]["item"].get("anyOf").is_none(),
+            "{schema}"
+        );
+        assert_eq!(schema["properties"]["item"]["type"], "object");
+
+        let (ag_tools, _) = convert_tool_definitions(&tools, SchemaFlavor::Antigravity, false);
+        assert_eq!(
+            ag_tools[0]["parametersJsonSchema"]["properties"]["item"]["anyOf"]
+                .as_array()
+                .unwrap()
+                .len(),
+            2
+        );
+    }
+
+    #[test]
     fn test_convert_tool_definitions_sanitize_conflict() {
         let tools = vec![
             json!({"name": "tool-name", "input_schema": {"type": "object"}}),
             json!({"name": "tool_name", "input_schema": {"type": "object"}}),
         ];
-        let (gemini_tools, short_map) = convert_tool_definitions(&tools, SchemaFlavor::Gemini);
+        let (gemini_tools, short_map) =
+            convert_tool_definitions(&tools, SchemaFlavor::Gemini, false);
         // 对齐 CPA:"-" 保留,不再冲突
         assert_eq!(gemini_tools[0]["name"], "tool-name");
         assert_eq!(gemini_tools[1]["name"], "tool_name");
