@@ -645,6 +645,23 @@ pub(crate) async fn prepare_message_request(
         }
     }
 
+    // Grok Responses:对齐 CPA xai_executor 明确 DeleteBytes 的字段;
+    // 保留 temperature/top_p/max_output_tokens(CPA preserveXAIResponsesOutputControls /
+    // 原生 ModelEntry 可带采样)。须在 payload_overrides 之后。
+    if matches!(route.protocol, Protocol::OpenAiResponses) && is_grok_model(&outbound_model) {
+        if let Some(obj) = body_json.as_object_mut() {
+            for key in [
+                "previous_response_id",
+                "prompt_cache_retention",
+                "safety_identifier",
+                "stream_options",
+                "stop",
+            ] {
+                obj.remove(key);
+            }
+        }
+    }
+
     // 6. 对齐 StripPromptCacheRetention
     if !matches!(route.protocol, Protocol::Claude) {
         body_json
