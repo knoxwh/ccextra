@@ -927,10 +927,10 @@ models:
         "safety_identifier",
         "stream_options",
         "prompt_cache_retention",
+        "temperature",
     ] {
         assert!(body.get(key).is_none(), "{key} 不应发往 GPT Responses");
     }
-    assert_eq!(body["temperature"], 0.1);
 }
 
 #[tokio::test]
@@ -2624,9 +2624,10 @@ async fn test_responses_payload_tier_is_serialized_before_input() {
     let response = app(state).oneshot(request).await.unwrap();
     assert_eq!(response.status(), StatusCode::OK);
     let raw = captured.raw_body.lock().unwrap().clone().unwrap();
-    assert!(std::str::from_utf8(&raw).unwrap().starts_with(
-        r#"{"model":"gpt-5","stream":false,"service_tier":"priority","instructions":"#
-    ));
+    // GPT adapter 路径省略空 instructions;路由字段仍须先于 input 序列化
+    assert!(std::str::from_utf8(&raw)
+        .unwrap()
+        .starts_with(r#"{"model":"gpt-5","stream":false,"service_tier":"priority""#));
     assert_eq!(captured.body()["service_tier"], "priority");
 }
 

@@ -612,13 +612,32 @@ pub(crate) async fn prepare_message_request(
 
     if matches!(route.protocol, Protocol::OpenAiResponses) && is_gpt_model(&outbound_model) {
         if let Some(obj) = body_json.as_object_mut() {
+            // ChatGPT Codex OAuth 拒收采样/兼容字段(对齐 CPA delete + sub2api
+            // openAICodexOAuthUnsupportedFields);须在 payload_overrides 之后剥,
+            // 否则 *gpt* 规则注入的 temperature 等会打到订阅上游 400。
             for key in [
                 "previous_response_id",
                 "generate",
                 "safety_identifier",
                 "stream_options",
+                "max_output_tokens",
+                "max_completion_tokens",
+                "temperature",
+                "top_p",
+                "frequency_penalty",
+                "presence_penalty",
+                "chat_template_kwargs",
+                "user",
+                "metadata",
+                "truncation",
+                "stop_sequences",
+                "background",
             ] {
                 obj.remove(key);
+            }
+            // 空 instructions 对齐 CPA DeleteBytes:省略而非发 ""
+            if obj.get("instructions").and_then(|v| v.as_str()) == Some("") {
+                obj.remove("instructions");
             }
         }
         if sanitize_gpt_reasoning_items(&mut body_json) {

@@ -148,6 +148,7 @@ payload:
 
   - models:
       - "*gpt*"
+    protocol: openai_chat
     params:
       temperature: 0.1
 
