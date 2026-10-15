@@ -809,7 +809,7 @@ pub fn maybe_observe_request_drift(
     headers: &HeaderMap,
     body: &Value,
     kind: ApiKind,
-) {
+) -> Option<String> {
     maybe_observe_request_drift_with(
         enabled,
         state,
@@ -817,7 +817,7 @@ pub fn maybe_observe_request_drift(
         body,
         kind,
         DriftObserveOptions::default(),
-    );
+    )
 }
 
 /// drift 观测可选开关。默认全关：热路径成本与今日等价。
@@ -835,21 +835,23 @@ pub fn maybe_observe_request_drift_with(
     body: &Value,
     kind: ApiKind,
     options: DriftObserveOptions,
-) {
+) -> Option<String> {
     if !enabled {
-        return;
+        return None;
     }
     if is_ancillary_request(body, kind) {
-        return;
+        return None;
     }
     let identity = derive_session_key(headers, body, kind);
     // 不稳定父级：在哈希之前跳过，避免每请求 SHA-256 + LRU 写入。
     if !is_stable_parent_bucket(&identity.parent) {
         state.note_unstable_parent(&identity.parent);
-        return;
+        return None;
     }
     let hash = compute_structural_hash_with(body, kind, options);
+    let parent = identity.parent.clone();
     observe_drift(state, &identity, hash);
+    Some(parent)
 }
 
 /// 用上游 `cache_read` / `cache_creation` 对照先前父级结构漂移（O(1) pending 弹出）。

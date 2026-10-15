@@ -5,7 +5,9 @@ use axum::{
     response::Response,
 };
 use bytes::Bytes;
-use ccextra_core::cache_stabilization::{maybe_observe_request_drift, DriftApiKind};
+use ccextra_core::cache_stabilization::{
+    maybe_observe_request_drift_with, observe_cache_usage, DriftApiKind, DriftObserveOptions,
+};
 use ccextra_core::convert::{
     clamp_passthrough_effort, convert_passthrough, convert_to_antigravity_with,
     convert_to_gemini_with_registry, convert_to_openai_chat_with, convert_to_openai_responses_with,
@@ -182,6 +184,7 @@ struct RelayParams {
     )>,
     signature_model: Option<Arc<str>>,
     token_scope: Option<crate::http::session_tokens::TokenCacheScope>,
+    drift_usage_scope: Option<crate::http::session_tokens::DriftUsageScope>,
 }
 
 /// 按协议旁路提取 replay：Responses 用 StreamReplayExtractor；
@@ -192,6 +195,11 @@ where
 {
     let stream =
         crate::http::session_tokens::tap_input_tokens(stream, params.protocol, params.token_scope);
+    let stream = crate::http::session_tokens::tap_drift_cache_usage(
+        stream,
+        params.protocol,
+        params.drift_usage_scope,
+    );
     if let Some((cache, key, request_fingerprint)) = params.replay_scope {
         let mut extractor = StreamReplayExtractor::new(cache, key, request_fingerprint);
         let tapped = stream.inspect(move |result| {
@@ -327,6 +335,8 @@ pub(crate) struct PreparedMessageRequest {
     )>,
     pub signature_model: Option<Arc<str>>,
     pub token_scope: Option<crate::http::session_tokens::TokenCacheScope>,
+    /// drift 开启且父级稳定时：响应路径关联 cache usage（与 token_scope 分离）
+    pub drift_usage_scope: Option<crate::http::session_tokens::DriftUsageScope>,
 }
 
 pub(crate) struct ExecutedUpstream {
@@ -344,6 +354,7 @@ pub(crate) async fn prepare_message_request(
 ) -> Result<PreparedMessageRequest, AppError> {
     let normalize_enabled = config_snapshot.runtime.normalize.enabled;
     let drift_enabled = config_snapshot.runtime.normalize.drift_detector;
+    let mut drift_parent_for_usage: Option<String> = None;
     let log_request_body = config_snapshot.runtime.logging.request_body;
     let thinking_registry = &config_snapshot.runtime.thinking_registry;
     let request_id = headers
@@ -455,12 +466,15 @@ pub(crate) async fn prepare_message_request(
                 }
             }
             // drift 仅观测：sanitize/effort 之后，避免计费指纹造成假 system 漂移
-            maybe_observe_request_drift(
+            drift_parent_for_usage = maybe_observe_request_drift_with(
                 drift_enabled,
                 &state.drift,
                 headers,
                 &body_json,
                 DriftApiKind::Anthropic,
+                DriftObserveOptions {
+                    tools_description: config_snapshot.runtime.normalize.drift_tools_description,
+                },
             );
         }
         Protocol::OpenAiChat => {
@@ -469,12 +483,15 @@ pub(crate) async fn prepare_message_request(
                 normalize_target_post(&mut body_json, TargetShape::OpenAiChat, request_id);
             }
             // drift 仅观测：转换 + post-normalize 之后（与 normalize.enabled 独立）
-            maybe_observe_request_drift(
+            drift_parent_for_usage = maybe_observe_request_drift_with(
                 drift_enabled,
                 &state.drift,
                 headers,
                 &body_json,
                 DriftApiKind::OpenAiChat,
+                DriftObserveOptions {
+                    tools_description: config_snapshot.runtime.normalize.drift_tools_description,
+                },
             );
         }
         Protocol::OpenAiResponses => {
@@ -490,12 +507,15 @@ pub(crate) async fn prepare_message_request(
                 normalize_target_post(&mut body_json, TargetShape::OpenAiResponses, request_id);
             }
             // drift 仅观测：post-normalize 之后、replay 注入之前
-            maybe_observe_request_drift(
+            drift_parent_for_usage = maybe_observe_request_drift_with(
                 drift_enabled,
                 &state.drift,
                 headers,
                 &body_json,
                 DriftApiKind::OpenAiResponses,
+                DriftObserveOptions {
+                    tools_description: config_snapshot.runtime.normalize.drift_tools_description,
+                },
             );
             if let Some(sess) = cc_session.as_deref() {
                 let key = format!("{}:{}", route.upstream_model, sess);
@@ -1018,6 +1038,7 @@ pub(crate) async fn prepare_message_request(
         signature_model,
         token_scope: session_id
             .map(|session| (Arc::clone(&state.last_input_tokens), session.to_string())),
+        drift_usage_scope: drift_parent_for_usage.map(|parent| (state.drift.clone(), parent)),
     })
 }
 
@@ -1114,6 +1135,7 @@ pub(crate) async fn execute_upstream_request(
                     kimi_replay_scope: None,
                     signature_model: prepared.signature_model.clone(),
                     token_scope: prepared.token_scope.clone(),
+                    drift_usage_scope: prepared.drift_usage_scope.clone(),
                 },
             );
             // 首帧只认业务帧:跳过心跳注释帧,防 keepalive 骗过错误检测提前提交 200
@@ -1387,6 +1409,7 @@ pub(crate) async fn deliver_response(
                         kimi_replay_scope: prepared.kimi_replay_scope.clone(),
                         signature_model: prepared.signature_model.clone(),
                         token_scope: prepared.token_scope.clone(),
+                        drift_usage_scope: prepared.drift_usage_scope.clone(),
                     },
                 )
             }
@@ -1423,6 +1446,45 @@ pub(crate) async fn deliver_response(
             if matches!(prepared.route.protocol, Protocol::Claude) {
                 if let Ok(v) = serde_json::from_slice::<Value>(&body_bytes) {
                     cache.store_from_message_response(key, &v);
+                }
+            }
+        }
+        if let Some((drift, parent)) = prepared.drift_usage_scope.as_ref() {
+            if let Ok(v) = serde_json::from_slice::<Value>(&body_bytes) {
+                let (cache_read, cache_creation) = match prepared.route.protocol {
+                    Protocol::Claude => (
+                        v.pointer("/usage/cache_read_input_tokens")
+                            .and_then(|t| t.as_i64())
+                            .unwrap_or(0),
+                        v.pointer("/usage/cache_creation_input_tokens")
+                            .and_then(|t| t.as_i64())
+                            .unwrap_or(0),
+                    ),
+                    Protocol::OpenAiChat => (
+                        v.pointer("/usage/prompt_tokens_details/cached_tokens")
+                            .and_then(|t| t.as_i64())
+                            .unwrap_or(0),
+                        v.pointer("/usage/prompt_tokens_details/cache_write_tokens")
+                            .or_else(|| v.pointer("/usage/prompt_tokens_details/cache_creation_tokens"))
+                            .and_then(|t| t.as_i64())
+                            .unwrap_or(0),
+                    ),
+                    Protocol::OpenAiResponses => (
+                        v.pointer("/usage/input_tokens_details/cached_tokens")
+                            .and_then(|t| t.as_i64())
+                            .unwrap_or(0),
+                        v.pointer("/usage/input_tokens_details/cache_write_tokens")
+                            .or_else(|| v.pointer("/usage/input_tokens_details/cache_creation_tokens"))
+                            .and_then(|t| t.as_i64())
+                            .unwrap_or(0),
+                    ),
+                    _ => (0, 0),
+                };
+                if matches!(
+                    prepared.route.protocol,
+                    Protocol::Claude | Protocol::OpenAiChat | Protocol::OpenAiResponses
+                ) {
+                    observe_cache_usage(drift, parent, cache_read, cache_creation);
                 }
             }
         }

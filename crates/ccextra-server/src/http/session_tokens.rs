@@ -61,6 +61,119 @@ where
     }
 }
 
+
+pub(crate) type DriftUsageScope = (
+    ccextra_core::cache_stabilization::DriftState,
+    String, // stable parent bucket
+);
+
+/// 旁路观测上游 cache_read / cache_creation，关联 drift pending。
+/// `scope == None` 时零成本透传（不解析）。不改写 `tap_input_tokens`。
+pub(crate) fn tap_drift_cache_usage<S>(
+    stream: S,
+    protocol: ccextra_core::route::Protocol,
+    scope: Option<DriftUsageScope>,
+) -> impl futures::Stream<Item = Result<bytes::Bytes, std::io::Error>> + Send
+where
+    S: futures::Stream<Item = Result<bytes::Bytes, std::io::Error>> + Send,
+{
+    use ccextra_core::cache_stabilization::observe_cache_usage;
+    use futures::StreamExt;
+    let mut parser = crate::sse::parser::SseParser::new();
+    let mut done = false;
+    async_stream::stream! {
+        futures::pin_mut!(stream);
+        loop {
+            let chunk = stream.next().await;
+            if !done {
+                if let Some((drift, parent)) = scope.as_ref() {
+                    let events = match &chunk {
+                        Some(Ok(bytes)) => parser.push(bytes),
+                        None => parser.finish(),
+                        Some(Err(_)) => Vec::new(),
+                    };
+                    for event in events {
+                        let Ok(value) = serde_json::from_str::<serde_json::Value>(&event.data) else {
+                            continue;
+                        };
+                        if let Some((cache_read, cache_creation)) =
+                            extract_cache_usage_tokens(protocol, &value)
+                        {
+                            observe_cache_usage(drift, parent, cache_read, cache_creation);
+                            done = true;
+                            break;
+                        }
+                    }
+                }
+            }
+            match chunk {
+                Some(chunk) => yield chunk,
+                None => break,
+            }
+        }
+    }
+}
+
+fn extract_cache_usage_tokens(
+    protocol: ccextra_core::route::Protocol,
+    value: &serde_json::Value,
+) -> Option<(i64, i64)> {
+    use ccextra_core::route::Protocol;
+    match protocol {
+        Protocol::Claude => {
+            // Anthropic SSE: message_delta / message_start 带 usage
+            let usage = value
+                .pointer("/usage")
+                .or_else(|| value.pointer("/message/usage"))?;
+            let cache_read = usage
+                .get("cache_read_input_tokens")
+                .and_then(|v| v.as_i64())
+                .unwrap_or(0);
+            let cache_creation = usage
+                .get("cache_creation_input_tokens")
+                .and_then(|v| v.as_i64())
+                .unwrap_or(0);
+            // 至少见到一个 cache 字段才关联，避免无 usage 的中间帧
+            if usage.get("cache_read_input_tokens").is_none()
+                && usage.get("cache_creation_input_tokens").is_none()
+            {
+                return None;
+            }
+            Some((cache_read, cache_creation))
+        }
+        Protocol::OpenAiChat => {
+            let usage = value.get("usage")?;
+            let cache_read = usage
+                .pointer("/prompt_tokens_details/cached_tokens")
+                .and_then(|v| v.as_i64())
+                .unwrap_or(0);
+            let cache_creation = usage
+                .pointer("/prompt_tokens_details/cache_write_tokens")
+                .or_else(|| usage.pointer("/prompt_tokens_details/cache_creation_tokens"))
+                .and_then(|v| v.as_i64())
+                .unwrap_or(0);
+            // Chat 流尾才有 usage；有 usage 对象即关联
+            Some((cache_read, cache_creation))
+        }
+        Protocol::OpenAiResponses => {
+            let usage = value
+                .pointer("/response/usage")
+                .or_else(|| value.get("usage"))?;
+            let cache_read = usage
+                .pointer("/input_tokens_details/cached_tokens")
+                .and_then(|v| v.as_i64())
+                .unwrap_or(0);
+            let cache_creation = usage
+                .pointer("/input_tokens_details/cache_write_tokens")
+                .or_else(|| usage.pointer("/input_tokens_details/cache_creation_tokens"))
+                .and_then(|v| v.as_i64())
+                .unwrap_or(0);
+            Some((cache_read, cache_creation))
+        }
+        Protocol::Gemini | Protocol::Antigravity => None,
+    }
+}
+
 pub struct SessionTokenCache {
     entries: HashMap<String, Entry>,
     next_sequence: u64,
