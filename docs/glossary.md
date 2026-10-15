@@ -76,10 +76,10 @@ Anthropic 推理内容。目标协议会映射为 `reasoning_effort`、reasoning
 OpenAI Chat 或 Responses 的 provider 级缓存桶标识。来自 Claude Code 会话 ID，不覆盖既有非空值；Chat+Grok 不注入。
 
 **drift**
-同一会话中 system、tools 或早期消息结构哈希的变化。检测器记录告警，不改变 body。
+同一稳定会话中 system、tools 或早期消息结构哈希的变化。父级 `system`/`tools` → WARN（`scope=parent`）；会话级 → DEBUG（`scope=conversation`）。可选 tools description 软维默认关闭。检测器只记录、不改 body；建议与 normalize 同开。
 
 **会话 ID**
-优先使用 `x-claude-code-session-id`，否则从 `metadata.user_id` 派生。用于缓存、drift 和上游会话亲和。
+优先使用 `x-claude-code-session-id`，否则从 `metadata.user_id` 派生，再可回退 `x-tklite-session-key`。用于缓存、drift 父级分桶和上游会话亲和；仅有 `x-request-id` 或 anonymous 时 drift 不播种基线。
 
 ## 运行时术语
 

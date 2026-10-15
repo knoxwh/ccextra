@@ -51,7 +51,7 @@ ccextra 将 Anthropic Messages 入口接到不同上游协议，同时尽量保�
 
 归一化保持幂等。Claude 直通运行完整流程：工具和 schema 排序、历史 reminder 拆分、`tool_use.input` 键序、system 列表、尾部空白、客户端日期指纹，以及对前缀的 volatile 只读 WARN。转换路径先运行适合 Anthropic 输入的确定性子集；Gemini / Antigravity 在转换前补跑日期指纹与 volatile WARN。OpenAI 输出随后排序工具/schema、system reminder、日期字段，并做 volatile WARN（Chat 的 system/developer 消息计入前缀扫描）。
 
-`drift_detector` 对同一会话的结构哈希发出告警，不修改请求；仅 Claude 与 OpenAI 路径接线。Gemini 与 Antigravity 不做转换后归一化或 drift 观测，避免将 Anthropic/OpenAI 规则施加到 Gemini 出站形状。
+`drift_detector` 对同一会话的结构哈希发出告警，不修改请求；仅 Claude 与 OpenAI 路径接线。Gemini 与 Antigravity 不做转换后归一化或 drift 观测，避免将 Anthropic/OpenAI 规则施加到 Gemini 出站形状。**建议与 `normalize.enabled` 同开**：先归一化再观测，否则键序/reminder 抖动易产生假阳。父级 `system`/`tools` 变化打 WARN（`scope=parent`）；会话级（含 `early_messages`，以及可选的 `tools_description` 软维）打 DEBUG（`scope=conversation`）。`request-id` / `anonymous` 父级不稳定，跳过基线。可选 `normalize.drift_tools_description`（默认 false）仅会话 DEBUG，永不进父级 WARN。上游 `cache_read`/`cache_creation` 经 pending 与父级 WARN 限速关联（DEBUG `cache_drift_usage_correlated`）。
 
 ## 协议转换
 
@@ -105,7 +105,7 @@ OpenAI 首帧预读跳过 `: keepalive` 心跳帧，只认业务帧（心跳帧�
 
 ## 会话、缓存与 reasoning
 
-Claude Code 会话 ID 优先取 `x-claude-code-session-id`，其次从 `metadata.user_id` 派生。它用于 drift 分桶、`prompt_cache_key` 和协议会话头。OpenAI provider 开启 `prompt_cache_key` 后，Chat 和 Responses 使用该裸会话 ID；Chat+Grok 例外，使用 `x-grok-conv-id` 维持亲和。
+Claude Code 会话 ID 优先取 `x-claude-code-session-id`，其次从 `metadata.user_id` 派生（与 `extract_claude_code_session` 一致）。它用于 drift 父级分桶、`prompt_cache_key` 和协议会话头；无稳定会话时 drift 还可回退 `x-tklite-session-key`，再退到不稳定的 `x-request-id`/`anonymous`（不播种基线）。OpenAI provider 开启 `prompt_cache_key` 后，Chat 和 Responses 使用该裸会话 ID；Chat+Grok 例外，使用 `x-grok-conv-id` 维持亲和。
 
 Responses 流会收集可回放 reasoning。服务端以模型和会话为键保存完整回合，在下一请求中按 tool call 和输入锚点插回兼容的 reasoning 项，防止 `store=false` 上游丢失推理上下文。签名检查按目标提供方族执行；支持 CAQS Envelope v4 容器 field 5 signature 回退与 v4+ 豁免；无效或不兼容的 thinking 不会发到上游。
 
