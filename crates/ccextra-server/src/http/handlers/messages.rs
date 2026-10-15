@@ -748,6 +748,12 @@ pub(crate) async fn prepare_message_request(
                 if !fresh_cred.refresh_token.trim().is_empty() {
                     pool_refresh_token = Some(fresh_cred.refresh_token);
                 }
+                // 对齐 CPA projectIDForRequest:缺 project 硬失败;发现结果写回出站 body
+                let pid = fresh_cred.project_id.trim();
+                if pid.is_empty() {
+                    return Err(AppError::bad_request("antigravity auth missing project_id"));
+                }
+                body_json["project"] = serde_json::Value::String(pid.to_string());
                 oauth_refresh = Some(OAuthRefreshTarget::Antigravity {
                     auth_dir: auth_dir_str,
                     email,
@@ -1562,6 +1568,10 @@ impl PreparedMessageRequest {
                 self.upstream_key = fresh.access_token;
                 if !fresh.refresh_token.trim().is_empty() {
                     self.pool_refresh_token = Some(fresh.refresh_token);
+                }
+                let pid = fresh.project_id.trim();
+                if pid.is_empty() {
+                    return Err(AppError::bad_request("antigravity auth missing project_id"));
                 }
                 Ok(true)
             }

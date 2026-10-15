@@ -1,5 +1,5 @@
 // Antigravity 动态 provider 注入
-use crate::antigravity::{constants, models, refresh, store};
+use crate::antigravity::{constants, models, oauth, project, refresh, store};
 use ccextra_core::route::{Protocol, ProviderConfig};
 use std::path::Path;
 
@@ -36,7 +36,6 @@ pub async fn load_antigravity_providers(
         // 检查并刷新 token（对齐 CLIProxyAPI 的 refreshSkew）
         match refresh::refresh_if_needed(&mut cred, proxy_url, constants::REFRESH_SKEW_SECS).await {
             Ok(true) => {
-                // token 已刷新，回写到文件
                 if let Err(e) = store::save(auth_dir, &cred) {
                     tracing::warn!("刷新后保存凭证失败: {}: {}", cred.email, e);
                 } else {
@@ -44,12 +43,51 @@ pub async fn load_antigravity_providers(
                 }
             }
             Ok(false) => {
-                // token 仍然有效，无需刷新
                 tracing::debug!("Antigravity token 仍然有效: {}", cred.email);
             }
             Err(e) => {
-                tracing::warn!("刷新 Antigravity token 失败: {}: {}", cred.email, e);
-                // 即使刷新失败，仍然尝试使用现有 token
+                tracing::warn!(
+                    "刷新 Antigravity token 失败,跳过该凭证: {}: {}",
+                    cred.email,
+                    e
+                );
+                continue;
+            }
+        }
+
+        // 对齐 CPA ensureAntigravityProjectID:缺 project 时补发现,仍空则跳过
+        if cred.project_id.trim().is_empty() {
+            match oauth::http_client(proxy_url) {
+                Ok(client) => {
+                    match project::fetch_project_id(&client, &cred.access_token, user_agent).await {
+                        Ok(id) if !id.trim().is_empty() => {
+                            cred.project_id = id;
+                            if let Err(e) = store::save(auth_dir, &cred) {
+                                tracing::warn!("project 发现后保存失败: {}: {}", cred.email, e);
+                            }
+                        }
+                        Ok(_) => {
+                            tracing::warn!("跳过无 project_id 的 antigravity 凭证: {}", cred.email);
+                            continue;
+                        }
+                        Err(e) => {
+                            tracing::warn!(
+                                "跳过无 project_id 的 antigravity 凭证: {}: {}",
+                                cred.email,
+                                e
+                            );
+                            continue;
+                        }
+                    }
+                }
+                Err(e) => {
+                    tracing::warn!(
+                        "跳过无 project_id 的 antigravity 凭证: {}: {}",
+                        cred.email,
+                        e
+                    );
+                    continue;
+                }
             }
         }
 
@@ -60,16 +98,9 @@ pub async fn load_antigravity_providers(
             format!("antigravity-{}", cred.email.replace(['@', '.'], "-"))
         };
 
-        // 获取模型列表
-        let project_id_ref = if cred.project_id.is_empty() {
-            None
-        } else {
-            Some(cred.project_id.as_str())
-        };
-
         let models = match models::fetch_models(
             &cred.access_token,
-            project_id_ref,
+            Some(cred.project_id.as_str()),
             proxy_url,
             user_agent,
             filter,
@@ -86,7 +117,6 @@ pub async fn load_antigravity_providers(
             }
         };
 
-        // 创建 ProviderConfig
         // Antigravity 使用 cloudcode-pa.googleapis.com 的内部 API,不是公开的 generativelanguage API
         let mut metadata = std::collections::HashMap::new();
         metadata.insert(
@@ -94,9 +124,7 @@ pub async fn load_antigravity_providers(
             auth_dir.to_string_lossy().to_string(),
         );
         metadata.insert("email".to_string(), cred.email.clone());
-        if !cred.project_id.is_empty() {
-            metadata.insert("project_id".to_string(), cred.project_id.clone());
-        }
+        metadata.insert("project_id".to_string(), cred.project_id.clone());
         // 连接池 scope 优先用 refresh_token（跨 access 刷新仍稳定，对齐 CPA）
         if !cred.refresh_token.trim().is_empty() {
             metadata.insert("refresh_token".to_string(), cred.refresh_token.clone());
@@ -119,11 +147,7 @@ pub async fn load_antigravity_providers(
             "加载 antigravity provider: {} (email: {}, project: {})",
             provider_name,
             cred.email,
-            if cred.project_id.is_empty() {
-                "(none)"
-            } else {
-                &cred.project_id
-            }
+            cred.project_id
         );
 
         providers.push(provider);
