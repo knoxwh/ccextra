@@ -2248,7 +2248,10 @@ mod tests {
         };
         let ha = compute_structural_hash_with(&body_a, ApiKind::Anthropic, opts);
         let hb = compute_structural_hash_with(&body_b, ApiKind::Anthropic, opts);
-        assert_eq!(ha.tools, hb.tools, "parent tools fingerprint ignores description");
+        assert_eq!(
+            ha.tools, hb.tools,
+            "parent tools fingerprint ignores description"
+        );
         assert_ne!(ha.tools_description, hb.tools_description);
         assert!(drift_dims(&ha, &hb).contains("tools_description"));
         assert!(!drift_dims(&ha, &hb).contains("tools,") && drift_dims(&ha, &hb) != "tools");

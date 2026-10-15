@@ -61,7 +61,6 @@ where
     }
 }
 
-
 pub(crate) type DriftUsageScope = (
     ccextra_core::cache_stabilization::DriftState,
     String, // stable parent bucket

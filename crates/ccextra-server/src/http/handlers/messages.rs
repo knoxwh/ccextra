@@ -1465,7 +1465,9 @@ pub(crate) async fn deliver_response(
                             .and_then(|t| t.as_i64())
                             .unwrap_or(0),
                         v.pointer("/usage/prompt_tokens_details/cache_write_tokens")
-                            .or_else(|| v.pointer("/usage/prompt_tokens_details/cache_creation_tokens"))
+                            .or_else(|| {
+                                v.pointer("/usage/prompt_tokens_details/cache_creation_tokens")
+                            })
                             .and_then(|t| t.as_i64())
                             .unwrap_or(0),
                     ),
@@ -1474,7 +1476,9 @@ pub(crate) async fn deliver_response(
                             .and_then(|t| t.as_i64())
                             .unwrap_or(0),
                         v.pointer("/usage/input_tokens_details/cache_write_tokens")
-                            .or_else(|| v.pointer("/usage/input_tokens_details/cache_creation_tokens"))
+                            .or_else(|| {
+                                v.pointer("/usage/input_tokens_details/cache_creation_tokens")
+                            })
                             .and_then(|t| t.as_i64())
                             .unwrap_or(0),
                     ),
