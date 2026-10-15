@@ -49,12 +49,13 @@ impl ClaudeCredential {
         if self.access_token.trim().is_empty() {
             return false;
         }
+        // 空/坏 expired 视为不新鲜,强制走刷新(对齐 CPA / Codex)
         if self.expired.trim().is_empty() {
-            return true;
+            return false;
         }
         let exp_time = match OffsetDateTime::parse(self.expired.trim(), &Rfc3339) {
             Ok(dt) => SystemTime::from(dt),
-            Err(_) => return true,
+            Err(_) => return false,
         };
         let skew = Duration::from_secs(skew_secs.max(0) as u64);
         match now.checked_add(skew) {
@@ -148,5 +149,29 @@ mod tests {
         let id = generate_device_id().unwrap();
         assert_eq!(id.len(), 64);
         assert!(id.chars().all(|c| c.is_ascii_hexdigit()));
+    }
+
+    #[test]
+    fn is_fresh_rejects_empty_or_bad_expired() {
+        let mut cred = ClaudeCredential {
+            r#type: "claude".into(),
+            id_token: String::new(),
+            access_token: "sk-ant-oat-tok".into(),
+            refresh_token: "r".into(),
+            last_refresh: String::new(),
+            email: "u@e.com".into(),
+            account_uuid: "a".into(),
+            organization_uuid: String::new(),
+            organization_name: String::new(),
+            claude_device_ids: vec![],
+            expired: String::new(),
+            disabled: false,
+        };
+        let now = SystemTime::now();
+        assert!(!cred.is_fresh(now, 0));
+        cred.expired = "not-rfc3339".into();
+        assert!(!cred.is_fresh(now, 0));
+        cred.expired = "2999-01-01T00:00:00Z".into();
+        assert!(cred.is_fresh(now, 0));
     }
 }
