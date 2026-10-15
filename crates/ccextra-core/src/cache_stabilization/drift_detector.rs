@@ -32,10 +32,10 @@
 //!
 //! 身份是两级：
 //!
-//! - **父级 bucket** — 由请求头派生：`x-tklite-session-key`
-//!   （外部注入的不透明 sidecar bucket），否则为哈希后的 `x-request-id`，
-//!   否则为 `anonymous`。跟踪 system/tools-only 基线，使历史压缩或
-//!   新会话无法掩盖真实的 prefix 漂移。
+//! - **父级 bucket** — 与 [`crate::session::extract_claude_code_session`] 对齐：
+//!   `x-claude-code-session-id`，否则 `metadata.user_id` 中的 session 尾缀，
+//!   否则 `x-tklite-session-key`。`x-request-id` / `anonymous` 视为**不稳定**
+//!   身份：跳过基线播种与比较（避免假阴性/假阳性），仅限速 DEBUG。
 //! - **会话键** — 父级 bucket 加上 `:conv:` 以及
 //!   `(model, 规范化首条会话消息)` 的截断 SHA-256。
 //!   将共享同一父级 bucket 的并发会话分隔开；规范化形态会屏蔽
@@ -44,9 +44,8 @@
 //!
 //! # 隐私
 //!
-//! 原始 API 密钥和授权请求头从不被接受。没有 sidecar bucket 时，
-//! `x-request-id` 会作为请求级回退被哈希；两个请求头都没有时，
-//! 请求共享 `anonymous` bucket。判别器只以哈希形式存储和记录——
+//! 原始 API 密钥和授权请求头从不被接受。不稳定父级（request-id /
+//! anonymous）不写入 LRU。判别器只以哈希形式存储和记录——
 //! 模型名和消息内容永远不会进入日志。
 //!
 //! # 成本
@@ -57,6 +56,7 @@
 //! - 一次 `tracing::debug!` 或 `tracing::warn!`。
 
 use std::num::NonZeroUsize;
+use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::{Arc, Mutex};
 
 use http::HeaderMap;
@@ -94,6 +94,9 @@ pub struct StructuralHash {
     pub tools: [u8; 32],
     pub early_messages: [u8; 32],
     pub early_message_item_hashes: Vec<String>,
+    /// 软维：tools description 指纹。仅 `DriftObserveOptions::tools_description`
+    /// 开启时为 `Some`；不参与父级 WARN，仅会话级 DEBUG。
+    pub tools_description: Option<[u8; 32]>,
 }
 
 /// 多少个消息形态条目算作"early"前缀。
@@ -103,10 +106,25 @@ const EARLY_MESSAGES_WINDOW: usize = 8;
 ///
 /// **此函数从不修改输入。**
 pub fn compute_structural_hash(body: &Value, kind: ApiKind) -> StructuralHash {
+    compute_structural_hash_with(body, kind, DriftObserveOptions::default())
+}
+
+/// 计算结构哈希；`options.tools_description` 开启时额外填充软维。
+pub fn compute_structural_hash_with(
+    body: &Value,
+    kind: ApiKind,
+    options: DriftObserveOptions,
+) -> StructuralHash {
     // system / early：只排对象键（sort_schema_keys），不做 reminder/cache_control
     // 全量 canonicalize——消除键序假阳，成本远低于完整判别器规范化。
     let system = hash_value_canonical_keys(extract_system(body, kind));
-    let tools = stable_tool_fingerprint_hash(&extract_tools(body));
+    let tools_value = extract_tools(body);
+    let tools = stable_tool_fingerprint_hash(&tools_value);
+    let tools_description = if options.tools_description {
+        Some(tools_description_hash(&tools_value))
+    } else {
+        None
+    };
     let mut early_messages_value = extract_early_messages(body, kind);
     sort_schema_keys_recursive(&mut early_messages_value);
     let early_messages = hash_value(&early_messages_value);
@@ -116,6 +134,7 @@ pub fn compute_structural_hash(body: &Value, kind: ApiKind) -> StructuralHash {
         tools,
         early_messages,
         early_message_item_hashes,
+        tools_description,
     }
 }
 
@@ -546,6 +565,53 @@ fn stable_tool_fingerprint_hash(tools: &Value) -> [u8; 32] {
     hash_value(&Value::Array(fingerprints))
 }
 
+/// tools[] description 软维指纹（按 name 排序后哈希 description 文本）。
+/// 默认关闭；开启后仅用于会话级 DEBUG，永不进入父级 WARN。
+fn tools_description_hash(tools: &Value) -> [u8; 32] {
+    let tools_arr = match tools.as_array() {
+        Some(arr) => arr,
+        None => return hash_value(&Value::Null),
+    };
+    let mut pairs: Vec<(String, String)> = tools_arr
+        .iter()
+        .map(|tool| {
+            let name = tool
+                .get("name")
+                .and_then(Value::as_str)
+                .or_else(|| {
+                    tool.get("function")
+                        .and_then(|f| f.get("name"))
+                        .and_then(Value::as_str)
+                })
+                .unwrap_or("")
+                .to_string();
+            let desc = tool
+                .get("description")
+                .and_then(Value::as_str)
+                .or_else(|| {
+                    tool.get("function")
+                        .and_then(|f| f.get("description"))
+                        .and_then(Value::as_str)
+                })
+                .unwrap_or("")
+                .to_string();
+            (name, desc)
+        })
+        .collect();
+    pairs.sort_by(|a, b| a.0.cmp(&b.0).then_with(|| a.1.cmp(&b.1)));
+    let mut hasher = Sha256::new();
+    for (name, desc) in pairs {
+        hasher.update(name.as_bytes());
+        hasher.update([0u8]);
+        hasher.update(desc.as_bytes());
+        hasher.update([0u8]);
+    }
+    let digest = hasher.finalize();
+    let mut out = [0u8; 32];
+    out.copy_from_slice(&digest);
+    out
+}
+
 /// 在父级 bucket 级别跟踪的 system/tools-only 基线。
 ///
 /// 与逐会话的 [`StructuralHash`] 分开维护，使身份轮换（历史压缩重写首条
@@ -556,10 +622,19 @@ struct ParentBaseline {
     tools: [u8; 32],
 }
 
-/// 由一个互斥锁守护的两个基线：会话级完整哈希加上父级 system/tools 基线。
+/// 父级 system/tools 漂移后等待与上游 cache usage 关联的 pending。
+#[derive(Debug, Clone)]
+struct PendingUsageCorr {
+    session_key_hash: String,
+    drift_dims: String,
+    identity_rotated: bool,
+}
+
+/// 由一个互斥锁守护：会话哈希、父级基线、usage 关联 pending。
 type DriftCaches = (
     LruCache<String, StructuralHash>,
     LruCache<String, ParentBaseline>,
+    LruCache<String, PendingUsageCorr>,
 );
 
 /// 有界 会话 → 上次所见哈希 状态。
@@ -568,9 +643,20 @@ type DriftCaches = (
 ///
 /// - `cache`：会话身份 → 完整 [`StructuralHash`]。
 /// - `parent_cache`：父级 bucket → [`ParentBaseline`]。
+/// 不稳定父级 DEBUG 的最小间隔（毫秒）。
+const UNSTABLE_PARENT_LOG_INTERVAL_MS: u64 = 5_000;
+/// usage 关联 DEBUG 的最小间隔（毫秒）。
+const USAGE_CORR_LOG_INTERVAL_MS: u64 = 1_000;
+
 #[derive(Clone)]
 pub struct DriftState {
     cache: Arc<Mutex<DriftCaches>>,
+    /// 上次发出 `cache_drift_unstable_parent` 的单调毫秒（限速）。
+    last_unstable_log_ms: Arc<AtomicU64>,
+    /// 上次发出 `cache_drift_usage_correlated` 的单调毫秒（限速）。
+    last_usage_corr_log_ms: Arc<AtomicU64>,
+    /// 跳过的不稳定父级次数（可选计数，无锁）。
+    pub unstable_parent_skips: Arc<AtomicU64>,
 }
 
 impl DriftState {
@@ -582,9 +668,54 @@ impl DriftState {
     pub fn new(capacity: usize) -> Self {
         let cap = NonZeroUsize::new(capacity).expect("DriftState capacity must be > 0");
         Self {
-            cache: Arc::new(Mutex::new((LruCache::new(cap), LruCache::new(cap)))),
+            cache: Arc::new(Mutex::new((
+                LruCache::new(cap),
+                LruCache::new(cap),
+                LruCache::new(cap),
+            ))),
+            last_unstable_log_ms: Arc::new(AtomicU64::new(0)),
+            last_usage_corr_log_ms: Arc::new(AtomicU64::new(0)),
+            unstable_parent_skips: Arc::new(AtomicU64::new(0)),
         }
     }
+
+    /// 不稳定父级：计数 + 限速 DEBUG，不写 LRU。
+    fn note_unstable_parent(&self, parent: &str) {
+        self.unstable_parent_skips.fetch_add(1, Ordering::Relaxed);
+        let now_ms = monotonic_ms();
+        let prev = self.last_unstable_log_ms.load(Ordering::Relaxed);
+        if now_ms.saturating_sub(prev) < UNSTABLE_PARENT_LOG_INTERVAL_MS {
+            return;
+        }
+        if self
+            .last_unstable_log_ms
+            .compare_exchange(prev, now_ms, Ordering::Relaxed, Ordering::Relaxed)
+            .is_err()
+        {
+            return;
+        }
+        let kind = if parent == "anonymous" {
+            "anonymous"
+        } else if parent.starts_with("request:") {
+            "request_id"
+        } else {
+            "other"
+        };
+        tracing::debug!(
+            event = "cache_drift_unstable_parent",
+            parent_kind = kind,
+            skips = self.unstable_parent_skips.load(Ordering::Relaxed),
+            "cache_drift skipped ephemeral parent bucket; no baseline"
+        );
+    }
+}
+
+fn monotonic_ms() -> u64 {
+    use std::time::{SystemTime, UNIX_EPOCH};
+    SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .map(|d| d.as_millis() as u64)
+        .unwrap_or(0)
 }
 
 impl std::fmt::Debug for DriftState {
@@ -620,19 +751,30 @@ pub fn observe_drift(state: &DriftState, identity: &SessionIdentity, current: St
             poisoned.into_inner()
         }
     };
-    let (cache, parent_cache) = &mut *caches;
+    let (cache, parent_cache, pending_cache) = &mut *caches;
 
     let parent_dims = update_parent_baseline(parent_cache, identity, &current);
 
     let conversation_is_new = !cache.contains(session_key);
     if !parent_dims.is_empty() {
+        let dims_joined = parent_dims.join(",");
         tracing::warn!(
             event = "cache_drift_observed",
+            scope = "parent",
             session_key_hash = %session_prefix,
-            drift_dims = %parent_dims.join(","),
+            drift_dims = %dims_joined,
             identity_rotated = conversation_is_new,
             current_hash_prefix = %structural_hash_log_prefix(&current),
             "cache_drift detector observed parent-level system/tools change"
+        );
+        // O(1) pending：供响应路径 usage 关联；不延长锁持有逻辑之外的工作。
+        pending_cache.put(
+            identity.parent.clone(),
+            PendingUsageCorr {
+                session_key_hash: session_prefix.clone(),
+                drift_dims: dims_joined,
+                identity_rotated: conversation_is_new,
+            },
         );
     }
 
@@ -668,6 +810,32 @@ pub fn maybe_observe_request_drift(
     body: &Value,
     kind: ApiKind,
 ) {
+    maybe_observe_request_drift_with(
+        enabled,
+        state,
+        headers,
+        body,
+        kind,
+        DriftObserveOptions::default(),
+    );
+}
+
+/// drift 观测可选开关。默认全关：热路径成本与今日等价。
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub struct DriftObserveOptions {
+    /// 是否额外计算 tools description 软维（仅会话级 DEBUG，永不进父级 WARN）。
+    pub tools_description: bool,
+}
+
+/// [`maybe_observe_request_drift`] 的可选项版本。
+pub fn maybe_observe_request_drift_with(
+    enabled: bool,
+    state: &DriftState,
+    headers: &HeaderMap,
+    body: &Value,
+    kind: ApiKind,
+    options: DriftObserveOptions,
+) {
     if !enabled {
         return;
     }
@@ -675,8 +843,63 @@ pub fn maybe_observe_request_drift(
         return;
     }
     let identity = derive_session_key(headers, body, kind);
-    let hash = compute_structural_hash(body, kind);
+    // 不稳定父级：在哈希之前跳过，避免每请求 SHA-256 + LRU 写入。
+    if !is_stable_parent_bucket(&identity.parent) {
+        state.note_unstable_parent(&identity.parent);
+        return;
+    }
+    let hash = compute_structural_hash_with(body, kind, options);
     observe_drift(state, &identity, hash);
+}
+
+/// 用上游 `cache_read` / `cache_creation` 对照先前父级结构漂移（O(1) pending 弹出）。
+///
+/// - 无 pending：立即返回（热路径无分配）。
+/// - 有 pending：限速 DEBUG `cache_drift_usage_correlated`。
+/// - **不修改请求**；可在响应路径调用。
+pub fn observe_cache_usage(
+    state: &DriftState,
+    parent_bucket: &str,
+    cache_read: i64,
+    cache_creation: i64,
+) {
+    if parent_bucket.is_empty() || !is_stable_parent_bucket(parent_bucket) {
+        return;
+    }
+    let pending = {
+        let mut caches = match state.cache.lock() {
+            Ok(c) => c,
+            Err(poisoned) => poisoned.into_inner(),
+        };
+        caches.2.pop(parent_bucket)
+    };
+    let Some(pending) = pending else {
+        return;
+    };
+
+    let now_ms = monotonic_ms();
+    let prev = state.last_usage_corr_log_ms.load(Ordering::Relaxed);
+    if now_ms.saturating_sub(prev) < USAGE_CORR_LOG_INTERVAL_MS {
+        return;
+    }
+    let _ = state.last_usage_corr_log_ms.compare_exchange(
+        prev,
+        now_ms,
+        Ordering::Relaxed,
+        Ordering::Relaxed,
+    );
+
+    let cache_miss_suspected = cache_read == 0 && cache_creation > 0;
+    tracing::debug!(
+        event = "cache_drift_usage_correlated",
+        session_key_hash = %pending.session_key_hash,
+        drift_dims = %pending.drift_dims,
+        identity_rotated = pending.identity_rotated,
+        cache_read_input_tokens = cache_read,
+        cache_creation_input_tokens = cache_creation,
+        cache_miss_suspected,
+        "cache_drift correlated parent structural change with upstream cache usage"
+    );
 }
 
 /// 记录会话级漂移（early_messages 变化）。
@@ -695,6 +918,7 @@ fn log_conversation_drift(
             match (diff.previous_hash, diff.current_hash) {
                 (Some(previous_item_hash), Some(current_item_hash)) => tracing::debug!(
                     event = "cache_drift_observed",
+                    scope = "conversation",
                     session_key_hash = %session_prefix,
                     drift_dims = %dims,
                     previous_hash_prefix = %previous_hash_prefix,
@@ -706,6 +930,7 @@ fn log_conversation_drift(
                 ),
                 (Some(previous_item_hash), None) => tracing::debug!(
                     event = "cache_drift_observed",
+                    scope = "conversation",
                     session_key_hash = %session_prefix,
                     drift_dims = %dims,
                     previous_hash_prefix = %previous_hash_prefix,
@@ -716,6 +941,7 @@ fn log_conversation_drift(
                 ),
                 (None, Some(current_item_hash)) => tracing::debug!(
                     event = "cache_drift_observed",
+                    scope = "conversation",
                     session_key_hash = %session_prefix,
                     drift_dims = %dims,
                     previous_hash_prefix = %previous_hash_prefix,
@@ -726,6 +952,7 @@ fn log_conversation_drift(
                 ),
                 _ => tracing::debug!(
                     event = "cache_drift_observed",
+                    scope = "conversation",
                     session_key_hash = %session_prefix,
                     drift_dims = %dims,
                     previous_hash_prefix = %previous_hash_prefix,
@@ -737,6 +964,7 @@ fn log_conversation_drift(
         }
         _ => tracing::debug!(
             event = "cache_drift_observed",
+            scope = "conversation",
             session_key_hash = %session_prefix,
             drift_dims = %dims,
             previous_hash_prefix = %previous_hash_prefix,
@@ -792,16 +1020,17 @@ pub struct SessionIdentity {
 ///
 /// 父级 bucket 优先级顺序：
 ///
-/// 1. `x-claude-code-session-id` — Claude Code 原生会话头，整会话稳定。
+/// 1. Claude Code 会话（[`crate::session::extract_claude_code_session`]：
+///    头 `x-claude-code-session-id`，否则 `metadata.user_id` session 尾缀）。
 /// 2. `x-tklite-session-key` — 外部注入的不透明 sidecar bucket。
-/// 3. `x-request-id` 请求头（SHA-256 哈希）——每请求回退。
-/// 4. 回退 `"anonymous"`。
+/// 3. `x-request-id`（哈希）——**不稳定**，观测路径会跳过基线。
+/// 4. `"anonymous"` — **不稳定**。
 ///
 /// 判别器是 `SHA-256(规范化 model + 规范化首条会话消息)`，截断为 16 个
 /// 十六进制字符并与父级 bucket 组合。缺失的 model 哈希为 `"nomodel"`，
 /// 缺失的消息为 `Value::Null`——身份派生从不失败，也从不修改请求体。
 pub fn derive_session_key(headers: &HeaderMap, body: &Value, kind: ApiKind) -> SessionIdentity {
-    let parent = derive_parent_bucket(headers);
+    let parent = derive_parent_bucket(headers, body);
     let discriminator = conversation_discriminator(body, kind);
     SessionIdentity {
         conversation: format!("{}:conv:{}", parent, discriminator),
@@ -809,19 +1038,14 @@ pub fn derive_session_key(headers: &HeaderMap, body: &Value, kind: ApiKind) -> S
     }
 }
 
-/// 仅依赖请求头的 bucket 派生。
-/// 优先级(会话身份链):
-/// 1. `x-claude-code-session-id` — Claude Code 原生会话头,整会话稳定
-/// 2. `x-tklite-session-key` — 外部注入的不透明 sidecar bucket
-/// 3. `x-request-id`(哈希)— 每请求回退
-/// 4. `anonymous`
-fn derive_parent_bucket(headers: &HeaderMap) -> String {
-    if let Some(session_id) = headers
-        .get(crate::session::CLAUDE_CODE_SESSION_HEADER)
-        .and_then(|v| v.to_str().ok())
-        .map(str::trim)
-        .filter(|v| !v.is_empty())
-    {
+/// 稳定父级：可跨轮比较。`request:` / `anonymous` 为瞬时身份，不播种基线。
+pub fn is_stable_parent_bucket(parent: &str) -> bool {
+    !(parent == "anonymous" || parent.starts_with("request:"))
+}
+
+/// 父级 bucket 派生（头 + body.metadata.user_id）。
+fn derive_parent_bucket(headers: &HeaderMap, body: &Value) -> String {
+    if let Some(session_id) = crate::session::extract_claude_code_session(headers, body) {
         return format!("claude-code:{}", session_id);
     }
 
@@ -922,7 +1146,7 @@ fn first_early_message_difference(
 
 /// 逗号连接的漂移维度列表。
 fn drift_dims(prev: &StructuralHash, curr: &StructuralHash) -> String {
-    let mut dims: Vec<&'static str> = Vec::with_capacity(3);
+    let mut dims: Vec<&'static str> = Vec::with_capacity(4);
     if prev.system != curr.system {
         dims.push("system");
     }
@@ -931,6 +1155,11 @@ fn drift_dims(prev: &StructuralHash, curr: &StructuralHash) -> String {
     }
     if prev.early_messages != curr.early_messages {
         dims.push("early_messages");
+    }
+    // 软维：仅两边都启用时比较；不进入父级 WARN。
+    match (prev.tools_description, curr.tools_description) {
+        (Some(a), Some(b)) if a != b => dims.push("tools_description"),
+        _ => {}
     }
     dims.join(",")
 }
@@ -1911,7 +2140,6 @@ mod tests {
     }
 
     #[test]
-    #[test]
     fn system_and_early_hashes_ignore_object_key_order() {
         let a = json!({
             "model": "m",
@@ -1933,7 +2161,8 @@ mod tests {
         assert_eq!(ha.early_message_item_hashes, hb.early_message_item_hashes);
     }
 
-        fn maybe_observe_disabled_is_noop() {
+    #[test]
+    fn maybe_observe_disabled_is_noop() {
         let state = make_state();
         let headers = anthropic_headers();
         let body = anthropic_body("sys", json!([{"name": "bash"}]), vec!["hi", "more"]);
@@ -1970,5 +2199,77 @@ mod tests {
         maybe_observe_request_drift(true, &state, &headers, &body, ApiKind::Anthropic);
         assert_eq!(state.cache.lock().unwrap().0.len(), 1);
         assert_eq!(serde_json::to_vec(&body).unwrap(), before);
+    }
+
+    #[test]
+    fn session_key_falls_back_to_metadata_user_id() {
+        let headers = HeaderMap::new();
+        let body = json!({
+            "model": "m",
+            "metadata": {"user_id": "user_x_session_0123abcd-ef01-2345-6789-abcdef012345"},
+            "messages": [{"role": "user", "content": "hi"}],
+        });
+        let id = derive_session_key(&headers, &body, ApiKind::Anthropic);
+        assert_eq!(
+            id.parent,
+            "claude-code:0123abcd-ef01-2345-6789-abcdef012345"
+        );
+        assert!(is_stable_parent_bucket(&id.parent));
+    }
+
+    #[test]
+    fn maybe_observe_skips_ephemeral_parent_without_baseline() {
+        let state = make_state();
+        let mut headers = HeaderMap::new();
+        headers.insert("x-request-id", "req-only".parse().unwrap());
+        let body = anthropic_body("sys", json!([{"name": "bash"}]), vec!["hi", "more"]);
+        maybe_observe_request_drift(true, &state, &headers, &body, ApiKind::Anthropic);
+        assert_eq!(state.cache.lock().unwrap().0.len(), 0);
+        assert_eq!(state.cache.lock().unwrap().1.len(), 0);
+        assert!(state.unstable_parent_skips.load(Ordering::Relaxed) >= 1);
+    }
+
+    #[test]
+    fn tools_description_soft_dim_does_not_affect_parent_tools_hash() {
+        let body_a = anthropic_body(
+            "sys",
+            json!([{"name": "bash", "description": "old", "input_schema": {"type": "object"}}]),
+            vec!["m1", "m2"],
+        );
+        let body_b = anthropic_body(
+            "sys",
+            json!([{"name": "bash", "description": "new", "input_schema": {"type": "object"}}]),
+            vec!["m1", "m2"],
+        );
+        let opts = DriftObserveOptions {
+            tools_description: true,
+        };
+        let ha = compute_structural_hash_with(&body_a, ApiKind::Anthropic, opts);
+        let hb = compute_structural_hash_with(&body_b, ApiKind::Anthropic, opts);
+        assert_eq!(ha.tools, hb.tools, "parent tools fingerprint ignores description");
+        assert_ne!(ha.tools_description, hb.tools_description);
+        assert!(drift_dims(&ha, &hb).contains("tools_description"));
+        assert!(!drift_dims(&ha, &hb).contains("tools,") && drift_dims(&ha, &hb) != "tools");
+    }
+
+    #[test]
+    fn observe_cache_usage_pops_pending_after_parent_drift() {
+        let state = make_state();
+        let id = identity("sess");
+        let h1 = compute_structural_hash(
+            &anthropic_body("sys-A", json!([]), vec!["m1"]),
+            ApiKind::Anthropic,
+        );
+        let h2 = compute_structural_hash(
+            &anthropic_body("sys-B", json!([]), vec!["m1"]),
+            ApiKind::Anthropic,
+        );
+        observe_drift(&state, &id, h1);
+        observe_drift(&state, &id, h2);
+        assert!(state.cache.lock().unwrap().2.contains(&id.parent));
+        observe_cache_usage(&state, &id.parent, 0, 120);
+        assert!(!state.cache.lock().unwrap().2.contains(&id.parent));
+        // second call is no-op
+        observe_cache_usage(&state, &id.parent, 0, 120);
     }
 }

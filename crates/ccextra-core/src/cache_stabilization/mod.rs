@@ -15,8 +15,9 @@
 //! - [`drift_detector`] — PR-E6：对每个会话的 cache 热区
 //!   （system / tools / early messages）计算结构哈希。首次见到时发出
 //!   DEBUG `cache_drift_first_request`；父级 `system`/`tools` 不一致时
-//!   WARN `cache_drift_observed`；会话级（含 `early_messages`）不一致时
-//!   DEBUG `cache_drift_observed`。
+//!   WARN `cache_drift_observed`（`scope=parent`）；会话级不一致时
+//!   DEBUG `cache_drift_observed`（`scope=conversation`）。建议与
+//!   `normalize.enabled` 同开。不稳定父级（request-id/anonymous）跳过基线。
 //! - [`tool_def_normalize`] — PR-E1 / PR-E2：按名称对 `tools[]` 进行
 //!   字母排序，并递归排序每个 tool 的 `input_schema` / `function.parameters`
 //!   内部的 JSON Schema 对象键。
@@ -39,8 +40,9 @@ pub mod tool_input_normalize;
 pub mod volatile_detector;
 
 pub use drift_detector::{
-    compute_structural_hash, derive_session_key, maybe_observe_request_drift, observe_drift,
-    ApiKind as DriftApiKind, DriftState,
+    compute_structural_hash, derive_session_key, is_stable_parent_bucket,
+    maybe_observe_request_drift, maybe_observe_request_drift_with, observe_cache_usage,
+    observe_drift, ApiKind as DriftApiKind, DriftObserveOptions, DriftState,
 };
 pub use reminder_rstrip::normalize_reminder_trailing_whitespace;
 pub use smoosh_split::split_smooshed_reminders;
