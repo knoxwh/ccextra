@@ -61,7 +61,7 @@ pub fn convert_to_openai_responses_with(
     // --- system → instructions / developer message ---
     // 对齐 CPA convertClaudeRequestToCodex:
     // GPT/Grok 上游将 system 配合 ADAPTER_BLOCK 作为 developer message 放入 input[]
-    // (instructions 留空);两者均清洗 system 剥离触发过度推理的块;
+    // (省略空 instructions);两者均清洗 system 剥离触发过度推理的块;
     // 其余 responses 上游保持 system → instructions
     let system = body
         .get("system")
@@ -74,11 +74,14 @@ pub fn convert_to_openai_responses_with(
         system.clone()
     };
 
+    // 空 instructions 省略(对齐 CPA DeleteBytes),不发 ""
     let mut openai = json!({
         "model": upstream_model,
-        "instructions": instructions,
         "input": [],
     });
+    if !instructions.is_empty() {
+        openai["instructions"] = json!(instructions);
+    }
     if needs_adapter {
         let adapter = if is_gpt6_astra(upstream_model) {
             GPT_6_ASTRA_ADAPTER_BLOCK
@@ -274,10 +277,7 @@ pub fn convert_to_openai_responses_with(
                         }
                     }
                     "redacted_thinking" => {
-                        // redacted_thinking 块不回放(对齐 grok-build parse-only 丢弃,
-                        // xai-grok-sampler/src/stream/messages.rs:288)。CPA 虽打包成
-                        // "claude-redacted-thinking:" 前缀,但有签名兼容性检查层剥离不兼容的;
-                        // ccextra 无该层,且 grok-build 官方参考实现也不回放,故跳过。
+                        // Claude→Codex 请求侧丢弃(对齐 CPA codex_claude_request 无此分支)
                     }
                     "image" => {
                         if let Some(img) = image_to_input_image(part) {

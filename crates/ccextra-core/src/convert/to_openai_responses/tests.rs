@@ -39,14 +39,14 @@ fn test_system_goes_to_instructions() {
 
 #[test]
 fn test_gpt_system_goes_to_developer_message() {
-    // GPT 上游将 adapter + system 作为 developer 输入，instructions 留空
+    // GPT 上游将 adapter + system 作为 developer 输入，省略空 instructions
     let mut body = json!({
         "model": "test",
         "system": "You are helpful",
         "messages": []
     });
     convert_to_openai_responses(&mut body, "gpt-5.6-terra").unwrap();
-    assert_eq!(body["instructions"], "");
+    assert!(body.get("instructions").is_none(), "空 instructions 应省略");
     assert_eq!(body["input"][0]["type"], "message");
     assert_eq!(body["input"][0]["role"], "developer");
     let dev_text = body["input"][0]["content"][0]["text"].as_str().unwrap();
@@ -62,7 +62,7 @@ fn test_gpt_without_system_no_developer_message() {
         "messages": [{"role": "user", "content": "hi"}]
     });
     convert_to_openai_responses(&mut body, "gpt-5.6-sol").unwrap();
-    assert_eq!(body["instructions"], "");
+    assert!(body.get("instructions").is_none(), "空 instructions 应省略");
     let input = body["input"].as_array().unwrap();
     assert_eq!(input.len(), 2); // developer + user
     assert_eq!(input[0]["role"], "developer");
@@ -72,14 +72,14 @@ fn test_gpt_without_system_no_developer_message() {
 
 #[test]
 fn test_grok_system_and_adapter_go_to_developer_message() {
-    // Grok 线将 adapter + 清洗后的 system 作为 developer 输入，instructions 留空。
+    // Grok 线将 adapter + 清洗后的 system 作为 developer 输入，省略空 instructions。
     let mut body = json!({
         "model": "test",
         "system": "You are helpful",
         "messages": []
     });
     convert_to_openai_responses(&mut body, "grok-4.6").unwrap();
-    assert_eq!(body["instructions"], "");
+    assert!(body.get("instructions").is_none(), "空 instructions 应省略");
     assert_eq!(body["input"][0]["type"], "message");
     assert_eq!(body["input"][0]["role"], "developer");
     let dev_text = body["input"][0]["content"][0]["text"].as_str().unwrap();
@@ -94,7 +94,7 @@ fn test_grok_adapter_creates_developer_message_without_system() {
         "messages": [{"role": "user", "content": "hi"}]
     });
     convert_to_openai_responses(&mut body, "grok-3").unwrap();
-    assert_eq!(body["instructions"], "");
+    assert!(body.get("instructions").is_none(), "空 instructions 应省略");
     let input = body["input"].as_array().unwrap();
     assert_eq!(input[0]["role"], "developer");
     assert_eq!(input[0]["content"][0]["text"], GROK_ADAPTER_BLOCK);
@@ -1228,7 +1228,7 @@ fn test_gpt_upstream_injects_adapter_block() {
     });
     convert_to_openai_responses(&mut body, "gpt-5.4").unwrap();
 
-    assert_eq!(body["instructions"], "");
+    assert!(body.get("instructions").is_none(), "空 instructions 应省略");
     let input = body["input"].as_array().unwrap();
     assert_eq!(input[0]["role"], "developer");
     let dev_text = input[0]["content"][0]["text"].as_str().unwrap();
@@ -1245,7 +1245,7 @@ fn test_gpt6_astra_injects_adapter_block() {
     });
     convert_to_openai_responses(&mut body, "gpt-6-astra").unwrap();
 
-    assert_eq!(body["instructions"], "");
+    assert!(body.get("instructions").is_none(), "空 instructions 应省略");
     let input = body["input"].as_array().unwrap();
     assert_eq!(input[0]["role"], "developer");
     let dev_text = input[0]["content"][0]["text"].as_str().unwrap();
