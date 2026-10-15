@@ -46,6 +46,8 @@ pub struct GeminiStreamState {
     pub saw_tool_call: bool,
     /// 最终事件是否已发(对齐 CPA HasFinalEvents,防重复 finalize)
     pub final_events_sent: bool,
+    /// 已发 MALFORMED api_error(对齐 CPA 7f2f17d7;SSE 层据此跳过 message_stop)
+    pub api_error_emitted: bool,
     /// 是否见过 usageMetadata(对齐 CPA HasUsageMetadata)
     has_usage: bool,
     /// 是否见过 finishReason(对齐 CPA HasFinishReason)
@@ -418,7 +420,27 @@ fn cache_chunk_metadata(chunk: &Value, state: &mut GeminiStreamState) {
     }
 }
 
-/// 对齐 CPA resolveGeminiClaudeStopReason (a0d31924)
+/// 对齐 CPA geminiMalformedFunctionCallErrorPayload (7f2f17d7)
+pub const GEMINI_MALFORMED_FUNCTION_CALL_ERROR_MESSAGE: &str =
+    "Gemini response finished with MALFORMED_FUNCTION_CALL";
+
+/// 无有效 tool_call 时的 MALFORMED → Claude api_error(对齐 CPA isGeminiMalformedFunctionCall)。
+pub(crate) fn is_gemini_malformed_function_call(finish_reason: &str, saw_tool_call: bool) -> bool {
+    finish_reason == "MALFORMED_FUNCTION_CALL" && !saw_tool_call
+}
+
+/// 对齐 CPA geminiMalformedFunctionCallErrorPayload。
+pub fn gemini_malformed_function_call_error() -> Value {
+    json!({
+        "type": "error",
+        "error": {
+            "type": "api_error",
+            "message": GEMINI_MALFORMED_FUNCTION_CALL_ERROR_MESSAGE
+        }
+    })
+}
+
+/// 对齐 CPA resolveGeminiClaudeStopReason (7f2f17d7:MALFORMED 不再映射 refusal)
 pub(crate) fn resolve_gemini_claude_stop_reason(
     finish_reason: &str,
     saw_tool_call: bool,
@@ -428,13 +450,9 @@ pub(crate) fn resolve_gemini_claude_stop_reason(
     }
     match finish_reason {
         "MAX_TOKENS" => "max_tokens",
-        "SAFETY"
-        | "RECITATION"
-        | "PROHIBITED_CONTENT"
-        | "SPII"
-        | "BLOCKLIST"
-        | "MALFORMED_FUNCTION_CALL"
-        | "IMAGE_SAFETY" => "refusal",
+        "SAFETY" | "RECITATION" | "PROHIBITED_CONTENT" | "SPII" | "BLOCKLIST" | "IMAGE_SAFETY" => {
+            "refusal"
+        }
         "STOP" | "FINISH_REASON_UNSPECIFIED" | "UNKNOWN" | "" => "end_turn",
         _ => "end_turn",
     }
@@ -444,9 +462,30 @@ fn stop_reason_of(state: &GeminiStreamState) -> &'static str {
     resolve_gemini_claude_stop_reason(&state.finish_reason, state.saw_tool_call)
 }
 
+/// 关块后发 MALFORMED api_error(对齐 CPA 7f2f17d7,不发 message_delta/message_stop)
+fn append_malformed_api_error(state: &mut GeminiStreamState, events: &mut Vec<Value>) {
+    if state.final_events_sent {
+        return;
+    }
+    state.final_events_sent = true;
+    state.api_error_emitted = true;
+    if state.response_type != ResponseType::None {
+        events.push(json!({
+            "type": "content_block_stop",
+            "index": state.response_index
+        }));
+        state.response_type = ResponseType::None;
+    }
+    events.push(gemini_malformed_function_call_error());
+}
+
 /// 关块 + message_delta(对齐 CPA appendFinalEvents)
 fn append_final_events(state: &mut GeminiStreamState, events: &mut Vec<Value>) {
     if state.final_events_sent || !state.has_content {
+        return;
+    }
+    if is_gemini_malformed_function_call(&state.finish_reason, state.saw_tool_call) {
+        append_malformed_api_error(state, events);
         return;
     }
     state.final_events_sent = true;
@@ -471,10 +510,20 @@ fn append_final_events(state: &mut GeminiStreamState, events: &mut Vec<Value>) {
 ///
 /// 非 force:finishReason + usage + 有内容才发,且只发一次
 /// (对齐 CPA HasFinalEvents:上游可能在多个非终帧重复带 usage/finishReason)
+/// MALFORMED 无 tool_call:见 finishReason 即发 api_error(不要求 usage/content,对齐 CPA 7f2f17d7)
 pub fn finalize_gemini_stream(chunk: &Value, state: &mut GeminiStreamState) -> Vec<Value> {
     cache_chunk_metadata(chunk, state);
     let mut events = Vec::new();
-    if state.has_finish && state.has_usage && state.has_content && !state.final_events_sent {
+    if state.final_events_sent {
+        return events;
+    }
+    if state.has_finish
+        && is_gemini_malformed_function_call(&state.finish_reason, state.saw_tool_call)
+    {
+        append_malformed_api_error(state, &mut events);
+        return events;
+    }
+    if state.has_finish && state.has_usage && state.has_content {
         append_final_events(state, &mut events);
     }
     events
@@ -482,9 +531,15 @@ pub fn finalize_gemini_stream(chunk: &Value, state: &mut GeminiStreamState) -> V
 
 /// [DONE]/EOF force 收尾(对齐 CPA appendFinalEvents(force=true)):
 /// 无内容先补空 text 块;然后关块 + message_delta(缺 usage 用已缓存值,默认 0)
+/// MALFORMED 无 tool_call:发 api_error,不补空 text / message_delta
 pub fn force_finalize_gemini_stream(state: &mut GeminiStreamState) -> Vec<Value> {
     if state.final_events_sent {
         return Vec::new();
+    }
+    if is_gemini_malformed_function_call(&state.finish_reason, state.saw_tool_call) {
+        let mut events = Vec::new();
+        append_malformed_api_error(state, &mut events);
+        return events;
     }
     let mut events = Vec::new();
     if !state.has_content {
@@ -630,6 +685,10 @@ pub fn convert_gemini_response(
             .and_then(|f| f.as_str())
             .filter(|reason| !reason.is_empty())
             .unwrap_or("STOP");
+        // 对齐 CPA 7f2f17d7:无 tool_call 的 MALFORMED → api_error(可重试)
+        if is_gemini_malformed_function_call(finish_reason, saw_tool_call) {
+            return gemini_malformed_function_call_error();
+        }
         anthropic["stop_reason"] = json!(resolve_gemini_claude_stop_reason(
             finish_reason,
             saw_tool_call
@@ -852,14 +911,13 @@ mod tests {
 
     #[test]
     fn test_convert_gemini_response_refusal_finish_reasons() {
-        // 对齐 CPA a0d31924:SAFETY/RECITATION/MALFORMED_FUNCTION_CALL 等映射为 refusal
+        // 对齐 CPA 7f2f17d7:SAFETY/RECITATION 等仍为 refusal;MALFORMED 单独走 api_error
         for reason in [
             "SAFETY",
             "RECITATION",
             "PROHIBITED_CONTENT",
             "SPII",
             "BLOCKLIST",
-            "MALFORMED_FUNCTION_CALL",
             "IMAGE_SAFETY",
         ] {
             let gemini = json!({
@@ -871,6 +929,123 @@ mod tests {
             let anthropic = convert_gemini_response(&gemini, &HashMap::new(), None);
             assert_eq!(anthropic["stop_reason"], "refusal");
         }
+    }
+
+    #[test]
+    fn test_convert_gemini_response_malformed_returns_api_error() {
+        // 对齐 CPA 7f2f17d7 / TestConvertGeminiResponseToClaudeNonStream_MalformedFunctionCallReturnsAPIError
+        let gemini = json!({
+            "candidates": [{
+                "content": {"parts": [], "role": "model"},
+                "finishReason": "MALFORMED_FUNCTION_CALL"
+            }],
+            "usageMetadata": {
+                "promptTokenCount": 120,
+                "candidatesTokenCount": 37,
+                "totalTokenCount": 157
+            },
+            "modelVersion": "m",
+            "responseId": "resp-test"
+        });
+        let out = convert_gemini_response(&gemini, &HashMap::new(), None);
+        assert_eq!(out["type"], "error");
+        assert_eq!(out["error"]["type"], "api_error");
+        assert!(
+            out["error"]["message"]
+                .as_str()
+                .unwrap_or("")
+                .contains("MALFORMED_FUNCTION_CALL"),
+            "{out}"
+        );
+        assert!(out.get("stop_reason").is_none() || out["stop_reason"].is_null());
+    }
+
+    #[test]
+    fn test_convert_gemini_response_malformed_with_tool_keeps_tool_use() {
+        // 对齐 CPA TestConvertGeminiResponseToClaude_MalformedFunctionCallWithToolUsePreservesToolUse
+        let gemini = json!({
+            "candidates": [{
+                "content": {
+                    "role": "model",
+                    "parts": [{"functionCall": {"name": "Bash", "args": {"command": "ls"}}}]
+                },
+                "finishReason": "MALFORMED_FUNCTION_CALL"
+            }],
+            "usageMetadata": {
+                "promptTokenCount": 50,
+                "candidatesTokenCount": 10,
+                "totalTokenCount": 60
+            },
+            "modelVersion": "m",
+            "responseId": "resp-tool"
+        });
+        let out = convert_gemini_response(&gemini, &HashMap::new(), None);
+        assert_eq!(out["type"], "message");
+        assert_eq!(out["stop_reason"], "tool_use");
+        assert_eq!(out["content"][0]["type"], "tool_use");
+    }
+
+    #[test]
+    fn test_finalize_gemini_stream_malformed_emits_api_error() {
+        // 对齐 CPA PartlessMalformed / WithoutUsage:见 finishReason 即 error,无 message_delta
+        let chunk = json!({
+            "candidates": [{
+                "content": {"role": "model", "parts": []},
+                "finishReason": "MALFORMED_FUNCTION_CALL"
+            }],
+            "modelVersion": "m"
+        });
+        let mut state = GeminiStreamState::default();
+        let events = finalize_gemini_stream(&chunk, &mut state);
+        assert!(state.api_error_emitted);
+        assert!(state.final_events_sent);
+        assert!(
+            events
+                .iter()
+                .any(|e| e["type"] == "error" && e["error"]["type"] == "api_error"),
+            "{events:?}"
+        );
+        assert!(
+            events.iter().all(|e| e["type"] != "message_delta"),
+            "{events:?}"
+        );
+
+        // 重复终帧 / [DONE] 不再发
+        let dup = json!({
+            "candidates": [{
+                "content": {"role": "model", "parts": [{"text": "late"}]},
+                "finishReason": "MALFORMED_FUNCTION_CALL"
+            }],
+            "usageMetadata": {"promptTokenCount": 1, "candidatesTokenCount": 1}
+        });
+        assert!(finalize_gemini_stream(&dup, &mut state).is_empty());
+        assert!(force_finalize_gemini_stream(&mut state).is_empty());
+    }
+
+    #[test]
+    fn test_finalize_gemini_stream_malformed_after_thinking_closes_then_error() {
+        let mut state = GeminiStreamState {
+            response_type: ResponseType::Thinking,
+            response_index: 0,
+            has_content: true,
+            ..Default::default()
+        };
+        let chunk = json!({
+            "candidates": [{
+                "content": {"role": "model", "parts": []},
+                "finishReason": "MALFORMED_FUNCTION_CALL"
+            }],
+            "usageMetadata": {
+                "promptTokenCount": 50,
+                "candidatesTokenCount": 10,
+                "thoughtsTokenCount": 313
+            }
+        });
+        let events = finalize_gemini_stream(&chunk, &mut state);
+        assert_eq!(events[0]["type"], "content_block_stop");
+        assert_eq!(events[1]["type"], "error");
+        assert_eq!(events[1]["error"]["type"], "api_error");
+        assert!(events.iter().all(|e| e["type"] != "message_delta"));
     }
 
     #[test]

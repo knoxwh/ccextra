@@ -1456,6 +1456,28 @@ pub(crate) async fn deliver_response(
             }
             Err(_) => None,
         };
+        // 对齐 CPA 7f2f17d7:转换层产出的 Claude api_error(如 MALFORMED)抬 502 供客户端重试
+        if let Some(out) = converted.as_ref() {
+            if out.get("type").and_then(|t| t.as_str()) == Some("error") {
+                let msg = out
+                    .pointer("/error/message")
+                    .and_then(|m| m.as_str())
+                    .unwrap_or("upstream translated api_error")
+                    .to_string();
+                let payload = serde_json::to_vec(out).unwrap_or_else(|_| {
+                    serde_json::to_vec(&serde_json::json!({
+                        "type": "error",
+                        "error": {"type": "api_error", "message": msg}
+                    }))
+                    .unwrap_or_default()
+                });
+                return Ok(Response::builder()
+                    .status(axum::http::StatusCode::BAD_GATEWAY)
+                    .header(header::CONTENT_TYPE, "application/json")
+                    .body(Body::from(payload))
+                    .map_err(|e| AppError::new(anyhow::anyhow!("构造响应失败: {e}")))?);
+            }
+        }
         let payload = converted
             .and_then(|out| serde_json::to_vec(&out).ok())
             .map(Bytes::from)

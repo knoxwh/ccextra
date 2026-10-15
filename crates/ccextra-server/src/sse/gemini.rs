@@ -34,11 +34,23 @@ fn finish_gemini_relay(relay: &mut GeminiRelayState) -> Vec<Bytes> {
         return output;
     }
 
+    // MALFORMED api_error 已下发:不再补 message_stop(对齐 CPA 7f2f17d7)
+    if relay.stream.api_error_emitted {
+        relay.upstream_failed = true;
+        relay.finished = true;
+        return output;
+    }
+
     if relay.synthesize_missing_finish && !relay.stream.has_finish_reason() {
         for event in force_finalize_gemini_stream(&mut relay.stream) {
             let event_type = event["type"].as_str().unwrap_or("");
             output.push(emit::sse(event_type, &event));
         }
+    }
+    if relay.stream.api_error_emitted {
+        relay.upstream_failed = true;
+        relay.finished = true;
+        return output;
     }
     output.push(emit::message_stop());
     relay.finished = true;
@@ -141,6 +153,11 @@ fn process_gemini_events(
         for event in finalize_gemini_stream(&chunk, &mut relay.stream) {
             let event_type = event["type"].as_str().unwrap_or("");
             output.push(emit::sse(event_type, &event));
+            // MALFORMED → api_error:流已开始则 SSE error 收尾,不补 message_stop
+            if event_type == "error" || relay.stream.api_error_emitted {
+                relay.upstream_failed = true;
+                relay.finished = true;
+            }
         }
     }
     output
@@ -399,5 +416,24 @@ mod tests {
         .await;
         assert!(output.contains("event: error"));
         assert!(!output.contains("event: message_stop"));
+    }
+
+    #[tokio::test]
+    async fn test_malformed_function_call_emits_sse_api_error() {
+        // 对齐 CPA 7f2f17d7:流式 MALFORMED 无 tool_call → event:error api_error,无 message_stop
+        let output = collect_output(stream::iter(vec![Ok(Bytes::from(
+            "data: {\"candidates\":[{\"content\":{\"role\":\"model\",\"parts\":[]},\"finishReason\":\"MALFORMED_FUNCTION_CALL\"}],\"modelVersion\":\"m\"}\n\ndata: [DONE]\n\n",
+        ))]))
+        .await;
+        assert!(output.contains("event: error"), "{output}");
+        assert!(output.contains("\"type\":\"api_error\""), "{output}");
+        assert!(output.contains("MALFORMED_FUNCTION_CALL"), "{output}");
+        assert!(!output.contains("event: message_stop"), "{output}");
+        assert!(!output.contains("\"stop_reason\":\"refusal\""), "{output}");
+        assert_eq!(
+            output.matches("event: message_delta").count(),
+            0,
+            "{output}"
+        );
     }
 }
