@@ -40,7 +40,8 @@ pub async fn load_codex_providers(auth_dir: &Path, proxy_url: Option<&str>) -> V
                 tracing::debug!("Codex token 仍然有效: {}", cred.email);
             }
             Err(e) => {
-                tracing::warn!("刷新 Codex token 失败: {}: {}", cred.email, e);
+                tracing::warn!("刷新 Codex token 失败,跳过该凭证: {}: {}", cred.email, e);
+                continue;
             }
         }
 
@@ -70,7 +71,7 @@ pub async fn load_codex_providers(auth_dir: &Path, proxy_url: Option<&str>) -> V
             vec![constants::DEFAULT_API_BASE_URL.to_string()],
             cred.access_token.clone(),
             proxy_url.map(|s| s.to_string()),
-            false, // prompt_cache_key
+            true, // prompt_cache_key: session 亲和(对齐 CPA)
             codex_models,
         )
         .with_metadata(metadata);
