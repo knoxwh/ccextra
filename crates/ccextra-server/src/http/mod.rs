@@ -139,6 +139,10 @@ pub struct PayloadRule {
 pub struct NormalizeConfig {
     pub enabled: bool,
     pub drift_detector: bool,
+    /// 可选：drift 额外观测 tools description 软维（默认 false，热路径成本≈现状）。
+    /// 仅会话级 DEBUG，永不进入父级 WARN。
+    #[serde(default)]
+    pub drift_tools_description: bool,
 }
 
 #[derive(Clone, Debug, serde::Deserialize)]

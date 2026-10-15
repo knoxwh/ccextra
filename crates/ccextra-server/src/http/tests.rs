@@ -169,6 +169,7 @@ fn mock_state() -> AppState {
         normalize: NormalizeConfig {
             enabled: false,
             drift_detector: false,
+            drift_tools_description: false,
         },
         logging: LoggingConfig {
             level: "info".into(),
@@ -1312,6 +1313,7 @@ fn reload_returning_secret(secret: Option<String>) -> ReloadFn {
                 normalize: NormalizeConfig {
                     enabled: false,
                     drift_detector: false,
+                    drift_tools_description: false,
                 },
                 logging: LoggingConfig {
                     level: "info".into(),
@@ -1380,6 +1382,7 @@ async fn test_reload_applies_normalize_and_proxy() {
                 normalize: NormalizeConfig {
                     enabled: true,
                     drift_detector: true,
+                    drift_tools_description: false,
                 },
                 logging: LoggingConfig {
                     level: "debug".into(),

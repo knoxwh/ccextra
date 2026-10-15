@@ -1015,6 +1015,7 @@ mod tests {
                 normalize: NormalizeConfig {
                     enabled: false,
                     drift_detector: false,
+                    drift_tools_description: false,
                 },
                 logging: LoggingConfig {
                     level: "info".into(),
@@ -1123,7 +1124,7 @@ providers:
     base_url: https://example.invalid
     key: fixture-key
     models: []
-normalize: { enabled: false, drift_detector: false }
+normalize: { enabled: false, drift_detector: false, drift_tools_description: false }
 logging: { level: info, request_body: false }
 auth_dir: new-antigravity
 xai_auth_dir: new-xai
