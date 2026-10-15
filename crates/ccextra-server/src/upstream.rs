@@ -244,6 +244,16 @@ fn grok_cli_headers(
 /// 仅 responses + *gpt* 用 Codex UA;chat 或 responses + *grok* 用 Grok CLI UA
 /// (对齐 sub2api CLIUserAgent 的双组件 UA);其余用 claude-cli
 /// 部分上游按 UA 分流缓存/特性,reqwest 默认 UA 会被识别为非官方客户端。
+/// 从 Codex UA 取 Originator(首段 `/` 前);仅认官方名,否则回退 codex_cli_rs。
+/// 对齐 sub2api PairCodexClientIdentity 的首段配套,避免 UA/Originator 错配 404。
+fn codex_originator_from_ua(ua: &str) -> &str {
+    let name = ua.split('/').next().unwrap_or("").trim();
+    match name {
+        "codex_cli_rs" | "codex-tui" => name,
+        _ => "codex_cli_rs",
+    }
+}
+
 fn user_agent(
     protocol: Protocol,
     upstream_model: &str,
@@ -823,10 +833,8 @@ impl UpstreamClient {
         let url = format!("{}{}", base_url.trim_end_matches('/'), endpoint);
         // 认证头按协议:Gemini 直连用 x-goog-api-key(对齐 CPA gemini_executor,
         // generativelanguage 不收 Bearer);其余 Bearer
-        let mut req = client.post(&url).header(
-            reqwest::header::USER_AGENT,
-            user_agent(protocol, upstream_model, user_agents, inbound_user_agent),
-        );
+        let ua = user_agent(protocol, upstream_model, user_agents, inbound_user_agent);
+        let mut req = client.post(&url).header(reqwest::header::USER_AGENT, &ua);
         if matches!(protocol, Protocol::Gemini) {
             req = req.header("x-goog-api-key", api_key);
         } else {
@@ -836,7 +844,7 @@ impl UpstreamClient {
             req = req.header(name, value);
         }
         // responses 协议:Session-Id/Thread-Id 有则带;Originator 仅 *gpt*
-        // Window-Id 对齐官方 `{thread_id}:{window_number}`;无 thread 则不造(对齐 CPA 透传)
+        // Window-Id:有 thread 时发官方形态 `{thread_id}:0`(CPA/sub2api 只透传不自造)
         if matches!(protocol, Protocol::OpenAiResponses) {
             if let Some(sid) = session_id {
                 req = req.header("Session-Id", sid);
@@ -848,7 +856,7 @@ impl UpstreamClient {
                 }
             }
             if is_gpt_model(upstream_model) {
-                req = req.header("Originator", "codex_cli_rs");
+                req = req.header("Originator", codex_originator_from_ua(&ua));
                 if let Some(hint) = routing_hint {
                     req = req.header("X-Codex-Routing-Hint", hint);
                 }
@@ -1137,6 +1145,20 @@ impl Default for UpstreamClient {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn test_codex_originator_from_ua() {
+        assert_eq!(
+            codex_originator_from_ua("codex_cli_rs/0.162.1 (Mac OS; arm64)"),
+            "codex_cli_rs"
+        );
+        assert_eq!(
+            codex_originator_from_ua("codex-tui/0.154.0 (Mac OS; arm64) iTerm"),
+            "codex-tui"
+        );
+        assert_eq!(codex_originator_from_ua("other/1.0"), "codex_cli_rs");
+        assert_eq!(codex_originator_from_ua(""), "codex_cli_rs");
+    }
 
     #[test]
     fn test_endpoint_path_routing() {
