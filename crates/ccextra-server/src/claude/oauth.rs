@@ -153,11 +153,12 @@ pub fn http_client(proxy_url: Option<&str>) -> Result<Client> {
         .context("build claude http client")
 }
 
-/// 对齐 CPA applyClaudeOAuthAxiosHeaders
+/// 对齐 CPA applyClaudeOAuthAxiosHeaders(控制面;不含 Connection:close)
 fn apply_oauth_headers(req: reqwest::RequestBuilder) -> reqwest::RequestBuilder {
     req.header("Accept", "application/json, text/plain, */*")
         .header("Content-Type", "application/json")
         .header("User-Agent", "axios/1.15.2")
+        .header("Accept-Encoding", "gzip, compress, deflate, br")
 }
 
 /// 回调 code 可能带 `#state` 片段 (对齐 CPA parseCodeAndState)
