@@ -48,7 +48,8 @@ pub async fn load_xai_providers(auth_dir: &Path, proxy_url: Option<&str>) -> Vec
                 tracing::debug!("xAI token 仍然有效: {}", cred.email);
             }
             Err(e) => {
-                tracing::warn!("刷新 xAI token 失败: {}: {}", cred.email, e);
+                tracing::warn!("刷新 xAI token 失败,跳过该凭证: {}: {}", cred.email, e);
+                continue;
             }
         }
 
@@ -72,18 +73,15 @@ pub async fn load_xai_providers(auth_dir: &Path, proxy_url: Option<&str>) -> Vec
         metadata.insert("sub".to_string(), cred.sub.clone());
         metadata.insert("provider_type".to_string(), "xai".to_string());
 
-        let base_urls = vec![
-            constants::CLI_CHAT_PROXY_BASE_URL.to_string(),
-            constants::DEFAULT_API_BASE_URL.to_string(),
-        ];
-
+        // OAuth 订阅钉 cli-chat-proxy(原生 grok-build SessionToken 路由;
+        // 不 failover 到 api.x.ai,避免丢 Token-Auth 身份头)
         let provider = ProviderConfig::new(
             provider_name.clone(),
             Protocol::OpenAiResponses,
-            base_urls,
+            vec![constants::CLI_CHAT_PROXY_BASE_URL.to_string()],
             cred.access_token.clone(),
             proxy_url.map(|s| s.to_string()),
-            false, // prompt_cache_key
+            true, // prompt_cache_key: Responses 亲和(原生 forwards_prompt_cache_key)
             grok_models,
         )
         .with_metadata(metadata);
