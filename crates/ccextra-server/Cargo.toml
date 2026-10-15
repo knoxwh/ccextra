@@ -29,7 +29,6 @@ hex.workspace = true
 lru = "0.18"
 md-5 = "0.11"
 wreq = { version = "0.16.1", default-features = true, features = ["json", "stream", "socks", "gzip", "brotli", "deflate", "zstd"] }
-percent-encoding = "2"
 
 time = { version = "0.3", features = ["formatting", "parsing", "std"] }
 getrandom = "0.4"

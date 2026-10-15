@@ -22,7 +22,5 @@ lru = "0.18"
 regex = "1"
 http = "1"
 
-
 [dev-dependencies]
-tracing-subscriber = { version = "0.3", default-features = false, features = ["fmt", "ansi"] }
 yaml_serde = "0.10"
