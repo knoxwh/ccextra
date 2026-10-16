@@ -1233,6 +1233,8 @@ fn remove_unsupported_keywords(schema: &mut Value, opts: CleanOptions) {
         "prefill",
         "deprecated",
         "encrypted",
+        // 对齐 CPA e9ba5c50 / Issue #6639: OpenAPI discriminator 元数据关键字
+        "discriminator",
         // 对齐 CPA c93978c4:补充剥离不支持关键字
         "additionalItems",
         "unevaluatedProperties",
@@ -3010,6 +3012,137 @@ mod tests {
             let out3 = clean(&input_missing_type);
             assert_eq!(out3["properties"]["endpoint"]["type"], "object");
             assert!(out3["properties"]["endpoint"]["properties"]["traces"].is_object());
+        }
+    }
+
+    #[test]
+    fn test_removes_discriminator_keyword_issue_6639() {
+        // 对齐 CPA e9ba5c50 / Issue #6639: schema 关键字 discriminator 剥离,
+        // properties.discriminator 合法属性名保留;多分支 anyOf/oneOf 在非
+        // AG-Claude flatten 路径上仍保留。
+        let schema = json!({
+            "type": "object",
+            "properties": {
+                "target": {
+                    "anyOf": [
+                        {"type": "object", "properties": {"kind": {"const": "a"}, "url": {"type": "string"}}},
+                        {"type": "object", "properties": {"kind": {"const": "b"}, "path": {"type": "string"}}}
+                    ],
+                    "discriminator": {"propertyName": "kind"}
+                },
+                "deliverables": {
+                    "type": "array",
+                    "items": {
+                        "anyOf": [
+                            {"type": "object", "properties": {"kind": {"const": "file"}, "path": {"type": "string"}}},
+                            {"type": "object", "properties": {"kind": {"const": "link"}, "url": {"type": "string"}}}
+                        ],
+                        "discriminator": {"propertyName": "kind"}
+                    }
+                },
+                "polymorphicObject": {
+                    "type": "object",
+                    "properties": {
+                        "kind": {"type": "string"}
+                    },
+                    "oneOf": [
+                        {"properties": {"a": {"type": "string"}}},
+                        {"properties": {"b": {"type": "number"}}}
+                    ],
+                    "discriminator": {
+                        "propertyName": "kind",
+                        "mapping": {"a": "#/definitions/A", "b": "#/definitions/B"}
+                    }
+                },
+                "discriminator": {
+                    "type": "string",
+                    "description": "Legitimate property named discriminator"
+                },
+                "nestedDiscriminatorProp": {
+                    "type": "object",
+                    "properties": {
+                        "discriminator": {
+                            "type": "object",
+                            "properties": {
+                                "kind": {"type": "string"}
+                            },
+                            "discriminator": {"propertyName": "kind"}
+                        }
+                    }
+                }
+            },
+            "discriminator": {"propertyName": "target"}
+        });
+
+        for name in [
+            "Gemini",
+            "Antigravity",
+            "AntigravityTool",
+            "AntigravityClaudeTool",
+        ] {
+            let out = match name {
+                "Gemini" => clean_json_schema_for_gemini(&schema),
+                "Antigravity" => clean_json_schema_for_antigravity(&schema),
+                "AntigravityTool" => clean_json_schema_for_antigravity_tool(&schema, false),
+                "AntigravityClaudeTool" => clean_json_schema_for_antigravity_claude_tool(&schema),
+                _ => unreachable!(),
+            };
+            assert!(
+                out.get("discriminator").is_none(),
+                "[{name}] root discriminator kept: {out}"
+            );
+            assert!(
+                out["properties"]["target"].get("discriminator").is_none(),
+                "[{name}] target.discriminator kept: {out}"
+            );
+            assert!(
+                out["properties"]["deliverables"]["items"]
+                    .get("discriminator")
+                    .is_none(),
+                "[{name}] deliverables.items.discriminator kept: {out}"
+            );
+            assert!(
+                out["properties"]["polymorphicObject"]
+                    .get("discriminator")
+                    .is_none(),
+                "[{name}] polymorphicObject.discriminator kept: {out}"
+            );
+            assert!(
+                out["properties"]["nestedDiscriminatorProp"]["properties"]["discriminator"]
+                    .get("discriminator")
+                    .is_none(),
+                "[{name}] nested keyword discriminator kept: {out}"
+            );
+
+            // AG Claude 工具路径强制展平多分支,不要求 anyOf 仍为 2
+            if name != "AntigravityClaudeTool" {
+                assert_eq!(
+                    out["properties"]["target"]["anyOf"]
+                        .as_array()
+                        .map(|a| a.len()),
+                    Some(2),
+                    "[{name}] target.anyOf branches: {out}"
+                );
+                assert_eq!(
+                    out["properties"]["deliverables"]["items"]["anyOf"]
+                        .as_array()
+                        .map(|a| a.len()),
+                    Some(2),
+                    "[{name}] deliverables.items.anyOf branches: {out}"
+                );
+            }
+
+            assert!(
+                out["properties"].get("discriminator").is_some(),
+                "[{name}] property discriminator dropped: {out}"
+            );
+            assert!(
+                out["properties"]["nestedDiscriminatorProp"]["properties"]["discriminator"]
+                    ["properties"]
+                    .get("kind")
+                    .is_some(),
+                "[{name}] nested property discriminator dropped: {out}"
+            );
         }
     }
 }
