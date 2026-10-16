@@ -214,14 +214,16 @@ async fn shutdown_signal() {
         let mut terminate =
             tokio::signal::unix::signal(tokio::signal::unix::SignalKind::terminate())
                 .expect("install SIGTERM handler");
-        tokio::select! {
-            _ = tokio::signal::ctrl_c() => {}
-            _ = terminate.recv() => {}
-        }
+        let reason = tokio::select! {
+            _ = tokio::signal::ctrl_c() => "SIGINT",
+            _ = terminate.recv() => "SIGTERM",
+        };
+        tracing::info!("ccextra shutting down ({reason})");
     }
     #[cfg(not(unix))]
     {
         let _ = tokio::signal::ctrl_c().await;
+        tracing::info!("ccextra shutting down (SIGINT)");
     }
 }
 
