@@ -96,7 +96,7 @@ messages 路径不做本地退避：429/5xx（含 52x）与网络错误在同轮
 非流响应 body 的统一读取边界：成功 body 16 MiB（恰好上限可读，多 1 字节拒绝），错误 body 256 KiB（超出停止读取并标记截断，截断前缀不当作完整 JSON 解析）；读取停顿与流 chunk idle 共用 180s，每次非空数据后重置。成功 body 超限返回 502、停顿返回 504；错误 body 截断或读取失败保留上游状态码（429/401 不被改写）；OAuth/project/model 保留各自 30s 请求总超时。
 
 **死连接**
-复用池中已失效的连接（reset/broken pipe/提前关闭）。立刻重试一次；普通建连失败/建连超时不属于死连接，交给 URL 回退，避免单 URL 建连超时被内部重试放大。
+复用池中已失效的连接（reset/broken pipe/提前关闭，以及等响应头 `SEND_TIMEOUT` 文案「上游请求超时」——常见于代理空闲掐线后的僵死 keep-alive）。立刻丢掉缓存 Client 再重试一次；普通建连失败/建连超时（传输层 `is_timeout`）不属于死连接，交给 URL 回退，避免单 URL 建连超时被内部重试放大。
 
 **relay 状态机**
 将 OpenAI 或 Gemini 风格 SSE 转成 Anthropic `message_start`、content block、delta 和终态事件的状态机。终态后忽略后续上游事件。
