@@ -13,10 +13,10 @@ pub fn build_fingerprint_client(proxy_key: &str, no_redirect: bool) -> anyhow::R
     // gzip/br/deflate/zstd feature:自动解压 Content-Encoding,与 Claude AE 金样对齐
     let mut builder = Client::builder()
         .pool_max_idle_per_host(4)
-        // Match UpstreamClient defaults (45s idle / 30s TCP keepalive).
-        .pool_idle_timeout(std::time::Duration::from_secs(45))
-        .connect_timeout(std::time::Duration::from_secs(10))
-        .tcp_keepalive(std::time::Duration::from_secs(30))
+        // Match UpstreamClient defaults (shared pool timeout consts).
+        .pool_idle_timeout(crate::upstream::POOL_IDLE_TIMEOUT)
+        .connect_timeout(crate::upstream::CONNECT_TIMEOUT)
+        .tcp_keepalive(crate::upstream::TCP_KEEPALIVE)
         .tcp_nodelay(true)
         .http1_only()
         .tls_options(bun_tls_options());

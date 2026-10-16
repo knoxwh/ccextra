@@ -1,7 +1,7 @@
-// 上游请求客户端 (reqwest)
+// 上游请求客户端 (双栈:默认 reqwest + Claude TLS fingerprint lane wreq/BoringSSL)
 //
 // 支持代理:全局 proxy 兜底 + 每 provider 覆盖。
-// 按"最终代理"缓存 client,避免每次请求重建。
+// reqwest 按 (proxy, ant, no_redirect, scope) 缓存;指纹车道按 (proxy, no_redirect) 进 fp_clients。
 
 use std::collections::HashMap;
 use std::sync::Mutex;
@@ -12,10 +12,10 @@ use reqwest::Client;
 use serde::Deserialize;
 
 /// 连接池空闲淘汰(短于常见 NAT/LB 静默掐线窗口;流 chunk idle 180s 不是池寿命)。
-const POOL_IDLE_TIMEOUT: Duration = Duration::from_secs(45);
+pub(crate) const POOL_IDLE_TIMEOUT: Duration = Duration::from_secs(45);
 /// TCP keepalive 首探间隔:半开连接更快被内核发现(指纹 H1 无 h2 ping 时尤其有用)。
-const TCP_KEEPALIVE: Duration = Duration::from_secs(30);
-const CONNECT_TIMEOUT: Duration = Duration::from_secs(10);
+pub(crate) const TCP_KEEPALIVE: Duration = Duration::from_secs(30);
+pub(crate) const CONNECT_TIMEOUT: Duration = Duration::from_secs(10);
 /// send() 上限(等到响应头)。30s:上游收连不回头时快速失败交客户端退避;
 /// 流式之后的 chunk idle 走 STREAM_IDLE_TIMEOUT。
 /// 无 Client::timeout,避免掐整条 SSE。
@@ -28,7 +28,7 @@ pub struct UpstreamResponse {
     pub body: UpstreamBody,
 }
 
-/// 双栈响应体:默认车道 reqwest,Claude oat 指纹车道 wreq。
+/// 双栈响应体:默认车道 reqwest,Claude TLS fingerprint lane (wreq/BoringSSL)。
 #[derive(Debug)]
 pub enum UpstreamBody {
     Reqwest(reqwest::Response),
@@ -399,7 +399,7 @@ fn parse_go_duration(raw: &str) -> anyhow::Result<Duration> {
 
 /// client 缓存键:(最终代理, 是否 antigravity, 是否禁 redirect, 凭证 scope)
 /// Antigravity 启用连接池时 scope 为凭证短摘要，隔离多账号 TCP/TLS 池。
-/// Claude oat 指纹车道不进此表,见 `FpClientCacheKey` / `fp_clients`。
+/// Claude TLS fingerprint lane 不进此表,见 `FpClientCacheKey` / `fp_clients`。
 type ClientCacheKey = (String, bool, bool, String);
 
 /// Claude Bun 指纹车道缓存键:(代理, 是否禁 redirect)
@@ -916,7 +916,7 @@ impl UpstreamClient {
         })
     }
 
-    /// Claude 官方 oat 指纹车道(wreq):仅 Protocol::Claude messages 路径。
+    /// Claude TLS fingerprint lane (wreq/BoringSSL):仅 Protocol::Claude messages 路径。
     #[allow(clippy::too_many_arguments)]
     async fn request_once_fp(
         &self,

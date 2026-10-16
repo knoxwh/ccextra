@@ -84,7 +84,7 @@ OpenAI Chat 或 Responses 的 provider 级缓存桶标识。来自 Claude Code �
 ## 运行时术语
 
 **UpstreamClient**
-按最终代理地址缓存 `reqwest::Client` 的发送器。它选择协议端点、认证、User-Agent、Grok 会话头和流式头。Responses 序列化时先发顶层 `model`、`stream` 和已有 `service_tier`，供网关在大 input 到达前路由；其余键序与值不变。
+双栈发送器：默认车道按 (proxy, antigravity, no_redirect, credential scope) 缓存 `reqwest::Client`；`protocol: claude` 走 Claude TLS fingerprint lane（wreq/BoringSSL），按 (proxy, no_redirect) 缓存进 `fp_clients`。它选择协议端点、认证、User-Agent、Grok 会话头和流式头。Responses 序列化时先发顶层 `model`、`stream` 和已有 `service_tier`，供网关在大 input 到达前路由；其余键序与值不变。
 
 **Grok CLI 身份**
 Grok Chat/Responses 请求使用 `x-grok-client-identifier: grok-pager`、`x-grok-client-mode: interactive` 与 `grok-pager/{version} grok-shell/{version} ({os}; {arch})`。版本默认 `1.0.46`，可由 `user_agents.grok_version` 覆盖；`x-authenticateresponse: authenticate-response` 仅官方 `cli-chat-proxy.grok.com` 添加，不用于普通 API 或其他模型/协议。

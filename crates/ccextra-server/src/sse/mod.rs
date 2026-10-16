@@ -1,10 +1,12 @@
 // SSE 解析与响应转换
 //
+// relay() 按协议分派响应流。子模块:
 // - parser:   手写 SSE 解析器(跨 chunk 累积)
 // - chat:     OpenAI chat SSE → Anthropic SSE 状态机
 // - responses: OpenAI responses SSE → Anthropic SSE 状态机
 // - emit:     无状态帧构造函数(chat/responses 共用)
-// - relay:    按协议分派响应流
+// - gemini / non_stream
+// - replay_cache / antigravity_replay_cache / kimi_thinking_replay_cache
 
 pub mod antigravity_replay_cache;
 pub mod chat;

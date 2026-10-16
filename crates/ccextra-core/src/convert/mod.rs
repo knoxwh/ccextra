@@ -1,10 +1,10 @@
 // 协议转换:独立 body-to-body 转换
 //
-// - passthrough: claude → claude 只改 model
-// - to_openai_chat: anthropic → openai chat
-// - to_openai_responses: anthropic → openai responses
-// - to_gemini: anthropic → gemini
-// - to_antigravity: anthropic → antigravity
+// - passthrough / to_openai_chat / to_openai_responses
+// - gemini / gemini_response / gemini_schema
+// - antigravity / antigravity_tools / antigravity_reasoning_replay
+// - message_convert / reasoning_replay / kimi_thinking_replay
+// - fix_json / shorten / signature / tool_id / tool_sanitize
 
 use thiserror::Error;
 

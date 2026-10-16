@@ -29,6 +29,10 @@
 //!   skills 与 deferred-tools 列表块进行排序，使 CC 的不稳定列表顺序不会
 //!   使 cache prefix 漂移。仅作用于 system；
 //!   tool 定义的排序由 [`tool_def_normalize`] 处理。
+//! - [`smoosh_split`] — PR-E9：从 `tool_result.content` 中剥离开被揉合的
+//!   `<system-reminder>` 块，拆成独立 text 块（幂等、无损；仅 Anthropic）。
+//! - [`tool_input_normalize`] — PR-E11：将 `tool_use.input` 键顺序归一化
+//!   以匹配工具 schema（schema 键在前，其余字典序；无损、幂等；仅 Anthropic）。
 
 pub mod drift_detector;
 pub mod json_walker;
