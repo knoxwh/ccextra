@@ -2,8 +2,52 @@
 set -euo pipefail
 
 SCRIPT_DIR="$(cd "$(dirname "$0")" && pwd)"
+TODAY=$(date +%Y-%m-%d)
+LOG_DIR="$SCRIPT_DIR/logs"
+OPS_LOG="$LOG_DIR/ops.$TODAY.log"
+CC_LOG="$LOG_DIR/ccextra.$TODAY.log"
+
+# 记录谁触发了 stop,方便下次对照 SIGTERM
+log_stop_caller() {
+    local ts user uid ppid parent_cmd tty_name term_val ssh_val line
+    ts=$(date '+%Y-%m-%d %H:%M:%S %Z')
+    user=$(id -un 2>/dev/null || echo '?')
+    uid=$(id -u 2>/dev/null || echo '?')
+    ppid=${PPID:-?}
+    # 压成单行并截断,避免 Cursor/agent 壳把整段 dump 脚本写进 ops 日志
+    parent_cmd=$(ps -p "$ppid" -o args= 2>/dev/null | tr '\n\r\t' ' ' | tr -s ' ' || true)
+    parent_cmd=${parent_cmd:-?}
+    if [ "${#parent_cmd}" -gt 240 ]; then
+        parent_cmd="${parent_cmd:0:240}..."
+    fi
+    tty_name=$(tty 2>/dev/null || true)
+    if [ -z "$tty_name" ] || [ "$tty_name" = "not a tty" ]; then
+        tty_name=$(ps -p $$ -o tty= 2>/dev/null | tr -d ' ' || true)
+        tty_name=${tty_name:-?}
+    fi
+    term_val=${TERM:-}
+    ssh_val=${SSH_CLIENT:-${SSH_CONNECTION:-}}
+
+    line="[ops] stop.sh caller ts=$ts user=$user uid=$uid ppid=$ppid tty=$tty_name parent=\"$parent_cmd\""
+    if [ -n "$term_val" ]; then
+        line="$line TERM=$term_val"
+    fi
+    if [ -n "$ssh_val" ]; then
+        line="$line SSH_CLIENT=\"$ssh_val\""
+    fi
+
+    echo "$line" >&2
+
+    mkdir -p "$LOG_DIR"
+    echo "$line" >> "$OPS_LOG" 2>/dev/null || true
+    # 若当日服务日志可写,也留一行便于和 shutting down (SIGTERM) 对照
+    if [ -w "$CC_LOG" ]; then
+        echo "$line" >> "$CC_LOG" 2>/dev/null || true
+    fi
+}
 
 echo "=== Stopping ccextra ==="
+log_stop_caller
 
 # 匹配本仓库二进制的完整路径,避免误杀命令行恰好含 ccextra 的无关进程
 CC_NAMES="$SCRIPT_DIR/ccextra"
