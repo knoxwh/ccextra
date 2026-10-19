@@ -159,8 +159,8 @@ fn parse_models(body: &Value, filter: &[String]) -> Result<Vec<ModelConfig>> {
         return Err(anyhow!("没有找到可用模型"));
     }
 
-    // 白名单过滤;过滤后为空同样报错,调用方按现有语义处理
-    let models = crate::model_filter::filter_models(models, filter);
+    // 白名单过滤;全非法 glob 显式失败;合法过滤后为空同样报错
+    let models = crate::model_filter::filter_models(models, filter).map_err(|e| anyhow!("{e}"))?;
     if models.is_empty() {
         return Err(anyhow!("Antigravity 模型过滤后为空"));
     }
