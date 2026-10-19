@@ -1359,6 +1359,7 @@ pub(crate) async fn deliver_response(
                 protocol = ?prepared.route.protocol,
                 "invalid_encrypted_content,剥离 reasoning 后重试一次"
             );
+            prepared.reencode_body().await?;
             if let Some((cache, key, _)) = prepared.replay_scope.as_ref() {
                 cache.invalidate(key);
             }
