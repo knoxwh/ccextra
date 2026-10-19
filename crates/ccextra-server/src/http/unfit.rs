@@ -22,8 +22,15 @@ pub enum UnfitKind {
 type UnfitKey = (String, String); // (provider, model)
 
 #[derive(Default)]
+struct UnfitState {
+    flags: HashMap<UnfitKey, Vec<UnfitKind>>,
+    /// /reload clear 时递增;持旧世代的飞行请求 mark 会被丢弃
+    generation: u64,
+}
+
+#[derive(Default)]
 pub struct UnfitRegistry {
-    flags: RwLock<HashMap<UnfitKey, Vec<UnfitKind>>>,
+    state: RwLock<UnfitState>,
 }
 
 impl UnfitRegistry {
@@ -31,11 +38,20 @@ impl UnfitRegistry {
         Self::default()
     }
 
-    /// 标记 (provider, model) 不兼容某特性;已存在同 kind 时不重复插入
-    pub fn mark(&self, provider: &str, model: &str, kind: UnfitKind) {
+    /// 当前世代(请求准备时捕获,mark 时比对)
+    pub fn generation(&self) -> u64 {
+        self.state.read().unwrap().generation
+    }
+
+    /// 标记 (provider, model) 不兼容某特性;已存在同 kind 时不重复插入。
+    /// `at_generation` 与当前世代不一致时丢弃(防止 /reload clear 后旧飞行请求写回)。
+    pub fn mark(&self, provider: &str, model: &str, kind: UnfitKind, at_generation: u64) {
+        let mut state = self.state.write().unwrap();
+        if at_generation != state.generation {
+            return;
+        }
         let key = (provider.to_string(), model.to_string());
-        let mut flags = self.flags.write().unwrap();
-        let kinds = flags.entry(key).or_default();
+        let kinds = state.flags.entry(key).or_default();
         if !kinds.contains(&kind) {
             kinds.push(kind);
         }
@@ -44,16 +60,19 @@ impl UnfitRegistry {
     /// 检查是否已标记为不兼容
     pub fn is_unfit(&self, provider: &str, model: &str, kind: UnfitKind) -> bool {
         let key = (provider.to_string(), model.to_string());
-        self.flags
+        self.state
             .read()
             .unwrap()
+            .flags
             .get(&key)
             .is_some_and(|kinds| kinds.contains(&kind))
     }
 
-    /// /reload 时清空,避免旧配置标记残留
+    /// /reload 时清空并增代,避免旧配置标记残留与旧飞行请求写回
     pub fn clear(&self) {
-        self.flags.write().unwrap().clear();
+        let mut state = self.state.write().unwrap();
+        state.flags.clear();
+        state.generation = state.generation.wrapping_add(1);
     }
 }
 
@@ -231,18 +250,33 @@ mod tests {
     #[test]
     fn mark_does_not_duplicate_kinds() {
         let reg = UnfitRegistry::new();
-        reg.mark("p", "m", UnfitKind::RefusesFormat);
-        reg.mark("p", "m", UnfitKind::RefusesFormat);
-        reg.mark("p", "m", UnfitKind::OffRefused);
-        let flags = reg.flags.read().unwrap();
-        assert_eq!(flags[&("p".into(), "m".into())].len(), 2);
+        let gen = reg.generation();
+        reg.mark("p", "m", UnfitKind::RefusesFormat, gen);
+        reg.mark("p", "m", UnfitKind::RefusesFormat, gen);
+        reg.mark("p", "m", UnfitKind::OffRefused, gen);
+        let state = reg.state.read().unwrap();
+        assert_eq!(state.flags[&("p".into(), "m".into())].len(), 2);
     }
 
     #[test]
     fn clear_empties_registry() {
         let reg = UnfitRegistry::new();
-        reg.mark("p", "m", UnfitKind::ToolChoiceRefused);
+        let gen = reg.generation();
+        reg.mark("p", "m", UnfitKind::ToolChoiceRefused, gen);
         reg.clear();
         assert!(!reg.is_unfit("p", "m", UnfitKind::ToolChoiceRefused));
+    }
+
+    #[test]
+    fn stale_generation_mark_does_not_pollute_after_clear() {
+        let reg = UnfitRegistry::new();
+        let stale = reg.generation();
+        reg.clear();
+        assert_ne!(stale, reg.generation());
+        reg.mark("p", "m", UnfitKind::RefusesFormat, stale);
+        assert!(!reg.is_unfit("p", "m", UnfitKind::RefusesFormat));
+        let current = reg.generation();
+        reg.mark("p", "m", UnfitKind::RefusesFormat, current);
+        assert!(reg.is_unfit("p", "m", UnfitKind::RefusesFormat));
     }
 }

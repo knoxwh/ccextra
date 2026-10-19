@@ -94,7 +94,7 @@ pub async fn handle_reload(State(state): State<AppState>) -> Result<Json<ReloadR
         });
     }
 
-    // 6. 清空 unfit 注册表(旧 provider/model 标记不得残留)
+    // 6. 清空 unfit 注册表并增代(旧标记与持旧世代的飞行 mark 均失效)
     crate::http::unfit::global_registry().clear();
     result.reloaded.push("unfit_registry".into());
 

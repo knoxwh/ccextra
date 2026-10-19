@@ -347,6 +347,8 @@ pub(crate) struct PreparedMessageRequest {
     pub token_scope: Option<crate::http::session_tokens::TokenCacheScope>,
     /// drift 开启且父级稳定时：响应路径关联 cache usage（与 token_scope 分离）
     pub drift_usage_scope: Option<crate::http::session_tokens::DriftUsageScope>,
+    /// 准备请求时捕获的 unfit 世代;/reload clear 增代后旧请求 mark 丢弃
+    pub unfit_generation: u64,
 }
 
 pub(crate) struct ExecutedUpstream {
@@ -1060,6 +1062,7 @@ pub(crate) async fn prepare_message_request(
         token_scope: session_id
             .map(|session| (Arc::clone(&state.last_input_tokens), session.to_string())),
         drift_usage_scope: drift_parent_for_usage.map(|parent| (state.drift.clone(), parent)),
+        unfit_generation: crate::http::unfit::global_registry().generation(),
     })
 }
 
@@ -1277,6 +1280,7 @@ pub(crate) async fn deliver_response(
                     &prepared.route.provider,
                     &prepared.route.upstream_model,
                     kind,
+                    prepared.unfit_generation,
                 );
 
                 // 原地修复请求并重试
