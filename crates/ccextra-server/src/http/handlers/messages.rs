@@ -1211,6 +1211,15 @@ pub(crate) async fn execute_upstream_request(
     })
 }
 
+/// 401 刷新重试后的门禁 status:无论成败均采用重试码,
+/// 使 unfit / AG·Kimi 清账本 / encrypted trim 看到最终上游结果而非首发 401。
+fn gate_status_after_auth_retry(
+    _initial: axum::http::StatusCode,
+    retry: axum::http::StatusCode,
+) -> axum::http::StatusCode {
+    retry
+}
+
 pub(crate) async fn deliver_response(
     state: &AppState,
     prepared: &mut PreparedMessageRequest,
@@ -1253,8 +1262,9 @@ pub(crate) async fn deliver_response(
                     }
                     let retry = prepared.send_retry(upstream_client, user_agents).await?;
                     final_status = retry.status;
+                    // 成败均更新门禁 status(对齐成功分支);后续 unfit 等看最终码
+                    status = gate_status_after_auth_retry(status, retry.status);
                     if retry.status.is_success() {
-                        status = retry.status;
                         executed.upstream = Some(retry);
                         retried_ok = true;
                     } else {
@@ -1890,6 +1900,20 @@ mod tests {
             drift_usage_scope: None,
             unfit_generation: 0,
         }
+    }
+
+    #[test]
+    fn auth_retry_failure_uses_retry_status_for_gates() {
+        let initial = axum::http::StatusCode::UNAUTHORIZED;
+        let retry = axum::http::StatusCode::BAD_REQUEST;
+        let effective = gate_status_after_auth_retry(initial, retry);
+        assert_eq!(effective, axum::http::StatusCode::BAD_REQUEST);
+        assert!(
+            effective.as_u16() == 400 || effective.as_u16() == 422,
+            "门禁应看到 400/422 而非首发 401"
+        );
+        // 若失败路径仍用 initial,本断言会红
+        assert_ne!(effective, initial);
     }
 
     /// Codex 401 helper:无 chatgpt-account-id → 插入后须 reencode 为 zstd。
