@@ -44,12 +44,11 @@ pub async fn handle_count_tokens(
     let model = body_json
         .get("model")
         .and_then(|v| v.as_str())
-        .ok_or_else(|| AppError::new(anyhow::anyhow!("缺少 model 字段")))?
+        .ok_or_else(|| AppError::bad_request("缺少 model 字段"))?
         .to_string();
 
-    // 路由判定
-    let route = resolve_route(&model, providers)
-        .map_err(|e| AppError::new(anyhow::anyhow!("路由失败: {e}")))?;
+    // 路由判定(ModelNotFound → 404,经 AppError::from)
+    let route = resolve_route(&model, providers).map_err(AppError::from)?;
 
     // 与 messages 直通一致:转发前把别名改写成上游模型名
     body_json["model"] = Value::String(route.upstream_model.clone());

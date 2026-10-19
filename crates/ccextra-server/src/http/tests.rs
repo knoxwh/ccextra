@@ -1835,6 +1835,50 @@ async fn test_count_tokens_empty_base_url_rejected() {
     );
 }
 
+/// count_tokens 未知模型 → 404(ModelNotFound via AppError::from)
+#[tokio::test]
+async fn test_count_tokens_unknown_model_returns_404() {
+    let state = mock_state();
+    let app = app(state);
+    let request = Request::builder()
+        .uri("/v1/messages/count_tokens")
+        .method("POST")
+        .header("content-type", "application/json")
+        .body(Body::from(
+            json!({"model": "definitely-not-a-model", "messages": []}).to_string(),
+        ))
+        .unwrap();
+    let response = app.oneshot(request).await.unwrap();
+    assert_eq!(response.status(), StatusCode::NOT_FOUND);
+    let bytes = to_bytes(response.into_body(), 1024).await.unwrap();
+    let v: Value = serde_json::from_slice(&bytes).unwrap();
+    assert_eq!(v["type"], "error");
+    assert_eq!(v["error"]["type"], "not_found_error");
+}
+
+/// count_tokens 缺 model → 400
+#[tokio::test]
+async fn test_count_tokens_missing_model_returns_400() {
+    let state = mock_state();
+    let app = app(state);
+    let request = Request::builder()
+        .uri("/v1/messages/count_tokens")
+        .method("POST")
+        .header("content-type", "application/json")
+        .body(Body::from(json!({"messages": []}).to_string()))
+        .unwrap();
+    let response = app.oneshot(request).await.unwrap();
+    assert_eq!(response.status(), StatusCode::BAD_REQUEST);
+    let bytes = to_bytes(response.into_body(), 1024).await.unwrap();
+    let v: Value = serde_json::from_slice(&bytes).unwrap();
+    assert_eq!(v["type"], "error");
+    assert!(
+        v["error"]["message"].as_str().unwrap().contains("model"),
+        "got {}",
+        v
+    );
+}
+
 // ── B1:非流 body 有界读取接线 ───────────────────────────────────────
 
 #[tokio::test]
