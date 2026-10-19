@@ -38,7 +38,8 @@ impl UnfitRegistry {
         Self::default()
     }
 
-    /// 当前世代(请求准备时捕获,mark 时比对)
+    /// 当前世代。须在持有 config 读锁的同一 guard 内与 snapshot 一并捕获
+    /// (见 handle_messages); /reload 在 config 写锁内 clear 增代。
     pub fn generation(&self) -> u64 {
         self.state.read().unwrap().generation
     }
@@ -68,7 +69,8 @@ impl UnfitRegistry {
             .is_some_and(|kinds| kinds.contains(&kind))
     }
 
-    /// /reload 时清空并增代,避免旧配置标记残留与旧飞行请求写回
+    /// /reload 时清空并增代;调用方须在持有 config 写锁时调用,
+    /// 与请求侧同读锁捕获的 generation 成对原子。
     pub fn clear(&self) {
         let mut state = self.state.write().unwrap();
         state.flags.clear();

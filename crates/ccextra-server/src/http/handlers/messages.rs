@@ -348,7 +348,7 @@ pub(crate) struct PreparedMessageRequest {
     pub token_scope: Option<crate::http::session_tokens::TokenCacheScope>,
     /// drift 开启且父级稳定时：响应路径关联 cache usage（与 token_scope 分离）
     pub drift_usage_scope: Option<crate::http::session_tokens::DriftUsageScope>,
-    /// 准备请求时捕获的 unfit 世代;/reload clear 增代后旧请求 mark 丢弃
+    /// 与 config 快照同读锁捕获的 unfit 世代;/reload 写锁内 clear 增代后旧请求 mark 丢弃
     pub unfit_generation: u64,
 }
 
@@ -364,6 +364,7 @@ pub(crate) async fn prepare_message_request(
     body_bytes: &[u8],
     config_snapshot: &crate::http::ConfigSnapshot,
     inbound_query: Option<&str>,
+    unfit_generation: u64,
 ) -> Result<PreparedMessageRequest, AppError> {
     let normalize_enabled = config_snapshot.runtime.normalize.enabled;
     let drift_enabled = config_snapshot.runtime.normalize.drift_detector;
@@ -1063,7 +1064,7 @@ pub(crate) async fn prepare_message_request(
         token_scope: session_id
             .map(|session| (Arc::clone(&state.last_input_tokens), session.to_string())),
         drift_usage_scope: drift_parent_for_usage.map(|parent| (state.drift.clone(), parent)),
-        unfit_generation: crate::http::unfit::global_registry().generation(),
+        unfit_generation,
     })
 }
 
@@ -1763,15 +1764,27 @@ pub async fn handle_messages(
     headers: HeaderMap,
     body: Body,
 ) -> Result<Response, AppError> {
-    // 只取得一次快照；认证、转换和响应交付始终使用同一版本。
-    let effective_snapshot = Arc::clone(&*state.config.read().await);
+    // 同读锁捕获快照与 unfit 世代,与 /reload 写锁内 clear 成对:
+    // prepare 中途 await 期间 reload 增代后,旧快照请求的 mark 必被丢弃。
+    let (effective_snapshot, unfit_generation) = {
+        let guard = state.config.read().await;
+        let gen = crate::http::unfit::global_registry().generation();
+        (Arc::clone(&*guard), gen)
+    };
     check_secret(&headers, &effective_snapshot.runtime.secret).await?;
     let bytes = to_bytes(body, crate::limits::INBOUND_BODY_LIMIT)
         .await
         .map_err(|e| AppError::new(anyhow::anyhow!("读请求体失败: {e}")))?;
 
-    let mut prepared =
-        prepare_message_request(&state, &headers, &bytes, &effective_snapshot, uri.query()).await?;
+    let mut prepared = prepare_message_request(
+        &state,
+        &headers,
+        &bytes,
+        &effective_snapshot,
+        uri.query(),
+        unfit_generation,
+    )
+    .await?;
 
     let executed = execute_upstream_request(
         &mut prepared,

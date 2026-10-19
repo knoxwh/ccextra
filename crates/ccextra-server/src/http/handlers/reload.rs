@@ -71,7 +71,8 @@ pub async fn handle_reload(State(state): State<AppState>) -> Result<Json<ReloadR
         return Ok(Json(result));
     }
 
-    // 4. 全局原子更新统一不可变快照并递增版本号
+    // 4. 全局原子更新统一不可变快照并递增版本号;
+    //    同写锁内 clear unfit,与 handle_messages 同读锁捕获的 (snapshot, generation) 成对
     {
         let mut cfg_lock = state.config.write().await;
         let next_version = cfg_lock.version.wrapping_add(1);
@@ -82,7 +83,10 @@ pub async fn handle_reload(State(state): State<AppState>) -> Result<Json<ReloadR
             runtime,
             refresh: data.refresh.clone(),
         });
+        // 清空 unfit 并增代(旧标记与持旧世代的飞行 mark 均失效)
+        crate::http::unfit::global_registry().clear();
     }
+    result.reloaded.push("unfit_registry".into());
 
     // 5. 清认证缓存(失败无碍)
     if auth_cache().lock().ok().map(|mut c| c.clear()).is_some() {
@@ -93,10 +97,6 @@ pub async fn handle_reload(State(state): State<AppState>) -> Result<Json<ReloadR
             reason: "lock failed".into(),
         });
     }
-
-    // 6. 清空 unfit 注册表并增代(旧标记与持旧世代的飞行 mark 均失效)
-    crate::http::unfit::global_registry().clear();
-    result.reloaded.push("unfit_registry".into());
 
     tracing::info!(
         "配置热重载完成: {} 成功, {} 失败",
