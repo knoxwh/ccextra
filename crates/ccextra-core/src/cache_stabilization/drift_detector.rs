@@ -637,15 +637,15 @@ type DriftCaches = (
     LruCache<String, PendingUsageCorr>,
 );
 
+/// 不稳定父级 DEBUG 的最小间隔（毫秒）。
+const UNSTABLE_PARENT_LOG_INTERVAL_MS: u64 = 5_000;
+
 /// 有界 会话 → 上次所见哈希 状态。
 ///
 /// 两个 map 共享一个互斥锁，使每个请求的两次比较都保持原子性：
 ///
 /// - `cache`：会话身份 → 完整 [`StructuralHash`]。
 /// - `parent_cache`：父级 bucket → [`ParentBaseline`]。
-/// 不稳定父级 DEBUG 的最小间隔（毫秒）。
-const UNSTABLE_PARENT_LOG_INTERVAL_MS: u64 = 5_000;
-
 #[derive(Clone)]
 pub struct DriftState {
     cache: Arc<Mutex<DriftCaches>>,

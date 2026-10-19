@@ -107,12 +107,8 @@ fn schema_has_unanalyzed_keyword(schema: &Value) -> bool {
     let Some(obj) = schema.as_object() else {
         return false;
     };
-    obj.keys().any(|k| {
-        !k.starts_with("x-")
-            && !ANALYZED_KEYWORDS
-                .iter()
-                .any(|allowed| *allowed == k.as_str())
-    })
+    obj.keys()
+        .any(|k| !k.starts_with("x-") && !ANALYZED_KEYWORDS.contains(&k.as_str()))
 }
 
 fn resolve_local_ref<'a>(root: &'a Value, ref_: &str) -> Option<&'a Value> {
@@ -499,7 +495,7 @@ fn resolve_array_items<'a>(
     let mut items = Vec::new();
     let mut deterministic = true;
     let mut collect = |candidate: &'a Value| {
-        if !items.iter().any(|existing| *existing == candidate) {
+        if !items.contains(&candidate) {
             items.push(candidate);
         }
     };
@@ -507,9 +503,7 @@ fn resolve_array_items<'a>(
         if visited_refs.contains(ref_) {
             return None;
         }
-        let Some(target) = resolve_local_ref(root, ref_) else {
-            return None;
-        };
+        let target = resolve_local_ref(root, ref_)?;
         visited_refs.insert(ref_.clone());
         let resolved = resolve_array_items(target, root, depth + 1, visited_refs);
         visited_refs.remove(ref_);
