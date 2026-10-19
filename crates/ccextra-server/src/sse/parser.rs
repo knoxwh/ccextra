@@ -58,24 +58,24 @@ impl SseParser {
         events
     }
 
-    /// 逐行处理缓冲,产出完整事件
+    /// 逐行处理缓冲,产出完整事件。
+    /// 用游标扫描整段 buf,末尾一次 copy_within/truncate,避免逐行 drain 的 O(n²)。
     fn process_lines(&mut self) -> Vec<SseEvent> {
         let mut events = Vec::new();
+        let mut start = 0;
 
-        while let Some(newline) = self.buf.iter().position(|&b| b == b'\n') {
-            let mut line_bytes = self.buf[..newline].to_vec();
-            self.buf.drain(..=newline);
-
-            // 去除行尾 \r
-            if line_bytes.last() == Some(&b'\r') {
-                line_bytes.pop();
+        while let Some(rel) = self.buf[start..].iter().position(|&b| b == b'\n') {
+            let newline = start + rel;
+            let mut line_end = newline;
+            if line_end > start && self.buf[line_end - 1] == b'\r' {
+                line_end -= 1;
             }
+            let line_bytes = &self.buf[start..line_end];
 
             // 整行字节齐了才转字符串,跨 chunk 的多字节字符不会被切断
-            let line = String::from_utf8_lossy(&line_bytes);
+            let line = String::from_utf8_lossy(line_bytes);
 
             if line.is_empty() {
-                // 空行结束当前事件
                 if let Some(ev) = self.take_event() {
                     events.push(ev);
                 }
@@ -86,6 +86,13 @@ impl SseParser {
                 self.event = Some(event.trim().to_string());
             }
             // 其他行(comment/retry/id)忽略
+
+            start = newline + 1;
+        }
+
+        if start > 0 {
+            self.buf.copy_within(start.., 0);
+            self.buf.truncate(self.buf.len() - start);
         }
 
         events
