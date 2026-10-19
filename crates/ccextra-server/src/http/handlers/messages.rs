@@ -310,7 +310,8 @@ pub(crate) enum OAuthRefreshTarget {
 pub(crate) struct PreparedMessageRequest {
     pub route: ccextra_core::route::RouteDecision,
     pub body_json: Value,
-    /// 已序列化(+可选 zstd)的出站 body;URL/401/unfit 重试复用,body_json 变更后须 reencode
+    /// 已序列化(+可选 zstd)的出站 body;URL/401/unfit 重试复用。
+    /// body_json 变更或 chatgpt-account-id 使 compress 翻转后须 reencode
     pub encoded_body: bytes::Bytes,
     pub is_stream: bool,
     pub upstream_base_urls: Vec<String>,
@@ -1723,11 +1724,18 @@ impl PreparedMessageRequest {
                         })?;
                 self.upstream_key = fresh.access_token;
                 if !fresh.account_id.is_empty() {
+                    // 初始无 account_id 时 body 未压;补头后 compress 变 true,
+                    // 须 reencode,否则仍发明文却带 Content-Encoding: zstd
+                    let compress_became_true =
+                        !self.extra_headers.contains_key("chatgpt-account-id");
                     if let Ok(value) = axum::http::HeaderValue::from_str(&fresh.account_id) {
                         self.extra_headers.insert(
                             axum::http::HeaderName::from_static("chatgpt-account-id"),
                             value,
                         );
+                        if compress_became_true {
+                            self.reencode_body().await?;
+                        }
                     }
                 }
                 Ok(true)
@@ -1826,5 +1834,62 @@ mod tests {
             initial_sse_error_message(&f),
             "event: error\ndata: not-json"
         );
+    }
+
+    fn stub_prepared_without_account_id() -> PreparedMessageRequest {
+        let body_json = json!({"model": "gpt-test", "input": []});
+        PreparedMessageRequest {
+            route: ccextra_core::route::RouteDecision {
+                provider: "codex".into(),
+                protocol: Protocol::OpenAiResponses,
+                upstream_model: "gpt-test".into(),
+            },
+            body_json,
+            encoded_body: Bytes::new(),
+            is_stream: false,
+            upstream_base_urls: vec!["https://example.invalid".into()],
+            active_base_url: None,
+            upstream_key: "tok".into(),
+            pool_refresh_token: None,
+            upstream_proxy: None,
+            oauth_refresh: None,
+            session_id: None,
+            thread_id: None,
+            extra_headers: HeaderMap::new(),
+            inbound_user_agent: None,
+            inbound_query: None,
+            estimated_input_tokens: None,
+            tool_names: None,
+            original_claude_request: None,
+            replay_scope: None,
+            ag_replay_scope: None,
+            kimi_replay_scope: None,
+            signature_model: None,
+            inbound_model: Arc::from("gpt-test"),
+            token_scope: None,
+            drift_usage_scope: None,
+            unfit_generation: 0,
+        }
+    }
+
+    /// 模拟 Codex 401 刷新补出 account_id:压缩决策 false→true 后 reencode 须产出 zstd 体。
+    #[tokio::test]
+    async fn reencode_after_chatgpt_account_id_enables_zstd() {
+        let mut prepared = stub_prepared_without_account_id();
+        prepared.reencode_body().await.unwrap();
+        let plain = prepared.encoded_body.clone();
+        assert!(!plain.is_empty());
+        // 明文 JSON,不是 zstd
+        assert!(serde_json::from_slice::<Value>(&plain).is_ok());
+
+        prepared.extra_headers.insert(
+            axum::http::HeaderName::from_static("chatgpt-account-id"),
+            "acct-1".parse().unwrap(),
+        );
+        prepared.reencode_body().await.unwrap();
+        let compressed = prepared.encoded_body.clone();
+        assert_ne!(plain, compressed);
+        let decoded = zstd::stream::decode_all(&compressed[..]).expect("should be zstd");
+        assert_eq!(decoded.as_slice(), plain.as_ref());
     }
 }
