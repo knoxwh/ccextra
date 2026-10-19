@@ -33,7 +33,7 @@ pub async fn handle_count_tokens(
     let providers = &snapshot.providers;
     let upstream_client = &snapshot.runtime.upstream;
     let user_agents = &snapshot.runtime.user_agents;
-    check_secret(&headers, &snapshot.runtime.secret)?;
+    check_secret(&headers, &snapshot.runtime.secret).await?;
     let bytes = to_bytes(body, crate::limits::INBOUND_BODY_LIMIT)
         .await
         .map_err(|e| AppError::new(anyhow::anyhow!("读请求体失败: {e}")))?;

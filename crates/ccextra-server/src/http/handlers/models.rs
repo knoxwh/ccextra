@@ -34,7 +34,7 @@ pub async fn handle_models(
     headers: HeaderMap,
 ) -> Result<Response, AppError> {
     let snapshot = std::sync::Arc::clone(&*state.config.read().await);
-    check_secret(&headers, &snapshot.runtime.secret)?;
+    check_secret(&headers, &snapshot.runtime.secret).await?;
     let body = build_models_list(&snapshot.providers);
     Response::builder()
         .status(StatusCode::OK)

@@ -27,16 +27,49 @@ fn cache_key(expected: &str, key: &str) -> String {
     format!("{expected}\u{0}{key}")
 }
 
-/// bcrypt 校验(带缓存;锁毒化时降级直验)
-pub fn verify_cached(key: &str, expected: &str) -> bool {
-    match auth_cache().lock() {
-        Ok(mut cache) => verify_with_cache(&mut cache, key, expected),
-        Err(_) => bcrypt::verify(key, expected).unwrap_or(false),
+/// bcrypt 校验(带缓存)。
+/// 锁内只做查/写缓存;bcrypt::verify 在锁外经 spawn_blocking 跑,避免同步 CPU
+/// 占用 Tokio worker 且拖死所有认证调用方。锁毒化时跳过缓存直验。
+pub async fn verify_cached(key: &str, expected: &str) -> bool {
+    let ck = cache_key(expected, key);
+    // 锁内只读缓存;PoisonError 内含 MutexGuard,必须在 await 前完全丢掉
+    enum Lookup {
+        Hit(bool),
+        Miss,
+        Poison,
     }
+    let lookup = match auth_cache().lock() {
+        Ok(mut cache) => match cache.get(&ck).copied() {
+            Some(ok) => Lookup::Hit(ok),
+            None => Lookup::Miss,
+        },
+        Err(_) => Lookup::Poison,
+    };
+    let skip_store = matches!(lookup, Lookup::Poison);
+    match lookup {
+        Lookup::Hit(ok) => return ok,
+        Lookup::Miss | Lookup::Poison => {}
+    }
+
+    let key_owned = key.to_string();
+    let expected_owned = expected.to_string();
+    let ok = tokio::task::spawn_blocking(move || {
+        bcrypt::verify(&key_owned, &expected_owned).unwrap_or(false)
+    })
+    .await
+    .unwrap_or(false);
+
+    if !skip_store {
+        if let Ok(mut cache) = auth_cache().lock() {
+            // 回填时若已有条目(并发 miss),以本次结果覆盖;负结果仍缓存(与既有语义一致)
+            cache.put(ck, ok);
+        }
+    }
+    ok
 }
 
-/// 对给定缓存执行「查缓存 → bcrypt 验证 → 回填」。
-/// 独立于全局缓存,便于测试用私有缓存实例复现 reload 竞争窗口。
+/// 对给定缓存执行「查缓存 → bcrypt 验证 → 回填」(同步,仅单测用私有缓存)。
+#[cfg(test)]
 fn verify_with_cache(cache: &mut LruCache<String, bool>, key: &str, expected: &str) -> bool {
     let ck = cache_key(expected, key);
     if let Some(&ok) = cache.get(&ck) {
@@ -50,13 +83,13 @@ fn verify_with_cache(cache: &mut LruCache<String, bool>, key: &str, expected: &s
 /// 校验入口 key:secret 未配置时放行;配置时需匹配,否则 401
 /// 支持 x-api-key 与 Authorization: Bearer 两种头(兼容 cc-switch 等工具)
 /// secret 为 bcrypt 哈希时用 verify,否则明文比对(便于测试/旧配置)
-pub fn check_secret(headers: &HeaderMap, secret: &Option<String>) -> Result<(), AppError> {
+pub async fn check_secret(headers: &HeaderMap, secret: &Option<String>) -> Result<(), AppError> {
     let Some(expected) = secret else {
         return Ok(());
     };
     let got = extract_key(headers);
     let ok = if looks_like_bcrypt(expected) {
-        verify_cached(got, expected)
+        verify_cached(got, expected).await
     } else {
         got == expected
     };

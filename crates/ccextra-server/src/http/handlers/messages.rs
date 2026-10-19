@@ -1741,7 +1741,7 @@ pub async fn handle_messages(
 ) -> Result<Response, AppError> {
     // 只取得一次快照；认证、转换和响应交付始终使用同一版本。
     let effective_snapshot = Arc::clone(&*state.config.read().await);
-    check_secret(&headers, &effective_snapshot.runtime.secret)?;
+    check_secret(&headers, &effective_snapshot.runtime.secret).await?;
     let bytes = to_bytes(body, crate::limits::INBOUND_BODY_LIMIT)
         .await
         .map_err(|e| AppError::new(anyhow::anyhow!("读请求体失败: {e}")))?;

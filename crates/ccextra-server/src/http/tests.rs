@@ -1205,8 +1205,8 @@ fn test_build_models_list_default_context() {
     assert_eq!(data[0]["max_tokens"], 64000);
 }
 
-#[test]
-fn test_secret_validation() {
+#[tokio::test]
+async fn test_secret_validation() {
     // 测试 secret 验证逻辑
     struct Case {
         name: &'static str,
@@ -1267,7 +1267,7 @@ fn test_secret_validation() {
     ];
 
     for case in cases {
-        let result = check_secret(&case.headers, &case.secret);
+        let result = check_secret(&case.headers, &case.secret).await;
         assert_eq!(
             result.is_ok(),
             case.expect_ok,
