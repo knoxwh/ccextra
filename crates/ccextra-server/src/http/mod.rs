@@ -126,6 +126,16 @@ pub struct AppState {
     pub last_input_tokens: Arc<std::sync::Mutex<session_tokens::SessionTokenCache>>,
 }
 
+impl AppState {
+    /// 同读锁捕获 config 快照与 unfit 世代;与 /reload 写锁内 clear 成对。
+    /// 请求侧请走本方法,勿单独调用 UnfitRegistry::generation。
+    pub async fn snapshot_and_unfit_generation(&self) -> (Arc<ConfigSnapshot>, u64) {
+        let guard = self.config.read().await;
+        let gen = unfit::global_registry().generation();
+        (Arc::clone(&*guard), gen)
+    }
+}
+
 /// 预编译的模型匹配器(`*` 或 glob)
 #[derive(Clone, Debug)]
 enum ModelMatcher {

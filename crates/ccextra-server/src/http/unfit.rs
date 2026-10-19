@@ -38,9 +38,9 @@ impl UnfitRegistry {
         Self::default()
     }
 
-    /// 当前世代。须在持有 config 读锁的同一 guard 内与 snapshot 一并捕获
-    /// (见 handle_messages); /reload 在 config 写锁内 clear 增代。
-    pub fn generation(&self) -> u64 {
+    /// 当前世代。仅供同 crate 内与 config 读锁成对捕获
+    /// (见 AppState::snapshot_and_unfit_generation); 勿单独对外暴露。
+    pub(crate) fn generation(&self) -> u64 {
         self.state.read().unwrap().generation
     }
 

@@ -1777,11 +1777,7 @@ pub async fn handle_messages(
 ) -> Result<Response, AppError> {
     // 同读锁捕获快照与 unfit 世代,与 /reload 写锁内 clear 成对:
     // prepare 中途 await 期间 reload 增代后,旧快照请求的 mark 必被丢弃。
-    let (effective_snapshot, unfit_generation) = {
-        let guard = state.config.read().await;
-        let gen = crate::http::unfit::global_registry().generation();
-        (Arc::clone(&*guard), gen)
-    };
+    let (effective_snapshot, unfit_generation) = state.snapshot_and_unfit_generation().await;
     check_secret(&headers, &effective_snapshot.runtime.secret).await?;
     let bytes = to_bytes(body, crate::limits::INBOUND_BODY_LIMIT)
         .await
