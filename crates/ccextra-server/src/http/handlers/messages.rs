@@ -185,6 +185,8 @@ struct RelayParams {
         bool,
     )>,
     signature_model: Option<Arc<str>>,
+    /// 客户端入站 model 别名(Responses message_start 预填)
+    inbound_model: Option<Arc<str>>,
     token_scope: Option<crate::http::session_tokens::TokenCacheScope>,
     drift_usage_scope: Option<crate::http::session_tokens::DriftUsageScope>,
 }
@@ -216,6 +218,7 @@ where
             params.tool_names,
             params.signature_model,
             params.original_claude_request,
+            params.inbound_model.as_deref(),
         );
     }
     if let Some((cache, key, request)) = params.ag_replay_scope {
@@ -232,6 +235,7 @@ where
             params.tool_names,
             params.signature_model,
             params.original_claude_request,
+            params.inbound_model.as_deref(),
         );
     }
     if let Some((cache, key, applied)) = params.kimi_replay_scope {
@@ -248,6 +252,7 @@ where
             params.tool_names,
             params.signature_model,
             params.original_claude_request,
+            params.inbound_model.as_deref(),
         );
     }
     crate::sse::relay(
@@ -257,6 +262,7 @@ where
         params.tool_names,
         params.signature_model,
         params.original_claude_request,
+        params.inbound_model.as_deref(),
     )
 }
 
@@ -342,6 +348,8 @@ pub(crate) struct PreparedMessageRequest {
         bool,
     )>,
     pub signature_model: Option<Arc<str>>,
+    /// 客户端入站 model 别名(body.model 路由前;Responses 回包 message_start 预填)
+    pub inbound_model: Arc<str>,
     pub token_scope: Option<crate::http::session_tokens::TokenCacheScope>,
     /// drift 开启且父级稳定时：响应路径关联 cache usage（与 token_scope 分离）
     pub drift_usage_scope: Option<crate::http::session_tokens::DriftUsageScope>,
@@ -1048,6 +1056,7 @@ pub(crate) async fn prepare_message_request(
         ag_replay_scope,
         kimi_replay_scope,
         signature_model,
+        inbound_model: Arc::from(model.as_str()),
         token_scope: session_id
             .map(|session| (Arc::clone(&state.last_input_tokens), session.to_string())),
         drift_usage_scope: drift_parent_for_usage.map(|parent| (state.drift.clone(), parent)),
@@ -1147,6 +1156,7 @@ pub(crate) async fn execute_upstream_request(
                     ag_replay_scope: None,
                     kimi_replay_scope: None,
                     signature_model: prepared.signature_model.clone(),
+                    inbound_model: Some(Arc::clone(&prepared.inbound_model)),
                     token_scope: prepared.token_scope.clone(),
                     drift_usage_scope: prepared.drift_usage_scope.clone(),
                 },
@@ -1422,6 +1432,7 @@ pub(crate) async fn deliver_response(
                         ag_replay_scope: ag_scope,
                         kimi_replay_scope: prepared.kimi_replay_scope.clone(),
                         signature_model: prepared.signature_model.clone(),
+                        inbound_model: Some(Arc::clone(&prepared.inbound_model)),
                         token_scope: prepared.token_scope.clone(),
                         drift_usage_scope: prepared.drift_usage_scope.clone(),
                     },

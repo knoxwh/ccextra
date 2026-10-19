@@ -36,7 +36,8 @@ pub use compensations::{
 };
 pub use web_search::web_search_result_content;
 
-/// message_start 的 model 兜底(同默认值)
+/// message_start 的 model 末级兜底:仅当入站预填与上游 response.model 都为空时使用。
+/// 正常 Responses 路径应传入站别名,避免 UI 误显为 Anthropic Opus。
 const FALLBACK_MODEL: &str = "claude-opus-4-1-20250805";
 /// 同一 reasoning item 多个 summary part 的分隔符(对齐 codexThinkingSummaryPartSeparator)
 const SUMMARY_PART_SEPARATOR: &str = "\n\n";
@@ -49,17 +50,22 @@ const SUMMARY_PART_SEPARATOR: &str = "\n\n";
 const CLAUDE_RESPONSES_REDACTED_THINKING_PREFIX: &str = "claude-redacted-thinking:";
 
 /// OpenAI responses → Anthropic SSE 状态机(realtime)
+///
+/// `inbound_model`: 客户端请求的 model 别名(如 gpt-6.1-sol),预填 message_start;
+/// 上游若回非空 response.model 仍会覆盖。
 pub fn relay_responses_to_anthropic<S>(
     stream: S,
     estimated_input_tokens: Option<usize>,
     tool_names: Option<Arc<HashMap<String, String>>>,
+    inbound_model: Option<&str>,
 ) -> SseStreamPin
 where
     S: Stream<Item = Result<Bytes, std::io::Error>> + Send + 'static,
 {
     let mut stream = Box::pin(stream);
     let mut parser = SseParser::new();
-    let mut relay = ResponsesRelay::new(estimated_input_tokens).with_tool_names(tool_names);
+    let mut relay =
+        ResponsesRelay::new(estimated_input_tokens, inbound_model).with_tool_names(tool_names);
 
     Box::pin(stream! {
         loop {

@@ -63,11 +63,18 @@ pub(crate) struct ResponsesRelay {
 }
 
 impl ResponsesRelay {
-    pub(crate) fn new(estimated_input: Option<usize>) -> Self {
+    /// `inbound_model`: 客户端入站别名(如 gpt-6.1-sol)。上游 response.created
+    /// 常只有 id、无 model 时,用它预填 message_start,避免硬编码 Anthropic Opus。
+    pub(crate) fn new(estimated_input: Option<usize>, inbound_model: Option<&str>) -> Self {
+        let model = inbound_model
+            .map(str::trim)
+            .filter(|s| !s.is_empty())
+            .unwrap_or("")
+            .to_string();
         Self {
             message_started: false,
             finished: false,
-            model: String::new(),
+            model,
             id: String::new(),
             next_block_index: 0,
             text_open: false,
@@ -571,7 +578,9 @@ impl ResponsesRelay {
         }
     }
 
-    /// 确保 message_start 已发(model 空时兜底)
+    /// 确保 message_start 已发。
+    /// model 优先级:入站预填 → update_identity(上游 response.model) → FALLBACK_MODEL。
+    /// FALLBACK 仅在入站与上游都缺 model 时使用(历史 CPA 对齐兜底)。
     pub(crate) fn ensure_started(&mut self) -> Vec<Bytes> {
         if self.message_started {
             return Vec::new();

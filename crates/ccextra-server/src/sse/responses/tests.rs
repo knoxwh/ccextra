@@ -31,7 +31,7 @@ fn frame_data(frame: &Bytes) -> Value {
 #[test]
 fn test_message_start_uses_estimated_when_upstream_silent() {
     // 上游未回真实 usage 时,message_start 用入站估算占位(context 不跳 1)
-    let mut r = ResponsesRelay::new(Some(1234));
+    let mut r = ResponsesRelay::new(Some(1234), None);
     let out = r.process(&created());
     let start = out
         .iter()
@@ -44,7 +44,7 @@ fn test_message_start_uses_estimated_when_upstream_silent() {
 
 #[test]
 fn test_responses_text_stream() {
-    let mut r = ResponsesRelay::new(None);
+    let mut r = ResponsesRelay::new(None, None);
     let out1 = r.process(&created());
     assert!(out1.iter().any(|b| b.starts_with(b"event: message_start")));
 
@@ -61,7 +61,7 @@ fn test_responses_text_stream() {
 
 #[test]
 fn test_responses_completed_with_tool_call() {
-    let mut r = ResponsesRelay::new(None);
+    let mut r = ResponsesRelay::new(None, None);
     r.process(&created());
 
     let out = r.process(&ev(
@@ -91,7 +91,7 @@ fn test_responses_completed_with_tool_call() {
 #[test]
 fn test_reasoning_replay_streaming_with_signature() {
     // 完整闭环:summary 流式可见 + encrypted_content 走 signature_delta
-    let mut r = ResponsesRelay::new(None);
+    let mut r = ResponsesRelay::new(None, None);
     r.process(&created());
 
     let out1 = r.process(&ev(
@@ -116,7 +116,7 @@ fn test_reasoning_replay_streaming_with_signature() {
 #[test]
 fn test_reasoning_signature_only() {
     // 无 summary 的 reasoning item:开块即收尾,仍带 signature
-    let mut r = ResponsesRelay::new(None);
+    let mut r = ResponsesRelay::new(None, None);
     r.process(&created());
     r.process(&ev(
         r#"{"type":"response.output_item.added","item":{"type":"reasoning"}}"#,
@@ -136,7 +136,7 @@ fn test_reasoning_grok_encrypted_content_signature() {
     // Grok 无信封密文: 应合法保留并发送 signature_delta
     const GROK_CIPHER: &str =
         "5+C3No7B0G0P2dR5lSbMvwrctRb+B3vLAJ5/VYemHZNuaDbKv8IfNb+4Gyd125rfZtRtG4+iqYjT5uWOZbE44A";
-    let mut r = ResponsesRelay::new(None);
+    let mut r = ResponsesRelay::new(None, None);
     r.process(&created());
     r.process(&ev(
         r#"{"type":"response.output_item.added","item":{"type":"reasoning"}}"#,
@@ -154,7 +154,7 @@ fn test_reasoning_grok_encrypted_content_signature() {
 #[test]
 fn test_reasoning_plaintext_delta() {
     // 非订阅网关发明文 reasoning_text.delta(无 encrypted_content):内容进 thinking 块
-    let mut r = ResponsesRelay::new(None);
+    let mut r = ResponsesRelay::new(None, None);
     r.process(&created());
     let out = r.process(&ev(
         r#"{"type":"response.reasoning_text.delta","delta":"明文推理"}"#,
@@ -180,7 +180,7 @@ fn test_reasoning_plaintext_delta() {
 #[test]
 fn test_content_part_added_reasoning_plaintext() {
     // content_part.added(part.type=reasoning):保持块打开,分隔符续接,不误关块
-    let mut r = ResponsesRelay::new(None);
+    let mut r = ResponsesRelay::new(None, None);
     r.process(&created());
     r.process(&ev(
         r#"{"type":"response.output_item.added","item":{"type":"reasoning"}}"#,
@@ -219,7 +219,7 @@ fn test_content_part_added_reasoning_plaintext() {
 
 #[test]
 fn test_reasoning_summary_parts_separated() {
-    let mut r = ResponsesRelay::new(None);
+    let mut r = ResponsesRelay::new(None, None);
     r.process(&created());
     r.process(&ev(r#"{"type":"response.reasoning_summary_part.added"}"#));
     r.process(&ev(
@@ -235,7 +235,7 @@ fn test_reasoning_summary_parts_separated() {
 
 #[test]
 fn test_usage_subtracts_cached_tokens() {
-    let mut r = ResponsesRelay::new(None);
+    let mut r = ResponsesRelay::new(None, None);
     r.process(&created());
     let out = r.process(&ev(
         r#"{"type":"response.completed","response":{"id":"r1","output":[],
@@ -255,7 +255,7 @@ fn test_usage_subtracts_cached_tokens() {
 fn test_usage_maps_cache_write_tokens() {
     // 对齐 CPA 893abbab:cache_write_tokens → cache_creation_input_tokens,
     // 0 时不下发该键;Anthropic 互斥语义:input 扣除 cached 与 cache_write
-    let mut r = ResponsesRelay::new(None);
+    let mut r = ResponsesRelay::new(None, None);
     r.process(&created());
     let out = r.process(&ev(
         r#"{"type":"response.completed","response":{"id":"r1","output":[],
@@ -271,7 +271,7 @@ fn test_usage_maps_cache_write_tokens() {
     assert_eq!(v["usage"]["cache_read_input_tokens"], 80);
     assert_eq!(v["usage"]["cache_creation_input_tokens"], 15);
 
-    let mut r = ResponsesRelay::new(None);
+    let mut r = ResponsesRelay::new(None, None);
     r.process(&created());
     let out = r.process(&ev(
         r#"{"type":"response.completed","response":{"id":"r1","output":[],
@@ -290,7 +290,7 @@ fn test_usage_maps_cache_write_tokens() {
 #[test]
 fn test_empty_output_synthesizes_text_block() {
     // 空轮次合成空 text 块(对齐 synthesizeCodexEmptyTextBlock)
-    let mut r = ResponsesRelay::new(None);
+    let mut r = ResponsesRelay::new(None, None);
     let out = r.process(&ev(
         r#"{"type":"response.completed","response":{"id":"r1","output":[]}}"#,
     ));
@@ -304,7 +304,7 @@ fn test_empty_output_synthesizes_text_block() {
 fn test_terminal_text_recovered_from_completed_output() {
     // 正文只出现在 response.completed 的 output[].message(无任何 delta):
     // 补发文本,不再合成空块(对齐 sub2api resToAnthRecoverTerminalText)
-    let mut r = ResponsesRelay::new(None);
+    let mut r = ResponsesRelay::new(None, None);
     r.process(&created());
     let out = r.process(&ev(
         r#"{"type":"response.completed","response":{"id":"r1","output":[
@@ -319,7 +319,7 @@ fn test_terminal_text_recovered_from_completed_output() {
     assert_eq!(s.matches("event: content_block_start").count(), 1);
 
     // 已流式发出过文本则不重复补发
-    let mut r2 = ResponsesRelay::new(None);
+    let mut r2 = ResponsesRelay::new(None, None);
     r2.process(&created());
     r2.process(&ev(
         r#"{"type":"response.output_text.delta","delta":"流式"}"#,
@@ -337,7 +337,7 @@ fn test_terminal_text_recovered_from_completed_output() {
 
 #[test]
 fn test_thinking_only_turn_synthesizes_text_block() {
-    let mut r = ResponsesRelay::new(None);
+    let mut r = ResponsesRelay::new(None, None);
     r.process(&created());
     r.process(&ev(
         r#"{"type":"response.output_item.done","item":{"type":"reasoning","encrypted_content":"E"}}"#,
@@ -352,7 +352,7 @@ fn test_thinking_only_turn_synthesizes_text_block() {
 
 #[test]
 fn test_stream_error_event() {
-    let mut r = ResponsesRelay::new(None);
+    let mut r = ResponsesRelay::new(None, None);
     let out = r.process(&ev(
         r#"{"type":"error","error":{"type":"invalid_request","code":"cyber_policy","message":"blocked"}}"#,
     ));
@@ -365,7 +365,7 @@ fn test_stream_error_event() {
 
 #[test]
 fn test_response_failed_event() {
-    let mut r = ResponsesRelay::new(None);
+    let mut r = ResponsesRelay::new(None, None);
     let out = r.process(&ev(
         r#"{"type":"response.failed","sequence_number":0,"response":{"status":"failed","error":{"type":"server_error","code":"internal_server_error","message":"boom"}}}"#,
     ));
@@ -378,7 +378,7 @@ fn test_response_failed_event() {
 
 #[test]
 fn test_response_failed_during_function_call_is_immediate() {
-    let mut r = ResponsesRelay::new(None);
+    let mut r = ResponsesRelay::new(None, None);
     r.process(&created());
     r.process(&ev(
         r#"{"type":"response.output_item.added","item":{"type":"function_call","call_id":"call_1","name":"get_weather","output_index":0}}"#,
@@ -397,7 +397,7 @@ fn test_response_failed_during_function_call_is_immediate() {
 fn test_error_event_stops_followup_events() {
     // 上游 error 后仍发正常事件(部分网关 overloaded 后混续):只保留 error,
     // 不得再产出 text/delta/stop 混合流,否则 SDK 判 "malformed"。
-    let mut r = ResponsesRelay::new(None);
+    let mut r = ResponsesRelay::new(None, None);
     r.process(&created());
     let out = r.process(&ev(
         r#"{"type":"error","error":{"type":"overloaded_error","message":"servers overloaded"}}"#,
@@ -416,7 +416,7 @@ fn test_error_event_stops_followup_events() {
 #[test]
 fn test_doom_loop_confident_signal_aborts_stream() {
     // 置信信号(thinking channel tail_repetition ≤ 64):吞掉事件 + 发 error 中断
-    let mut r = ResponsesRelay::new(None);
+    let mut r = ResponsesRelay::new(None, None);
     r.process(&created());
     let out = r.process(&ev(
         r#"{"type":"response.doom_loop_check","doom_loop_check":{"triggers":["tail_repetition:32@thinking"]}}"#,
@@ -445,7 +445,7 @@ fn test_doom_loop_confident_signal_aborts_stream() {
 #[test]
 fn test_doom_loop_non_confident_signal_passes_through() {
     // 非置信信号(response channel):吞掉事件,流照常
-    let mut r = ResponsesRelay::new(None);
+    let mut r = ResponsesRelay::new(None, None);
     r.process(&created());
     let out = r.process(&ev(
         r#"{"type":"response.doom_loop_check","doom_loop_check":{"triggers":["tail_repetition:32@response"]}}"#,
@@ -459,7 +459,7 @@ fn test_doom_loop_non_confident_signal_passes_through() {
 #[test]
 fn test_doom_loop_terminal_field_confident() {
     // 终态响应对象上的 doom_loop_check 字段:置信时中断而非正常收尾
-    let mut r = ResponsesRelay::new(None);
+    let mut r = ResponsesRelay::new(None, None);
     r.process(&created());
     let out = r.process(&ev(
         r#"{"type":"response.completed","response":{"id":"r1","output":[],"doom_loop_check":{"triggers":["tail_repetition:16@thinking"]}}}"#,
@@ -475,7 +475,7 @@ fn test_doom_loop_terminal_field_confident() {
 #[test]
 fn test_doom_loop_dedup_repeated_triggers() {
     // 服务端重发累计集:同 label 去重,不重复判定
-    let mut r = ResponsesRelay::new(None);
+    let mut r = ResponsesRelay::new(None, None);
     r.process(&created());
     // 第一次:非置信
     r.process(&ev(
@@ -491,7 +491,7 @@ fn test_doom_loop_dedup_repeated_triggers() {
 #[test]
 fn test_doom_loop_malformed_payload_never_fails() {
     // malformed payload:best-effort,不弄挂流
-    let mut r = ResponsesRelay::new(None);
+    let mut r = ResponsesRelay::new(None, None);
     r.process(&created());
     let out = r.process(&ev(
         r#"{"type":"response.doom_loop_check","doom_loop_check":{"triggers":[123,null]}}"#,
@@ -526,7 +526,7 @@ fn test_stop_reason_mappings() {
 
 #[test]
 fn test_stop_sequence_in_message_delta() {
-    let mut r = ResponsesRelay::new(None);
+    let mut r = ResponsesRelay::new(None, None);
     let out = r.process(&ev(
         r#"{"type":"response.completed","response":{"id":"r1","output":[],
             "stop_reason":"stop","stop_sequence":"END"}}"#,
@@ -542,7 +542,8 @@ fn test_stop_sequence_in_message_delta() {
 
 #[test]
 fn test_model_fallback() {
-    let mut r = ResponsesRelay::new(None);
+    // 入站未预填且上游 response.created 只有 id → 末级 FALLBACK
+    let mut r = ResponsesRelay::new(None, None);
     let out = r.process(&ev(r#"{"type":"response.created","response":{"id":"r1"}}"#));
     let bufs = out.concat();
     let s = String::from_utf8_lossy(&bufs);
@@ -550,9 +551,35 @@ fn test_model_fallback() {
 }
 
 #[test]
+fn test_model_prefers_inbound_when_upstream_omits() {
+    // z-codex 等瘦回包:response.created 常只有 id。入站别名必须写入 message_start,
+    // 不得落到 Anthropic Opus FALLBACK。
+    let mut r = ResponsesRelay::new(None, Some("gpt-6.1-sol"));
+    let out = r.process(&ev(r#"{"type":"response.created","response":{"id":"r1"}}"#));
+    let bufs = out.concat();
+    let s = String::from_utf8_lossy(&bufs);
+    assert!(s.contains("gpt-6.1-sol"), "{s}");
+    assert!(!s.contains(FALLBACK_MODEL), "{s}");
+}
+
+#[test]
+fn test_model_upstream_overrides_inbound() {
+    // 上游显式回 response.model 时覆盖入站预填
+    let mut r = ResponsesRelay::new(None, Some("gpt-6.1-sol"));
+    let out = r.process(&ev(
+        r#"{"type":"response.created","response":{"id":"r1","model":"gpt-5.6-terra"}}"#,
+    ));
+    let bufs = out.concat();
+    let s = String::from_utf8_lossy(&bufs);
+    assert!(s.contains("gpt-5.6-terra"), "{s}");
+    assert!(!s.contains("gpt-6.1-sol"), "{s}");
+    assert!(!s.contains(FALLBACK_MODEL), "{s}");
+}
+
+#[test]
 fn test_message_item_text_fallback() {
     // 无 delta 流时从 output_item.done(message) 的 content 补发
-    let mut r = ResponsesRelay::new(None);
+    let mut r = ResponsesRelay::new(None, None);
     r.process(&created());
     let out = r.process(&ev(
         r#"{"type":"response.output_item.done","item":{"type":"message",
@@ -567,7 +594,7 @@ fn test_message_item_text_fallback() {
 #[test]
 fn test_finish_eof_after_completed_keeps_normal() {
     // 正常 completed 后 finish 幂等,不再产出(已完成流)
-    let mut r = ResponsesRelay::new(None);
+    let mut r = ResponsesRelay::new(None, None);
     r.process(&ev(
         r#"{"type":"response.completed","response":{"id":"r1","output":[]}}"#,
     ));
@@ -577,7 +604,7 @@ fn test_finish_eof_after_completed_keeps_normal() {
 #[test]
 fn test_finish_eof_without_completed_errors() {
     // 残缺流:已发 content delta 但未 completed 就 EOF,显式报 error,不包装成正常收尾
-    let mut r = ResponsesRelay::new(None);
+    let mut r = ResponsesRelay::new(None, None);
     r.process(&created());
     r.process(&ev(
         r#"{"type":"response.output_text.delta","delta":"partial"}"#,
@@ -601,7 +628,7 @@ fn test_finish_eof_without_completed_errors() {
 #[test]
 fn test_finish_eof_empty_stream_errors() {
     // 空流:一个事件都没有,EOF 直接报 error
-    let mut r = ResponsesRelay::new(None);
+    let mut r = ResponsesRelay::new(None, None);
     let out = r.finish();
     let bufs = out.concat();
     let s = String::from_utf8_lossy(&bufs);
@@ -638,7 +665,7 @@ fn test_sanitize_tool_id() {
 #[test]
 fn test_function_call_streaming_full_lifecycle() {
     // 完整生命周期:added → args delta → args done → item done → start/stop
-    let mut r = ResponsesRelay::new(None);
+    let mut r = ResponsesRelay::new(None, None);
     r.process(&created());
 
     let out1 = r.process(&ev(
@@ -679,7 +706,7 @@ fn test_function_call_tool_name_restored() {
         "mcp__short".to_string(),
         "mcp__very_long_original_name".to_string(),
     );
-    let mut r = ResponsesRelay::new(None);
+    let mut r = ResponsesRelay::new(None, None);
     r.tool_names = Some(Arc::new(names));
     r.process(&created());
 
@@ -694,7 +721,7 @@ fn test_function_call_tool_name_restored() {
 #[test]
 fn test_function_call_multiple_queued_serially() {
     // 并发两个调用:串行输出,每个独立 start/delta/stop
-    let mut r = ResponsesRelay::new(None);
+    let mut r = ResponsesRelay::new(None, None);
     r.process(&created());
 
     r.process(&ev(
@@ -713,7 +740,7 @@ fn test_function_call_multiple_queued_serially() {
 #[test]
 fn test_response_completed_flushes_terminal_calls_with_deferred() {
     // 无流式事件只有 completed:从 response.output 补发工具调用
-    let mut r = ResponsesRelay::new(None);
+    let mut r = ResponsesRelay::new(None, None);
     r.process(&created());
     let out = r.process(&ev(
         r#"{"type":"response.completed","response":{"id":"r1","output":[
@@ -732,7 +759,7 @@ fn test_response_completed_flushes_terminal_calls_with_deferred() {
 fn test_custom_tool_call_streaming_full_lifecycle() {
     // custom 工具:added → input delta → input done → item done,
     // input 是字符串,包成 {"input": str} 发 tool_use(对齐响应转换 custom 分支)
-    let mut r = ResponsesRelay::new(None);
+    let mut r = ResponsesRelay::new(None, None);
     r.process(&created());
 
     let out1 = r.process(&ev(
@@ -766,7 +793,7 @@ fn test_custom_tool_call_streaming_full_lifecycle() {
 #[test]
 fn test_custom_tool_call_from_terminal_output() {
     // 无流式事件只有 completed:从 response.output 补发 custom 工具调用
-    let mut r = ResponsesRelay::new(None);
+    let mut r = ResponsesRelay::new(None, None);
     r.process(&created());
     let out = r.process(&ev(
         r#"{"type":"response.completed","response":{"id":"r1","output":[
@@ -789,7 +816,7 @@ fn test_custom_tool_call_from_terminal_output() {
 #[test]
 fn test_custom_tool_call_done_with_full_input_direct() {
     // output_item.added 直接带完整 input(无 delta 流),done 时一次性发
-    let mut r = ResponsesRelay::new(None);
+    let mut r = ResponsesRelay::new(None, None);
     r.process(&created());
     r.process(&ev(
         r#"{"type":"response.output_item.added","item":{"type":"custom_tool_call","call_id":"call_x","name":"freeform","input":"pwd","output_index":0}}"#,
@@ -807,7 +834,7 @@ fn test_custom_tool_call_done_with_full_input_direct() {
 #[test]
 fn test_web_search_call_streaming() {
     // web_search_call → server_tool_use + web_search_tool_result
-    let mut r = ResponsesRelay::new(None);
+    let mut r = ResponsesRelay::new(None, None);
     r.process(&created());
     let out = r.process(&ev(
         r#"{"type":"response.output_item.done","item":{"type":"web_search_call","id":"ws_1","action":{"query":"rust async"},"results":[{"url":"https://example.com","title":"Example"}]}}"#,
@@ -823,7 +850,7 @@ fn test_web_search_call_streaming() {
 #[test]
 fn test_redacted_thinking_restores_from_encrypted_content() {
     // encrypted_content 带前缀 "claude-redacted-thinking:" 应还原为 redacted_thinking 块
-    let mut r = ResponsesRelay::new(None);
+    let mut r = ResponsesRelay::new(None, None);
     r.process(&created());
     r.process(&ev(
         r#"{"type":"response.output_item.added","item":{"type":"reasoning"}}"#,
@@ -853,7 +880,7 @@ fn test_redacted_thinking_restores_from_encrypted_content() {
 #[test]
 fn test_redacted_thinking_with_summary_seen() {
     // 带 summary 的 redacted_thinking: summary 可见 + 最后发 data
-    let mut r = ResponsesRelay::new(None);
+    let mut r = ResponsesRelay::new(None, None);
     r.process(&created());
     r.process(&ev(
         r#"{"type":"response.reasoning_summary_text.delta","delta":"thinking process"}"#,
@@ -874,7 +901,7 @@ fn test_redacted_thinking_with_summary_seen() {
 #[test]
 fn test_normal_thinking_signature_not_affected() {
     // 无前缀的普通 signature 应继续正常处理（不误判为 redacted_thinking）
-    let mut r = ResponsesRelay::new(None);
+    let mut r = ResponsesRelay::new(None, None);
     r.process(&created());
     let out1 = r.process(&ev(
         r#"{"type":"response.reasoning_summary_text.delta","delta":"思考中"}"#,
@@ -909,7 +936,7 @@ fn test_normal_thinking_signature_not_affected() {
 #[test]
 fn test_redacted_thinking_signature_only() {
     // 无 summary 只有 encrypted_content 的 redacted_thinking
-    let mut r = ResponsesRelay::new(None);
+    let mut r = ResponsesRelay::new(None, None);
     r.process(&created());
     r.process(&ev(
         r#"{"type":"response.output_item.added","item":{"type":"reasoning","encrypted_content":"claude-redacted-thinking:sig_only"}}"#,
@@ -928,7 +955,7 @@ fn test_redacted_thinking_signature_only() {
 #[test]
 fn test_empty_incomplete_becomes_error() {
     // 0 token 空 incomplete:报错而非伪成功(对齐 CPA 502 语义)
-    let mut r = ResponsesRelay::new(None);
+    let mut r = ResponsesRelay::new(None, None);
     r.process(&created());
     let out = r.process(&ev(
         r#"{"type":"response.incomplete","response":{"id":"r1","output":[],"usage":{"output_tokens":0}}}"#,
@@ -945,7 +972,7 @@ fn test_empty_incomplete_becomes_error() {
 #[test]
 fn test_empty_incomplete_with_output_not_error() {
     // 已有输出 delta:空 incomplete 判定不成立,正常收尾
-    let mut r = ResponsesRelay::new(None);
+    let mut r = ResponsesRelay::new(None, None);
     r.process(&created());
     r.process(&ev(r#"{"type":"response.output_text.delta","delta":"hi"}"#));
     let out = r.process(&ev(
@@ -962,7 +989,7 @@ fn test_empty_incomplete_guards() {
         r#""usage":{"output_tokens":0.5}"#,
         r#""usage":{"output_tokens":3}"#,
     ] {
-        let mut r = ResponsesRelay::new(None);
+        let mut r = ResponsesRelay::new(None, None);
         r.process(&created());
         let out = r.process(&ev(&format!(
             r#"{{"type":"response.incomplete","response":{{"id":"r1","output":[],{usage}}}}}"#
@@ -973,7 +1000,7 @@ fn test_empty_incomplete_guards() {
         );
     }
     // 有已完成 item(response.output_item.done 计数):不算
-    let mut r = ResponsesRelay::new(None);
+    let mut r = ResponsesRelay::new(None, None);
     r.process(&created());
     r.process(&ev(
         r#"{"type":"response.output_item.done","item":{"type":"reasoning"}}"#,
@@ -983,7 +1010,7 @@ fn test_empty_incomplete_guards() {
     ));
     assert!(out.iter().any(|b| b.starts_with(b"event: message_delta")));
     // response.completed 不触发该判定
-    let mut r = ResponsesRelay::new(None);
+    let mut r = ResponsesRelay::new(None, None);
     r.process(&created());
     let out = r.process(&ev(
         r#"{"type":"response.completed","response":{"id":"r1","output":[],"usage":{"output_tokens":0}}}"#,
@@ -995,7 +1022,7 @@ fn test_empty_incomplete_guards() {
 fn test_golden_sse_typical_flows_byte_invariance() {
     // 1. 文本增量 (Text Delta Stream)
     {
-        let mut r = ResponsesRelay::new(Some(100));
+        let mut r = ResponsesRelay::new(Some(100), None);
         let mut out = Vec::new();
         out.extend(r.process(&ev(
             r#"{"type":"response.created","response":{"id":"resp_1","model":"gpt-5"}}"#,
@@ -1024,7 +1051,7 @@ fn test_golden_sse_typical_flows_byte_invariance() {
 
     // 2. Thinking 思考过程与签名收尾 (Thinking + Signature Stream)
     {
-        let mut r = ResponsesRelay::new(None);
+        let mut r = ResponsesRelay::new(None, None);
         let mut out = Vec::new();
         let sig = "gAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA";
         out.extend(r.process(&ev(
@@ -1061,7 +1088,7 @@ fn test_golden_sse_typical_flows_byte_invariance() {
 
     // 3. Function Call 串行队列 (Function Call Queue Stream)
     {
-        let mut r = ResponsesRelay::new(None);
+        let mut r = ResponsesRelay::new(None, None);
         let mut out = Vec::new();
         out.extend(r.process(&ev(
             r#"{"type":"response.created","response":{"id":"resp_3","model":"gpt-5"}}"#,
@@ -1087,7 +1114,7 @@ concat!(
 
     // 4. 0-token incomplete 终态检测与报错 (0-token incomplete terminal)
     {
-        let mut r = ResponsesRelay::new(None);
+        let mut r = ResponsesRelay::new(None, None);
         let mut out = Vec::new();
         out.extend(r.process(&ev(
             r#"{"type":"response.created","response":{"id":"resp_4","model":"gpt-5"}}"#,

@@ -116,6 +116,7 @@ where
 /// `tool_names`:short→original 工具名还原表(请求转换侧产出;stream 需 'static,
 /// 内部用 Arc 共享)。
 /// `original_claude_request`:Gemini/AG 转换前 Claude 请求快照,用于响应侧回剥占位 args。
+/// `inbound_model`:客户端入站 model 别名;仅 OpenAiResponses 用于预填 message_start。
 pub fn relay<S>(
     protocol: Protocol,
     stream: S,
@@ -123,6 +124,7 @@ pub fn relay<S>(
     tool_names: Option<Arc<HashMap<String, String>>>,
     signature_model: Option<Arc<str>>,
     original_claude_request: Option<Arc<serde_json::Value>>,
+    inbound_model: Option<&str>,
 ) -> SseStreamPin
 where
     S: Stream<Item = Result<Bytes, std::io::Error>> + Send + 'static,
@@ -133,9 +135,12 @@ where
         Protocol::OpenAiChat => {
             chat::relay_openai_chat_to_anthropic(stream, estimated_input_tokens)
         }
-        Protocol::OpenAiResponses => {
-            responses::relay_responses_to_anthropic(stream, estimated_input_tokens, tool_names)
-        }
+        Protocol::OpenAiResponses => responses::relay_responses_to_anthropic(
+            stream,
+            estimated_input_tokens,
+            tool_names,
+            inbound_model,
+        ),
         Protocol::Gemini => gemini::relay_gemini_to_anthropic(
             stream,
             estimated_input_tokens,
@@ -328,7 +333,15 @@ mod tests {
             futures::stream::once(async move { Ok(Bytes::from(responses_frames)) })
                 .chain(futures::stream::pending()),
         );
-        let out = relay(Protocol::OpenAiResponses, hanging, None, None, None, None);
+        let out = relay(
+            Protocol::OpenAiResponses,
+            hanging,
+            None,
+            None,
+            None,
+            None,
+            None,
+        );
         let drained = tokio::time::timeout(std::time::Duration::from_secs(2), drain(out))
             .await
             .expect("终态后不得等上游 EOF");
@@ -343,7 +356,7 @@ mod tests {
             futures::stream::once(async move { Ok(Bytes::from(chat_frames)) })
                 .chain(futures::stream::pending()),
         );
-        let out = relay(Protocol::OpenAiChat, hanging, None, None, None, None);
+        let out = relay(Protocol::OpenAiChat, hanging, None, None, None, None, None);
         let drained = tokio::time::timeout(std::time::Duration::from_secs(2), drain(out))
             .await
             .expect("终态后不得等上游 EOF");
