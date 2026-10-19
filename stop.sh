@@ -4,17 +4,16 @@ set -euo pipefail
 SCRIPT_DIR="$(cd "$(dirname "$0")" && pwd)"
 TODAY=$(date +%Y-%m-%d)
 LOG_DIR="$SCRIPT_DIR/logs"
-OPS_LOG="$LOG_DIR/ops.$TODAY.log"
 CC_LOG="$LOG_DIR/ccextra.$TODAY.log"
 
-# 记录谁触发了 stop,方便下次对照 SIGTERM
+# 记录谁触发了 stop,方便下次对照 SIGTERM(只写当日 ccextra 日志)
 log_stop_caller() {
     local ts user uid ppid parent_cmd tty_name term_val ssh_val line
     ts=$(date '+%Y-%m-%d %H:%M:%S %Z')
     user=$(id -un 2>/dev/null || echo '?')
     uid=$(id -u 2>/dev/null || echo '?')
     ppid=${PPID:-?}
-    # 压成单行并截断,避免 Cursor/agent 壳把整段 dump 脚本写进 ops 日志
+    # 压成单行并截断,避免 Cursor/agent 壳把整段 dump 脚本写进日志
     parent_cmd=$(ps -p "$ppid" -o args= 2>/dev/null | tr '\n\r\t' ' ' | tr -s ' ' || true)
     parent_cmd=${parent_cmd:-?}
     if [ "${#parent_cmd}" -gt 240 ]; then
@@ -36,14 +35,8 @@ log_stop_caller() {
         line="$line SSH_CLIENT=\"$ssh_val\""
     fi
 
-    echo "$line" >&2
-
     mkdir -p "$LOG_DIR"
-    echo "$line" >> "$OPS_LOG" 2>/dev/null || true
-    # 若当日服务日志可写,也留一行便于和 shutting down (SIGTERM) 对照
-    if [ -w "$CC_LOG" ]; then
-        echo "$line" >> "$CC_LOG" 2>/dev/null || true
-    fi
+    echo "$line" >> "$CC_LOG" 2>/dev/null || true
 }
 
 echo "=== Stopping ccextra ==="
