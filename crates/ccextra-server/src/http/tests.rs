@@ -886,21 +886,25 @@ models:
         .push(provider);
     Arc::make_mut(&mut *state.config.write().await)
         .payload_rules
-        .push(PayloadRule {
-            models: vec!["test-responses-final".into()],
-            protocol: Some(Protocol::OpenAiResponses),
-            params: json!({
-                "previous_response_id": "resp_previous",
-                "generate": true,
-                "safety_identifier": "safe-id",
-                "stream_options": {"include_usage": true},
-                "prompt_cache_retention": "24h",
-                "temperature": 0.1
-            })
-            .as_object()
-            .unwrap()
-            .clone(),
-        });
+        .push(
+            PayloadRule {
+                models: vec!["test-responses-final".into()],
+                protocol: Some(Protocol::OpenAiResponses),
+                params: json!({
+                    "previous_response_id": "resp_previous",
+                    "generate": true,
+                    "safety_identifier": "safe-id",
+                    "stream_options": {"include_usage": true},
+                    "prompt_cache_retention": "24h",
+                    "temperature": 0.1
+                })
+                .as_object()
+                .unwrap()
+                .clone(),
+                matchers: vec![],
+            }
+            .compiled(),
+        );
     let app = app(state);
     let request = Request::builder()
         .uri("/v1/messages")
@@ -1028,7 +1032,9 @@ fn test_payload_override_wildcard() {
             map.insert("temperature".into(), json!(0.1));
             map
         },
-    }];
+        matchers: vec![],
+    }
+    .compiled()];
     apply_payload_overrides(&mut body, "glm-5.1", Protocol::OpenAiChat, &rules);
     assert_eq!(body["max_tokens"], 32000);
     assert_eq!(body["temperature"], 0.1);
@@ -1046,7 +1052,9 @@ fn test_payload_override_protocol_gate() {
             map.insert("tool_stream".into(), json!(true));
             map
         },
-    }];
+        matchers: vec![],
+    }
+    .compiled()];
     apply_payload_overrides(&mut body, "glm-5.1", Protocol::Claude, &rules);
     assert!(body.get("tool_stream").is_none());
     assert_eq!(body["max_tokens"], 1024);
@@ -1064,7 +1072,9 @@ fn test_payload_override_claude_requires_explicit_protocol() {
             map.insert("max_tokens".into(), json!(32000));
             map
         },
-    }];
+        matchers: vec![],
+    }
+    .compiled()];
     apply_payload_overrides(&mut body, "evol-opus-5", Protocol::Claude, &rules);
     assert_eq!(
         body["max_tokens"], 1024,
@@ -1080,7 +1090,9 @@ fn test_payload_override_claude_requires_explicit_protocol() {
             map.insert("max_tokens".into(), json!(32000));
             map
         },
-    }];
+        matchers: vec![],
+    }
+    .compiled()];
     apply_payload_overrides(&mut body, "evol-opus-5", Protocol::Claude, &rules2);
     assert_eq!(body["max_tokens"], 32000, "显式 claude 协议应注入");
 }
@@ -1096,7 +1108,9 @@ fn test_payload_override_no_match() {
             map.insert("max_tokens".into(), json!(32000));
             map
         },
-    }];
+        matchers: vec![],
+    }
+    .compiled()];
     apply_payload_overrides(&mut body, "claude-opus", Protocol::OpenAiChat, &rules);
     assert_eq!(body["max_tokens"], 1024);
 }
@@ -1112,7 +1126,9 @@ fn test_payload_override_star_matches_all() {
             map.insert("temperature".into(), json!(0.5));
             map
         },
-    }];
+        matchers: vec![],
+    }
+    .compiled()];
     apply_payload_overrides(&mut body, "any-model", Protocol::OpenAiChat, &rules);
     assert_eq!(body["temperature"], 0.5);
 }
@@ -2142,11 +2158,15 @@ models:
     params.insert("model".into(), json!("grok-4.6"));
     Arc::make_mut(&mut *state.config.write().await)
         .payload_rules
-        .push(PayloadRule {
-            models: vec!["test-gpt-to-grok".into()],
-            protocol: Some(Protocol::OpenAiChat),
-            params,
-        });
+        .push(
+            PayloadRule {
+                models: vec!["test-gpt-to-grok".into()],
+                protocol: Some(Protocol::OpenAiChat),
+                params,
+                matchers: vec![],
+            }
+            .compiled(),
+        );
     let app = app(state);
     let request = Request::builder()
         .uri("/v1/messages")
@@ -2663,6 +2683,7 @@ async fn test_responses_payload_tier_is_serialized_before_input() {
         snapshot.payload_rules = yaml_serde::from_str(
             "- models: ['*']\n  protocol: openai_responses\n  params:\n    service_tier: priority\n"
         ).unwrap();
+        PayloadRule::compile_all(&mut snapshot.payload_rules).unwrap();
     }
     let request = Request::builder()
         .uri("/v1/messages")

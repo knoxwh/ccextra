@@ -126,6 +126,22 @@ pub struct AppState {
     pub last_input_tokens: Arc<std::sync::Mutex<session_tokens::SessionTokenCache>>,
 }
 
+/// 预编译的模型匹配器(`*` 或 glob)
+#[derive(Clone, Debug)]
+enum ModelMatcher {
+    All,
+    Glob(globset::GlobMatcher),
+}
+
+impl ModelMatcher {
+    fn is_match(&self, model: &str) -> bool {
+        match self {
+            Self::All => true,
+            Self::Glob(g) => g.is_match(model),
+        }
+    }
+}
+
 #[derive(Clone, Debug, serde::Deserialize)]
 pub struct PayloadRule {
     pub models: Vec<String>,
@@ -133,6 +149,49 @@ pub struct PayloadRule {
     #[serde(default)]
     pub protocol: Option<Protocol>,
     pub params: serde_json::Map<String, Value>,
+    /// 配置加载/reload 时编译;热路径只做 is_match
+    #[serde(skip)]
+    matchers: Vec<ModelMatcher>,
+}
+
+impl PayloadRule {
+    /// 编译 models 中的 glob;`*` 为全匹配。非法 pattern 返回 Err(不静默忽略)。
+    pub fn compile(&mut self) -> Result<(), String> {
+        let mut matchers = Vec::with_capacity(self.models.len());
+        for pat in &self.models {
+            if pat == "*" {
+                matchers.push(ModelMatcher::All);
+                continue;
+            }
+            let glob = globset::Glob::new(pat)
+                .map_err(|e| format!("无效 payload 模型模式 '{pat}': {e}"))?;
+            matchers.push(ModelMatcher::Glob(glob.compile_matcher()));
+        }
+        self.matchers = matchers;
+        Ok(())
+    }
+
+    /// 批量编译;任一失败则整批失败
+    pub fn compile_all(rules: &mut [PayloadRule]) -> Result<(), String> {
+        for rule in rules.iter_mut() {
+            rule.compile()?;
+        }
+        Ok(())
+    }
+
+    pub(crate) fn matches_model(&self, model: &str) -> bool {
+        debug_assert!(
+            !self.matchers.is_empty() || self.models.is_empty(),
+            "payload rule 未 compile"
+        );
+        self.matchers.iter().any(|m| m.is_match(model))
+    }
+
+    /// 测试/内联构造后立即编译
+    pub fn compiled(mut self) -> Self {
+        self.compile().unwrap_or_else(|e| panic!("{e}"));
+        self
+    }
 }
 
 #[derive(Clone, Debug, serde::Deserialize)]

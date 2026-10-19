@@ -78,6 +78,10 @@ impl Config {
                 persist_secret(path, &content, &hashed)?;
             }
         }
+        if let Some(ref mut rules) = config.payload {
+            PayloadRule::compile_all(rules)
+                .map_err(|e| anyhow::anyhow!("payload 规则编译失败: {e}"))?;
+        }
         Ok(config)
     }
 }

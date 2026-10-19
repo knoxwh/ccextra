@@ -62,11 +62,15 @@ async fn request_retains_snapshot_across_reload(endpoint: &'static str) {
         snapshot.providers[0].set_base_url_for_test(server.url.clone());
         snapshot.runtime.secret = Some("old-key".into());
         snapshot.runtime.user_agents.claude_cli = Arc::new("snapshot-old-agent".into());
-        snapshot.payload_rules.push(PayloadRule {
-            models: vec!["test-opus".into()],
-            protocol: Some(Protocol::Claude),
-            params: serde_json::from_value(json!({"max_tokens": 17})).unwrap(),
-        });
+        snapshot.payload_rules.push(
+            PayloadRule {
+                models: vec!["test-opus".into()],
+                protocol: Some(Protocol::Claude),
+                params: serde_json::from_value(json!({"max_tokens": 17})).unwrap(),
+                matchers: vec![],
+            }
+            .compiled(),
+        );
     }
     state.reload = reload_returning_secret(Some("new-key".into()));
     let router = app(state);

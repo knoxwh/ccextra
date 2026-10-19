@@ -23,7 +23,6 @@ use ccextra_core::prompt_cache::inject_prompt_cache_key;
 use ccextra_core::route::{resolve_route, Protocol, ProviderConfig};
 use ccextra_core::session::{extract_claude_code_session, extract_claude_code_thread};
 use futures::StreamExt;
-use globset::Glob;
 use serde_json::{json, Value};
 use std::collections::HashMap;
 use std::sync::atomic::{AtomicU64, Ordering};
@@ -105,14 +104,7 @@ pub(crate) fn apply_payload_overrides(
                 continue;
             }
         }
-        let matched = rule.models.iter().any(|pat| {
-            if pat == "*" {
-                return true;
-            }
-            Glob::new(pat)
-                .map(|g| g.compile_matcher().is_match(model))
-                .unwrap_or(false)
-        });
+        let matched = rule.matches_model(model);
         if matched {
             for (key, val) in &rule.params {
                 body[key] = val.clone();
