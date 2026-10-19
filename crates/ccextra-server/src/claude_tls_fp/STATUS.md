@@ -4,6 +4,8 @@ Status as of 2026-10-13 (Claude Code 2.1.296 / Bun 1.4.3 baseline).
 
 Verified 2026-10-14: Claude Code **2.1.299** (still Bun 1.4.3) re-sampled; JA3 / JA4 / peetprint match the 2.1.296 baseline — no TLS constant changes needed.
 
+Verified 2026-10-18: Claude Code **2.1.303** (embedded Bun string **1.4.4**) — local ClientHello / JA3 inputs and HTTP messages still match the 2.1.296 baseline; no TLS constant changes. Full peetprint pending public Bun 1.4.4 peet package.
+
 ## Goal
 
 Match peet baseline:
