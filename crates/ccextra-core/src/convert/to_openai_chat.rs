@@ -218,6 +218,10 @@ pub fn convert_to_openai_chat_with(
         if !pending_system_reminders.is_empty() {
             messages.extend(pending_system_reminders);
         }
+
+        // 对齐 CPA AlignOpenAIToolCallMessages:按 tool_call_id 把 tool 收到
+        // 对应 assistant.tool_calls 紧后;歧义/孤儿/不完整不动。
+        messages = align_openai_tool_call_messages(messages);
     }
 
     // 对齐 键序:messages 在 tools 之前
@@ -561,6 +565,170 @@ fn should_map_thinking_to_reasoning(part: &Value) -> bool {
         .unwrap_or("")
         .trim();
     sig.is_empty() || sig.starts_with("gAAAA")
+}
+
+/// 对齐 CPA `AlignOpenAIToolCallMessages`:把完整且无歧义的 tool 结果消息
+/// 重排到对应 `assistant.tool_calls` 紧后;相对序保留。
+/// 歧义(重复 id)/孤儿/不完整/因果颠倒 → 整组不动。
+pub(crate) fn align_openai_tool_call_messages(messages: Vec<Value>) -> Vec<Value> {
+    if messages.len() <= 1 {
+        return messages;
+    }
+
+    struct AssistantRecord {
+        msg_index: usize,
+        call_ids: Vec<String>,
+        has_invalid_or_empty_id: bool,
+    }
+
+    let mut assistants: Vec<AssistantRecord> = Vec::new();
+    let mut assistant_by_call_id: HashMap<String, usize> = HashMap::new();
+    let mut ambiguous_call_ids: HashSet<String> = HashSet::new();
+    let mut tool_msg_indices_by_call_id: HashMap<String, Vec<usize>> = HashMap::new();
+
+    for (i, msg) in messages.iter().enumerate() {
+        let role = msg.get("role").and_then(|r| r.as_str()).unwrap_or("");
+        match role {
+            "assistant" => {
+                let Some(tool_calls) = msg.get("tool_calls").and_then(|v| v.as_array()) else {
+                    continue;
+                };
+                if tool_calls.is_empty() {
+                    continue;
+                }
+                let mut call_ids = Vec::new();
+                let mut has_empty = false;
+                for tc in tool_calls {
+                    let call_id = tc.get("id").and_then(|v| v.as_str()).unwrap_or("");
+                    if call_id.is_empty() {
+                        ambiguous_call_ids.insert(String::new());
+                        has_empty = true;
+                        continue;
+                    }
+                    if assistant_by_call_id.contains_key(call_id) {
+                        ambiguous_call_ids.insert(call_id.to_string());
+                    }
+                    assistant_by_call_id.insert(call_id.to_string(), i);
+                    call_ids.push(call_id.to_string());
+                }
+                if !call_ids.is_empty() || has_empty {
+                    assistants.push(AssistantRecord {
+                        msg_index: i,
+                        call_ids,
+                        has_invalid_or_empty_id: has_empty,
+                    });
+                }
+            }
+            "tool" => {
+                let call_id = msg
+                    .get("tool_call_id")
+                    .and_then(|v| v.as_str())
+                    .unwrap_or("");
+                if call_id.is_empty() {
+                    ambiguous_call_ids.insert(String::new());
+                } else {
+                    let indices = tool_msg_indices_by_call_id
+                        .entry(call_id.to_string())
+                        .or_default();
+                    indices.push(i);
+                    if indices.len() > 1 {
+                        ambiguous_call_ids.insert(call_id.to_string());
+                    }
+                }
+            }
+            _ => {}
+        }
+    }
+
+    if assistants.is_empty() {
+        return messages;
+    }
+
+    struct ReorderGroup {
+        assistant_index: usize,
+        tool_indices: Vec<usize>,
+    }
+
+    let mut groups: Vec<ReorderGroup> = Vec::new();
+    let mut needs_reorder = false;
+
+    for ast in &assistants {
+        if ast.has_invalid_or_empty_id {
+            continue;
+        }
+        let mut is_eligible = true;
+        let mut matched_tool_indices: Vec<usize> = Vec::with_capacity(ast.call_ids.len());
+
+        for call_id in &ast.call_ids {
+            if ambiguous_call_ids.contains(call_id) {
+                is_eligible = false;
+                break;
+            }
+            let Some(indices) = tool_msg_indices_by_call_id.get(call_id) else {
+                is_eligible = false;
+                break;
+            };
+            if indices.len() != 1 {
+                is_eligible = false;
+                break;
+            }
+            let tool_idx = indices[0];
+            if tool_idx <= ast.msg_index {
+                // 因果颠倒:tool 结果在 assistant 之前
+                is_eligible = false;
+                break;
+            }
+            matched_tool_indices.push(tool_idx);
+        }
+
+        if !is_eligible {
+            continue;
+        }
+
+        matched_tool_indices.sort_unstable();
+
+        let already_adjacent = matched_tool_indices
+            .iter()
+            .enumerate()
+            .all(|(offset, &tool_idx)| tool_idx == ast.msg_index + offset + 1);
+
+        if !already_adjacent {
+            needs_reorder = true;
+            groups.push(ReorderGroup {
+                assistant_index: ast.msg_index,
+                tool_indices: matched_tool_indices,
+            });
+        }
+    }
+
+    if !needs_reorder {
+        return messages;
+    }
+
+    let mut moved_tool_indices: HashSet<usize> = HashSet::new();
+    let mut tools_to_insert: HashMap<usize, Vec<Value>> = HashMap::new();
+
+    for g in &groups {
+        let mut tool_list = Vec::with_capacity(g.tool_indices.len());
+        for &idx in &g.tool_indices {
+            moved_tool_indices.insert(idx);
+            tool_list.push(messages[idx].clone());
+        }
+        tools_to_insert.insert(g.assistant_index, tool_list);
+    }
+
+    let mut reordered = Vec::with_capacity(messages.len());
+    for (i, msg) in messages.into_iter().enumerate() {
+        if moved_tool_indices.contains(&i) {
+            continue;
+        }
+        reordered.push(msg);
+        if let Some(tools) = tools_to_insert.remove(&i) {
+            reordered.extend(tools);
+        }
+    }
+
+    reordered
 }
 
 /// 转换单条消息的内容部件
@@ -2397,5 +2565,89 @@ IMPORTANT: Assist with authorized security testing.
         assert_eq!(body["max_completion_tokens"], 32000);
         assert!(body.get("max_tokens").is_none());
         assert!(body.get("tool_stream").is_none());
+    }
+    #[test]
+    fn align_reorders_tool_results_after_matching_assistant() {
+        let messages = vec![
+            json!({"role": "user", "content": "start"}),
+            json!({"role": "assistant", "tool_calls": [
+                {"id": "call_a", "type": "function"},
+                {"id": "call_b", "type": "function"}
+            ]}),
+            json!({"role": "assistant", "content": "thinking part", "reasoning_content": "step 1"}),
+            json!({"role": "user", "content": "system reminder"}),
+            json!({"role": "tool", "tool_call_id": "call_b", "content": "res_b"}),
+            json!({"role": "tool", "tool_call_id": "call_a", "content": "res_a"}),
+            json!({"role": "user", "content": "final prompt"}),
+        ];
+        let got = align_openai_tool_call_messages(messages);
+        assert_eq!(got.len(), 7);
+        let roles: Vec<_> = got.iter().map(|m| m["role"].as_str().unwrap()).collect();
+        assert_eq!(
+            roles,
+            [
+                "user",
+                "assistant",
+                "tool",
+                "tool",
+                "assistant",
+                "user",
+                "user"
+            ]
+        );
+        assert_eq!(got[2]["tool_call_id"], "call_b");
+        assert_eq!(got[3]["tool_call_id"], "call_a");
+        assert_eq!(got[4]["reasoning_content"], "step 1");
+    }
+
+    #[test]
+    fn align_leaves_ambiguous_duplicate_ids_untouched() {
+        let messages = vec![
+            json!({"role": "assistant", "tool_calls": [{"id": "dup_call"}]}),
+            json!({"role": "assistant", "tool_calls": [{"id": "dup_call"}]}),
+            json!({"role": "user", "content": "middle"}),
+            json!({"role": "tool", "tool_call_id": "dup_call", "content": "res"}),
+        ];
+        let original = messages.clone();
+        let got = align_openai_tool_call_messages(messages);
+        assert_eq!(got, original);
+    }
+
+    #[test]
+    fn align_leaves_orphan_tool_untouched() {
+        let messages = vec![
+            json!({"role": "user", "content": "start"}),
+            json!({"role": "tool", "tool_call_id": "call_orphan", "content": "orphan"}),
+        ];
+        let original = messages.clone();
+        let got = align_openai_tool_call_messages(messages);
+        assert_eq!(got, original);
+    }
+
+    #[test]
+    fn align_noop_when_already_adjacent() {
+        let messages = vec![
+            json!({"role": "user", "content": "start"}),
+            json!({"role": "assistant", "tool_calls": [
+                {"id": "call_1", "type": "function", "function": {"name": "f1"}}
+            ]}),
+            json!({"role": "tool", "tool_call_id": "call_1", "content": "res1"}),
+            json!({"role": "assistant", "content": "done"}),
+        ];
+        let original = messages.clone();
+        let got = align_openai_tool_call_messages(messages);
+        assert_eq!(got, original);
+    }
+
+    #[test]
+    fn align_leaves_incomplete_tool_calls_untouched() {
+        let messages = vec![
+            json!({"role": "assistant", "tool_calls": [{"id": "call_1"}, {"id": "call_2"}]}),
+            json!({"role": "user", "content": "middle"}),
+            json!({"role": "tool", "tool_call_id": "call_1", "content": "res1"}),
+        ];
+        let original = messages.clone();
+        let got = align_openai_tool_call_messages(messages);
+        assert_eq!(got, original);
     }
 }
