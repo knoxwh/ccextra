@@ -39,22 +39,31 @@ pub async fn handle_count_tokens(
         .map_err(|e| AppError::new(anyhow::anyhow!("读请求体失败: {e}")))?;
 
     // 解析 model 字段
-    let body_json: Value = serde_json::from_slice(&bytes)
+    let mut body_json: Value = serde_json::from_slice(&bytes)
         .map_err(|e| AppError::new(anyhow::anyhow!("解析请求体失败: {e}")))?;
     let model = body_json
         .get("model")
         .and_then(|v| v.as_str())
-        .ok_or_else(|| AppError::new(anyhow::anyhow!("缺少 model 字段")))?;
+        .ok_or_else(|| AppError::new(anyhow::anyhow!("缺少 model 字段")))?
+        .to_string();
 
     // 路由判定
-    let route = resolve_route(model, providers)
+    let route = resolve_route(&model, providers)
         .map_err(|e| AppError::new(anyhow::anyhow!("路由失败: {e}")))?;
+
+    // 与 messages 直通一致:转发前把别名改写成上游模型名
+    body_json["model"] = Value::String(route.upstream_model.clone());
 
     // Claude 协议:转发上游
     if route.protocol == Protocol::Claude {
         let provider = find_provider(providers, &route.provider)
             .ok_or_else(|| AppError::new(anyhow::anyhow!("provider 未找到")))?;
-        let base_url = provider.base_urls()[0].clone(); // 取首个 URL（count_tokens 无需回退）
+        let base_url = provider.base_urls().first().cloned().ok_or_else(|| {
+            AppError::new(anyhow::anyhow!(
+                "provider {} 未配置 base_url",
+                route.provider
+            ))
+        })?;
         let mut key = provider.key.clone();
         let proxy_url = provider.proxy_url.clone();
         let mut claude_oauth: Option<(String, String)> = None; // (auth_dir, id)

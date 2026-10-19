@@ -120,11 +120,9 @@ async fn request_retains_snapshot_across_reload(endpoint: &'static str) {
         captured.header("user-agent").as_deref(),
         Some("snapshot-old-agent")
     );
+    assert_eq!(captured.body()["model"], "claude-opus-5");
     if endpoint == "/v1/messages" {
-        assert_eq!(captured.body()["model"], "claude-opus-5");
         assert_eq!(captured.body()["max_tokens"], 17);
-    } else {
-        assert_eq!(captured.body()["model"], "test-opus");
     }
     let old_key = Request::builder()
         .uri("/v1/models")

@@ -1745,6 +1745,60 @@ async fn test_count_tokens_relay_uses_fallback_user_agent() {
     assert!(!captured.has_header("x-api-key"));
 }
 
+/// count_tokens 转发上游时须把入站别名改写成 upstream_model
+#[tokio::test]
+async fn test_count_tokens_rewrites_model_to_upstream() {
+    let (server, captured) = spawn_captured_server(
+        "/v1/messages/count_tokens",
+        StatusCode::OK,
+        r#"{"input_tokens":7}"#,
+    )
+    .await;
+
+    let state = mock_state();
+    Arc::make_mut(&mut *state.config.write().await).providers[0]
+        .set_base_url_for_test(server.url.clone());
+    let app = app(state);
+    let request = Request::builder()
+        .uri("/v1/messages/count_tokens")
+        .method("POST")
+        .header("content-type", "application/json")
+        .body(Body::from(
+            json!({"model": "test-opus", "messages": []}).to_string(),
+        ))
+        .unwrap();
+    let response = app.oneshot(request).await.unwrap();
+    assert_eq!(response.status(), StatusCode::OK);
+    assert_eq!(
+        captured.body()["model"],
+        "claude-opus-5",
+        "count_tokens 须转发 upstream_model 而非入站别名"
+    );
+}
+
+/// count_tokens 空 base_url 列表须返回错误而非 panic
+#[tokio::test]
+async fn test_count_tokens_empty_base_url_rejected() {
+    let state = mock_state();
+    let provider: ProviderConfig = yaml_serde::from_str(
+        "name: ct-empty\nprotocol: claude\nbase_url: []\nkey: sk-test\nmodels:\n  - name: claude-x\n    alias: ct-empty\n",
+    )
+    .unwrap();
+    Arc::make_mut(&mut *state.config.write().await)
+        .providers
+        .push(provider);
+    let response = post_test_request(state, "/v1/messages/count_tokens", "ct-empty").await;
+    assert_eq!(response.status(), StatusCode::INTERNAL_SERVER_ERROR);
+    let bytes = to_bytes(response.into_body(), 1024 * 1024).await.unwrap();
+    let v: Value = serde_json::from_slice(&bytes).unwrap();
+    assert_eq!(v["type"], "error");
+    assert!(
+        v["error"]["message"].as_str().unwrap().contains("base_url"),
+        "got {}",
+        v
+    );
+}
+
 // ── B1:非流 body 有界读取接线 ───────────────────────────────────────
 
 #[tokio::test]

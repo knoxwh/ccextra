@@ -32,6 +32,9 @@ pub enum RouteError {
 
     #[error("model_variant_unavailable: {0}")]
     VariantUnavailable(String),
+
+    #[error("provider {0} 未配置 base_url")]
+    EmptyBaseUrl(String),
 }
 
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
@@ -195,6 +198,10 @@ pub fn validate_providers(providers: &[ProviderConfig]) -> Result<(), RouteError
     let mut alias_map: HashMap<&str, &str> = HashMap::new();
 
     for provider in providers {
+        // base_url: [] 会在热路径索引越界/panic;允许 base_url: ""(部分动态 provider 占位)
+        if provider.base_urls().is_empty() {
+            return Err(RouteError::EmptyBaseUrl(provider.name.clone()));
+        }
         for model in &provider.models {
             if let Some(existing_provider) = alias_map.get(model.alias.as_str()) {
                 if existing_provider != &provider.name.as_str() {
@@ -261,6 +268,22 @@ models:
 
         let err = validate_providers(&providers).unwrap_err();
         assert!(matches!(err, RouteError::AliasConflict(_)));
+    }
+
+    #[test]
+    fn test_empty_base_url_list_rejected_at_validate() {
+        let yaml = r#"
+- name: empty-url
+  protocol: claude
+  base_url: []
+  key: sk-a
+  models:
+    - name: model-a
+      alias: a
+"#;
+        let providers: Vec<ProviderConfig> = yaml_serde::from_str(yaml).unwrap();
+        let err = validate_providers(&providers).unwrap_err();
+        assert!(matches!(err, RouteError::EmptyBaseUrl(_)));
     }
 
     #[test]
