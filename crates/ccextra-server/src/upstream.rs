@@ -1087,18 +1087,10 @@ pub(crate) async fn send_with_timeout(
 }
 
 /// 连接失效:立即额外尝试一次,不耗 3s 重试预算。
-/// SEND_TIMEOUT(等响应头 30s)视为僵死 keep-alive:丢缓存 Client 后重试一次
-/// (代理空闲掐线常见表现);仅匹配本路径文案 "上游请求超时",不含取消。
+/// send()/等响应头 SEND_TIMEOUT 不走这里,避免真慢被放大成双倍空等。
 /// 普通建连失败/建连超时(reqwest/wreq is_timeout)不是死连接:不得进入内部
 /// 快速重试(否则单 URL 建连超时被放大成约 20s),交给外层 URL fallback。
 fn is_stale_connection(err: &anyhow::Error) -> bool {
-    // send_with_timeout / send_with_timeout_wreq 包出的 anyhow,非传输层 is_timeout
-    if err
-        .chain()
-        .any(|cause| cause.to_string().contains("上游请求超时"))
-    {
-        return true;
-    }
     let (is_connect, is_timeout) = if let Some(e) = err.downcast_ref::<reqwest::Error>() {
         (e.is_connect(), e.is_timeout())
     } else if let Some(e) = err.downcast_ref::<wreq::Error>() {
@@ -1881,20 +1873,20 @@ mod tests {
     }
 
     #[test]
-    fn test_stale_connection_detects_reset_and_send_header_timeout() {
+    fn test_stale_connection_detects_reset_not_timeout_message() {
         assert!(is_stale_connection(&anyhow::anyhow!(
             "connection reset by peer"
         )));
         assert!(is_stale_connection(&anyhow::anyhow!("Broken pipe")));
         assert!(
-            is_stale_connection(&anyhow::anyhow!("上游请求超时 (30s)")),
-            "SEND_TIMEOUT(等响应头)视为僵死连接,丢池重试一次"
+            !is_stale_connection(&anyhow::anyhow!("上游请求超时 (30s)")),
+            "send/等响应头超时不得进入死连接重试"
         );
         assert!(
-            is_stale_connection(
+            !is_stale_connection(
                 &anyhow::anyhow!("error sending request").context("上游请求超时 (30s)")
             ),
-            "错误链上的 SEND_TIMEOUT 文案也应判 stale"
+            "错误链上的 SEND_TIMEOUT 文案也不得判 stale"
         );
         assert!(!is_stale_connection(&anyhow::anyhow!("invalid api key")));
         assert!(
