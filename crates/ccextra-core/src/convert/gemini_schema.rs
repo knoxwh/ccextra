@@ -7,6 +7,7 @@
 //
 // 只接受单个 schema 值,禁止传整个请求文档(对齐 CPA 注释:
 // 清洗按 key 名重写,作用于会话历史会误删工具参数)
+// unsupported 关键字含 contentMediaType/contentEncoding(CPA a43026d7 / #6699)
 
 use serde_json::{json, Map, Value};
 

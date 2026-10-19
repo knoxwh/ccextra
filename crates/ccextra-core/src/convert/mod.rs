@@ -1,7 +1,7 @@
 // 协议转换:独立 body-to-body 转换
 //
 // - passthrough / to_openai_chat / to_openai_responses
-// - gemini / gemini_response / gemini_schema
+// - gemini / gemini_response / gemini_schema / claude_tool_args
 // - antigravity / antigravity_tools / antigravity_reasoning_replay
 // - message_convert / reasoning_replay / kimi_thinking_replay
 // - fix_json / shorten / signature / tool_id / tool_sanitize
@@ -11,6 +11,7 @@ use thiserror::Error;
 pub mod antigravity;
 pub mod antigravity_reasoning_replay;
 pub mod antigravity_tools;
+pub mod claude_tool_args;
 pub mod fix_json;
 pub mod gemini;
 pub mod gemini_response;
@@ -34,6 +35,10 @@ pub use antigravity_reasoning_replay::{
 };
 pub use antigravity_tools::{
     antigravity_tool_name_to_upstream, antigravity_upstream_tool_name_to_client,
+};
+pub use claude_tool_args::{
+    claude_tool_is_parameterless, clean_claude_tool_arguments, clean_claude_tool_arguments_raw,
+    ToolArgStreamState,
 };
 pub use fix_json::fix_json_quotes;
 pub use gemini::{convert_to_gemini, convert_to_gemini_with_registry};

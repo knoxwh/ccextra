@@ -113,14 +113,16 @@ where
 /// 又必须第一帧发,故用它占位,让 cc context 过程中接近真实而非跳 1;
 /// 流尾 message_delta 以真实 usage 覆盖。claude 直通不经过状态机,传 None。
 ///
-/// `tool_names`:short→original 工具名还原表(仅 responses 协议用,请求转换侧
-/// 产出;stream 需 'static,内部用 Arc 共享)。
+/// `tool_names`:short→original 工具名还原表(请求转换侧产出;stream 需 'static,
+/// 内部用 Arc 共享)。
+/// `original_claude_request`:Gemini/AG 转换前 Claude 请求快照,用于响应侧回剥占位 args。
 pub fn relay<S>(
     protocol: Protocol,
     stream: S,
     estimated_input_tokens: Option<usize>,
     tool_names: Option<Arc<HashMap<String, String>>>,
     signature_model: Option<Arc<str>>,
+    original_claude_request: Option<Arc<serde_json::Value>>,
 ) -> SseStreamPin
 where
     S: Stream<Item = Result<Bytes, std::io::Error>> + Send + 'static,
@@ -134,14 +136,18 @@ where
         Protocol::OpenAiResponses => {
             responses::relay_responses_to_anthropic(stream, estimated_input_tokens, tool_names)
         }
-        Protocol::Gemini => {
-            gemini::relay_gemini_to_anthropic(stream, estimated_input_tokens, tool_names)
-        }
+        Protocol::Gemini => gemini::relay_gemini_to_anthropic(
+            stream,
+            estimated_input_tokens,
+            tool_names,
+            original_claude_request,
+        ),
         Protocol::Antigravity => gemini::relay_antigravity_to_anthropic(
             stream,
             estimated_input_tokens,
             tool_names,
             signature_model.unwrap_or_default(),
+            original_claude_request,
         ),
     };
     with_idle_keepalive(inner)
@@ -322,7 +328,7 @@ mod tests {
             futures::stream::once(async move { Ok(Bytes::from(responses_frames)) })
                 .chain(futures::stream::pending()),
         );
-        let out = relay(Protocol::OpenAiResponses, hanging, None, None, None);
+        let out = relay(Protocol::OpenAiResponses, hanging, None, None, None, None);
         let drained = tokio::time::timeout(std::time::Duration::from_secs(2), drain(out))
             .await
             .expect("终态后不得等上游 EOF");
@@ -337,7 +343,7 @@ mod tests {
             futures::stream::once(async move { Ok(Bytes::from(chat_frames)) })
                 .chain(futures::stream::pending()),
         );
-        let out = relay(Protocol::OpenAiChat, hanging, None, None, None);
+        let out = relay(Protocol::OpenAiChat, hanging, None, None, None, None);
         let drained = tokio::time::timeout(std::time::Duration::from_secs(2), drain(out))
             .await
             .expect("终态后不得等上游 EOF");

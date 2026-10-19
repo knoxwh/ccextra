@@ -5,6 +5,7 @@ use std::collections::HashMap;
 use std::sync::atomic::{AtomicU64, Ordering};
 
 use super::antigravity_tools::antigravity_upstream_tool_name_to_client;
+use super::claude_tool_args::{clean_claude_tool_arguments, ToolArgStreamState};
 use super::signature::{format_claude_signature_value, model_group};
 use super::tool_id::claude_tool_id_for;
 
@@ -48,6 +49,8 @@ pub struct GeminiStreamState {
     pub final_events_sent: bool,
     /// 已发 MALFORMED api_error(对齐 CPA 7f2f17d7;SSE 层据此跳过 message_stop)
     pub api_error_emitted: bool,
+    /// 工具参数清洗流状态(对齐 CPA CurrentTool*)
+    pub tool_args: ToolArgStreamState,
     /// 是否见过 usageMetadata(对齐 CPA HasUsageMetadata)
     has_usage: bool,
     /// 是否见过 finishReason(对齐 CPA HasFinishReason)
@@ -135,6 +138,7 @@ pub fn convert_gemini_stream_chunk(
     state: &mut GeminiStreamState,
     short_to_original: &HashMap<String, String>,
     signature_model: Option<&str>,
+    original_request: Option<&Value>,
 ) -> Vec<Value> {
     let mut events = Vec::new();
 
@@ -246,14 +250,21 @@ pub fn convert_gemini_stream_chunk(
                 // 流式分块:名称为空表示续传
                 if state.response_type == ResponseType::Function && upstream_tool_name.is_empty() {
                     if let Some(args) = function_call.get("args") {
-                        events.push(json!({
-                            "type": "content_block_delta",
-                            "index": state.response_index,
-                            "delta": {
-                                "type": "input_json_delta",
-                                "partial_json": args.to_string()
-                            }
-                        }));
+                        let tool_name = state.tool_args.current_tool_name.clone();
+                        if let Some(partial) = state.tool_args.clean_emitted_args(
+                            &args.to_string(),
+                            &tool_name,
+                            original_request,
+                        ) {
+                            events.push(json!({
+                                "type": "content_block_delta",
+                                "index": state.response_index,
+                                "delta": {
+                                    "type": "input_json_delta",
+                                    "partial_json": partial
+                                }
+                            }));
+                        }
                     }
                     if has_thought_signature {
                         append_carrier_thinking_block(&mut events, state, &signature_value);
@@ -287,6 +298,10 @@ pub fn convert_gemini_stream_chunk(
                     .map(|s| s.as_str())
                     .unwrap_or(&restored_upstream_name);
 
+                state
+                    .tool_args
+                    .begin_tool(client_tool_name, original_request);
+
                 let tool_use_id = claude_tool_id_for(
                     &restored_upstream_name,
                     TOOL_USE_ID_COUNTER.fetch_add(1, Ordering::SeqCst),
@@ -304,14 +319,20 @@ pub fn convert_gemini_stream_chunk(
                 }));
 
                 if let Some(args) = function_call.get("args") {
-                    events.push(json!({
-                        "type": "content_block_delta",
-                        "index": state.response_index,
-                        "delta": {
-                            "type": "input_json_delta",
-                            "partial_json": args.to_string()
-                        }
-                    }));
+                    if let Some(partial) = state.tool_args.clean_emitted_args(
+                        &args.to_string(),
+                        client_tool_name,
+                        original_request,
+                    ) {
+                        events.push(json!({
+                            "type": "content_block_delta",
+                            "index": state.response_index,
+                            "delta": {
+                                "type": "input_json_delta",
+                                "partial_json": partial
+                            }
+                        }));
+                    }
                 }
 
                 state.response_type = ResponseType::Function;
@@ -565,6 +586,7 @@ pub fn convert_gemini_response(
     response: &Value,
     short_to_original: &HashMap<String, String>,
     signature_model: Option<&str>,
+    original_request: Option<&Value>,
 ) -> Value {
     let mut anthropic = json!({
         "id": "",
@@ -646,7 +668,13 @@ pub fn convert_gemini_response(
                         .unwrap_or(&restored_name);
                     // args 仅接受对象,否则兜底 {}(对齐 CPA gjson.Valid && IsObject)
                     let args = match function_call.get("args") {
-                        Some(a) if a.is_object() => a.clone(),
+                        Some(a) if a.is_object() => {
+                            if let Some(orig) = original_request {
+                                clean_claude_tool_arguments(a, original_name, orig)
+                            } else {
+                                a.clone()
+                            }
+                        }
                         _ => json!({}),
                     };
                     let tool_id = claude_tool_id_for(
@@ -744,7 +772,7 @@ mod tests {
         });
 
         let tool_map = HashMap::new();
-        let anthropic = convert_gemini_response(&gemini, &tool_map, None);
+        let anthropic = convert_gemini_response(&gemini, &tool_map, None, None);
 
         assert_eq!(anthropic["type"], "message");
         assert_eq!(anthropic["role"], "assistant");
@@ -787,7 +815,7 @@ mod tests {
         let mut tool_map = HashMap::new();
         tool_map.insert("Rd".to_string(), "Read".to_string());
 
-        let anthropic = convert_gemini_response(&gemini, &tool_map, None);
+        let anthropic = convert_gemini_response(&gemini, &tool_map, None, None);
 
         let content = anthropic["content"].as_array().unwrap();
         assert_eq!(content.len(), 1);
@@ -840,7 +868,7 @@ mod tests {
                 }],
                 "usageMetadata": usage
             });
-            let anthropic = convert_gemini_response(&gemini, &HashMap::new(), None);
+            let anthropic = convert_gemini_response(&gemini, &HashMap::new(), None, None);
             assert_eq!(anthropic["usage"]["input_tokens"], input_tokens, "{usage}");
             assert_eq!(
                 anthropic["usage"]["output_tokens"], output_tokens,
@@ -862,7 +890,7 @@ mod tests {
                 "finishReason": "STOP"
             }]
         });
-        let anthropic = convert_gemini_response(&gemini, &HashMap::new(), None);
+        let anthropic = convert_gemini_response(&gemini, &HashMap::new(), None, None);
         // 对齐 CPA:无 usageMetadata 时删除 usage
         assert!(anthropic.get("usage").is_none());
         assert!(anthropic.get("stop_sequence").is_some());
@@ -879,7 +907,7 @@ mod tests {
                 "candidatesTokenCount": 2
             }
         });
-        let anthropic = convert_gemini_response(&gemini, &HashMap::new(), None);
+        let anthropic = convert_gemini_response(&gemini, &HashMap::new(), None, None);
         assert_eq!(anthropic["usage"]["input_tokens"], 4);
         assert_eq!(anthropic["usage"]["output_tokens"], 2);
     }
@@ -891,7 +919,7 @@ mod tests {
                 "content": {"parts": [{"text": "hi"}], "role": "model"}
             }]
         });
-        let anthropic = convert_gemini_response(&gemini, &HashMap::new(), None);
+        let anthropic = convert_gemini_response(&gemini, &HashMap::new(), None, None);
         assert_eq!(anthropic["stop_reason"], "end_turn");
     }
     #[test]
@@ -905,7 +933,7 @@ mod tests {
                 "finishReason": "STOP"
             }]
         });
-        let anthropic = convert_gemini_response(&gemini, &HashMap::new(), None);
+        let anthropic = convert_gemini_response(&gemini, &HashMap::new(), None, None);
         assert_eq!(anthropic["content"][0]["input"], json!({}));
     }
 
@@ -926,7 +954,7 @@ mod tests {
                     "finishReason": reason
                 }]
             });
-            let anthropic = convert_gemini_response(&gemini, &HashMap::new(), None);
+            let anthropic = convert_gemini_response(&gemini, &HashMap::new(), None, None);
             assert_eq!(anthropic["stop_reason"], "refusal");
         }
     }
@@ -947,7 +975,7 @@ mod tests {
             "modelVersion": "m",
             "responseId": "resp-test"
         });
-        let out = convert_gemini_response(&gemini, &HashMap::new(), None);
+        let out = convert_gemini_response(&gemini, &HashMap::new(), None, None);
         assert_eq!(out["type"], "error");
         assert_eq!(out["error"]["type"], "api_error");
         assert!(
@@ -979,7 +1007,7 @@ mod tests {
             "modelVersion": "m",
             "responseId": "resp-tool"
         });
-        let out = convert_gemini_response(&gemini, &HashMap::new(), None);
+        let out = convert_gemini_response(&gemini, &HashMap::new(), None, None);
         assert_eq!(out["type"], "message");
         assert_eq!(out["stop_reason"], "tool_use");
         assert_eq!(out["content"][0]["type"], "tool_use");
@@ -1120,7 +1148,7 @@ mod tests {
 
         let mut state = GeminiStreamState::default();
         let tool_map = HashMap::new();
-        let events = convert_gemini_stream_chunk(&chunk, &mut state, &tool_map, None);
+        let events = convert_gemini_stream_chunk(&chunk, &mut state, &tool_map, None, None);
 
         // 新状态机：第一个块会发送 content_block_start + content_block_delta
         assert_eq!(events.len(), 2);
@@ -1243,7 +1271,7 @@ mod tests {
         });
 
         let anthropic =
-            convert_gemini_response(&response, &HashMap::new(), Some("claude-sonnet-4-6"));
+            convert_gemini_response(&response, &HashMap::new(), Some("claude-sonnet-4-6"), None);
         let content = anthropic["content"].as_array().unwrap();
         assert_eq!(content.len(), 2);
         assert_eq!(content[0]["type"], "thinking");
@@ -1269,7 +1297,7 @@ mod tests {
             "modelVersion": "gemini-2.5-pro"
         });
 
-        let anthropic = convert_gemini_response(&response, &HashMap::new(), None);
+        let anthropic = convert_gemini_response(&response, &HashMap::new(), None, None);
         let content = anthropic["content"].as_array().unwrap();
         assert_eq!(content[0]["signature"], sig);
         assert!(content[1].get("signature").is_none());
@@ -1296,6 +1324,7 @@ mod tests {
             &mut state,
             &HashMap::new(),
             Some("claude-sonnet-4-6"),
+            None,
         );
         let delta = events
             .iter()
@@ -1323,13 +1352,13 @@ mod tests {
         });
 
         let mut state = GeminiStreamState::default();
-        let events1 = convert_gemini_stream_chunk(&chunk1, &mut state, &HashMap::new(), None);
+        let events1 = convert_gemini_stream_chunk(&chunk1, &mut state, &HashMap::new(), None, None);
         assert_eq!(state.response_type, ResponseType::Thinking);
         let start = events1.iter().find(|e| e["type"] == "content_block_start");
         assert!(start.is_some());
         assert_eq!(start.unwrap()["content_block"]["type"], "thinking");
 
-        let events2 = convert_gemini_stream_chunk(&chunk2, &mut state, &HashMap::new(), None);
+        let events2 = convert_gemini_stream_chunk(&chunk2, &mut state, &HashMap::new(), None, None);
         // 空 text 不应关闭 thinking 块
         assert!(events2.iter().all(|e| e["type"] != "content_block_stop"));
         assert_eq!(state.response_type, ResponseType::Thinking);
@@ -1346,7 +1375,7 @@ mod tests {
             }]
         });
         let mut state = GeminiStreamState::default();
-        let events = convert_gemini_stream_chunk(&chunk, &mut state, &HashMap::new(), None);
+        let events = convert_gemini_stream_chunk(&chunk, &mut state, &HashMap::new(), None, None);
 
         let carrier_start = events
             .iter()
@@ -1377,7 +1406,7 @@ mod tests {
             }]
         });
         let mut state = GeminiStreamState::default();
-        let events = convert_gemini_stream_chunk(&chunk, &mut state, &HashMap::new(), None);
+        let events = convert_gemini_stream_chunk(&chunk, &mut state, &HashMap::new(), None, None);
         assert!(events.iter().any(
             |e| e["type"] == "content_block_start" && e["content_block"]["type"] == "thinking"
         ));
@@ -1399,7 +1428,7 @@ mod tests {
             }]
         });
         let mut state = GeminiStreamState::default();
-        let events = convert_gemini_stream_chunk(&chunk, &mut state, &HashMap::new(), None);
+        let events = convert_gemini_stream_chunk(&chunk, &mut state, &HashMap::new(), None, None);
         assert!(events
             .iter()
             .any(|e| e["delta"]["type"] == "thinking_delta" && e["delta"]["thinking"] == "reason"));
@@ -1420,7 +1449,7 @@ mod tests {
             }]
         });
         let mut state = GeminiStreamState::default();
-        let events = convert_gemini_stream_chunk(&chunk, &mut state, &HashMap::new(), None);
+        let events = convert_gemini_stream_chunk(&chunk, &mut state, &HashMap::new(), None, None);
 
         let carrier_idx = events
             .iter()
@@ -1457,10 +1486,10 @@ mod tests {
         });
 
         let mut state = GeminiStreamState::default();
-        convert_gemini_stream_chunk(&chunk1, &mut state, &HashMap::new(), None);
+        convert_gemini_stream_chunk(&chunk1, &mut state, &HashMap::new(), None, None);
         assert_eq!(state.response_type, ResponseType::Thinking);
 
-        let events2 = convert_gemini_stream_chunk(&chunk2, &mut state, &HashMap::new(), None);
+        let events2 = convert_gemini_stream_chunk(&chunk2, &mut state, &HashMap::new(), None, None);
         // 非空 text 应关闭 thinking 并开始 text 块
         let stop = events2.iter().find(|e| e["type"] == "content_block_stop");
         assert!(stop.is_some());
@@ -1468,5 +1497,124 @@ mod tests {
         assert!(start.is_some());
         assert_eq!(start.unwrap()["content_block"]["type"], "text");
         assert_eq!(state.response_type, ResponseType::Content);
+    }
+
+    #[test]
+    fn test_stream_parameterless_tool_args_normalized_to_empty() {
+        // 对齐 CPA 202b8b8c:无参工具 reason 占位在响应侧归一为 {}
+        let orig = json!({
+            "tools": [{"name": "EnterPlanMode", "input_schema": {"type": "object", "properties": {}}}]
+        });
+        let chunk = json!({
+            "candidates": [{
+                "content": {
+                    "parts": [{
+                        "functionCall": {
+                            "name": "EnterPlanMode",
+                            "args": {"reason": "Switching to plan mode to inspect files"}
+                        }
+                    }]
+                },
+                "finishReason": "STOP"
+            }]
+        });
+        let mut state = GeminiStreamState::default();
+        let events =
+            convert_gemini_stream_chunk(&chunk, &mut state, &HashMap::new(), None, Some(&orig));
+        let partial: String = events
+            .iter()
+            .filter(|e| e["delta"]["type"] == "input_json_delta")
+            .map(|e| {
+                e["delta"]["partial_json"]
+                    .as_str()
+                    .unwrap_or("")
+                    .to_string()
+            })
+            .collect();
+        assert_eq!(partial, "{}");
+    }
+
+    #[test]
+    fn test_nonstream_strips_injected_underscore() {
+        let orig = json!({
+            "tools": [{
+                "name": "WrappedPlaceholder",
+                "input_schema": {
+                    "type": "object",
+                    "properties": {"flag": {"type": "string"}},
+                    "additionalProperties": false
+                }
+            }]
+        });
+        let response = json!({
+            "candidates": [{
+                "content": {
+                    "parts": [{
+                        "functionCall": {
+                            "name": "WrappedPlaceholder",
+                            "args": {"flag": "x", "_": true}
+                        }
+                    }]
+                },
+                "finishReason": "STOP"
+            }]
+        });
+        let out = convert_gemini_response(&response, &HashMap::new(), None, Some(&orig));
+        assert_eq!(out["content"][0]["input"], json!({"flag": "x"}));
+    }
+
+    #[test]
+    fn test_stream_parameterless_continuation_does_not_duplicate_empty() {
+        let orig = json!({
+            "tools": [{"name": "EnterPlanMode", "input_schema": {"type": "object", "properties": {}}}]
+        });
+        let first = json!({
+            "candidates": [{
+                "content": {
+                    "parts": [{
+                        "functionCall": {
+                            "name": "EnterPlanMode",
+                            "args": {"reason": "Switching to plan mode"}
+                        }
+                    }]
+                }
+            }]
+        });
+        let cont = json!({
+            "candidates": [{
+                "content": {
+                    "parts": [{
+                        "functionCall": {
+                            "args": {"reason": "more"}
+                        }
+                    }]
+                },
+                "finishReason": "STOP"
+            }]
+        });
+        let mut state = GeminiStreamState::default();
+        let e1 =
+            convert_gemini_stream_chunk(&first, &mut state, &HashMap::new(), None, Some(&orig));
+        let e2 = convert_gemini_stream_chunk(&cont, &mut state, &HashMap::new(), None, Some(&orig));
+        let starts = e1
+            .iter()
+            .chain(e2.iter())
+            .filter(|e| {
+                e["type"] == "content_block_start" && e["content_block"]["type"] == "tool_use"
+            })
+            .count();
+        assert_eq!(starts, 1);
+        let partial: String = e1
+            .iter()
+            .chain(e2.iter())
+            .filter(|e| e["delta"]["type"] == "input_json_delta")
+            .map(|e| {
+                e["delta"]["partial_json"]
+                    .as_str()
+                    .unwrap_or("")
+                    .to_string()
+            })
+            .collect();
+        assert_eq!(partial, "{}");
     }
 }

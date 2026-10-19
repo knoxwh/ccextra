@@ -63,6 +63,7 @@ fn process_gemini_events(
     input_tokens: i64,
     tool_map: &HashMap<String, String>,
     signature_model: Option<&str>,
+    original_request: Option<&serde_json::Value>,
 ) -> Vec<Bytes> {
     let mut output = Vec::new();
     for event in events {
@@ -144,9 +145,13 @@ fn process_gemini_events(
             relay.message_started = true;
         }
 
-        for event in
-            convert_gemini_stream_chunk(&chunk, &mut relay.stream, tool_map, signature_model)
-        {
+        for event in convert_gemini_stream_chunk(
+            &chunk,
+            &mut relay.stream,
+            tool_map,
+            signature_model,
+            original_request,
+        ) {
             let event_type = event["type"].as_str().unwrap_or("");
             output.push(emit::sse(event_type, &event));
         }
@@ -171,11 +176,19 @@ pub fn relay_gemini_to_anthropic<S>(
     stream: S,
     estimated_input_tokens: Option<usize>,
     tool_names: Option<Arc<HashMap<String, String>>>,
+    original_claude_request: Option<Arc<serde_json::Value>>,
 ) -> SseStreamPin
 where
     S: Stream<Item = Result<Bytes, std::io::Error>> + Send + 'static,
 {
-    relay_gemini_like_to_anthropic(stream, estimated_input_tokens, tool_names, true, None)
+    relay_gemini_like_to_anthropic(
+        stream,
+        estimated_input_tokens,
+        tool_names,
+        true,
+        None,
+        original_claude_request,
+    )
 }
 
 /// Antigravity SSE 流转 Anthropic SSE。
@@ -188,6 +201,7 @@ pub fn relay_antigravity_to_anthropic<S>(
     estimated_input_tokens: Option<usize>,
     tool_names: Option<Arc<HashMap<String, String>>>,
     signature_model: Arc<str>,
+    original_claude_request: Option<Arc<serde_json::Value>>,
 ) -> SseStreamPin
 where
     S: Stream<Item = Result<Bytes, std::io::Error>> + Send + 'static,
@@ -198,6 +212,7 @@ where
         tool_names,
         true,
         Some(signature_model),
+        original_claude_request,
     )
 }
 
@@ -207,11 +222,13 @@ fn relay_gemini_like_to_anthropic<S>(
     tool_names: Option<Arc<HashMap<String, String>>>,
     synthesize_missing_finish: bool,
     signature_model: Option<Arc<str>>,
+    original_claude_request: Option<Arc<serde_json::Value>>,
 ) -> SseStreamPin
 where
     S: Stream<Item = Result<Bytes, std::io::Error>> + Send + 'static,
 {
     let tool_map = tool_names.unwrap_or_default();
+    let original_request = original_claude_request;
 
     Box::pin(async_stream::stream! {
         let mut parser = SseParser::new();
@@ -260,6 +277,7 @@ where
                 input_tokens as i64,
                 &tool_map,
                 signature_model.as_deref(),
+                original_request.as_deref(),
             ) {
                 yield Ok(output);
             }
@@ -278,6 +296,7 @@ where
                 input_tokens as i64,
                 &tool_map,
                 signature_model.as_deref(),
+                original_request.as_deref(),
             ) {
                 yield Ok(output);
             }
@@ -302,7 +321,7 @@ mod tests {
     where
         S: Stream<Item = Result<Bytes, std::io::Error>> + Send + 'static,
     {
-        relay_gemini_to_anthropic(stream, None, None)
+        relay_gemini_to_anthropic(stream, None, None, None)
             .collect::<Vec<_>>()
             .await
             .into_iter()
@@ -314,7 +333,7 @@ mod tests {
     where
         S: Stream<Item = Result<Bytes, std::io::Error>> + Send + 'static,
     {
-        relay_antigravity_to_anthropic(stream, None, None, Arc::from("gemini-2.5-pro"))
+        relay_antigravity_to_anthropic(stream, None, None, Arc::from("gemini-2.5-pro"), None)
             .collect::<Vec<_>>()
             .await
             .into_iter()

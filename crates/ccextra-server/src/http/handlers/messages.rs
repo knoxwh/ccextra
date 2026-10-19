@@ -170,6 +170,8 @@ struct RelayParams {
     protocol: Protocol,
     estimated_input_tokens: Option<usize>,
     tool_names: Option<Arc<HashMap<String, String>>>,
+    /// 转换前 Claude 请求快照(Gemini/AG 响应用来回剥占位 tool args)
+    original_claude_request: Option<Arc<Value>>,
     replay_scope: Option<(crate::sse::replay_cache::ReplayCache, String, String)>,
     ag_replay_scope: Option<(
         crate::sse::antigravity_replay_cache::AgReplayCache,
@@ -213,6 +215,7 @@ where
             params.estimated_input_tokens,
             params.tool_names,
             params.signature_model,
+            params.original_claude_request,
         );
     }
     if let Some((cache, key, request)) = params.ag_replay_scope {
@@ -228,6 +231,7 @@ where
             params.estimated_input_tokens,
             params.tool_names,
             params.signature_model,
+            params.original_claude_request,
         );
     }
     if let Some((cache, key, applied)) = params.kimi_replay_scope {
@@ -243,6 +247,7 @@ where
             params.estimated_input_tokens,
             params.tool_names,
             params.signature_model,
+            params.original_claude_request,
         );
     }
     crate::sse::relay(
@@ -251,6 +256,7 @@ where
         params.estimated_input_tokens,
         params.tool_names,
         params.signature_model,
+        params.original_claude_request,
     )
 }
 
@@ -324,6 +330,8 @@ pub(crate) struct PreparedMessageRequest {
     pub inbound_query: Option<String>,
     pub estimated_input_tokens: Option<usize>,
     pub tool_names: Option<Arc<HashMap<String, String>>>,
+    /// 转换前 Claude 请求快照(仅 Gemini/AG;响应用来回剥占位 tool args)
+    pub original_claude_request: Option<Arc<Value>>,
     pub replay_scope: Option<(crate::sse::replay_cache::ReplayCache, String, String)>,
     /// Antigravity thoughtSignature 账本 scope：(cache, "{model}:{session}")
     pub ag_replay_scope: Option<(crate::sse::antigravity_replay_cache::AgReplayCache, String)>,
@@ -417,6 +425,7 @@ pub(crate) async fn prepare_message_request(
     };
 
     let mut tool_names: Option<Arc<HashMap<String, String>>> = None;
+    let mut original_claude_request: Option<Arc<Value>> = None;
     let mut request_fingerprint = String::new();
     let mut kimi_replay_applied = false;
 
@@ -535,6 +544,7 @@ pub(crate) async fn prepare_message_request(
             }
         }
         Protocol::Gemini => {
+            original_claude_request = Some(Arc::new(body_json.clone()));
             let (gemini_body, short_to_original) = convert_to_gemini_with_registry(
                 &body_json,
                 &route.upstream_model,
@@ -547,6 +557,7 @@ pub(crate) async fn prepare_message_request(
             }
         }
         Protocol::Antigravity => {
+            original_claude_request = Some(Arc::new(body_json.clone()));
             let project_id = {
                 let provider = find_provider(providers, &route.provider);
                 provider
@@ -1032,6 +1043,7 @@ pub(crate) async fn prepare_message_request(
             .map(str::to_string),
         estimated_input_tokens,
         tool_names,
+        original_claude_request,
         replay_scope,
         ag_replay_scope,
         kimi_replay_scope,
@@ -1130,6 +1142,7 @@ pub(crate) async fn execute_upstream_request(
                     protocol: prepared.route.protocol,
                     estimated_input_tokens: prepared.estimated_input_tokens,
                     tool_names: prepared.tool_names.clone(),
+                    original_claude_request: prepared.original_claude_request.clone(),
                     replay_scope: prepared.replay_scope.clone(),
                     ag_replay_scope: None,
                     kimi_replay_scope: None,
@@ -1404,6 +1417,7 @@ pub(crate) async fn deliver_response(
                         protocol: prepared.route.protocol,
                         estimated_input_tokens: prepared.estimated_input_tokens,
                         tool_names: prepared.tool_names.clone(),
+                        original_claude_request: prepared.original_claude_request.clone(),
                         replay_scope: prepared.replay_scope.clone(),
                         ag_replay_scope: ag_scope,
                         kimi_replay_scope: prepared.kimi_replay_scope.clone(),
@@ -1536,6 +1550,7 @@ pub(crate) async fn deliver_response(
                             &v,
                             prepared.tool_names.as_deref().unwrap_or(&HashMap::new()),
                             None,
+                            prepared.original_claude_request.as_deref(),
                         ))
                     }
                     Protocol::Antigravity => {
@@ -1555,6 +1570,7 @@ pub(crate) async fn deliver_response(
                             &inner,
                             prepared.tool_names.as_deref().unwrap_or(&HashMap::new()),
                             Some(prepared.route.upstream_model.as_str()),
+                            prepared.original_claude_request.as_deref(),
                         ))
                     }
                 }
