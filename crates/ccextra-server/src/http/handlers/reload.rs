@@ -94,6 +94,10 @@ pub async fn handle_reload(State(state): State<AppState>) -> Result<Json<ReloadR
         });
     }
 
+    // 6. 清空 unfit 注册表(旧 provider/model 标记不得残留)
+    crate::http::unfit::global_registry().clear();
+    result.reloaded.push("unfit_registry".into());
+
     tracing::info!(
         "配置热重载完成: {} 成功, {} 失败",
         result.reloaded.len(),

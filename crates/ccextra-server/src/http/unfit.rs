@@ -31,11 +31,14 @@ impl UnfitRegistry {
         Self::default()
     }
 
-    /// 标记 (provider, model) 不兼容某特性
+    /// 标记 (provider, model) 不兼容某特性;已存在同 kind 时不重复插入
     pub fn mark(&self, provider: &str, model: &str, kind: UnfitKind) {
         let key = (provider.to_string(), model.to_string());
         let mut flags = self.flags.write().unwrap();
-        flags.entry(key).or_default().push(kind);
+        let kinds = flags.entry(key).or_default();
+        if !kinds.contains(&kind) {
+            kinds.push(kind);
+        }
     }
 
     /// 检查是否已标记为不兼容
@@ -46,6 +49,11 @@ impl UnfitRegistry {
             .unwrap()
             .get(&key)
             .is_some_and(|kinds| kinds.contains(&kind))
+    }
+
+    /// /reload 时清空,避免旧配置标记残留
+    pub fn clear(&self) {
+        self.flags.write().unwrap().clear();
     }
 }
 
@@ -214,4 +222,27 @@ fn remove_reasoning_config(body: &mut serde_json::Value) -> bool {
         }
     }
     removed
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn mark_does_not_duplicate_kinds() {
+        let reg = UnfitRegistry::new();
+        reg.mark("p", "m", UnfitKind::RefusesFormat);
+        reg.mark("p", "m", UnfitKind::RefusesFormat);
+        reg.mark("p", "m", UnfitKind::OffRefused);
+        let flags = reg.flags.read().unwrap();
+        assert_eq!(flags[&("p".into(), "m".into())].len(), 2);
+    }
+
+    #[test]
+    fn clear_empties_registry() {
+        let reg = UnfitRegistry::new();
+        reg.mark("p", "m", UnfitKind::ToolChoiceRefused);
+        reg.clear();
+        assert!(!reg.is_unfit("p", "m", UnfitKind::ToolChoiceRefused));
+    }
 }
