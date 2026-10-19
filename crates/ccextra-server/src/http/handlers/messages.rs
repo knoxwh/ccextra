@@ -1637,6 +1637,30 @@ impl PreparedMessageRequest {
         Ok(())
     }
 
+    /// Codex 401 刷新后写入 chatgpt-account-id。
+    /// 初始无该头时 body 未压;补头后 compress 变 true,须 reencode,
+    /// 否则重试仍发明文却声明 Content-Encoding: zstd。已有头则只更新值。
+    async fn apply_codex_account_id_after_refresh(
+        &mut self,
+        account_id: &str,
+    ) -> Result<(), AppError> {
+        if account_id.is_empty() {
+            return Ok(());
+        }
+        let compress_became_true = !self.extra_headers.contains_key("chatgpt-account-id");
+        let Ok(value) = axum::http::HeaderValue::from_str(account_id) else {
+            return Ok(());
+        };
+        self.extra_headers.insert(
+            axum::http::HeaderName::from_static("chatgpt-account-id"),
+            value,
+        );
+        if compress_became_true {
+            self.reencode_body().await?;
+        }
+        Ok(())
+    }
+
     async fn send_retry(
         &self,
         client: &crate::upstream::UpstreamClient,
@@ -1724,21 +1748,8 @@ impl PreparedMessageRequest {
                             ))
                         })?;
                 self.upstream_key = fresh.access_token;
-                if !fresh.account_id.is_empty() {
-                    // 初始无 account_id 时 body 未压;补头后 compress 变 true,
-                    // 须 reencode,否则仍发明文却带 Content-Encoding: zstd
-                    let compress_became_true =
-                        !self.extra_headers.contains_key("chatgpt-account-id");
-                    if let Ok(value) = axum::http::HeaderValue::from_str(&fresh.account_id) {
-                        self.extra_headers.insert(
-                            axum::http::HeaderName::from_static("chatgpt-account-id"),
-                            value,
-                        );
-                        if compress_became_true {
-                            self.reencode_body().await?;
-                        }
-                    }
-                }
+                self.apply_codex_account_id_after_refresh(&fresh.account_id)
+                    .await?;
                 Ok(true)
             }
             OAuthRefreshTarget::Xai { auth_dir, id } => {
@@ -1885,24 +1896,64 @@ mod tests {
         }
     }
 
-    /// 模拟 Codex 401 刷新补出 account_id:压缩决策 false→true 后 reencode 须产出 zstd 体。
+    /// Codex 401 helper:无 chatgpt-account-id → 插入后须 reencode 为 zstd。
+    /// 删掉 helper 内 reencode 调用会使本测变红。
     #[tokio::test]
-    async fn reencode_after_chatgpt_account_id_enables_zstd() {
+    async fn apply_codex_account_id_enables_zstd_when_header_was_absent() {
         let mut prepared = stub_prepared_without_account_id();
         prepared.reencode_body().await.unwrap();
         let plain = prepared.encoded_body.clone();
         assert!(!plain.is_empty());
-        // 明文 JSON,不是 zstd
         assert!(serde_json::from_slice::<Value>(&plain).is_ok());
 
-        prepared.extra_headers.insert(
-            axum::http::HeaderName::from_static("chatgpt-account-id"),
-            "acct-1".parse().unwrap(),
-        );
-        prepared.reencode_body().await.unwrap();
+        prepared
+            .apply_codex_account_id_after_refresh("acct-1")
+            .await
+            .unwrap();
+        assert!(prepared.extra_headers.contains_key("chatgpt-account-id"));
         let compressed = prepared.encoded_body.clone();
         assert_ne!(plain, compressed);
         let decoded = zstd::stream::decode_all(&compressed[..]).expect("should be zstd");
         assert_eq!(decoded.as_slice(), plain.as_ref());
+    }
+
+    /// 已有 chatgpt-account-id 时只更新头,不触发 reencode(compress 未翻转)。
+    #[tokio::test]
+    async fn apply_codex_account_id_skips_reencode_when_header_present() {
+        let mut prepared = stub_prepared_without_account_id();
+        prepared.extra_headers.insert(
+            axum::http::HeaderName::from_static("chatgpt-account-id"),
+            "acct-old".parse().unwrap(),
+        );
+        prepared.reencode_body().await.unwrap();
+        let before = prepared.encoded_body.clone();
+        assert!(zstd::stream::decode_all(&before[..]).is_ok());
+
+        prepared
+            .apply_codex_account_id_after_refresh("acct-new")
+            .await
+            .unwrap();
+        assert_eq!(
+            prepared
+                .extra_headers
+                .get("chatgpt-account-id")
+                .and_then(|v| v.to_str().ok()),
+            Some("acct-new")
+        );
+        assert_eq!(prepared.encoded_body, before);
+    }
+
+    /// 空 account_id 为 no-op(不插头、不 reencode)。
+    #[tokio::test]
+    async fn apply_codex_account_id_empty_is_noop() {
+        let mut prepared = stub_prepared_without_account_id();
+        prepared.reencode_body().await.unwrap();
+        let before = prepared.encoded_body.clone();
+        prepared
+            .apply_codex_account_id_after_refresh("")
+            .await
+            .unwrap();
+        assert!(!prepared.extra_headers.contains_key("chatgpt-account-id"));
+        assert_eq!(prepared.encoded_body, before);
     }
 }
