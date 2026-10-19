@@ -318,6 +318,8 @@ pub(crate) enum OAuthRefreshTarget {
 pub(crate) struct PreparedMessageRequest {
     pub route: ccextra_core::route::RouteDecision,
     pub body_json: Value,
+    /// 已序列化(+可选 zstd)的出站 body;URL/401/unfit 重试复用,body_json 变更后须 reencode
+    pub encoded_body: bytes::Bytes,
     pub is_stream: bool,
     pub upstream_base_urls: Vec<String>,
     /// 本轮实际生效的 base_url(多 URL 轮转后记录;内部重试用它,不倒退回 [0])
@@ -1031,9 +1033,15 @@ pub(crate) async fn prepare_message_request(
     let signature_model: Option<Arc<str>> = matches!(route.protocol, Protocol::Antigravity)
         .then(|| Arc::from(route.upstream_model.as_str()));
 
+    let compress = extra_headers.contains_key("chatgpt-account-id");
+    let encoded_body = crate::upstream::encode_request_body(route.protocol, &body_json, compress)
+        .await
+        .map_err(AppError::new)?;
+
     Ok(PreparedMessageRequest {
         route,
         body_json,
+        encoded_body,
         is_stream,
         upstream_base_urls,
         active_base_url: None,
@@ -1080,11 +1088,12 @@ pub(crate) async fn execute_upstream_request(
         for (idx, base_url) in prepared.upstream_base_urls.iter().enumerate() {
             let has_next = idx + 1 < prepared.upstream_base_urls.len();
             match upstream_client
-                .request(
+                .request_encoded(
                     base_url,
                     &prepared.upstream_key,
                     prepared.route.protocol,
                     prepared.upstream_proxy.as_deref(),
+                    prepared.encoded_body.clone(),
                     &prepared.body_json,
                     prepared.is_stream,
                     prepared.session_id.as_deref(),
@@ -1291,6 +1300,7 @@ pub(crate) async fn deliver_response(
                         kind = ?kind,
                         "unfit detected, retrying with adapted request"
                     );
+                    prepared.reencode_body().await?;
                     if let Some((cache, key, _)) = prepared.replay_scope.as_ref() {
                         cache.invalidate(key);
                     }
@@ -1623,19 +1633,29 @@ pub(crate) async fn deliver_response(
 }
 
 impl PreparedMessageRequest {
+    async fn reencode_body(&mut self) -> Result<(), AppError> {
+        let compress = self.extra_headers.contains_key("chatgpt-account-id");
+        self.encoded_body =
+            crate::upstream::encode_request_body(self.route.protocol, &self.body_json, compress)
+                .await
+                .map_err(AppError::new)?;
+        Ok(())
+    }
+
     async fn send_retry(
         &self,
         client: &crate::upstream::UpstreamClient,
         user_agents: &crate::http::UserAgentSet,
     ) -> anyhow::Result<UpstreamResponse> {
         client
-            .request(
+            .request_encoded(
                 self.active_base_url
                     .as_deref()
                     .unwrap_or(&self.upstream_base_urls[0]),
                 &self.upstream_key,
                 self.route.protocol,
                 self.upstream_proxy.as_deref(),
+                self.encoded_body.clone(),
                 &self.body_json,
                 self.is_stream,
                 self.session_id.as_deref(),
@@ -1680,6 +1700,9 @@ impl PreparedMessageRequest {
                 if pid.is_empty() {
                     return Err(AppError::bad_request("antigravity auth missing project_id"));
                 }
+                // 与首跳 ensure_credential_fresh 一致:把新 project_id 写回出站 body
+                self.body_json["project"] = serde_json::Value::String(pid.to_string());
+                self.reencode_body().await?;
                 Ok(true)
             }
             OAuthRefreshTarget::Claude { auth_dir, id } => {

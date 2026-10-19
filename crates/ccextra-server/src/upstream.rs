@@ -126,17 +126,39 @@ fn serialize_request_body(
 /// debug 记录压缩前后字节与耗时)。ccextra 的 codex extra_headers 由
 /// messages.rs 新建仅含 chatgpt-account-id,不存在 Content-Encoding
 /// 冲突路径,故省略 codex 的冲突报错守卫。
-fn compress_request_body(body: bytes::Bytes) -> anyhow::Result<bytes::Bytes> {
-    let started = std::time::Instant::now();
-    let compressed = zstd::stream::encode_all(&body[..], 3)
-        .map_err(|e| anyhow::anyhow!("zstd 压缩请求体失败: {e}"))?;
-    tracing::debug!(
-        pre_bytes = body.len(),
-        post_bytes = compressed.len(),
-        elapsed_ms = started.elapsed().as_millis() as u64,
-        "codex 请求体 zstd 压缩"
+/// 同步 CPU 压缩放 spawn_blocking,避免占满 Tokio worker。
+async fn compress_request_body(body: bytes::Bytes) -> anyhow::Result<bytes::Bytes> {
+    tokio::task::spawn_blocking(move || {
+        let started = std::time::Instant::now();
+        let compressed = zstd::stream::encode_all(&body[..], 3)
+            .map_err(|e| anyhow::anyhow!("zstd 压缩请求体失败: {e}"))?;
+        tracing::debug!(
+            pre_bytes = body.len(),
+            post_bytes = compressed.len(),
+            elapsed_ms = started.elapsed().as_millis() as u64,
+            "codex 请求体 zstd 压缩"
+        );
+        Ok(bytes::Bytes::from(compressed))
+    })
+    .await
+    .map_err(|e| anyhow::anyhow!("zstd 压缩任务失败: {e}"))?
+}
+
+/// 序列化(+可选 zstd)一次,供 URL 轮转 / 401 / unfit 重试复用同一份字节。
+pub(crate) async fn encode_request_body(
+    protocol: Protocol,
+    body: &serde_json::Value,
+    compress: bool,
+) -> anyhow::Result<bytes::Bytes> {
+    let body_bytes = bytes::Bytes::from(
+        serialize_request_body(protocol, body)
+            .map_err(|e| anyhow::anyhow!("序列化请求体失败: {e}"))?,
     );
-    Ok(bytes::Bytes::from(compressed))
+    if compress {
+        compress_request_body(body_bytes).await
+    } else {
+        Ok(body_bytes)
+    }
 }
 
 /// 按协议取上游请求路径
@@ -686,20 +708,47 @@ impl UpstreamClient {
         pool_refresh_token: Option<&str>,
         query: Option<&str>,
     ) -> anyhow::Result<UpstreamResponse> {
-        // 对齐 codex EncodedJsonBody:一次序列化,Bytes 共享分配;
-        // stale-connection 重试复用同一份字节,不重复序列化
-        let body_bytes = bytes::Bytes::from(
-            serialize_request_body(protocol, body)
-                .map_err(|e| anyhow::anyhow!("序列化请求体失败: {e}"))?,
-        );
-        // 对齐 codex responses_request_compression:仅 codex OAuth 订阅请求
-        // (uses_codex_backend + openai provider 的等价标记 chatgpt-account-id)
-        // 压缩;压缩一次,stale 重试共享压缩字节(into_prepared 语义)
-        let body_bytes = if extra_headers.contains_key("chatgpt-account-id") {
-            compress_request_body(body_bytes)?
-        } else {
-            body_bytes
-        };
+        // 测试与外部入口:自行编码一次后再走 request_encoded
+        let compress = extra_headers.contains_key("chatgpt-account-id");
+        let body_bytes = encode_request_body(protocol, body, compress).await?;
+        self.request_encoded(
+            base_url,
+            api_key,
+            protocol,
+            provider_proxy,
+            body_bytes,
+            body,
+            is_stream,
+            session_id,
+            thread_id,
+            extra_headers,
+            user_agents,
+            inbound_user_agent,
+            pool_refresh_token,
+            query,
+        )
+        .await
+    }
+
+    /// 使用已编码(及可选已压缩)的 body 字节发上游;URL 轮转与业务重试应复用同一份。
+    #[allow(clippy::too_many_arguments)]
+    pub(crate) async fn request_encoded(
+        &self,
+        base_url: &str,
+        api_key: &str,
+        protocol: Protocol,
+        provider_proxy: Option<&str>,
+        body_bytes: bytes::Bytes,
+        body: &serde_json::Value,
+        is_stream: bool,
+        session_id: Option<&str>,
+        thread_id: Option<&str>,
+        extra_headers: &axum::http::HeaderMap,
+        user_agents: &crate::http::UserAgentSet,
+        inbound_user_agent: Option<&str>,
+        pool_refresh_token: Option<&str>,
+        query: Option<&str>,
+    ) -> anyhow::Result<UpstreamResponse> {
         let upstream_model = body.get("model").and_then(|v| v.as_str()).unwrap_or("");
         // 路由提示从压缩前的最终 body 构造(对齐 codex build_routing_hint_header)
         let routing_hint = if extra_headers.contains_key("chatgpt-account-id")
