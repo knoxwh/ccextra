@@ -1240,6 +1240,9 @@ fn remove_unsupported_keywords(schema: &mut Value, opts: CleanOptions) {
         "unevaluatedProperties",
         "unevaluatedItems",
         "contentSchema",
+        // 对齐 CPA a43026d7 / Issue #6699: JSON Schema Content Vocabulary 注解
+        "contentMediaType",
+        "contentEncoding",
     ]);
     if opts.antigravity_semantics {
         keywords.push("not");
@@ -3142,6 +3145,126 @@ mod tests {
                     .get("kind")
                     .is_some(),
                 "[{name}] nested property discriminator dropped: {out}"
+            );
+        }
+    }
+
+    #[test]
+    fn test_removes_content_media_type_keyword_issue_6699() {
+        // 对齐 CPA a43026d7 / Issue #6699: contentMediaType/contentEncoding 注解剥离,
+        // properties 同名合法属性保留。
+        let schema = json!({
+            "type": "object",
+            "contentMediaType": "application/json",
+            "contentEncoding": "utf-8",
+            "properties": {
+                "value": {
+                    "anyOf": [
+                        { "type": "object", "properties": {} },
+                        {
+                            "type": "string",
+                            "contentMediaType": "application/json",
+                            "contentEncoding": "base64"
+                        }
+                    ]
+                },
+                "directPayload": {
+                    "type": "string",
+                    "contentMediaType": "application/json",
+                    "contentEncoding": "base64"
+                },
+                "contentMediaType": {
+                    "type": "string",
+                    "contentMediaType": "text/plain",
+                    "description": "Legitimate property named contentMediaType"
+                },
+                "contentEncoding": {
+                    "type": "string",
+                    "contentEncoding": "base64",
+                    "description": "Legitimate property named contentEncoding"
+                }
+            }
+        });
+
+        for name in [
+            "Gemini",
+            "Antigravity",
+            "AntigravityTool",
+            "AntigravityClaudeTool",
+        ] {
+            let out = match name {
+                "Gemini" => clean_json_schema_for_gemini(&schema),
+                "Antigravity" => clean_json_schema_for_antigravity(&schema),
+                "AntigravityTool" => clean_json_schema_for_antigravity_tool(&schema, false),
+                "AntigravityClaudeTool" => clean_json_schema_for_antigravity_claude_tool(&schema),
+                _ => unreachable!(),
+            };
+            assert!(
+                out.get("contentMediaType").is_none(),
+                "[{name}] root contentMediaType kept: {out}"
+            );
+            assert!(
+                out.get("contentEncoding").is_none(),
+                "[{name}] root contentEncoding kept: {out}"
+            );
+            assert!(
+                out["properties"]["value"]["anyOf"][1]
+                    .get("contentMediaType")
+                    .is_none(),
+                "[{name}] anyOf[1].contentMediaType kept: {out}"
+            );
+            assert!(
+                out["properties"]["value"]["anyOf"][1]
+                    .get("contentEncoding")
+                    .is_none(),
+                "[{name}] anyOf[1].contentEncoding kept: {out}"
+            );
+            assert!(
+                out["properties"]["directPayload"]
+                    .get("contentMediaType")
+                    .is_none(),
+                "[{name}] directPayload.contentMediaType kept: {out}"
+            );
+            assert!(
+                out["properties"]["directPayload"]
+                    .get("contentEncoding")
+                    .is_none(),
+                "[{name}] directPayload.contentEncoding kept: {out}"
+            );
+            assert!(
+                out["properties"]["contentMediaType"]
+                    .get("contentMediaType")
+                    .is_none(),
+                "[{name}] nested keyword contentMediaType kept: {out}"
+            );
+            assert!(
+                out["properties"]["contentEncoding"]
+                    .get("contentEncoding")
+                    .is_none(),
+                "[{name}] nested keyword contentEncoding kept: {out}"
+            );
+
+            if name != "AntigravityClaudeTool" {
+                assert_eq!(
+                    out["properties"]["value"]["anyOf"]
+                        .as_array()
+                        .map(|a| a.len()),
+                    Some(2),
+                    "[{name}] value.anyOf branches: {out}"
+                );
+                assert_eq!(
+                    out["properties"]["value"]["anyOf"][1]["type"], "string",
+                    "[{name}] value.anyOf[1].type: {out}"
+                );
+            }
+
+            assert!(
+                out["properties"].get("contentMediaType").is_some(),
+                "[{name}] property contentMediaType dropped: {out}"
+            );
+            assert!(
+                out["properties"].get("contentEncoding").is_some(),
+                "[{name}] property contentEncoding dropped: {out}"
             );
         }
     }
