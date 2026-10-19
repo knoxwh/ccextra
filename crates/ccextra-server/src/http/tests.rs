@@ -776,19 +776,31 @@ async fn test_openai_responses_retries_valid_encrypted_content_after_upstream_re
 async fn test_openai_responses_retries_on_422_invalid_encrypted_content() {
     const VALID: &str = "gAAAAAAAAAAAAQIDBAUGBwgJCgsMDQ4PEBESExQVFhcYGRobHB0eHyAhIiMkJSYnKCkqKywtLi8wMTIzNDU2Nzg5Ojs8PT4_QA";
     let attempts = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+    let saw_encrypted = Arc::new(std::sync::atomic::AtomicBool::new(false));
+    let saw_trimmed = Arc::new(std::sync::atomic::AtomicBool::new(false));
     let handler_attempts = Arc::clone(&attempts);
+    let handler_encrypted = Arc::clone(&saw_encrypted);
+    let handler_trimmed = Arc::clone(&saw_trimmed);
     let upstream = Router::new().route(
             "/responses",
-            post(move || {
+            post(move |body: axum::body::Bytes| {
                 let attempts = Arc::clone(&handler_attempts);
+                let saw_encrypted = Arc::clone(&handler_encrypted);
+                let saw_trimmed = Arc::clone(&handler_trimmed);
                 async move {
+                    let parsed: Value = serde_json::from_slice(&body).unwrap();
+                    let has_encrypted = parsed["input"].as_array().unwrap().iter().any(|item| {
+                        item["type"] == "reasoning" && item.get("encrypted_content").is_some()
+                    });
                     if attempts.fetch_add(1, Ordering::SeqCst) == 0 {
+                        saw_encrypted.store(has_encrypted, Ordering::SeqCst);
                         (
                             StatusCode::UNPROCESSABLE_ENTITY,
                             [(header::CONTENT_TYPE, "application/json")],
                             r#"{"error":{"code":"invalid_encrypted_content","message":"could not decrypt"}}"#,
                         )
                     } else {
+                        saw_trimmed.store(!has_encrypted, Ordering::SeqCst);
                         (
                             StatusCode::OK,
                             [(header::CONTENT_TYPE, "application/json")],
@@ -832,6 +844,14 @@ async fn test_openai_responses_retries_on_422_invalid_encrypted_content() {
 
     assert_eq!(response.status(), StatusCode::OK);
     assert_eq!(attempts.load(Ordering::SeqCst), 2);
+    assert!(
+        saw_encrypted.load(Ordering::SeqCst),
+        "首次请求应带 encrypted_content"
+    );
+    assert!(
+        saw_trimmed.load(Ordering::SeqCst),
+        "422 重试请求不应再带 encrypted_content"
+    );
 }
 
 #[tokio::test]

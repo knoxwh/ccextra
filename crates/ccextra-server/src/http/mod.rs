@@ -188,6 +188,7 @@ impl PayloadRule {
     }
 
     /// 测试/内联构造后立即编译
+    #[cfg(test)]
     pub fn compiled(mut self) -> Self {
         self.compile().unwrap_or_else(|e| panic!("{e}"));
         self

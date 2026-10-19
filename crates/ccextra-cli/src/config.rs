@@ -433,4 +433,49 @@ normalize:
         let result = Config::load(file.path().to_str().unwrap());
         assert!(result.is_err());
     }
+
+    #[test]
+    fn test_load_rejects_invalid_payload_glob() {
+        // aa4a4e7: 非法 glob 在 Config::load 失败，不静默忽略
+        let yaml = r#"
+server:
+  host: "127.0.0.1"
+  port: 8222
+
+providers:
+  - name: test
+    protocol: claude
+    base_url: https://example.com
+    key: sk-test
+    models:
+      - name: model-1
+        alias: m1
+
+payload:
+  - models:
+      - "["
+    params:
+      max_tokens: 1
+
+normalize:
+  enabled: true
+  drift_detector: false
+
+logging:
+  level: info
+  request_body: false
+"#;
+        let mut file = NamedTempFile::new().unwrap();
+        file.write_all(yaml.as_bytes()).unwrap();
+        let err = Config::load(file.path().to_str().unwrap()).unwrap_err();
+        let msg = format!("{err:#}");
+        assert!(
+            msg.contains("payload 规则编译失败"),
+            "unexpected error: {msg}"
+        );
+        assert!(
+            msg.contains("无效 payload 模型模式"),
+            "unexpected error: {msg}"
+        );
+    }
 }
