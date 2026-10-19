@@ -8,6 +8,7 @@
 //
 // 状态记忆:(provider, model, feature) 三元组标记,避免重复试探
 
+use ccextra_core::route::Protocol;
 use std::collections::HashMap;
 use std::sync::{Arc, RwLock};
 
@@ -119,19 +120,21 @@ pub fn detect_unfit_from_error(status: u16, body: &str) -> Option<UnfitKind> {
     None
 }
 
-/// 根据 unfit 标记降级请求体(对齐 magpie adaptForUnfit)
+/// 根据 unfit 标记降级请求体(对齐 magpie adaptForUnfit)。
+/// `protocol` 决定改已转换 body 的字段形状(Chat/Responses 与 Claude 不同)。
 pub fn adapt_request_for_unfit(
     body: &mut serde_json::Value,
     provider: &str,
     model: &str,
     registry: &UnfitRegistry,
+    protocol: Protocol,
 ) -> bool {
     let mut adapted = false;
 
-    // RefusesFormat: schema 注入 system prompt, 移除 response_format
+    // RefusesFormat: schema 注入 system/instructions, 移除 response_format
     if registry.is_unfit(provider, model, UnfitKind::RefusesFormat) {
         if let Some(schema) = extract_and_remove_response_format(body) {
-            inject_schema_to_system(body, &schema);
+            inject_schema_instruction(body, &schema, protocol);
             adapted = true;
             tracing::info!(
                 provider,
@@ -141,17 +144,17 @@ pub fn adapt_request_for_unfit(
         }
     }
 
-    // OffRefused: reasoning effort "off" → "low"
+    // OffRefused: reasoning effort "off"/"none" → "low"
     if registry.is_unfit(provider, model, UnfitKind::OffRefused)
-        && force_reasoning_effort(body, "low")
+        && force_reasoning_effort(body, "low", protocol)
     {
         adapted = true;
         tracing::info!(provider, model, "unfit: reasoning effort off → low");
     }
 
-    // ToolChoiceRefused: tool_choice → "auto"
+    // ToolChoiceRefused: tool_choice → auto
     if registry.is_unfit(provider, model, UnfitKind::ToolChoiceRefused)
-        && downgrade_tool_choice(body)
+        && downgrade_tool_choice(body, protocol)
     {
         adapted = true;
         tracing::info!(provider, model, "unfit: tool_choice → auto");
@@ -159,7 +162,7 @@ pub fn adapt_request_for_unfit(
 
     // ToolsWithoutEffort: 移除 thinking/reasoning 配置
     if registry.is_unfit(provider, model, UnfitKind::ToolsWithoutEffort)
-        && remove_reasoning_config(body)
+        && remove_reasoning_config(body, protocol)
     {
         adapted = true;
         tracing::info!(provider, model, "unfit: removed reasoning (tools conflict)");
@@ -175,7 +178,12 @@ fn extract_and_remove_response_format(body: &mut serde_json::Value) -> Option<se
         body.as_object_mut()?.remove("output_config");
         return Some(schema);
     }
-    // OpenAI: response_format.json_schema
+    // OpenAI Chat: response_format.json_schema.schema(优先取真正 schema)
+    if let Some(schema) = body.pointer("/response_format/json_schema/schema") {
+        let schema = schema.clone();
+        body.as_object_mut()?.remove("response_format");
+        return Some(schema);
+    }
     if let Some(schema) = body.pointer("/response_format/json_schema") {
         let schema = schema.clone();
         body.as_object_mut()?.remove("response_format");
@@ -184,65 +192,169 @@ fn extract_and_remove_response_format(body: &mut serde_json::Value) -> Option<se
     None
 }
 
-fn inject_schema_to_system(body: &mut serde_json::Value, schema: &serde_json::Value) {
+fn inject_schema_instruction(
+    body: &mut serde_json::Value,
+    schema: &serde_json::Value,
+    protocol: Protocol,
+) {
     let instruction = format!(
         "\n\nIMPORTANT: Respond with valid JSON matching this schema:\n{}",
         serde_json::to_string_pretty(schema).unwrap_or_else(|_| schema.to_string())
     );
 
-    match body.get_mut("system") {
-        Some(serde_json::Value::String(s)) => {
-            s.push_str(&instruction);
+    match protocol {
+        Protocol::Claude => match body.get_mut("system") {
+            Some(serde_json::Value::String(s)) => {
+                s.push_str(&instruction);
+            }
+            Some(serde_json::Value::Array(arr)) => {
+                arr.push(serde_json::json!({"type": "text", "text": instruction}));
+            }
+            _ => {
+                body["system"] = serde_json::json!(instruction);
+            }
+        },
+        Protocol::OpenAiChat => {
+            if let Some(msgs) = body.get_mut("messages").and_then(|m| m.as_array_mut()) {
+                if let Some(sys) = msgs
+                    .iter_mut()
+                    .find(|m| m.get("role").and_then(|r| r.as_str()) == Some("system"))
+                {
+                    match sys.get_mut("content") {
+                        Some(serde_json::Value::String(s)) => s.push_str(&instruction),
+                        Some(serde_json::Value::Array(arr)) => {
+                            arr.push(serde_json::json!({"type": "text", "text": instruction}));
+                        }
+                        _ => {
+                            sys["content"] = serde_json::json!(instruction);
+                        }
+                    }
+                } else {
+                    msgs.insert(
+                        0,
+                        serde_json::json!({"role": "system", "content": instruction}),
+                    );
+                }
+            }
         }
-        Some(serde_json::Value::Array(arr)) => {
-            arr.push(serde_json::json!({"type": "text", "text": instruction}));
-        }
-        _ => {
-            body["system"] = serde_json::json!(instruction);
-        }
+        Protocol::OpenAiResponses => match body.get_mut("instructions") {
+            Some(serde_json::Value::String(s)) => {
+                s.push_str(&instruction);
+            }
+            _ => {
+                body["instructions"] = serde_json::json!(instruction.trim_start_matches('\n'));
+            }
+        },
+        // Gemini/AG: 本批不扩 thinkingConfig 大改;无匹配字段时 adapt 保持 false
+        Protocol::Gemini | Protocol::Antigravity => {}
     }
 }
 
-fn force_reasoning_effort(body: &mut serde_json::Value, effort: &str) -> bool {
-    // Anthropic: thinking.output_config.effort
-    if let Some(config) = body.pointer_mut("/thinking/output_config/effort") {
-        if config.as_str() == Some("off") {
-            *config = serde_json::json!(effort);
-            return true;
+fn force_reasoning_effort(body: &mut serde_json::Value, effort: &str, protocol: Protocol) -> bool {
+    match protocol {
+        Protocol::Claude => {
+            if let Some(config) = body.pointer_mut("/thinking/output_config/effort") {
+                if config.as_str() == Some("off") {
+                    *config = serde_json::json!(effort);
+                    return true;
+                }
+            }
+            false
         }
+        Protocol::OpenAiChat => {
+            if let Some(re) = body.get_mut("reasoning_effort") {
+                if matches!(re.as_str(), Some("off") | Some("none")) {
+                    *re = serde_json::json!(effort);
+                    return true;
+                }
+            }
+            // Kimi: thinking.effort
+            if let Some(te) = body.pointer_mut("/thinking/effort") {
+                if matches!(te.as_str(), Some("off") | Some("none")) {
+                    *te = serde_json::json!(effort);
+                    return true;
+                }
+            }
+            false
+        }
+        Protocol::OpenAiResponses => {
+            if let Some(e) = body.pointer_mut("/reasoning/effort") {
+                if matches!(e.as_str(), Some("off") | Some("none")) {
+                    *e = serde_json::json!(effort);
+                    return true;
+                }
+            }
+            false
+        }
+        Protocol::Gemini | Protocol::Antigravity => false,
     }
-    false
 }
 
-fn downgrade_tool_choice(body: &mut serde_json::Value) -> bool {
-    if let Some(choice) = body.get_mut("tool_choice") {
-        if choice.get("type").and_then(|t| t.as_str()) != Some("auto") {
-            *choice = serde_json::json!({"type": "auto"});
-            return true;
+fn downgrade_tool_choice(body: &mut serde_json::Value, protocol: Protocol) -> bool {
+    match protocol {
+        Protocol::Claude => {
+            if let Some(choice) = body.get_mut("tool_choice") {
+                if choice.get("type").and_then(|t| t.as_str()) != Some("auto") {
+                    *choice = serde_json::json!({"type": "auto"});
+                    return true;
+                }
+            }
+            false
         }
+        Protocol::OpenAiChat | Protocol::OpenAiResponses => {
+            if let Some(choice) = body.get_mut("tool_choice") {
+                if choice.as_str() == Some("auto") {
+                    return false;
+                }
+                *choice = serde_json::json!("auto");
+                return true;
+            }
+            false
+        }
+        Protocol::Gemini | Protocol::Antigravity => false,
     }
-    false
 }
 
-fn remove_reasoning_config(body: &mut serde_json::Value) -> bool {
-    let mut removed = false;
-    if body
-        .as_object_mut()
-        .and_then(|m| m.remove("thinking"))
-        .is_some()
-    {
-        removed = true;
-    }
-    if let Some(config) = body.pointer_mut("/output_config") {
-        if config
+fn remove_reasoning_config(body: &mut serde_json::Value, protocol: Protocol) -> bool {
+    match protocol {
+        Protocol::Claude => {
+            let mut removed = false;
+            if body
+                .as_object_mut()
+                .and_then(|m| m.remove("thinking"))
+                .is_some()
+            {
+                removed = true;
+            }
+            if let Some(config) = body.pointer_mut("/output_config") {
+                if config
+                    .as_object_mut()
+                    .and_then(|m| m.remove("effort"))
+                    .is_some()
+                {
+                    removed = true;
+                }
+            }
+            removed
+        }
+        Protocol::OpenAiChat => {
+            let mut removed = false;
+            if let Some(obj) = body.as_object_mut() {
+                if obj.remove("reasoning_effort").is_some() {
+                    removed = true;
+                }
+                if obj.remove("thinking").is_some() {
+                    removed = true;
+                }
+            }
+            removed
+        }
+        Protocol::OpenAiResponses => body
             .as_object_mut()
-            .and_then(|m| m.remove("effort"))
-            .is_some()
-        {
-            removed = true;
-        }
+            .and_then(|m| m.remove("reasoning"))
+            .is_some(),
+        Protocol::Gemini | Protocol::Antigravity => false,
     }
-    removed
 }
 
 #[cfg(test)]
@@ -280,5 +392,124 @@ mod tests {
         let current = reg.generation();
         reg.mark("p", "m", UnfitKind::RefusesFormat, current);
         assert!(reg.is_unfit("p", "m", UnfitKind::RefusesFormat));
+    }
+
+    fn marked(kind: UnfitKind) -> UnfitRegistry {
+        let reg = UnfitRegistry::new();
+        let gen = reg.generation();
+        reg.mark("p", "m", kind, gen);
+        reg
+    }
+
+    #[test]
+    fn adapt_claude_off_refused_still_uses_thinking_path() {
+        let reg = marked(UnfitKind::OffRefused);
+        let mut body = serde_json::json!({
+            "thinking": {"output_config": {"effort": "off"}}
+        });
+        assert!(adapt_request_for_unfit(
+            &mut body,
+            "p",
+            "m",
+            &reg,
+            Protocol::Claude
+        ));
+        assert_eq!(body["thinking"]["output_config"]["effort"], "low");
+    }
+
+    #[test]
+    fn adapt_chat_off_refused_sets_reasoning_effort_low() {
+        let reg = marked(UnfitKind::OffRefused);
+        let mut body = serde_json::json!({"reasoning_effort": "off", "messages": []});
+        assert!(adapt_request_for_unfit(
+            &mut body,
+            "p",
+            "m",
+            &reg,
+            Protocol::OpenAiChat
+        ));
+        assert_eq!(body["reasoning_effort"], "low");
+        // 不得误写 Anthropic 残留字段
+        assert!(body.get("thinking").is_none());
+    }
+
+    #[test]
+    fn adapt_chat_tools_without_effort_removes_reasoning_effort() {
+        let reg = marked(UnfitKind::ToolsWithoutEffort);
+        let mut body = serde_json::json!({
+            "reasoning_effort": "high",
+            "thinking": {"type": "enabled", "effort": "high"},
+            "messages": []
+        });
+        assert!(adapt_request_for_unfit(
+            &mut body,
+            "p",
+            "m",
+            &reg,
+            Protocol::OpenAiChat
+        ));
+        assert!(body.get("reasoning_effort").is_none());
+        assert!(body.get("thinking").is_none());
+    }
+
+    #[test]
+    fn adapt_chat_tool_choice_downgrades_to_string_auto() {
+        let reg = marked(UnfitKind::ToolChoiceRefused);
+        let mut body = serde_json::json!({
+            "tool_choice": {"type": "function", "function": {"name": "x"}},
+            "messages": []
+        });
+        assert!(adapt_request_for_unfit(
+            &mut body,
+            "p",
+            "m",
+            &reg,
+            Protocol::OpenAiChat
+        ));
+        assert_eq!(body["tool_choice"], "auto");
+    }
+
+    #[test]
+    fn adapt_chat_refuses_format_injects_into_system_message() {
+        let reg = marked(UnfitKind::RefusesFormat);
+        let mut body = serde_json::json!({
+            "messages": [
+                {"role": "system", "content": "base"},
+                {"role": "user", "content": "hi"}
+            ],
+            "response_format": {
+                "type": "json_schema",
+                "json_schema": {"schema": {"type": "object"}}
+            }
+        });
+        assert!(adapt_request_for_unfit(
+            &mut body,
+            "p",
+            "m",
+            &reg,
+            Protocol::OpenAiChat
+        ));
+        assert!(body.get("response_format").is_none());
+        let sys = body["messages"][0]["content"].as_str().unwrap();
+        assert!(sys.starts_with("base"));
+        assert!(sys.contains("IMPORTANT: Respond with valid JSON"));
+        // 不得写顶层 Anthropic system
+        assert!(body.get("system").is_none());
+    }
+
+    #[test]
+    fn adapt_responses_off_refused_sets_reasoning_effort() {
+        let reg = marked(UnfitKind::OffRefused);
+        let mut body = serde_json::json!({
+            "reasoning": {"effort": "off", "summary": "auto"}
+        });
+        assert!(adapt_request_for_unfit(
+            &mut body,
+            "p",
+            "m",
+            &reg,
+            Protocol::OpenAiResponses
+        ));
+        assert_eq!(body["reasoning"]["effort"], "low");
     }
 }

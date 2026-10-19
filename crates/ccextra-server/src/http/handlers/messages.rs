@@ -1301,6 +1301,7 @@ pub(crate) async fn deliver_response(
                     &prepared.route.provider,
                     &prepared.route.upstream_model,
                     registry.as_ref(),
+                    prepared.route.protocol,
                 ) {
                     tracing::info!(
                         provider = prepared.route.provider,
