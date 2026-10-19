@@ -1458,8 +1458,10 @@ pub(crate) async fn deliver_response(
     } else {
         let upstream = executed.upstream.take().expect("上游响应应存在");
         let body_bytes = crate::limits::read_success_body_or_anthropic(upstream.body).await?;
-        if let Some((cache, key, fingerprint)) = prepared.replay_scope.as_ref() {
-            if let Ok(v) = serde_json::from_slice::<Value>(&body_bytes) {
+        // 成功 body 只解析一次,供 replay / AG / Kimi / drift / 协议转换复用
+        let parsed: Option<Value> = serde_json::from_slice(&body_bytes).ok();
+        if let Some(ref v) = parsed {
+            if let Some((cache, key, fingerprint)) = prepared.replay_scope.as_ref() {
                 if matches!(prepared.route.protocol, Protocol::OpenAiResponses)
                     && v.get("object").and_then(|o| o.as_str()) == Some("response")
                 {
@@ -1467,25 +1469,19 @@ pub(crate) async fn deliver_response(
                     cache.store_from_completed(key, &wrapped, fingerprint);
                 }
             }
-        }
-        if let Some((cache, key)) = prepared.ag_replay_scope.as_ref() {
-            if matches!(prepared.route.protocol, Protocol::Antigravity) {
-                if let Ok(v) = serde_json::from_slice::<Value>(&body_bytes) {
+            if let Some((cache, key)) = prepared.ag_replay_scope.as_ref() {
+                if matches!(prepared.route.protocol, Protocol::Antigravity) {
                     if let Some(request) = prepared.body_json.get("request") {
-                        cache.store_from_response(key, request, &v);
+                        cache.store_from_response(key, request, v);
                     }
                 }
             }
-        }
-        if let Some((cache, key, _)) = prepared.kimi_replay_scope.as_ref() {
-            if matches!(prepared.route.protocol, Protocol::Claude) {
-                if let Ok(v) = serde_json::from_slice::<Value>(&body_bytes) {
-                    cache.store_from_message_response(key, &v);
+            if let Some((cache, key, _)) = prepared.kimi_replay_scope.as_ref() {
+                if matches!(prepared.route.protocol, Protocol::Claude) {
+                    cache.store_from_message_response(key, v);
                 }
             }
-        }
-        if let Some((drift, parent)) = prepared.drift_usage_scope.as_ref() {
-            if let Ok(v) = serde_json::from_slice::<Value>(&body_bytes) {
+            if let Some((drift, parent)) = prepared.drift_usage_scope.as_ref() {
                 let (cache_read, cache_creation) = match prepared.route.protocol {
                     Protocol::Claude => (
                         v.pointer("/usage/cache_read_input_tokens")
@@ -1527,8 +1523,8 @@ pub(crate) async fn deliver_response(
                 }
             }
         }
-        let converted = match serde_json::from_slice::<Value>(&body_bytes) {
-            Ok(v) => {
+        let converted = match parsed {
+            Some(v) => {
                 if let Some(sid) = prepared.session_id.as_deref() {
                     let input_tokens = match prepared.route.protocol {
                         Protocol::OpenAiChat => {
@@ -1596,7 +1592,7 @@ pub(crate) async fn deliver_response(
                     }
                 }
             }
-            Err(_) => None,
+            None => None,
         };
         // 对齐 CPA 7f2f17d7:转换层产出的 Claude api_error(如 MALFORMED)抬 502 供客户端重试
         if let Some(out) = converted.as_ref() {
