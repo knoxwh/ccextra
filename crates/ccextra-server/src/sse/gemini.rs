@@ -170,7 +170,7 @@ fn process_gemini_events(
 
 /// Gemini SSE 流转 Anthropic SSE。
 ///
-/// 缺失 finishReason 时在 clean EOF/[DONE] 合成终态(与 Antigravity 一致)。
+/// 缺失 finishReason 时在 clean EOF/`[DONE]` 合成终态(与 Antigravity 一致)。
 /// 签名原样透传(CPA gemini/claude 响应侧不做归一化)。
 pub fn relay_gemini_to_anthropic<S>(
     stream: S,
@@ -193,7 +193,7 @@ where
 
 /// Antigravity SSE 流转 Anthropic SSE。
 ///
-/// 缺失 finishReason 时按 CPA 在 clean EOF/[DONE] 合成终态 chunk。
+/// 缺失 finishReason 时按 CPA 在 clean EOF/`[DONE]` 合成终态 chunk。
 /// `signature_model` 为上游模型名,出站 thoughtSignature 按 CPA
 /// formatClaudeSignatureValue 归一化(claude 组解回原生 E 形)。
 pub fn relay_antigravity_to_anthropic<S>(

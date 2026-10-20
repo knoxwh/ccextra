@@ -426,7 +426,7 @@ impl AgReplayCache {
             .0
     }
 
-    /// 同 [`Self::apply_to_antigravity_body`]，带工具上下文（schema 归一 / 旧式 id 回写）；
+    /// 将缓存签名 / 原生 id 回填到 Antigravity body 并执行外发前处理链，带工具上下文（schema 归一 / 旧式 id 回写）；
     /// 另返回本请求读账本时的快照，供后续 IfUnchanged 提交 / 清理（对齐 CPA scope.cacheSnapshot）。
     pub fn apply_to_antigravity_body_with_tools(
         &self,

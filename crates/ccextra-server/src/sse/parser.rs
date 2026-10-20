@@ -20,7 +20,7 @@ pub struct SseEvent {
 
 /// 跨 chunk 状态化的 SSE 解析器
 ///
-/// 缓冲用字节(Vec<u8>)而非 String:多字节 UTF-8 字符(中文等)可能被
+/// 缓冲用字节(`Vec<u8>`)而非 String:多字节 UTF-8 字符(中文等)可能被
 /// TCP 分片切到两个 chunk,from_utf8_lossy 会把两半都变成 U+FFFD。
 /// 按字节找换行,整行齐了才转字符串,规避截断乱码。
 #[derive(Debug, Default)]
