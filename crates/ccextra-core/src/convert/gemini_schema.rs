@@ -2,8 +2,11 @@
 //
 // 两个入口:
 // - clean_json_schema_for_gemini: Gemini 直连(enum 强制 string、去 nullable/title/占位字段)
-// - clean_json_schema_for_antigravity: Antigravity(内联 $ref、drop 全部 enum、
+// - clean_json_schema_for_antigravity: Antigravity(drop 全部 enum、
 //   空对象 schema 补占位 required 属性,满足 Claude VALIDATED 模式)
+//
+// 所有清洗路径在剥离 $defs/definitions 前内联本地 $ref(CPA c558d320 / #6732),
+// 并跳过 literal 关键字(default/example/examples/const/enum)内的伪 schema 键。
 //
 // 只接受单个 schema 值,禁止传整个请求文档(对齐 CPA 注释:
 // 清洗按 key 名重写,作用于会话历史会误删工具参数)
@@ -123,10 +126,9 @@ fn clean_json_schema(schema: &Value, opts: CleanOptions) -> Value {
     // Phase 0: 归一化畸形 schema(对齐 CPA normalizeMalformedSchemaObjects)
     s = normalize_malformed_schema_objects(s, opts.add_missing_array_items);
 
-    // Phase 1: 转换与提示
-    if opts.antigravity_semantics {
-        s = inline_local_refs(&s);
-    }
+    // Phase 1: 转换与提示。所有 cleaner 随后剥离 $defs/definitions,本地 $ref
+    // 必须在此对每条路径展开,否则嵌套字段会丢(对齐 CPA c558d320 / #6732)。
+    s = inline_local_refs_for_clean(&s);
     convert_refs_to_hints(&mut s, opts.antigravity_semantics);
     convert_const_to_enum(&mut s);
     convert_enum_values_to_strings(&mut s, opts.force_enum_string_type);
@@ -160,10 +162,13 @@ fn clean_json_schema(schema: &Value, opts: CleanOptions) -> Value {
         remove_keywords(&mut s, &["title"]);
     }
     cleanup_required_fields(&mut s);
-    // Gemini protobuf 要求声明 items 的节点 type 为 ARRAY(对齐 CPA ffe6ad3c / Issue #6011)
-    sanitize_array_items(&mut s);
-    // Gemini protobuf 要求声明 properties 的节点 type 为 OBJECT(对齐 CPA e1e3a811 / Issue #6394)
+    // Gemini protobuf 要求声明 properties 的节点 type 为 OBJECT(对齐 CPA e1e3a811 / Issue #6394)。
+    // 须先于 sanitize_array_items:节点同时有 properties + type:array + items 时先定 object,
+    // 再由 array sanitizer 剥掉残留 items(对齐 CPA c558d320 顺序)。
     sanitize_object_properties(&mut s);
+    // Gemini protobuf 要求声明 items 的节点 type 为 ARRAY(对齐 CPA ffe6ad3c / Issue #6011)。
+    // add_missing: 内联后仍缺 items 的 array 补占位(Phase 0 不能在 $ref 节点上预加,否则会盖掉定义里的真 items)。
+    sanitize_array_items(&mut s, opts.add_missing_array_items);
 
     // Phase 4: 空对象 schema 占位(Claude VALIDATED)
     if opts.add_placeholder {
@@ -177,10 +182,22 @@ fn clean_json_schema(schema: &Value, opts: CleanOptions) -> Value {
 
 /// 对齐 CPA schemaNameMapKeywords:值是"名字→子 schema"映射的关键字
 fn is_name_map_keyword(key: &str) -> bool {
+    // 对齐 CPA schemaNameMapKeywords(c558d320 起含 Draft-07 dependencies)
     matches!(
         key,
-        "properties" | "patternProperties" | "dependentSchemas" | "$defs" | "definitions"
+        "properties"
+            | "patternProperties"
+            | "dependentSchemas"
+            | "dependencies"
+            | "$defs"
+            | "definitions"
     )
+}
+
+/// literal 关键字承载客户端数据而非子 schema(对齐 CPA literalValueKeywords / c558d320)。
+/// 清洗与 $ref 内联须原样拷贝其值;内部长得像 schema 关键字的键是数据。
+fn is_literal_value_keyword(key: &str) -> bool {
+    matches!(key, "default" | "example" | "examples" | "const" | "enum")
 }
 
 /// 对齐 CPA isPropertyDefinition:路径尾部连续 name-map 关键字数为奇数
@@ -210,6 +227,11 @@ fn walk_objects(value: &mut Value, path: &mut Vec<String>, f: &mut WalkFn<'_>) {
             // 再递归子节点(重新 collect 键,回调可能已改结构)
             let keys: Vec<String> = map.keys().cloned().collect();
             for key in keys {
+                // literal 值是客户端数据,内部伪 schema 键不清洗;name-map 下同名键是属性名仍下钻
+                // (对齐 CPA WalkSchema / c558d320)
+                if is_literal_value_keyword(&key) && !is_property_definition(path) {
+                    continue;
+                }
                 if let Some(child) = map.get_mut(&key) {
                     match child {
                         Value::Object(_) | Value::Array(_) => {
@@ -280,60 +302,417 @@ fn append_hint(map: &mut Map<String, Value>, hint: &str) {
 
 // --- Phase 1: 转换与提示 ---
 
-/// 对齐 CPA inlineLocalRefs:定义容器被剥离前,内联本地 $ref
-/// 每次展开获得独立副本,兄弟关键字覆盖被引用定义,环引用退化为类型化提示
+/// 内联体积预算(对齐 CPA maxInlinedSchemaBytes):共享定义每引用各拷一份,超预算退化为类型化提示。
+const MAX_INLINED_SCHEMA_BYTES: usize = 256 * 1024;
+
+/// 退化引用拷贝目标 description 的上限(对齐 CPA maxFallbackDescriptionBytes)。
+const MAX_FALLBACK_DESCRIPTION_BYTES: usize = 512;
+
+/// 公开内联:保留 $defs/definitions,供 xAI 等非 clean 路径使用(对齐 CPA InlineLocalRefs)。
 pub(crate) fn inline_local_refs(schema: &Value) -> Value {
-    fn contains_ref(v: &Value) -> bool {
-        match v {
-            Value::Object(m) => m.contains_key("$ref") || m.values().any(contains_ref),
-            Value::Array(a) => a.iter().any(contains_ref),
-            _ => false,
-        }
-    }
+    inline_local_refs_rooted(schema, false)
+}
+
+/// 清洗路径内联(对齐 CPA inlineLocalRefsForClean / c558d320)。
+/// 单键 `{"schema": ...}` 载体时对内层解析,避免相对 carrier 根查找全 miss。
+fn inline_local_refs_for_clean(schema: &Value) -> Value {
     if !contains_ref(schema) {
         return schema.clone();
     }
-    resolve_local_refs(schema, schema, &mut Vec::new())
+    if let Value::Object(root_map) = schema {
+        if root_map.len() == 1 {
+            if let Some(inner) = root_map.get("schema") {
+                if inner.is_object() {
+                    let resolved = resolve_schema_root(inner, &mut RefResolveState::new(), true);
+                    return Value::Object(Map::from_iter([("schema".to_string(), resolved)]));
+                }
+            }
+        }
+    }
+    inline_local_refs_rooted(schema, true)
 }
 
-fn resolve_local_refs(root: &Value, value: &Value, active: &mut Vec<String>) -> Value {
+fn inline_local_refs_rooted(schema: &Value, for_clean: bool) -> Value {
+    if !contains_ref(schema) {
+        return schema.clone();
+    }
+    resolve_schema_root(schema, &mut RefResolveState::new(), for_clean)
+}
+
+fn contains_ref(v: &Value) -> bool {
+    match v {
+        Value::Object(m) => m.contains_key("$ref") || m.values().any(contains_ref),
+        Value::Array(a) => a.iter().any(contains_ref),
+        _ => false,
+    }
+}
+
+/// 单次内联剩余预算(对齐 CPA refResolveState)。
+struct RefResolveState {
+    budget: usize,
+}
+
+impl RefResolveState {
+    fn new() -> Self {
+        Self {
+            budget: MAX_INLINED_SCHEMA_BYTES,
+        }
+    }
+}
+
+fn sorted_keys(map: &Map<String, Value>) -> Vec<String> {
+    let mut keys: Vec<String> = map.keys().cloned().collect();
+    keys.sort();
+    keys
+}
+
+/// 先解析 schema 本体再解析定义容器,避免预算花在随后会被剥掉的定义拷贝上。
+fn resolve_schema_root(root: &Value, state: &mut RefResolveState, for_clean: bool) -> Value {
+    let Value::Object(root_map) = root else {
+        return resolve_local_refs(root, root, &mut Vec::new(), state, false, for_clean);
+    };
+
+    let mut out = Map::with_capacity(root_map.len());
+    for key in sorted_keys(root_map) {
+        let item = &root_map[&key];
+        match key.as_str() {
+            "$defs" | "definitions" => {
+                if !for_clean {
+                    // 占位,本体解析完后再填
+                    out.insert(key, Value::Null);
+                }
+            }
+            "$ref" => {
+                out.insert(key, item.clone());
+            }
+            _ => {
+                out.insert(
+                    key.clone(),
+                    resolve_schema_entry(root, &key, item, &mut Vec::new(), state, for_clean),
+                );
+            }
+        }
+    }
+
+    // 根级 $ref 展开后兄弟关键字覆盖目标(对齐 resolveLocalRefs)
+    if let Some(Value::String(ref_)) = root_map.get("$ref") {
+        if let Some(ptr) = ref_.strip_prefix("#/") {
+            if let Some(target) = resolve_json_pointer(root, ptr) {
+                let size = target_expansion_size(target, for_clean);
+                if size <= state.budget {
+                    state.budget -= size;
+                    let mut active = vec![ref_.clone()];
+                    let resolved_target =
+                        resolve_local_refs(root, target, &mut active, state, false, for_clean);
+                    if let Value::Object(target_map) = resolved_target {
+                        let mut merged = Map::with_capacity(target_map.len() + out.len());
+                        for k in sorted_keys(&target_map) {
+                            merged.insert(k.clone(), target_map[&k].clone());
+                        }
+                        for k in sorted_keys(&out) {
+                            if k != "$ref" {
+                                merged.insert(k.clone(), out[&k].clone());
+                            }
+                        }
+                        out = merged;
+                    } else {
+                        out = resolve_ref_fallback(
+                            root,
+                            &out,
+                            target,
+                            ref_,
+                            &mut Vec::new(),
+                            state,
+                            for_clean,
+                        );
+                    }
+                } else {
+                    out = resolve_ref_fallback(
+                        root,
+                        &out,
+                        target,
+                        ref_,
+                        &mut Vec::new(),
+                        state,
+                        for_clean,
+                    );
+                }
+                out.shift_remove("$ref");
+            }
+        }
+    }
+
+    if !for_clean {
+        for key in ["$defs", "definitions"] {
+            if let Some(item) = root_map.get(key) {
+                out.insert(
+                    key.to_string(),
+                    resolve_schema_entry(root, key, item, &mut Vec::new(), state, false),
+                );
+            }
+        }
+    }
+
+    Value::Object(out)
+}
+
+fn target_expansion_size(value: &Value, for_clean: bool) -> usize {
+    if !for_clean {
+        return json_value_size(value);
+    }
+    clean_expansion_size(value, false)
+}
+
+fn clean_expansion_size(value: &Value, in_name_map: bool) -> usize {
+    match value {
+        Value::Null => 4,
+        Value::Bool(_) => 5,
+        Value::Number(n) => n.to_string().len(),
+        Value::String(s) => json_string_encoded_size(s),
+        Value::Array(arr) => {
+            let mut size = 2;
+            for item in arr {
+                size += clean_expansion_size(item, false) + 1;
+                if size > MAX_INLINED_SCHEMA_BYTES + 1 {
+                    return MAX_INLINED_SCHEMA_BYTES + 1;
+                }
+            }
+            size
+        }
+        Value::Object(map) => {
+            let mut size = 2;
+            for (key, item) in map {
+                if !in_name_map && (key == "$defs" || key == "definitions") {
+                    continue;
+                }
+                let mut child_in_name_map = false;
+                if !in_name_map {
+                    if is_literal_value_keyword(key) {
+                        size += json_string_encoded_size(key) + 1 + json_value_size(item) + 1;
+                        if size > MAX_INLINED_SCHEMA_BYTES + 1 {
+                            return MAX_INLINED_SCHEMA_BYTES + 1;
+                        }
+                        continue;
+                    }
+                    if is_name_map_keyword(key) {
+                        child_in_name_map = true;
+                    }
+                }
+                size += json_string_encoded_size(key)
+                    + 1
+                    + clean_expansion_size(item, child_in_name_map)
+                    + 1;
+                if size > MAX_INLINED_SCHEMA_BYTES + 1 {
+                    return MAX_INLINED_SCHEMA_BYTES + 1;
+                }
+            }
+            size
+        }
+    }
+}
+
+/// 估算编码体积(含 Go encoding/json 默认 HTML 转义),用于内联预算。
+fn json_value_size(value: &Value) -> usize {
+    match value {
+        Value::Null => 4,
+        Value::Bool(_) => 5,
+        Value::Number(n) => n.to_string().len(),
+        Value::String(s) => json_string_encoded_size(s),
+        Value::Array(arr) => {
+            let mut size = 2;
+            for item in arr {
+                size += json_value_size(item) + 1;
+            }
+            size
+        }
+        Value::Object(map) => {
+            let mut size = 2;
+            for (key, item) in map {
+                size += json_string_encoded_size(key) + 1 + json_value_size(item) + 1;
+            }
+            size
+        }
+    }
+}
+
+/// JSON 字符串编码长度(含引号),对齐 Go encoding/json HTML escape。
+fn json_string_encoded_size(s: &str) -> usize {
+    let bytes = s.as_bytes();
+    let mut size = 2;
+    let mut i = 0;
+    while i < bytes.len() {
+        let c = bytes[i];
+        match c {
+            b'\n' | b'\r' | b'\t' => size += 2,
+            c if c < 0x20 => size += 6,
+            b'"' | b'\\' => size += 2,
+            b'<' | b'>' | b'&' => size += 6,
+            c if c < 0x80 => size += 1,
+            0xe2 if i + 2 < bytes.len()
+                && bytes[i + 1] == 0x80
+                && (bytes[i + 2] == 0xa8 || bytes[i + 2] == 0xa9) =>
+            {
+                size += 6;
+                i += 2;
+            }
+            _ => size += 1,
+        }
+        i += 1;
+    }
+    size
+}
+
+fn resolve_local_refs(
+    root: &Value,
+    value: &Value,
+    active: &mut Vec<String>,
+    state: &mut RefResolveState,
+    in_name_map: bool,
+    for_clean: bool,
+) -> Value {
     match value {
         Value::Array(arr) => Value::Array(
             arr.iter()
-                .map(|item| resolve_local_refs(root, item, active))
+                .map(|item| resolve_local_refs(root, item, active, state, false, for_clean))
                 .collect(),
         ),
         Value::Object(map) => {
-            if let Some(Value::String(ref_)) = map.get("$ref") {
-                if let Some(ptr) = ref_.strip_prefix("#/") {
-                    if let Some(target) = resolve_json_pointer(root, ptr) {
-                        if active.contains(ref_) {
-                            return cyclic_ref_fallback(map, target, ref_);
-                        }
-                        active.push(ref_.clone());
-                        let resolved_target = resolve_local_refs(root, target, active);
-                        active.pop();
-                        if let Value::Object(target_map) = resolved_target {
-                            let mut out = target_map.clone();
-                            for (key, item) in map {
-                                if key == "$ref" {
-                                    continue;
-                                }
-                                out.insert(key.clone(), resolve_local_refs(root, item, active));
+            if !in_name_map {
+                if let Some(Value::String(ref_)) = map.get("$ref") {
+                    if let Some(ptr) = ref_.strip_prefix("#/") {
+                        if let Some(target) = resolve_json_pointer(root, ptr) {
+                            if active.contains(ref_) {
+                                return Value::Object(resolve_ref_fallback(
+                                    root, map, target, ref_, active, state, for_clean,
+                                ));
                             }
-                            return Value::Object(out);
+                            let size = target_expansion_size(target, for_clean);
+                            if size > state.budget {
+                                return Value::Object(resolve_ref_fallback(
+                                    root, map, target, ref_, active, state, for_clean,
+                                ));
+                            }
+                            state.budget -= size;
+                            active.push(ref_.clone());
+                            let resolved_target =
+                                resolve_local_refs(root, target, active, state, false, for_clean);
+                            active.pop();
+                            if let Value::Object(target_map) = resolved_target {
+                                let mut out = Map::with_capacity(target_map.len() + map.len());
+                                for key in sorted_keys(&target_map) {
+                                    if for_clean && (key == "$defs" || key == "definitions") {
+                                        continue;
+                                    }
+                                    out.insert(key.clone(), target_map[&key].clone());
+                                }
+                                for key in sorted_keys(map) {
+                                    if key == "$ref" {
+                                        continue;
+                                    }
+                                    if for_clean && (key == "$defs" || key == "definitions") {
+                                        continue;
+                                    }
+                                    out.insert(
+                                        key.clone(),
+                                        resolve_schema_entry(
+                                            root, &key, &map[&key], active, state, for_clean,
+                                        ),
+                                    );
+                                }
+                                return Value::Object(out);
+                            }
                         }
                     }
                 }
             }
+
             let mut out = Map::with_capacity(map.len());
-            for (key, item) in map {
-                out.insert(key.clone(), resolve_local_refs(root, item, active));
+            for key in sorted_keys(map) {
+                if for_clean && !in_name_map && (key == "$defs" || key == "definitions") {
+                    continue;
+                }
+                out.insert(
+                    key.clone(),
+                    resolve_schema_entry(root, &key, &map[&key], active, state, for_clean),
+                );
             }
             Value::Object(out)
         }
         other => other.clone(),
     }
+}
+
+/// 环/超预算退化:仍解析兄弟子 schema,literal 原样(对齐 CPA resolveRefFallback)。
+fn resolve_ref_fallback(
+    root: &Value,
+    node: &Map<String, Value>,
+    target: &Value,
+    ref_: &str,
+    active: &mut Vec<String>,
+    state: &mut RefResolveState,
+    for_clean: bool,
+) -> Map<String, Value> {
+    let mut out = cyclic_ref_fallback(node, target, ref_);
+    // 退化拷贝的目标 description 计入预算;超限只留短 hint
+    if let Value::Object(target_map) = target {
+        if let Some(Value::String(description)) = target_map.get("description") {
+            if !description.is_empty()
+                && description.len() <= MAX_FALLBACK_DESCRIPTION_BYTES
+                && !node.contains_key("description")
+            {
+                let cost = json_string_encoded_size(description);
+                if cost > state.budget {
+                    out.insert(
+                        "description".to_string(),
+                        Value::String(format!("See: {}", ref_name(ref_))),
+                    );
+                } else {
+                    state.budget -= cost;
+                }
+            }
+        }
+    }
+    for key in sorted_keys(node) {
+        if key == "$ref" || key == "description" {
+            continue;
+        }
+        if for_clean && (key == "$defs" || key == "definitions") {
+            out.shift_remove(&key);
+            continue;
+        }
+        out.insert(
+            key.clone(),
+            resolve_schema_entry(root, &key, &node[&key], active, state, for_clean),
+        );
+    }
+    out
+}
+
+/// 解析单个 map 条目:literal 深拷贝不解析;name-map 下同名键是属性名仍作 schema。
+fn resolve_schema_entry(
+    root: &Value,
+    key: &str,
+    item: &Value,
+    active: &mut Vec<String>,
+    state: &mut RefResolveState,
+    for_clean: bool,
+) -> Value {
+    if is_literal_value_keyword(key) {
+        return item.clone();
+    }
+    if is_name_map_keyword(key) {
+        if let Value::Object(name_map) = item {
+            let mut out = Map::with_capacity(name_map.len());
+            for name in sorted_keys(name_map) {
+                out.insert(
+                    name.clone(),
+                    resolve_local_refs(root, &name_map[&name], active, state, false, for_clean),
+                );
+            }
+            return Value::Object(out);
+        }
+    }
+    resolve_local_refs(root, item, active, state, false, for_clean)
 }
 
 /// JSON Pointer 解析(~0/~1 反转义)
@@ -353,12 +732,23 @@ fn resolve_json_pointer<'a>(root: &'a Value, pointer: &str) -> Option<&'a Value>
     Some(current)
 }
 
-/// 环引用退化:保留 type/nullable/description,追加 "See: <name>" 提示
-fn cyclic_ref_fallback(node: &Map<String, Value>, target: &Value, ref_: &str) -> Value {
+/// 环引用退化:保留 type/nullable/description(超长 description 省略),追加 "See: <name>" 提示
+fn cyclic_ref_fallback(
+    node: &Map<String, Value>,
+    target: &Value,
+    ref_: &str,
+) -> Map<String, Value> {
     let mut out = Map::new();
     if let Value::Object(t) = target {
         for key in ["type", "nullable", "description"] {
             if let Some(v) = t.get(key) {
+                if key == "description" {
+                    if let Value::String(d) = v {
+                        if d.len() > MAX_FALLBACK_DESCRIPTION_BYTES {
+                            continue;
+                        }
+                    }
+                }
                 out.insert(key.to_string(), v.clone());
             }
         }
@@ -370,7 +760,7 @@ fn cyclic_ref_fallback(node: &Map<String, Value>, target: &Value, ref_: &str) ->
     }
     let hint = format!("See: {}", ref_name(ref_));
     append_hint(&mut out, &hint);
-    Value::Object(out)
+    out
 }
 
 /// 取 $ref 最后一段作为定义名
@@ -385,7 +775,11 @@ fn ref_name(ref_: &str) -> String {
 /// preserve_siblings=false 时整个节点替换为 {"type":"object","description":hint}
 fn convert_refs_to_hints(schema: &mut Value, preserve_siblings: bool) {
     let mut path = Vec::new();
-    walk_objects(schema, &mut path, &mut |_, map| {
+    walk_objects(schema, &mut path, &mut |path, map| {
+        // 属性名本身叫 "$ref" 时跳过(对齐 CPA isPropertyDefinition / c558d320)
+        if is_property_definition(path) {
+            return;
+        }
         let Some(Value::String(ref_)) = map.get("$ref") else {
             return;
         };
@@ -688,6 +1082,10 @@ fn flatten_any_of_one_of_at(
         Value::Object(map) => {
             let keys: Vec<String> = map.keys().cloned().collect();
             for key in keys {
+                // literal 值是客户端数据,内部 anyOf/oneOf 不展平(对齐 CPA findPathsByFields / c558d320)
+                if is_literal_value_keyword(&key) && !is_property_definition(path) {
+                    continue;
+                }
                 if let Some(child) = map.get_mut(&key) {
                     if matches!(child, Value::Object(_) | Value::Array(_)) {
                         path.push(key);
@@ -1111,16 +1509,23 @@ fn flatten_type_arrays(schema: &mut Value, preserve_native_nullable: bool) {
 
 /// 声明 items 的节点必须 type=array(对齐 CPA sanitizeArrayItems,ffe6ad3c / Issue #6011)。
 /// type 缺失推断 array;type 显式非 array 时剥 items。
+/// add_missing: 内联后仍缺 items 的 array 补 `{"type":"string"}`(对齐 CPA c558d320)。
 /// 后序遍历:先处理子节点,父节点剥 items 时子树已处理完。
-/// 属性名本身叫 "items" 时跳过(is_property_definition)。
-fn sanitize_array_items(schema: &mut Value) {
-    fn visit(value: &mut Value, path: &mut Vec<String>) {
+/// 属性名本身叫 "items" 时跳过(is_property_definition);literal 值不下钻。
+fn sanitize_array_items(schema: &mut Value, add_missing: bool) {
+    fn visit(value: &mut Value, path: &mut Vec<String>, add_missing: bool) {
         let keys: Vec<String> = match value {
             Value::Object(map) => map.keys().cloned().collect(),
             Value::Array(arr) => (0..arr.len()).map(|i| i.to_string()).collect(),
             _ => return,
         };
         for key in keys {
+            if matches!(value, Value::Object(_))
+                && is_literal_value_keyword(&key)
+                && !is_property_definition(path)
+            {
+                continue;
+            }
             let child = match value {
                 Value::Object(map) => map.get_mut(&key),
                 Value::Array(arr) => key.parse::<usize>().ok().and_then(|i| arr.get_mut(i)),
@@ -1129,7 +1534,7 @@ fn sanitize_array_items(schema: &mut Value) {
             if let Some(child) = child {
                 if matches!(child, Value::Object(_) | Value::Array(_)) {
                     path.push(key);
-                    visit(child, path);
+                    visit(child, path, add_missing);
                     path.pop();
                 }
             }
@@ -1137,19 +1542,27 @@ fn sanitize_array_items(schema: &mut Value) {
         let Value::Object(map) = value else {
             return;
         };
-        if !map.contains_key("items") || is_property_definition(path) {
+        if is_property_definition(path) {
             return;
         }
-        // gjson String():缺失/null/"" 都是空串,CPA 据此补 array;其它非 "array" 剥 items
-        // (对齐 CPA 2eb8dd11:比较大小写不敏感,大写 ARRAY 保留 items)
-        if schema_type_string(map.get("type")).is_empty() {
-            map.insert("type".into(), Value::String("array".to_string()));
-        } else if !schema_type_string(map.get("type")).eq_ignore_ascii_case("array") {
-            map.shift_remove("items");
+        if map.contains_key("items") {
+            // gjson String():缺失/null/"" 都是空串,CPA 据此补 array;其它非 "array" 剥 items
+            // (对齐 CPA 2eb8dd11:比较大小写不敏感,大写 ARRAY 保留 items)
+            if schema_type_string(map.get("type")).is_empty() {
+                map.insert("type".into(), Value::String("array".to_string()));
+            } else if !schema_type_string(map.get("type")).eq_ignore_ascii_case("array") {
+                map.shift_remove("items");
+            }
+        } else if add_missing
+            && is_array_declared_type(map.get("type"))
+            && !map.contains_key("$ref")
+        {
+            // 内联后仍缺 items 的 array 补占位;仍挂 $ref 的跳过以免盖掉定义
+            map.insert("items".into(), json!({"type": "string"}));
         }
     }
 
-    visit(schema, &mut Vec::new());
+    visit(schema, &mut Vec::new(), add_missing);
 }
 
 /// 对齐 CPA sanitizeObjectProperties (e1e3a811 / Issue #6394):
@@ -1164,6 +1577,12 @@ fn sanitize_object_properties(schema: &mut Value) {
             _ => return,
         };
         for key in keys {
+            if matches!(value, Value::Object(_))
+                && is_literal_value_keyword(&key)
+                && !is_property_definition(path)
+            {
+                continue;
+            }
             let child = match value {
                 Value::Object(map) => map.get_mut(&key),
                 Value::Array(arr) => key.parse::<usize>().ok().and_then(|i| arr.get_mut(i)),
@@ -1371,20 +1790,32 @@ fn cleanup_required_fields(schema: &mut Value) {
 /// 无 properties 或空 properties 的对象 schema → 补必填 reason 属性;
 /// 有 properties 但无 required(且非顶层)→ 补必填 "_" 布尔属性
 fn add_empty_schema_placeholder(schema: &mut Value) {
-    fn apply(node: &mut Value, is_top_level: bool) {
+    fn apply(node: &mut Value, path: &mut Vec<String>, is_top_level: bool) {
         let Value::Object(map) = node else {
             return;
         };
-        // 先递归子节点(自底向上近似 CPA sortByDepth)
+        // 先递归子节点(自底向上近似 CPA sortByDepth);literal 内不下钻
+        // (对齐 CPA findPaths/WalkSchema / c558d320)
         let keys: Vec<String> = map.keys().cloned().collect();
         for key in keys {
+            if is_literal_value_keyword(&key) && !is_property_definition(path) {
+                continue;
+            }
             if let Some(child) = map.get_mut(&key) {
                 match child {
-                    Value::Object(_) => apply(child, false),
+                    Value::Object(_) => {
+                        path.push(key.clone());
+                        apply(child, path, false);
+                        path.pop();
+                    }
                     Value::Array(arr) => {
-                        for item in arr.iter_mut() {
-                            apply(item, false);
+                        path.push(key.clone());
+                        for (i, item) in arr.iter_mut().enumerate() {
+                            path.push(i.to_string());
+                            apply(item, path, false);
+                            path.pop();
                         }
+                        path.pop();
                     }
                     _ => {}
                 }
@@ -1393,6 +1824,13 @@ fn add_empty_schema_placeholder(schema: &mut Value) {
 
         let is_object = map.get("type").and_then(|t| t.as_str()) == Some("object");
         if !is_object {
+            return;
+        }
+        // 对齐 CPA addEmptySchemaPlaceholder:父节点已是 anyOf/oneOf 多分支 union 时
+        // 不注入 reason/_ 占位(分支自身仍可递归补占位)
+        if map.get("anyOf").is_some_and(|v| v.is_array())
+            || map.get("oneOf").is_some_and(|v| v.is_array())
+        {
             return;
         }
         let props = map.get("properties");
@@ -1432,7 +1870,7 @@ fn add_empty_schema_placeholder(schema: &mut Value) {
             map.insert("required".into(), json!(["_"]));
         }
     }
-    apply(schema, true);
+    apply(schema, &mut Vec::new(), true);
 }
 
 /// 归一化畸形 schema 节点(对齐 CPA normalizeMalformedSchemaObjects):
@@ -1579,7 +2017,9 @@ fn repair_schema_node(
 
     // Gemini/Antigravity 拒无 items 的工具 array schema,也拒 items 配非 array type
     // (对齐 CPA b5cde4ba + ffe6ad3c)。显式非 array type 的 items 留给 sanitize_array_items 剥离。
-    if add_missing_array_items {
+    // 仍挂未解析 $ref 的节点不加占位 items / 不合成 type,否则内联时会变成兄弟键盖掉定义(CPA c558d320)。
+    // 对齐 CPA clone["$ref"] == nil:键缺失或值为 JSON null 都视为无 $ref
+    if add_missing_array_items && clone.get("$ref").map_or(true, Value::is_null) {
         if is_array_declared_type(clone.get("type")) && !clone.contains_key("items") {
             clone.insert("items".to_string(), json!({"type": "string"}));
             modified = true;
@@ -3399,8 +3839,7 @@ mod tests {
             );
 
             assert_eq!(
-                out["properties"]["database"]["properties"]["name"]["type"],
-                "string",
+                out["properties"]["database"]["properties"]["name"]["type"], "string",
                 "[{name}] database.name.type lost: {out}"
             );
             assert_eq!(
@@ -3413,13 +3852,11 @@ mod tests {
                 "[{name}] property readOnly dropped: {out}"
             );
             assert_eq!(
-                out["properties"]["readOnly"]["type"],
-                "boolean",
+                out["properties"]["readOnly"]["type"], "boolean",
                 "[{name}] property readOnly type lost: {out}"
             );
             assert_eq!(
-                out["properties"]["readOnly"]["description"],
-                "Legitimate property named readOnly",
+                out["properties"]["readOnly"]["description"], "Legitimate property named readOnly",
                 "[{name}] property readOnly description lost: {out}"
             );
             assert!(
@@ -3427,8 +3864,7 @@ mod tests {
                 "[{name}] property writeOnly dropped: {out}"
             );
             assert_eq!(
-                out["properties"]["writeOnly"]["type"],
-                "boolean",
+                out["properties"]["writeOnly"]["type"], "boolean",
                 "[{name}] property writeOnly type lost: {out}"
             );
             assert_eq!(
@@ -3438,5 +3874,821 @@ mod tests {
             );
         }
     }
-}
 
+    // --- CPA c558d320 / Issue #6732: 全路径内联、$ref 预算、literal 原样 ---
+
+    #[test]
+    fn test_issue6732_gemini_cleaners_inline_local_defs() {
+        let input = json!({
+            "type": "object",
+            "properties": {"person": {"$ref": "#/$defs/Person"}},
+            "required": ["person"],
+            "$defs": {
+                "Person": {
+                    "type": "object",
+                    "properties": {"name": {"type": "string"}},
+                    "required": ["name"]
+                }
+            }
+        });
+        let out = clean_json_schema_for_gemini(&input);
+        assert_eq!(
+            out["properties"]["person"]["properties"]["name"]["type"], "string",
+            "{out}"
+        );
+        assert!(out.get("$defs").is_none(), "{out}");
+        let s = out.to_string();
+        assert!(!s.contains("See: Person"), "{out}");
+    }
+
+    #[test]
+    fn test_issue6732_gemini_cleaners_inline_property_reuse() {
+        let input = json!({
+            "type": "object",
+            "properties": {
+                "billing": {"type": "object", "properties": {"zip": {"type": "string"}}},
+                "shipping": {"$ref": "#/properties/billing"}
+            }
+        });
+        let out = clean_json_schema_for_gemini(&input);
+        assert_eq!(
+            out["properties"]["shipping"]["properties"]["zip"]["type"], "string",
+            "{out}"
+        );
+    }
+
+    #[test]
+    fn test_issue6732_gemini_cleaners_reuse_same_definition_twice() {
+        let input = json!({
+            "type": "object",
+            "properties": {
+                "billing": {"$ref": "#/$defs/Address"},
+                "shipping": {"$ref": "#/$defs/Address"}
+            },
+            "$defs": {"Address": {"type": "object", "properties": {"zip": {"type": "string"}}}}
+        });
+        let out = clean_json_schema_for_gemini(&input);
+        for field in ["billing", "shipping"] {
+            assert_eq!(
+                out["properties"][field]["properties"]["zip"]["type"], "string",
+                "{field} lost: {out}"
+            );
+        }
+    }
+
+    #[test]
+    fn test_issue6732_wrapped_schema_resolves_against_inner_root() {
+        let inner = json!({
+            "type": "object",
+            "properties": {"person": {"$ref": "#/$defs/Person"}},
+            "required": ["person"],
+            "$defs": {
+                "Person": {
+                    "type": "object",
+                    "properties": {"name": {"type": "string"}},
+                    "required": ["name"]
+                }
+            }
+        });
+        let wrapped = json!({"schema": inner});
+        let out = clean_json_schema_for_antigravity_tool(&wrapped, false);
+        assert_eq!(
+            out["schema"]["properties"]["person"]["properties"]["name"]["type"], "string",
+            "{out}"
+        );
+        assert!(out["schema"].get("$defs").is_none(), "{out}");
+        assert!(!out.to_string().contains("See: Person"), "{out}");
+    }
+
+    #[test]
+    fn test_issue6732_default_literal_preserved_on_json_schema_route() {
+        let input = json!({
+            "type": "object",
+            "properties": {
+                "report": {
+                    "type": "object",
+                    "default": {
+                        "title": "Report",
+                        "format": "pdf",
+                        "id": 7,
+                        "x-owner": "ops"
+                    }
+                }
+            }
+        });
+        let out = clean_json_schema_for_gemini(&input);
+        let def = &out["properties"]["report"]["default"];
+        assert_eq!(def["title"], "Report", "{out}");
+        assert_eq!(def["format"], "pdf", "{out}");
+        assert_eq!(def["id"], 7, "{out}");
+        assert_eq!(def["x-owner"], "ops", "{out}");
+    }
+
+    #[test]
+    fn test_issue6732_example_literals_preserved() {
+        let input = json!({
+            "type": "object",
+            "properties": {
+                "a": {
+                    "type": "string",
+                    "example": {"title": "Hi", "x-owner": "ops", "id": 3},
+                    "examples": [{"title": "Hi2", "x-owner": "ops", "id": 4}]
+                }
+            }
+        });
+        let out = clean_json_schema_for_gemini(&input);
+        let example = &out["properties"]["a"]["example"];
+        assert_eq!(example["title"], "Hi", "{out}");
+        assert_eq!(example["x-owner"], "ops", "{out}");
+        assert_eq!(example["id"], 3, "{out}");
+        let item = &out["properties"]["a"]["examples"][0];
+        assert_eq!(item["title"], "Hi2", "{out}");
+        assert_eq!(item["x-owner"], "ops", "{out}");
+        assert_eq!(item["id"], 4, "{out}");
+    }
+
+    #[test]
+    fn test_issue6732_inline_local_refs_leaves_literal_refs() {
+        let input = json!({
+            "type": "object",
+            "properties": {
+                "a": {
+                    "type": "object",
+                    "default": {"$ref": "#/$defs/Person"}
+                }
+            },
+            "$defs": {
+                "Person": {
+                    "type": "object",
+                    "properties": {"name": {"type": "string"}}
+                }
+            }
+        });
+        let got = inline_local_refs(&input);
+        assert_eq!(
+            got["properties"]["a"]["default"]["$ref"], "#/$defs/Person",
+            "literal $ref inside default was expanded: {got}"
+        );
+        assert!(
+            got["properties"]["a"]["default"]
+                .get("properties")
+                .is_none(),
+            "literal $ref inside default was expanded: {got}"
+        );
+        assert!(
+            got["$defs"]["Person"]["properties"]["name"].is_object(),
+            "InlineLocalRefs must not strip definitions: {got}"
+        );
+    }
+
+    #[test]
+    fn test_issue6732_properties_named_default_and_type_remain_schemas() {
+        let input = json!({
+            "type": "object",
+            "properties": {
+                "default": {"$ref": "#/$defs/Person"},
+                "type": {"type": "string", "title": "Kind"}
+            },
+            "$defs": {
+                "Person": {
+                    "type": "object",
+                    "properties": {"name": {"type": "string"}}
+                }
+            }
+        });
+        let out = clean_json_schema_for_gemini(&input);
+        assert_eq!(
+            out["properties"]["default"]["properties"]["name"]["type"], "string",
+            "{out}"
+        );
+        assert!(
+            out["properties"]["type"].get("title").is_none(),
+            "property named type title should still be cleaned: {out}"
+        );
+    }
+
+    #[test]
+    fn test_issue6732_expansion_budget_bounds_shared_defs() {
+        // diamond D12 → 2^13 叶子;超预算须退化且输出有界,外层仍展开
+        let mut defs = serde_json::Map::new();
+        defs.insert(
+            "leaf0".to_string(),
+            json!({
+                "type": "string",
+                "description": "leaf leaf leaf leaf leaf leaf leaf leaf leaf leaf"
+            }),
+        );
+        for i in 0..13 {
+            let target = if i == 0 {
+                "leaf0".to_string()
+            } else {
+                format!("D{}", i - 1)
+            };
+            defs.insert(
+                format!("D{i}"),
+                json!({
+                    "type": "object",
+                    "properties": {
+                        "a": {"$ref": format!("#/$defs/{target}")},
+                        "b": {"$ref": format!("#/$defs/{target}")}
+                    }
+                }),
+            );
+        }
+        let input = json!({
+            "type": "object",
+            "properties": {"leaf": {"$ref": "#/$defs/D12"}},
+            "$defs": defs
+        });
+        let out = clean_json_schema_for_gemini(&input);
+        let s = out.to_string();
+        assert!(
+            s.len() < 512 * 1024,
+            "diamond expansion unbounded: {} bytes",
+            s.len()
+        );
+        assert!(out["properties"].get("leaf").is_some(), "{out}");
+        assert!(
+            out["properties"]["leaf"]["properties"]["a"]["properties"]
+                .get("a")
+                .is_some(),
+            "outer levels should still expand: {out}"
+        );
+        assert!(out.get("$defs").is_none(), "{out}");
+    }
+
+    #[test]
+    fn test_issue6732_unused_definitions_do_not_consume_expansion_budget() {
+        let big = "x".repeat(280 * 1024);
+        let input = json!({
+            "type": "object",
+            "properties": {"a": {"$ref": "#/$defs/S"}},
+            "$defs": {
+                "Unused": {"type": "string", "description": big},
+                "S": {"type": "string"}
+            }
+        });
+        let out = clean_json_schema_for_gemini(&input);
+        assert_eq!(out["properties"]["a"]["type"], "string", "{out}");
+        assert!(!out.to_string().contains("See: S"), "{out}");
+    }
+
+    #[test]
+    fn test_issue6732_budget_fallback_does_not_copy_large_descriptions() {
+        let big = "x".repeat(280 * 1024);
+        let input = json!({
+            "type": "object",
+            "properties": {
+                "a": {"$ref": "#/$defs/Big"},
+                "b": {"$ref": "#/$defs/Big"},
+                "c": {"$ref": "#/$defs/Big"},
+                "d": {"$ref": "#/$defs/Big"},
+                "e": {"$ref": "#/$defs/Big"},
+                "f": {"$ref": "#/$defs/Big"},
+                "g": {"$ref": "#/$defs/Big"},
+                "h": {"$ref": "#/$defs/Big"}
+            },
+            "$defs": {
+                "Big": {
+                    "type": "object",
+                    "description": big,
+                    "properties": {"name": {"type": "string"}}
+                }
+            }
+        });
+        let out = clean_json_schema_for_gemini(&input);
+        let s = out.to_string();
+        assert!(
+            s.len() < 512 * 1024,
+            "large desc fan-out: {} bytes",
+            s.len()
+        );
+    }
+
+    #[test]
+    fn test_issue6732_array_ref_without_target_items_gets_placeholder() {
+        let input = json!({
+            "type": "object",
+            "properties": {
+                "rows": {"type": "array", "$ref": "#/$defs/Common"}
+            },
+            "$defs": {"Common": {"description": "Rows"}}
+        });
+        let first = clean_json_schema_for_antigravity_tool(&input, false);
+        assert_eq!(
+            first["properties"]["rows"]["items"]["type"], "string",
+            "{first}"
+        );
+        let second = clean_json_schema_for_antigravity_tool(&first, false);
+        assert_eq!(first, second, "not idempotent:\n{first}\n{second}");
+    }
+
+    #[test]
+    fn test_issue6732_array_ref_with_explicit_type_keeps_target_items() {
+        let input = json!({
+            "type": "object",
+            "properties": {
+                "rows": {
+                    "type": "array",
+                    "$ref": "#/$defs/Rows"
+                }
+            },
+            "$defs": {
+                "Rows": {
+                    "type": "array",
+                    "items": {
+                        "type": "object",
+                        "properties": {"name": {"type": "string"}}
+                    }
+                }
+            }
+        });
+        let out = clean_json_schema_for_gemini(&input);
+        assert_eq!(
+            out["properties"]["rows"]["items"]["properties"]["name"]["type"], "string",
+            "target items clobbered: {out}"
+        );
+    }
+
+    #[test]
+    fn test_issue6732_synthesized_type_does_not_override_ref_target() {
+        let input = json!({
+            "$ref": "#/$defs/O",
+            "items": {"type": "integer"},
+            "$defs": {
+                "O": {"type": "object", "properties": {"x": {"type": "string"}}}
+            }
+        });
+        let first = clean_json_schema_for_gemini(&input);
+        assert_eq!(first["type"], "object", "{first}");
+        assert!(first.get("items").is_none(), "{first}");
+        assert_eq!(first["properties"]["x"]["type"], "string", "{first}");
+        let second = clean_json_schema_for_gemini(&first);
+        assert_eq!(first, second, "not idempotent");
+    }
+
+    #[test]
+    fn test_issue6732_property_named_ref_remains_property() {
+        let input = json!({
+            "type": "object",
+            "properties": {"$ref": {"type": "string"}}
+        });
+        let out = clean_json_schema_for_gemini(&input);
+        assert_eq!(out["properties"]["$ref"]["type"], "string", "{out}");
+        assert!(!out.to_string().contains("See:"), "{out}");
+    }
+
+    #[test]
+    fn test_issue6732_property_named_const_remains_property() {
+        let input = json!({
+            "type": "object",
+            "properties": {"const": {"type": "string"}}
+        });
+        let out = clean_json_schema_for_gemini(&input);
+        assert_eq!(out["properties"]["const"]["type"], "string", "{out}");
+        assert!(out.get("enum").is_none(), "{out}");
+    }
+
+    #[test]
+    fn test_issue6732_inline_local_refs_definition_names_keep_schema_semantics() {
+        let input = json!({
+            "$defs": {
+                "S": {"type": "string"},
+                "properties": {"type": "object", "default": {"$ref": "#/$defs/S"}},
+                "default": {
+                    "type": "object",
+                    "properties": {"x": {"$ref": "#/$defs/S"}}
+                }
+            }
+        });
+        let got = inline_local_refs(&input);
+        assert_eq!(
+            got["$defs"]["properties"]["default"]["$ref"], "#/$defs/S",
+            "literal default inside def named properties expanded: {got}"
+        );
+        assert_eq!(
+            got["$defs"]["default"]["properties"]["x"]["type"], "string",
+            "def named default not resolved: {got}"
+        );
+    }
+
+    #[test]
+    fn test_issue6732_dependencies_name_map_keeps_schema_semantics() {
+        let input = json!({
+            "type": "object",
+            "dependencies": {
+                "default": {"properties": {"x": {"$ref": "#/definitions/S"}}}
+            },
+            "definitions": {"S": {"type": "string"}}
+        });
+        let got = inline_local_refs(&input);
+        assert_eq!(
+            got["dependencies"]["default"]["properties"]["x"]["type"], "string",
+            "{got}"
+        );
+        assert!(
+            got["dependencies"]["default"]["properties"]["x"]
+                .get("$ref")
+                .is_none(),
+            "{got}"
+        );
+    }
+
+    #[test]
+    fn test_issue6732_target_nested_definitions_exempt_from_budget() {
+        let big = "x".repeat(280 * 1024);
+        let person = json!({
+            "type": "object",
+            "properties": {"name": {"type": "string"}},
+            "$defs": {"Unused": {"type": "string", "description": big}}
+        });
+        let property_ref = json!({
+            "type": "object",
+            "properties": {"person": {"$ref": "#/$defs/Person"}},
+            "$defs": {"Person": person.clone()}
+        });
+        let root_ref = json!({
+            "$ref": "#/$defs/Person",
+            "$defs": {"Person": person}
+        });
+        for (name, input) in [("propertyRef", property_ref), ("rootRef", root_ref)] {
+            let out = clean_json_schema_for_gemini(&input);
+            let name_path = if name == "rootRef" {
+                &out["properties"]["name"]["type"]
+            } else {
+                &out["properties"]["person"]["properties"]["name"]["type"]
+            };
+            assert_eq!(name_path, "string", "{name}: {out}");
+            assert!(out.get("$defs").is_none(), "{name}: {out}");
+        }
+    }
+
+    #[test]
+    fn test_issue6732_budget_fallback_still_resolves_siblings() {
+        let big = "x".repeat(280 * 1024);
+        let input = json!({
+            "type": "object",
+            "properties": {
+                "a": {
+                    "$ref": "#/$defs/Big",
+                    "properties": {"x": {"$ref": "#/$defs/S"}}
+                }
+            },
+            "$defs": {
+                "Big": {"type": "object", "description": big},
+                "S": {"type": "string"}
+            }
+        });
+        let out = clean_json_schema_for_gemini(&input);
+        assert_eq!(
+            out["properties"]["a"]["properties"]["x"]["type"], "string",
+            "{out}"
+        );
+        assert!(!out.to_string().contains("\"$ref\""), "{out}");
+    }
+
+    #[test]
+    fn test_issue6732_ref_sibling_name_map_references_still_expand() {
+        let input = json!({
+            "type": "object",
+            "properties": {
+                "a": {
+                    "$ref": "#/$defs/Base",
+                    "properties": {"x": {"$ref": "#/$defs/S"}}
+                }
+            },
+            "$defs": {
+                "Base": {"type": "object"},
+                "S": {"type": "string"}
+            }
+        });
+        let out = clean_json_schema_for_gemini(&input);
+        assert_eq!(
+            out["properties"]["a"]["properties"]["x"]["type"], "string",
+            "{out}"
+        );
+    }
+
+    #[test]
+    fn test_issue6732_small_target_fan_out_stays_bounded() {
+        let mut props = serde_json::Map::new();
+        for i in 0..2000 {
+            props.insert(format!("p{i}"), json!({"$ref": "#/$defs/S"}));
+        }
+        let input = json!({
+            "type": "object",
+            "properties": props,
+            "$defs": {
+                "S": {"type": "string", "description": "x".repeat(512)}
+            }
+        });
+        let out = clean_json_schema_for_gemini(&input);
+        let n = out.to_string().len();
+        assert!(n < 512 * 1024, "small-target fan-out = {n}");
+    }
+
+    /// 节点同时有 properties + type:array + items:object sanitizer 先跑后应剥 items
+    /// (对齐 CPA c558d320 sanitizeObjectProperties 先于 sanitizeArrayItems)。
+    #[test]
+    fn test_c558d320_sanitize_object_before_array_strips_leftover_items() {
+        let input = json!({
+            "type": "object",
+            "properties": {
+                "weird": {
+                    "type": "array",
+                    "properties": {"name": {"type": "string"}},
+                    "items": {"type": "string"}
+                }
+            }
+        });
+        let out = clean_json_schema_for_gemini(&input);
+        let weird = &out["properties"]["weird"];
+        assert_eq!(weird["type"], "object", "{out}");
+        assert!(
+            weird.get("items").is_none(),
+            "leftover items after object sanitize: {out}"
+        );
+        assert_eq!(weird["properties"]["name"]["type"], "string", "{out}");
+    }
+
+    /// AG 路径保留 singular example;占位器不得递归进 example 塞 `_` / required。
+    #[test]
+    fn test_c558d320_ag_placeholder_skips_example_literal() {
+        let input = json!({
+            "type": "object",
+            "properties": {
+                "payload": {
+                    "type": "object",
+                    "properties": {"id": {"type": "string"}},
+                    "required": ["id"],
+                    "example": {
+                        "type": "object",
+                        "properties": {"demo": {"type": "string"}}
+                    }
+                }
+            },
+            "required": ["payload"]
+        });
+        let out = clean_json_schema_for_antigravity(&input);
+        let example = &out["properties"]["payload"]["example"];
+        assert!(
+            example.get("_").is_none()
+                && example
+                    .get("required")
+                    .and_then(|r| r.as_array())
+                    .map(|a| !a.iter().any(|v| v == "_"))
+                    .unwrap_or(true),
+            "placeholder injected into example literal: {out}"
+        );
+        // example 对象本身若被当 schema 清洗,还会被塞 properties.reason;二者都不应出现
+        assert!(
+            example.pointer("/properties/_").is_none(),
+            "underscore inside example.properties: {out}"
+        );
+        assert_eq!(
+            example["properties"]["demo"]["type"], "string",
+            "example body should stay intact: {out}"
+        );
+    }
+
+    /// AG 占位:带 anyOf 的 object union 节点不得再注入 `_`/`reason`(对齐 CPA c558d320)。
+    #[test]
+    fn test_c558d320_ag_placeholder_skips_anyof_union_node() {
+        let input = json!({
+            "type": "object",
+            "properties": {
+                "choice": {
+                    "type": "object",
+                    "anyOf": [
+                        {
+                            "type": "object",
+                            "properties": {"a": {"type": "string"}},
+                            "required": ["a"]
+                        },
+                        {
+                            "type": "object",
+                            "properties": {"b": {"type": "integer"}},
+                            "required": ["b"]
+                        }
+                    ],
+                    "properties": {
+                        "reason": {"type": "string"}
+                    }
+                }
+            },
+            "required": ["choice"]
+        });
+        let out = clean_json_schema_for_antigravity(&input);
+        let choice = &out["properties"]["choice"];
+        assert!(
+            choice.get("anyOf").is_some(),
+            "AG Tool 应保留多分支 anyOf: {out}"
+        );
+        assert!(
+            choice.pointer("/properties/_").is_none(),
+            "union 节点不应注入 properties._: {out}"
+        );
+        assert!(
+            choice
+                .get("required")
+                .and_then(|r| r.as_array())
+                .map(|a| !a.iter().any(|v| v == "_"))
+                .unwrap_or(true),
+            "union 节点不应注入 required:[_]: {out}"
+        );
+        // 原有 reason 属性保留;不得被占位 reason-only properties 整表替换
+        assert_eq!(
+            choice["properties"]["reason"]["type"], "string",
+            "原有 reason 属性应保留: {out}"
+        );
+        assert_ne!(
+            choice.get("required"),
+            Some(&json!(["reason"])),
+            "不应把 union 节点改成占位 required:[reason]: {out}"
+        );
+    }
+
+    /// Gemini 保留约束:default 内 anyOf 不得被 flatten。
+    #[test]
+    fn test_c558d320_gemini_flatten_skips_default_literal_anyof() {
+        let input = json!({
+            "type": "object",
+            "properties": {
+                "report": {
+                    "type": "object",
+                    "default": {"anyOf": [{"type": "string"}]}
+                }
+            }
+        });
+        let out = clean_json_schema_for_gemini(&input);
+        let def = &out["properties"]["report"]["default"];
+        assert!(
+            def.get("anyOf").is_some(),
+            "default.anyOf was flattened away: {out}"
+        );
+        assert_eq!(def["anyOf"][0]["type"], "string", "{out}");
+        assert!(
+            def.get("type").is_none() || def["type"] != "string",
+            "default should not be projected to type:string: {out}"
+        );
+    }
+
+    /// properties 下名为 $ref 且值为 string 的畸形 schema 不得转 hint。
+    #[test]
+    fn test_c558d320_property_named_ref_string_value_not_hinted() {
+        let input = json!({
+            "type": "object",
+            "properties": {
+                "$ref": "https://example.com/schemas/thing.json"
+            }
+        });
+        let out = clean_json_schema_for_gemini(&input);
+        // normalize 可能把 string property 包一层;关键是不出现 See: hint
+        assert!(!out.to_string().contains("See:"), "{out}");
+        assert!(
+            out["properties"].get("$ref").is_some(),
+            "property named $ref disappeared: {out}"
+        );
+    }
+
+    /// $ref 键存在但值为 null 时仍允许补 items(对齐 CPA clone[$ref]==nil)。
+    #[test]
+    fn test_c558d320_null_ref_still_allows_array_items_placeholder() {
+        let input = json!({
+            "type": "object",
+            "properties": {
+                "rows": {
+                    "type": "array",
+                    "$ref": null
+                }
+            }
+        });
+        let out = clean_json_schema_for_gemini(&input);
+        assert_eq!(
+            out["properties"]["rows"]["items"]["type"], "string",
+            "null $ref should not block items placeholder: {out}"
+        );
+    }
+
+    #[test]
+    fn test_issue6732_clean_inlining_strips_definitions_from_intermediate() {
+        let person = json!({
+            "type": "object",
+            "properties": {"name": {"type": "string"}},
+            "$defs": {
+                "Unused": {
+                    "type": "string",
+                    "description": "x".repeat(280 * 1024)
+                }
+            }
+        });
+        let input = json!({
+            "type": "object",
+            "properties": {
+                "p0": {"$ref": "#/$defs/Person"},
+                "p1": {"$ref": "#/$defs/Person"}
+            },
+            "$defs": {"Person": person}
+        });
+        let got = inline_local_refs_for_clean(&input);
+        let n = got.to_string().len();
+        assert!(n < 64 * 1024, "clean inlining intermediate = {n}");
+        assert!(got.get("$defs").is_none(), "{got}");
+        assert!(got.pointer("/properties/p0/$defs").is_none(), "{got}");
+        assert_eq!(
+            got["properties"]["p1"]["properties"]["name"]["type"], "string",
+            "{got}"
+        );
+    }
+
+    #[test]
+    fn test_issue6732_omitted_fallback_description_not_charged() {
+        let input = json!({
+            "type": "object",
+            "properties": {
+                "a": {"$ref": "#/$defs/A"},
+                "b": {"$ref": "#/$defs/B"}
+            },
+            "$defs": {
+                "A": {
+                    "type": "string",
+                    "description": "x".repeat(262142)
+                },
+                "B": {
+                    "type": "object",
+                    "properties": {"name": {"type": "string"}}
+                }
+            }
+        });
+        let out = clean_json_schema_for_gemini(&input);
+        assert_eq!(
+            out["properties"]["b"]["properties"]["name"]["type"], "string",
+            "{out}"
+        );
+    }
+
+    #[test]
+    fn test_issue6732_escaped_description_fan_out_stays_bounded() {
+        let mut props = serde_json::Map::new();
+        for i in 0..8 {
+            props.insert(format!("p{i}"), json!({"$ref": "#/$defs/Big"}));
+        }
+        let input = json!({
+            "type": "object",
+            "properties": props,
+            "$defs": {
+                "Big": {
+                    "type": "object",
+                    "description": "<".repeat(32 * 1024),
+                    "properties": {"name": {"type": "string"}}
+                }
+            }
+        });
+        let out = clean_json_schema_for_gemini(&input);
+        let n = out.to_string().len();
+        assert!(n < 512 * 1024, "escaped-description fan-out = {n}");
+    }
+
+    #[test]
+    fn test_issue6732_nested_unused_definitions_graph_does_not_consume_budget() {
+        let mut nested_defs = serde_json::Map::new();
+        nested_defs.insert(
+            "Leaf".to_string(),
+            json!({
+                "type": "string",
+                "description": "x".repeat(1024)
+            }),
+        );
+        for i in 0..256 {
+            nested_defs.insert(
+                format!("U{i}"),
+                json!({"$ref": "#/properties/a/$defs/Leaf"}),
+            );
+        }
+        let input = json!({
+            "type": "object",
+            "properties": {
+                "person": {"$ref": "#/$defs/Person"},
+                "a": {
+                    "type": "object",
+                    "$defs": nested_defs
+                }
+            },
+            "required": ["person"],
+            "$defs": {
+                "Person": {
+                    "type": "object",
+                    "properties": {"name": {"type": "string"}},
+                    "required": ["name"]
+                }
+            }
+        });
+        let out = clean_json_schema_for_gemini(&input);
+        assert_eq!(
+            out["properties"]["person"]["properties"]["name"]["type"], "string",
+            "{out}"
+        );
+        assert!(out.get("$defs").is_none(), "{out}");
+        assert!(out.pointer("/properties/a/$defs").is_none(), "{out}");
+    }
+}
