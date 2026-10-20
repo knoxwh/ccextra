@@ -492,17 +492,11 @@ impl ChatRelay {
     /// length/content_filter 原样保留;saw_tool_call 按 args 校验在
     /// tool_calls/length 间定;否则用已存值(空值由 map_finish_reason 兜底)
     fn effective_finish_reason(&self) -> String {
-        if self.finish_reason == "length" || self.finish_reason == "content_filter" {
-            return self.finish_reason.clone();
-        }
-        if self.saw_tool_call {
-            return if self.has_valid_tool_call_arguments() {
-                "tool_calls".to_string()
-            } else {
-                "length".to_string()
-            };
-        }
-        self.finish_reason.clone()
+        resolve_finish_reason(
+            &self.finish_reason,
+            self.saw_tool_call,
+            self.has_valid_tool_call_arguments(),
+        )
     }
 
     /// 校验全部累积 tool arguments 可修复为合法 JSON object
@@ -712,6 +706,28 @@ pub(super) fn map_finish_reason(reason: &str) -> &'static str {
         "content_filter" => "refusal",
         _ => "end_turn",
     }
+}
+
+/// 终态 finish_reason 选择(对齐 CPA effectiveOpenAIFinishReason):
+/// length/content_filter 原样保留;有工具调用时按 args 校验在
+/// tool_calls/length 间定;否则用上游原值(空值由 map_finish_reason 兜底)。
+/// 流式与非流式共用,避免两条路径给出不同的 stop_reason。
+pub(super) fn resolve_finish_reason(
+    finish_reason: &str,
+    saw_tool_call: bool,
+    args_valid: bool,
+) -> String {
+    if finish_reason == "length" || finish_reason == "content_filter" {
+        return finish_reason.to_string();
+    }
+    if saw_tool_call {
+        return if args_valid {
+            "tool_calls".to_string()
+        } else {
+            "length".to_string()
+        };
+    }
+    finish_reason.to_string()
 }
 
 /// Claude 直通:字节级转发,不解析

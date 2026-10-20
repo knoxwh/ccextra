@@ -10,7 +10,7 @@
 use serde_json::{json, Value};
 use std::collections::HashMap;
 
-use super::chat::map_finish_reason;
+use super::chat::{map_finish_reason, resolve_finish_reason};
 use super::responses::{
     codex_stop_reason, map_stop_reason, sanitize_tool_id, stop_sequence, web_search_result_content,
 };
@@ -319,6 +319,9 @@ pub fn openai_chat_to_anthropic(body: &Value) -> Option<Value> {
     if !reasoning_texts.is_empty() {
         content.push(json!({
             "type": "thinking",
+            // 多段 reasoning 来自不同字段(reasoning_content / details / reasoning),
+            // 用换行分隔;流式 join("") 拼的是同一条 reasoning 的连续 delta,
+            // 两者语义不同,不强行对齐
             "thinking": reasoning_texts.join("\n"),
             "signature": ""
         }));
@@ -344,6 +347,8 @@ pub fn openai_chat_to_anthropic(body: &Value) -> Option<Value> {
 
     // tool_calls
     let mut args_buf = String::new();
+    // 非流式同样按 args 校验决定工具是否真的完整(对齐流式 resolve_finish_reason)
+    let mut tool_args_valid = true;
     if let Some(calls) = message.get("tool_calls").and_then(|v| v.as_array()) {
         for call in calls {
             has_tool_use = true;
@@ -359,10 +364,13 @@ pub fn openai_chat_to_anthropic(body: &Value) -> Option<Value> {
             let input = if fixed.trim().is_empty() {
                 json!({})
             } else {
-                serde_json::from_str::<Value>(&fixed)
-                    .ok()
-                    .filter(|v| v.is_object())
-                    .unwrap_or_else(|| json!({}))
+                match serde_json::from_str::<Value>(&fixed) {
+                    Ok(v) if v.is_object() => v,
+                    _ => {
+                        tool_args_valid = false;
+                        json!({})
+                    }
+                }
             };
             content.push(json!({"type": "tool_use", "id": id, "name": name, "input": input}));
         }
@@ -374,11 +382,23 @@ pub fn openai_chat_to_anthropic(body: &Value) -> Option<Value> {
         .map(super::extract_usage_chat)
         .unwrap_or((0, 0, 0, 0));
 
-    let stop_reason = if has_tool_use {
-        "tool_use"
-    } else {
-        map_finish_reason(finish_reason)
-    };
+    // reasoning-only 空回合兜底(对齐流式 finalize 与 sub2api
+    // chatMessageToAnthropicBlocks:text=="" 且无 tool_calls 时 text=reasoning),
+    // 避免非流式请求拿到零可见内容回合。
+    let has_text = content
+        .iter()
+        .any(|b| b.get("type").and_then(|v| v.as_str()) == Some("text"));
+    if !has_text && !has_tool_use && !reasoning_texts.is_empty() {
+        content.push(json!({"type": "text", "text": reasoning_texts.join("\n")}));
+    }
+
+    // 与流式共用同一选择:length/content_filter 不被 tool_use 覆盖,
+    // 非法 args 落 max_tokens(截断),而非谎报 tool_use。
+    let stop_reason = map_finish_reason(&resolve_finish_reason(
+        finish_reason,
+        has_tool_use,
+        tool_args_valid,
+    ));
     build_message(
         body,
         content,
@@ -716,6 +736,62 @@ mod tests {
         assert_eq!(out["stop_reason"], "tool_use");
         assert_eq!(out["usage"]["input_tokens"], 20);
         assert_eq!(out["usage"]["cache_read_input_tokens"], 10);
+    }
+
+    #[test]
+    fn test_chat_nonstream_truncated_tool_args_finish_max_tokens() {
+        // 非流与流式同语义:args 非法 JSON 时降级 max_tokens(对齐 CPA
+        // effectiveOpenAIFinishReason),不谎报 tool_use
+        let body = json!({
+            "id": "c1",
+            "model": "gpt-5",
+            "choices": [{
+                "message": {
+                    "role": "assistant",
+                    "content": "",
+                    "tool_calls": [{
+                        "id": "call_1",
+                        "type": "function",
+                        "function": {"name": "write_file", "arguments": "{\"path\":\"/tmp/a"}
+                    }]
+                },
+                "finish_reason": "stop"
+            }],
+            "usage": {"prompt_tokens": 5, "completion_tokens": 5}
+        });
+        let out = openai_chat_to_anthropic(&body).unwrap();
+        assert_eq!(out["stop_reason"], "max_tokens");
+    }
+
+    #[test]
+    fn test_chat_nonstream_reasoning_only_emits_text() {
+        // 纯 reasoning 回合(无 text / 无 tool)必须产出客户端可接受文本,
+        // 与流式 fallback 对齐
+        let body = json!({
+            "id": "c1",
+            "model": "gpt-5",
+            "choices": [{
+                "message": {"role": "assistant", "reasoning_content": "plan A", "content": ""},
+                "finish_reason": "stop"
+            }],
+            "usage": {"prompt_tokens": 1, "completion_tokens": 1}
+        });
+        let out = openai_chat_to_anthropic(&body).unwrap();
+        let types: Vec<&str> = out["content"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .map(|b| b["type"].as_str().unwrap())
+            .collect();
+        assert!(types.contains(&"text"), "{types:?}");
+        let text = out["content"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .find(|b| b["type"] == "text")
+            .unwrap();
+        assert_eq!(text["text"], "plan A");
+        assert_eq!(out["stop_reason"], "end_turn");
     }
 
     #[test]
