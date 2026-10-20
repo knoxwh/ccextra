@@ -1211,15 +1211,6 @@ pub(crate) async fn execute_upstream_request(
     })
 }
 
-/// 401 刷新重试后的门禁 status:无论成败均采用重试码,
-/// 使 unfit / AG·Kimi 清账本 / encrypted trim 看到最终上游结果而非首发 401。
-fn gate_status_after_auth_retry(
-    _initial: axum::http::StatusCode,
-    retry: axum::http::StatusCode,
-) -> axum::http::StatusCode {
-    retry
-}
-
 pub(crate) async fn deliver_response(
     state: &AppState,
     prepared: &mut PreparedMessageRequest,
@@ -1262,8 +1253,9 @@ pub(crate) async fn deliver_response(
                     }
                     let retry = prepared.send_retry(upstream_client, user_agents).await?;
                     final_status = retry.status;
-                    // 成败均更新门禁 status(对齐成功分支);后续 unfit 等看最终码
-                    status = gate_status_after_auth_retry(status, retry.status);
+                    // 成败均采用重试码:后续 unfit / AG·Kimi 清账本 / encrypted trim
+                    // 必须看到最终上游结果,而非首发 401(401 不触发任何门禁)
+                    status = retry.status;
                     if retry.status.is_success() {
                         executed.upstream = Some(retry);
                         retried_ok = true;
@@ -1904,17 +1896,22 @@ mod tests {
     }
 
     #[test]
-    fn auth_retry_failure_uses_retry_status_for_gates() {
-        let initial = axum::http::StatusCode::UNAUTHORIZED;
+    fn auth_retry_gates_see_retry_status_not_initial_401() {
+        // 真实覆盖在 deliver_response:401 刷新重试后 `status = retry.status`,
+        // 门禁(400/422)看到最终码;首发 401 本身不触发任何门禁。
+        // 本测仅钉住门禁谓词的上界:400 命中、401 不命中。
+        // 钉住 deliver 那行赋值需 OAuth 刷新 + 两跳 mock 上游,留给集成测。
         let retry = axum::http::StatusCode::BAD_REQUEST;
-        let effective = gate_status_after_auth_retry(initial, retry);
-        assert_eq!(effective, axum::http::StatusCode::BAD_REQUEST);
-        assert!(
-            effective.as_u16() == 400 || effective.as_u16() == 422,
-            "门禁应看到 400/422 而非首发 401"
-        );
-        // 若失败路径仍用 initial,本断言会红
-        assert_ne!(effective, initial);
+        assert!(crate::http::unfit::detect_unfit_from_error(
+            retry.as_u16(),
+            r#"{"error":{"message":"unsupported response_format"}}"#
+        )
+        .is_some());
+        assert!(crate::http::unfit::detect_unfit_from_error(
+            axum::http::StatusCode::UNAUTHORIZED.as_u16(),
+            r#"{"error":{"message":"unsupported response_format"}}"#
+        )
+        .is_none());
     }
 
     /// Codex 401 helper:无 chatgpt-account-id → 插入后须 reencode 为 zstd。

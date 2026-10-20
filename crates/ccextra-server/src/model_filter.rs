@@ -26,7 +26,7 @@ pub fn filter_models(
     }
     if matchers.is_empty() {
         // patterns 非空(上面已 early-return)且无一合法 → 配置脚枪
-        return Err(format!("antigravity_models 全部为非法 glob({invalid} 条)"));
+        return Err(format!("全部为非法 glob({invalid} 条)"));
     }
     Ok(models
         .into_iter()
@@ -91,10 +91,7 @@ mod tests {
         // `[` 单独是非法 glob
         let patterns: Vec<String> = vec!["[".into(), "[unterminated".into()];
         let err = filter_models(models, &patterns).unwrap_err();
-        assert!(
-            err.contains("antigravity_models 全部为非法 glob"),
-            "got {err}"
-        );
+        assert!(err.contains("全部为非法 glob"), "got {err}");
     }
 
     #[test]

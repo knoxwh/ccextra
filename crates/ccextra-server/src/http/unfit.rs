@@ -131,16 +131,22 @@ pub fn adapt_request_for_unfit(
 ) -> bool {
     let mut adapted = false;
 
-    // RefusesFormat: schema 注入 system/instructions, 移除 response_format
+    // RefusesFormat: schema 注入 system/instructions, 注入成功后移除 response_format
     if registry.is_unfit(provider, model, UnfitKind::RefusesFormat) {
-        if let Some(schema) = extract_and_remove_response_format(body) {
-            inject_schema_instruction(body, &schema, protocol);
-            adapted = true;
-            tracing::info!(
-                provider,
-                model,
-                "unfit: response_format → system instruction"
-            );
+        // 先探测再注入:注入失败(协议无对应字段 / body 缺 messages)时
+        // 不得剥掉 response_format,否则 body 被改却不会重试
+        if let Some((schema, slot)) = response_format_schema(body) {
+            if inject_schema_instruction(body, &schema, protocol) {
+                if let Some(obj) = body.as_object_mut() {
+                    obj.remove(slot);
+                }
+                adapted = true;
+                tracing::info!(
+                    provider,
+                    model,
+                    "unfit: response_format → system instruction"
+                );
+            }
         }
     }
 
@@ -171,55 +177,64 @@ pub fn adapt_request_for_unfit(
     adapted
 }
 
-fn extract_and_remove_response_format(body: &mut serde_json::Value) -> Option<serde_json::Value> {
+/// 只读探测 response_format schema 及承载它的顶层字段;不做修改。
+/// 移除由调用方在注入成功后执行。
+fn response_format_schema(body: &serde_json::Value) -> Option<(serde_json::Value, &'static str)> {
     // Anthropic: output_config.format.json_schema
     if let Some(schema) = body.pointer("/output_config/format/json_schema") {
-        let schema = schema.clone();
-        body.as_object_mut()?.remove("output_config");
-        return Some(schema);
+        return Some((schema.clone(), "output_config"));
     }
     // OpenAI Chat: response_format.json_schema.schema(优先取真正 schema)
     if let Some(schema) = body.pointer("/response_format/json_schema/schema") {
-        let schema = schema.clone();
-        body.as_object_mut()?.remove("response_format");
-        return Some(schema);
+        return Some((schema.clone(), "response_format"));
     }
     if let Some(schema) = body.pointer("/response_format/json_schema") {
-        let schema = schema.clone();
-        body.as_object_mut()?.remove("response_format");
-        return Some(schema);
+        return Some((schema.clone(), "response_format"));
     }
     None
 }
 
+/// 返回是否真的注入了指令;协议无对应字段时返回 false,调用方不得置 adapted。
 fn inject_schema_instruction(
     body: &mut serde_json::Value,
     schema: &serde_json::Value,
     protocol: Protocol,
-) {
+) -> bool {
     let instruction = format!(
         "\n\nIMPORTANT: Respond with valid JSON matching this schema:\n{}",
         serde_json::to_string_pretty(schema).unwrap_or_else(|_| schema.to_string())
     );
 
     match protocol {
-        Protocol::Claude => match body.get_mut("system") {
-            Some(serde_json::Value::String(s)) => {
-                s.push_str(&instruction);
+        Protocol::Claude => {
+            match body.get_mut("system") {
+                Some(serde_json::Value::String(s)) => {
+                    s.push_str(&instruction);
+                }
+                Some(serde_json::Value::Array(arr)) => {
+                    arr.push(serde_json::json!({"type": "text", "text": instruction}));
+                }
+                _ => {
+                    body["system"] = serde_json::json!(instruction);
+                }
             }
-            Some(serde_json::Value::Array(arr)) => {
-                arr.push(serde_json::json!({"type": "text", "text": instruction}));
-            }
-            _ => {
-                body["system"] = serde_json::json!(instruction);
-            }
-        },
+            true
+        }
         Protocol::OpenAiChat => {
-            if let Some(msgs) = body.get_mut("messages").and_then(|m| m.as_array_mut()) {
-                if let Some(sys) = msgs
-                    .iter_mut()
-                    .find(|m| m.get("role").and_then(|r| r.as_str()) == Some("system"))
-                {
+            let Some(msgs) = body.get_mut("messages").and_then(|m| m.as_array_mut()) else {
+                return false;
+            };
+            // 转换后前缀消息可能是 system 或 developer(o 系列 / GPT-5 族),
+            // 两者都算系统位;都未命中才新建,且用 system。
+            let sys_pos = msgs.iter().position(|m| {
+                matches!(
+                    m.get("role").and_then(|r| r.as_str()),
+                    Some("system") | Some("developer")
+                )
+            });
+            match sys_pos {
+                Some(pos) => {
+                    let sys = &mut msgs[pos];
                     match sys.get_mut("content") {
                         Some(serde_json::Value::String(s)) => s.push_str(&instruction),
                         Some(serde_json::Value::Array(arr)) => {
@@ -229,24 +244,27 @@ fn inject_schema_instruction(
                             sys["content"] = serde_json::json!(instruction);
                         }
                     }
-                } else {
-                    msgs.insert(
-                        0,
-                        serde_json::json!({"role": "system", "content": instruction}),
-                    );
+                }
+                None => msgs.insert(
+                    0,
+                    serde_json::json!({"role": "system", "content": instruction}),
+                ),
+            }
+            true
+        }
+        Protocol::OpenAiResponses => {
+            match body.get_mut("instructions") {
+                Some(serde_json::Value::String(s)) => {
+                    s.push_str(&instruction);
+                }
+                _ => {
+                    body["instructions"] = serde_json::json!(instruction.trim_start_matches('\n'));
                 }
             }
+            true
         }
-        Protocol::OpenAiResponses => match body.get_mut("instructions") {
-            Some(serde_json::Value::String(s)) => {
-                s.push_str(&instruction);
-            }
-            _ => {
-                body["instructions"] = serde_json::json!(instruction.trim_start_matches('\n'));
-            }
-        },
-        // Gemini/AG: 本批不扩 thinkingConfig 大改;无匹配字段时 adapt 保持 false
-        Protocol::Gemini | Protocol::Antigravity => {}
+        // Gemini/AG: 无 responseMimeType 路径,不注入
+        Protocol::Gemini | Protocol::Antigravity => false,
     }
 }
 
@@ -495,6 +513,83 @@ mod tests {
         assert!(sys.contains("IMPORTANT: Respond with valid JSON"));
         // 不得写顶层 Anthropic system
         assert!(body.get("system").is_none());
+    }
+
+    /// o 系列 / GPT-5 族转换后前缀是 developer,注入须落到该消息,
+    /// 不得再插一条 system 造成双前缀。
+    #[test]
+    fn adapt_chat_refuses_format_injects_into_developer_message() {
+        let reg = marked(UnfitKind::RefusesFormat);
+        let mut body = serde_json::json!({
+            "messages": [
+                {"role": "developer", "content": [{"type": "text", "text": "base"}]},
+                {"role": "user", "content": "hi"}
+            ],
+            "response_format": {
+                "type": "json_schema",
+                "json_schema": {"schema": {"type": "object"}}
+            }
+        });
+        assert!(adapt_request_for_unfit(
+            &mut body,
+            "p",
+            "m",
+            &reg,
+            Protocol::OpenAiChat
+        ));
+        let msgs = body["messages"].as_array().unwrap();
+        assert_eq!(msgs.len(), 2, "不得插入额外前缀消息");
+        assert_eq!(msgs[0]["role"], "developer");
+        let parts = msgs[0]["content"].as_array().unwrap();
+        assert_eq!(parts[0]["text"], "base");
+        assert!(parts[1]["text"]
+            .as_str()
+            .unwrap()
+            .contains("IMPORTANT: Respond with valid JSON"));
+    }
+
+    /// Gemini/AG 无注入字段:schema 探测得到但注入失败,不得置 adapted,
+    /// 也不得剥掉原 response_format(body 原样返回)。
+    #[test]
+    fn adapt_gemini_refuses_format_does_not_claim_adaptation() {
+        let reg = marked(UnfitKind::RefusesFormat);
+        let original = serde_json::json!({
+            "contents": [{"role": "user", "parts": [{"text": "hi"}]}],
+            "response_format": {
+                "type": "json_schema",
+                "json_schema": {"schema": {"type": "object"}}
+            }
+        });
+        let mut body = original.clone();
+        assert!(!adapt_request_for_unfit(
+            &mut body,
+            "p",
+            "m",
+            &reg,
+            Protocol::Gemini
+        ));
+        assert_eq!(body, original, "response_format 不得被剥掉");
+    }
+
+    /// Chat 形 body 缺 messages 时注入失败,同样不得剥 response_format。
+    #[test]
+    fn adapt_chat_refuses_format_without_messages_keeps_response_format() {
+        let reg = marked(UnfitKind::RefusesFormat);
+        let original = serde_json::json!({
+            "response_format": {
+                "type": "json_schema",
+                "json_schema": {"schema": {"type": "object"}}
+            }
+        });
+        let mut body = original.clone();
+        assert!(!adapt_request_for_unfit(
+            &mut body,
+            "p",
+            "m",
+            &reg,
+            Protocol::OpenAiChat
+        ));
+        assert_eq!(body, original);
     }
 
     #[test]
