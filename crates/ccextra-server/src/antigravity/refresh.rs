@@ -1,4 +1,4 @@
-use super::constants::REFRESH_SKEW_SECS;
+use super::constants::{REFRESH_MAX_RETRIES, REFRESH_SKEW_SECS};
 use super::credential::AntigravityCredential;
 use super::{oauth, project, store};
 use anyhow::{anyhow, Result};
@@ -20,7 +20,7 @@ async fn lock_for_refresh_token(refresh_token: &str) -> Arc<Mutex<()>> {
         .clone()
 }
 
-/// 检查并刷新凭证（如果需要）
+/// 检查并刷新凭证(如果需要);仅对明确可重试 HTTP 5xx 退避重试
 /// skew_secs: 提前刷新的时间窗口（秒），对齐 CPA antigravityRequestTokenSafetyWindow = 300s
 pub async fn refresh_if_needed(
     cred: &mut AntigravityCredential,
@@ -40,17 +40,43 @@ pub async fn refresh_if_needed(
     tracing::debug!("刷新 Antigravity token: {}", cred.email);
 
     let client = oauth::http_client(proxy_url)?;
-    let token = oauth::refresh_token(&client, &cred.refresh_token).await?;
-    let new_refresh = if token.refresh_token.trim().is_empty() {
-        None
-    } else {
-        Some(token.refresh_token)
-    };
-    cred.apply_tokens(token.access_token, new_refresh, token.expires_in);
-
-    tracing::info!("Antigravity token 刷新成功: {}", cred.email);
-
-    Ok(true)
+    let mut last_err = None;
+    for attempt in 0..REFRESH_MAX_RETRIES {
+        if attempt > 0 {
+            tokio::time::sleep(std::time::Duration::from_secs(attempt as u64)).await;
+        }
+        match oauth::refresh_token(&client, &cred.refresh_token).await {
+            Ok(token) => {
+                let new_refresh = if token.refresh_token.trim().is_empty() {
+                    None
+                } else {
+                    Some(token.refresh_token)
+                };
+                cred.apply_tokens(token.access_token, new_refresh, token.expires_in);
+                tracing::info!("Antigravity token 刷新成功: {}", cred.email);
+                return Ok(true);
+            }
+            Err(e) => {
+                if !e.retryable {
+                    return Err(anyhow!("{e}"));
+                }
+                tracing::warn!(
+                    "Antigravity token 刷新第 {} 次失败(可重试): {}",
+                    attempt + 1,
+                    e
+                );
+                last_err = Some(e);
+            }
+        }
+    }
+    Err(anyhow!(
+        "{}",
+        last_err.unwrap_or_else(|| oauth::RefreshError {
+            status: None,
+            message: "antigravity token refresh failed".into(),
+            retryable: false,
+        })
+    ))
 }
 
 fn usable(cred: &AntigravityCredential, rejected_token: Option<&str>) -> bool {

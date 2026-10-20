@@ -248,23 +248,64 @@ pub async fn poll_for_token(client: &Client, device: &DeviceCodeResponse) -> Res
     }
 }
 
+/// 刷新结果错误分类:仅明确 HTTP 5xx 可重试;其余(含传输/解码/discovery)不盲重放
+#[derive(Debug)]
+pub struct RefreshError {
+    pub status: Option<u16>,
+    pub message: String,
+    pub retryable: bool,
+}
+
+impl std::fmt::Display for RefreshError {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self.status {
+            Some(s) => write!(
+                f,
+                "xai token refresh failed with status {s}: {}",
+                self.message
+            ),
+            None => write!(f, "xai token refresh failed: {}", self.message),
+        }
+    }
+}
+
+impl std::error::Error for RefreshError {}
+
+/// 仅明确 HTTP 5xx 可重试(对齐 Claude oauth::RefreshError)
+pub fn refresh_status_retryable(status: u16) -> bool {
+    status >= 500
+}
+
+/// 刷新 token;失败不自动重试——由 refresh.rs 按 retryable 决定
 pub async fn refresh_token(
     client: &Client,
     token_endpoint: &str,
     refresh: &str,
-) -> Result<TokenData> {
+) -> Result<TokenData, RefreshError> {
     let refresh = refresh.trim();
     if refresh.is_empty() {
-        return Err(anyhow!("xai token refresh: missing refresh token"));
+        return Err(RefreshError {
+            status: None,
+            message: "missing refresh token".into(),
+            retryable: false,
+        });
     }
     let endpoint = if token_endpoint.trim().is_empty() {
-        let disco = discover(client).await?;
-        disco.token_endpoint
+        match discover(client).await {
+            Ok(disco) => disco.token_endpoint,
+            Err(e) => {
+                return Err(RefreshError {
+                    status: None,
+                    message: format!("discovery failed: {e}"),
+                    retryable: false,
+                })
+            }
+        }
     } else {
         token_endpoint.trim().to_string()
     };
 
-    let resp = client
+    let resp = match client
         .post(&endpoint)
         .header("Content-Type", "application/x-www-form-urlencoded")
         .header("Accept", "application/json")
@@ -275,21 +316,53 @@ pub async fn refresh_token(
         ])
         .send()
         .await
-        .context("xai token refresh")?;
+    {
+        Ok(r) => r,
+        Err(e) => {
+            return Err(RefreshError {
+                status: None,
+                message: format!("request failed: {e}"),
+                retryable: false,
+            })
+        }
+    };
 
     let status = resp.status();
     if !status.is_success() {
-        // 错误正文有界读取(256 KiB);读取失败返回空,对齐原 unwrap_or_default
         let body = crate::limits::read_error_text(resp).await;
-        return Err(anyhow!("xai token refresh failed: status {status}: {body}"));
+        let code = status.as_u16();
+        return Err(RefreshError {
+            status: Some(code),
+            message: body,
+            retryable: refresh_status_retryable(code),
+        });
     }
-    let bytes = crate::limits::read_success_body(resp)
-        .await
-        .context("xai decode refresh token response")?;
-    let data: TokenData =
-        serde_json::from_slice(&bytes).context("xai decode refresh token response")?;
+    let bytes = match crate::limits::read_success_body(resp).await {
+        Ok(b) => b,
+        Err(e) => {
+            return Err(RefreshError {
+                status: None,
+                message: format!("read response: {e}"),
+                retryable: false,
+            })
+        }
+    };
+    let data: TokenData = match serde_json::from_slice(&bytes) {
+        Ok(d) => d,
+        Err(e) => {
+            return Err(RefreshError {
+                status: None,
+                message: format!("parse response: {e}"),
+                retryable: false,
+            })
+        }
+    };
     if data.access_token.trim().is_empty() {
-        return Err(anyhow!("xai token refresh: empty access token in response"));
+        return Err(RefreshError {
+            status: None,
+            message: "empty access token in response".into(),
+            retryable: false,
+        });
     }
     Ok(data)
 }
@@ -297,6 +370,15 @@ pub async fn refresh_token(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn refresh_status_only_5xx_retryable() {
+        assert!(refresh_status_retryable(500));
+        assert!(refresh_status_retryable(503));
+        assert!(!refresh_status_retryable(400));
+        assert!(!refresh_status_retryable(401));
+        assert!(!refresh_status_retryable(429));
+    }
 
     #[test]
     fn test_validate_oauth_endpoint() {
@@ -390,6 +472,7 @@ mod tests {
                     refresh_token(&client, &server.url, "refresh-tok")
                         .await
                         .map(|data| data.access_token)
+                        .map_err(anyhow::Error::from)
                 };
                 if expected.is_empty() {
                     assert_eq!(result.unwrap(), if device { "uc" } else { "at" });

@@ -10,3 +10,6 @@ pub const CLI_CHAT_PROXY_BASE_URL: &str = "https://cli-chat-proxy.grok.com/v1";
 
 /// 提前刷新窗口 (秒): 对齐 CLIProxyAPI refreshLead = 5 * time.Minute
 pub const REFRESH_SKEW_SECS: i64 = 300;
+
+/// 刷新 HTTP 最大尝试次数(仅明确 5xx 可重试,对齐 Claude/Codex)
+pub const REFRESH_MAX_RETRIES: usize = 3;

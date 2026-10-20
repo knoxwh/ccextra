@@ -1,6 +1,6 @@
 // xAI Token 刷新与运行时单飞锁 (按 refresh_token singleflight,对齐 Codex/AG)
 
-use super::constants::REFRESH_SKEW_SECS;
+use super::constants::{REFRESH_MAX_RETRIES, REFRESH_SKEW_SECS};
 use super::credential::XAICredential;
 use super::{oauth, store};
 use anyhow::{anyhow, Result};
@@ -22,7 +22,7 @@ async fn lock_for_refresh_token(refresh_token: &str) -> Arc<Mutex<()>> {
         .clone()
 }
 
-/// 检查并刷新凭证（如果需要）
+/// 检查并刷新凭证(如果需要);仅对明确可重试 HTTP 5xx 退避重试
 pub async fn refresh_if_needed(
     cred: &mut XAICredential,
     proxy_url: Option<&str>,
@@ -46,22 +46,44 @@ pub async fn refresh_if_needed(
     tracing::debug!("刷新 xAI token: {}", email_or_sub);
 
     let client = oauth::http_client(proxy_url)?;
-    let token = oauth::refresh_token(&client, &cred.token_endpoint, &cred.refresh_token).await?;
-    let new_refresh = if token.refresh_token.trim().is_empty() {
-        None
-    } else {
-        Some(token.refresh_token)
-    };
-    let new_id = if token.id_token.trim().is_empty() {
-        None
-    } else {
-        Some(token.id_token)
-    };
-    cred.apply_tokens(token.access_token, new_refresh, new_id, token.expires_in);
-
-    tracing::info!("xAI token 刷新成功: {}", email_or_sub);
-
-    Ok(true)
+    let mut last_err = None;
+    for attempt in 0..REFRESH_MAX_RETRIES {
+        if attempt > 0 {
+            tokio::time::sleep(std::time::Duration::from_secs(attempt as u64)).await;
+        }
+        match oauth::refresh_token(&client, &cred.token_endpoint, &cred.refresh_token).await {
+            Ok(token) => {
+                let new_refresh = if token.refresh_token.trim().is_empty() {
+                    None
+                } else {
+                    Some(token.refresh_token)
+                };
+                let new_id = if token.id_token.trim().is_empty() {
+                    None
+                } else {
+                    Some(token.id_token)
+                };
+                cred.apply_tokens(token.access_token, new_refresh, new_id, token.expires_in);
+                tracing::info!("xAI token 刷新成功: {}", email_or_sub);
+                return Ok(true);
+            }
+            Err(e) => {
+                if !e.retryable {
+                    return Err(anyhow!("{e}"));
+                }
+                tracing::warn!("xAI token 刷新第 {} 次失败(可重试): {}", attempt + 1, e);
+                last_err = Some(e);
+            }
+        }
+    }
+    Err(anyhow!(
+        "{}",
+        last_err.unwrap_or_else(|| oauth::RefreshError {
+            status: None,
+            message: "xai token refresh failed".into(),
+            retryable: false,
+        })
+    ))
 }
 
 fn usable(cred: &XAICredential, rejected_token: Option<&str>) -> bool {

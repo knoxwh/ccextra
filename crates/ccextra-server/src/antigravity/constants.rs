@@ -105,6 +105,9 @@ pub fn version_from_user_agent(user_agent: &str) -> String {
 /// 到期前 300s 视为需刷新(对齐 CPA antigravityRequestTokenSafetyWindow = 5 * time.Minute)
 pub const REFRESH_SKEW_SECS: i64 = 300;
 
+/// 刷新 HTTP 最大尝试次数(仅明确 5xx 可重试,对齐 Claude/Codex)
+pub const REFRESH_MAX_RETRIES: usize = 3;
+
 /// 项目缓存下的凭证目录
 pub const DEFAULT_AUTH_DIR: &str = ".cache/antigravity";
 

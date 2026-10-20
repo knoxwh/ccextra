@@ -141,14 +141,47 @@ async fn fetch_user_email_at(
     Ok(email)
 }
 
-pub async fn refresh_token(client: &Client, refresh: &str) -> Result<TokenResponse> {
+/// 刷新结果错误分类:仅明确 HTTP 5xx 可重试;其余(含传输/解码)不盲重放
+#[derive(Debug)]
+pub struct RefreshError {
+    pub status: Option<u16>,
+    pub message: String,
+    pub retryable: bool,
+}
+
+impl std::fmt::Display for RefreshError {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self.status {
+            Some(s) => write!(
+                f,
+                "antigravity token refresh failed with status {s}: {}",
+                self.message
+            ),
+            None => write!(f, "antigravity token refresh failed: {}", self.message),
+        }
+    }
+}
+
+impl std::error::Error for RefreshError {}
+
+/// 仅明确 HTTP 5xx 可重试(对齐 Claude oauth::RefreshError)
+pub fn refresh_status_retryable(status: u16) -> bool {
+    status >= 500
+}
+
+/// 刷新 token;失败不自动重试——由 refresh.rs 按 retryable 决定
+pub async fn refresh_token(client: &Client, refresh: &str) -> Result<TokenResponse, RefreshError> {
     let refresh = refresh.trim();
     if refresh.is_empty() {
-        return Err(anyhow!("antigravity token refresh: missing refresh token"));
+        return Err(RefreshError {
+            status: None,
+            message: "missing refresh token".into(),
+            retryable: false,
+        });
     }
     // 不设手动 Host 头:reqwest 0.13(hyper 1.x)下会与 :authority 并存,
     // Google 前端以 HTTP/2 PROTOCOL_ERROR RST 该流;端点本身即 oauth2.googleapis.com
-    let resp = client
+    let resp = match client
         .post(TOKEN_ENDPOINT)
         .header("Content-Type", "application/x-www-form-urlencoded")
         .header("User-Agent", TOKEN_REFRESH_UA)
@@ -160,8 +193,55 @@ pub async fn refresh_token(client: &Client, refresh: &str) -> Result<TokenRespon
         ])
         .send()
         .await
-        .context("antigravity token refresh")?;
-    decode_token(resp, "token refresh").await
+    {
+        Ok(r) => r,
+        // 传输错误:上游可能已消费 refresh,不可重放
+        Err(e) => {
+            return Err(RefreshError {
+                status: None,
+                message: format!("request failed: {e}"),
+                retryable: false,
+            })
+        }
+    };
+    let status = resp.status();
+    if !status.is_success() {
+        let text = crate::limits::read_error_text(resp).await;
+        let code = status.as_u16();
+        return Err(RefreshError {
+            status: Some(code),
+            message: text,
+            retryable: refresh_status_retryable(code),
+        });
+    }
+    let bytes = match crate::limits::read_success_body(resp).await {
+        Ok(b) => b,
+        Err(e) => {
+            return Err(RefreshError {
+                status: None,
+                message: format!("read response: {e}"),
+                retryable: false,
+            })
+        }
+    };
+    let token: TokenResponse = match serde_json::from_slice(&bytes) {
+        Ok(t) => t,
+        Err(e) => {
+            return Err(RefreshError {
+                status: None,
+                message: format!("parse response: {e}"),
+                retryable: false,
+            })
+        }
+    };
+    if token.access_token.trim().is_empty() {
+        return Err(RefreshError {
+            status: None,
+            message: "empty access token".into(),
+            retryable: false,
+        });
+    }
+    Ok(token)
 }
 
 async fn decode_token(resp: reqwest::Response, what: &str) -> Result<TokenResponse> {
@@ -195,6 +275,15 @@ fn http_err(what: &str, status: u16, body: &str) -> anyhow::Error {
 mod tests {
     use super::*;
     use crate::antigravity::constants::CLIENT_ID;
+
+    #[test]
+    fn refresh_status_only_5xx_retryable() {
+        assert!(refresh_status_retryable(500));
+        assert!(refresh_status_retryable(503));
+        assert!(!refresh_status_retryable(400));
+        assert!(!refresh_status_retryable(401));
+        assert!(!refresh_status_retryable(429));
+    }
 
     #[test]
     fn auth_url_has_offline_consent_and_scopes() {
