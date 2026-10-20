@@ -174,6 +174,7 @@ fn mock_state() -> AppState {
         logging: LoggingConfig {
             level: "info".into(),
             request_body: false,
+            log_dir: None,
         },
         secret: None,
         upstream: UpstreamClient::new(None),
@@ -1354,6 +1355,7 @@ fn reload_returning_secret(secret: Option<String>) -> ReloadFn {
                 logging: LoggingConfig {
                     level: "info".into(),
                     request_body: false,
+                    log_dir: None,
                 },
                 secret,
                 proxy_url: None,
@@ -1423,6 +1425,7 @@ async fn test_reload_applies_normalize_and_proxy() {
                 logging: LoggingConfig {
                     level: "debug".into(),
                     request_body: true,
+                    log_dir: None,
                 },
                 secret: None,
                 proxy_url: Some("socks5://127.0.0.1:1080".into()),

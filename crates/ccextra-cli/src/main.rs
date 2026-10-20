@@ -336,7 +336,7 @@ async fn main() -> Result<()> {
                 providers,
                 payload_rules: cfg.payload.unwrap_or_default(),
                 normalize: cfg.normalize,
-                logging: cfg.logging,
+                logging: with_pinned_log_dir(cfg.logging, &config_path),
                 secret: cfg.secret_key,
                 proxy_url: cfg.server.proxy_url,
                 antigravity: cfg.antigravity,
@@ -352,7 +352,7 @@ async fn main() -> Result<()> {
 
     let runtime = RuntimeConfig {
         normalize: config.normalize,
-        logging: config.logging,
+        logging: with_pinned_log_dir(config.logging, &cli.config),
         secret: config.secret_key,
         upstream: UpstreamClient::with_ant_pool(
             config.server.proxy_url,
@@ -486,6 +486,15 @@ fn pin_path(config_path: &str, raw: &str) -> PathBuf {
         Some(dir) => dir.join(path),
         None => path,
     }
+}
+
+/// 把 request_body 落盘目录钉到配置文件旁 `logs`(不新增 YAML 字段)
+fn with_pinned_log_dir(
+    mut logging: ccextra_server::http::LoggingConfig,
+    config_path: &str,
+) -> ccextra_server::http::LoggingConfig {
+    logging.log_dir = Some(pin_path(config_path, "logs"));
+    logging
 }
 
 /// 相对路径钉在配置文件所在目录,不跟进程 cwd 走
@@ -975,13 +984,13 @@ fn build_user_agents(config: Option<&config::UserAgents>) -> UserAgentSet {
 mod tests {
     use super::{
         build_user_agents, load_refreshed_providers, load_thinking_registry, pin_auth_dir,
-        pin_path, provider_refresh_config, refresh_providers, Arc, Config, ProviderConfig,
-        RuntimeConfig, RwLock, UpstreamClient,
+        pin_path, provider_refresh_config, refresh_providers, with_pinned_log_dir, Arc, Config,
+        ProviderConfig, RuntimeConfig, RwLock, UpstreamClient,
     };
     use ccextra_server::antigravity::resolve_auth_dir as resolve_antigravity_auth_dir;
     use ccextra_server::xai::resolve_auth_dir as resolve_xai_auth_dir;
     use std::io::Write;
-    use std::path::PathBuf;
+    use std::path::{Path, PathBuf};
 
     #[test]
     fn antigravity_ua_defaults_to_request_ua_constant() {
@@ -1020,6 +1029,7 @@ mod tests {
                 logging: LoggingConfig {
                     level: "info".into(),
                     request_body: false,
+                    log_dir: None,
                 },
                 secret: None,
                 upstream: UpstreamClient::new(None),
@@ -1188,6 +1198,27 @@ xai_auth_dir: new-xai
         assert_eq!(
             pin_path("/tmp/proj/config.yaml", "/abs/models.json"),
             PathBuf::from("/abs/models.json")
+        );
+        assert_eq!(
+            pin_path("/tmp/proj/config.yaml", "logs"),
+            PathBuf::from("/tmp/proj/logs")
+        );
+    }
+
+    #[test]
+    fn with_pinned_log_dir_sets_config_sibling_logs() {
+        use ccextra_server::http::LoggingConfig;
+        let logging = with_pinned_log_dir(
+            LoggingConfig {
+                level: "info".into(),
+                request_body: true,
+                log_dir: None,
+            },
+            "/tmp/proj/config.yaml",
+        );
+        assert_eq!(
+            logging.log_dir.as_deref(),
+            Some(Path::new("/tmp/proj/logs"))
         );
     }
 

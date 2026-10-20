@@ -216,6 +216,9 @@ pub struct NormalizeConfig {
 pub struct LoggingConfig {
     pub level: String,
     pub request_body: bool,
+    /// request_body 落盘目录;YAML 不配置,由 CLI 钉到配置文件旁 `logs`
+    #[serde(default, skip_deserializing)]
+    pub log_dir: Option<std::path::PathBuf>,
 }
 
 async fn health_check() -> &'static str {

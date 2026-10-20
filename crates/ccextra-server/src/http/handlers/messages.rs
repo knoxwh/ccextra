@@ -953,17 +953,23 @@ pub(crate) async fn prepare_message_request(
     };
     let log_stem = upstream_log_stem(&sess, ts, request_seq, &proto);
     if log_request_body {
-        let _ = std::fs::create_dir_all("logs");
+        let log_dir = config_snapshot
+            .runtime
+            .logging
+            .log_dir
+            .as_deref()
+            .unwrap_or_else(|| std::path::Path::new("logs"));
+        let _ = std::fs::create_dir_all(log_dir);
         let dump_obj = json!({
             "inbound_headers": inbound_headers_json(headers),
             "upstream_body": body_json,
         });
-        let path = format!("logs/upstream_request_{log_stem}.json");
+        let path = log_dir.join(format!("upstream_request_{log_stem}.json"));
         let dumped = serde_json::to_vec_pretty(&dump_obj)
             .ok()
             .and_then(|bytes| std::fs::write(&path, bytes).ok());
         if dumped.is_none() {
-            tracing::warn!(path = %path, "上游请求诊断信息落盘失败");
+            tracing::warn!(path = %path.display(), "上游请求诊断信息落盘失败");
         }
     }
 
