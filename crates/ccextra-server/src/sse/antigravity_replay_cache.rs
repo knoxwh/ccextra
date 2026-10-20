@@ -414,7 +414,7 @@ impl AgReplayCache {
     }
 
     /// 将缓存签名 / 原生 id 回填到 Antigravity 外层 body 的 `request` 对象，并执行
-    /// 降级 / 首 functionCall 哨兵 / 配对回退兜底（[`prepare_ag_replay_request`]）。
+    /// 降级 / 首 functionCall 哨兵 / 配对回退兜底（[`prepare_ag_replay_request_with_tools`]）。
     /// 账本 miss 时兜底照跑：历史里的稳定 id 仍须降级为合成 id。
     #[cfg(test)]
     pub fn apply_to_antigravity_body(

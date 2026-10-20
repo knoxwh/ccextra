@@ -26,7 +26,7 @@ pub const MAX_ITEMS_PER_ENTRY: usize = 4096;
 pub const MAX_BYTES_PER_ENTRY: usize = 16 << 20;
 
 /// 是否为可入库的 native thoughtSignature（非空且非 bypass 哨兵）。
-pub fn has_native_thought_signature(signature: &str) -> bool {
+fn has_native_thought_signature(signature: &str) -> bool {
     let signature = signature.trim();
     !signature.is_empty() && signature != GEMINI_SKIP_THOUGHT_SIGNATURE_VALIDATOR
 }
@@ -63,7 +63,7 @@ fn strip_part_thought_signatures(part: &mut Value) {
 }
 
 /// 规范化单条 replay item；非法返回 None。
-pub fn normalize_ag_replay_item(item: &Value) -> Option<Value> {
+fn normalize_ag_replay_item(item: &Value) -> Option<Value> {
     let ty = item
         .get("type")
         .and_then(|v| v.as_str())
@@ -1186,11 +1186,13 @@ fn apply_function_call_item(
 /// 将缓存 items 注入到 Antigravity `request` 对象（含 `contents`）。
 /// 逐条顺序回放（对齐 CPA sequential 路径：逐条 eligibility filter，不合格即跳过）：签名回填 +
 /// 稳定 id → 原生 id 回写 + 缺失 functionCall 插回（G5）。返回是否发生变更。
-pub fn apply_ag_replay_items(request: &mut Value, items: &[Value]) -> bool {
+#[cfg(test)]
+fn apply_ag_replay_items(request: &mut Value, items: &[Value]) -> bool {
     apply_ag_replay_items_with_tools(request, items, AgReplayToolContext::default())
 }
 
-/// 同 [`apply_ag_replay_items`]，带工具上下文（schema default 归一 / 旧式 id 身份回写）。
+/// 逐条顺序回放账本 items（签名回填 + 稳定 id → 原生 id 回写 + G5 插回），带工具上下文
+/// （schema default 归一 / 旧式 id 身份回写）。返回是否发生变更。
 pub fn apply_ag_replay_items_with_tools(
     request: &mut Value,
     items: &[Value],
@@ -1348,7 +1350,7 @@ pub fn repair_unsigned_first_function_calls(request: &mut Value) -> usize {
 }
 
 /// functionCall / functionResponse 配对校验（对齐 CPA signature.ValidateGeminiFunctionCallPairing）。
-pub fn gemini_function_call_pairing_valid(request: &Value) -> bool {
+fn gemini_function_call_pairing_valid(request: &Value) -> bool {
     gemini_function_call_pairing_error(request).is_none()
 }
 
@@ -1615,14 +1617,14 @@ pub struct AgReplayPrepareReport {
 ///    ensureAntigravityGeminiBoundaryUserContent：剥尾部纯 thought → 首 user → 尾 user；
 ///    角色归一可能让尾部 functionResponse 回合变成 model）。
 #[cfg(test)]
-pub fn prepare_ag_replay_request(
+fn prepare_ag_replay_request(
     request: &mut Value,
     items: Option<&[Value]>,
 ) -> AgReplayPrepareReport {
     prepare_ag_replay_request_with_tools(request, items, AgReplayToolContext::default())
 }
 
-/// 同 [`prepare_ag_replay_request`]，带工具上下文（见 [`AgReplayToolContext`]）。
+/// 外发前处理链（步骤见上），带工具上下文（见 [`AgReplayToolContext`]）。
 pub fn prepare_ag_replay_request_with_tools(
     request: &mut Value,
     items: Option<&[Value]>,
@@ -3180,7 +3182,13 @@ mod tests {
         // 无账本但历史含稳定 id（回放路径仍激活）→ 同样 400
         let mut req = original.clone();
         let report = prepare_ag_replay_request(&mut req, None);
-        assert!(report.pairing_error.is_some());
+        assert_eq!(
+            report.pairing_error.as_deref(),
+            Some(
+                "antigravity executor: invalid Gemini function call history: \
+                 request.contents[2]: functionResponse count 1 does not match pending functionCall count 2"
+            )
+        );
     }
 
     /// 门控对齐 CPA：无账本、无稳定 id 的无效历史同样 400（CPA 只按模型门控）。
@@ -3947,7 +3955,7 @@ mod tests {
         let mut no_id = req.clone();
         let report = prepare_ag_replay_request(&mut no_id, Some(&no_id_items));
         assert!(!report.applied);
-        assert!(report.pairing_error.is_some());
+        assert_eq!(report.pairing_error.as_deref(), Some(expected.as_str()));
     }
 
     /// 原生 / 稳定 id 已在某个 functionCall 上（客户端改过该 call）→ 绝不再插第二份。
