@@ -6,7 +6,7 @@
 //!
 //! 本模块对这些块内的列表项进行确定性排序（按字母序），与 cccf 的
 //! `sort-stabilization` 扩展保持一致。仅处理 **system** 提示——消息不处理。
-//! 工具定义排序已由 [`sort_tools_deterministically`] 处理，此处不重复。
+//! 工具定义排序已由 [`sort_tools_deterministically`](super::tool_def_normalize::sort_tools_deterministically) 处理，此处不重复。
 //!
 //! # 范围
 //!

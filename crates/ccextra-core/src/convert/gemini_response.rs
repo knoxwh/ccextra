@@ -95,7 +95,7 @@ pub struct GeminiStreamState {
 }
 
 impl GeminiStreamState {
-    /// 是否观察到非空 finishReason(供 Antigravity [DONE] 收尾判断)。
+    /// 是否观察到非空 finishReason(供 Antigravity `[DONE]` 收尾判断)。
     pub fn has_finish_reason(&self) -> bool {
         self.has_finish
     }
@@ -579,7 +579,7 @@ pub fn finalize_gemini_stream(chunk: &Value, state: &mut GeminiStreamState) -> V
     events
 }
 
-/// [DONE]/EOF force 收尾(对齐 CPA appendFinalEvents(force=true)):
+/// `[DONE]`/EOF force 收尾(对齐 CPA appendFinalEvents(force=true)):
 /// 无内容先补空 text 块;然后关块 + message_delta(缺 usage 用已缓存值,默认 0)
 /// MALFORMED 无 tool_call:发 api_error,不补空 text / message_delta
 pub fn force_finalize_gemini_stream(state: &mut GeminiStreamState) -> Vec<Value> {

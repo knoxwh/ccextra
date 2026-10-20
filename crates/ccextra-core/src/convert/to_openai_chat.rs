@@ -442,7 +442,7 @@ fn keeps_bailian_tool_stream(model_name: &str) -> bool {
 
 /// payload 覆盖之后再跑一遍 OpenAI Chat 出站守卫。
 ///
-/// - kimi:再跑 [`normalize_kimi_temperature`](防 payload 写回非法 temperature)
+/// - kimi:再跑 `normalize_kimi_temperature`(防 payload 写回非法 temperature)
 /// - 非 qwen/glm:剥 `tool_stream`(百炼文档仅 Qwen/GLM 支持;其它上游可能拒未知键)
 /// - 需要 `max_completion_tokens` 的模型:把 payload 的 `max_tokens` 迁过去
 ///   (语义对齐 CPA `NormalizeOpenAIMaxTokens`;双字段并存时以 payload 的

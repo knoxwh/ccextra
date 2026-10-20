@@ -220,7 +220,7 @@ fn messages_array(body: &Value, kind: ApiKind) -> Option<&Vec<Value>> {
 /// 因此为它们跳过漂移检测不会损失任何东西。
 ///
 /// 启发式：`tools` 缺失/null/为空 且 非 system 消息数为 ≤ 1。消息数排除
-/// OpenAI 的 `system`/`developer` 前缀条目，与 [`extract_early_messages`]
+/// OpenAI 的 `system`/`developer` 前缀条目，与 `extract_early_messages`
 /// 保持一致，使附属判断与它所守护的哈希在什么算作"消息"上一致。
 pub fn is_ancillary_request(body: &Value, kind: ApiKind) -> bool {
     // 当 tools 缺失、为 null 或为空数组时，它被视为"空"——三种情况都表示
@@ -645,7 +645,7 @@ const UNSTABLE_PARENT_LOG_INTERVAL_MS: u64 = 5_000;
 /// 两个 map 共享一个互斥锁，使每个请求的两次比较都保持原子性：
 ///
 /// - `cache`：会话身份 → 完整 [`StructuralHash`]。
-/// - `parent_cache`：父级 bucket → [`ParentBaseline`]。
+/// - `parent_cache`：父级 bucket → `ParentBaseline`。
 #[derive(Clone)]
 pub struct DriftState {
     cache: Arc<Mutex<DriftCaches>>,
