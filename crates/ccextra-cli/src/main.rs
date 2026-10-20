@@ -275,7 +275,7 @@ async fn main() -> Result<()> {
         );
     }
 
-    // 静态配置自身先硬校验:alias/name 冲突属用户配置错误,启动即失败
+    // 静态配置自身先硬校验:跨 provider alias 冲突属用户配置错误,启动即失败
     ccextra_core::route::validate_providers(&config.providers)?;
 
     // 合并所有 providers
@@ -285,7 +285,7 @@ async fn main() -> Result<()> {
     all_providers = merge_providers(all_providers, claude_providers);
     all_providers = merge_providers(all_providers, antigravity_providers);
 
-    // 合并后复查:merge_providers 已按 alias/name 去重,这里只兜底告警,
+    // 合并后复查:merge_providers 已按 alias 去重,这里只兜底告警,
     // 不再让后台拉取的动态 provider 决定服务能否启动
     if let Err(e) = ccextra_core::route::validate_providers(&all_providers) {
         tracing::warn!("合并后 provider 校验未通过(继续启动): {e}");
@@ -642,8 +642,9 @@ async fn run_antigravity_injection(state: AppState) {
 }
 
 /// 合并配置文件与动态注入的 providers(多账号暴露同一批模型)。
-/// alias 或 name 与已合并集合撞车时丢弃注入模型并告警:动态 provider 由后台拉取,
-/// 用户不可控,不能让它把启动/刷新校验打挂。静态配置自身的冲突仍由启动校验硬失败。
+/// 仅按 alias 去重:alias 与已合并集合撞车时丢弃注入模型并告警。
+/// name 允许重复;alias 可等于其他模型的 name。动态 provider 由后台拉取,
+/// 用户不可控,不能让它把启动/刷新校验打挂。静态配置自身的 alias 冲突仍由启动校验硬失败。
 fn merge_providers(
     mut base: Vec<ProviderConfig>,
     injected: Vec<ProviderConfig>,
@@ -651,11 +652,6 @@ fn merge_providers(
     let mut seen_aliases: std::collections::HashSet<String> = base
         .iter()
         .flat_map(|p| p.models.iter().map(|m| m.alias.clone()))
-        .collect();
-    // name 也要收集:alias 与 name 跨模型撞车会让 resolve_route 的 alias 优先产生歧义
-    let mut seen_names: std::collections::HashSet<String> = base
-        .iter()
-        .flat_map(|p| p.models.iter().map(|m| m.name.clone()))
         .collect();
     for mut p in injected {
         p.models.retain(|m| {
@@ -666,29 +662,11 @@ fn merge_providers(
                     m.name,
                     m.alias
                 );
-                return false;
+                false
+            } else {
+                seen_aliases.insert(m.alias.clone());
+                true
             }
-            if seen_names.contains(&m.name) {
-                tracing::warn!(
-                    "name 与已有 alias/name 冲突,丢弃 {} 的模型 {}(alias {})",
-                    p.name,
-                    m.name,
-                    m.alias
-                );
-                return false;
-            }
-            if seen_aliases.contains(&m.name) || seen_names.contains(&m.alias) {
-                tracing::warn!(
-                    "alias↔name 交叉冲突,丢弃 {} 的模型 name={} alias={}",
-                    p.name,
-                    m.name,
-                    m.alias
-                );
-                return false;
-            }
-            seen_aliases.insert(m.alias.clone());
-            seen_names.insert(m.name.clone());
-            true
         });
         base.push(p);
     }
@@ -1267,17 +1245,18 @@ xai_auth_dir: new-xai
         assert_eq!(merged[1].models.len(), 0);
     }
 
-    /// 动态 provider 的 alias 与静态 name 撞车必须丢弃,否则启动校验硬失败
+    /// name 可重复:注入模型 alias 与静态 alias 不同时即使 name 相同也保留
     #[test]
-    fn merge_providers_drops_injected_alias_matching_static_name() {
+    fn merge_providers_keeps_injected_when_name_matches_but_alias_differs() {
         let base = vec![provider("static", vec![model("gemini-3-pro", "my-gemini")])];
         let injected = vec![provider(
             "dynamic",
             vec![model("gemini-3-pro", "gemini-3-pro")],
         )];
         let merged = merge_providers(base, injected);
-        assert_eq!(merged[1].models.len(), 0);
-        // 合并结果通过启动校验
+        assert_eq!(merged[1].models.len(), 1);
+        assert_eq!(merged[1].models[0].alias, "gemini-3-pro");
+        // 合并结果通过启动校验(仅 alias 唯一)
         ccextra_core::route::validate_providers(&merged).unwrap();
     }
 
