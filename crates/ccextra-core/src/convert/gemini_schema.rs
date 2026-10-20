@@ -7,7 +7,8 @@
 //
 // 只接受单个 schema 值,禁止传整个请求文档(对齐 CPA 注释:
 // 清洗按 key 名重写,作用于会话历史会误删工具参数)
-// unsupported 关键字含 contentMediaType/contentEncoding(CPA a43026d7 / #6699)
+// unsupported 关键字含 contentMediaType/contentEncoding(CPA a43026d7 / #6699)、
+// readOnly/writeOnly(CPA 154d5144 / #6778)
 
 use serde_json::{json, Map, Value};
 
@@ -1244,6 +1245,9 @@ fn remove_unsupported_keywords(schema: &mut Value, opts: CleanOptions) {
         // 对齐 CPA a43026d7 / Issue #6699: JSON Schema Content Vocabulary 注解
         "contentMediaType",
         "contentEncoding",
+        // 对齐 CPA 154d5144 / Issue #6778: JSON Schema 访问注解(Firestore/MCP 常见)
+        "readOnly",
+        "writeOnly",
     ]);
     if opts.antigravity_semantics {
         keywords.push("not");
@@ -3269,4 +3273,170 @@ mod tests {
             );
         }
     }
+    #[test]
+    fn test_removes_readonly_writeonly_keyword_issue_6778() {
+        // 对齐 CPA 154d5144 / Issue #6778: readOnly/writeOnly 注解剥离,
+        // properties 同名合法属性保留。
+        let schema = json!({
+            "type": "object",
+            "$schema": "http://json-schema.org/draft-04/schema#",
+            "readOnly": false,
+            "writeOnly": false,
+            "properties": {
+                "parent": { "type": "string", "description": "Parent resource name" },
+                "database": {
+                    "type": "object",
+                    "properties": {
+                        "name": {
+                            "type": "string",
+                            "description": "Database resource name",
+                            "readOnly": true
+                        },
+                        "uid": { "type": "string", "readOnly": true },
+                        "createTime": { "type": "string", "readOnly": true },
+                        "etag": { "type": "string", "writeOnly": true },
+                        "locationId": { "type": "string" }
+                    }
+                },
+                "itemsList": {
+                    "type": "array",
+                    "items": {
+                        "type": "string",
+                        "readOnly": true,
+                        "writeOnly": false
+                    }
+                },
+                "unionField": {
+                    "anyOf": [
+                        { "type": "string", "readOnly": true },
+                        { "type": "integer", "writeOnly": true }
+                    ]
+                },
+                "readOnly": {
+                    "type": "boolean",
+                    "readOnly": true,
+                    "description": "Legitimate property named readOnly"
+                },
+                "writeOnly": {
+                    "type": "boolean",
+                    "writeOnly": true,
+                    "description": "Legitimate property named writeOnly"
+                }
+            },
+            "required": ["parent"]
+        });
+
+        for name in [
+            "Gemini",
+            "Antigravity",
+            "AntigravityTool",
+            "AntigravityClaudeTool",
+        ] {
+            let out = match name {
+                "Gemini" => clean_json_schema_for_gemini(&schema),
+                "Antigravity" => clean_json_schema_for_antigravity(&schema),
+                "AntigravityTool" => clean_json_schema_for_antigravity_tool(&schema, false),
+                "AntigravityClaudeTool" => clean_json_schema_for_antigravity_claude_tool(&schema),
+                _ => unreachable!(),
+            };
+            assert!(
+                out.get("readOnly").is_none(),
+                "[{name}] root readOnly kept: {out}"
+            );
+            assert!(
+                out.get("writeOnly").is_none(),
+                "[{name}] root writeOnly kept: {out}"
+            );
+            assert!(
+                out["properties"]["database"]["properties"]["name"]
+                    .get("readOnly")
+                    .is_none(),
+                "[{name}] database.name.readOnly kept: {out}"
+            );
+            assert!(
+                out["properties"]["database"]["properties"]["uid"]
+                    .get("readOnly")
+                    .is_none(),
+                "[{name}] database.uid.readOnly kept: {out}"
+            );
+            assert!(
+                out["properties"]["database"]["properties"]["etag"]
+                    .get("writeOnly")
+                    .is_none(),
+                "[{name}] database.etag.writeOnly kept: {out}"
+            );
+            assert!(
+                out["properties"]["itemsList"]["items"]
+                    .get("readOnly")
+                    .is_none(),
+                "[{name}] itemsList.items.readOnly kept: {out}"
+            );
+            assert!(
+                out["properties"]["itemsList"]["items"]
+                    .get("writeOnly")
+                    .is_none(),
+                "[{name}] itemsList.items.writeOnly kept: {out}"
+            );
+            assert!(
+                out["properties"]["unionField"]["anyOf"][0]
+                    .get("readOnly")
+                    .is_none(),
+                "[{name}] unionField.anyOf[0].readOnly kept: {out}"
+            );
+            assert!(
+                out["properties"]["unionField"]["anyOf"][1]
+                    .get("writeOnly")
+                    .is_none(),
+                "[{name}] unionField.anyOf[1].writeOnly kept: {out}"
+            );
+            assert!(
+                out["properties"]["readOnly"].get("readOnly").is_none(),
+                "[{name}] nested keyword readOnly kept: {out}"
+            );
+            assert!(
+                out["properties"]["writeOnly"].get("writeOnly").is_none(),
+                "[{name}] nested keyword writeOnly kept: {out}"
+            );
+
+            assert_eq!(
+                out["properties"]["database"]["properties"]["name"]["type"],
+                "string",
+                "[{name}] database.name.type lost: {out}"
+            );
+            assert_eq!(
+                out["properties"]["database"]["properties"]["name"]["description"],
+                "Database resource name",
+                "[{name}] database.name.description lost: {out}"
+            );
+            assert!(
+                out["properties"].get("readOnly").is_some(),
+                "[{name}] property readOnly dropped: {out}"
+            );
+            assert_eq!(
+                out["properties"]["readOnly"]["type"],
+                "boolean",
+                "[{name}] property readOnly type lost: {out}"
+            );
+            assert_eq!(
+                out["properties"]["readOnly"]["description"],
+                "Legitimate property named readOnly",
+                "[{name}] property readOnly description lost: {out}"
+            );
+            assert!(
+                out["properties"].get("writeOnly").is_some(),
+                "[{name}] property writeOnly dropped: {out}"
+            );
+            assert_eq!(
+                out["properties"]["writeOnly"]["type"],
+                "boolean",
+                "[{name}] property writeOnly type lost: {out}"
+            );
+            assert_eq!(
+                out["properties"]["writeOnly"]["description"],
+                "Legitimate property named writeOnly",
+                "[{name}] property writeOnly description lost: {out}"
+            );
+        }
+    }
 }
+
