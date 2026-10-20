@@ -24,7 +24,7 @@ xAI Grok 与 Codex 不是独立 protocol。它们使用 OAuth 凭证动态创建
 一个上游连接定义，含 `name`、`protocol`、`base_url`、`key`、可选代理和 models。`base_url` 可按顺序列出多个地址，至少一个；空列表在请求时被拒绝。
 
 **model alias**
-客户端发送的模型名。路由先按 alias 匹配，再按真实上游模型名匹配。alias 全局唯一。
+客户端发送的模型名。路由先按 alias 匹配，再按真实上游模型名匹配。alias 全局唯一；亦不得与另一模型的 `name` 冲突（自身 alias==name 允许）。静态配置冲突 → 启动/`/reload` 失败；动态注入冲突 → 丢弃该动态模型。
 
 **upstream model**
 实际写入上游请求 `model` 的名称，可与 alias 不同。

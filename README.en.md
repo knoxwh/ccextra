@@ -125,7 +125,7 @@ Full fields: [config.example.yaml](config.example.yaml). Common items:
 
 | Item | Notes |
 | :--- | :--- |
-| `models[].alias` | Inbound model name; must be unique across providers; `base_url` may be a fallback array |
+| `models[].alias` | Inbound model name; must be unique across providers and must not collide with another model's `name`; `base_url` may be a fallback array |
 | `server.proxy_url` / provider `proxy_url` | Provider overrides server; `"direct"` = no proxy |
 | `secret_key` | Entry auth; bcrypt-written on load; requests use `x-api-key` or `Bearer` |
 | `payload` | Glob overrides for top-level params; optional `protocol` scope |
@@ -138,7 +138,7 @@ Full fields: [config.example.yaml](config.example.yaml). Common items:
 <summary>Advanced options</summary>
 
 - `user_agents` — override Claude / Codex / Grok / Antigravity identifiers
-- `logging.request_body` — write diagnostic requests under `logs/`
+- `logging.request_body` — write diagnostic requests under `logs/` next to the config file (not cwd)
 - `POST /reload` — atomically publish providers, payload, normalize, auth, proxy, UA, reasoning table, and refresh params; failed loads leave the snapshot unchanged; `logging.level` needs a restart
 - Background refresh uses the last successfully published static config; explicit reload prefers removals / disables / directory switches
 - `antigravity.connection-pool` — short connections by default; with `enabled: true`, keep the pool per idle / per-host caps

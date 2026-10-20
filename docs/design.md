@@ -146,7 +146,18 @@ providers、payload、运行时配置及后台刷新参数保存在统一不可�
 
 后台 Antigravity 返回空集合时，沿用整个 provider 集合保旧策略，本轮 xAI 结果也不发布。显式 reload 优先应用新配置：移除的静态 provider、切换目录或禁用凭证不从旧快照补回；动态加载器沿用既有跳过不可用凭证的语义，可能返回部分或空集合。该集合通过校验后随 reload 整体发布。之后的后台只扫描新目录，旧轮次不能恢复被移除的 provider。凭证刷新等磁盘副作用不属于配置快照事务。
 
-`secret_key` 明文会写回 bcrypt；验证结果缓存以 (bcrypt hash, key) 为键，换 secret 后旧结果不可命中，最多 1024 项，满时淘汰最久未访问条目（不再整体清空），重载时清空。`logging.request_body` 保存最终出站请求的诊断数据，敏感入站头会脱敏。归一化只在能够安全处理时改变 body，避免优化本身阻断请求；转换失败由 HTTP 层返回 Anthropic error。
+`secret_key` 明文会写回 bcrypt；验证结果缓存以 (bcrypt hash, key) 为键，换 secret 后旧结果不可命中，最多 1024 项，满时淘汰最久未访问条目（不再整体清空），重载时清空。`logging.request_body` 将最终出站请求的诊断数据写入**配置文件旁的 `logs/`**（启动与 `/reload` 时 pin，不跟进程 cwd）；敏感入站头会脱敏。归一化只在能够安全处理时改变 body，避免优化本身阻断请求；转换失败由 HTTP 层返回 Anthropic error。
+
+## 有意保留（相对对照实现）
+
+以下行为经审计确认保留，不强制对齐对照实现（CPA / sub2api / Codex 等）：
+
+- Chat 的 `content_filter` 映射为 Anthropic `refusal`（非 `stop`）。
+- Gemini / Antigravity：上游缺 `finishReason` 时合成终态，避免流无终态挂起。
+- Grok Responses 推理账本：空轮仍 append（跟 Codex，不因空内容跳过）。
+- `gemini_schema`：`const`→`enum` 求交与缺省 type 补齐比 CPA 更严。
+- Chat tool 结果抽图 notice 跟 sub2api（不跟 CPA）。
+- 已有表述见上文：Claude 直通仍可走 normalize；Antigravity 优先协商 HTTP/2；`logging.level` 仅启动生效；非 Claude `count_tokens` 读会话缓存；unfit 世代在 `/reload` 增代，与 `snapshot.version` 解耦。
 
 ## 验证
 

@@ -125,7 +125,7 @@ curl -H "Authorization: Bearer $ANTHROPIC_AUTH_TOKEN" http://127.0.0.1:8222/v1/m
 
 | 项 | 说明 |
 | :--- | :--- |
-| `models[].alias` | 入站模型名，不可跨 provider 重复；`base_url` 可为回退数组 |
+| `models[].alias` | 入站模型名，不可跨 provider 重复，也不可与其他模型的 `name` 撞车；`base_url` 可为回退数组 |
 | `server.proxy_url` / provider `proxy_url` | 后者覆盖前者；`"direct"` = 直连 |
 | `secret_key` | 入口鉴权；加载时 bcrypt 写回；请求用 `x-api-key` 或 `Bearer` |
 | `payload` | 按模型 glob 覆盖顶层参数，可用 `protocol` 限定 |
@@ -138,7 +138,7 @@ curl -H "Authorization: Bearer $ANTHROPIC_AUTH_TOKEN" http://127.0.0.1:8222/v1/m
 <summary>进阶选项</summary>
 
 - `user_agents` — 覆盖 Claude / Codex / Grok / Antigravity 标识
-- `logging.request_body` — 诊断请求写入 `logs/`
+- `logging.request_body` — 诊断请求写入配置文件目录下的 `logs/`（不跟 cwd）
 - `POST /reload` — 原子发布 providers、payload、归一化、认证、代理、UA、reasoning 表与刷新参数；失败不改快照；`logging.level` 需重启
 - 后台刷新用最近成功发布的静态配置；显式 reload 优先应用删除 / 禁用 / 目录切换
 - `antigravity.connection-pool` — 默认短连接；`enabled: true` 后按 idle / per-host 上限保留池
