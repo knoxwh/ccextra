@@ -27,7 +27,7 @@ pub enum RouteError {
     #[error("模型未找到: {0}")]
     ModelNotFound(String),
 
-    #[error("模型别名冲突: {0} 在多个 provider 中定义")]
+    #[error("模型别名冲突: {0}（与其他模型的 alias 或 name 重复）")]
     AliasConflict(String),
 
     #[error("provider {0} 未配置 base_url")]
@@ -153,9 +153,9 @@ pub struct ModelConfig {
 
 /// 路由决策:从入站 model 解析到 (provider, protocol, upstream_model)
 ///
-/// 启动时验证:
-/// - 所有 alias 唯一(跨 provider 不能重复)
-/// - 同一 provider 内 alias 与 name 不冲突
+/// 启动时由 [`validate_providers`] 保证:
+/// - 跨 provider alias 唯一
+/// - 任意模型的 alias 不等于另一模型的 name(自身 alias==name 允许)
 pub fn resolve_route(
     inbound_model: &str,
     providers: &[ProviderConfig],
@@ -188,7 +188,7 @@ pub fn resolve_route(
     Err(RouteError::ModelNotFound(inbound_model.to_string()))
 }
 
-/// 启动时验证配置:检查 alias 冲突
+/// 启动时验证配置:检查 alias 冲突与 alias↔name 撞车
 pub fn validate_providers(providers: &[ProviderConfig]) -> Result<(), RouteError> {
     use std::collections::HashMap;
 
@@ -206,6 +206,20 @@ pub fn validate_providers(providers: &[ProviderConfig]) -> Result<(), RouteError
                 }
             }
             alias_map.insert(&model.alias, &provider.name);
+        }
+    }
+
+    // alias 不得等于另一模型的 name;自身 alias==name 允许
+    for (pi, provider) in providers.iter().enumerate() {
+        for (mi, model) in provider.models.iter().enumerate() {
+            let alias = model.alias.as_str();
+            for (pj, other_provider) in providers.iter().enumerate() {
+                for (mj, other) in other_provider.models.iter().enumerate() {
+                    if other.name.as_str() == alias && (pi != pj || mi != mj) {
+                        return Err(RouteError::AliasConflict(model.alias.clone()));
+                    }
+                }
+            }
         }
     }
 
@@ -359,5 +373,62 @@ models:
         assert_eq!(provider.base_urls().len(), 2);
         assert_eq!(provider.base_urls()[0], "https://daily.example.com");
         assert_eq!(provider.base_urls()[1], "https://prod.example.com");
+    }
+
+    #[test]
+    fn test_alias_equals_other_model_name_rejected() {
+        // A.alias == B.name → inbound=B.name 会命中 alias 优先的 A
+        let yaml = r#"
+- name: provider-a
+  protocol: claude
+  base_url: "https://a.com"
+  key: sk-a
+  models:
+    - name: model-a
+      alias: model-b
+- name: provider-b
+  protocol: openai_chat
+  base_url: "https://b.com"
+  key: sk-b
+  models:
+    - name: model-b
+      alias: b-alias
+"#;
+        let providers: Vec<ProviderConfig> = yaml_serde::from_str(yaml).unwrap();
+        let err = validate_providers(&providers).unwrap_err();
+        assert!(matches!(err, RouteError::AliasConflict(_)));
+    }
+
+    #[test]
+    fn test_self_alias_equals_name_allowed() {
+        let yaml = r#"
+- name: provider-a
+  protocol: claude
+  base_url: "https://a.com"
+  key: sk-a
+  models:
+    - name: same-id
+      alias: same-id
+"#;
+        let providers: Vec<ProviderConfig> = yaml_serde::from_str(yaml).unwrap();
+        validate_providers(&providers).unwrap();
+    }
+
+    #[test]
+    fn test_same_provider_alias_equals_sibling_name_rejected() {
+        let yaml = r#"
+- name: provider-a
+  protocol: claude
+  base_url: "https://a.com"
+  key: sk-a
+  models:
+    - name: model-a
+      alias: model-b
+    - name: model-b
+      alias: b-alias
+"#;
+        let providers: Vec<ProviderConfig> = yaml_serde::from_str(yaml).unwrap();
+        let err = validate_providers(&providers).unwrap_err();
+        assert!(matches!(err, RouteError::AliasConflict(_)));
     }
 }

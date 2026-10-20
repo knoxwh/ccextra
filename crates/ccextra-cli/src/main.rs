@@ -275,6 +275,9 @@ async fn main() -> Result<()> {
         );
     }
 
+    // 静态配置自身先硬校验:alias/name 冲突属用户配置错误,启动即失败
+    ccextra_core::route::validate_providers(&config.providers)?;
+
     // 合并所有 providers
     let mut all_providers = merge_providers(config.providers.clone(), Vec::new());
     all_providers = merge_providers(all_providers, xai_providers);
@@ -282,8 +285,11 @@ async fn main() -> Result<()> {
     all_providers = merge_providers(all_providers, claude_providers);
     all_providers = merge_providers(all_providers, antigravity_providers);
 
-    // 启动时验证配置
-    ccextra_core::route::validate_providers(&all_providers)?;
+    // 合并后复查:merge_providers 已按 alias/name 去重,这里只兜底告警,
+    // 不再让后台拉取的动态 provider 决定服务能否启动
+    if let Err(e) = ccextra_core::route::validate_providers(&all_providers) {
+        tracing::warn!("合并后 provider 校验未通过(继续启动): {e}");
+    }
     tracing::info!("配置验证通过");
 
     // 构建应用状态
@@ -635,30 +641,54 @@ async fn run_antigravity_injection(state: AppState) {
     }
 }
 
-/// 合并配置文件与动态注入的 providers(多账号暴露同一批模型,
-/// alias 冲突会触发启动校验失败;先到者胜出,重复 alias 丢弃并告警)
+/// 合并配置文件与动态注入的 providers(多账号暴露同一批模型)。
+/// alias 或 name 与已合并集合撞车时丢弃注入模型并告警:动态 provider 由后台拉取,
+/// 用户不可控,不能让它把启动/刷新校验打挂。静态配置自身的冲突仍由启动校验硬失败。
 fn merge_providers(
     mut base: Vec<ProviderConfig>,
     injected: Vec<ProviderConfig>,
 ) -> Vec<ProviderConfig> {
-    let mut seen: std::collections::HashSet<String> = base
+    let mut seen_aliases: std::collections::HashSet<String> = base
         .iter()
         .flat_map(|p| p.models.iter().map(|m| m.alias.clone()))
         .collect();
+    // name 也要收集:alias 与 name 跨模型撞车会让 resolve_route 的 alias 优先产生歧义
+    let mut seen_names: std::collections::HashSet<String> = base
+        .iter()
+        .flat_map(|p| p.models.iter().map(|m| m.name.clone()))
+        .collect();
     for mut p in injected {
         p.models.retain(|m| {
-            if seen.contains(&m.alias) {
+            if seen_aliases.contains(&m.alias) {
                 tracing::warn!(
                     "alias 冲突,丢弃 {} 的模型 {}(alias {})",
                     p.name,
                     m.name,
                     m.alias
                 );
-                false
-            } else {
-                seen.insert(m.alias.clone());
-                true
+                return false;
             }
+            if seen_names.contains(&m.name) {
+                tracing::warn!(
+                    "name 与已有 alias/name 冲突,丢弃 {} 的模型 {}(alias {})",
+                    p.name,
+                    m.name,
+                    m.alias
+                );
+                return false;
+            }
+            if seen_aliases.contains(&m.name) || seen_names.contains(&m.alias) {
+                tracing::warn!(
+                    "alias↔name 交叉冲突,丢弃 {} 的模型 name={} alias={}",
+                    p.name,
+                    m.name,
+                    m.alias
+                );
+                return false;
+            }
+            seen_aliases.insert(m.alias.clone());
+            seen_names.insert(m.name.clone());
+            true
         });
         base.push(p);
     }
@@ -983,10 +1013,11 @@ fn build_user_agents(config: Option<&config::UserAgents>) -> UserAgentSet {
 #[cfg(test)]
 mod tests {
     use super::{
-        build_user_agents, load_refreshed_providers, load_thinking_registry, pin_auth_dir,
-        pin_path, provider_refresh_config, refresh_providers, with_pinned_log_dir, Arc, Config,
-        ProviderConfig, RuntimeConfig, RwLock, UpstreamClient,
+        build_user_agents, load_refreshed_providers, load_thinking_registry, merge_providers,
+        pin_auth_dir, pin_path, provider_refresh_config, refresh_providers, with_pinned_log_dir,
+        Arc, Config, ProviderConfig, RuntimeConfig, RwLock, UpstreamClient,
     };
+    use ccextra_core::route::{ModelConfig, Protocol};
     use ccextra_server::antigravity::resolve_auth_dir as resolve_antigravity_auth_dir;
     use ccextra_server::xai::resolve_auth_dir as resolve_xai_auth_dir;
     use std::io::Write;
@@ -1203,6 +1234,60 @@ xai_auth_dir: new-xai
             pin_path("/tmp/proj/config.yaml", "logs"),
             PathBuf::from("/tmp/proj/logs")
         );
+    }
+
+    /// 静态 provider 里一个模型,方便拼 merge 场景
+    fn model(name: &str, alias: &str) -> ModelConfig {
+        ModelConfig {
+            name: name.into(),
+            alias: alias.into(),
+            max_input_tokens: None,
+            max_tokens: None,
+        }
+    }
+
+    fn provider(name: &str, models: Vec<ModelConfig>) -> ProviderConfig {
+        ProviderConfig::new(
+            name.into(),
+            Protocol::Claude,
+            vec!["https://example.invalid".into()],
+            "fixture-key".into(),
+            None,
+            false,
+            models,
+        )
+    }
+
+    #[test]
+    fn merge_providers_drops_injected_alias_collision() {
+        let base = vec![provider("static", vec![model("m1", "alias-1")])];
+        let injected = vec![provider("dynamic", vec![model("m2", "alias-1")])];
+        let merged = merge_providers(base, injected);
+        assert_eq!(merged.len(), 2);
+        assert_eq!(merged[1].models.len(), 0);
+    }
+
+    /// 动态 provider 的 alias 与静态 name 撞车必须丢弃,否则启动校验硬失败
+    #[test]
+    fn merge_providers_drops_injected_alias_matching_static_name() {
+        let base = vec![provider("static", vec![model("gemini-3-pro", "my-gemini")])];
+        let injected = vec![provider(
+            "dynamic",
+            vec![model("gemini-3-pro", "gemini-3-pro")],
+        )];
+        let merged = merge_providers(base, injected);
+        assert_eq!(merged[1].models.len(), 0);
+        // 合并结果通过启动校验
+        ccextra_core::route::validate_providers(&merged).unwrap();
+    }
+
+    #[test]
+    fn merge_providers_keeps_non_conflicting_model() {
+        let base = vec![provider("static", vec![model("m1", "alias-1")])];
+        let injected = vec![provider("dynamic", vec![model("m2", "alias-2")])];
+        let merged = merge_providers(base, injected);
+        assert_eq!(merged[1].models.len(), 1);
+        ccextra_core::route::validate_providers(&merged).unwrap();
     }
 
     #[test]
