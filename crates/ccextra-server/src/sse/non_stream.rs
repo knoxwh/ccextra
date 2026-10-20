@@ -10,7 +10,7 @@
 use serde_json::{json, Value};
 use std::collections::HashMap;
 
-use super::chat::{map_finish_reason, resolve_finish_reason};
+use super::chat::map_finish_reason;
 use super::responses::{
     codex_stop_reason, map_stop_reason, sanitize_tool_id, stop_sequence, web_search_result_content,
 };
@@ -347,8 +347,6 @@ pub fn openai_chat_to_anthropic(body: &Value) -> Option<Value> {
 
     // tool_calls
     let mut args_buf = String::new();
-    // 非流式同样按 args 校验决定工具是否真的完整(对齐流式 resolve_finish_reason)
-    let mut tool_args_valid = true;
     if let Some(calls) = message.get("tool_calls").and_then(|v| v.as_array()) {
         for call in calls {
             has_tool_use = true;
@@ -366,10 +364,7 @@ pub fn openai_chat_to_anthropic(body: &Value) -> Option<Value> {
             } else {
                 match serde_json::from_str::<Value>(&fixed) {
                     Ok(v) if v.is_object() => v,
-                    _ => {
-                        tool_args_valid = false;
-                        json!({})
-                    }
+                    _ => json!({}),
                 }
             };
             content.push(json!({"type": "tool_use", "id": id, "name": name, "input": input}));
@@ -392,13 +387,7 @@ pub fn openai_chat_to_anthropic(body: &Value) -> Option<Value> {
         content.push(json!({"type": "text", "text": reasoning_texts.join("\n")}));
     }
 
-    // 与流式共用同一选择:length/content_filter 不被 tool_use 覆盖,
-    // 非法 args 落 max_tokens(截断),而非谎报 tool_use。
-    let stop_reason = map_finish_reason(&resolve_finish_reason(
-        finish_reason,
-        has_tool_use,
-        tool_args_valid,
-    ));
+    let stop_reason = map_nonstream_finish_reason(finish_reason, has_tool_use);
     build_message(
         body,
         content,
@@ -410,6 +399,16 @@ pub fn openai_chat_to_anthropic(body: &Value) -> Option<Value> {
         cache_write,
         -1, // chat 路径无 thinking_tokens
     )
+}
+
+/// 非流式 stop_reason(对齐 CPA c449529e mapOpenAINonStreamFinishReasonToAnthropic):
+/// 有工具调用且非 length/content_filter 一律 tool_use,不校验 args;
+/// 流式仍走 resolve_finish_reason 的 args 校验。
+fn map_nonstream_finish_reason(finish_reason: &str, has_tool_call: bool) -> &'static str {
+    if has_tool_call && finish_reason != "length" && finish_reason != "content_filter" {
+        return "tool_use";
+    }
+    map_finish_reason(finish_reason)
 }
 
 /// 组装 Anthropic messages 非流式响应(基础形状)
@@ -739,9 +738,9 @@ mod tests {
     }
 
     #[test]
-    fn test_chat_nonstream_truncated_tool_args_finish_max_tokens() {
-        // 非流与流式同语义:args 非法 JSON 时降级 max_tokens(对齐 CPA
-        // effectiveOpenAIFinishReason),不谎报 tool_use
+    fn test_chat_nonstream_truncated_tool_args_finish_tool_use() {
+        // 对齐 CPA c449529e:非流式有工具调用即 tool_use,不校验 args;
+        // 非法 args 的 tool_use 块 input 仍为 {}
         let body = json!({
             "id": "c1",
             "model": "gpt-5",
@@ -760,7 +759,59 @@ mod tests {
             "usage": {"prompt_tokens": 5, "completion_tokens": 5}
         });
         let out = openai_chat_to_anthropic(&body).unwrap();
+        assert_eq!(out["stop_reason"], "tool_use");
+        assert_eq!(out["content"][0]["type"], "tool_use");
+        assert_eq!(out["content"][0]["input"], json!({}));
+    }
+
+    fn chat_tool_body(args: &str, finish: &str) -> Value {
+        json!({
+            "id": "c1",
+            "model": "gpt-5",
+            "choices": [{
+                "message": {
+                    "role": "assistant",
+                    "content": "",
+                    "tool_calls": [{
+                        "id": "call_1",
+                        "type": "function",
+                        "function": {"name": "write_file", "arguments": args}
+                    }]
+                },
+                "finish_reason": finish
+            }],
+            "usage": {"prompt_tokens": 5, "completion_tokens": 5}
+        })
+    }
+
+    #[test]
+    fn test_chat_nonstream_invalid_args_stop_maps_tool_use() {
+        let out = openai_chat_to_anthropic(&chat_tool_body("{not json", "stop")).unwrap();
+        assert_eq!(out["stop_reason"], "tool_use");
+        assert_eq!(out["content"][0]["input"], json!({}));
+    }
+
+    #[test]
+    fn test_chat_nonstream_tool_length_maps_max_tokens() {
+        let out =
+            openai_chat_to_anthropic(&chat_tool_body("{\"path\":\"/tmp/a\"}", "length")).unwrap();
         assert_eq!(out["stop_reason"], "max_tokens");
+    }
+
+    #[test]
+    fn test_chat_nonstream_tool_content_filter_maps_refusal() {
+        let out =
+            openai_chat_to_anthropic(&chat_tool_body("{\"path\":\"/tmp/a\"}", "content_filter"))
+                .unwrap();
+        assert_eq!(out["stop_reason"], "refusal");
+    }
+
+    #[test]
+    fn test_chat_nonstream_valid_args_stop_maps_tool_use() {
+        let out =
+            openai_chat_to_anthropic(&chat_tool_body("{\"path\":\"/tmp/a\"}", "stop")).unwrap();
+        assert_eq!(out["stop_reason"], "tool_use");
+        assert_eq!(out["content"][0]["input"]["path"], "/tmp/a");
     }
 
     #[test]

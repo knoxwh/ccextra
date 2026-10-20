@@ -55,6 +55,8 @@ struct ChatRelay {
 
     // 待发 tool calls(按 OpenAI index 索引)
     tool_calls: HashMap<usize, ToolCall>,
+    // 对齐 CPA c449529e:上游省略 tool_calls[].index 时,chunk 内数组下标 → 实际累加器 key
+    omitted_tool_call_indexes: HashMap<usize, usize>,
     saw_tool_call: bool,
     // 对齐 CPA ef99119e:当前开启未收尾的 tool 块(有 start 无 stop)
     open_tool_index: Option<usize>,
@@ -88,6 +90,7 @@ impl ChatRelay {
             active_block: None,
             next_block_index: 0,
             tool_calls: HashMap::new(),
+            omitted_tool_call_indexes: HashMap::new(),
             saw_tool_call: false,
             open_tool_index: None,
             interleaved: Vec::new(),
@@ -396,9 +399,37 @@ impl ChatRelay {
     fn collect_tool_calls(&mut self, tool_calls: &[Value]) -> Vec<Bytes> {
         let mut frames = Vec::new();
         for (array_index, tc) in tool_calls.iter().enumerate() {
-            // 缺 index 用数组下标(对齐 CPA be1763e5);字段存在则走 Int(),非法值当 0
+            let incoming_id = tc
+                .get("id")
+                .and_then(|v| v.as_str())
+                .filter(|s| !s.is_empty())
+                .map(|s| s.to_string());
+
+            // 缺 index 用数组下标(对齐 CPA be1763e5);跨 chunk 新 id 时独立累加器
+            // (对齐 CPA c449529e OmittedToolCallIndexes)。字段存在则走 Int(),非法值当 0。
             let index = if tc.get("index").is_none() {
-                array_index
+                let pos = array_index;
+                let mut index = self
+                    .omitted_tool_call_indexes
+                    .get(&pos)
+                    .copied()
+                    .unwrap_or(pos);
+                let id_conflict = self.tool_calls.get(&index).is_some_and(|existing| {
+                    incoming_id
+                        .as_ref()
+                        .is_some_and(|incoming| !existing.id.is_empty() && existing.id != *incoming)
+                });
+                if id_conflict {
+                    let mut next_index = index + 1;
+                    for &k in self.tool_calls.keys() {
+                        if k >= next_index {
+                            next_index = k + 1;
+                        }
+                    }
+                    index = next_index;
+                    self.omitted_tool_call_indexes.insert(pos, index);
+                }
+                index
             } else {
                 tc.get("index").and_then(|v| v.as_u64()).unwrap_or(0) as usize
             };
@@ -413,15 +444,17 @@ impl ChatRelay {
                     closed: false,
                 });
 
-                if let Some(id) = tc.get("id").and_then(|v| v.as_str()) {
-                    if !id.is_empty() {
-                        call.id = id.to_string();
+                // 仅在 start 未发射时接受非空 string id(对齐 CPA c449529e)
+                if let Some(ref id) = incoming_id {
+                    if !call.start_emitted {
+                        call.id = id.clone();
                     }
                 }
 
                 if let Some(function) = tc.get("function") {
+                    // name 同 id:仅在 start 未发射时接受非空值(对齐 CPA)
                     if let Some(name) = function.get("name").and_then(|v| v.as_str()) {
-                        if !name.is_empty() {
+                        if !name.is_empty() && !call.start_emitted {
                             call.name = name.to_string();
                         }
                     }
@@ -711,7 +744,7 @@ pub(super) fn map_finish_reason(reason: &str) -> &'static str {
 /// 终态 finish_reason 选择(对齐 CPA effectiveOpenAIFinishReason):
 /// length/content_filter 原样保留;有工具调用时按 args 校验在
 /// tool_calls/length 间定;否则用上游原值(空值由 map_finish_reason 兜底)。
-/// 流式与非流式共用,避免两条路径给出不同的 stop_reason。
+/// 仅流式使用;非流式按 CPA c449529e 走 non_stream::map_nonstream_finish_reason。
 pub(super) fn resolve_finish_reason(
     finish_reason: &str,
     saw_tool_call: bool,
@@ -833,6 +866,37 @@ mod tests {
         let mut out = r.process(&sse_ev(data));
         out.extend(r.process(&done_ev()));
         out
+    }
+
+    /// 从 SSE 文本抽出 tool_use start / input_json_delta / stop 计数
+    fn collect_tool_use_events(s: &str) -> (Vec<Value>, Vec<Value>, usize) {
+        let mut starts = Vec::new();
+        let mut deltas = Vec::new();
+        let mut stops = 0;
+        for block in s.split("event: ") {
+            if block.starts_with("content_block_start") {
+                if let Some(data) = block.split_once("data: ").map(|(_, rest)| rest) {
+                    let json = data.split("\n\n").next().unwrap_or(data).trim();
+                    if let Ok(v) = serde_json::from_str::<Value>(json) {
+                        if v["content_block"]["type"] == "tool_use" {
+                            starts.push(v);
+                        }
+                    }
+                }
+            } else if block.starts_with("content_block_delta") {
+                if let Some(data) = block.split_once("data: ").map(|(_, rest)| rest) {
+                    let json = data.split("\n\n").next().unwrap_or(data).trim();
+                    if let Ok(v) = serde_json::from_str::<Value>(json) {
+                        if v["delta"]["type"] == "input_json_delta" {
+                            deltas.push(v);
+                        }
+                    }
+                }
+            } else if block.starts_with("content_block_stop") {
+                stops += 1;
+            }
+        }
+        (starts, deltas, stops)
     }
 
     #[test]
@@ -1063,6 +1127,99 @@ mod tests {
         assert_eq!(second["tz"], "UTC");
         assert_eq!(stops, 2, "应有两个 content_block_stop,实际: {s}");
         assert!(s.contains("\"stop_reason\":\"tool_use\""), "实际: {s}");
+    }
+
+    #[test]
+    fn test_omitted_tool_call_index_separate_chunks_preserves_parallel_calls() {
+        // 对齐 CPA c449529e:跨 chunk 省略 index、各带新 id 时应开两个累加器
+        let mut r = ChatRelay::new(None);
+        r.process(&sse_ev(
+            r#"{"choices":[{"index":0,"delta":{"role":"assistant","tool_calls":[{"id":"call_paris","type":"function","function":{"name":"get_weather","arguments":"{\"city\":\"Paris\"}"}}]}}]}"#,
+        ));
+        r.process(&sse_ev(
+            r#"{"choices":[{"index":0,"delta":{"role":"assistant","tool_calls":[{"id":"call_tokyo","type":"function","function":{"name":"get_weather","arguments":"{\"city\":\"Tokyo\"}"}}]}}]}"#,
+        ));
+        let out = process_then_done(
+            &mut r,
+            r#"{"choices":[{"index":0,"delta":{},"finish_reason":"stop"}],"usage":{"prompt_tokens":10,"completion_tokens":5}}"#,
+        );
+        let buf = out.concat();
+        let s = String::from_utf8_lossy(&buf);
+        let (starts, deltas, stops) = collect_tool_use_events(&s);
+        assert_eq!(starts.len(), 2, "应有两个 tool_use start,实际: {s}");
+        assert_eq!(starts[0]["content_block"]["id"], "call_paris");
+        assert_eq!(starts[0]["content_block"]["name"], "get_weather");
+        assert_eq!(starts[1]["content_block"]["id"], "call_tokyo");
+        assert_eq!(starts[1]["content_block"]["name"], "get_weather");
+        assert_eq!(deltas.len(), 2, "应有两个 input_json_delta,实际: {s}");
+        let first: Value =
+            serde_json::from_str(deltas[0]["delta"]["partial_json"].as_str().unwrap()).unwrap();
+        let second: Value =
+            serde_json::from_str(deltas[1]["delta"]["partial_json"].as_str().unwrap()).unwrap();
+        assert_eq!(first["city"], "Paris");
+        assert_eq!(second["city"], "Tokyo");
+        assert_eq!(stops, 2, "应有两个 content_block_stop,实际: {s}");
+        assert!(s.contains("\"stop_reason\":\"tool_use\""), "实际: {s}");
+    }
+
+    #[test]
+    fn test_omitted_tool_call_index_separate_chunks_with_fragmented_args() {
+        // 对齐 CPA c449529e:缺 index 跨 chunk + 参数分片,映射位应续写同一累加器
+        let mut r = ChatRelay::new(None);
+        r.process(&sse_ev(
+            r#"{"choices":[{"index":0,"delta":{"role":"assistant","tool_calls":[{"id":"call_paris","type":"function","function":{"name":"get_weather","arguments":"{\"city\":"}}]}}]}"#,
+        ));
+        r.process(&sse_ev(
+            r#"{"choices":[{"index":0,"delta":{"tool_calls":[{"function":{"arguments":"\"Paris\"}"}}]}}]}"#,
+        ));
+        r.process(&sse_ev(
+            r#"{"choices":[{"index":0,"delta":{"tool_calls":[{"id":"call_tokyo","type":"function","function":{"name":"get_weather","arguments":"{\"city\":"}}]}}]}"#,
+        ));
+        r.process(&sse_ev(
+            r#"{"choices":[{"index":0,"delta":{"tool_calls":[{"function":{"arguments":"\"Tokyo\"}"}}]}}]}"#,
+        ));
+        let out = process_then_done(
+            &mut r,
+            r#"{"choices":[{"index":0,"delta":{},"finish_reason":"stop"}],"usage":{"prompt_tokens":10,"completion_tokens":5}}"#,
+        );
+        let buf = out.concat();
+        let s = String::from_utf8_lossy(&buf);
+        let (starts, deltas, _stops) = collect_tool_use_events(&s);
+        assert_eq!(starts.len(), 2, "应有两个 tool_use start,实际: {s}");
+        assert_eq!(starts[0]["content_block"]["id"], "call_paris");
+        assert_eq!(starts[1]["content_block"]["id"], "call_tokyo");
+        assert_eq!(deltas.len(), 2, "应有两个 input_json_delta,实际: {s}");
+        let first: Value =
+            serde_json::from_str(deltas[0]["delta"]["partial_json"].as_str().unwrap()).unwrap();
+        let second: Value =
+            serde_json::from_str(deltas[1]["delta"]["partial_json"].as_str().unwrap()).unwrap();
+        assert_eq!(first["city"], "Paris");
+        assert_eq!(second["city"], "Tokyo");
+        assert!(s.contains("\"stop_reason\":\"tool_use\""), "实际: {s}");
+    }
+
+    #[test]
+    fn test_with_index_tool_calls_unchanged_parallel() {
+        // 显式 index 路径不受 OmittedToolCallIndexes 影响
+        let mut r = ChatRelay::new(None);
+        r.process(&sse_ev(
+            r#"{"choices":[{"delta":{"tool_calls":[{"index":0,"id":"call_a","function":{"name":"fa","arguments":"{\"x\":1}"}}]}}]}"#,
+        ));
+        r.process(&sse_ev(
+            r#"{"choices":[{"delta":{"tool_calls":[{"index":1,"id":"call_b","function":{"name":"fb","arguments":"{\"y\":2}"}}]}}]}"#,
+        ));
+        let out = process_then_done(
+            &mut r,
+            r#"{"choices":[{"delta":{},"finish_reason":"tool_calls"}],"usage":{"prompt_tokens":1,"completion_tokens":1}}"#,
+        );
+        let buf = out.concat();
+        let s = String::from_utf8_lossy(&buf);
+        let (starts, deltas, stops) = collect_tool_use_events(&s);
+        assert_eq!(starts.len(), 2, "{s}");
+        assert_eq!(starts[0]["content_block"]["id"], "call_a");
+        assert_eq!(starts[1]["content_block"]["id"], "call_b");
+        assert_eq!(deltas.len(), 2, "{s}");
+        assert_eq!(stops, 2, "{s}");
     }
 
     #[test]
@@ -1504,6 +1661,25 @@ mod tests {
         let bufs = out.concat();
         let s = String::from_utf8_lossy(&bufs);
         assert!(s.contains("\"stop_reason\":\"max_tokens\""), "{s}");
+    }
+
+    #[test]
+    fn test_tool_name_ignored_after_start_emitted() {
+        // 对齐 CPA:start 已发射后,后续 chunk 的不同 name/id 不改写累加器
+        let mut r = ChatRelay::new(None);
+        let _ = r.process(&super::super::parser::SseEvent {
+            event: Some("c".into()),
+            data: r#"{"id":"1","choices":[{"delta":{"tool_calls":[{"index":0,"id":"call_1","function":{"name":"write_file","arguments":""}}]}}]}"#.into(),
+        });
+        // 本地 content_block_start 延迟到关块/flush 才发,这里直接置位模拟已发射
+        assert!(r.tool_calls[&0].started);
+        r.tool_calls.get_mut(&0).unwrap().start_emitted = true;
+        let _ = r.process(&super::super::parser::SseEvent {
+            event: Some("c".into()),
+            data: r#"{"id":"1","choices":[{"delta":{"tool_calls":[{"index":0,"id":"call_1","function":{"name":"other","arguments":"{}"}}]}}]}"#.into(),
+        });
+        assert_eq!(r.tool_calls[&0].name, "write_file");
+        assert_eq!(r.tool_calls[&0].id, "call_1");
     }
 
     #[tokio::test]
