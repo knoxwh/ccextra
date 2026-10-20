@@ -30,9 +30,6 @@ pub enum RouteError {
     #[error("模型别名冲突: {0} 在多个 provider 中定义")]
     AliasConflict(String),
 
-    #[error("model_variant_unavailable: {0}")]
-    VariantUnavailable(String),
-
     #[error("provider {0} 未配置 base_url")]
     EmptyBaseUrl(String),
 }

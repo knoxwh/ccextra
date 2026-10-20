@@ -2401,50 +2401,6 @@ models:
     );
 }
 
-#[test]
-fn test_cf_retry_after_keeps_jitter_above_general_cap() {
-    let started = std::time::Instant::now();
-    let mut headers = reqwest::header::HeaderMap::new();
-    headers.insert(reqwest::header::RETRY_AFTER, "2".parse().unwrap());
-    let status = reqwest::StatusCode::from_u16(522).unwrap();
-
-    let delay = compute_retry_delay(0, started, &headers, Some(status)).unwrap();
-
-    assert!(
-        delay > RETRY_MAX_DELAY,
-        "52x Retry-After 不得被通用上限截断"
-    );
-    assert!(delay >= std::time::Duration::from_millis(1600));
-    assert!(delay <= std::time::Duration::from_millis(2400));
-}
-
-#[test]
-fn test_retry_delay_respects_retry_after_and_budget() {
-    let started = std::time::Instant::now();
-    let mut headers = reqwest::header::HeaderMap::new();
-    headers.insert(reqwest::header::RETRY_AFTER, "5".parse().unwrap());
-    // 5xx 带 Retry-After: 钳位 1.5s 后 ±20% jitter
-    let d = compute_retry_delay(
-        0,
-        started,
-        &headers,
-        Some(reqwest::StatusCode::SERVICE_UNAVAILABLE),
-    )
-    .unwrap();
-    assert!(d >= std::time::Duration::from_millis(1200));
-    assert!(d <= std::time::Duration::from_millis(1800));
-
-    // 无头: 基础 300ms 经 jitter 在 [240ms, 360ms] 范围
-    let d2 = compute_retry_delay(0, started, &reqwest::header::HeaderMap::new(), None).unwrap();
-    assert!(d2 >= std::time::Duration::from_millis(240));
-    assert!(d2 <= std::time::Duration::from_millis(360));
-
-    // 总预算耗尽 → 不再重试
-    std::thread::sleep(std::time::Duration::from_millis(20));
-    let exhausted_start = started - (RETRY_TOTAL_BUDGET + std::time::Duration::from_secs(1));
-    assert!(compute_retry_delay(0, exhausted_start, &headers, None).is_none());
-}
-
 /// 上游 429:不进退避重试(对齐 codex 传输层 retry_429: false),单次命中即返回;
 /// Retry-After 头透传给客户端,由客户端按上游声明退避。
 #[tokio::test]

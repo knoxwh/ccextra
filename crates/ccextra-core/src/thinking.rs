@@ -92,11 +92,10 @@ fn find_capability<'a>(
         .find(|cap| cap.id.to_ascii_lowercase() == model_lower)
 }
 
-/// 查找模型支持的 reasoning_levels(精确匹配或别名匹配,测试可注入 registry)
+/// 查找模型支持的 reasoning_levels(仅精确匹配,测试可注入 registry)
 ///
-/// 匹配逻辑(大小写不敏感):
-/// 1. 精确匹配:`glm-5.1` 匹配 `glm-5.1`
-/// 2. 别名匹配:`glm-5.1-27717e1a8a72-glm51` 也能匹配到独立条目
+/// 大小写不敏感,按 `ModelCapability::id` 全等比较;不做别名/前缀/子串匹配,
+/// 中转站前缀名需在 models.json 中单列条目。
 fn lookup_model_levels_impl(model: &str, registry: &[ModelCapability]) -> Option<Vec<Level>> {
     find_capability(model, registry).map(|cap| {
         cap.reasoning_levels

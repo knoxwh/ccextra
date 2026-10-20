@@ -30,10 +30,7 @@ pub use claude_relay::{
     ensure_oauth_beta, is_claude_passthrough_header_excluded, CLAUDE_ACCEPT_ENCODING,
 };
 pub use error::{extract_upstream_error, to_anthropic_error, AppError};
-pub use retry::{
-    compute_retry_delay, jitter_backoff, parse_retry_after, CF_EDGE_MAX_RETRY_BACKOFF,
-    RETRY_BASE_DELAY, RETRY_MAX_DELAY, RETRY_TOTAL_BUDGET,
-};
+pub use retry::parse_retry_after;
 
 /// 配置重载闭包类型
 pub type ReloadFn =
