@@ -1381,4 +1381,45 @@ mod tests {
         assert_eq!(parts[1]["tool_use_id"], "call_1");
         assert_eq!(parts[2]["tool_use_id"], "call_2");
     }
+
+    /// 稳定 tool_use id 不含工具名：functionResponse.name 必须取历史 tool_use.name，
+    /// 含 `-` 的 MCP 名与 AG `external_` 冲突名同样走历史；旧式 id 反解行为不变。
+    #[test]
+    fn tool_result_name_comes_from_history_for_stable_ids() {
+        let stable = crate::convert::tool_id::gemini_claude_tool_use_id(
+            "native-9",
+            "mcp__x__query-docs",
+            None,
+        );
+        let messages = vec![
+            json!({"role": "user", "content": "hi"}),
+            json!({"role": "assistant", "content": [
+                {"type": "tool_use", "id": stable, "name": "mcp__x__query-docs", "input": {}},
+                {"type": "tool_use", "id": "Read-3", "name": "Read", "input": {"p": "/a"}}
+            ]}),
+            json!({"role": "user", "content": [
+                {"type": "tool_result", "tool_use_id": stable, "content": "ok"},
+                {"type": "tool_result", "tool_use_id": "Read-3", "content": "ok2"}
+            ]}),
+        ];
+        let contents = convert_messages(&messages, &HashMap::new(), true, "gemini-3-flash");
+        let fcs = contents[1]["parts"].as_array().unwrap();
+        assert_eq!(fcs[0]["functionCall"]["id"], stable.as_str());
+        assert_eq!(fcs[0]["functionCall"]["name"], "mcp__x__query-docs");
+        let frs = contents[2]["parts"].as_array().unwrap();
+        assert_eq!(frs[0]["functionResponse"]["id"], stable.as_str());
+        assert_eq!(frs[0]["functionResponse"]["name"], "mcp__x__query-docs");
+        assert_eq!(frs[1]["functionResponse"]["id"], "Read-3");
+        assert_eq!(frs[1]["functionResponse"]["name"], "Read");
+
+        // 旧式 id 缺历史时仍按 {name}-{counter} 反解（行为不变）
+        let orphan = vec![json!({"role": "user", "content": [
+            {"type": "tool_result", "tool_use_id": "mcp__x__query-docs-12", "content": "ok"}
+        ]})];
+        let contents = convert_messages(&orphan, &HashMap::new(), true, "gemini-3-flash");
+        assert_eq!(
+            contents[0]["parts"][0]["functionResponse"]["name"],
+            "mcp__x__query-docs"
+        );
+    }
 }

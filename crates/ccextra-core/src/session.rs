@@ -14,6 +14,10 @@ use serde_json::Value;
 /// Claude Code 会话头(小写形式,HeaderMap 查找大小写不敏感)
 pub const CLAUDE_CODE_SESSION_HEADER: &str = "x-claude-code-session-id";
 pub const CLAUDE_CODE_THREAD_HEADER: &str = "x-claude-code-thread-id";
+/// Claude Code 子代理头(对齐 CPA helps.ClaudeCodeAgentHeader)
+pub const CLAUDE_CODE_AGENT_HEADER: &str = "x-claude-code-agent-id";
+/// 缺省 agent 哨兵(对齐 CPA helps.ClaudeCodeMainAgentID)
+pub const CLAUDE_CODE_MAIN_AGENT_ID: &str = "main";
 
 /// 提取 Claude Code 会话 ID(头优先,user_id 兜底)
 pub fn extract_claude_code_session(headers: &HeaderMap, body: &Value) -> Option<String> {
@@ -67,6 +71,17 @@ pub fn extract_claude_code_thread(headers: &HeaderMap) -> Option<String> {
         .and_then(|v| v.to_str().ok())
         .map(|s| s.trim().to_string())
         .filter(|s| !s.is_empty())
+}
+
+/// 提取 Claude Code agent ID;缺失/空白回落 `main`(对齐 CPA ExtractClaudeCodeAgentID)
+pub fn extract_claude_code_agent_id(headers: &HeaderMap) -> String {
+    headers
+        .get(CLAUDE_CODE_AGENT_HEADER)
+        .and_then(|v| v.to_str().ok())
+        .map(str::trim)
+        .filter(|s| !s.is_empty())
+        .unwrap_or(CLAUDE_CODE_MAIN_AGENT_ID)
+        .to_string()
 }
 
 #[cfg(test)]
@@ -137,5 +152,14 @@ mod tests {
         let headers = HeaderMap::new();
         let body = json!({"messages": [{"role": "user", "content": "hi"}]});
         assert_eq!(extract_claude_code_session(&headers, &body), None);
+    }
+
+    #[test]
+    fn test_agent_id_header_or_main() {
+        assert_eq!(extract_claude_code_agent_id(&HeaderMap::new()), "main");
+        let h = headers_with("X-Claude-Code-Agent-Id", "  agent-7  ");
+        assert_eq!(extract_claude_code_agent_id(&h), "agent-7");
+        let blank = headers_with("x-claude-code-agent-id", "   ");
+        assert_eq!(extract_claude_code_agent_id(&blank), "main");
     }
 }

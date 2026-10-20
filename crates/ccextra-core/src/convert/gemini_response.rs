@@ -7,10 +7,41 @@ use std::sync::atomic::{AtomicU64, Ordering};
 use super::antigravity_tools::antigravity_upstream_tool_name_to_client;
 use super::claude_tool_args::{clean_claude_tool_arguments, ToolArgStreamState};
 use super::signature::{format_claude_signature_value, model_group};
-use super::tool_id::claude_tool_id_for;
+use super::tool_id::{claude_tool_id_for, gemini_claude_tool_use_id};
 
 /// 全局工具使用 ID 计数器
 static TOOL_USE_ID_COUNTER: AtomicU64 = AtomicU64::new(0);
+
+/// Claude 侧 tool_use id(对齐 CPA antigravityClaudeToolUseID):
+/// AG Gemini 族(与 reasoning replay 同门禁)且上游给了非空原生 `functionCall.id` 时,
+/// 用 (原生 id, name, args) 派生稳定 id,回放时据账本换回原生 id;
+/// 否则(含 plain Gemini、AG claude 族、原生 id 为空)保持 `{name}-{counter}`。
+fn claude_tool_use_id(
+    signature_model: Option<&str>,
+    function_call: &Value,
+    fallback_name: &str,
+) -> String {
+    if signature_model.is_some_and(crate::antigravity_uses_reasoning_replay) {
+        let stable = gemini_claude_tool_use_id(
+            function_call
+                .get("id")
+                .and_then(|v| v.as_str())
+                .unwrap_or(""),
+            function_call
+                .get("name")
+                .and_then(|v| v.as_str())
+                .unwrap_or(""),
+            function_call.get("args"),
+        );
+        if !stable.is_empty() {
+            return stable;
+        }
+    }
+    claude_tool_id_for(
+        fallback_name,
+        TOOL_USE_ID_COUNTER.fetch_add(1, Ordering::SeqCst),
+    )
+}
 
 /// 出站 thoughtSignature 归一化。
 ///
@@ -302,10 +333,8 @@ pub fn convert_gemini_stream_chunk(
                     .tool_args
                     .begin_tool(client_tool_name, original_request);
 
-                let tool_use_id = claude_tool_id_for(
-                    &restored_upstream_name,
-                    TOOL_USE_ID_COUNTER.fetch_add(1, Ordering::SeqCst),
-                );
+                let tool_use_id =
+                    claude_tool_use_id(signature_model, function_call, &restored_upstream_name);
 
                 events.push(json!({
                     "type": "content_block_start",
@@ -647,7 +676,7 @@ pub fn convert_gemini_response(
                     }
                 }
 
-                // 工具调用:id 自生成(对齐 CPA,不透传上游 id),name 还原原名
+                // 工具调用:id 见 claude_tool_use_id(不直接透传上游 id),name 还原原名
                 if let Some(function_call) = part.get("functionCall") {
                     saw_tool_call = true;
                     let upstream_name = function_call
@@ -677,10 +706,8 @@ pub fn convert_gemini_response(
                         }
                         _ => json!({}),
                     };
-                    let tool_id = claude_tool_id_for(
-                        &restored_name,
-                        TOOL_USE_ID_COUNTER.fetch_add(1, Ordering::SeqCst),
-                    );
+                    let tool_id =
+                        claude_tool_use_id(signature_model, function_call, &restored_name);
                     let mut tool_block = json!({
                         "type": "tool_use",
                         "id": tool_id,
@@ -1616,5 +1643,73 @@ mod tests {
             })
             .collect();
         assert_eq!(partial, "{}");
+    }
+
+    fn stream_tool_use_ids(signature_model: Option<&str>, fc: Value) -> Vec<String> {
+        let mut state = GeminiStreamState::default();
+        let chunk = json!({"candidates": [{"content": {"parts": [{"functionCall": fc}]}}]});
+        convert_gemini_stream_chunk(&chunk, &mut state, &HashMap::new(), signature_model, None)
+            .iter()
+            .filter(|e| {
+                e["type"] == "content_block_start" && e["content_block"]["type"] == "tool_use"
+            })
+            .map(|e| e["content_block"]["id"].as_str().unwrap().to_string())
+            .collect()
+    }
+
+    fn nonstream_tool_use_ids(signature_model: Option<&str>, fc: Value) -> Vec<String> {
+        let response = json!({"candidates": [{
+            "content": {"parts": [{"functionCall": fc}]},
+            "finishReason": "STOP"
+        }]});
+        convert_gemini_response(&response, &HashMap::new(), signature_model, None)["content"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .filter(|b| b["type"] == "tool_use")
+            .map(|b| b["id"].as_str().unwrap().to_string())
+            .collect()
+    }
+
+    /// AG Gemini 族 + 原生 id → 稳定 id（流式 / 非流式一致）；无原生 id → `{name}-{counter}`。
+    #[test]
+    fn ag_gemini_native_call_id_emits_stable_tool_use_id() {
+        use crate::convert::tool_id::{gemini_claude_tool_use_id, is_gemini_claude_tool_use_id};
+        let fc = json!({"id": "native-1", "name": "Read", "args": {"file_path": "/a"}});
+        let expected = gemini_claude_tool_use_id("native-1", "Read", Some(&fc["args"]));
+        for ids in [
+            stream_tool_use_ids(Some("gemini-3-flash"), fc.clone()),
+            nonstream_tool_use_ids(Some("gemini-3-flash"), fc.clone()),
+        ] {
+            assert_eq!(ids, vec![expected.clone()]);
+        }
+
+        let no_id = json!({"name": "Read", "args": {"file_path": "/a"}});
+        let empty_id = json!({"id": "  ", "name": "Read", "args": {"file_path": "/a"}});
+        for ids in [
+            stream_tool_use_ids(Some("gemini-3-flash"), no_id.clone()),
+            nonstream_tool_use_ids(Some("gemini-3-flash"), no_id),
+            stream_tool_use_ids(Some("gemini-3-flash"), empty_id.clone()),
+            nonstream_tool_use_ids(Some("gemini-3-flash"), empty_id),
+        ] {
+            assert_eq!(ids.len(), 1);
+            assert!(ids[0].starts_with("Read-"), "{ids:?}");
+            assert!(!is_gemini_claude_tool_use_id(&ids[0]));
+        }
+    }
+
+    /// 非 replay 路径（plain Gemini / AG claude 族）即使上游给了 id 也保持旧格式。
+    #[test]
+    fn non_replay_paths_keep_counter_tool_use_id() {
+        let fc = json!({"id": "native-1", "name": "Read", "args": {"file_path": "/a"}});
+        for model in [None, Some("claude-sonnet-4-6")] {
+            for ids in [
+                stream_tool_use_ids(model, fc.clone()),
+                nonstream_tool_use_ids(model, fc.clone()),
+            ] {
+                assert_eq!(ids.len(), 1);
+                assert!(ids[0].starts_with("Read-"), "{model:?} {ids:?}");
+            }
+        }
     }
 }

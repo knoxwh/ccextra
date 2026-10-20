@@ -1231,12 +1231,164 @@ pub fn format_claude_signature_value(model_name: &str, signature: &str) -> Strin
     signature.to_string()
 }
 
+// ---- Gemini 请求签名清洗(对齐 gemini_sanitize.go)----
+
+/// 回放到 Gemini 的 thoughtSignature:兼容的原样保留,缺失/未知/跨族换哨兵
+/// (对齐 GeminiReplaySignatureOrBypass)。
+pub fn gemini_replay_signature_or_bypass(raw: &str, block_kind: SignatureBlockKind) -> String {
+    if let Some(sig) =
+        compatible_signature_for_provider_block(SignatureProvider::Gemini, raw, block_kind)
+    {
+        return sig;
+    }
+    let decision = decide_signature_compatibility(SignatureProvider::Gemini, raw, block_kind);
+    if decision.action == SignatureAction::ReplaceWithGeminiBypass
+        && !decision.replacement.is_empty()
+    {
+        return decision.replacement;
+    }
+    GEMINI_SKIP_THOUGHT_SIGNATURE_VALIDATOR.to_string()
+}
+
+/// 对齐 geminiPartThoughtSignaturePaths(顺序即优先级)
+const GEMINI_PART_THOUGHT_SIGNATURE_PATHS: &[&[&str]] = &[
+    &["thoughtSignature"],
+    &["thought_signature"],
+    &["functionCall", "thoughtSignature"],
+    &["functionCall", "thought_signature"],
+    &["functionResponse", "thoughtSignature"],
+    &["functionResponse", "thought_signature"],
+    &["extra_content", "google", "thought_signature"],
+];
+
+fn value_at_path<'a>(part: &'a serde_json::Value, path: &[&str]) -> Option<&'a serde_json::Value> {
+    path.iter().try_fold(part, |v, key| v.get(*key))
+}
+
+/// 对齐 geminiPartThoughtSignature(gjson String():字符串取值,其它取原文)
+fn gemini_part_thought_signature(part: &serde_json::Value) -> Option<String> {
+    GEMINI_PART_THOUGHT_SIGNATURE_PATHS.iter().find_map(|path| {
+        value_at_path(part, path).map(|v| match v {
+            serde_json::Value::String(s) => s.clone(),
+            serde_json::Value::Null => String::new(),
+            other => other.to_string(),
+        })
+    })
+}
+
+/// 对齐 hasNormalizedGeminiPartThoughtSignature
+fn has_normalized_gemini_part_thought_signature(part: &serde_json::Value, replay: &str) -> bool {
+    if part.get("thoughtSignature").and_then(|v| v.as_str()) != Some(replay) {
+        return false;
+    }
+    GEMINI_PART_THOUGHT_SIGNATURE_PATHS[1..]
+        .iter()
+        .all(|path| value_at_path(part, path).is_none())
+}
+
+/// 对齐 deleteGeminiPartThoughtSignatureFields(只删叶子键,与 sjson.Delete 一致)
+fn delete_gemini_part_thought_signature_fields(part: &mut serde_json::Value) {
+    for path in GEMINI_PART_THOUGHT_SIGNATURE_PATHS {
+        let (leaf, parents) = path.split_last().expect("non-empty path");
+        let mut cur = Some(&mut *part);
+        for key in parents {
+            cur = cur.and_then(|v| v.get_mut(*key));
+        }
+        if let Some(obj) = cur.and_then(|v| v.as_object_mut()) {
+            obj.remove(*leaf);
+        }
+    }
+}
+
+/// 对 Gemini 形 contents 施加回放签名策略(对齐 SanitizeGeminiRequestThoughtSignatures):
+/// 已有兼容签名留在原 model part;toolCall/toolResponse 原样;每个 model 回合仅首个
+/// functionCall 在缺失/不兼容时补哨兵,兄弟 call 的签名(非兼容或哨兵)删掉;
+/// functionResponse 上的签名一律删。返回是否改动。
+pub fn sanitize_gemini_request_thought_signatures(contents: &mut [serde_json::Value]) -> bool {
+    let mut changed = false;
+    for content in contents.iter_mut() {
+        let is_model_turn = content.get("role").and_then(|r| r.as_str()) == Some("model");
+        let Some(parts) = content.get_mut("parts").and_then(|p| p.as_array_mut()) else {
+            continue;
+        };
+        let mut first_function_call_seen = false;
+        for part in parts.iter_mut() {
+            let raw = gemini_part_thought_signature(part);
+            let has_signature = raw.is_some();
+            let raw = raw.unwrap_or_default();
+            if part.get("functionResponse").is_some() {
+                if has_signature {
+                    delete_gemini_part_thought_signature_fields(part);
+                    changed = true;
+                }
+                continue;
+            }
+            if !is_model_turn {
+                continue;
+            }
+            if ["toolCall", "tool_call", "toolResponse", "tool_response"]
+                .iter()
+                .any(|k| part.get(*k).is_some())
+            {
+                continue;
+            }
+            let has_function_call = part.get("functionCall").is_some();
+            let is_first_function_call = has_function_call && !first_function_call_seen;
+            if has_function_call {
+                first_function_call_seen = true;
+            }
+            if !has_function_call && !has_signature {
+                continue;
+            }
+            let block_kind = if has_function_call {
+                SignatureBlockKind::GeminiFunctionCall
+            } else {
+                SignatureBlockKind::GeminiModelPart
+            };
+            let decision =
+                decide_signature_compatibility(SignatureProvider::Gemini, &raw, block_kind);
+            let replay = if is_first_function_call {
+                gemini_replay_signature_or_bypass(&raw, block_kind)
+            } else if has_signature
+                && decision.action == SignatureAction::Preserve
+                && !is_gemini_thought_signature_bypass(&signature_payload_without_prefix(&raw))
+            {
+                decision.normalized.clone()
+            } else {
+                String::new()
+            };
+            if !replay.is_empty() {
+                if !has_normalized_gemini_part_thought_signature(part, &replay) {
+                    delete_gemini_part_thought_signature_fields(part);
+                    if let Some(obj) = part.as_object_mut() {
+                        obj.insert("thoughtSignature".into(), serde_json::Value::String(replay));
+                        changed = true;
+                    }
+                }
+            } else if has_signature {
+                delete_gemini_part_thought_signature_fields(part);
+                changed = true;
+            }
+        }
+    }
+    changed
+}
+
 /// 测试夹具:构造真实形状的 Claude 签名(对齐 CPA buildClaudeSignaturePayload)。
 /// 各转换层测试共用,避免手写假签名被严格校验拒掉。
 #[cfg(test)]
 pub(crate) mod fixtures {
     use base64::engine::general_purpose::STANDARD;
     use base64::Engine;
+
+    /// Gemini 3 field2{field1{payload}} 信封(对齐 CPA testGemini3ThoughtSignature)
+    pub(crate) fn gemini_native_signature(payload: &[u8]) -> String {
+        let mut inner = vec![0x0a, payload.len() as u8];
+        inner.extend_from_slice(payload);
+        let mut outer = vec![0x12, inner.len() as u8];
+        outer.extend_from_slice(&inner);
+        STANDARD.encode(outer)
+    }
 
     fn append_varint(buf: &mut Vec<u8>, mut value: u64) {
         while value >= 0x80 {
@@ -1553,6 +1705,112 @@ mod tests {
         );
         assert_eq!(
             resolve_tool_use_thought_signature("gemini-2.5-pro", Some(&high_entropy_base64(48))),
+            GEMINI_SKIP_THOUGHT_SIGNATURE_VALIDATOR
+        );
+    }
+
+    // ---- SanitizeGeminiRequestThoughtSignatures(移植 CPA gemini_sanitize_test.go)----
+
+    fn sanitized(mut contents: serde_json::Value) -> serde_json::Value {
+        sanitize_gemini_request_thought_signatures(contents.as_array_mut().unwrap());
+        contents
+    }
+
+    #[test]
+    fn sanitize_preserves_native_first_call_and_unsigned_sibling() {
+        let native = super::fixtures::gemini_native_signature(&[0x01, 0x0c, 0x39]);
+        assert_eq!(
+            detect_signature_provider(&native),
+            SignatureProvider::Gemini
+        );
+        let input = serde_json::json!([{"role": "model", "parts": [
+            {"functionCall": {"name": "first", "args": {}}, "thoughtSignature": native},
+            {"functionCall": {"name": "second", "args": {}}}
+        ]}]);
+        let mut contents = input.clone();
+        assert!(!sanitize_gemini_request_thought_signatures(
+            contents.as_array_mut().unwrap()
+        ));
+        assert_eq!(contents, input);
+    }
+
+    #[test]
+    fn sanitize_parallel_synthetic_only_first_gets_bypass() {
+        let out = sanitized(serde_json::json!([{"role": "model", "parts": [
+            {"functionCall": {"name": "first", "args": {}}},
+            {"functionCall": {"name": "second", "args": {}}}
+        ]}]));
+        assert_eq!(
+            out[0]["parts"][0]["thoughtSignature"],
+            GEMINI_SKIP_THOUGHT_SIGNATURE_VALIDATOR
+        );
+        assert!(out[0]["parts"][1].get("thoughtSignature").is_none());
+    }
+
+    #[test]
+    fn sanitize_removes_polluted_and_prefixed_sibling_bypass() {
+        let native = super::fixtures::gemini_native_signature(&[0x01, 0x0c, 0x39]);
+        for sibling in [
+            GEMINI_SKIP_THOUGHT_SIGNATURE_VALIDATOR.to_string(),
+            format!("gemini#{GEMINI_SKIP_THOUGHT_SIGNATURE_VALIDATOR}"),
+            format!("google#{GEMINI_SKIP_THOUGHT_SIGNATURE_VALIDATOR}"),
+        ] {
+            let out = sanitized(serde_json::json!([{"role": "model", "parts": [
+                {"functionCall": {"name": "first", "args": {}}, "thoughtSignature": native},
+                {"functionCall": {"name": "second", "args": {}}, "thoughtSignature": sibling}
+            ]}]));
+            assert_eq!(out[0]["parts"][0]["thoughtSignature"], native.as_str());
+            assert!(out[0]["parts"][1].get("thoughtSignature").is_none());
+        }
+    }
+
+    #[test]
+    fn sanitize_replaces_uuid_and_nested_signature_on_first_call() {
+        let uuid_sig = STANDARD.encode("e24830a7-5cd6-42fe-998b-ee539e72b9c3");
+        let out = sanitized(serde_json::json!([{"role": "model", "parts": [
+            {"functionCall": {"name": "f", "args": {}, "thoughtSignature": uuid_sig}}
+        ]}]));
+        assert_eq!(
+            out[0]["parts"][0]["thoughtSignature"],
+            GEMINI_SKIP_THOUGHT_SIGNATURE_VALIDATOR
+        );
+        assert!(out[0]["parts"][0]["functionCall"]
+            .get("thoughtSignature")
+            .is_none());
+    }
+
+    #[test]
+    fn sanitize_strips_function_response_and_foreign_text_signatures() {
+        let out = sanitized(serde_json::json!([
+            {"role": "user", "parts": [{"functionResponse": {"name": "f", "response": {},
+                "thoughtSignature": "bad"}, "thoughtSignature": "bad"}]},
+            {"role": "model", "parts": [{"text": "answer", "thoughtSignature": "claude_or_invalid_signature"}]},
+            {"role": "model", "parts": [{"text": "hidden", "thought": true}]}
+        ]));
+        assert!(out[0]["parts"][0].get("thoughtSignature").is_none());
+        assert!(out[0]["parts"][0]["functionResponse"]
+            .get("thoughtSignature")
+            .is_none());
+        assert!(out[1]["parts"][0].get("thoughtSignature").is_none());
+        assert!(out[2]["parts"][0].get("thoughtSignature").is_none());
+    }
+
+    #[test]
+    fn sanitize_skips_server_tool_parts_and_user_turns() {
+        let input = serde_json::json!([
+            {"role": "user", "parts": [{"text": "hi", "thoughtSignature": "user-turn-untouched"}]},
+            {"role": "model", "parts": [
+                {"toolCall": {"toolType": "GOOGLE_SEARCH_WEB"}, "thoughtSignature": "arbitrary_opaque_tool_sig_value"},
+                {"tool_response": {"tool_type": "GOOGLE_SEARCH_WEB"}, "thought_signature": "arbitrary_snake_tool_sig"},
+                {"functionCall": {"name": "my_func", "args": {}}}
+            ]}
+        ]);
+        let out = sanitized(input.clone());
+        assert_eq!(out[0], input[0]);
+        assert_eq!(out[1]["parts"][0], input[1]["parts"][0]);
+        assert_eq!(out[1]["parts"][1], input[1]["parts"][1]);
+        assert_eq!(
+            out[1]["parts"][2]["thoughtSignature"],
             GEMINI_SKIP_THOUGHT_SIGNATURE_VALIDATOR
         );
     }

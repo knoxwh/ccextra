@@ -21,7 +21,9 @@ use ccextra_core::normalize::{
 };
 use ccextra_core::prompt_cache::inject_prompt_cache_key;
 use ccextra_core::route::{resolve_route, Protocol, ProviderConfig};
-use ccextra_core::session::{extract_claude_code_session, extract_claude_code_thread};
+use ccextra_core::session::{
+    extract_claude_code_agent_id, extract_claude_code_session, extract_claude_code_thread,
+};
 use futures::StreamExt;
 use serde_json::{json, Value};
 use std::collections::HashMap;
@@ -158,6 +160,15 @@ pub(crate) fn inbound_headers_json(headers: &HeaderMap) -> Value {
     Value::Object(map)
 }
 
+/// AG replay 账本是否因上游错误清理（逐字对齐 CPA
+/// clearAntigravityReasoningReplayOnInvalidSignature：仅 status == 400，body 小写后含
+/// thoughtsignature / thought_signature / signature）。只用于 AG 账本，不影响其它协议的签名门禁。
+fn should_clear_ag_replay_on_error(protocol: Protocol, status: u16, body: &[u8]) -> bool {
+    matches!(protocol, Protocol::Antigravity)
+        && status == 400
+        && is_antigravity_thought_signature_invalid(body)
+}
+
 struct RelayParams {
     protocol: Protocol,
     estimated_input_tokens: Option<usize>,
@@ -165,9 +176,11 @@ struct RelayParams {
     /// 转换前 Claude 请求快照(Gemini/AG 响应用来回剥占位 tool args)
     original_claude_request: Option<Arc<Value>>,
     replay_scope: Option<(crate::sse::replay_cache::ReplayCache, String, String)>,
+    /// (cache, key, 读账本快照, 外发 request)：提交走 ReplaceIfUnchanged(snapshot)
     ag_replay_scope: Option<(
         crate::sse::antigravity_replay_cache::AgReplayCache,
         String,
+        crate::sse::antigravity_replay_cache::AgReplaySnapshot,
         Value,
     )>,
     /// Kimi thinking：(cache, key, replay_applied)
@@ -213,8 +226,8 @@ where
             params.inbound_model.as_deref(),
         );
     }
-    if let Some((cache, key, request)) = params.ag_replay_scope {
-        let mut extractor = AgStreamReplayExtractor::new(cache, key, request);
+    if let Some((cache, key, snapshot, request)) = params.ag_replay_scope {
+        let mut extractor = AgStreamReplayExtractor::new(cache, key, snapshot, request);
         let tapped = stream.inspect(move |result| {
             if let Ok(bytes) = result {
                 extractor.push(bytes);
@@ -334,8 +347,10 @@ pub(crate) struct PreparedMessageRequest {
     /// 转换前 Claude 请求快照(仅 Gemini/AG;响应用来回剥占位 tool args)
     pub original_claude_request: Option<Arc<Value>>,
     pub replay_scope: Option<(crate::sse::replay_cache::ReplayCache, String, String)>,
-    /// Antigravity thoughtSignature 账本 scope：(cache, "{model}:{session}")
+    /// Antigravity thoughtSignature 账本 scope：(cache, key)，key 见 `ag_replay_session_key`
     pub ag_replay_scope: Option<(crate::sse::antigravity_replay_cache::AgReplayCache, String)>,
+    /// 本请求读 AG 账本时的快照（对齐 CPA scope.cacheSnapshot，供 IfUnchanged 清理）
+    pub ag_replay_snapshot: crate::sse::antigravity_replay_cache::AgReplaySnapshot,
     /// Kimi thinking replay：(cache, "{family}:{session}", applied)
     pub kimi_replay_scope: Option<(
         crate::sse::kimi_thinking_replay_cache::KimiThinkingReplayCache,
@@ -434,6 +449,9 @@ pub(crate) async fn prepare_message_request(
     let mut original_claude_request: Option<Arc<Value>> = None;
     let mut request_fingerprint = String::new();
     let mut kimi_replay_applied = false;
+    // AG thoughtSignature 账本 key：读（注入）与写（响应提交）共用同一值
+    let mut ag_replay_key: Option<String> = None;
+    let mut ag_replay_snapshot = crate::sse::antigravity_replay_cache::AgReplaySnapshot::default();
 
     match route.protocol {
         Protocol::Claude => {
@@ -564,6 +582,16 @@ pub(crate) async fn prepare_message_request(
         }
         Protocol::Antigravity => {
             original_claude_request = Some(Arc::new(body_json.clone()));
+            if ccextra_core::antigravity_uses_reasoning_replay(&route.upstream_model) {
+                ag_replay_key = cc_session.as_deref().map(|sess| {
+                    crate::sse::antigravity_replay_cache::ag_replay_session_key(
+                        &route.upstream_model,
+                        sess,
+                        &extract_claude_code_agent_id(headers),
+                        &ccextra_core::convert::claude_replay_system_lane(&body_json),
+                    )
+                });
+            }
             let project_id = {
                 let provider = find_provider(providers, &route.provider);
                 provider
@@ -584,13 +612,18 @@ pub(crate) async fn prepare_message_request(
                 tool_names = Some(Arc::new(short_to_original));
             }
             if ccextra_core::antigravity_uses_reasoning_replay(&route.upstream_model) {
-                if let Some(sess) = cc_session.as_deref() {
-                    let key = format!("{}:{}", route.upstream_model, sess);
+                // 工具表（对齐 CPA toolSchemas 来源：原始 Claude 请求）+ 上游短名映射
+                let replay_tools = ccextra_core::convert::AgReplayToolContext {
+                    original_request: original_claude_request.as_deref(),
+                    short_to_original: tool_names.as_deref(),
+                };
+                if let (Some(sess), Some(key)) = (cc_session.as_deref(), ag_replay_key.as_deref()) {
                     use crate::sse::antigravity_replay_cache::AgReplayApplyOutcome;
-                    match state
+                    let (outcome, snapshot) = state
                         .ag_replay_cache
-                        .apply_to_antigravity_body(&key, &mut body_json)
-                    {
+                        .apply_to_antigravity_body_with_tools(key, &mut body_json, replay_tools);
+                    ag_replay_snapshot = snapshot;
+                    match outcome {
                         AgReplayApplyOutcome::Applied { items } => {
                             tracing::debug!(
                                 session = %sess,
@@ -622,9 +655,38 @@ pub(crate) async fn prepare_message_request(
                                 "antigravity reasoning replay 缺少 request 字段，跳过注入"
                             );
                         }
+                        AgReplayApplyOutcome::RolledBack { items } => {
+                            tracing::debug!(
+                                session = %sess,
+                                model = %route.upstream_model,
+                                items,
+                                "antigravity reasoning replay 破坏配对，已退回原始请求并按快照清账本"
+                            );
+                        }
                         AgReplayApplyOutcome::Miss => {
                             // 对齐 CPA：普通 miss 保持安静，避免每轮刷屏
                         }
+                        AgReplayApplyOutcome::PairingInvalid { message } => {
+                            // 对齐 CPA statusErr 400 → Claude invalid_request_error。每个 AG Gemini
+                            // 族请求都校验；历史坏了时每轮同样 400，直到用户 rewind 或 /clear。
+                            tracing::debug!(
+                                session = %sess,
+                                model = %route.upstream_model,
+                                "antigravity replay 历史配对无效，本地 400"
+                            );
+                            return Err(AppError::bad_request(message));
+                        }
+                    }
+                } else {
+                    // 无会话：无账本，但历史稳定 id 仍须降级（对齐 CPA 兜底不依赖 scope）；
+                    // 配对无效同样本地 400（见上，坏历史每轮重现）
+                    if let Some(message) =
+                        crate::sse::antigravity_replay_cache::prepare_antigravity_body_without_ledger(
+                            &mut body_json,
+                            replay_tools,
+                        )
+                    {
+                        return Err(AppError::bad_request(message));
                     }
                 }
             }
@@ -1026,12 +1088,9 @@ pub(crate) async fn prepare_message_request(
     let ag_replay_scope = if matches!(route.protocol, Protocol::Antigravity)
         && ccextra_core::antigravity_uses_reasoning_replay(&route.upstream_model)
     {
-        cc_session.as_deref().map(|s| {
-            (
-                state.ag_replay_cache.clone(),
-                format!("{}:{}", route.upstream_model, s),
-            )
-        })
+        ag_replay_key
+            .clone()
+            .map(|key| (state.ag_replay_cache.clone(), key))
     } else {
         None
     };
@@ -1083,6 +1142,7 @@ pub(crate) async fn prepare_message_request(
         original_claude_request,
         replay_scope,
         ag_replay_scope,
+        ag_replay_snapshot,
         kimi_replay_scope,
         signature_model,
         inbound_model: Arc::from(model.as_str()),
@@ -1270,9 +1330,8 @@ pub(crate) async fn deliver_response(
                     if let Some((cache, key, _)) = prepared.replay_scope.as_ref() {
                         cache.invalidate(key);
                     }
-                    if let Some((cache, key)) = prepared.ag_replay_scope.as_ref() {
-                        cache.invalidate(key);
-                    }
+                    // AG 账本不清：对齐 CPA，401 只走凭证刷新重试，
+                    // clearAntigravityReasoningReplayOnInvalidSignature 仅处理 400
                     if let Some((cache, key, _)) = prepared.kimi_replay_scope.as_ref() {
                         cache.invalidate(key);
                     }
@@ -1330,9 +1389,8 @@ pub(crate) async fn deliver_response(
                     if let Some((cache, key, _)) = prepared.replay_scope.as_ref() {
                         cache.invalidate(key);
                     }
-                    if let Some((cache, key)) = prepared.ag_replay_scope.as_ref() {
-                        cache.invalidate(key);
-                    }
+                    // AG 账本不清：CPA 无 unfit 自适应重试路径，也无对应清理；重试结果仍由
+                    // 签名无效清理（400 + IfUnchanged）与成功提交（ReplaceIfUnchanged）处理
                     if let Some((cache, key, _)) = prepared.kimi_replay_scope.as_ref() {
                         cache.invalidate(key);
                     }
@@ -1356,16 +1414,19 @@ pub(crate) async fn deliver_response(
 
         if !retried_ok
             && !final_truncated
-            && (status.as_u16() == 400 || status.as_u16() == 422)
-            && matches!(prepared.route.protocol, Protocol::Antigravity)
-            && is_antigravity_thought_signature_invalid(&final_bytes)
+            && should_clear_ag_replay_on_error(
+                prepared.route.protocol,
+                status.as_u16(),
+                &final_bytes,
+            )
         {
             tracing::warn!(
                 protocol = ?prepared.route.protocol,
                 "antigravity thoughtSignature 无效,清空 replay 账本"
             );
             if let Some((cache, key)) = prepared.ag_replay_scope.as_ref() {
-                cache.invalidate(key);
+                // 对齐 CPA DeleteAntigravityReasoningReplayItemsIfUnchanged(scope.cacheSnapshot)
+                cache.invalidate_if_unchanged(key, &prepared.ag_replay_snapshot);
             }
         }
 
@@ -1451,6 +1512,7 @@ pub(crate) async fn deliver_response(
                     (
                         cache.clone(),
                         key.clone(),
+                        prepared.ag_replay_snapshot.clone(),
                         prepared
                             .body_json
                             .get("request")
@@ -1499,7 +1561,7 @@ pub(crate) async fn deliver_response(
             if let Some((cache, key)) = prepared.ag_replay_scope.as_ref() {
                 if matches!(prepared.route.protocol, Protocol::Antigravity) {
                     if let Some(request) = prepared.body_json.get("request") {
-                        cache.store_from_response(key, request, v);
+                        cache.store_from_response(key, &prepared.ag_replay_snapshot, request, v);
                     }
                 }
             }
@@ -1911,6 +1973,7 @@ mod tests {
             original_claude_request: None,
             replay_scope: None,
             ag_replay_scope: None,
+            ag_replay_snapshot: Default::default(),
             kimi_replay_scope: None,
             signature_model: None,
             inbound_model: Arc::from("gpt-test"),
@@ -1918,6 +1981,42 @@ mod tests {
             drift_usage_scope: None,
             unfit_generation: 0,
         }
+    }
+
+    /// AG 账本清理门禁对齐 CPA：仅 400；422 / 401 / 其它协议不清；含 "signature" 即命中。
+    #[test]
+    fn ag_replay_clear_gate_matches_cpa() {
+        let body = br#"{"error":{"message":"Corrupted thought signature."}}"#;
+        assert!(should_clear_ag_replay_on_error(
+            Protocol::Antigravity,
+            400,
+            body
+        ));
+        assert!(should_clear_ag_replay_on_error(
+            Protocol::Antigravity,
+            400,
+            b"signature mismatch"
+        ));
+        assert!(!should_clear_ag_replay_on_error(
+            Protocol::Antigravity,
+            422,
+            body
+        ));
+        assert!(!should_clear_ag_replay_on_error(
+            Protocol::Antigravity,
+            401,
+            body
+        ));
+        assert!(!should_clear_ag_replay_on_error(
+            Protocol::Claude,
+            400,
+            body
+        ));
+        assert!(!should_clear_ag_replay_on_error(
+            Protocol::Antigravity,
+            400,
+            br#"{"error":{"message":"quota exceeded"}}"#
+        ));
     }
 
     #[test]

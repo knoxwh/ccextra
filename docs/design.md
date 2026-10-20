@@ -119,7 +119,9 @@ Antigravity（gemini/flash/agent，不含 claude）使用**独立的** thoughtSi
 
 累积与提交：流式与非流式从上游 `candidates[].parts` 累积可回放项；`finishReason` **只标记 terminal**，不立即落库（后续帧仍可能带 signature / usage）。流式在 SSE 结束（`finish` / `Drop`）时若 terminal 才提交；非流在完整 body 观察后提交。terminal 但空或字节/条数溢出则清空该会话账本；非 terminal 不动缓存。
 
-下一轮在已有 `request.contents` part 上补回 `thoughtSignature`（MVP 不插入缺失的 functionCall）。unfit 重试，或上游 400 且 body 文案像 thoughtSignature 校验失败时，清空该会话账本。
+下一轮在已有 `request.contents` part 上补回 `thoughtSignature`，稳定 tool_use id（`ccx_gemini_…`）换回原生 `functionCall.id`，孤儿 `functionResponse` 按账本插回缺失的 functionCall（对齐 CPA）。上游 400 且 body 含 `signature` 时按读账本快照清空该会话账本（unfit 与 401 重试不清）。
+
+配对校验对齐 CPA：每个 AG Gemini 族请求（与有无会话 / 账本无关）都校验 functionCall / functionResponse 配对；回放破坏配对则退回原始请求，原始历史本身无效则本地回 400。历史不变时该 400 每轮重现，直到用户回退（rewind）或 `/clear`。
 
 ## OAuth provider
 

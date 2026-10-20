@@ -147,22 +147,19 @@ pub fn convert_to_gemini_with_registry(
     // 对齐 CPA EnsureGeminiTrailingUserContent(15d2148b):尾 turn 为 model 时补空
     // user;纯 functionResponse 保留(上游期望模型续写),但 FR 嵌套媒体时仍补
     // (#6524)。Antigravity claude 目标全部跳过(adapter 拒空 text part)。
+    // 顺序：Antigravity 对齐 CPA ensureAntigravityGeminiBoundaryUserContent（剥 → 首 → 尾，
+    // antigravity_executor.go:525-531）；Gemini 直连保持原有「首 → 剥 → 尾」不变。
     let is_claude_target = upstream_model.to_lowercase().contains("claude");
-    if !(flavor == SchemaFlavor::Antigravity && is_claude_target) {
-        if let Some(contents) = gemini.get_mut("contents").and_then(|c| c.as_array_mut()) {
-            if contents
-                .first()
-                .and_then(|c| c.get("role"))
-                .and_then(|r| r.as_str())
-                == Some("model")
-            {
-                contents.insert(
-                    0,
-                    serde_json::json!({"role": "user", "parts": [{"text": ""}]}),
-                );
+    if let Some(contents) = gemini.get_mut("contents").and_then(|c| c.as_array_mut()) {
+        match flavor {
+            SchemaFlavor::Antigravity if is_claude_target => {}
+            SchemaFlavor::Antigravity => ensure_antigravity_gemini_boundary_user_content(contents),
+            SchemaFlavor::Gemini => {
+                // 对齐 CPA gemini_executor.go:166/:300（及 vertex 同位置）：外发前
+                // SanitizeGeminiRequestThoughtSignatures(body, "contents")，再补边界 user 回合
+                super::signature::sanitize_gemini_request_thought_signatures(contents);
+                ensure_gemini_boundary_user_content(contents)
             }
-            drop_gemini_trailing_thought_only_content(contents);
-            ensure_gemini_trailing_user_content(contents);
         }
     }
 
@@ -409,6 +406,38 @@ fn content_is_thought_only_model_turn(content: &Value) -> bool {
             && part.get("functionResponse").is_none()
             && part.get("function_response").is_none()
     })
+}
+
+/// Gemini 直连：首 turn 为 model 时前置空 user;剥尾部纯 thought model turn;尾 model turn
+/// 补空 user(ccextra 既有顺序,不随 AG 对齐改动)。
+pub(crate) fn ensure_gemini_boundary_user_content(contents: &mut Vec<Value>) {
+    ensure_gemini_leading_user_content(contents);
+    drop_gemini_trailing_thought_only_content(contents);
+    ensure_gemini_trailing_user_content(contents);
+}
+
+/// Antigravity 非 Claude 目标(对齐 CPA ensureAntigravityGeminiBoundaryUserContent):
+/// 先 DropGeminiTrailingThoughtOnlyContent,再 EnsureGeminiBoundaryUserContent(首 → 尾)。
+/// 转换器与 AG replay prepare 之后共用。
+pub(crate) fn ensure_antigravity_gemini_boundary_user_content(contents: &mut Vec<Value>) {
+    drop_gemini_trailing_thought_only_content(contents);
+    ensure_gemini_leading_user_content(contents);
+    ensure_gemini_trailing_user_content(contents);
+}
+
+/// 对齐 CPA EnsureGeminiLeadingUserContent:首 turn 为 model 时前置空 user
+fn ensure_gemini_leading_user_content(contents: &mut Vec<Value>) {
+    if contents
+        .first()
+        .and_then(|c| c.get("role"))
+        .and_then(|r| r.as_str())
+        == Some("model")
+    {
+        contents.insert(
+            0,
+            serde_json::json!({"role": "user", "parts": [{"text": ""}]}),
+        );
+    }
 }
 
 /// 对齐 CPA DropGeminiTrailingThoughtOnlyContent:剥尾部纯 thought model turn,至少留 1
@@ -1353,5 +1382,84 @@ IMPORTANT: Assist with authorized security testing.
         assert_eq!(gemini_tools[1]["name"], "tool_name");
         assert_eq!(short_map.get("tool-name").unwrap(), "tool-name");
         assert_eq!(short_map.get("tool_name").unwrap(), "tool_name");
+    }
+
+    /// 边界顺序：AG 对齐 CPA（剥 → 首 → 尾），Gemini 直连保持既有（首 → 剥 → 尾）。
+    /// 只有「除合成首 user 外全是尾部纯 thought model 回合」时两者结果不同。
+    #[test]
+    fn boundary_order_antigravity_matches_cpa_gemini_unchanged() {
+        let thought_only = json!({"role": "model", "parts": [{"text": "t", "thought": true}]});
+        let empty_user = json!({"role": "user", "parts": [{"text": ""}]});
+
+        let mut ag = vec![thought_only.clone()];
+        ensure_antigravity_gemini_boundary_user_content(&mut ag);
+        assert_eq!(
+            ag,
+            vec![empty_user.clone(), thought_only.clone(), empty_user.clone()]
+        );
+
+        let mut gemini = vec![thought_only.clone()];
+        ensure_gemini_boundary_user_content(&mut gemini);
+        assert_eq!(gemini, vec![empty_user.clone()]);
+
+        // 常见形态两者一致：尾部纯 thought 被剥，以 user 结尾
+        let common = vec![
+            json!({"role": "user", "parts": [{"text": "q"}]}),
+            json!({"role": "model", "parts": [{"text": "a"}]}),
+            thought_only.clone(),
+        ];
+        let (mut a, mut g) = (common.clone(), common.clone());
+        ensure_antigravity_gemini_boundary_user_content(&mut a);
+        ensure_gemini_boundary_user_content(&mut g);
+        assert_eq!(a, g);
+        assert_eq!(a.len(), 3);
+        assert_eq!(a[2], empty_user);
+    }
+
+    /// 对齐 CPA gemini_executor.go:166/:300：Gemini 直连外发前跑
+    /// SanitizeGeminiRequestThoughtSignatures——并行 call 只有首个带哨兵，兄弟 call 去签名；
+    /// Antigravity 走 prepare 链，不在 converter 里 sanitize。
+    #[test]
+    fn gemini_direct_sanitizes_parallel_call_signatures() {
+        let body = json!({
+            "model": "gemini-2.5-pro",
+            "max_tokens": 64,
+            "messages": [
+                {"role": "user", "content": "read both"},
+                {"role": "assistant", "content": [
+                    {"type": "tool_use", "id": "t1", "name": "Read", "input": {"p": "/a"}},
+                    {"type": "tool_use", "id": "t2", "name": "Read", "input": {"p": "/b"}}
+                ]},
+                {"role": "user", "content": [
+                    {"type": "tool_result", "tool_use_id": "t1", "content": "a"},
+                    {"type": "tool_result", "tool_use_id": "t2", "content": "b"}
+                ]}
+            ]
+        });
+        let (gemini, _) = convert_to_gemini(&body, "gemini-2.5-pro");
+        let model = gemini["contents"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .find(|c| c["role"] == "model")
+            .expect("model turn");
+        let parts = model["parts"].as_array().unwrap();
+        assert_eq!(parts.len(), 2);
+        assert_eq!(
+            parts[0]["thoughtSignature"],
+            crate::convert::signature::GEMINI_SKIP_THOUGHT_SIGNATURE_VALIDATOR
+        );
+        assert!(parts[1].get("thoughtSignature").is_none());
+        assert!(parts[1].get("thought_signature").is_none());
+
+        let (ag, _) =
+            convert_to_gemini_with_registry(&body, "gemini-3-pro", SchemaFlavor::Antigravity, &[]);
+        let ag_model = ag["contents"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .find(|c| c["role"] == "model")
+            .unwrap();
+        assert!(ag_model["parts"][1].get("thoughtSignature").is_some());
     }
 }

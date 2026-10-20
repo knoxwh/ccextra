@@ -386,8 +386,8 @@ async fn main() -> Result<()> {
             1024,
         ),
         ag_replay_cache: ccextra_server::sse::antigravity_replay_cache::AgReplayCache::new(
-            std::time::Duration::from_secs(3600),
-            1024,
+            ccextra_server::sse::antigravity_replay_cache::AG_REPLAY_CACHE_TTL,
+            ccextra_server::sse::antigravity_replay_cache::AG_REPLAY_CACHE_MAX_ENTRIES,
         ),
         kimi_thinking_replay_cache:
             ccextra_server::sse::kimi_thinking_replay_cache::KimiThinkingReplayCache::new(
@@ -402,6 +402,11 @@ async fn main() -> Result<()> {
     // Antigravity 后台注入(对齐 CPA 启动模式:listening 不等在线模型列表;
     // 任务内部立即拉取一次,成功替换 providers,失败保旧等下轮)
     tokio::spawn(run_antigravity_injection(state.clone()));
+
+    // AG 账本后台过期清理(对齐 CPA startCacheCleanup 10 分钟 purgeExpired;任务只持 Weak)
+    state.ag_replay_cache.spawn_purge_task(
+        ccextra_server::sse::antigravity_replay_cache::AG_REPLAY_CACHE_CLEANUP_INTERVAL,
+    );
 
     // 启动 HTTP 服务
     let addr = format!("{}:{}", config.server.host, config.server.port);

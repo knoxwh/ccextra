@@ -29,9 +29,11 @@ pub mod tool_sanitize;
 
 pub use antigravity::{convert_to_antigravity, convert_to_antigravity_with};
 pub use antigravity_reasoning_replay::{
-    apply_ag_replay_items, collect_ag_replay_from_response, has_native_thought_signature,
-    is_antigravity_thought_signature_invalid, normalize_ag_replay_item, normalize_ag_replay_items,
-    AgReplayAccumulator, MAX_BYTES_PER_ENTRY, MAX_ITEMS_PER_ENTRY,
+    apply_ag_replay_items, claude_replay_system_lane, collect_ag_replay_from_response,
+    has_native_thought_signature, is_antigravity_thought_signature_invalid,
+    normalize_ag_replay_item, normalize_ag_replay_items, prepare_ag_replay_request_with_tools,
+    AgReplayAccumulator, AgReplayPrepareReport, AgReplayToolContext, MAX_BYTES_PER_ENTRY,
+    MAX_ITEMS_PER_ENTRY,
 };
 pub use antigravity_tools::{
     antigravity_tool_name_to_upstream, antigravity_upstream_tool_name_to_client,
@@ -75,8 +77,11 @@ pub use to_openai_responses::{
     sanitize_gpt_reasoning_items, trim_encrypted_reasoning_items,
 };
 
-/// Claude Code 每请求注入 system 的计费+prompt 指纹块前缀(内容逐请求变化)。
-/// 转换到 openai 侧必须剥离,否则上游缓存前缀每次请求全 miss。
+/// Claude Code 注入 system 的计费归属行前缀(`cc_version=VER.FFF; cc_entrypoint=…`)。
+/// 内容只在 first-party 签名路径(带 `cch=` / `cc_prev_req` / `cc_prompt_id`)逐请求变化;
+/// 经自定义 base URL 走代理时会话内稳定(FFF 取自首条 user 消息,随版本升级 / compact 变)。
+/// 转换到非 Anthropic 上游仍剥离(对齐 CPA d606faa9):它不是给模型的指令,且一旦带签名字段
+/// 会让上游缓存前缀逐请求 miss。AG replay 账本分道同样剥离(见 claude_replay_system_lane)。
 const CLAUDE_CODE_ATTRIBUTION_PREFIX: &str = "x-anthropic-billing-header:";
 
 /// Claude Code subagent / CLI 注入的固定身份声明。非 Claude 上游剥离防拦截/人设冲突。
