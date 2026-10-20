@@ -642,27 +642,73 @@ fn function_call_matches_item(fc: &Value, item: &Value, tools: &ReplayToolTable)
     )
 }
 
-/// 首个 `functionCall.id == id` 的位置（对齐 CPA functionCallsByID 取首个）。
-fn first_function_call_with_id(contents: &[Value], id: &str) -> Option<(usize, usize)> {
-    if id.is_empty() {
-        return None;
+/// apply 期间的 functionCall id → 位置索引（对齐 CPA functionCallsByID 取首个）。
+/// 替代逐条全历史扫描：同 id 多处取 (ci, pi) 最小者，与线性扫描首个一致。
+/// 生命周期 = 单次 [`apply_ag_replay_items_with_tools`]，与 [`ContextFingerprints`]
+/// 同点失效维护：身份回写 O(1) 增量更新，G5 插入移位整表重建（罕见路径）。
+struct FunctionCallIndex {
+    positions: HashMap<String, Vec<(usize, usize)>>,
+}
+
+impl FunctionCallIndex {
+    /// 全量建表：键为 trim 后的 functionCall.id，空 id 跳过。
+    fn build(contents: &[Value]) -> Self {
+        let mut positions: HashMap<String, Vec<(usize, usize)>> = HashMap::new();
+        for (ci, content) in contents.iter().enumerate() {
+            for (pi, part) in content_parts(content).iter().enumerate() {
+                let Some(fc) = part.get("functionCall") else {
+                    continue;
+                };
+                let id = str_field(fc, "id");
+                if id.is_empty() {
+                    continue;
+                }
+                positions.entry(id.to_string()).or_default().push((ci, pi));
+            }
+        }
+        Self { positions }
     }
-    for (ci, content) in contents.iter().enumerate() {
-        for (pi, part) in content_parts(content).iter().enumerate() {
-            if let Some(fc) = part.get("functionCall") {
-                if str_field(fc, "id") == id {
-                    return Some((ci, pi));
+
+    /// 首个 `functionCall.id == id` 的位置；空 id 返回 None。
+    fn first(&self, id: &str) -> Option<(usize, usize)> {
+        if id.is_empty() {
+            return None;
+        }
+        self.positions.get(id)?.iter().copied().min()
+    }
+
+    /// (ci, pi) 的 call id 由 old_id 改写为 new_id：摘旧键挂新键，O(1)。
+    fn rewrite_id(&mut self, ci: usize, pi: usize, old_id: &str, new_id: &str) {
+        if old_id == new_id {
+            return;
+        }
+        if !old_id.is_empty() {
+            if let Some(vec) = self.positions.get_mut(old_id) {
+                vec.retain(|&(c, p)| !(c == ci && p == pi));
+                if vec.is_empty() {
+                    self.positions.remove(old_id);
                 }
             }
         }
+        if !new_id.is_empty() {
+            self.positions
+                .entry(new_id.to_string())
+                .or_default()
+                .push((ci, pi));
+        }
     }
-    None
+
+    /// G5 插入移位后整表重建。
+    fn rebuild(&mut self, contents: &[Value]) {
+        *self = Self::build(contents);
+    }
 }
 
 /// 对齐 CPA functionCallPartLocationForReplayWithSchemas。
 fn locate_function_call_part(
     contents: &[Value],
     fp: &mut ContextFingerprints,
+    index: &FunctionCallIndex,
     item: &Value,
     stable_id: &str,
     tools: &ReplayToolTable,
@@ -683,7 +729,7 @@ fn locate_function_call_part(
         if candidate.is_empty() {
             continue;
         }
-        let Some((ci, pi)) = first_function_call_with_id(contents, candidate) else {
+        let Some((ci, pi)) = index.first(candidate) else {
             continue;
         };
         if !context_matches(fp, contents, item, ci) {
@@ -746,6 +792,7 @@ fn locate_function_call_part(
 /// functionCallProvenanceLocation + :2156-2162）。
 fn function_call_provenance_location(
     contents: &[Value],
+    index: &FunctionCallIndex,
     item: &Value,
     stable_id: &str,
     tools: &ReplayToolTable,
@@ -753,7 +800,7 @@ fn function_call_provenance_location(
     if stable_id.is_empty() || stable_id == item_call_id(item) {
         return None;
     }
-    let (ci, pi) = first_function_call_with_id(contents, stable_id)?;
+    let (ci, pi) = index.first(stable_id)?;
     let fc = function_call_at(contents, ci, pi)?;
     function_call_matches_item(fc, item, tools).then_some((ci, pi))
 }
@@ -1071,6 +1118,7 @@ fn restore_function_response_identity(
 fn insert_missing_function_call(
     contents: &mut Vec<Value>,
     fp: &mut ContextFingerprints,
+    index: &mut FunctionCallIndex,
     item: &Value,
     stable_id: &str,
 ) -> Option<usize> {
@@ -1081,9 +1129,7 @@ fn insert_missing_function_call(
     if name.is_empty() || call_id.is_empty() {
         return None;
     }
-    if first_function_call_with_id(contents, &call_id).is_some()
-        || first_function_call_with_id(contents, stable_id).is_some()
-    {
+    if index.first(&call_id).is_some() || index.first(stable_id).is_some() {
         return None;
     }
     let mut candidates = vec![call_id.clone()];
@@ -1117,7 +1163,10 @@ fn insert_missing_function_call(
                 &args,
                 &thought_sig,
             ));
+            let pi = parts.len() - 1;
             restore_function_response_identity(contents, &response_id, &call_id, &name);
+            // 追加不动既有位置：O(1) 挂新键
+            index.rewrite_id(model_index, pi, "", &call_id);
             tracing::debug!(
                 call_id = %call_id,
                 content_index = model_index,
@@ -1141,6 +1190,8 @@ fn insert_missing_function_call(
             }),
         );
         restore_function_response_identity(contents, &response_id, &call_id, &name);
+        // 插入 content 使后续位置整体移位：整表重建
+        index.rebuild(contents);
         tracing::debug!(
             call_id = %call_id,
             content_index = fr_index,
@@ -1153,15 +1204,40 @@ fn insert_missing_function_call(
     None
 }
 
+/// restore 后按 (ci, pi) 改写前后的实际 id 增量更新索引：身份回写才动 id，
+/// args / 签名改动不影响索引（id 不变时 rewrite_id 为 no-op）。
+fn restore_with_index(
+    contents: &mut [Value],
+    index: &mut FunctionCallIndex,
+    ci: usize,
+    pi: usize,
+    item: &Value,
+    allow_legacy: bool,
+) -> FunctionCallReplay {
+    let before_id = function_call_at(contents, ci, pi)
+        .map(|fc| str_field(fc, "id").to_string())
+        .unwrap_or_default();
+    let replay = restore_native_function_call(contents, ci, pi, item, allow_legacy);
+    if matches!(replay, FunctionCallReplay::Identity(_)) {
+        let after_id = function_call_at(contents, ci, pi)
+            .map(|fc| str_field(fc, "id").to_string())
+            .unwrap_or_default();
+        index.rewrite_id(ci, pi, &before_id, &after_id);
+    }
+    replay
+}
+
 fn apply_function_call_item(
     contents: &mut Vec<Value>,
     fp: &mut ContextFingerprints,
+    index: &mut FunctionCallIndex,
     item: &Value,
     tools: &ReplayToolTable,
 ) -> FunctionCallReplay {
     let name = str_field(item, "name");
     let stable_id = gemini_claude_tool_use_id(item_call_id(item), name, item.get("args"));
-    if let Some((ci, pi)) = locate_function_call_part(contents, fp, item, &stable_id, tools) {
+    if let Some((ci, pi)) = locate_function_call_part(contents, fp, index, item, &stable_id, tools)
+    {
         // 对齐 CPA eligibility filter :812-821（顺序路径不合格即跳过，:414-416；批量路径
         // sameNativeCall 同条件 no-op，:613-616）：id 与 args 都已是原生，且账本无签名或 part
         // 已带 native 签名 → 不动
@@ -1170,14 +1246,16 @@ fn apply_function_call_item(
         }
         // 对齐 CPA :2153 `_, allowLegacyIDRestore := toolSchemas[name]`
         let allow_legacy = tools.schema(name).is_some();
-        return restore_native_function_call(contents, ci, pi, item, allow_legacy);
+        return restore_with_index(contents, index, ci, pi, item, allow_legacy);
     }
     // provenance 路径：CPA :2161 传 allowLegacyIDRestore=false
-    if let Some((ci, pi)) = function_call_provenance_location(contents, item, &stable_id, tools) {
-        return restore_native_function_call(contents, ci, pi, item, false);
+    if let Some((ci, pi)) =
+        function_call_provenance_location(contents, index, item, &stable_id, tools)
+    {
+        return restore_with_index(contents, index, ci, pi, item, false);
     }
     // G5 缺失 functionCall 插回（CPA :2163-2195）
-    match insert_missing_function_call(contents, fp, item, &stable_id) {
+    match insert_missing_function_call(contents, fp, index, item, &stable_id) {
         Some(min_ci) => FunctionCallReplay::Identity(min_ci),
         None => FunctionCallReplay::Unchanged,
     }
@@ -1209,6 +1287,7 @@ pub fn apply_ag_replay_items_with_tools(
     let Some(contents) = contents_mut(request) else {
         return false;
     };
+    let mut index = FunctionCallIndex::build(contents);
     let mut changed = false;
     for item in &normalized {
         match item.get("type").and_then(|v| v.as_str()).unwrap_or("") {
@@ -1224,16 +1303,17 @@ pub fn apply_ag_replay_items_with_tools(
                     changed = true;
                 }
             }
-            "function_call_part" => match apply_function_call_item(contents, &mut fp, item, &tools)
-            {
-                FunctionCallReplay::Unchanged => {}
-                FunctionCallReplay::Signature => changed = true,
-                FunctionCallReplay::Identity(min_ci) => {
-                    // 身份回写改变上下文指纹：后续条目按改写后的 payload 重算（对齐 CPA 重建 index）
-                    fp.invalidate_from(min_ci);
-                    changed = true;
+            "function_call_part" => {
+                match apply_function_call_item(contents, &mut fp, &mut index, item, &tools) {
+                    FunctionCallReplay::Unchanged => {}
+                    FunctionCallReplay::Signature => changed = true,
+                    FunctionCallReplay::Identity(min_ci) => {
+                        // 身份回写改变上下文指纹：后续条目按改写后的 payload 重算（对齐 CPA 重建 index）
+                        fp.invalidate_from(min_ci);
+                        changed = true;
+                    }
                 }
-            },
+            }
             _ => {}
         }
     }
@@ -3974,9 +4054,98 @@ mod tests {
             ]}),
         ];
         let mut fp = ContextFingerprints::new(&base);
+        let mut index = FunctionCallIndex::build(&contents);
         let item_a = items.iter().find(|i| i["call_id"] == "native-a").unwrap();
-        assert!(insert_missing_function_call(&mut contents, &mut fp, item_a, &sa).is_none());
+        assert!(
+            insert_missing_function_call(&mut contents, &mut fp, &mut index, item_a, &sa).is_none()
+        );
         assert_eq!(contents.len(), 3);
+    }
+
+    // ---- functionCall id 索引（P2-2）----
+
+    /// 索引语义：同 id 多处取位置最小者（与线性扫描首个一致）；改写摘旧挂新；重建跟随移位。
+    #[test]
+    fn function_call_index_first_rewrite_and_rebuild() {
+        let contents = || {
+            vec![
+                json!({"role": "user", "parts": [{"text": "hi"}]}),
+                json!({"role": "model", "parts": [
+                    {"functionCall": {"id": "dup", "name": "Read", "args": {}}},
+                    {"functionCall": {"id": "dup", "name": "Read", "args": {}}},
+                    {"functionCall": {"id": "x", "name": "Read", "args": {}}},
+                ]}),
+            ]
+        };
+        let mut index = FunctionCallIndex::build(&contents());
+        assert_eq!(index.first("dup"), Some((1, 0)));
+        assert_eq!(index.first(""), None);
+        assert_eq!(index.first("missing"), None);
+        // (1,0) 改写为 native-a：dup 只剩 (1,1)，native-a 挂 (1,0)
+        index.rewrite_id(1, 0, "dup", "native-a");
+        assert_eq!(index.first("dup"), Some((1, 1)));
+        assert_eq!(index.first("native-a"), Some((1, 0)));
+        // id 不变 → no-op
+        index.rewrite_id(1, 1, "dup", "dup");
+        assert_eq!(index.first("dup"), Some((1, 1)));
+        // 旧 id 最后一个位置被摘走 → 键移除
+        index.rewrite_id(1, 1, "dup", "native-b");
+        assert_eq!(index.first("dup"), None);
+        // G5 插入移位 → 整表重建
+        let mut shifted = contents();
+        shifted.insert(
+            1,
+            json!({"role": "model", "parts": [
+                {"functionCall": {"id": "ins", "name": "Read", "args": {}}}
+            ]}),
+        );
+        index.rebuild(&shifted);
+        assert_eq!(index.first("ins"), Some((1, 0)));
+        assert_eq!(index.first("dup"), Some((2, 0)));
+    }
+
+    /// G5 插入移位后，后续条目经索引仍命中移位后的位置：第二条 call 完整在场，
+    /// 第一条孤儿 FR 触发插回使整体后移；陈旧索引会指到 FR part 上导致漏回写。
+    #[test]
+    fn insert_shift_keeps_later_items_locatable() {
+        let base = base_request();
+        let items = first_turn_items(&base);
+        let (sa, sb) = (stable("native-a", "/a"), stable("native-b", "/b"));
+        let mut req = base.clone();
+        let contents = req["contents"].as_array_mut().unwrap();
+        contents.push(json!({"role": "user", "parts": [
+            {"functionResponse": {"id": sa, "name": "Read", "response": {"result": "a"}}}
+        ]}));
+        contents.push(json!({"role": "model", "parts": [
+            {"functionCall": {"id": sb, "name": "Read", "args": {"p": "/b"}}}
+        ]}));
+        contents.push(json!({"role": "user", "parts": [
+            {"functionResponse": {"id": sb, "name": "Read", "response": {"result": "b"}}}
+        ]}));
+
+        let report = prepare_ag_replay_request(&mut req, Some(&items));
+        assert!(report.applied && !report.rolled_back);
+        assert!(report.pairing_error.is_none(), "{:?}", report.pairing_error);
+        assert_eq!(report.degraded, 0);
+        assert_eq!(
+            req["contents"],
+            json!([
+                {"role": "user", "parts": [{"text": "hi"}]},
+                {"role": "model", "parts": [
+                    {"functionCall": {"name": "Read", "id": "native-a", "args": {"p": "/a"}}, "thoughtSignature": SIG_A}
+                ]},
+                {"role": "model", "parts": [
+                    {"functionResponse": {"id": "native-a", "name": "Read", "response": {"result": "a"}}}
+                ]},
+                {"role": "model", "parts": [
+                    {"functionCall": {"name": "Read", "id": "native-b", "args": {"p": "/b"}}, "thoughtSignature": GEMINI_SKIP_THOUGHT_SIGNATURE_VALIDATOR}
+                ]},
+                {"role": "model", "parts": [
+                    {"functionResponse": {"id": "native-b", "name": "Read", "response": {"result": "b"}}}
+                ]},
+            ])
+        );
+        assert!(gemini_function_call_pairing_valid(&req));
     }
 
     // ---- 缺失 args 的出现次序键 / extra_content 签名路径 ----
