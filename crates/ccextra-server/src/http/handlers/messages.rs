@@ -917,6 +917,25 @@ pub(crate) async fn prepare_message_request(
         tracing::debug!("prompt_cache_key 已注入");
     }
 
+    // 首发前预降级:该 (provider, model) 已有 unfit 标记时直接改 body,
+    // 避免每个请求都先吃一次 400 再重试。adapt 幂等,重试路径再次调用安全。
+    let registry = crate::http::unfit::global_registry();
+    if registry.has_any(&route.provider, &route.upstream_model)
+        && crate::http::unfit::adapt_request_for_unfit(
+            &mut body_json,
+            &route.provider,
+            &route.upstream_model,
+            registry.as_ref(),
+            route.protocol,
+        )
+    {
+        tracing::info!(
+            provider = route.provider,
+            model = route.upstream_model,
+            "unfit: pre-adapted before first upstream send"
+        );
+    }
+
     // 诊断落盘
     let sess = cc_session
         .as_deref()

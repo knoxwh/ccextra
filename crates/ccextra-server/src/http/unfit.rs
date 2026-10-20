@@ -70,6 +70,18 @@ impl UnfitRegistry {
             .is_some_and(|kinds| kinds.contains(&kind))
     }
 
+    /// 该 (provider, model) 是否已被标记任意 unfit。
+    /// 供首发前预降级做单次读锁快判,避免无标记时逐一探测各 kind。
+    pub fn has_any(&self, provider: &str, model: &str) -> bool {
+        let key = (provider.to_string(), model.to_string());
+        self.state
+            .read()
+            .unwrap()
+            .flags
+            .get(&key)
+            .is_some_and(|kinds| !kinds.is_empty())
+    }
+
     /// /reload 时清空并增代;调用方须在持有 config 写锁时调用,
     /// 与请求侧同读锁捕获的 generation 成对原子。
     pub fn clear(&self) {
@@ -141,7 +153,7 @@ pub fn adapt_request_for_unfit(
                     obj.remove(slot);
                 }
                 adapted = true;
-                tracing::info!(
+                tracing::debug!(
                     provider,
                     model,
                     "unfit: response_format → system instruction"
@@ -155,7 +167,7 @@ pub fn adapt_request_for_unfit(
         && force_reasoning_effort(body, "low", protocol)
     {
         adapted = true;
-        tracing::info!(provider, model, "unfit: reasoning effort off → low");
+        tracing::debug!(provider, model, "unfit: reasoning effort off → low");
     }
 
     // ToolChoiceRefused: tool_choice → auto
@@ -163,7 +175,7 @@ pub fn adapt_request_for_unfit(
         && downgrade_tool_choice(body, protocol)
     {
         adapted = true;
-        tracing::info!(provider, model, "unfit: tool_choice → auto");
+        tracing::debug!(provider, model, "unfit: tool_choice → auto");
     }
 
     // ToolsWithoutEffort: 移除 thinking/reasoning 配置
@@ -171,7 +183,7 @@ pub fn adapt_request_for_unfit(
         && remove_reasoning_config(body, protocol)
     {
         adapted = true;
-        tracing::info!(provider, model, "unfit: removed reasoning (tools conflict)");
+        tracing::debug!(provider, model, "unfit: removed reasoning (tools conflict)");
     }
 
     adapted
@@ -513,6 +525,37 @@ mod tests {
         assert!(sys.contains("IMPORTANT: Respond with valid JSON"));
         // 不得写顶层 Anthropic system
         assert!(body.get("system").is_none());
+    }
+
+    /// 首发前预降级依赖幂等:第二次调用不得再改 body,也不得重复报 adapted。
+    #[test]
+    fn adapt_is_idempotent_for_second_call() {
+        let reg = marked(UnfitKind::RefusesFormat);
+        let mut body = serde_json::json!({
+            "messages": [
+                {"role": "user", "content": "hi"}
+            ],
+            "response_format": {
+                "type": "json_schema",
+                "json_schema": {"schema": {"type": "object"}}
+            }
+        });
+        assert!(adapt_request_for_unfit(
+            &mut body,
+            "p",
+            "m",
+            &reg,
+            Protocol::OpenAiChat
+        ));
+        let once = body.clone();
+        assert!(!adapt_request_for_unfit(
+            &mut body,
+            "p",
+            "m",
+            &reg,
+            Protocol::OpenAiChat
+        ));
+        assert_eq!(body, once);
     }
 
     /// o 系列 / GPT-5 族转换后前缀是 developer,注入须落到该消息,
