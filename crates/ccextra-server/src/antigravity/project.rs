@@ -1,8 +1,8 @@
 // project_id:loadCodeAssist,空则 daily onboardUser 轮询
 
 use super::constants::{
-    onboard_ua, version_from_user_agent, API_ENDPOINT, API_VERSION, DAILY_API_ENDPOINT,
-    GOOG_API_CLIENT, REQUEST_UA,
+    onboard_ua, version_from_user_agent, API_VERSION, DAILY_API_ENDPOINT, GOOG_API_CLIENT,
+    REQUEST_UA,
 };
 use anyhow::{anyhow, Context, Result};
 use reqwest::Client;
@@ -66,7 +66,7 @@ pub async fn fetch_project_id(
     access_token: &str,
     request_ua: Option<&str>,
 ) -> Result<String> {
-    let url = format!("{API_ENDPOINT}/{API_VERSION}:loadCodeAssist");
+    let url = format!("{DAILY_API_ENDPOINT}/{API_VERSION}:loadCodeAssist");
     fetch_project_id_at(client, &url, access_token, request_ua).await
 }
 
