@@ -31,7 +31,7 @@ Claude Code sends Anthropic Messages requests; ccextra picks an upstream by mode
 | **Capability adaptation** | Message / tool / image conversion; `models.json` clamps reasoning levels |
 | **OAuth providers** | Antigravity, xAI Grok, Codex, Claude subscription — credential load, refresh, dynamic models |
 | **Claude fingerprint lane** | `protocol: claude` defaults to wreq/BoringSSL (Bun-aligned TLS + HTTP/1.1) |
-| **Hot reload** | `POST /reload` publishes atomically; in-flight requests keep the old snapshot |
+| **Hot reload** | Saving `config.yaml` / `models.json` or `POST /reload` publishes atomically; in-flight requests keep the old snapshot |
 
 ## Architecture
 
@@ -117,7 +117,7 @@ curl http://127.0.0.1:8222/health
 curl -H "Authorization: Bearer $ANTHROPIC_AUTH_TOKEN" http://127.0.0.1:8222/v1/models
 ```
 
-Daemon helpers (macOS): `build.sh` / `deploy.sh` / `start.sh` / `stop.sh` / `restart.sh` manage `./ccextra` via LaunchAgent `com.wanghao.ccextra` (survives quitting the terminal; first run `scripts/macos/install-launchagent.sh`, or `./start.sh` installs the plist). `logs/ccextra.launchd.{out,err}.log` rotate by day only when the Agent is unloaded and about to bootstrap. Hot reload remains `POST /reload`.
+Daemon helpers (macOS): `build.sh` / `deploy.sh` / `start.sh` / `stop.sh` / `restart.sh` manage `./ccextra` via LaunchAgent `com.wanghao.ccextra` (survives quitting the terminal; first run `scripts/macos/install-launchagent.sh`, or `./start.sh` installs the plist). `logs/ccextra.launchd.{out,err}.log` rotate by day only when the Agent is unloaded and about to bootstrap. Hot reload: saving `config.yaml` / startup `models.json` applies (150ms debounce); `POST /reload` still works.
 
 ## Configuration highlights
 
@@ -139,7 +139,7 @@ Full fields: [config.example.yaml](config.example.yaml). Common items:
 
 - `user_agents` — override Claude / Codex / Grok / Antigravity identifiers
 - `logging.request_body` — write diagnostic requests under `logs/` next to the config file (not cwd)
-- `POST /reload` — atomically publish providers, payload, normalize, auth, proxy, UA, reasoning table, and refresh params; failed loads leave the snapshot unchanged; `logging.level` needs a restart
+- Hot reload — watches `config.yaml` and the startup-pinned `models.json` (save-to-reload, 150ms debounce + content hash); `POST /reload` also works. Atomically publishes providers, payload, normalize, auth, proxy, UA, reasoning table, and refresh params; failed loads leave the snapshot unchanged; `logging.level` needs a restart
 - Background refresh uses the last successfully published static config; explicit reload prefers removals / disables / directory switches
 - `antigravity.connection-pool` — short connections by default; with `enabled: true`, keep the pool per idle / per-host caps
 
@@ -153,7 +153,7 @@ Full fields: [config.example.yaml](config.example.yaml). Common items:
 | `POST /v1/messages/count_tokens` | \* | Claude forwards upstream count; others read session records, miss → 0 |
 | `GET /v1/models` | \* | Anthropic-format model list |
 | `GET /health` | — | Returns `ok` (does not probe upstream) |
-| `POST /reload` | — | Validate and publish new config |
+| Save config / `POST /reload` | — | Validate and publish new config (file watch and HTTP share one path) |
 
 \* When `secret_key` is set, use `x-api-key` or `Authorization: Bearer`.
 
@@ -194,7 +194,7 @@ Quota / model catalog:
 ./scripts/check_codex_quota.sh
 ```
 
-Successful login auto `POST /reload` against `--config` `host`/`port` (failure is a warning only). Manual reload:
+Successful login auto `POST /reload` against `--config` `host`/`port` (failure is a warning only). Saving the config file also hot-reloads; manual:
 
 ```bash
 curl -X POST http://127.0.0.1:8222/reload

@@ -25,7 +25,7 @@ ccextra 将 Anthropic Messages 入口接到不同上游协议，同时尽量保�
 | `POST /v1/messages/count_tokens` | Claude 路径转发精确请求；其他路径返回该会话上轮响应记录的输入 token 数，未命中返回 0。Chat/Responses/Gemini/Antigravity 从原始 SSE 提取正数输入用量并写回会话缓存；不记录转换后的占位值，缺字段或零值保留旧值。 |
 | `GET /v1/models` | 汇总 provider alias，返回 Anthropic 模型清单。 |
 | `GET /health` | 固定返回 `ok`。 |
-| `POST /reload` | 重新读取运行时配置。 |
+| 保存 `config.yaml` / `models.json` 或 `POST /reload` | 重新读取运行时配置（文件监视与 HTTP 共用发布路径）。 |
 
 `secret_key` 启用后，三个 Anthropic API 端点都要认证；`/health` 和 `/reload` 不认证。
 

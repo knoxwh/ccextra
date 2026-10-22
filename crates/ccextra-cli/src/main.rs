@@ -35,6 +35,7 @@ use tracing_subscriber::{
 };
 
 mod config;
+mod config_watch;
 
 use config::Config;
 
@@ -354,6 +355,10 @@ async fn main() -> Result<()> {
     });
 
     let user_agents = build_user_agents(config.user_agents.as_ref());
+    let models_watch_path = pin_path(
+        &cli.config,
+        config.models_file.as_deref().unwrap_or("models.json"),
+    );
     let thinking_registry = load_thinking_registry(&cli.config, config.models_file.as_deref())?;
 
     let runtime = RuntimeConfig {
@@ -406,6 +411,13 @@ async fn main() -> Result<()> {
     // AG 账本后台过期清理(对齐 CPA startCacheCleanup 10 分钟 purgeExpired;任务只持 Weak)
     state.ag_replay_cache.spawn_purge_task(
         ccextra_server::sse::antigravity_replay_cache::AG_REPLAY_CACHE_CLEANUP_INTERVAL,
+    );
+
+    // 保存 config / models.json → 热重载（对齐 CPA；保留 POST /reload）
+    config_watch::spawn_config_watcher(
+        state.clone(),
+        PathBuf::from(&cli.config),
+        models_watch_path,
     );
 
     // 启动 HTTP 服务
@@ -1312,5 +1324,19 @@ xai_auth_dir: new-xai
         let reg = load_thinking_registry(cfg.to_str().unwrap(), None).unwrap();
         assert_eq!(reg.len(), 1);
         assert_eq!(reg[0].id, "gpt-6-astra");
+    }
+
+    #[test]
+    fn load_thinking_registry_bad_json_errors() {
+        let dir = tempfile::tempdir().unwrap();
+        let models = dir.path().join("models.json");
+        std::fs::write(&models, "{not-json").unwrap();
+        let cfg = dir.path().join("config.yaml");
+        std::fs::write(&cfg, "unused").unwrap();
+        let err = load_thinking_registry(cfg.to_str().unwrap(), None).unwrap_err();
+        assert!(
+            err.to_string().contains("reasoning") || err.to_string().contains("解析"),
+            "unexpected err: {err}"
+        );
     }
 }

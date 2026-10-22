@@ -22,9 +22,9 @@ pub struct ReloadError {
     pub reason: String,
 }
 
-/// 热重载按取得专用互斥锁的顺序加载并发布；失败收集到 result.failed 但继续处理其他组件。
-/// 加载期间不持有配置锁，请求和后台刷新仍可访问当前快照。
-pub async fn handle_reload(State(state): State<AppState>) -> Result<Json<ReloadResult>, AppError> {
+/// 热重载核心路径（HTTP 与文件监视共用）。
+/// 按专用互斥锁串行加载并发布；失败收集到 result.failed；加载期间不持有配置读锁。
+pub async fn reload_now(state: &AppState) -> Result<ReloadResult, AppError> {
     let _reload_guard = state.reload_lock.lock().await;
     let mut result = ReloadResult::default();
 
@@ -61,14 +61,14 @@ pub async fn handle_reload(State(state): State<AppState>) -> Result<Json<ReloadR
                 reason: e.to_string(),
             });
             tracing::warn!("runtime 配置构建失败，回滚整个 reload: {e}");
-            return Ok(Json(result));
+            return Ok(result);
         }
     };
 
     // providers 校验失败但 runtime 成功时，仍不更新配置
     if !providers_valid {
         tracing::warn!("providers 校验失败，不更新配置");
-        return Ok(Json(result));
+        return Ok(result);
     }
 
     // 4. 全局原子更新统一不可变快照并递增版本号;
@@ -103,7 +103,12 @@ pub async fn handle_reload(State(state): State<AppState>) -> Result<Json<ReloadR
         result.reloaded.len(),
         result.failed.len()
     );
-    Ok(Json(result))
+    Ok(result)
+}
+
+/// HTTP `POST /reload`：委托 [`reload_now`]。
+pub async fn handle_reload(State(state): State<AppState>) -> Result<Json<ReloadResult>, AppError> {
+    Ok(Json(reload_now(&state).await?))
 }
 
 /// 构建 runtime 配置(独立函数便于错误处理)

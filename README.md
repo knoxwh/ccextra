@@ -31,7 +31,7 @@ Claude Code 发来 Anthropic Messages 请求；ccextra 按模型别名选上游�
 | **能力适配** | 消息 / 工具 / 图片转换；`models.json` 钳制 reasoning 档位 |
 | **OAuth 接入** | Antigravity、xAI Grok、Codex、Claude 订阅 — 凭证加载、刷新、动态模型 |
 | **Claude 指纹车道** | `protocol: claude` 默认走 wreq/BoringSSL（Bun 对齐 TLS + HTTP/1.1） |
-| **热重载** | `POST /reload` 原子发布；进行中的请求继续用旧快照 |
+| **热重载** | 保存 `config.yaml` / `models.json` 或 `POST /reload` 原子发布；进行中的请求继续用旧快照 |
 
 ## 架构
 
@@ -117,7 +117,7 @@ curl http://127.0.0.1:8222/health
 curl -H "Authorization: Bearer $ANTHROPIC_AUTH_TOKEN" http://127.0.0.1:8222/v1/models
 ```
 
-后台（macOS）：`build.sh` / `deploy.sh` / `start.sh` / `stop.sh` / `restart.sh` 经 LaunchAgent `com.wanghao.ccextra` 管理根目录 `./ccextra`（关终端不杀进程；首次 `scripts/macos/install-launchagent.sh`，或直接 `./start.sh` 会安装 plist）。`logs/ccextra.launchd.{out,err}.log` 仅在 Agent 未加载、即将 bootstrap 时按日滚动。热重载仍用 `POST /reload`。
+后台（macOS）：`build.sh` / `deploy.sh` / `start.sh` / `stop.sh` / `restart.sh` 经 LaunchAgent `com.wanghao.ccextra` 管理根目录 `./ccextra`（关终端不杀进程；首次 `scripts/macos/install-launchagent.sh`，或直接 `./start.sh` 会安装 plist）。`logs/ccextra.launchd.{out,err}.log` 仅在 Agent 未加载、即将 bootstrap 时按日滚动。热重载：保存 `config.yaml` / 启动时的 `models.json` 即生效（150ms debounce），亦可 `POST /reload`。
 
 ## 配置要点
 
@@ -139,7 +139,7 @@ curl -H "Authorization: Bearer $ANTHROPIC_AUTH_TOKEN" http://127.0.0.1:8222/v1/m
 
 - `user_agents` — 覆盖 Claude / Codex / Grok / Antigravity 标识
 - `logging.request_body` — 诊断请求写入配置文件目录下的 `logs/`（不跟 cwd）
-- `POST /reload` — 原子发布 providers、payload、归一化、认证、代理、UA、reasoning 表与刷新参数；失败不改快照；`logging.level` 需重启
+- 热重载 — 监视 `config.yaml` 与启动时钉死的 `models.json`（保存即重载，150ms debounce + 内容 hash）；亦可 `POST /reload`。原子发布 providers、payload、归一化、认证、代理、UA、reasoning 表与刷新参数；失败不改快照；`logging.level` 需重启
 - 后台刷新用最近成功发布的静态配置；显式 reload 优先应用删除 / 禁用 / 目录切换
 - `antigravity.connection-pool` — 默认短连接；`enabled: true` 后按 idle / per-host 上限保留池
 
@@ -153,7 +153,7 @@ curl -H "Authorization: Bearer $ANTHROPIC_AUTH_TOKEN" http://127.0.0.1:8222/v1/m
 | `POST /v1/messages/count_tokens` | \* | Claude 转发上游计数；其余读会话记录，未命中返回 0 |
 | `GET /v1/models` | \* | Anthropic 格式模型列表 |
 | `GET /health` | — | 返回 `ok`（不探上游） |
-| `POST /reload` | — | 校验并发布新配置 |
+| 保存配置 / `POST /reload` | — | 校验并发布新配置（文件监视与 HTTP 同路径） |
 
 \* 配置了 `secret_key` 时需要 `x-api-key` 或 `Authorization: Bearer`。
 
@@ -194,7 +194,7 @@ curl -H "Authorization: Bearer $ANTHROPIC_AUTH_TOKEN" http://127.0.0.1:8222/v1/m
 ./scripts/check_codex_quota.sh
 ```
 
-登录成功后会按 `--config` 的 `host`/`port` 自动 `POST /reload`（失败只提示）。手动重载：
+登录成功后会按 `--config` 的 `host`/`port` 自动 `POST /reload`（失败只提示）。保存配置文件也会热重载；手动：
 
 ```bash
 curl -X POST http://127.0.0.1:8222/reload

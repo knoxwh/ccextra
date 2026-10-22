@@ -25,6 +25,9 @@ clap.workspace = true
 tracing.workspace = true
 tracing-subscriber.workspace = true
 bcrypt.workspace = true
+sha2.workspace = true
+hex.workspace = true
+notify.workspace = true
 time = { version = "0.3", features = ["formatting", "local-offset"] }
 
 [dev-dependencies]
