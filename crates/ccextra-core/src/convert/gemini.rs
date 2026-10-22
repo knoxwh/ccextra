@@ -283,13 +283,8 @@ pub fn convert_to_gemini_with_registry(
             }
             "none" => {
                 gemini["toolConfig"]["functionCallingConfig"]["mode"] = serde_json::json!("NONE");
-                // 对齐 CPA a76da711:Antigravity tool_choice=none 时不发 tools
-                // (上游拒 mode=NONE 与 tools 并存);Gemini 直连保留声明
-                if flavor == SchemaFlavor::Antigravity {
-                    if let Some(obj) = gemini.as_object_mut() {
-                        obj.remove("tools");
-                    }
-                }
+                // 对齐 CPA 80aa2b1d:tool_choice=none 时保留 tools 声明
+                // (mode=NONE 禁调用;删 tools 会断多轮 replay / contextHash)
             }
             "any" => {
                 gemini["toolConfig"]["functionCallingConfig"]["mode"] = serde_json::json!("ANY");
@@ -1136,17 +1131,17 @@ IMPORTANT: Assist with authorized security testing.
         };
         let (g, _) = convert_to_gemini(&base(json!({"type": "none"})), "m");
         assert_eq!(g["toolConfig"]["functionCallingConfig"]["mode"], "NONE");
-        // Gemini 直连保留工具声明
+        // Gemini 直连与 Antigravity 均保留工具声明(对齐 CPA 80aa2b1d)
         assert!(g.get("tools").is_some());
 
-        // 对齐 CPA a76da711:Antigravity tool_choice=none 删 tools
         let (g, _) = convert_to_gemini_with(
             &base(json!({"type": "none"})),
             "gemini-3.8-flash-high",
             SchemaFlavor::Antigravity,
         );
         assert_eq!(g["toolConfig"]["functionCallingConfig"]["mode"], "NONE");
-        assert!(g.get("tools").is_none());
+        assert!(g.get("tools").is_some());
+        assert_eq!(g["tools"][0]["functionDeclarations"][0]["name"], "Read");
 
         let (g, _) = convert_to_gemini(&base(json!({"type": "tool", "name": "Read"})), "m");
         assert_eq!(g["toolConfig"]["functionCallingConfig"]["mode"], "ANY");
