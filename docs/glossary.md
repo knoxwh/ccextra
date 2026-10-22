@@ -128,6 +128,7 @@ Gemini 函数调用模式。Antigravity Claude 模型强制使用；Gemini 直�
 
 **热重载**
 进程监视 `--config` 父目录与启动时钉死的 `models.json`：Write/Create/Rename 经 150ms debounce，内容 hash 未变则跳过（吸收 `secret_key` bcrypt 回写）。触发后与 `POST /reload` 走同一发布路径。
+`POST /reload` 响应含 `published`（是否已写入统一配置快照）、`reloaded`（成功组件名）、`failed`（失败组件及原因）；providers/runtime 回滚时 `published=false` 且保留旧快照。
 各 OAuth 登录命令保存凭证后自动调用配置地址的 `POST /reload`（直连，通配地址转回环地址，连接超时 2 秒、总超时 30 秒）；失败仅提示，凭证保留，服务未启动时下次启动加载。
 加载、校验后原子替换统一不可变配置快照；失败不改变已生效版本。旧请求保留旧快照，新请求取得新快照。后台刷新绑定版本，过期结果丢弃；后续轮次使用最新已发布的静态配置、目录及代理。
 

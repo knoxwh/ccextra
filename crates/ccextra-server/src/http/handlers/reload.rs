@@ -14,6 +14,9 @@ pub struct ReloadResult {
     pub reloaded: Vec<String>,
     /// 失败的组件及原因
     pub failed: Vec<ReloadError>,
+    /// 是否已写入统一配置快照（providers/runtime 回滚或加载 Err 均为 false）
+    #[serde(default)]
+    pub published: bool,
 }
 
 #[derive(Debug, Serialize, Deserialize)]
@@ -87,6 +90,7 @@ pub async fn reload_now(state: &AppState) -> Result<ReloadResult, AppError> {
         crate::http::unfit::global_registry().clear();
     }
     result.reloaded.push("unfit_registry".into());
+    result.published = true;
 
     // 5. 清认证缓存(失败无碍)
     if auth_cache().lock().ok().map(|mut c| c.clear()).is_some() {

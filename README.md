@@ -198,6 +198,7 @@ curl -H "Authorization: Bearer $ANTHROPIC_AUTH_TOKEN" http://127.0.0.1:8222/v1/m
 
 ```bash
 curl -X POST http://127.0.0.1:8222/reload
+# 响应示例字段：published / reloaded / failed；仅 published=true 表示快照已切换
 ```
 
 <details>

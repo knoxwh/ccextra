@@ -182,21 +182,23 @@ async fn failed_reload_or_refresh_preserves_the_entire_snapshot() {
         })
     });
     let result = handle_reload(State(state.clone())).await.unwrap();
-    // providers 校验失败应在 failed 中
+    // providers 校验失败应在 failed 中，且不得标记 published
     assert!(result.failed.iter().any(|e| e.component == "providers"));
+    assert!(!result.published);
     assert!(Arc::ptr_eq(&old, &*state.config.read().await));
     state.reload = Arc::new(|| Box::pin(async { anyhow::bail!("invalid configuration") }));
     assert!(handle_reload(State(state.clone())).await.is_err());
     assert!(Arc::ptr_eq(&old, &*state.config.read().await));
     // 失败不能占用版本，也不能让后续合法 reload 永久等待。
     state.reload = reload_returning_secret(None);
-    let _ = tokio::time::timeout(
+    let ok = tokio::time::timeout(
         std::time::Duration::from_secs(2),
         handle_reload(State(state.clone())),
     )
     .await
     .unwrap()
     .unwrap();
+    assert!(ok.published);
     assert_eq!(state.config.read().await.version, 2);
 }
 

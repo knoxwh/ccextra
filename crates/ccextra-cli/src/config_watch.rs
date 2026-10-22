@@ -98,10 +98,24 @@ pub(crate) fn decide_reload(
     }
 }
 
-/// 快照是否已真正发布（与 [`reload_now`] 写锁更新一致：含 `unfit_registry`）。
+/// 快照是否已真正发布（读 [`ReloadResult::published`]，不依赖 `reloaded` 字符串）。
 /// Ok 但 providers/runtime 回滚、或 Err，均视为未发布，监视侧不得提交 `last_hash`。
 pub(crate) fn reload_published(result: &ReloadResult) -> bool {
-    result.reloaded.iter().any(|c| c == "unfit_registry")
+    result.published
+}
+
+/// 监视侧提交契约：仅 `published` 时用磁盘指纹替换 `last_hash`；否则原样保留以便同内容重试。
+pub(crate) fn next_last_hash_after_reload(
+    published: bool,
+    last_hash: &str,
+    config_path: &Path,
+    models_path: &Path,
+) -> String {
+    if published {
+        content_fingerprint(config_path, models_path)
+    } else {
+        last_hash.to_string()
+    }
 }
 
 /// 后台监视 `--config` 父目录与启动时钉死的 `models.json`；事件经 debounce 后进程内 `handle_reload`。
@@ -220,9 +234,8 @@ async fn run_config_watcher(
                     }
                 };
                 // 仅快照真正发布成功才提交 hash；Config::load 可能 bcrypt 回写，重读吸收环
-                if published {
-                    last_hash = content_fingerprint(&config_path, &models_path);
-                }
+                last_hash =
+                    next_last_hash_after_reload(published, &last_hash, &config_path, &models_path);
             }
         }
     }
@@ -373,30 +386,6 @@ mod tests {
         )));
     }
 
-    /// secret 回写后指纹变化，成功发布后 commit 再 decide 应 Skip（吸收 bcrypt 环）
-    #[test]
-    fn hash_commit_absorbs_rewrite() {
-        let dir = tempdir().unwrap();
-        let cfg = dir.path().join("config.yaml");
-        let models = dir.path().join("models.json");
-        fs::write(&cfg, "secret_key: plain\n").unwrap();
-        fs::write(&models, "[]\n").unwrap();
-        let mut last = content_fingerprint(&cfg, &models);
-        // 模拟 Config::load 回写
-        fs::write(&cfg, "secret_key: \"$2b$12$abcdef\"\n").unwrap();
-        match decide_reload(&last, &cfg, &models) {
-            ReloadDecision::Reload { .. } => {}
-            other => panic!("{other:?}"),
-        }
-        // 发布成功后重读指纹并提交
-        assert!(reload_published(&published_result()));
-        last = content_fingerprint(&cfg, &models);
-        assert_eq!(
-            decide_reload(&last, &cfg, &models),
-            ReloadDecision::SkipUnchanged
-        );
-    }
-
     fn published_result() -> ReloadResult {
         ReloadResult {
             reloaded: vec![
@@ -405,6 +394,7 @@ mod tests {
                 "unfit_registry".into(),
             ],
             failed: vec![],
+            published: true,
         }
     }
 
@@ -415,53 +405,101 @@ mod tests {
                 component: "providers".into(),
                 reason: "校验失败".into(),
             }],
+            published: false,
         }
     }
 
+    /// 钉死：发布判定只看 `published`，不依赖 reloaded 里的魔法字符串。
     #[test]
-    fn reload_published_requires_unfit_registry() {
+    fn reload_published_reads_published_flag() {
         assert!(reload_published(&published_result()));
         assert!(!reload_published(&unpublished_providers_failed()));
         assert!(!reload_published(&ReloadResult::default()));
+        // 即使误塞 unfit_registry，published=false 仍算未发布
+        let spoofed = ReloadResult {
+            reloaded: vec!["unfit_registry".into()],
+            failed: vec![],
+            published: false,
+        };
+        assert!(!reload_published(&spoofed));
+        // 无 unfit_registry 但 published=true 仍算已发布
+        let flag_only = ReloadResult {
+            reloaded: vec!["providers".into()],
+            failed: vec![],
+            published: true,
+        };
+        assert!(reload_published(&flag_only));
     }
 
-    /// 未发布成功不得提交 last_hash：同内容指纹仍应 decide Reload。
+    /// 监视提交契约：纯函数锁住 published → 是否替换 last_hash。
     #[test]
-    fn failed_reload_does_not_commit_last_hash() {
+    fn next_last_hash_commits_only_when_published() {
         let dir = tempdir().unwrap();
         let cfg = dir.path().join("config.yaml");
         let models = dir.path().join("models.json");
         fs::write(&cfg, "host: good\n").unwrap();
         fs::write(&models, "[]\n").unwrap();
-        let mut last = content_fingerprint(&cfg, &models);
+        let last = content_fingerprint(&cfg, &models);
 
         fs::write(&cfg, "host: bad\n").unwrap();
         let bad_fp = content_fingerprint(&cfg, &models);
-        match decide_reload(&last, &cfg, &models) {
-            ReloadDecision::Reload { new_hash } => assert_eq!(new_hash, bad_fp),
-            other => panic!("expected Reload, got {other:?}"),
-        }
 
-        // 模拟 Ok-but-unpublished：不提交 hash
-        assert!(!reload_published(&unpublished_providers_failed()));
-        // last 仍为旧值 → 同内容仍 Reload
-        match decide_reload(&last, &cfg, &models) {
+        // 未发布：保留旧 hash
+        let kept = next_last_hash_after_reload(
+            reload_published(&unpublished_providers_failed()),
+            &last,
+            &cfg,
+            &models,
+        );
+        assert_eq!(kept, last);
+        match decide_reload(&kept, &cfg, &models) {
             ReloadDecision::Reload { new_hash } => assert_eq!(new_hash, bad_fp),
             other => panic!("expected Retry Reload after unpublished, got {other:?}"),
         }
 
-        // 若误提交失败指纹，则会 Skip — 对照钉死
-        let wrongly_committed = bad_fp.clone();
+        // 若误用 bad 指纹当 last，则会 Skip — 对照钉死
         assert_eq!(
-            decide_reload(&wrongly_committed, &cfg, &models),
+            decide_reload(&bad_fp, &cfg, &models),
             ReloadDecision::SkipUnchanged
         );
 
-        // 发布成功后才提交（含回写吸收）
-        assert!(reload_published(&published_result()));
-        last = content_fingerprint(&cfg, &models);
+        // 发布：提交新指纹（同内容此后 Skip）
+        let committed = next_last_hash_after_reload(
+            reload_published(&published_result()),
+            &last,
+            &cfg,
+            &models,
+        );
+        assert_eq!(committed, bad_fp);
         assert_eq!(
-            decide_reload(&last, &cfg, &models),
+            decide_reload(&committed, &cfg, &models),
+            ReloadDecision::SkipUnchanged
+        );
+    }
+
+    /// secret 回写后指纹变化，成功发布后 commit 再 decide 应 Skip（吸收 bcrypt 环）
+    #[test]
+    fn hash_commit_via_helper_absorbs_rewrite() {
+        let dir = tempdir().unwrap();
+        let cfg = dir.path().join("config.yaml");
+        let models = dir.path().join("models.json");
+        fs::write(&cfg, "secret_key: plain\n").unwrap();
+        fs::write(&models, "[]\n").unwrap();
+        let last = content_fingerprint(&cfg, &models);
+        fs::write(&cfg, "secret_key: \"$2b$12$abcdef\"\n").unwrap();
+        match decide_reload(&last, &cfg, &models) {
+            ReloadDecision::Reload { .. } => {}
+            other => panic!("{other:?}"),
+        }
+        let committed = next_last_hash_after_reload(
+            reload_published(&published_result()),
+            &last,
+            &cfg,
+            &models,
+        );
+        assert_ne!(committed, last);
+        assert_eq!(
+            decide_reload(&committed, &cfg, &models),
             ReloadDecision::SkipUnchanged
         );
     }
