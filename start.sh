@@ -13,10 +13,15 @@ INSTALL_SH="$SCRIPT_DIR/scripts/macos/install-launchagent.sh"
 
 mkdir -p "$LOG_DIR"
 
-# 清理当日之前的按日滚动日志（不动 launchd 固定 out/err）
+# 清理当日之前的按日滚动日志（含 launchd 滚动件 *.YYYY-MM-DD[.HHMMSS].log；
+# 不动当前固定的 ccextra.launchd.{out,err}.log）
 find "$LOG_DIR" -name '*.log' | while read -r f; do
     basename=$(basename "$f")
-    if [[ "$basename" =~ \.([0-9]{4}-[0-9]{2}-[0-9]{2})\.log$ ]]; then
+    # 跳过 launchd 当前固定 out/err（无日期后缀）
+    if [ "$basename" = "ccextra.launchd.out.log" ] || [ "$basename" = "ccextra.launchd.err.log" ]; then
+        continue
+    fi
+    if [[ "$basename" =~ \.([0-9]{4}-[0-9]{2}-[0-9]{2})(\.[0-9]+)?\.log$ ]]; then
         file_date="${BASH_REMATCH[1]}"
         if [ "$file_date" != "$TODAY" ]; then
             echo "Removing old log: $f"
@@ -71,29 +76,37 @@ fail_if_foreign_listener() {
     done
 }
 
-# 清掉非 launchd 拉起的同二进制残留（KeepAlive 下勿在已 load 时乱杀）
+# 仅在 LaunchAgent 未 load 时调用：清掉本仓库二进制残留（含 ppid=1 孤儿）。
+# 已 load 时走 kickstart，禁止在此路径杀进程（KeepAlive 会立刻拉回）。
 kill_stray_orphans() {
-    local pid ppid
+    local pid
     for pid in $(our_pids); do
-        ppid=$(ps -p "$pid" -o ppid= 2>/dev/null | tr -d ' ' || true)
-        # launchd 子进程的 ppid 通常为 1
-        if [ "${ppid:-}" = "1" ]; then
-            continue
-        fi
-        echo "Stopping stray non-launchd ccextra (PID: $pid, ppid: ${ppid:-?})"
+        echo "Stopping stray ccextra (PID: $pid)"
         kill "$pid" 2>/dev/null || true
     done
     for _ in $(seq 1 10); do
-        local left=0
-        for pid in $(our_pids); do
-            ppid=$(ps -p "$pid" -o ppid= 2>/dev/null | tr -d ' ' || true)
-            if [ "${ppid:-}" != "1" ]; then
-                left=1
-                break
-            fi
-        done
-        [ "$left" = "0" ] && break
+        if [ -z "$(our_pids)" ]; then
+            break
+        fi
         sleep 0.2
+    done
+}
+
+# 仅在即将 bootstrap（服务未 load）时滚动 launchd 固定 out/err，避免无界增长。
+# kickstart 路径不滚动（进程仍持有旧 fd）。
+rotate_launchd_logs() {
+    local kind src dest
+    for kind in out err; do
+        src="$LOG_DIR/ccextra.launchd.${kind}.log"
+        if [ ! -f "$src" ] || [ ! -s "$src" ]; then
+            continue
+        fi
+        dest="$LOG_DIR/ccextra.launchd.${kind}.${TODAY}.log"
+        if [ -e "$dest" ]; then
+            dest="$LOG_DIR/ccextra.launchd.${kind}.${TODAY}.$(date +%H%M%S).log"
+        fi
+        echo "Rotating launchd ${kind} log -> $(basename "$dest")"
+        mv "$src" "$dest"
     done
 }
 
@@ -136,6 +149,7 @@ else
         done
         sleep 0.5
     fi
+    rotate_launchd_logs
     echo "bootstrap $DOMAIN <- ~/Library/LaunchAgents/${LABEL}.plist"
     launchctl bootstrap "$DOMAIN" "${HOME}/Library/LaunchAgents/${LABEL}.plist"
 fi
