@@ -117,7 +117,7 @@ curl http://127.0.0.1:8222/health
 curl -H "Authorization: Bearer $ANTHROPIC_AUTH_TOKEN" http://127.0.0.1:8222/v1/models
 ```
 
-后台：`build.sh` / `deploy.sh` / `start.sh` / `stop.sh` / `restart.sh`（操作根目录 `./ccextra`）。
+后台（macOS）：`build.sh` / `deploy.sh` / `start.sh` / `stop.sh` / `restart.sh` 经 LaunchAgent `com.wanghao.ccextra` 管理根目录 `./ccextra`（关终端不杀进程；首次 `scripts/macos/install-launchagent.sh`，或直接 `./start.sh` 会安装 plist）。热重载仍用 `POST /reload`。
 
 ## 配置要点
 

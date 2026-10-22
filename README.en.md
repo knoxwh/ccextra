@@ -117,7 +117,7 @@ curl http://127.0.0.1:8222/health
 curl -H "Authorization: Bearer $ANTHROPIC_AUTH_TOKEN" http://127.0.0.1:8222/v1/models
 ```
 
-Daemon helpers: `build.sh` / `deploy.sh` / `start.sh` / `stop.sh` / `restart.sh` (operate on `./ccextra` in the repo root).
+Daemon helpers (macOS): `build.sh` / `deploy.sh` / `start.sh` / `stop.sh` / `restart.sh` manage `./ccextra` via LaunchAgent `com.wanghao.ccextra` (survives quitting the terminal; first run `scripts/macos/install-launchagent.sh`, or `./start.sh` installs the plist). Hot reload remains `POST /reload`.
 
 ## Configuration highlights
 
