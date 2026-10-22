@@ -1,7 +1,7 @@
 //! 配置文件监视：保存 config / models.json → debounce → 复用 `handle_reload` 热换。
 //! 对齐 CPA：父目录监视 + 150ms debounce + 内容 hash（吸收 secret bcrypt 回写）。
 
-use ccextra_server::http::handlers::reload::reload_now;
+use ccextra_server::http::handlers::reload::{reload_now, ReloadResult};
 use ccextra_server::http::AppState;
 use hex::encode as hex_encode;
 use notify::{Event, EventKind, RecommendedWatcher, RecursiveMode, Watcher};
@@ -98,6 +98,12 @@ pub(crate) fn decide_reload(
     }
 }
 
+/// 快照是否已真正发布（与 [`reload_now`] 写锁更新一致：含 `unfit_registry`）。
+/// Ok 但 providers/runtime 回滚、或 Err，均视为未发布，监视侧不得提交 `last_hash`。
+pub(crate) fn reload_published(result: &ReloadResult) -> bool {
+    result.reloaded.iter().any(|c| c == "unfit_registry")
+}
+
 /// 后台监视 `--config` 父目录与启动时钉死的 `models.json`；事件经 debounce 后进程内 `handle_reload`。
 /// 失败只打日志，不崩进程；`POST /reload` 仍可用。
 pub(crate) fn spawn_config_watcher(state: AppState, config_path: PathBuf, models_path: PathBuf) {
@@ -191,7 +197,7 @@ async fn run_config_watcher(
                     config_path.display(),
                     models_path.display()
                 );
-                match reload_now(&state).await {
+                let published = match reload_now(&state).await {
                     Ok(result) => {
                         tracing::info!(
                             "文件监视热重载完成: {} 成功, {} 失败",
@@ -201,14 +207,22 @@ async fn run_config_watcher(
                         for f in &result.failed {
                             tracing::warn!("热重载组件失败 {}: {}", f.component, f.reason);
                         }
+                        let ok = reload_published(&result);
+                        if !ok {
+                            tracing::warn!("热重载未发布快照，保留旧内容 hash 以便同内容可重试");
+                        }
+                        ok
                     }
                     Err(e) => {
-                        // 与 POST /reload 一致：失败保旧快照
+                        // 与 POST /reload 一致：失败保旧快照；不提交 hash
                         tracing::error!("文件监视热重载失败（保留旧配置）: {}", e.err);
+                        false
                     }
+                };
+                // 仅快照真正发布成功才提交 hash；Config::load 可能 bcrypt 回写，重读吸收环
+                if published {
+                    last_hash = content_fingerprint(&config_path, &models_path);
                 }
-                // Config::load 可能 bcrypt 回写；重读指纹吸收回写环，避免紧接二次 reload
-                last_hash = content_fingerprint(&config_path, &models_path);
             }
         }
     }
@@ -238,6 +252,7 @@ fn absolutize(path: &Path) -> PathBuf {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use ccextra_server::http::handlers::reload::ReloadError;
     use std::fs;
     use tempfile::tempdir;
 
@@ -358,7 +373,7 @@ mod tests {
         )));
     }
 
-    /// secret 回写后指纹变化，commit 后再 decide 应 Skip（吸收 bcrypt 环）
+    /// secret 回写后指纹变化，成功发布后 commit 再 decide 应 Skip（吸收 bcrypt 环）
     #[test]
     fn hash_commit_absorbs_rewrite() {
         let dir = tempdir().unwrap();
@@ -373,7 +388,77 @@ mod tests {
             ReloadDecision::Reload { .. } => {}
             other => panic!("{other:?}"),
         }
-        // 重载后重读指纹
+        // 发布成功后重读指纹并提交
+        assert!(reload_published(&published_result()));
+        last = content_fingerprint(&cfg, &models);
+        assert_eq!(
+            decide_reload(&last, &cfg, &models),
+            ReloadDecision::SkipUnchanged
+        );
+    }
+
+    fn published_result() -> ReloadResult {
+        ReloadResult {
+            reloaded: vec![
+                "providers".into(),
+                "runtime".into(),
+                "unfit_registry".into(),
+            ],
+            failed: vec![],
+        }
+    }
+
+    fn unpublished_providers_failed() -> ReloadResult {
+        ReloadResult {
+            reloaded: vec!["runtime".into()],
+            failed: vec![ReloadError {
+                component: "providers".into(),
+                reason: "校验失败".into(),
+            }],
+        }
+    }
+
+    #[test]
+    fn reload_published_requires_unfit_registry() {
+        assert!(reload_published(&published_result()));
+        assert!(!reload_published(&unpublished_providers_failed()));
+        assert!(!reload_published(&ReloadResult::default()));
+    }
+
+    /// 未发布成功不得提交 last_hash：同内容指纹仍应 decide Reload。
+    #[test]
+    fn failed_reload_does_not_commit_last_hash() {
+        let dir = tempdir().unwrap();
+        let cfg = dir.path().join("config.yaml");
+        let models = dir.path().join("models.json");
+        fs::write(&cfg, "host: good\n").unwrap();
+        fs::write(&models, "[]\n").unwrap();
+        let mut last = content_fingerprint(&cfg, &models);
+
+        fs::write(&cfg, "host: bad\n").unwrap();
+        let bad_fp = content_fingerprint(&cfg, &models);
+        match decide_reload(&last, &cfg, &models) {
+            ReloadDecision::Reload { new_hash } => assert_eq!(new_hash, bad_fp),
+            other => panic!("expected Reload, got {other:?}"),
+        }
+
+        // 模拟 Ok-but-unpublished：不提交 hash
+        assert!(!reload_published(&unpublished_providers_failed()));
+        // last 仍为旧值 → 同内容仍 Reload
+        match decide_reload(&last, &cfg, &models) {
+            ReloadDecision::Reload { new_hash } => assert_eq!(new_hash, bad_fp),
+            other => panic!("expected Retry Reload after unpublished, got {other:?}"),
+        }
+
+        // 若误提交失败指纹，则会 Skip — 对照钉死
+        let wrongly_committed = bad_fp.clone();
+        assert_eq!(
+            decide_reload(&wrongly_committed, &cfg, &models),
+            ReloadDecision::SkipUnchanged
+        );
+
+        // 发布成功后才提交（含回写吸收）
+        assert!(reload_published(&published_result()));
         last = content_fingerprint(&cfg, &models);
         assert_eq!(
             decide_reload(&last, &cfg, &models),
