@@ -79,16 +79,14 @@ pub fn convert_to_gemini_with_registry(
         None => (HashMap::new(), HashMap::new()),
     };
 
-    // system → systemInstruction(过滤 attribution 文本与非 Claude 目标身份声明,对齐 CPA;
+    // system → systemInstruction(过滤 attribution;Antigravity 一律中和前导 Claude 身份句;
     // 清洗 Claude 触发块压制过度推理)
     let mut system_parts = Vec::new();
     match body.get("system") {
         Some(Value::String(s)) => {
             // 先清洗,再过滤 ignorable 文本
             let cleaned = super::to_openai_responses::strip_claude_system_for_gemini(s);
-            let cleaned = if flavor == SchemaFlavor::Antigravity
-                && !upstream_model.to_lowercase().contains("claude")
-            {
+            let cleaned = if flavor == SchemaFlavor::Antigravity {
                 neutralize_claude_identity(&cleaned)
             } else {
                 cleaned
@@ -104,9 +102,7 @@ pub fn convert_to_gemini_with_registry(
                 }
                 if let Some(text) = block.get("text").and_then(|t| t.as_str()) {
                     let cleaned = super::to_openai_responses::strip_claude_system_for_gemini(text);
-                    let cleaned = if flavor == SchemaFlavor::Antigravity
-                        && !upstream_model.to_lowercase().contains("claude")
-                    {
+                    let cleaned = if flavor == SchemaFlavor::Antigravity {
                         neutralize_claude_identity(&cleaned)
                     } else {
                         cleaned
@@ -739,12 +735,13 @@ IMPORTANT: Assist with authorized security testing.
     }
 
     #[test]
-    fn test_convert_to_antigravity_claude_keeps_identity() {
+    fn test_convert_to_antigravity_claude_neutralizes_identity() {
+        // AG Claude 与 AG Gemini 同处理:前导身份句中和为 You are an AI agent.
         let anthropic = json!({
             "model": "m", "max_tokens": 100,
             "system": [
                 {"type": "text", "text": "You are a Claude agent, built on Anthropic's Claude Agent SDK."},
-                {"type": "text", "text": "You are Claude Code, Anthropic's official CLI for Claude."},
+                {"type": "text", "text": "You are Claude Code, Anthropic's official CLI for Claude. Solve bugs."},
                 {"type": "text", "text": "You are helpful"}
             ],
             "messages": [{"role": "user", "content": "hi"}]
@@ -753,14 +750,8 @@ IMPORTANT: Assist with authorized security testing.
             convert_to_gemini_with(&anthropic, "claude-opus-5", SchemaFlavor::Antigravity);
         let parts = gemini["systemInstruction"]["parts"].as_array().unwrap();
         assert_eq!(parts.len(), 3);
-        assert_eq!(
-            parts[0]["text"],
-            "You are a Claude agent, built on Anthropic's Claude Agent SDK."
-        );
-        assert_eq!(
-            parts[1]["text"],
-            "You are Claude Code, Anthropic's official CLI for Claude."
-        );
+        assert_eq!(parts[0]["text"], "You are an AI agent.");
+        assert_eq!(parts[1]["text"], "You are an AI agent. Solve bugs.");
         assert_eq!(parts[2]["text"], "You are helpful");
     }
 
