@@ -1160,10 +1160,44 @@ IMPORTANT: Assist with authorized security testing, defensive security, CTF chal
     assert!(!dev_text.contains("# Output Style: Concise"));
     assert!(!dev_text.contains("Keep responses short"));
     assert!(!dev_text.contains("<safety_guardrails>"));
+    assert!(!dev_text.contains("</safety_guardrails>"));
     assert!(!dev_text.contains("Consider the reversibility and potential impact"));
     assert!(!dev_text.contains("IMPORTANT: Assist with authorized security testing"));
     assert!(!dev_text.contains("Claude Code is available as a CLI"));
     assert!(!dev_text.contains("Fast mode for Claude Code"));
+}
+
+#[test]
+fn test_strip_discards_blacklist_closers_keeps_plain_tail() {
+    // 黑名单开段丢弃;闭合行吞掉不外泄;闭合后无标记 Plain 保留
+    let cleaned = strip_claude_system_for_chat(
+        r#"# Language
+Always respond in zh-CN.
+
+<rules>
+Always obey Claude rules
+</rules>
+
+User custom system prompt line.
+
+<safety_guardrails>
+risk tree
+</safety_guardrails>
+
+Trailing plain after safety.
+"#,
+    );
+
+    assert!(cleaned.contains("# Language"));
+    assert!(cleaned.contains("Always respond in zh-CN."));
+    assert!(cleaned.contains("User custom system prompt line."));
+    assert!(cleaned.contains("Trailing plain after safety."));
+    assert!(!cleaned.contains("<rules>"));
+    assert!(!cleaned.contains("</rules>"));
+    assert!(!cleaned.contains("Always obey Claude rules"));
+    assert!(!cleaned.contains("<safety_guardrails>"));
+    assert!(!cleaned.contains("</safety_guardrails>"));
+    assert!(!cleaned.contains("risk tree"));
 }
 
 #[test]

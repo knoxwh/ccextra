@@ -12,20 +12,21 @@ use crate::convert::{is_ignorable_system_text, strip_attribution_line};
 /// - `# Session-specific guidance` — 会话级指令
 /// - `# MCP Server Instructions` — MCP 工具说明
 /// - `# Context management` — 上下文压缩提示
-/// - `<safety_guardrails>` — 风险分级决策树、注入防御、秘密保护
-/// - `<git_safety>` — commit/push 规则、破坏性操作确认
-/// - `<content_safety>` — child safety、恶意代码拒绝、仇恨言论过滤
 /// - CLAUDE.md / memory / 项目指令内容
 /// - **无段落标记的普通文本**(用户自定义 system prompt)
 ///
 /// **丢弃**(触发 GPT-5/Grok/Gemini 过度推理):
 /// - `<identity>` — Claude 品牌、模型族、平台描述
+/// - `<safety_guardrails>` — 风险分级决策树、注入防御、秘密保护
+/// - `<git_safety>` — commit/push 规则、破坏性操作确认
+/// - `<content_safety>` — child safety、恶意代码拒绝、仇恨言论过滤
 /// - `IMPORTANT: Assist with authorized security testing...` — 安全预评估触发器
 /// - `When you use a pronoun for someone...` — 代词检查循环
 /// - `# Output Style: Concise` + `# Concise Style Active` — 严格简洁规则(被 adapter 替代)
 /// - `<response_style>`, `<capabilities>`, `<rules>` — 冗长行为约束(adapter 已覆盖)
 /// - `<investigate_before_answering>`, `<verification>`, `<tool_use>` — 过度规划触发器
 /// - `<default_to_action>`, `<context_awareness>` — 元指令(adapter 已简化)
+/// - 黑名单 XML 开标签对应的闭合行(如 `</rules>`)吞掉并回到未分类,后续无标记 Plain 保留
 ///
 /// 实现策略:按 XML 标签 / markdown header 分段,白名单匹配保留,黑名单丢弃,其余保留。
 ///
@@ -112,6 +113,22 @@ pub(crate) fn strip_claude_system_for_gpt(system: &str) -> String {
             current_section.clear();
             section_retention_state = SectionState::Discard;
             continue;
+        }
+
+        // 黑名单 XML 闭合行:吞掉闭合标签,状态回 Unknown,后续无标记 Plain 保留
+        if trimmed.starts_with("</") && trimmed.ends_with('>') && trimmed.len() > 3 {
+            let name = &trimmed[2..trimmed.len() - 1];
+            let open = format!("<{name}>");
+            if DISCARD_HEADERS.iter().any(|h| *h == open) {
+                if section_retention_state != SectionState::Discard
+                    && !current_section.trim().is_empty()
+                {
+                    retained_sections.push(current_section.trim().to_string());
+                }
+                current_section.clear();
+                section_retention_state = SectionState::Unknown;
+                continue;
+            }
         }
 
         // 检测新段落开始(markdown header 或 XML 标签)

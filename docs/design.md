@@ -43,7 +43,7 @@ ccextra 将 Anthropic Messages 入口接到不同上游协议，同时尽量保�
 
 ## 路由与配置
 
-`alias` 优先匹配；上游真实模型名是回退匹配，便于 `count_tokens` 等辅助请求。重复 alias 在启动或重载校验时失败。`base_url` 支持列表：单轮遇网络错误或 429 立即切换后续地址；5xx 则在指数退避后开始新一轮轮询。provider 代理优先于全局代理，`"direct"` 或空值不使用代理。
+`alias` 优先匹配；上游真实模型名是回退匹配，便于 `count_tokens` 等辅助请求。重复 alias 在启动或重载校验时失败。`base_url` 支持列表：messages 路径遇网络错误、429 或 5xx（含 Cloudflare 52x）在同轮内立即切换后续地址，耗尽后快速失败，不做本地退避（退避交客户端，`Retry-After` 透传）；OAuth/token refresh 的 5xx 可重试退避（Claude / Antigravity / Codex / xAI）属于凭证层，不参与 messages URL 轮转。provider 代理优先于全局代理，`"direct"` 或空值不使用代理。
 
 配置重载替换 providers、payload、normalize、认证、全局 HTTP client、User-Agent 和 reasoning 注册表。`logging.level` 在启动时创建 `EnvFilter`，因此不能热改。
 
