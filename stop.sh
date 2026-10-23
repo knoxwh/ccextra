@@ -2,16 +2,15 @@
 set -euo pipefail
 
 SCRIPT_DIR="$(cd "$(dirname "$0")" && pwd)"
-TODAY=$(date +%Y-%m-%d)
 LOG_DIR="$SCRIPT_DIR/logs"
-CC_LOG="$LOG_DIR/ccextra.$TODAY.log"
+CC_LOG="$LOG_DIR/ccextra.launchd.log"
 BIN="$SCRIPT_DIR/ccextra"
 LABEL="com.wanghao.ccextra"
 UID_NUM="$(id -u)"
 DOMAIN="gui/${UID_NUM}"
 SERVICE="${DOMAIN}/${LABEL}"
 
-# 记录谁触发了 stop，方便下次对照 SIGTERM（只写当日 ccextra 日志）
+# 记录谁触发了 stop，方便下次对照 SIGTERM（写入 launchd 活跃日志）
 log_stop_caller() {
     local ts user uid ppid parent_cmd tty_name term_val ssh_val line
     ts=$(date '+%Y-%m-%d %H:%M:%S %Z')

@@ -14,12 +14,12 @@ INSTALL_SH="$SCRIPT_DIR/scripts/macos/install-launchagent.sh"
 mkdir -p "$LOG_DIR"
 
 # 清理当日之前的按日滚动日志（含 launchd 当日合并件 *.YYYY-MM-DD.log，
-# 以及旧版残留的 *.YYYY-MM-DD.HHMMSS.log 碎片；
-# 不动当前固定的 ccextra.launchd.{out,err}.log）
+# 以及旧版残留的 *.YYYY-MM-DD.HHMMSS.log / out|err 碎片；
+# 不动当前固定的 ccextra.launchd.log）
 find "$LOG_DIR" -name '*.log' | while read -r f; do
     basename=$(basename "$f")
-    # 跳过 launchd 当前固定 out/err（无日期后缀）
-    if [ "$basename" = "ccextra.launchd.out.log" ] || [ "$basename" = "ccextra.launchd.err.log" ]; then
+    # 跳过 launchd 当前固定日志（无日期后缀）
+    if [ "$basename" = "ccextra.launchd.log" ]; then
         continue
     fi
     if [[ "$basename" =~ \.([0-9]{4}-[0-9]{2}-[0-9]{2})(\.[0-9]+)?\.log$ ]]; then
@@ -93,26 +93,34 @@ kill_stray_orphans() {
     done
 }
 
-# 仅在即将 bootstrap（服务未 load）时滚动 launchd 固定 out/err，避免无界增长。
-# 合并进当日单文件 ccextra.launchd.{kind}.YYYY-MM-DD.log（已存在则 append）；
-# 不再写 .HHMMSS 碎片。kickstart 路径不滚动（进程仍持有旧 fd）。
+# 仅在即将 bootstrap（服务未 load）时滚动 launchd 固定日志，避免无界增长。
+# 合并进当日单文件 ccextra.launchd.YYYY-MM-DD.log（已存在则 append）；
+# 顺带吞掉旧版 out/err 固定件（非空才迁）。kickstart 路径不滚动（进程仍持有旧 fd）。
 rotate_launchd_logs() {
-    local kind src dest
-    for kind in out err; do
-        src="$LOG_DIR/ccextra.launchd.${kind}.log"
-        if [ ! -f "$src" ] || [ ! -s "$src" ]; then
-            continue
+    local src dest
+    dest="$LOG_DIR/ccextra.launchd.${TODAY}.log"
+    fold_into_daily() {
+        src="$1"
+        if [ ! -f "$src" ]; then
+            return 0
         fi
-        dest="$LOG_DIR/ccextra.launchd.${kind}.${TODAY}.log"
+        if [ ! -s "$src" ]; then
+            rm -f "$src"
+            return 0
+        fi
         if [ -e "$dest" ]; then
-            echo "Appending launchd ${kind} log -> $(basename "$dest")"
+            echo "Appending launchd log -> $(basename "$dest") ($(basename "$src"))"
             cat "$src" >> "$dest"
             rm -f "$src"
         else
-            echo "Rotating launchd ${kind} log -> $(basename "$dest")"
+            echo "Rotating launchd log -> $(basename "$dest") ($(basename "$src"))"
             mv "$src" "$dest"
         fi
-    done
+    }
+    # 旧版拆分残留（若仍非空则并入当日归档）
+    fold_into_daily "$LOG_DIR/ccextra.launchd.out.log"
+    fold_into_daily "$LOG_DIR/ccextra.launchd.err.log"
+    fold_into_daily "$LOG_DIR/ccextra.launchd.log"
 }
 
 wait_health() {
@@ -126,7 +134,7 @@ wait_health() {
         fi
         sleep 0.2
     done
-    echo "错误: 等待 /health 超时，请查看 $LOG_DIR/ccextra.launchd.err.log" >&2
+    echo "错误: 等待 /health 超时，请查看 $LOG_DIR/ccextra.launchd.log" >&2
     return 1
 }
 

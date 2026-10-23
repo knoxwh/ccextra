@@ -117,7 +117,7 @@ curl http://127.0.0.1:8222/health
 curl -H "Authorization: Bearer $ANTHROPIC_AUTH_TOKEN" http://127.0.0.1:8222/v1/models
 ```
 
-Daemon helpers (macOS): `build.sh` / `deploy.sh` / `start.sh` / `stop.sh` / `restart.sh` manage `./ccextra` via LaunchAgent `com.wanghao.ccextra` (survives quitting the terminal; first run `scripts/macos/install-launchagent.sh`, or `./start.sh` installs the plist). `logs/ccextra.launchd.{out,err}.log` merge/append into one daily file only when the Agent is unloaded and about to bootstrap (no timestamped fragments). Hot reload: saving `config.yaml` / startup `models.json` applies (150ms debounce); `POST /reload` still works.
+Daemon helpers (macOS): `build.sh` / `deploy.sh` / `start.sh` / `stop.sh` / `restart.sh` manage `./ccextra` via LaunchAgent `com.wanghao.ccextra` (survives quitting the terminal; first run `scripts/macos/install-launchagent.sh`, or `./start.sh` installs the plist). `logs/ccextra.launchd.log` (stdout+stderr) merges/appends into `ccextra.launchd.YYYY-MM-DD.log` only when the Agent is unloaded and about to bootstrap (no timestamped fragments). Hot reload: saving `config.yaml` / startup `models.json` applies (150ms debounce); `POST /reload` still works.
 
 ## Configuration highlights
 

@@ -19,8 +19,8 @@
 	<key>ThrottleInterval</key>
 	<integer>10</integer>
 	<key>StandardOutPath</key>
-	<string>@REPO@/logs/ccextra.launchd.out.log</string>
+	<string>@REPO@/logs/ccextra.launchd.log</string>
 	<key>StandardErrorPath</key>
-	<string>@REPO@/logs/ccextra.launchd.err.log</string>
+	<string>@REPO@/logs/ccextra.launchd.log</string>
 </dict>
 </plist>

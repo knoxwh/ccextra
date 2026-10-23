@@ -38,6 +38,6 @@ echo "ccextra → $SCRIPT_DIR/ccextra"
 # 编完必起：即使原先没在跑，也拉起来，避免「只停不起 / 已死后 deploy 不启」
 echo "=== Starting service ==="
 if ! "$SCRIPT_DIR/start.sh"; then
-    echo "错误: deploy 后 start 失败，请检查 logs/ccextra.launchd.err.log 与端口 8222" >&2
+    echo "错误: deploy 后 start 失败，请检查 logs/ccextra.launchd.log 与端口 8222" >&2
     exit 1
 fi
