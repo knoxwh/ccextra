@@ -13,7 +13,8 @@ INSTALL_SH="$SCRIPT_DIR/scripts/macos/install-launchagent.sh"
 
 mkdir -p "$LOG_DIR"
 
-# 清理当日之前的按日滚动日志（含 launchd 滚动件 *.YYYY-MM-DD[.HHMMSS].log；
+# 清理当日之前的按日滚动日志（含 launchd 当日合并件 *.YYYY-MM-DD.log，
+# 以及旧版残留的 *.YYYY-MM-DD.HHMMSS.log 碎片；
 # 不动当前固定的 ccextra.launchd.{out,err}.log）
 find "$LOG_DIR" -name '*.log' | while read -r f; do
     basename=$(basename "$f")
@@ -93,7 +94,8 @@ kill_stray_orphans() {
 }
 
 # 仅在即将 bootstrap（服务未 load）时滚动 launchd 固定 out/err，避免无界增长。
-# kickstart 路径不滚动（进程仍持有旧 fd）。
+# 合并进当日单文件 ccextra.launchd.{kind}.YYYY-MM-DD.log（已存在则 append）；
+# 不再写 .HHMMSS 碎片。kickstart 路径不滚动（进程仍持有旧 fd）。
 rotate_launchd_logs() {
     local kind src dest
     for kind in out err; do
@@ -103,10 +105,13 @@ rotate_launchd_logs() {
         fi
         dest="$LOG_DIR/ccextra.launchd.${kind}.${TODAY}.log"
         if [ -e "$dest" ]; then
-            dest="$LOG_DIR/ccextra.launchd.${kind}.${TODAY}.$(date +%H%M%S).log"
+            echo "Appending launchd ${kind} log -> $(basename "$dest")"
+            cat "$src" >> "$dest"
+            rm -f "$src"
+        else
+            echo "Rotating launchd ${kind} log -> $(basename "$dest")"
+            mv "$src" "$dest"
         fi
-        echo "Rotating launchd ${kind} log -> $(basename "$dest")"
-        mv "$src" "$dest"
     done
 }
 
