@@ -1344,7 +1344,7 @@ fn test_grok_upstream_still_injects_grok_adapter() {
 
 #[test]
 fn test_non_adapter_upstream_uses_instructions() {
-    // 非 adapter 上游(glm/deepseek/claude)保持 system → instructions,不注入 developer 块
+    // 非 adapter 上游(glm/deepseek/claude)将清洗后 system → instructions,不注入 developer 块
     for model in ["glm-5.1", "claude-opus-5"] {
         let mut body = json!({
             "model": "test",
@@ -1358,6 +1358,99 @@ fn test_non_adapter_upstream_uses_instructions() {
         // 首条消息应该是 user,不是 developer
         assert_eq!(input[0]["role"], "user", "{model}");
         assert_eq!(input.len(), 1, "{model}");
+    }
+}
+
+#[test]
+fn test_non_adapter_responses_upstream_strips_claude_triggers() {
+    // 所有 Responses 上游(含非 adapter 的 glm/deepseek)先 strip 再入 instructions
+    let system = r#"
+Available agent types for the Agent tool:
+- claude: Catch-all for any task
+
+<identity>
+You are Claude, Anthropic's AI assistant.
+</identity>
+
+# Memory
+Memory path: /home/user/.claude/memory
+
+# Environment
+Working directory: /project
+
+<response_style>
+Be very verbose and explain everything in detail.
+</response_style>
+
+# Output Style: Concise
+Keep responses short.
+
+# Language
+Always respond in Simplified Chinese (简体中文).
+
+<safety_guardrails>
+Consider the reversibility and potential impact of your actions.
+</safety_guardrails>
+
+IMPORTANT: Assist with authorized security testing, defensive security, CTF challenges.
+
+User custom system prompt line.
+"#;
+    for model in ["glm-5.1", "deepseek-chat", "test-model"] {
+        let mut body = json!({
+            "model": "test",
+            "system": system,
+            "messages": [{"role": "user", "content": "test"}]
+        });
+        convert_to_openai_responses(&mut body, model).unwrap();
+
+        let instructions = body["instructions"].as_str().unwrap();
+        assert!(
+            body.get("input").unwrap().as_array().unwrap()[0]["role"] == "user",
+            "{model}"
+        );
+
+        // 白名单保留
+        assert!(instructions.contains("# Memory"), "{model}");
+        assert!(
+            instructions.contains("Memory path: /home/user/.claude/memory"),
+            "{model}"
+        );
+        assert!(instructions.contains("# Environment"), "{model}");
+        assert!(
+            instructions.contains("Working directory: /project"),
+            "{model}"
+        );
+        assert!(instructions.contains("# Language"), "{model}");
+        assert!(instructions.contains("Simplified Chinese"), "{model}");
+        assert!(
+            instructions.contains("User custom system prompt line."),
+            "{model}"
+        );
+
+        // 触发块剥离(与 GPT 路径同一套 scrub)
+        assert!(!instructions.contains("Available agent types"), "{model}");
+        assert!(!instructions.contains("<identity>"), "{model}");
+        assert!(
+            !instructions.contains("Claude, Anthropic's AI assistant"),
+            "{model}"
+        );
+        assert!(!instructions.contains("<response_style>"), "{model}");
+        assert!(
+            !instructions.contains("verbose and explain everything"),
+            "{model}"
+        );
+        assert!(!instructions.contains("# Output Style: Concise"), "{model}");
+        assert!(!instructions.contains("Keep responses short"), "{model}");
+        assert!(!instructions.contains("<safety_guardrails>"), "{model}");
+        assert!(
+            !instructions.contains("Consider the reversibility and potential impact"),
+            "{model}"
+        );
+        assert!(
+            !instructions.contains("IMPORTANT: Assist with authorized security testing"),
+            "{model}"
+        );
     }
 }
 

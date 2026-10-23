@@ -59,19 +59,20 @@ pub fn convert_to_openai_responses_with(
     registry: &[crate::thinking::ModelCapability],
 ) -> Result<HashMap<String, String>> {
     // --- system → instructions / developer message ---
-    // 对齐 CPA convertClaudeRequestToCodex:
-    // GPT/Grok 上游将 system 配合 ADAPTER_BLOCK 作为 developer message 放入 input[]
-    // (省略空 instructions);两者均清洗 system 剥离触发过度推理的块;
-    // 其余 responses 上游保持 system → instructions
+    // 对齐 CPA convertClaudeRequestToCodex + design 矩阵:
+    // 所有 Responses 上游先 strip Claude 触发块(与 GPT/Grok 同一套 scrub);
+    // GPT/Grok 再将 adapter + 白名单入 developer(省略空 instructions);
+    // 其余上游将白名单直入 instructions。
     let system = body
         .get("system")
         .map(|system| system_to_instructions_text(system, upstream_model))
         .unwrap_or_default();
     let needs_adapter = needs_adapter_block(upstream_model);
+    let cleaned_system = strip_claude_system_for_gpt(&system);
     let instructions = if needs_adapter {
         String::new()
     } else {
-        system.clone()
+        cleaned_system.clone()
     };
 
     // 空 instructions 省略(对齐 CPA DeleteBytes),不发 ""
@@ -91,13 +92,10 @@ pub fn convert_to_openai_responses_with(
             GROK_ADAPTER_BLOCK
         };
 
-        // GPT/Grok 上游均清洗 system,剥离 Claude 触发块
-        let base_system = strip_claude_system_for_gpt(&system);
-
         let mut developer = String::from(adapter);
-        if !base_system.is_empty() {
+        if !cleaned_system.is_empty() {
             developer.push_str("\n\n");
-            developer.push_str(&base_system);
+            developer.push_str(&cleaned_system);
         }
         openai["input"].as_array_mut().unwrap().push(json!({
             "type": "message",
