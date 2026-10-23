@@ -106,9 +106,11 @@ pub fn detect_unfit_from_error(status: u16, body: &str) -> Option<UnfitKind> {
     }
     let lower = body.to_lowercase();
 
-    // response_format 拒绝(Gemini: "response_mime_type", OpenAI: "response_format")
+    // response_format / text.format 拒绝
+    // (Gemini: "response_mime_type", Chat: "response_format", Responses: "text.format")
     if lower.contains("response_mime_type")
         || lower.contains("response_format")
+        || lower.contains("text.format")
         || lower.contains("json_schema")
     {
         return Some(UnfitKind::RefusesFormat);
@@ -143,15 +145,13 @@ pub fn adapt_request_for_unfit(
 ) -> bool {
     let mut adapted = false;
 
-    // RefusesFormat: schema 注入 system/instructions, 注入成功后移除 response_format
+    // RefusesFormat: schema 注入 system/instructions, 注入成功后剥 format 字段
     if registry.is_unfit(provider, model, UnfitKind::RefusesFormat) {
         // 先探测再注入:注入失败(协议无对应字段 / body 缺 messages)时
-        // 不得剥掉 response_format,否则 body 被改却不会重试
+        // 不得剥掉 format,否则 body 被改却不会重试
         if let Some((schema, slot)) = response_format_schema(body) {
             if inject_schema_instruction(body, &schema, protocol) {
-                if let Some(obj) = body.as_object_mut() {
-                    obj.remove(slot);
-                }
+                strip_response_format_slot(body, slot);
                 adapted = true;
                 tracing::debug!(
                     provider,
@@ -189,8 +189,10 @@ pub fn adapt_request_for_unfit(
     adapted
 }
 
-/// 只读探测 response_format schema 及承载它的顶层字段;不做修改。
+/// 只读探测 structured-output schema 及剥离目标;不做修改。
 /// 移除由调用方在注入成功后执行。
+/// slot: `"output_config"` / `"response_format"` 为顶层整键;
+/// `"text.format"` 仅剥 `text.format`,保留同级 `text.verbosity`。
 fn response_format_schema(body: &serde_json::Value) -> Option<(serde_json::Value, &'static str)> {
     // Anthropic: output_config.format.json_schema
     if let Some(schema) = body.pointer("/output_config/format/json_schema") {
@@ -203,7 +205,37 @@ fn response_format_schema(body: &serde_json::Value) -> Option<(serde_json::Value
     if let Some(schema) = body.pointer("/response_format/json_schema") {
         return Some((schema.clone(), "response_format"));
     }
+    // OpenAI Responses: text.format.schema(Claude→Responses 转换后的位置)
+    if let Some(schema) = body.pointer("/text/format/schema") {
+        return Some((schema.clone(), "text.format"));
+    }
     None
+}
+
+/// 按 `response_format_schema` 返回的 slot 剥离 format。
+/// `"text.format"` 只删 format;text 空则再删顶层 text,保留 verbosity。
+fn strip_response_format_slot(body: &mut serde_json::Value, slot: &str) {
+    match slot {
+        "text.format" => {
+            let text_empty =
+                if let Some(text) = body.get_mut("text").and_then(|t| t.as_object_mut()) {
+                    text.remove("format");
+                    text.is_empty()
+                } else {
+                    false
+                };
+            if text_empty {
+                if let Some(obj) = body.as_object_mut() {
+                    obj.remove("text");
+                }
+            }
+        }
+        _ => {
+            if let Some(obj) = body.as_object_mut() {
+                obj.remove(slot);
+            }
+        }
+    }
 }
 
 /// 返回是否真的注入了指令;协议无对应字段时返回 false,调用方不得置 adapted。
@@ -633,6 +665,103 @@ mod tests {
             Protocol::OpenAiChat
         ));
         assert_eq!(body, original);
+    }
+
+    /// Responses 结构化输出在 text.format;RefusesFormat 须注入 instructions、
+    /// 只剥 format,同级 verbosity 保留。
+    #[test]
+    fn adapt_responses_refuses_format_injects_instructions_keeps_verbosity() {
+        let reg = marked(UnfitKind::RefusesFormat);
+        let mut body = serde_json::json!({
+            "instructions": "base",
+            "text": {
+                "format": {
+                    "type": "json_schema",
+                    "name": "cli_proxy_structured_output",
+                    "strict": true,
+                    "schema": {"type": "object", "properties": {"answer": {"type": "string"}}}
+                },
+                "verbosity": "low"
+            }
+        });
+        assert!(adapt_request_for_unfit(
+            &mut body,
+            "p",
+            "m",
+            &reg,
+            Protocol::OpenAiResponses
+        ));
+        assert!(
+            body.pointer("/text/format").is_none(),
+            "text.format 须被剥掉"
+        );
+        assert_eq!(body["text"]["verbosity"], "low", "verbosity 须保留");
+        let instr = body["instructions"].as_str().unwrap();
+        assert!(instr.starts_with("base"));
+        assert!(instr.contains("IMPORTANT: Respond with valid JSON"));
+        assert!(instr.contains("answer"));
+        // 不得误删顶层 text(verbosity 还在)
+        assert!(body.get("text").is_some());
+    }
+
+    /// 仅 text.format、无 verbosity 时,剥完后顶层 text 应一并移除。
+    #[test]
+    fn adapt_responses_refuses_format_removes_empty_text_object() {
+        let reg = marked(UnfitKind::RefusesFormat);
+        let mut body = serde_json::json!({
+            "text": {
+                "format": {
+                    "type": "json_schema",
+                    "name": "out",
+                    "strict": true,
+                    "schema": {"type": "object"}
+                }
+            }
+        });
+        assert!(adapt_request_for_unfit(
+            &mut body,
+            "p",
+            "m",
+            &reg,
+            Protocol::OpenAiResponses
+        ));
+        assert!(body.get("text").is_none());
+        assert!(body["instructions"]
+            .as_str()
+            .unwrap()
+            .contains("IMPORTANT: Respond with valid JSON"));
+    }
+
+    /// 首发预降级幂等:第二次不得再改 body / 报 adapted。
+    #[test]
+    fn adapt_responses_refuses_format_is_idempotent() {
+        let reg = marked(UnfitKind::RefusesFormat);
+        let mut body = serde_json::json!({
+            "instructions": "base",
+            "text": {
+                "format": {
+                    "type": "json_schema",
+                    "schema": {"type": "object"}
+                },
+                "verbosity": "low"
+            }
+        });
+        assert!(adapt_request_for_unfit(
+            &mut body,
+            "p",
+            "m",
+            &reg,
+            Protocol::OpenAiResponses
+        ));
+        let once = body.clone();
+        assert!(!adapt_request_for_unfit(
+            &mut body,
+            "p",
+            "m",
+            &reg,
+            Protocol::OpenAiResponses
+        ));
+        assert_eq!(body, once);
     }
 
     #[test]

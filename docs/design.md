@@ -97,7 +97,7 @@ Grok 交互身份对齐 sub2api `ad05eda15`：Chat/Responses 的 identifier 为 
 
 messages 路径不做本地退避重试：429、5xx（含 Cloudflare 52x）与网络错误在同轮内轮转多 `base_url`，耗尽后快速失败，把末次上游错误（Anthropic error 形状）返给客户端；退避重试交客户端（如 Claude Code 自带退避），`Retry-After` 头透传。429 不本地重试对齐 codex 传输层 `retry_429: false`。流式 OpenAI 请求声明 `Accept: text/event-stream` 和 `Cache-Control: no-cache`。
 
-上游 400/422 按错误文案识别特性不兼容（`response_format`、reasoning `off`、`tool_choice`、tools+reasoning 冲突），按 `(provider, upstream_model)` 记入进程内 unfit 注册表并原地降级请求体重试一次：schema 注入 system/instructions 后移除 `response_format`，effort `off`/`none` 提到 `low`，`tool_choice` 降为 `auto`，或移除 reasoning 配置；降级字段按目标协议形状写（Chat `messages`/`reasoning_effort`/字符串 `tool_choice`，Responses `instructions`/`reasoning.effort`，Claude `system`/`thinking`）。标记跨请求存活，已被标记的模型在首发前就按标记预降级，不再每请求先打一次 400；注入失败时不剥字段也不重试。`/reload` 清空注册表并增代，旧飞行请求的迟到标记丢弃。
+上游 400/422 按错误文案识别特性不兼容（`response_format` / Responses `text.format`、reasoning `off`、`tool_choice`、tools+reasoning 冲突），按 `(provider, upstream_model)` 记入进程内 unfit 注册表并原地降级请求体重试一次：schema 注入 system/instructions 后剥 format——Chat/Claude 移除顶层 `response_format` / `output_config`，Responses 只剥 `text.format`（保留同级 `text.verbosity`，空则再删顶层 `text`）——effort `off`/`none` 提到 `low`，`tool_choice` 降为 `auto`，或移除 reasoning 配置；降级字段按目标协议形状写（Chat `messages`/`reasoning_effort`/字符串 `tool_choice`，Responses `instructions`/`reasoning.effort`，Claude `system`/`thinking`）。标记跨请求存活，已被标记的模型在首发前就按标记预降级，不再每请求先打一次 400；注入失败时不剥字段也不重试。`/reload` 清空注册表并增代，旧飞行请求的迟到标记丢弃。
 
 ## 响应转发
 
