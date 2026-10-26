@@ -477,7 +477,12 @@ pub fn claude_tool_is_parameterless(tool_name: &str, original_request: &Value) -
         return true;
     };
     let info = analyze_object_schema(schema, schema);
-    if info.complex || info_any_branch_allows_dynamic(&info) || !info.declares_object {
+    // 对齐 CPA e1fb2521:仅 additionalProperties:false 的闭空对象才算 parameterless
+    if info.complex
+        || info_any_branch_allows_dynamic(&info)
+        || !info.declares_object
+        || !info.forbids_dynamic
+    {
         return false;
     }
     info.required.is_empty() && (!info.has_properties || info.properties.is_empty())
@@ -676,6 +681,7 @@ fn clean_object(
         .all(|schema| analyze_object_schema(schema, root).declares_object);
     if is_empty_schema
         && all_declare_object
+        && merged.forbids_dynamic
         && !info_any_branch_allows_dynamic(&merged)
         && !originals_any_branch_allows_dynamic(schemas, root)
         && !originals_any_candidate_accepts_implicitly(schemas, root, &current)
@@ -784,8 +790,10 @@ pub fn clean_claude_tool_arguments(
     if info.complex || !info.declares_object {
         return args.clone();
     }
+    // 对齐 CPA e1fb2521:隐式开放空对象不整包抹成 {}
     if info.required.is_empty()
         && (!info.has_properties || info.properties.is_empty())
+        && info.forbids_dynamic
         && !info_any_branch_allows_dynamic(&info)
     {
         return json!({});
@@ -870,8 +878,16 @@ mod tests {
 
     #[test]
     fn parameterless_normalizes_to_empty_object() {
+        // 对齐 CPA e1fb2521:闭空对象(additionalProperties:false)才整对象归一成 {}
         let orig = json!({
-            "tools": [{"name": "EnterPlanMode", "input_schema": {"type": "object", "properties": {}}}]
+            "tools": [{
+                "name": "EnterPlanMode",
+                "input_schema": {
+                    "type": "object",
+                    "properties": {},
+                    "additionalProperties": false
+                }
+            }]
         });
         let args = json!({"reason": "Switching to plan mode"});
         assert_eq!(
@@ -879,6 +895,63 @@ mod tests {
             json!({})
         );
         assert!(claude_tool_is_parameterless("EnterPlanMode", &orig));
+    }
+
+    #[test]
+    fn implicit_open_empty_object_preserves_user_args() {
+        // additionalProperties 省略/true → 保留用户参数;false → 归一 {}
+        for (schema, want_args, want_parameterless) in [
+            (
+                json!({"type": "object", "properties": {}}),
+                json!({"user": "v"}),
+                false,
+            ),
+            (json!({"type": "object"}), json!({"user": "v"}), false),
+            (
+                json!({"type": "object", "properties": {}, "additionalProperties": true}),
+                json!({"user": "v"}),
+                false,
+            ),
+            (
+                json!({"type": "object", "properties": {}, "additionalProperties": false}),
+                json!({}),
+                true,
+            ),
+            (
+                json!({"type": "object", "additionalProperties": false}),
+                json!({}),
+                true,
+            ),
+        ] {
+            let orig = json!({"tools": [{"name": "echo", "input_schema": schema}]});
+            let args = json!({"user": "v"});
+            assert_eq!(
+                clean_claude_tool_arguments(&args, "echo", &orig),
+                want_args,
+                "schema={schema}"
+            );
+            assert_eq!(
+                claude_tool_is_parameterless("echo", &orig),
+                want_parameterless,
+                "schema={schema}"
+            );
+        }
+    }
+
+    #[test]
+    fn implicit_open_strips_injected_placeholder_keeps_user_arg() {
+        let orig = json!({
+            "tools": [{
+                "name": "echo",
+                "input_schema": {"type": "object", "properties": {}}
+            }]
+        });
+        let args = json!({"user": "v", "reason": "Brief explanation"});
+        assert_eq!(
+            clean_claude_tool_arguments(&args, "echo", &orig),
+            json!({"user": "v"})
+        );
+        assert!(!claude_tool_is_parameterless("echo", &orig));
     }
 
     #[test]
@@ -942,7 +1015,7 @@ mod tests {
     #[test]
     fn stream_parameterless_continuation_emits_empty_once() {
         let orig = json!({
-            "tools": [{"name": "EnterPlanMode", "input_schema": {"type": "object", "properties": {}}}]
+            "tools": [{"name": "EnterPlanMode", "input_schema": {"type": "object", "properties": {}, "additionalProperties": false}}]
         });
         let mut state = ToolArgStreamState::default();
         state.begin_tool("EnterPlanMode", Some(&orig));

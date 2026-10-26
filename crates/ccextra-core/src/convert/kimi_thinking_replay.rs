@@ -33,6 +33,7 @@ pub fn kimi_thinking_replay_model_family(model: &str) -> String {
     let normalized = normalize_kimi_upstream_model(&base);
     match normalized.as_str() {
         "k3" | "k3-256k" => "k3".to_string(),
+        "k3.1-pro" | "k3.1-pro-highspeed" => "k3.1-pro".to_string(),
         other => other.to_string(),
     }
 }
@@ -567,6 +568,18 @@ mod tests {
         assert_eq!(kimi_thinking_replay_model_family("k3"), "k3");
         assert_eq!(kimi_thinking_replay_model_family("kimi-k3"), "k3");
         assert_eq!(kimi_thinking_replay_model_family("k3-256k"), "k3");
+        assert_eq!(
+            kimi_thinking_replay_model_family("kimi-k3.1-pro"),
+            "k3.1-pro"
+        );
+        assert_eq!(
+            kimi_thinking_replay_model_family("kimi-k3.1-pro-highspeed"),
+            "k3.1-pro"
+        );
+        assert_eq!(
+            kimi_thinking_replay_model_family("kimi-k3.1-pro[1m](high)"),
+            "k3.1-pro"
+        );
         assert_eq!(
             kimi_thinking_replay_model_family("kimi-k3-256k(high)"),
             "k3"

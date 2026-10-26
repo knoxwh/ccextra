@@ -1530,7 +1530,7 @@ mod tests {
     fn test_stream_parameterless_tool_args_normalized_to_empty() {
         // 对齐 CPA 202b8b8c:无参工具 reason 占位在响应侧归一为 {}
         let orig = json!({
-            "tools": [{"name": "EnterPlanMode", "input_schema": {"type": "object", "properties": {}}}]
+            "tools": [{"name": "EnterPlanMode", "input_schema": {"type": "object", "properties": {}, "additionalProperties": false}}]
         });
         let chunk = json!({
             "candidates": [{
@@ -1593,7 +1593,7 @@ mod tests {
     #[test]
     fn test_stream_parameterless_continuation_does_not_duplicate_empty() {
         let orig = json!({
-            "tools": [{"name": "EnterPlanMode", "input_schema": {"type": "object", "properties": {}}}]
+            "tools": [{"name": "EnterPlanMode", "input_schema": {"type": "object", "properties": {}, "additionalProperties": false}}]
         });
         let first = json!({
             "candidates": [{
