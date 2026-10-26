@@ -255,36 +255,18 @@ async fn main() -> Result<()> {
         );
     }
 
-    // 动态加载 Antigravity providers（UA 与 chat 同源）
-    let user_agents_early = build_user_agents(config.user_agents.as_ref());
-    let antigravity_auth_dir = pin_auth_dir(
-        &cli.config,
-        config.auth_dir.as_deref(),
-        resolve_antigravity_auth_dir,
-    );
-    let antigravity_providers = ccextra_server::antigravity::load_antigravity_providers(
-        &antigravity_auth_dir,
-        config.server.proxy_url.as_deref(),
-        config.antigravity_models.as_deref().unwrap_or(&[]),
-        Some(user_agents_early.antigravity.as_str()),
-    )
-    .await;
-    if !antigravity_providers.is_empty() {
-        tracing::info!(
-            "动态加载 {} 个 Antigravity providers",
-            antigravity_providers.len()
-        );
-    }
+    // Antigravity 不在 listen 前同步 fetch_models（对齐 CPA：已知数据先行、
+    // asyncProbe / StartModelsUpdater 后台注入；HTTP 30s timeout 不得堵 bind）。
+    // 凭证扫描 + 模型列表由下方 run_antigravity_injection 启动即拉一次。
 
     // 静态配置自身先硬校验:跨 provider alias 冲突属用户配置错误,启动即失败
     ccextra_core::route::validate_providers(&config.providers)?;
 
-    // 合并所有 providers
+    // 合并已知 providers（AG 由后台注入）
     let mut all_providers = merge_providers(config.providers.clone(), Vec::new());
     all_providers = merge_providers(all_providers, xai_providers);
     all_providers = merge_providers(all_providers, codex_providers);
     all_providers = merge_providers(all_providers, claude_providers);
-    all_providers = merge_providers(all_providers, antigravity_providers);
 
     // 合并后复查:merge_providers 已按 alias 去重,这里只兜底告警,
     // 不再让后台拉取的动态 provider 决定服务能否启动

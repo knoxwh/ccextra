@@ -124,8 +124,10 @@ rotate_launchd_logs() {
 }
 
 wait_health() {
+    # AG 模型列表已改后台注入，listen 不再等 fetch_models；15s 覆盖 xAI/Codex/Claude
+    # 本地扫描与偶发慢启动。真正挂死仍失败并指向 launchd 日志。
     local i
-    for i in $(seq 1 50); do
+    for i in $(seq 1 75); do
         if health_ok; then
             local pid
             pid=$(listen_pids | head -1 || true)
