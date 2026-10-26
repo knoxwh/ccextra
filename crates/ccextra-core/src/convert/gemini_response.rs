@@ -120,10 +120,7 @@ fn append_carrier_thinking_block(
         return;
     }
     if state.response_type != ResponseType::None {
-        events.push(json!({
-            "type": "content_block_stop",
-            "index": state.response_index
-        }));
+        push_content_block_stop(events, state);
         state.response_index += 1;
         state.response_type = ResponseType::None;
     }
@@ -143,10 +140,7 @@ fn append_carrier_thinking_block(
             "signature": signature
         }
     }));
-    events.push(json!({
-        "type": "content_block_stop",
-        "index": state.response_index
-    }));
+    push_content_block_stop(events, state);
     state.response_index += 1;
     state.response_type = ResponseType::None;
     state.has_content = true;
@@ -162,6 +156,24 @@ fn append_signature_delta(events: &mut Vec<Value>, state: &mut GeminiStreamState
         }
     }));
     state.has_content = true;
+}
+
+/// 关块前冲刷延迟的空 `{}`(对齐 CPA e1fb2521 flushPendingToolInput)。
+fn push_content_block_stop(events: &mut Vec<Value>, state: &mut GeminiStreamState) {
+    if let Some(partial) = state.tool_args.flush_pending_empty() {
+        events.push(json!({
+            "type": "content_block_delta",
+            "index": state.response_index,
+            "delta": {
+                "type": "input_json_delta",
+                "partial_json": partial
+            }
+        }));
+    }
+    events.push(json!({
+        "type": "content_block_stop",
+        "index": state.response_index
+    }));
 }
 
 pub fn convert_gemini_stream_chunk(
@@ -232,10 +244,7 @@ pub fn convert_gemini_stream_chunk(
                     state.has_content = true;
                 } else {
                     if state.response_type != ResponseType::None {
-                        events.push(json!({
-                            "type": "content_block_stop",
-                            "index": state.response_index
-                        }));
+                        push_content_block_stop(&mut events, state);
                         state.response_index += 1;
                     }
                     events.push(json!({
@@ -308,19 +317,13 @@ pub fn convert_gemini_stream_chunk(
                 }
 
                 if state.response_type == ResponseType::Function {
-                    events.push(json!({
-                        "type": "content_block_stop",
-                        "index": state.response_index
-                    }));
+                    push_content_block_stop(&mut events, state);
                     state.response_index += 1;
                     state.response_type = ResponseType::None;
                 }
 
                 if state.response_type != ResponseType::None {
-                    events.push(json!({
-                        "type": "content_block_stop",
-                        "index": state.response_index
-                    }));
+                    push_content_block_stop(&mut events, state);
                     state.response_index += 1;
                 }
 
@@ -396,10 +399,7 @@ pub fn convert_gemini_stream_chunk(
                 } else if !text.is_empty() {
                     // 对齐 CPA fd3e6623:只在非空时转换,防止空 text 关闭活动块
                     if state.response_type != ResponseType::None {
-                        events.push(json!({
-                            "type": "content_block_stop",
-                            "index": state.response_index
-                        }));
+                        push_content_block_stop(&mut events, state);
                         state.response_index += 1;
                     }
                     events.push(json!({
@@ -422,6 +422,20 @@ pub fn convert_gemini_stream_chunk(
                     state.has_content = true;
                 }
             }
+        }
+    }
+
+    // 对齐 CPA e1fb2521:见 finishReason 即冲刷延迟空 input
+    if state.has_finish {
+        if let Some(partial) = state.tool_args.flush_pending_empty() {
+            events.push(json!({
+                "type": "content_block_delta",
+                "index": state.response_index,
+                "delta": {
+                    "type": "input_json_delta",
+                    "partial_json": partial
+                }
+            }));
         }
     }
 
@@ -520,10 +534,7 @@ fn append_malformed_api_error(state: &mut GeminiStreamState, events: &mut Vec<Va
     state.final_events_sent = true;
     state.api_error_emitted = true;
     if state.response_type != ResponseType::None {
-        events.push(json!({
-            "type": "content_block_stop",
-            "index": state.response_index
-        }));
+        push_content_block_stop(events, state);
         state.response_type = ResponseType::None;
     }
     events.push(gemini_malformed_function_call_error());
@@ -540,10 +551,7 @@ fn append_final_events(state: &mut GeminiStreamState, events: &mut Vec<Value>) {
     }
     state.final_events_sent = true;
     if state.response_type != ResponseType::None {
-        events.push(json!({
-            "type": "content_block_stop",
-            "index": state.response_index
-        }));
+        push_content_block_stop(events, state);
         state.response_type = ResponseType::None;
     }
     events.push(json!({
@@ -1643,6 +1651,57 @@ mod tests {
             })
             .collect();
         assert_eq!(partial, "{}");
+    }
+
+    #[test]
+    fn test_stream_implicit_open_continuation_ordering() {
+        // 对齐 CPA e1fb2521 ImplicitOpenToolContinuationOrdering
+        let orig = json!({
+            "tools": [{"name": "echo", "input_schema": {"type": "object", "properties": {}}}]
+        });
+        for (first_args, cont_args, want) in [
+            (json!({}), json!({"user": "v"}), r#"{"user":"v"}"#),
+            (
+                json!({"reason": "thinking"}),
+                json!({"user": "v"}),
+                r#"{"user":"v"}"#,
+            ),
+            (json!({"user": "v"}), json!({}), r#"{"user":"v"}"#),
+            (
+                json!({"user": "v"}),
+                json!({"reason": "done"}),
+                r#"{"user":"v"}"#,
+            ),
+        ] {
+            let first = json!({
+                "candidates": [{
+                    "content": {"parts": [{"functionCall": {"name": "echo", "args": first_args}}]}
+                }]
+            });
+            let cont = json!({
+                "candidates": [{
+                    "content": {"parts": [{"functionCall": {"args": cont_args}}]},
+                    "finishReason": "STOP"
+                }]
+            });
+            let mut state = GeminiStreamState::default();
+            let e1 =
+                convert_gemini_stream_chunk(&first, &mut state, &HashMap::new(), None, Some(&orig));
+            let e2 =
+                convert_gemini_stream_chunk(&cont, &mut state, &HashMap::new(), None, Some(&orig));
+            let partial: String = e1
+                .iter()
+                .chain(e2.iter())
+                .filter(|e| e["delta"]["type"] == "input_json_delta")
+                .map(|e| {
+                    e["delta"]["partial_json"]
+                        .as_str()
+                        .unwrap_or("")
+                        .to_string()
+                })
+                .collect();
+            assert_eq!(partial, want, "first={first_args} cont={cont_args}");
+        }
     }
 
     fn stream_tool_use_ids(signature_model: Option<&str>, fc: Value) -> Vec<String> {

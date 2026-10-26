@@ -828,6 +828,8 @@ pub struct ToolArgStreamState {
     pub current_tool_name: String,
     pub current_tool_is_parameterless: bool,
     pub current_tool_input_emitted: bool,
+    /// 对齐 CPA CurrentToolPendingEmpty:隐式开放工具的 `{}` 延迟到关块再发。
+    pub current_tool_pending_empty: bool,
 }
 
 impl ToolArgStreamState {
@@ -837,9 +839,10 @@ impl ToolArgStreamState {
             .map(|orig| claude_tool_is_parameterless(tool_name, orig))
             .unwrap_or(false);
         self.current_tool_input_emitted = false;
+        self.current_tool_pending_empty = false;
     }
 
-    /// 清洗并按无参工具规则抑制重复 `{}`。返回 None 表示跳过本 delta。
+    /// 清洗并按无参/隐式开放规则决定是否发射。返回 None 表示本 delta 跳过(延迟空 `{}`)。
     pub fn clean_emitted_args(
         &mut self,
         raw_args: &str,
@@ -862,12 +865,33 @@ impl ToolArgStreamState {
                 return Some(String::new());
             }
             self.current_tool_input_emitted = true;
+            self.current_tool_pending_empty = false;
             return Some(cleaned);
+        }
+        // 对齐 CPA e1fb2521:非 parameterless 的 `{}` 延迟到 flush,避免与续传真参拼接成 `{}{...}`
+        if cleaned == "{}" {
+            if !self.current_tool_input_emitted {
+                self.current_tool_pending_empty = true;
+            }
+            return None;
         }
         if !cleaned.is_empty() {
             self.current_tool_input_emitted = true;
+            self.current_tool_pending_empty = false;
         }
         Some(cleaned)
+    }
+
+    /// 关块 / finish 前冲刷延迟的 `{}`(对齐 CPA flushPendingToolInput)。
+    pub fn flush_pending_empty(&mut self) -> Option<String> {
+        if self.current_tool_pending_empty && !self.current_tool_input_emitted {
+            self.current_tool_input_emitted = true;
+            self.current_tool_pending_empty = false;
+            Some("{}".to_string())
+        } else {
+            self.current_tool_pending_empty = false;
+            None
+        }
     }
 }
 
@@ -1031,6 +1055,51 @@ mod tests {
             .clean_emitted_args(r#"{"reason":"more"}"#, "EnterPlanMode", Some(&orig))
             .unwrap();
         assert_eq!(cont, "");
+    }
+
+    #[test]
+    fn stream_implicit_open_defers_empty_until_flush() {
+        // 对齐 CPA ImplicitOpenToolContinuationOrdering:empty→real / real→empty
+        let orig = json!({
+            "tools": [{"name": "echo", "input_schema": {"type": "object", "properties": {}}}]
+        });
+        let mut state = ToolArgStreamState::default();
+        state.begin_tool("echo", Some(&orig));
+        assert!(state
+            .clean_emitted_args("{}", "echo", Some(&orig))
+            .is_none());
+        assert!(state.current_tool_pending_empty);
+        let real = state
+            .clean_emitted_args(r#"{"user":"v"}"#, "echo", Some(&orig))
+            .unwrap();
+        assert_eq!(real, r#"{"user":"v"}"#);
+        assert!(!state.current_tool_pending_empty);
+        assert!(state.flush_pending_empty().is_none());
+
+        let mut state2 = ToolArgStreamState::default();
+        state2.begin_tool("echo", Some(&orig));
+        let first = state2
+            .clean_emitted_args(r#"{"user":"v"}"#, "echo", Some(&orig))
+            .unwrap();
+        assert_eq!(first, r#"{"user":"v"}"#);
+        assert!(state2
+            .clean_emitted_args("{}", "echo", Some(&orig))
+            .is_none());
+        assert!(state2.flush_pending_empty().is_none());
+    }
+
+    #[test]
+    fn stream_implicit_open_flush_emits_deferred_empty() {
+        let orig = json!({
+            "tools": [{"name": "echo", "input_schema": {"type": "object", "properties": {}}}]
+        });
+        let mut state = ToolArgStreamState::default();
+        state.begin_tool("echo", Some(&orig));
+        assert!(state
+            .clean_emitted_args("{}", "echo", Some(&orig))
+            .is_none());
+        assert_eq!(state.flush_pending_empty().as_deref(), Some("{}"));
+        assert!(state.flush_pending_empty().is_none());
     }
 
     #[test]
