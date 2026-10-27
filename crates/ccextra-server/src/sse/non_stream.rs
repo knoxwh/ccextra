@@ -16,6 +16,7 @@ use super::responses::{
 };
 use ccextra_core::convert::{
     fix_json_quotes, is_valid_gpt_reasoning_signature, is_valid_grok_encrypted_content,
+    CODEX_COMMENTARY_SIGNATURE_MARKER,
 };
 use ccextra_core::doom_loop::{is_confident, parse_trigger};
 
@@ -139,11 +140,23 @@ pub fn responses_to_anthropic(
                     }
                 }
                 "message" => {
+                    // 对齐 CPA 376015c3/531721bf:commentary preamble → thinking+marker
+                    let commentary =
+                        item.get("phase").and_then(|v| v.as_str()) == Some("commentary");
                     if let Some(parts) = item.get("content").and_then(|v| v.as_array()) {
                         for part in parts {
                             if part.get("type").and_then(|v| v.as_str()) == Some("output_text") {
                                 let t = part.get("text").and_then(|v| v.as_str()).unwrap_or("");
-                                if !t.is_empty() {
+                                if t.is_empty() {
+                                    continue;
+                                }
+                                if commentary {
+                                    content.push(json!({
+                                        "type": "thinking",
+                                        "thinking": t,
+                                        "signature": CODEX_COMMENTARY_SIGNATURE_MARKER,
+                                    }));
+                                } else {
                                     content.push(json!({"type": "text", "text": t}));
                                 }
                             }

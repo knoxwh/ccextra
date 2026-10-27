@@ -6,8 +6,9 @@ use std::collections::HashMap;
 use super::antigravity_tools::antigravity_tool_name_to_upstream;
 use super::is_ignorable_system_text;
 use super::signature::{
-    resolve_thinking_signature, resolve_tool_use_thought_signature,
-    signature_provider_from_model_name, SignatureProvider, GEMINI_SKIP_THOUGHT_SIGNATURE_VALIDATOR,
+    is_codex_commentary_signature_marker, resolve_thinking_signature,
+    resolve_tool_use_thought_signature, signature_provider_from_model_name, SignatureProvider,
+    GEMINI_SKIP_THOUGHT_SIGNATURE_VALIDATOR,
 };
 use super::tool_id::tool_name_from_claude_tool_use_id;
 use super::tool_sanitize::sanitize_function_name;
@@ -485,18 +486,25 @@ fn append_block_parts(
         // (对齐 CPA antigravity 翻译器:签名经 resolveProviderCompatibleSignature
         // 归一化,claude 目标出双层 R 形;无签名时仅 gemini 目标保住思维文本)
         "thinking" => {
-            if !antigravity {
-                return;
-            }
             let text = block.get("thinking").and_then(|t| t.as_str()).unwrap_or("");
-            // 空文本块只在 CPA 的 detached carrier 路径上有意义,该机制未移植 → 丢弃
-            if text.is_empty() {
-                return;
-            }
             let raw_signature = block
                 .get("signature")
                 .and_then(|s| s.as_str())
                 .unwrap_or("");
+            // 对齐 CPA 531721bf 跨格式:commentary marker → 纯文本,不进 thoughtSignature
+            if is_codex_commentary_signature_marker(raw_signature) {
+                if !text.is_empty() {
+                    parts.push(json!({ "text": text }));
+                }
+                return;
+            }
+            if !antigravity {
+                return;
+            }
+            // 空文本块只在 CPA 的 detached carrier 路径上有意义,该机制未移植 → 丢弃
+            if text.is_empty() {
+                return;
+            }
             let signature = resolve_thinking_signature(upstream_model, raw_signature);
             if signature.is_empty()
                 && signature_provider_from_model_name(upstream_model) != SignatureProvider::Gemini

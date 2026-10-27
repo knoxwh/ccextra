@@ -2,6 +2,7 @@ use bytes::Bytes;
 use serde_json::Value;
 
 use crate::sse::emit;
+use ccextra_core::convert::CODEX_COMMENTARY_SIGNATURE_MARKER;
 
 use super::state_machine::ResponsesRelay;
 use super::CLAUDE_RESPONSES_REDACTED_THINKING_PREFIX;
@@ -32,6 +33,8 @@ impl ResponsesRelay {
     pub(crate) fn plaintext_reasoning_delta(&mut self, root: &Value) -> Vec<Bytes> {
         let delta = root.get("delta").and_then(|v| v.as_str()).unwrap_or("");
         let mut out = self.stop_text();
+        out.extend(self.finalize_commentary_block());
+        self.commentary_message_open = false;
         // 根据 thinking_is_redacted 标志打开对应类型的块
         if self.thinking_is_redacted {
             out.extend(self.start_redacted_thinking());
@@ -45,25 +48,37 @@ impl ResponsesRelay {
 
     /// 关闭 thinking 块:有 signature 先发 signature_delta(加密内容回放闭环)
     /// 若 signature 为 redacted_thinking 载荷(带前缀),发 redacted_thinking 块而非 thinking
+    /// 对齐 CPA `finalizeCodexCommentaryBlock`:关 commentary thinking,
+    /// 发内部 marker 作 signature,不吞掉后续 reasoning 的 pending signature。
+    pub(crate) fn finalize_commentary_block(&mut self) -> Vec<Bytes> {
+        if !self.commentary_message_open || !self.thinking_open {
+            return Vec::new();
+        }
+        self.finalize_thinking()
+    }
+
     pub(crate) fn finalize_thinking(&mut self) -> Vec<Bytes> {
         if !self.thinking_open {
             return Vec::new();
         }
         let mut out = Vec::new();
-        // 检测 redacted_thinking 载荷(对齐 responsesRedactedThinkingData)
-        if let Some(data) = self
+        // 对齐 CPA 531721bf:commentary 块发内部 marker,保留真实 reasoning signature
+        if self.commentary_message_open {
+            out.push(emit::content_block_delta_signature(
+                self.thinking_index,
+                CODEX_COMMENTARY_SIGNATURE_MARKER,
+            ));
+        } else if let Some(data) = self
             .thinking_signature
             .strip_prefix(CLAUDE_RESPONSES_REDACTED_THINKING_PREFIX)
         {
             if !data.is_empty() {
-                // 发送 redacted_thinking 的 data 字段
                 out.push(emit::content_block_delta_redacted_thinking_data(
                     self.thinking_index,
                     data,
                 ));
             }
         } else if !self.thinking_signature.is_empty() {
-            // 普通 thinking 签名
             out.push(emit::content_block_delta_signature(
                 self.thinking_index,
                 &self.thinking_signature,

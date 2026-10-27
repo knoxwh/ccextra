@@ -65,8 +65,9 @@ pub use reasoning_replay::{
 pub use shorten::build_reverse_map;
 pub use shorten::build_short_name_map;
 pub use signature::{
-    format_claude_signature_value, is_valid_gpt_reasoning_signature,
-    is_valid_grok_encrypted_content, model_group,
+    format_claude_signature_value, is_codex_commentary_signature_marker,
+    is_valid_gpt_reasoning_signature, is_valid_grok_encrypted_content, model_group,
+    restore_codex_commentary_markers, CODEX_COMMENTARY_SIGNATURE_MARKER,
 };
 pub use to_openai_chat::{
     convert_to_openai_chat, convert_to_openai_chat_with, sanitize_openai_chat_after_payload,

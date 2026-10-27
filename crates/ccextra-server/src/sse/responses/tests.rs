@@ -1128,3 +1128,52 @@ concat!(
         assert!(inc_stream.contains("incomplete empty response"));
     }
 }
+
+#[test]
+fn test_commentary_phase_maps_to_thinking_with_marker() {
+    // 对齐 CPA 376015c3/531721bf:phase=commentary → thinking + cpa:commentary:v1
+    use ccextra_core::convert::CODEX_COMMENTARY_SIGNATURE_MARKER;
+    let mut r = ResponsesRelay::new(None, Some("gpt-6.1-sol"));
+    let mut out = Vec::new();
+    out.extend(r.process(&ev(
+        r#"{"type":"response.created","response":{"id":"resp_c"}}"#,
+    )));
+    out.extend(r.process(&ev(
+        r#"{"type":"response.output_item.added","item":{"type":"message","phase":"commentary","role":"assistant"}}"#,
+    )));
+    out.extend(r.process(&ev(
+        r#"{"type":"response.output_text.delta","delta":"preamble"}"#,
+    )));
+    out.extend(r.process(&ev(
+        r#"{"type":"response.content_part.done","part":{"type":"output_text"}}"#,
+    )));
+    out.extend(r.process(&ev(
+        r#"{"type":"response.output_item.done","item":{"type":"message","phase":"commentary","role":"assistant","content":[{"type":"output_text","text":"preamble"}]}}"#,
+    )));
+    out.extend(r.process(&ev(
+        r#"{"type":"response.output_item.added","item":{"type":"message","role":"assistant"}}"#,
+    )));
+    out.extend(r.process(&ev(
+        r#"{"type":"response.output_text.delta","delta":"final answer"}"#,
+    )));
+    out.extend(r.process(&ev(
+        r#"{"type":"response.completed","response":{"id":"resp_c","status":"completed","usage":{"input_tokens":1,"output_tokens":2}}}"#,
+    )));
+    let body = s(&out);
+    assert!(
+        body.contains("thinking_delta"),
+        "commentary 应进 thinking_delta,实际: {body}"
+    );
+    assert!(
+        body.contains(CODEX_COMMENTARY_SIGNATURE_MARKER),
+        "应带 commentary marker,实际: {body}"
+    );
+    assert!(
+        body.contains("final answer"),
+        "最终答案应仍为 text,实际: {body}"
+    );
+    assert!(
+        body.contains("preamble"),
+        "preamble 应出现在 thinking,实际: {body}"
+    );
+}

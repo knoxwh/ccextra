@@ -20,6 +20,73 @@ pub const GEMINI_SKIP_THOUGHT_SIGNATURE_VALIDATOR: &str = "skip_thought_signatur
 /// Gemini 第二个 bypass 哨兵(对齐 GeminiContextEngineeringBypass)
 pub const GEMINI_CONTEXT_ENGINEERING_BYPASS: &str = "context_engineering_is_the_way_to_go";
 
+/// 对齐 CPA `CodexCommentarySignatureMarker`(`531721bf`):
+/// Responses `phase:commentary` 中继为 Claude thinking 时写入 signature 的内部标记。
+/// 可伪造字面量、非凭证;仅区分中继 preamble 与真 reasoning,且不得送上游。
+/// 字面量与 CPA 相同,便于跨代理会话历史互通。
+pub const CODEX_COMMENTARY_SIGNATURE_MARKER: &str = "cpa:commentary:v1";
+
+/// 对齐 CPA `IsCodexCommentarySignatureMarker`
+pub fn is_codex_commentary_signature_marker(raw: &str) -> bool {
+    raw.trim() == CODEX_COMMENTARY_SIGNATURE_MARKER
+}
+
+/// 对齐 CPA `RestoreCodexCommentaryMarkers`:
+/// 把带内部 commentary marker 的 assistant thinking 改写为纯 text 块
+/// (空 thinking 丢弃)。marker 不得到达任何上游。返回改写块数。
+pub fn restore_codex_commentary_markers(body: &mut serde_json::Value) -> usize {
+    let Some(messages) = body.get_mut("messages").and_then(|m| m.as_array_mut()) else {
+        return 0;
+    };
+    let mut restored = 0;
+    let mut kept_messages: Vec<serde_json::Value> = Vec::with_capacity(messages.len());
+    for mut message in messages.drain(..) {
+        let Some(content) = message.get("content").cloned() else {
+            kept_messages.push(message);
+            continue;
+        };
+        let Some(parts) = content.as_array() else {
+            kept_messages.push(message);
+            continue;
+        };
+        let mut kept_parts: Vec<serde_json::Value> = Vec::with_capacity(parts.len());
+        let mut message_modified = false;
+        for part in parts {
+            let is_thinking = part.get("type").and_then(|t| t.as_str()) == Some("thinking");
+            let sig = part.get("signature").and_then(|s| s.as_str()).unwrap_or("");
+            if !is_thinking || !is_codex_commentary_signature_marker(sig) {
+                kept_parts.push(part.clone());
+                continue;
+            }
+            restored += 1;
+            message_modified = true;
+            if let Some(t) = part.get("thinking").and_then(|v| v.as_str()) {
+                if !t.is_empty() {
+                    kept_parts.push(serde_json::json!({"type": "text", "text": t}));
+                }
+            }
+        }
+        if !message_modified {
+            kept_messages.push(message);
+            continue;
+        }
+        if kept_parts.is_empty() {
+            // 整条消息只剩空 commentary → 丢弃消息(对齐 CPA)
+            continue;
+        }
+        message["content"] = serde_json::Value::Array(kept_parts);
+        kept_messages.push(message);
+    }
+    if restored == 0 {
+        // 还原 drain 的 messages——上面已经 drain 进 kept;若 restored==0
+        // kept_messages 应等于原内容
+        *body.get_mut("messages").unwrap() = serde_json::Value::Array(kept_messages);
+        return 0;
+    }
+    *body.get_mut("messages").unwrap() = serde_json::Value::Array(kept_messages);
+    restored
+}
+
 /// Kimi 两个观测固定原始长度(对齐 kimiThinkingSignatureLens)
 const KIMI_NON_STREAMING_LEN: usize = 12946;
 const KIMI_STREAMING_LEN: usize = 4340;

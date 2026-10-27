@@ -34,6 +34,9 @@ pub(crate) struct ResponsesRelay {
     pub(crate) thinking_summary_seen: bool,
     /// 当前 reasoning item 是否为 redacted_thinking(根据 encrypted_content 前缀判定)
     pub(crate) thinking_is_redacted: bool,
+    /// 对齐 CPA `CommentaryMessageOpen`(`376015c3`/`531721bf`):
+    /// 当前 message output item 带 `phase:commentary` 时,其文本进 thinking 块。
+    pub(crate) commentary_message_open: bool,
 
     /// function_call 流式状态(对齐 ConvertCodexResponseToClaudeParams)
     pub(crate) function_calls: HashMap<String, usize>,
@@ -85,6 +88,7 @@ impl ResponsesRelay {
             thinking_signature: String::new(),
             thinking_summary_seen: false,
             thinking_is_redacted: false,
+            commentary_message_open: false,
             function_calls: HashMap::new(),
             function_call_queue: Vec::new(),
             active_function_call: None,
@@ -170,6 +174,8 @@ impl ResponsesRelay {
             }
             "response.reasoning_summary_part.added" => {
                 let mut out = self.stop_text();
+                out.extend(self.finalize_commentary_block());
+                self.commentary_message_open = false;
                 // Codex 一个 reasoning item 拆多个 summary part,块保持打开,
                 // part 之间空行分隔,signature 只在 output_item.done 发一次
                 if self.thinking_open {
@@ -234,11 +240,16 @@ impl ResponsesRelay {
                     self.thinking_summary_seen = true;
                     return out;
                 }
-                let mut out = self.finalize_thinking();
                 if part_type == Some("output_text") {
+                    // 对齐 CPA 376015c3:commentary message 的 output_text 进 thinking
+                    if self.commentary_message_open {
+                        return self.start_thinking();
+                    }
+                    let mut out = self.finalize_thinking();
                     out.extend(self.start_text());
+                    return out;
                 }
-                out
+                self.finalize_thinking()
             }
             "response.output_text.delta" => {
                 let delta = root.get("delta").and_then(|v| v.as_str()).unwrap_or("");
@@ -246,6 +257,12 @@ impl ResponsesRelay {
                     return Vec::new();
                 }
                 self.has_text_delta = true;
+                // 对齐 CPA 376015c3:commentary preamble → thinking_delta
+                if self.commentary_message_open {
+                    let mut out = self.start_thinking();
+                    out.extend(self.thinking_delta(delta));
+                    return out;
+                }
                 let mut out = self.finalize_thinking();
                 out.extend(self.start_text());
                 out.extend(self.text_delta(delta));
@@ -253,7 +270,11 @@ impl ResponsesRelay {
             }
             "response.content_part.done" => {
                 if root.pointer("/part/type").and_then(|v| v.as_str()) == Some("output_text") {
-                    self.stop_text()
+                    if self.commentary_message_open {
+                        self.finalize_commentary_block()
+                    } else {
+                        self.stop_text()
+                    }
                 } else {
                     Vec::new()
                 }
@@ -265,9 +286,21 @@ impl ResponsesRelay {
                     .and_then(|v| v.as_str())
                     .unwrap_or("");
                 match item_type {
+                    "message" => {
+                        // 对齐 CPA 376015c3:每个 message item 独立;commentary 进 thinking
+                        let mut out = self.finalize_thinking();
+                        out.extend(self.stop_text());
+                        self.has_text_delta = false;
+                        self.commentary_message_open =
+                            item.and_then(|i| i.get("phase")).and_then(|v| v.as_str())
+                                == Some("commentary");
+                        out
+                    }
                     "reasoning" => {
                         let mut out = self.stop_text();
                         // 上一个没 done 的 reasoning item 不得泄漏未关块
+                        out.extend(self.finalize_commentary_block());
+                        self.commentary_message_open = false;
                         out.extend(self.finalize_thinking());
                         self.thinking_summary_seen = false;
                         // 兜底快照:仅当 output_item.done 不带 encrypted_content 时用
@@ -288,6 +321,7 @@ impl ResponsesRelay {
                         let is_custom = item_type == "custom_tool_call";
                         let mut out = self.finalize_thinking();
                         out.extend(self.stop_text());
+                        self.commentary_message_open = false;
                         let idx = self.record_function_call(item, Some(&root));
                         if let Some(i) = idx {
                             self.update_function_call_identity(i, item, Some(&root));
@@ -468,18 +502,46 @@ impl ResponsesRelay {
         let item_type = item.get("type").and_then(|v| v.as_str()).unwrap_or("");
         match item_type {
             "message" => {
+                let commentary = self.commentary_message_open
+                    || item.get("phase").and_then(|v| v.as_str()) == Some("commentary");
+                // 对齐 CPA:message done 后复位,避免后续 item 误判
+                let finish = |this: &mut Self| {
+                    this.commentary_message_open = false;
+                    this.has_text_delta = false;
+                };
                 if self.has_text_delta {
-                    return Vec::new();
+                    let mut out = Vec::new();
+                    if commentary {
+                        out.extend(self.finalize_commentary_block());
+                    }
+                    finish(self);
+                    return out;
                 }
-                // 无 delta 流时从 item.content 补发文本(与 recover_terminal_text 共用)
+                // 无 delta 流时从 item.content 补发
                 let text = extract_output_text(item.get("content"));
                 if text.is_empty() {
+                    finish(self);
                     return Vec::new();
                 }
-                self.emit_recovered_text(&text)
+                if commentary {
+                    // 整包 commentary → thinking + 内部 marker
+                    let mut out = self.finalize_thinking();
+                    out.extend(self.stop_text());
+                    self.commentary_message_open = true;
+                    out.extend(self.start_thinking());
+                    out.extend(self.thinking_delta(&text));
+                    out.extend(self.finalize_commentary_block());
+                    finish(self);
+                    return out;
+                }
+                let out = self.emit_recovered_text(&text);
+                finish(self);
+                out
             }
             "reasoning" => {
                 let mut out = self.stop_text();
+                out.extend(self.finalize_commentary_block());
+                self.commentary_message_open = false;
                 if let Some(sig) = item.get("encrypted_content").and_then(|v| v.as_str()) {
                     if sig.is_empty() {
                         // 空签名跳过

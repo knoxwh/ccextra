@@ -5,16 +5,51 @@
 // serde_json 的 preserve_order feature 保证 Map 顺序,最小化字节变化。
 
 use super::Result;
+use crate::convert::signature::restore_codex_commentary_markers;
 use crate::thinking::{clamp_effort, ModelCapability};
 use serde_json::Value;
 
-/// Claude 直通转换:只改 model 字段
+/// Claude 直通转换:改 model,并对 Claude 5.5 降级强制 tool_choice
 ///
 /// 输入:归一化后的 anthropic body
-/// 输出:改完 model 的 body,其余原样
+/// 输出:改完 model(及必要时 tool_choice)的 body,其余原样
 pub fn convert_passthrough(body: &mut Value, upstream_model: &str) -> Result<()> {
     body["model"] = Value::String(upstream_model.to_string());
+    normalize_claude_55_tool_choice(body, upstream_model);
+    // 对齐 CPA 531721bf:commentary marker 不得进入任何 Claude 兼容上游
+    restore_codex_commentary_markers(body);
     Ok(())
+}
+
+/// 对齐 CPA `1d45a5f3` `NormalizeClaudeToolChoice`:
+/// Claude 5.5(opus/sonnet) 拒强制 `tool_choice`(any/tool),降为 auto。
+/// 在直通路径尽早执行,避免上游 400 后再走 unfit 重试。
+fn normalize_claude_55_tool_choice(body: &mut Value, upstream_model: &str) -> bool {
+    if !is_claude_55_forced_tool_restricted(upstream_model) {
+        return false;
+    }
+    let Some(choice) = body.get_mut("tool_choice") else {
+        return false;
+    };
+    let Some(obj) = choice.as_object_mut() else {
+        return false;
+    };
+    match obj.get("type").and_then(|t| t.as_str()) {
+        Some("any") | Some("tool") => {
+            obj.insert("type".into(), Value::String("auto".into()));
+            obj.remove("name");
+            true
+        }
+        _ => false,
+    }
+}
+
+/// 对齐 CPA `claude55Model`(ParseSuffix / 去 bracket 后缀后):
+/// 仅 opus/sonnet 5.5,不含 haiku。
+fn is_claude_55_forced_tool_restricted(model: &str) -> bool {
+    let m = model.trim().to_ascii_lowercase();
+    let m = m.split('[').next().unwrap_or(&m);
+    m.starts_with("claude-opus-5-5") || m.starts_with("claude-sonnet-5-5")
 }
 
 /// Claude 直通路径的 system 清洗(对齐 chat / responses / gemini)
@@ -500,5 +535,51 @@ mod tests {
             json!({"thinking": {"type": "disabled", "output_config": {"effort": "high"}}});
         assert!(!clamp_passthrough_effort(&mut body2, "glm-5.3", &reg2));
         assert_eq!(body2["thinking"]["output_config"]["effort"], "high");
+    }
+
+    #[test]
+    fn test_claude_55_forced_tool_choice_downgraded_to_auto() {
+        // 对齐 CPA 1d45a5f3:any/tool → auto,清 name
+        for (model, tc) in [
+            ("claude-sonnet-5-5", json!({"type": "any"})),
+            (
+                "claude-opus-5-5-high",
+                json!({"type": "tool", "name": "Bash"}),
+            ),
+        ] {
+            let mut body = json!({
+                "model": "alias",
+                "tool_choice": tc,
+                "messages": []
+            });
+            convert_passthrough(&mut body, model).unwrap();
+            assert_eq!(body["model"], model);
+            assert_eq!(body["tool_choice"]["type"], "auto", "{model}");
+            assert!(body["tool_choice"].get("name").is_none(), "{model}");
+        }
+    }
+
+    #[test]
+    fn test_claude_55_tool_choice_auto_none_untouched() {
+        for tc in [json!({"type": "auto"}), json!({"type": "none"})] {
+            let mut body = json!({"model": "a", "tool_choice": tc.clone(), "messages": []});
+            convert_passthrough(&mut body, "claude-sonnet-5-5").unwrap();
+            assert_eq!(body["tool_choice"], tc);
+        }
+    }
+
+    #[test]
+    fn test_non_claude_55_forced_tool_choice_preserved() {
+        // haiku 5.5 / opus-5 / 非 5.5 不降级
+        for model in ["claude-haiku-5-5", "claude-opus-5", "claude-sonnet-4-6"] {
+            let mut body = json!({
+                "model": "a",
+                "tool_choice": {"type": "tool", "name": "Bash"},
+                "messages": []
+            });
+            convert_passthrough(&mut body, model).unwrap();
+            assert_eq!(body["tool_choice"]["type"], "tool", "{model}");
+            assert_eq!(body["tool_choice"]["name"], "Bash", "{model}");
+        }
     }
 }

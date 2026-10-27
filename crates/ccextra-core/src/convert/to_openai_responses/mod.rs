@@ -30,6 +30,7 @@ use serde_json::{json, Value};
 use std::collections::{HashMap, HashSet};
 
 use crate::convert::shorten::{build_short_name_map, shorten_name_if_needed};
+use crate::convert::signature::is_codex_commentary_signature_marker;
 use crate::convert::Result;
 
 pub use instructions::{
@@ -246,7 +247,20 @@ pub fn convert_to_openai_responses_with(
                         // 其余 Responses 上游保留既有明文 reasoning 回放。
                         if role == "assistant" {
                             let sig = part.get("signature").and_then(|v| v.as_str());
-                            if matches!(sig, Some(s) if !s.trim().is_empty()) {
+                            // 对齐 CPA 531721bf:commentary marker → phase:commentary message
+                            if matches!(sig, Some(s) if is_codex_commentary_signature_marker(s)) {
+                                if let Some(t) = part.get("thinking").and_then(|v| v.as_str()) {
+                                    if !t.is_empty() {
+                                        flush_message(&mut content_items, &mut out_items);
+                                        out_items.push(json!({
+                                            "type": "message",
+                                            "role": "assistant",
+                                            "phase": "commentary",
+                                            "content": [{"type": "output_text", "text": t}],
+                                        }));
+                                    }
+                                }
+                            } else if matches!(sig, Some(s) if !s.trim().is_empty()) {
                                 if let Some(good) = gpt_compatible_signature(sig, upstream_model) {
                                     flush_message(&mut content_items, &mut out_items);
                                     let mut reasoning = json!({

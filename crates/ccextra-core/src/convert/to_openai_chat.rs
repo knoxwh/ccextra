@@ -17,6 +17,7 @@ use std::collections::{HashMap, HashSet};
 
 use serde_json::{json, Value};
 
+use super::signature::is_codex_commentary_signature_marker;
 use super::{ConvertError, Result};
 
 /// Anthropic messages → OpenAI chat/completions
@@ -768,7 +769,15 @@ fn convert_message_parts(
         let ptype = part.get("type").and_then(|v| v.as_str()).unwrap_or("");
         match ptype {
             "thinking" => {
-                if role == "assistant" && should_map_thinking_to_reasoning(part) {
+                let sig = part.get("signature").and_then(|v| v.as_str()).unwrap_or("");
+                // 对齐 CPA 531721bf 跨格式:commentary → 纯 text,不进 reasoning_content
+                if is_codex_commentary_signature_marker(sig) {
+                    if let Some(t) = part.get("thinking").and_then(|v| v.as_str()) {
+                        if !t.is_empty() {
+                            content_items.push(json!({"type": "text", "text": t}));
+                        }
+                    }
+                } else if role == "assistant" && should_map_thinking_to_reasoning(part) {
                     if let Some(t) = part.get("thinking").and_then(|v| v.as_str()) {
                         if !t.trim().is_empty() {
                             reasoning_parts.push(t.to_string());
