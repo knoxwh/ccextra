@@ -50,7 +50,8 @@ fn test_gpt_system_goes_to_developer_message() {
     assert_eq!(body["input"][0]["type"], "message");
     assert_eq!(body["input"][0]["role"], "developer");
     let dev_text = body["input"][0]["content"][0]["text"].as_str().unwrap();
-    assert!(dev_text.starts_with("You are Codex, based on GPT-5."));
+    assert!(dev_text.starts_with("You are running as a coding agent inside Claude Code CLI"));
+    assert!(dev_text.contains("You are Codex, based on GPT-5."));
     assert!(dev_text.contains("You are helpful"));
 }
 
@@ -113,6 +114,39 @@ fn test_grok_adapter_block_contains_key_constraints() {
     assert!(GROK_ADAPTER_BLOCK.contains("in complete sentences"));
     assert!(GROK_ADAPTER_BLOCK.contains("NEVER coin acronyms"));
     assert!(GROK_ADAPTER_BLOCK.contains("Always respond in Simplified Chinese"));
+}
+
+#[test]
+fn test_gpt_codex_adapter_block_contains_key_constraints() {
+    assert!(GPT_CODEX_ADAPTER_BLOCK
+        .starts_with("You are running as a coding agent inside Claude Code CLI"));
+    assert!(GPT_CODEX_ADAPTER_BLOCK.contains("tools declared in this request"));
+    assert!(GPT_CODEX_ADAPTER_BLOCK.contains("Always respond in Simplified Chinese"));
+    assert!(GPT_CODEX_ADAPTER_BLOCK.contains("Read / Edit / Write"));
+    assert!(GPT_CODEX_ADAPTER_BLOCK.contains("NEVER use Bash (including echo)"));
+    assert!(GPT_CODEX_ADAPTER_BLOCK.contains("You are Codex, based on GPT-5."));
+    assert!(GPT_CODEX_ADAPTER_BLOCK.contains("## Destructive actions"));
+    assert!(GPT_CODEX_ADAPTER_BLOCK.contains("git reset --hard"));
+    assert!(
+        GPT_CODEX_ADAPTER_BLOCK.contains("Do not infer authorization beyond the current request")
+    );
+    assert!(!GPT_CODEX_ADAPTER_BLOCK.contains("bias towards action"));
+    assert!(!GPT_CODEX_ADAPTER_BLOCK.contains("keep working until their intended goal"));
+}
+
+#[test]
+fn test_gpt6_astra_adapter_block_contains_key_constraints() {
+    assert!(GPT_6_ASTRA_ADAPTER_BLOCK
+        .starts_with("You are running as a coding agent inside Claude Code CLI"));
+    assert!(GPT_6_ASTRA_ADAPTER_BLOCK.contains("You are Codex, an agent based on GPT-6."));
+    assert!(GPT_6_ASTRA_ADAPTER_BLOCK.contains("keep working until their intended goal"));
+    assert!(GPT_6_ASTRA_ADAPTER_BLOCK.contains("acknowledge capability"));
+    assert!(GPT_6_ASTRA_ADAPTER_BLOCK.contains("Compaction does not end the task"));
+    assert!(GPT_6_ASTRA_ADAPTER_BLOCK.contains("X, not Y"));
+    assert!(GPT_6_ASTRA_ADAPTER_BLOCK.contains("skip mirror tests"));
+    assert!(GPT_6_ASTRA_ADAPTER_BLOCK.contains("Read / Edit / Write"));
+    assert!(!GPT_6_ASTRA_ADAPTER_BLOCK.contains("based on GPT-5."));
+    assert!(!GPT_6_ASTRA_ADAPTER_BLOCK.contains("## Destructive actions"));
 }
 
 #[test]
@@ -1140,7 +1174,8 @@ IMPORTANT: Assist with authorized security testing, defensive security, CTF chal
     let dev_text = body["input"][0]["content"][0]["text"].as_str().unwrap();
 
     // adapter 前缀存在
-    assert!(dev_text.starts_with("You are Codex, based on GPT-5."));
+    assert!(dev_text.starts_with("You are running as a coding agent inside Claude Code CLI"));
+    assert!(dev_text.contains("You are Codex, based on GPT-5."));
 
     // 保留的块
     assert!(dev_text.contains("# Memory"));
@@ -1266,7 +1301,17 @@ fn test_gpt_upstream_injects_adapter_block() {
     let input = body["input"].as_array().unwrap();
     assert_eq!(input[0]["role"], "developer");
     let dev_text = input[0]["content"][0]["text"].as_str().unwrap();
-    assert!(dev_text.starts_with("You are Codex, based on GPT-5."));
+    assert!(dev_text.starts_with("You are running as a coding agent inside Claude Code CLI"));
+    assert!(dev_text.contains("You are Codex, based on GPT-5."));
+    assert!(dev_text.contains("tools declared in this request"));
+    assert!(dev_text.contains("Simplified Chinese"));
+    assert!(dev_text.contains("Read / Edit / Write"));
+    assert!(dev_text.contains("NEVER use Bash (including echo)"));
+    assert!(dev_text.contains("## Destructive actions"));
+    assert!(dev_text.contains("git reset --hard"));
+    assert!(dev_text.contains("Do not infer authorization beyond the current request"));
+    assert!(!dev_text.contains("bias towards action"));
+    assert!(!dev_text.contains("easiest 25%"));
     assert!(dev_text.contains("Custom system instructions"));
 }
 
@@ -1283,13 +1328,19 @@ fn test_gpt6_astra_injects_adapter_block() {
     let input = body["input"].as_array().unwrap();
     assert_eq!(input[0]["role"], "developer");
     let dev_text = input[0]["content"][0]["text"].as_str().unwrap();
-    assert!(dev_text.starts_with("You are Codex, an agent based on GPT-6."));
+    assert!(dev_text.starts_with("You are running as a coding agent inside Claude Code CLI"));
+    assert!(dev_text.contains("You are Codex, an agent based on GPT-6."));
     assert!(dev_text.contains("Claude Code CLI"));
+    assert!(dev_text.contains("tools declared in this request"));
+    assert!(dev_text.contains("Simplified Chinese"));
+    assert!(dev_text.contains("Read / Edit / Write"));
+    assert!(dev_text.contains("NEVER use Bash (including echo)"));
     assert!(dev_text.contains("persist across turns"));
-    assert!(dev_text.contains("Do not stop at acknowledging capability"));
+    assert!(dev_text.contains("acknowledge capability"));
+    assert!(dev_text.contains("keep working until their intended goal"));
     assert!(dev_text.contains("Compaction does not end the task"));
     assert!(dev_text.contains("X, not Y"));
-    assert!(dev_text.contains("Read/Edit/Write"));
+    assert!(dev_text.contains("skip mirror tests"));
     assert!(dev_text.contains("Custom system instructions"));
     assert!(!dev_text.contains("based on GPT-5."));
     assert!(!dev_text.contains("functions.exec"));
@@ -1304,7 +1355,8 @@ fn test_gpt6_alias_uses_astra_adapter() {
     });
     convert_to_openai_responses(&mut body, "gpt-6").unwrap();
     let dev_text = body["input"][0]["content"][0]["text"].as_str().unwrap();
-    assert!(dev_text.starts_with("You are Codex, an agent based on GPT-6."));
+    assert!(dev_text.starts_with("You are running as a coding agent inside Claude Code CLI"));
+    assert!(dev_text.contains("You are Codex, an agent based on GPT-6."));
 }
 
 #[test]
@@ -1319,7 +1371,8 @@ fn test_gpt_upstream_adapter_with_empty_system() {
     let input = body["input"].as_array().unwrap();
     assert_eq!(input[0]["role"], "developer");
     let dev_text = input[0]["content"][0]["text"].as_str().unwrap();
-    assert!(dev_text.starts_with("You are Codex"));
+    assert!(dev_text.starts_with("You are running as a coding agent inside Claude Code CLI"));
+    assert!(dev_text.contains("You are Codex, based on GPT-5."));
     // adapter block 本身包含多个 \n\n 分隔的段落，这是正常的
     // 只要不是在末尾追加了额外的 "\n\n" + 空 system 即可
     assert!(!dev_text.ends_with("\n\n"));

@@ -85,6 +85,8 @@ Anthropic `system` 成为 system message；o 系列（`o1-mini`/`o1-preview` 除
 | **Gemini 直连** | 剥离 | 剥离 | 剥离 | 剥离 | 保留 | 转换为 `systemInstruction.parts` |
 | **Antigravity**（含 Claude 模型） | 剥离 | system 前导 Claude 身份句中和为 `You are an AI agent.`，保留后文 | 剥离 | 剥离 | 保留 | 转换为 `request.systemInstruction.parts`；不改 user 内容 |
 
+Responses 的 GPT adapters：`GPT_CODEX_ADAPTER_BLOCK` / `GPT_6_ASTRA_ADAPTER_BLOCK` = 公共段 `CC_LOOP_COMMON`（中文、工具卫生、通信）+ 族段（Codex 偏守含 destructive；Astra 偏做完）；Grok 仍为独立 `GROK_ADAPTER_BLOCK`。仅 Responses 注入，Chat 路径不注。
+
 ## 传输与可靠性
 
 Responses 的最终 body 在 payload 覆盖后、zstd 压缩前序列化，对齐 codex `ed0cc1a4ab`，顶层按 `model`、`stream`、已有 `service_tier` 排在 instructions/input 前，避免增量解析网关先缓冲多 MiB prompt。缺失字段不补，显式值不改；其余顶层键与全部嵌套数据保持原顺序，不克隆大 input。Claude、Chat、Gemini 和 Antigravity 的序列化字节不受影响。
