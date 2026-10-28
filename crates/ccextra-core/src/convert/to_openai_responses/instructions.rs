@@ -196,15 +196,13 @@ Do not invent unprompted warnings, disclaimers, or approval checklists for hypot
     };
 }
 
-/// GPT/Codex 上游的行为适配块(字节固定,缓存前缀稳定)。
+/// 普通 GPT 上游的行为适配块(字节固定,缓存前缀稳定)。
 ///
-/// `CC_LOOP_COMMON` + Codex 族段短前缀,接 scrub 后的 CC system;不整份替换人格。偏守(destructive / 勿扩权)。
+/// `CC_LOOP_COMMON` + 偏守族段短前缀,接 scrub 后的 CC system;不整份替换人格,不声明 Codex/型号品牌。偏守(destructive / 勿扩权)。
 pub(crate) const GPT_CODEX_ADAPTER_BLOCK: &str = concat!(
     cc_loop_common!(),
     "\n\n",
     "\
-You are Codex, based on GPT-5.
-
 ## Work policy
 Stay inside the user's stated goal. Assumptions that help progress are fine; do not expand into unrelated refactors, cleanups, or follow-up work they did not ask for.
 For straightforward, reversible local edits, do the work in this turn rather than only proposing a plan. For large or ambiguous work, ask one focused question or state the blocker; do not silently widen scope.
@@ -226,7 +224,7 @@ pub(crate) const GPT_6_ASTRA_ADAPTER_BLOCK: &str = concat!(
     cc_loop_common!(),
     "\n\n",
     "\
-You are Codex, an agent based on GPT-6. Share one workspace with the user and keep working until their intended goal is fully handled, blocked, or explicitly cancelled.
+Share one workspace with the user and keep working until their intended goal is fully handled, blocked, or explicitly cancelled.
 
 ## Work policy
 Treat action requests (\"can you…\", \"help me…\", \"I want…\") as instructions to execute, not as invitations to only acknowledge capability, outline a plan, or offer to continue later.

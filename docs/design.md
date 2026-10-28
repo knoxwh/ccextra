@@ -85,7 +85,7 @@ Anthropic `system` 成为 system message；o 系列（`o1-mini`/`o1-preview` 除
 | **Gemini 直连** | 剥离 | 剥离 | 剥离 | 剥离 | 保留 | 转换为 `systemInstruction.parts` |
 | **Antigravity**（含 Claude 模型） | 剥离 | system 前导 Claude 身份句中和为 `You are an AI agent.`，保留后文 | 剥离 | 剥离 | 保留 | 转换为 `request.systemInstruction.parts`；不改 user 内容 |
 
-Responses 的 GPT adapters：`GPT_CODEX_ADAPTER_BLOCK` / `GPT_6_ASTRA_ADAPTER_BLOCK` = 公共段 `CC_LOOP_COMMON`（中文、工具卫生、通信）+ 族段（Codex 偏守含 destructive；Astra 偏做完）；Grok 仍为独立 `GROK_ADAPTER_BLOCK`。仅 Responses 注入，Chat 路径不注。
+Responses 的 GPT adapters：`GPT_CODEX_ADAPTER_BLOCK` / `GPT_6_ASTRA_ADAPTER_BLOCK` = 公共段 `CC_LOOP_COMMON`（中文、工具卫生、通信）+ 族段（普通 GPT 偏守含 destructive；Astra 偏做完）；**不声明 Codex / 型号品牌身份**。常量名 `GPT_CODEX_*` 仅为历史命名。Grok 仍为独立 `GROK_ADAPTER_BLOCK`。仅 Responses 注入，Chat 路径不注。
 
 ## 传输与可靠性
 
