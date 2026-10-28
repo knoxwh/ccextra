@@ -842,21 +842,30 @@ impl ResponsesRelay {
         out
     }
 
-    /// EOF 兜底:未收到 Responses 终态时显式报 error,不把半个回答包装成正常完成。
+    /// EOF 兜底:未收到 Responses 终态时显式报 timeout_error(对齐 CPA Claude 408)。
     pub(crate) fn finish(&mut self) -> Vec<Bytes> {
         if self.finished {
             return Vec::new();
         }
         // completed/incomplete 分支必已 finalize 置 finished,到此即残缺
-        self.stream_error("upstream stream ended before response completion")
+        self.stream_timeout_error("upstream stream ended before response completion")
     }
 
-    /// 上游流中断:发 Anthropic error 事件,不伪造 message_start。
+    /// 上游流中断(业务/空 incomplete/doom loop):api_error。
     pub(crate) fn stream_error(&mut self, message: &str) -> Vec<Bytes> {
         if self.finished {
             return Vec::new();
         }
         self.finished = true;
         vec![emit::error_event(message)]
+    }
+
+    /// 传输被掐 / chunk idle:timeout_error(对齐 CPA Claude incomplete stream)。
+    pub(crate) fn stream_timeout_error(&mut self, message: &str) -> Vec<Bytes> {
+        if self.finished {
+            return Vec::new();
+        }
+        self.finished = true;
+        vec![emit::timeout_error_event(message)]
     }
 }

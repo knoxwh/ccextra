@@ -72,14 +72,14 @@ where
             let chunk = match crate::sse::next_upstream_chunk(&mut stream).await {
                 Ok(Some(Ok(c))) => c,
                 Ok(Some(Err(e))) => {
-                    for out in relay.stream_error(&e.to_string()) {
+                    for out in relay.stream_timeout_error(&e.to_string()) {
                         yield Ok(out);
                     }
                     return;
                 }
                 Ok(None) => break,
                 Err(msg) => {
-                    for out in relay.stream_error(msg) {
+                    for out in relay.stream_timeout_error(msg) {
                         yield Ok(out);
                     }
                     return;

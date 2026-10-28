@@ -264,13 +264,13 @@ impl ChatRelay {
         self.finalize()
     }
 
-    /// 上游流中断:发 Anthropic error 事件,不伪造 message_start。
+    /// 上游流中断/残缺 EOF:timeout_error(对齐 CPA Claude 408)。
     fn stream_error(&mut self, message: &str) -> Vec<Bytes> {
         if self.finished {
             return Vec::new();
         }
         self.finished = true;
-        vec![emit::error_event(message)]
+        vec![emit::timeout_error_event(message)]
     }
 
     /// 统一收尾:close active + flush tool calls + message_delta + message_stop
@@ -774,13 +774,13 @@ where
             match crate::sse::next_upstream_chunk(&mut stream).await {
                 Ok(Some(Ok(chunk))) => yield Ok(chunk),
                 Ok(Some(Err(e))) => {
-                    // 读失败发 Anthropic error 事件,避免下游只见 io::Error 断流
-                    yield Ok(crate::sse::emit::error_event(&format!("上游流中断: {e}")));
+                    // 读失败发 timeout_error,避免下游只见 io::Error 断流
+                    yield Ok(crate::sse::emit::timeout_error_event(&format!("上游流中断: {e}")));
                     return;
                 }
                 Ok(None) => return,
                 Err(msg) => {
-                    yield Ok(crate::sse::emit::error_event(msg));
+                    yield Ok(crate::sse::emit::timeout_error_event(msg));
                     return;
                 }
             }
@@ -1414,6 +1414,10 @@ mod tests {
         let s = String::from_utf8_lossy(&buf);
         assert!(s.contains("event: error"), "残缺 EOF 应发 error,实际: {s}");
         assert!(
+            s.contains("\"type\":\"timeout_error\""),
+            "残缺 EOF 应为 timeout_error,实际: {s}"
+        );
+        assert!(
             !s.contains("message_delta"),
             "残缺 EOF 不得发正常 message_delta,实际: {s}"
         );
@@ -1698,5 +1702,9 @@ mod tests {
         let s = String::from_utf8_lossy(err_frame);
         assert!(s.contains("event: error"), "实际: {s}");
         assert!(s.contains("上游流中断"), "实际: {s}");
+        assert!(
+            s.contains("\"type\":\"timeout_error\""),
+            "读失败应为 timeout_error,实际: {s}"
+        );
     }
 }

@@ -139,7 +139,7 @@ pub(crate) async fn read_body_by_status(
     }
 }
 
-/// Messages/count_tokens 成功 body:超限 502、停顿 504(Anthropic api_error),
+/// Messages/count_tokens 成功 body:超限 502(api_error)、停顿 504(timeout_error),
 /// 传输错误维持 500(原 .bytes() 错误语义)
 pub(crate) async fn read_success_body_or_anthropic(
     resp: crate::upstream::UpstreamBody,

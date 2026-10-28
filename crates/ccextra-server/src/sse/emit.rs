@@ -236,7 +236,7 @@ pub fn error_event(message: &str) -> Bytes {
     )
 }
 
-/// error 事件(自定义错误类型,responses 协议专用)
+/// error 事件(自定义错误类型)
 pub fn error_event_typed(err_type: &str, message: &str) -> Bytes {
     sse(
         "error",
@@ -244,9 +244,24 @@ pub fn error_event_typed(err_type: &str, message: &str) -> Bytes {
     )
 }
 
+/// 传输被掐 / chunk idle / 等头超时:对齐 CPA Claude `timeout_error`(408/504)
+pub fn timeout_error_event(message: &str) -> Bytes {
+    error_event_typed("timeout_error", message)
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn test_timeout_error_event_shape() {
+        let frame = timeout_error_event("upstream stream ended before response completion");
+        let s = String::from_utf8_lossy(&frame);
+        assert!(s.starts_with("event: error"));
+        assert!(s.contains("\"type\":\"timeout_error\""));
+        assert!(s.contains("upstream stream ended before response completion"));
+        assert!(!s.contains("\"type\":\"api_error\""));
+    }
 
     #[test]
     fn test_emit_delta_matches_json_serialization() {

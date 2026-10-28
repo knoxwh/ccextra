@@ -15,9 +15,17 @@ pub struct AppError {
 
 impl AppError {
     pub fn new(err: impl Into<anyhow::Error>) -> Self {
+        let err = err.into();
+        // 等响应头 SEND_TIMEOUT:对齐 CPA incomplete/timeout → 408 + timeout_error
+        if is_upstream_send_timeout(&err) {
+            return Self {
+                status: StatusCode::REQUEST_TIMEOUT,
+                err,
+            };
+        }
         Self {
             status: StatusCode::INTERNAL_SERVER_ERROR,
-            err: err.into(),
+            err,
         }
     }
 
@@ -58,6 +66,8 @@ impl IntoResponse for AppError {
             StatusCode::UNAUTHORIZED => "authentication_error",
             StatusCode::NOT_FOUND => "not_found_error",
             StatusCode::UNPROCESSABLE_ENTITY => "invalid_request_error",
+            // 对齐 CPA claudeErrorTypeFromStatus:408/504 → timeout_error
+            StatusCode::REQUEST_TIMEOUT | StatusCode::GATEWAY_TIMEOUT => "timeout_error",
             _ => "api_error",
         };
         let body = json!({
@@ -97,6 +107,11 @@ impl From<reqwest::Error> for AppError {
     fn from(err: reqwest::Error) -> Self {
         Self::new(err)
     }
+}
+
+/// 等响应头 SEND_TIMEOUT 文案(见 upstream::send_with_timeout*)
+fn is_upstream_send_timeout(err: &anyhow::Error) -> bool {
+    err.chain().any(|e| e.to_string().contains("上游请求超时"))
 }
 
 /// 上游错误 body → anthropic 错误形状
@@ -199,5 +214,52 @@ pub fn extract_upstream_error(body: &[u8]) -> (String, String) {
         // message 是普通字符串(二次解析失败或非嵌套)
         Some(Value::String(s)) => (code, s),
         _ => (code, String::new()),
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use axum::body::to_bytes;
+    use axum::response::IntoResponse;
+
+    async fn body_json(resp: axum::response::Response) -> Value {
+        let bytes = to_bytes(resp.into_body(), 1024 * 1024).await.unwrap();
+        serde_json::from_slice(&bytes).unwrap()
+    }
+
+    #[tokio::test]
+    async fn send_timeout_maps_to_408_timeout_error() {
+        let err = AppError::new(anyhow::anyhow!("上游请求超时 (60s)"));
+        let resp = err.into_response();
+        assert_eq!(resp.status(), StatusCode::REQUEST_TIMEOUT);
+        let v = body_json(resp).await;
+        assert_eq!(v["type"], "error");
+        assert_eq!(v["error"]["type"], "timeout_error");
+        assert!(v["error"]["message"]
+            .as_str()
+            .unwrap()
+            .contains("上游请求超时"));
+    }
+
+    #[tokio::test]
+    async fn gateway_timeout_maps_to_timeout_error() {
+        let err = AppError::with_status(
+            StatusCode::GATEWAY_TIMEOUT,
+            "上游响应读取停顿: idle timeout",
+        );
+        let resp = err.into_response();
+        assert_eq!(resp.status(), StatusCode::GATEWAY_TIMEOUT);
+        let v = body_json(resp).await;
+        assert_eq!(v["error"]["type"], "timeout_error");
+    }
+
+    #[tokio::test]
+    async fn plain_500_stays_api_error() {
+        let err = AppError::new(anyhow::anyhow!("构造响应失败: boom"));
+        let resp = err.into_response();
+        assert_eq!(resp.status(), StatusCode::INTERNAL_SERVER_ERROR);
+        let v = body_json(resp).await;
+        assert_eq!(v["error"]["type"], "api_error");
     }
 }

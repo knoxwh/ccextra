@@ -26,7 +26,7 @@ struct GeminiRelayState {
 fn finish_gemini_relay(relay: &mut GeminiRelayState) -> Vec<Bytes> {
     let mut output = Vec::new();
     if !relay.saw_payload || !relay.message_started {
-        output.push(emit::error_event(
+        output.push(emit::timeout_error_event(
             "upstream stream ended before response start",
         ));
         relay.upstream_failed = true;
@@ -249,14 +249,7 @@ where
                         break;
                     }
                     tracing::error!("Gemini 流读取错误: {}", e);
-                    let error_event = serde_json::json!({
-                        "type": "error",
-                        "error": {
-                            "type": "api_error",
-                            "message": format!("上游流中断: {}", e)
-                        }
-                    });
-                    yield Ok(emit::sse("error", &error_event));
+                    yield Ok(emit::timeout_error_event(&format!("上游流中断: {}", e)));
                     relay.upstream_failed = true;
                     break;
                 }
@@ -266,7 +259,7 @@ where
                     if relay.finished {
                         break;
                     }
-                    yield Ok(emit::error_event(msg));
+                    yield Ok(emit::timeout_error_event(msg));
                     relay.upstream_failed = true;
                     break;
                 }

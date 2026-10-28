@@ -603,7 +603,7 @@ fn test_finish_eof_after_completed_keeps_normal() {
 
 #[test]
 fn test_finish_eof_without_completed_errors() {
-    // 残缺流:已发 content delta 但未 completed 就 EOF,显式报 error,不包装成正常收尾
+    // 残缺流:已发 content delta 但未 completed 就 EOF → timeout_error(对齐 CPA Claude 408)
     let mut r = ResponsesRelay::new(None, None);
     r.process(&created());
     r.process(&ev(
@@ -613,6 +613,10 @@ fn test_finish_eof_without_completed_errors() {
     let bufs = out.concat();
     let s = String::from_utf8_lossy(&bufs);
     assert!(s.contains("event: error"), "残缺流应发 error 帧,实际: {s}");
+    assert!(
+        s.contains("\"type\":\"timeout_error\""),
+        "残缺 EOF 应为 timeout_error,实际: {s}"
+    );
     assert!(
         !s.contains("message_delta"),
         "残缺流不得发正常 message_delta,实际: {s}"
@@ -627,12 +631,16 @@ fn test_finish_eof_without_completed_errors() {
 
 #[test]
 fn test_finish_eof_empty_stream_errors() {
-    // 空流:一个事件都没有,EOF 直接报 error
+    // 空流:一个事件都没有,EOF → timeout_error
     let mut r = ResponsesRelay::new(None, None);
     let out = r.finish();
     let bufs = out.concat();
     let s = String::from_utf8_lossy(&bufs);
     assert!(s.contains("event: error"), "空流应发 error 帧,实际: {s}");
+    assert!(
+        s.contains("\"type\":\"timeout_error\""),
+        "空流 EOF 应为 timeout_error,实际: {s}"
+    );
     assert!(
         !s.contains("message_start"),
         "空流不得伪造 message_start,实际: {s}"
@@ -963,6 +971,10 @@ fn test_empty_incomplete_becomes_error() {
     assert_eq!(out.len(), 1);
     let v = frame_data(&out[0]);
     assert_eq!(v["type"], "error");
+    assert_eq!(
+        v["error"]["type"], "api_error",
+        "空 incomplete 维持 api_error(CPA 502),不得改成 timeout_error"
+    );
     assert!(v["error"]["message"]
         .as_str()
         .unwrap()
