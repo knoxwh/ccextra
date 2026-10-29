@@ -27,7 +27,7 @@ pub fn save(auth_dir: &Path, cred: &CodexCredential) -> Result<PathBuf> {
 /// (对齐 CPA FileTokenStore.resolveAuthPath 优先使用 path 属性)
 pub fn save_to(path: &Path, cred: &CodexCredential) -> Result<()> {
     let json = serde_json::to_vec_pretty(cred).context("序列化 Codex 凭证失败")?;
-    oauth_common::write_credential_file(path, &json, "codex", true)
+    oauth_common::write_credential_file(path, &json, "codex")
 }
 
 pub fn load(path: &Path) -> Result<CodexCredential> {

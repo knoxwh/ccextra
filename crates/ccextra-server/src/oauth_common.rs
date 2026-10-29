@@ -53,14 +53,9 @@ fn write_atomic(path: &Path, data: &[u8], tmp_prefix: &str) -> Result<()> {
     result
 }
 
-/// 凭证 JSON 写到指定路径:目录 0700、进程内 path 锁、可选跨进程文件锁
-/// (`{path}.lock`)、临时文件原子替换、文件 0600。
-pub(crate) fn write_credential_file(
-    path: &Path,
-    data: &[u8],
-    tmp_prefix: &str,
-    file_lock: bool,
-) -> Result<()> {
+/// 凭证 JSON 写到指定路径:目录 0700、进程内 path 锁、跨进程文件锁(`{path}.lock`)、
+/// 临时文件原子替换、文件 0600。
+pub(crate) fn write_credential_file(path: &Path, data: &[u8], tmp_prefix: &str) -> Result<()> {
     let auth_dir = path.parent().context("credential path missing parent")?;
     fs::create_dir_all(auth_dir)
         .with_context(|| format!("创建凭证目录失败: {}", auth_dir.display()))?;
@@ -72,28 +67,20 @@ pub(crate) fn write_credential_file(
     let inproc = path_lock(path);
     let _guard = inproc.lock().unwrap_or_else(|p| p.into_inner());
 
-    let lock = if file_lock {
-        let lock_path = PathBuf::from(format!("{}.lock", path.display()));
-        let mut lock = fslock::LockFile::open(&lock_path)
-            .with_context(|| format!("open credential lock {}", lock_path.display()))?;
-        lock.lock()
-            .with_context(|| format!("acquire credential lock {}", lock_path.display()))?;
-        Some((lock, lock_path))
-    } else {
-        None
-    };
+    let lock_path = PathBuf::from(format!("{}.lock", path.display()));
+    let mut file_lock = fslock::LockFile::open(&lock_path)
+        .with_context(|| format!("open credential lock {}", lock_path.display()))?;
+    file_lock
+        .lock()
+        .with_context(|| format!("acquire credential lock {}", lock_path.display()))?;
 
     write_atomic(path, data, tmp_prefix)?;
     #[cfg(unix)]
     {
         let _ = fs::set_permissions(path, fs::Permissions::from_mode(0o600));
-        if let Some((_, lock_path)) = &lock {
-            let _ = fs::set_permissions(lock_path, fs::Permissions::from_mode(0o600));
-        }
+        let _ = fs::set_permissions(&lock_path, fs::Permissions::from_mode(0o600));
     }
-    if let Some((mut lock, _)) = lock {
-        let _ = lock.unlock();
-    }
+    let _ = file_lock.unlock();
     Ok(())
 }
 
@@ -134,17 +121,27 @@ pub(crate) fn sanitize_file_segment(value: &str) -> String {
     out.trim_matches('-').to_string()
 }
 
-static REFRESH_LOCKS: OnceLock<tokio::sync::Mutex<HashMap<String, Arc<tokio::sync::Mutex<()>>>>> =
-    OnceLock::new();
+type RefreshLock = Arc<tokio::sync::Mutex<()>>;
 
-/// 按 refresh_token 单飞的刷新锁(对齐 CPA 按 refresh_token singleflight)
-pub(crate) async fn lock_for_refresh_token(refresh_token: &str) -> Arc<tokio::sync::Mutex<()>> {
-    let key = refresh_token.trim().to_string();
+static REFRESH_LOCKS: OnceLock<tokio::sync::Mutex<HashMap<String, RefreshLock>>> = OnceLock::new();
+
+/// 按 refresh_token 单飞的刷新锁(对齐 CPA conductor_refresh refreshLocks 按凭证串行刷新)
+pub(crate) async fn lock_for_refresh_token(refresh_token: &str) -> RefreshLock {
     let mut map = REFRESH_LOCKS
         .get_or_init(|| tokio::sync::Mutex::new(HashMap::new()))
         .lock()
         .await;
-    map.entry(key)
+    acquire_refresh_lock(&mut map, refresh_token)
+}
+
+/// refresh_token 每次刷新都会轮换,旧 key 不再出现;取锁时顺带清掉
+/// 只剩 map 自身持有(无人持有/等待)的条目,防止表无限增长。
+fn acquire_refresh_lock(
+    map: &mut HashMap<String, RefreshLock>,
+    refresh_token: &str,
+) -> RefreshLock {
+    map.retain(|_, lock| Arc::strong_count(lock) > 1);
+    map.entry(refresh_token.trim().to_string())
         .or_insert_with(|| Arc::new(tokio::sync::Mutex::new(())))
         .clone()
 }
@@ -181,4 +178,37 @@ pub(crate) fn urlencode(value: &str) -> String {
         }
     }
     out
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn refresh_lock_shared_while_held_and_pruned_when_idle() {
+        let mut map = HashMap::new();
+        let a1 = acquire_refresh_lock(&mut map, " rt-a ");
+        let a2 = acquire_refresh_lock(&mut map, "rt-a");
+        assert!(Arc::ptr_eq(&a1, &a2), "同一 refresh_token 共用一把锁");
+        drop(a1);
+        drop(a2);
+        let _b = acquire_refresh_lock(&mut map, "rt-b");
+        assert_eq!(map.len(), 1, "无人持有的旧 token 锁被清理");
+        assert!(map.contains_key("rt-b"));
+    }
+
+    #[test]
+    fn write_credential_file_creates_lock_file_and_restricts_permissions() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("sub").join("antigravity-a.json");
+        write_credential_file(&path, b"{}", "antigravity").unwrap();
+        assert_eq!(fs::read(&path).unwrap(), b"{}");
+        assert!(PathBuf::from(format!("{}.lock", path.display())).exists());
+        #[cfg(unix)]
+        {
+            let mode = |p: &Path| fs::metadata(p).unwrap().permissions().mode() & 0o777;
+            assert_eq!(mode(path.parent().unwrap()), 0o700);
+            assert_eq!(mode(&path), 0o600);
+        }
+    }
 }

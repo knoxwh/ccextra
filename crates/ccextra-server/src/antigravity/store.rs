@@ -54,7 +54,7 @@ pub fn save(dir: &Path, cred: &AntigravityCredential) -> Result<PathBuf> {
 /// (对齐 CPA FileTokenStore.resolveAuthPath 优先使用 path 属性)
 pub fn save_to(path: &Path, cred: &AntigravityCredential) -> Result<()> {
     let raw = serde_json::to_vec(cred).context("serialize antigravity credential")?;
-    oauth_common::write_credential_file(path, &raw, "antigravity", false)
+    oauth_common::write_credential_file(path, &raw, "antigravity")
 }
 
 /// 列出目录下 `antigravity*.json`(忽略坏文件和 client_id 不匹配的凭证)
