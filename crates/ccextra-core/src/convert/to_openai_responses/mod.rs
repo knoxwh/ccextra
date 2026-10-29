@@ -31,6 +31,8 @@ use std::collections::{HashMap, HashSet};
 
 use crate::convert::shorten::{build_short_name_map, shorten_name_if_needed};
 use crate::convert::signature::is_codex_commentary_signature_marker;
+use crate::convert::system_reminder_text;
+use crate::convert::tool_id::shorten_call_id;
 use crate::convert::Result;
 
 pub use instructions::{
@@ -153,8 +155,7 @@ pub fn convert_to_openai_responses_with(
             // role=system 消息:reminder 文本 → user message(对齐 ClaudeMessageSystemReminderText)
             // 当存在未应答 tool_use 时暂存 reminder,保持 tool 调用紧邻配对
             if role == "system" {
-                if let Some(text) = claude_system_reminder_text(msg.get("content"), upstream_model)
-                {
+                if let Some(text) = system_reminder_text(msg.get("content"), upstream_model) {
                     let reminder_msg = json!({
                         "type": "message",
                         "role": "user",

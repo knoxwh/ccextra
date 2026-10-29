@@ -347,37 +347,3 @@ pub(crate) fn system_to_instructions_text(system: &Value, upstream_model: &str) 
     }
     texts.join("\n\n")
 }
-
-/// role=system 消息的 reminder 文本(对齐 ClaudeMessageSystemReminderText)
-pub(crate) fn claude_system_reminder_text(
-    content: Option<&Value>,
-    upstream_model: &str,
-) -> Option<String> {
-    let parts: Vec<String> = match content {
-        Some(Value::String(s)) => {
-            let s = strip_attribution_line(s);
-            if !is_ignorable_system_text(s, upstream_model) {
-                vec![s.trim().to_string()]
-            } else {
-                Vec::new()
-            }
-        }
-        Some(Value::Array(items)) => items
-            .iter()
-            .filter(|i| i.get("type").and_then(|v| v.as_str()) == Some("text"))
-            .filter_map(|i| i.get("text").and_then(|v| v.as_str()))
-            .map(strip_attribution_line)
-            .filter(|t| !is_ignorable_system_text(t, upstream_model))
-            .map(|t| t.trim().to_string())
-            .collect(),
-        _ => Vec::new(),
-    };
-    if parts.is_empty() {
-        return None;
-    }
-    let text = parts.join("\n");
-    if text.trim().is_empty() {
-        return None;
-    }
-    Some(format!("<system-reminder>\n{text}\n</system-reminder>"))
-}

@@ -38,28 +38,12 @@ fn comparable_call_ids(call_id: &str) -> Vec<String> {
     if call_id.is_empty() {
         return Vec::new();
     }
-    let claude_visible = shorten_call_id(&super::tool_id::sanitize_claude_tool_id(call_id));
+    let claude_visible =
+        super::tool_id::shorten_call_id(&super::tool_id::sanitize_claude_tool_id(call_id));
     if claude_visible.is_empty() || claude_visible == call_id {
         return vec![call_id.to_string()];
     }
     vec![call_id.to_string(), claude_visible]
-}
-
-/// call_id 超 64 字符确定性截短(对齐 shortenCodexReplayCallIDIfNeeded,
-// 与 to_openai_responses::shorten_call_id 同算法)
-fn shorten_call_id(id: &str) -> String {
-    const LIMIT: usize = 64;
-    if id.len() <= LIMIT {
-        return id.to_string();
-    }
-    use sha2::{Digest, Sha256};
-    let digest = Sha256::digest(id.as_bytes());
-    let suffix = format!("_{}", hex::encode(&digest[..8]));
-    let mut prefix_len = LIMIT.saturating_sub(suffix.len());
-    while prefix_len > 0 && !id.is_char_boundary(prefix_len) {
-        prefix_len -= 1;
-    }
-    format!("{}{}", &id[..prefix_len], suffix)
 }
 
 /// 工具调用项的判重键(对齐 codexReplayToolCallKeys):`{type}:{call_id}`

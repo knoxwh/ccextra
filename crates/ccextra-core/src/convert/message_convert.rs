@@ -4,7 +4,6 @@ use serde_json::{json, Value};
 use std::collections::HashMap;
 
 use super::antigravity_tools::antigravity_tool_name_to_upstream;
-use super::is_ignorable_system_text;
 use super::signature::{
     is_codex_commentary_signature_marker, resolve_thinking_signature,
     resolve_tool_use_thought_signature, signature_provider_from_model_name, SignatureProvider,
@@ -60,7 +59,9 @@ pub fn convert_messages(
         // system 消息 → user 角色的 system-reminder 文本(对齐 ClaudeMessageSystemReminderText)
         // 遇到 system 消息时不清除 pending_tool_use_ids,保持 tool 调用配对
         if role == "system" {
-            if let Some(reminder) = system_reminder_text(&msg["content"], upstream_model) {
+            if let Some(reminder) =
+                super::system_reminder_text(Some(&msg["content"]), upstream_model)
+            {
                 contents.push(json!({
                     "role": "user",
                     "parts": [{ "text": reminder }]
@@ -375,39 +376,6 @@ pub(crate) fn align_tool_results(content: &Value, preceding_tool_use_ids: &[Stri
         ordered[slot] = result;
     }
     Value::Array(ordered)
-}
-
-/// 提取 system 消息文本并包成 <system-reminder>...</system-reminder>
-/// 空文本、attribution 文本与非 Claude 目标身份声明跳过;无有效内容返回 None
-fn system_reminder_text(content: &Value, upstream_model: &str) -> Option<String> {
-    let mut parts: Vec<&str> = Vec::new();
-    match content {
-        Value::String(s) => {
-            let s = super::strip_attribution_line(s);
-            if !is_ignorable_system_text(s, upstream_model) {
-                parts.push(s.trim());
-            }
-        }
-        Value::Array(arr) => {
-            for item in arr {
-                if item.get("type").and_then(|t| t.as_str()) != Some("text") {
-                    continue;
-                }
-                if let Some(text) = item.get("text").and_then(|t| t.as_str()) {
-                    let text = super::strip_attribution_line(text);
-                    if !is_ignorable_system_text(text, upstream_model) {
-                        parts.push(text.trim());
-                    }
-                }
-            }
-        }
-        _ => return None,
-    }
-    let joined = parts.join("\n");
-    if joined.trim().is_empty() {
-        return None;
-    }
-    Some(format!("<system-reminder>\n{}\n</system-reminder>", joined))
 }
 
 /// 转换 content 为 Gemini parts

@@ -190,19 +190,3 @@ pub(crate) fn unwrap_custom_tool_input(input: Option<&Value>) -> String {
         _ => String::new(),
     }
 }
-
-/// call_id 超 64 字符确定性截短(对齐 shortenCodexCallIDIfNeeded)
-pub(crate) fn shorten_call_id(id: &str) -> String {
-    const LIMIT: usize = 64;
-    if id.len() <= LIMIT {
-        return id.to_string();
-    }
-    use sha2::{Digest, Sha256};
-    let digest = Sha256::digest(id.as_bytes());
-    let suffix = format!("_{}", hex::encode(&digest[..8]));
-    let mut prefix_len = LIMIT.saturating_sub(suffix.len());
-    while prefix_len > 0 && !id.is_char_boundary(prefix_len) {
-        prefix_len -= 1;
-    }
-    format!("{}{}", &id[..prefix_len], suffix)
-}

@@ -169,7 +169,8 @@ pub fn convert_to_openai_chat_with(
             // messages 内 role=system:提取文本包 <system-reminder> 转 user
             // 当存在未应答 tool_use 时暂存 reminder,保持 tool 调用紧邻配对
             if role == "system" {
-                if let Some(reminder) = system_reminder_text(&content, upstream_model) {
+                if let Some(reminder) = super::system_reminder_text(Some(&content), upstream_model)
+                {
                     let reminder_msg = json!({
                         "role": "user",
                         "content": [{"type": "text", "text": reminder}]
@@ -513,44 +514,6 @@ fn is_date_only(s: &str) -> bool {
         _ => return false,
     };
     day >= 1 && day <= max_day
-}
-
-/// messages 内 role=system 消息 → 文本提取,包 <system-reminder> 标记
-/// (对齐 common.ClaudeMessageSystemReminderText)。
-fn system_reminder_text(content: &Value, upstream_model: &str) -> Option<String> {
-    let parts: Vec<&str> = match content {
-        Value::String(s) => {
-            let s = super::strip_attribution_line(s);
-            if super::is_ignorable_system_text(s, upstream_model) {
-                return None;
-            }
-            vec![s.trim()]
-        }
-        Value::Array(blocks) => blocks
-            .iter()
-            .filter_map(|b| {
-                if b.get("type").and_then(|t| t.as_str()) != Some("text") {
-                    return None;
-                }
-                let t = b.get("text").and_then(|v| v.as_str())?;
-                let t = super::strip_attribution_line(t);
-                if super::is_ignorable_system_text(t, upstream_model) {
-                    None
-                } else {
-                    Some(t.trim())
-                }
-            })
-            .collect(),
-        _ => return None,
-    };
-    if parts.is_empty() {
-        return None;
-    }
-    let text = parts.join("\n");
-    if text.trim().is_empty() {
-        return None;
-    }
-    Some(format!("<system-reminder>\n{text}\n</system-reminder>"))
 }
 
 /// 对齐 CPA `shouldMapClaudeThinkingToGPTReasoning` 默认路径。

@@ -151,6 +151,22 @@ pub fn is_gemini_claude_tool_use_id(id: &str) -> bool {
     digest.len() == 32 && digest.bytes().all(|b| b.is_ascii_hexdigit())
 }
 
+/// call_id 超 64 字符确定性截短:保留前缀 + `_` + sha256 前 8 字节 hex,总长 ≤ 64
+/// (对齐 CPA shortenCodexCallIDIfNeeded / shortenCodexReplayCallIDIfNeeded,两处同算法)
+pub(crate) fn shorten_call_id(id: &str) -> String {
+    const LIMIT: usize = 64;
+    if id.len() <= LIMIT {
+        return id.to_string();
+    }
+    let digest = Sha256::digest(id.as_bytes());
+    let suffix = format!("_{}", hex::encode(&digest[..8]));
+    let mut prefix_len = LIMIT.saturating_sub(suffix.len());
+    while prefix_len > 0 && !id.is_char_boundary(prefix_len) {
+        prefix_len -= 1;
+    }
+    format!("{}{}", &id[..prefix_len], suffix)
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
