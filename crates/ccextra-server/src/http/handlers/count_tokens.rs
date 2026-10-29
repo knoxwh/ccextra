@@ -4,7 +4,7 @@ use axum::{
     http::{header, HeaderMap, StatusCode},
     response::Response,
 };
-use ccextra_core::route::{resolve_route, Protocol, ProviderConfig};
+use ccextra_core::route::{resolve_route, Protocol};
 use ccextra_core::session::extract_claude_code_session;
 use serde_json::Value;
 
@@ -14,10 +14,6 @@ use crate::http::claude_relay::{
 };
 use crate::http::error::AppError;
 use crate::http::AppState;
-
-fn find_provider<'a>(providers: &'a [ProviderConfig], name: &str) -> Option<&'a ProviderConfig> {
-    providers.iter().find(|p| p.name == name)
-}
 
 /// POST /v1/messages/count_tokens(带 secret 认证)
 ///
@@ -55,7 +51,8 @@ pub async fn handle_count_tokens(
 
     // Claude 协议:转发上游
     if route.protocol == Protocol::Claude {
-        let provider = find_provider(providers, &route.provider)
+        let provider = route
+            .provider_config(providers)
             .ok_or_else(|| AppError::new(anyhow::anyhow!("provider 未找到")))?;
         let base_url = provider.base_urls().first().cloned().ok_or_else(|| {
             AppError::new(anyhow::anyhow!(

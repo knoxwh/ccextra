@@ -20,7 +20,7 @@ use ccextra_core::normalize::{
     normalize_anthropic_full, normalize_anthropic_pretransform, normalize_target_post, TargetShape,
 };
 use ccextra_core::prompt_cache::inject_prompt_cache_key;
-use ccextra_core::route::{resolve_route, Protocol, ProviderConfig};
+use ccextra_core::route::{resolve_route, Protocol};
 use ccextra_core::session::{
     extract_claude_code_agent_id, extract_claude_code_session, extract_claude_code_thread,
 };
@@ -45,14 +45,6 @@ use crate::upstream::{is_gpt_model, is_grok_model, UpstreamResponse};
 
 /// 诊断日志请求序号:与毫秒时间戳组合,避免并发请求覆盖同一文件。
 static UPSTREAM_LOG_SEQUENCE: AtomicU64 = AtomicU64::new(0);
-
-/// 按 provider 名查找 provider 配置
-pub(crate) fn find_provider<'a>(
-    providers: &'a [ProviderConfig],
-    name: &str,
-) -> Option<&'a ProviderConfig> {
-    providers.iter().find(|p| p.name == name)
-}
 
 /// 解析 payload 后最终模型。仅 OpenAI 的无效覆盖回退路由模型并同步写回 body,
 /// 确保 Grok 判定与 UpstreamClient 读取的 model 一致；其余协议保留 payload 原语义。
@@ -593,7 +585,7 @@ pub(crate) async fn prepare_message_request(
                 });
             }
             let project_id = {
-                let provider = find_provider(providers, &route.provider);
+                let provider = route.provider_config(providers);
                 provider
                     .and_then(|p| p.metadata.as_ref())
                     .and_then(|m| m.get("project_id"))
@@ -784,7 +776,8 @@ pub(crate) async fn prepare_message_request(
         codex_refresh,
         claude_refresh,
     ) = {
-        let provider = find_provider(providers, &route.provider)
+        let provider = route
+            .provider_config(providers)
             .ok_or_else(|| AppError::new(anyhow::anyhow!("provider 未找到: {}", route.provider)))?;
         let meta = provider.metadata.as_ref();
         let pool_refresh_token = if matches!(route.protocol, Protocol::Antigravity) {
@@ -1951,6 +1944,7 @@ mod tests {
         PreparedMessageRequest {
             route: ccextra_core::route::RouteDecision {
                 provider: "codex".into(),
+                provider_index: 0,
                 protocol: Protocol::OpenAiResponses,
                 upstream_model: "gpt-test".into(),
             },

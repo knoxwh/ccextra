@@ -125,7 +125,7 @@ curl -H "Authorization: Bearer $ANTHROPIC_AUTH_TOKEN" http://127.0.0.1:8222/v1/m
 
 | 项 | 说明 |
 | :--- | :--- |
-| `models[].alias` | 入站模型名，不可跨 provider 重复，也不可与其他模型的 `name` 撞车；`base_url` 可为回退数组 |
+| `models[].alias` | 入站模型名，全局唯一（跨 provider 与同 provider 内均不可重复），可等于其他模型的 `name`；`base_url` 可为回退数组 |
 | `server.proxy_url` / provider `proxy_url` | 后者覆盖前者；`"direct"` = 直连 |
 | `secret_key` | 入口鉴权；加载时 bcrypt 写回；请求用 `x-api-key` 或 `Bearer` |
 | `payload` | 按模型 glob 覆盖顶层参数，可用 `protocol` 限定 |

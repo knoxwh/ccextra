@@ -17,9 +17,23 @@ pub enum Protocol {
 
 #[derive(Debug, Clone)]
 pub struct RouteDecision {
+    /// provider 名(日志 / unfit 登记等);name 允许重复,取配置请用 [`RouteDecision::provider_config`]
     pub provider: String,
+    /// 命中 provider 在同一 providers 快照中的下标
+    /// (对齐 CPA pickNext 直接返回选中的 *Auth,不按名二次查找)
+    pub provider_index: usize,
     pub protocol: Protocol,
     pub upstream_model: String,
+}
+
+impl RouteDecision {
+    /// 取命中的 provider 配置;`providers` 须为 [`resolve_route`] 使用的同一快照
+    pub fn provider_config<'a>(
+        &self,
+        providers: &'a [ProviderConfig],
+    ) -> Option<&'a ProviderConfig> {
+        providers.get(self.provider_index)
+    }
 }
 
 #[derive(Debug, Error)]
@@ -27,7 +41,7 @@ pub enum RouteError {
     #[error("模型未找到: {0}")]
     ModelNotFound(String),
 
-    #[error("模型别名冲突: {0} 在多个 provider 中定义")]
+    #[error("模型别名冲突: {0} 重复定义")]
     AliasConflict(String),
 
     #[error("provider {0} 未配置 base_url")]
@@ -153,45 +167,40 @@ pub struct ModelConfig {
 
 /// 路由决策:从入站 model 解析到 (provider, protocol, upstream_model)
 ///
-/// 启动时由 [`validate_providers`] 保证跨 provider alias 唯一。
-/// name 允许重复;alias 可等于其他模型的 name(自身 alias==name 也允许)。
+/// 启动时由 [`validate_providers`] 保证 alias 全局唯一。
+/// provider name 允许重复;alias 可等于其他模型的 name(自身 alias==name 也允许)。
 pub fn resolve_route(
     inbound_model: &str,
     providers: &[ProviderConfig],
 ) -> Result<RouteDecision, RouteError> {
     // alias 优先(Claude Code 主对话发别名);name 兜底(部分内部门如
     // count_tokens 发上游裸名)
-    for provider in providers {
-        for model in &provider.models {
-            if model.alias == inbound_model {
-                return Ok(RouteDecision {
-                    provider: provider.name.clone(),
-                    protocol: provider.protocol,
-                    upstream_model: model.name.clone(),
-                });
-            }
-        }
-    }
-    for provider in providers {
-        for model in &provider.models {
-            if model.name == inbound_model {
-                return Ok(RouteDecision {
-                    provider: provider.name.clone(),
-                    protocol: provider.protocol,
-                    upstream_model: model.name.clone(),
-                });
-            }
-        }
-    }
-
-    Err(RouteError::ModelNotFound(inbound_model.to_string()))
+    find_route(providers, |m| m.alias == inbound_model)
+        .or_else(|| find_route(providers, |m| m.name == inbound_model))
+        .ok_or_else(|| RouteError::ModelNotFound(inbound_model.to_string()))
 }
 
-/// 启动时验证配置:检查跨 provider alias 冲突与空 base_url
-pub fn validate_providers(providers: &[ProviderConfig]) -> Result<(), RouteError> {
-    use std::collections::HashMap;
+fn find_route(
+    providers: &[ProviderConfig],
+    matches: impl Fn(&ModelConfig) -> bool,
+) -> Option<RouteDecision> {
+    providers
+        .iter()
+        .enumerate()
+        .find_map(|(provider_index, provider)| {
+            let model = provider.models.iter().find(|m| matches(m))?;
+            Some(RouteDecision {
+                provider: provider.name.clone(),
+                provider_index,
+                protocol: provider.protocol,
+                upstream_model: model.name.clone(),
+            })
+        })
+}
 
-    let mut alias_map: HashMap<&str, &str> = HashMap::new();
+/// 启动时验证配置:检查 alias 全局唯一(跨 provider 与同 provider 内)与空 base_url
+pub fn validate_providers(providers: &[ProviderConfig]) -> Result<(), RouteError> {
+    let mut aliases: std::collections::HashSet<&str> = std::collections::HashSet::new();
 
     for provider in providers {
         // base_url: [] 会在热路径索引越界/panic;允许 base_url: ""(部分动态 provider 占位)
@@ -199,12 +208,9 @@ pub fn validate_providers(providers: &[ProviderConfig]) -> Result<(), RouteError
             return Err(RouteError::EmptyBaseUrl(provider.name.clone()));
         }
         for model in &provider.models {
-            if let Some(existing_provider) = alias_map.get(model.alias.as_str()) {
-                if existing_provider != &provider.name.as_str() {
-                    return Err(RouteError::AliasConflict(model.alias.clone()));
-                }
+            if !aliases.insert(model.alias.as_str()) {
+                return Err(RouteError::AliasConflict(model.alias.clone()));
             }
-            alias_map.insert(&model.alias, &provider.name);
         }
     }
 
@@ -399,6 +405,72 @@ models:
 "#;
         let providers: Vec<ProviderConfig> = yaml_serde::from_str(yaml).unwrap();
         validate_providers(&providers).unwrap();
+    }
+
+    #[test]
+    fn test_duplicate_alias_rejected_within_and_across_same_name_providers() {
+        let within = r#"
+- name: p
+  protocol: claude
+  base_url: "https://a.com"
+  key: sk-a
+  models:
+    - name: m1
+      alias: dup
+    - name: m2
+      alias: dup
+"#;
+        let across = r#"
+- name: same
+  protocol: claude
+  base_url: "https://a.com"
+  key: sk-a
+  models:
+    - name: m1
+      alias: dup
+- name: same
+  protocol: claude
+  base_url: "https://b.com"
+  key: sk-b
+  models:
+    - name: m2
+      alias: dup
+"#;
+        for yaml in [within, across] {
+            let providers: Vec<ProviderConfig> = yaml_serde::from_str(yaml).unwrap();
+            let err = validate_providers(&providers).unwrap_err();
+            assert!(matches!(err, RouteError::AliasConflict(_)));
+        }
+    }
+
+    #[test]
+    fn test_duplicate_provider_name_routes_to_matched_provider() {
+        let yaml = r#"
+- name: dup
+  protocol: claude
+  base_url: "https://a.com"
+  key: sk-a
+  models:
+    - name: m-a
+      alias: a1
+- name: dup
+  protocol: claude
+  base_url: "https://b.com"
+  key: sk-b
+  models:
+    - name: m-b
+      alias: b1
+"#;
+        let providers: Vec<ProviderConfig> = yaml_serde::from_str(yaml).unwrap();
+        validate_providers(&providers).unwrap();
+        let route = resolve_route("b1", &providers).unwrap();
+        assert_eq!(route.provider_index, 1);
+        let provider = route.provider_config(&providers).unwrap();
+        assert_eq!(provider.base_urls()[0], "https://b.com");
+        assert_eq!(provider.key, "sk-b");
+        // name 兜底同样带下标
+        let by_name = resolve_route("m-b", &providers).unwrap();
+        assert_eq!(by_name.provider_index, 1);
     }
 
     #[test]
