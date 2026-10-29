@@ -1155,7 +1155,7 @@ fn insert_missing_function_call(
                 if sig.is_empty() && !parts.iter().any(|p| p.get("functionCall").is_some()) {
                     GEMINI_SKIP_THOUGHT_SIGNATURE_VALIDATOR.to_string()
                 } else {
-                    sig.clone()
+                    sig
                 };
             parts.push(inserted_function_call_part(
                 &name,
@@ -2098,7 +2098,7 @@ impl AgReplayAccumulator {
                     .iter()
                     .any(|(sig, kind)| *kind == target_kind && *sig != signature)
                 {
-                    self.flush_pending_for_kind(&target_kind.clone());
+                    self.flush_pending_for_kind(&target_kind);
                 }
             }
             if self.last_response_kind != target_kind

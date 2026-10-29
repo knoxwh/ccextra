@@ -681,18 +681,10 @@ impl UpstreamClient {
             .remove(&key);
     }
 
-    /// 发起上游请求,返回原始响应(字节或流由调用方决定)
-    ///
-    /// - `is_stream`:chat 链路流式时补 `Accept: text/event-stream` /
-    ///   `Cache-Control: no-cache`
-    /// - `session_id`:responses 链路发 `session-id` 头(对齐 cacheHelper,
-    ///   值为 prompt_cache_key,上游按它做缓存亲和);grok 模型(chat/responses)
-    ///   发 `x-grok-conv-id` 会话路由头(xAI 服务器缓存亲和)
-    /// - `extra_headers`:Claude 直通为 [`crate::http::claude_passthrough_headers`] 最小透传头
-    /// - `inbound_user_agent`:Claude 协议优先使用入站值,缺失时回退配置值
-    /// - `query`:入站 URI query(不含 `?`);仅 Claude 直通接到 `/v1/messages`
+    /// 测试入口:自行编码 body 后委托 [`Self::request_encoded`]
+    #[cfg(test)]
     #[allow(clippy::too_many_arguments)]
-    pub async fn request(
+    pub(crate) async fn request(
         &self,
         base_url: &str,
         api_key: &str,
@@ -708,7 +700,6 @@ impl UpstreamClient {
         pool_refresh_token: Option<&str>,
         query: Option<&str>,
     ) -> anyhow::Result<UpstreamResponse> {
-        // 测试与外部入口:自行编码一次后再走 request_encoded
         let compress = extra_headers.contains_key("chatgpt-account-id");
         let body_bytes = encode_request_body(protocol, body, compress).await?;
         self.request_encoded(
@@ -730,7 +721,18 @@ impl UpstreamClient {
         .await
     }
 
-    /// 使用已编码(及可选已压缩)的 body 字节发上游;URL 轮转与业务重试应复用同一份。
+    /// 发起上游请求,返回原始响应(字节或流由调用方决定)
+    ///
+    /// 使用已编码(及可选已压缩)的 body 字节;URL 轮转与业务重试应复用同一份。
+    ///
+    /// - `is_stream`:chat 链路流式时补 `Accept: text/event-stream` /
+    ///   `Cache-Control: no-cache`
+    /// - `session_id`:responses 链路发 `session-id` 头(对齐 cacheHelper,
+    ///   值为 prompt_cache_key,上游按它做缓存亲和);grok 模型(chat/responses)
+    ///   发 `x-grok-conv-id` 会话路由头(xAI 服务器缓存亲和)
+    /// - `extra_headers`:Claude 直通为 [`crate::http::claude_passthrough_headers`] 最小透传头
+    /// - `inbound_user_agent`:Claude 协议优先使用入站值,缺失时回退配置值
+    /// - `query`:入站 URI query(不含 `?`);仅 Claude 直通接到 `/v1/messages`
     #[allow(clippy::too_many_arguments)]
     pub(crate) async fn request_encoded(
         &self,

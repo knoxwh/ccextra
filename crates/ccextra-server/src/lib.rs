@@ -6,7 +6,6 @@ pub mod claude_tls_fp;
 pub mod codex;
 pub mod http;
 pub mod jwt;
-pub mod oauth;
 pub mod sse;
 pub mod upstream;
 pub mod xai;

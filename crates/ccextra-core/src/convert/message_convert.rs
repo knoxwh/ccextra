@@ -602,7 +602,7 @@ fn append_block_parts(
             let upstream_func_name = if antigravity {
                 antigravity_tool_name_to_upstream(&func_name)
             } else {
-                func_name.clone()
+                func_name
             };
 
             // 对齐 CPA fixCLIToolResponse 归一化:Antigravity 把工具图嵌进

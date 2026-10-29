@@ -241,7 +241,7 @@ pub fn responses_to_anthropic(
 
     let stop_reason = map_stop_reason(&codex_stop_reason(response), has_tool_use);
     let stop_seq = stop_sequence(response);
-    build_message(
+    Some(build_message(
         response,
         content,
         &stop_reason,
@@ -251,7 +251,7 @@ pub fn responses_to_anthropic(
         cached,
         cache_write,
         thinking_tokens,
-    )
+    ))
 }
 
 /// 终态响应对象上的 doom_loop_check 置信检查(对齐 grok-build is_confident)
@@ -401,7 +401,7 @@ pub fn openai_chat_to_anthropic(body: &Value) -> Option<Value> {
     }
 
     let stop_reason = map_nonstream_finish_reason(finish_reason, has_tool_use);
-    build_message(
+    Some(build_message(
         body,
         content,
         stop_reason,
@@ -411,7 +411,7 @@ pub fn openai_chat_to_anthropic(body: &Value) -> Option<Value> {
         cached,
         cache_write,
         -1, // chat 路径无 thinking_tokens
-    )
+    ))
 }
 
 /// 非流式 stop_reason(对齐 CPA c449529e mapOpenAINonStreamFinishReasonToAnthropic):
@@ -436,7 +436,7 @@ fn build_message(
     cached: i64,
     cache_write: i64,
     thinking_tokens: i64,
-) -> Option<Value> {
+) -> Value {
     let mut out = json!({
         "id": source.get("id").and_then(|v| v.as_str()).unwrap_or(""),
         "type": "message",
@@ -457,7 +457,7 @@ fn build_message(
     if thinking_tokens >= 0 {
         out["usage"]["output_tokens_details"] = json!({"thinking_tokens": thinking_tokens});
     }
-    Some(out)
+    out
 }
 
 /// reasoning_content:字符串 / 对象 {text} / 数组(对齐 collectOpenAIReasoningTexts)

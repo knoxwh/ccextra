@@ -52,21 +52,9 @@ pub async fn reload_now(state: &AppState) -> Result<ReloadResult, AppError> {
         }
     };
 
-    // 3. 构建 runtime 配置(失败则整体回滚，不更新任何配置)
-    let runtime = match build_runtime_config(&data) {
-        Ok(r) => {
-            result.reloaded.push("runtime".into());
-            r
-        }
-        Err(e) => {
-            result.failed.push(ReloadError {
-                component: "runtime".into(),
-                reason: e.to_string(),
-            });
-            tracing::warn!("runtime 配置构建失败，回滚整个 reload: {e}");
-            return Ok(result);
-        }
-    };
+    // 3. 构建 runtime 配置(纯字段拷贝，不会失败)
+    let runtime = build_runtime_config(&data);
+    result.reloaded.push("runtime".into());
 
     // providers 校验失败但 runtime 成功时，仍不更新配置
     if !providers_valid {
@@ -115,14 +103,14 @@ pub async fn handle_reload(State(state): State<AppState>) -> Result<Json<ReloadR
     Ok(Json(reload_now(&state).await?))
 }
 
-/// 构建 runtime 配置(独立函数便于错误处理)
-fn build_runtime_config(data: &crate::http::ReloadData) -> anyhow::Result<RuntimeConfig> {
-    Ok(RuntimeConfig {
+/// 构建 runtime 配置
+fn build_runtime_config(data: &crate::http::ReloadData) -> RuntimeConfig {
+    RuntimeConfig {
         normalize: data.normalize.clone(),
         logging: data.logging.clone(),
         secret: data.secret.clone(),
         upstream: UpstreamClient::with_ant_pool(data.proxy_url.clone(), data.antigravity.as_ref()),
         user_agents: data.user_agents.clone(),
         thinking_registry: data.thinking_registry.clone(),
-    })
+    }
 }

@@ -607,7 +607,7 @@ impl ResponsesRelay {
                     };
                     let call = &mut self.function_call_queue[i];
                     if !call.has_received_arguments_delta || args.starts_with(&call.arguments) {
-                        call.arguments = args.to_string();
+                        call.arguments = args;
                     }
                     call.done = true;
                 }

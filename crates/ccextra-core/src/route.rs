@@ -65,7 +65,6 @@ pub struct ProviderConfig {
     /// 仅 openai_chat / openai_responses 生效)
     #[serde(default)]
     pub prompt_cache_key: bool,
-    #[serde(serialize_with = "serialize_nonempty_vec")]
     pub models: Vec<ModelConfig>,
     /// 额外元数据(用于 Antigravity 的 project_id 等)
     #[serde(default, skip_serializing_if = "Option::is_none")]
@@ -142,16 +141,6 @@ where
     } else {
         urls.serialize(serializer)
     }
-}
-
-/// 空数组规范化:输出 [] 不是 null(对齐 magpie orNone)
-fn serialize_nonempty_vec<T, S>(vec: &[T], serializer: S) -> Result<S::Ok, S::Error>
-where
-    T: Serialize,
-    S: serde::Serializer,
-{
-    use serde::Serialize;
-    vec.serialize(serializer)
 }
 
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize, Default)]

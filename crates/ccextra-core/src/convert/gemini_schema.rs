@@ -1935,7 +1935,7 @@ fn repair_schema_node(
     node: Map<String, Value>,
     add_missing_array_items: bool,
 ) -> (Map<String, Value>, bool) {
-    let mut clone = node.clone();
+    let mut clone = node;
     let mut modified = false;
     let mut skip_step2 = false; // Step 1 处理了 bare properties 后跳过 Step 2
 
