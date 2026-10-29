@@ -3,7 +3,8 @@
 use super::credential::{parse_jwt_identity, XAICredential};
 use super::oauth::{http_client, poll_for_token, start_device_flow};
 use super::store;
-use anyhow::{anyhow, Context, Result};
+use crate::oauth_common::open_browser;
+use anyhow::Result;
 use std::path::PathBuf;
 
 #[derive(Debug, Clone)]
@@ -114,16 +115,4 @@ pub async fn run_login(opts: XAILoginOptions) -> Result<PathBuf> {
     println!("📁 凭证已保存至: {}", path.display());
 
     Ok(path)
-}
-
-fn open_browser(url: &str) -> Result<()> {
-    let status = std::process::Command::new("open")
-        .arg(url)
-        .status()
-        .context("open browser")?;
-    if status.success() {
-        Ok(())
-    } else {
-        Err(anyhow!("open browser failed: {status}"))
-    }
 }

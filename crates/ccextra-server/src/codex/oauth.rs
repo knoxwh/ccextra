@@ -2,6 +2,7 @@
 // (对齐 CLIProxyAPI internal/auth/codex/openai_auth.go + pkce.go)
 
 use super::constants::{AUTH_SCOPE, AUTH_URL, CLIENT_ID, REFRESH_SCOPE, TOKEN_URL};
+use crate::oauth_common::urlencode;
 use anyhow::{anyhow, Context, Result};
 use reqwest::Client;
 use serde::Deserialize;
@@ -60,20 +61,6 @@ pub fn build_auth_url(state: &str, redirect_uri: &str, pkce: &PkceCodes) -> Stri
         .map(|(k, v)| format!("{}={}", k, urlencode(v)))
         .collect();
     format!("{}?{}", AUTH_URL, query.join("&"))
-}
-
-/// form 编码(空格等保留字符转义)
-fn urlencode(value: &str) -> String {
-    let mut out = String::with_capacity(value.len());
-    for b in value.bytes() {
-        match b {
-            b'A'..=b'Z' | b'a'..=b'z' | b'0'..=b'9' | b'-' | b'_' | b'.' | b'~' => {
-                out.push(b as char)
-            }
-            _ => out.push_str(&format!("%{b:02X}")),
-        }
-    }
-    out
 }
 
 /// 与项目 xai/antigravity 相同的代理感知 HTTP 客户端

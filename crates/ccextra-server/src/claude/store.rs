@@ -2,76 +2,19 @@
 
 use super::credential::{credential_file_name, ClaudeCredential};
 use anyhow::{Context, Result};
-use std::collections::HashMap;
-use std::fs::{self, OpenOptions};
-use std::io::Write;
+use std::fs;
 use std::path::{Path, PathBuf};
-use std::sync::{Arc, Mutex, OnceLock};
 
-#[cfg(unix)]
-use std::os::unix::fs::{OpenOptionsExt, PermissionsExt};
+use crate::oauth_common;
 
-static PATH_LOCKS: OnceLock<Mutex<HashMap<PathBuf, Arc<Mutex<()>>>>> = OnceLock::new();
-
-fn path_lock(path: &Path) -> Arc<Mutex<()>> {
-    let key = path.canonicalize().unwrap_or_else(|_| path.to_path_buf());
-    let mut map = PATH_LOCKS
-        .get_or_init(|| Mutex::new(HashMap::new()))
-        .lock()
-        .unwrap_or_else(|p| p.into_inner());
-    map.entry(key)
-        .or_insert_with(|| Arc::new(Mutex::new(())))
-        .clone()
-}
+const DEFAULT_AUTH_DIR: &str = ".cache/claude";
 
 pub fn default_auth_dir() -> PathBuf {
-    PathBuf::from(".cache/claude")
+    PathBuf::from(DEFAULT_AUTH_DIR)
 }
 
 pub fn resolve_auth_dir(dir: Option<&str>) -> PathBuf {
-    match dir {
-        Some(d) if !d.trim().is_empty() => {
-            if let Some(rest) = d.strip_prefix("~/") {
-                if let Some(home) =
-                    dirs_next().or_else(|| std::env::var_os("HOME").map(PathBuf::from))
-                {
-                    return home.join(rest);
-                }
-            }
-            PathBuf::from(d)
-        }
-        _ => default_auth_dir(),
-    }
-}
-
-fn dirs_next() -> Option<PathBuf> {
-    std::env::var_os("HOME")
-        .or_else(|| std::env::var_os("USERPROFILE"))
-        .map(PathBuf::from)
-}
-
-fn write_atomic(path: &Path, data: &[u8]) -> Result<()> {
-    let dir = path.parent().context("credential path missing parent")?;
-    let mut nonce = [0u8; 8];
-    getrandom::fill(&mut nonce).context("credential temp nonce")?;
-    let tmp = dir.join(format!(".claude.{:016x}.tmp", u64::from_be_bytes(nonce)));
-    let mut options = OpenOptions::new();
-    options.write(true).create_new(true);
-    #[cfg(unix)]
-    options.mode(0o600);
-    let mut file = options
-        .open(&tmp)
-        .with_context(|| format!("create temp credential {}", tmp.display()))?;
-    let result = (|| -> Result<()> {
-        file.write_all(data)?;
-        file.sync_all()?;
-        fs::rename(&tmp, path).with_context(|| format!("replace credential {}", path.display()))?;
-        Ok(())
-    })();
-    if result.is_err() {
-        let _ = fs::remove_file(&tmp);
-    }
-    result
+    oauth_common::resolve_auth_dir(dir, DEFAULT_AUTH_DIR)
 }
 
 pub fn save(auth_dir: &Path, cred: &ClaudeCredential) -> Result<PathBuf> {
@@ -83,33 +26,8 @@ pub fn save(auth_dir: &Path, cred: &ClaudeCredential) -> Result<PathBuf> {
 /// 写回指定凭证文件:运行时刷新落盘到扫描到的原路径,不按 email 重新推导文件名
 /// (对齐 CPA FileTokenStore.resolveAuthPath 优先使用 path 属性)
 pub fn save_to(path: &Path, cred: &ClaudeCredential) -> Result<()> {
-    let auth_dir = path.parent().context("credential path missing parent")?;
-    fs::create_dir_all(auth_dir)
-        .with_context(|| format!("创建凭证目录失败: {}", auth_dir.display()))?;
-    #[cfg(unix)]
-    {
-        fs::set_permissions(auth_dir, fs::Permissions::from_mode(0o700))?;
-    }
     let json = serde_json::to_vec_pretty(cred).context("序列化 Claude 凭证失败")?;
-
-    let inproc = path_lock(path);
-    let _guard = inproc.lock().unwrap_or_else(|p| p.into_inner());
-
-    let lock_path = PathBuf::from(format!("{}.lock", path.display()));
-    let mut file_lock = fslock::LockFile::open(&lock_path)
-        .with_context(|| format!("open credential lock {}", lock_path.display()))?;
-    file_lock
-        .lock()
-        .with_context(|| format!("acquire credential lock {}", lock_path.display()))?;
-
-    write_atomic(path, &json)?;
-    #[cfg(unix)]
-    {
-        let _ = fs::set_permissions(path, fs::Permissions::from_mode(0o600));
-        let _ = fs::set_permissions(&lock_path, fs::Permissions::from_mode(0o600));
-    }
-    let _ = file_lock.unlock();
-    Ok(())
+    oauth_common::write_credential_file(path, &json, "claude", true)
 }
 
 pub fn load(path: &Path) -> Result<ClaudeCredential> {
@@ -142,6 +60,8 @@ pub fn list(auth_dir: &Path) -> Result<Vec<(PathBuf, ClaudeCredential)>> {
 #[cfg(test)]
 mod tests {
     use super::*;
+    #[cfg(unix)]
+    use std::os::unix::fs::PermissionsExt;
 
     #[test]
     fn test_save_and_load_roundtrip() {

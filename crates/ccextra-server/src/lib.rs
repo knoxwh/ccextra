@@ -12,6 +12,7 @@ pub mod xai;
 
 mod limits;
 mod model_filter;
+mod oauth_common;
 #[cfg(test)]
 mod test_support;
 

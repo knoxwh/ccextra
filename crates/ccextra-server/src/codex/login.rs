@@ -4,6 +4,7 @@ use super::constants::{CALLBACK_PATH, DEFAULT_CALLBACK_PORT};
 use super::credential::{parse_jwt_identity, CodexCredential};
 use super::oauth::{build_auth_url, exchange_code, generate_pkce_codes, http_client};
 use super::store;
+use crate::oauth_common::{open_browser, random_state};
 use anyhow::{anyhow, Context, Result};
 use axum::extract::Query;
 use axum::response::Html;
@@ -179,23 +180,4 @@ async fn start_callback(
             .await;
     });
     Ok((bound, rx, shutdown_tx))
-}
-
-/// 16 字节随机 hex
-fn random_state() -> Result<String> {
-    let mut bytes = [0u8; 16];
-    getrandom::fill(&mut bytes).context("generate oauth state")?;
-    Ok(bytes.iter().map(|b| format!("{b:02x}")).collect())
-}
-
-fn open_browser(url: &str) -> Result<()> {
-    let status = std::process::Command::new("open")
-        .arg(url)
-        .status()
-        .context("open browser")?;
-    if status.success() {
-        Ok(())
-    } else {
-        Err(anyhow!("open browser failed: {status}"))
-    }
 }

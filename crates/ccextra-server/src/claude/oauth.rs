@@ -4,6 +4,7 @@
 use super::constants::{
     AUTH_SCOPE, AUTH_URL, CLIENT_ID, PROFILE_URL, REDIRECT_URI, REFRESH_TOKEN_URL, TOKEN_URL,
 };
+use crate::oauth_common::urlencode;
 use anyhow::{anyhow, Context, Result};
 use reqwest::Client;
 use serde::{Deserialize, Serialize};
@@ -111,19 +112,6 @@ pub fn build_auth_url(state: &str, pkce: &PkceCodes) -> String {
         .map(|(k, v)| format!("{}={}", k, urlencode(v)))
         .collect();
     format!("{}?{}", AUTH_URL, query.join("&"))
-}
-
-fn urlencode(value: &str) -> String {
-    let mut out = String::with_capacity(value.len());
-    for b in value.bytes() {
-        match b {
-            b'A'..=b'Z' | b'a'..=b'z' | b'0'..=b'9' | b'-' | b'_' | b'.' | b'~' => {
-                out.push(b as char)
-            }
-            _ => out.push_str(&format!("%{b:02X}")),
-        }
-    }
-    out
 }
 
 /// 与项目 xai/codex 相同的代理感知 HTTP 客户端

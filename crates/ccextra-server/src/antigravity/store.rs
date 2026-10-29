@@ -3,27 +3,10 @@
 use super::constants::DEFAULT_AUTH_DIR;
 use super::credential::{credential_file_name, AntigravityCredential};
 use anyhow::{Context, Result};
-use std::collections::HashMap;
-use std::fs::{self, OpenOptions};
-use std::io::Write;
+use std::fs;
 use std::path::{Path, PathBuf};
-use std::sync::{Arc, Mutex, OnceLock};
 
-#[cfg(unix)]
-use std::os::unix::fs::{OpenOptionsExt, PermissionsExt};
-
-static PATH_LOCKS: OnceLock<Mutex<HashMap<PathBuf, Arc<Mutex<()>>>>> = OnceLock::new();
-
-fn path_lock(path: &Path) -> Arc<Mutex<()>> {
-    let key = path.canonicalize().unwrap_or_else(|_| path.to_path_buf());
-    let mut map = PATH_LOCKS
-        .get_or_init(|| Mutex::new(HashMap::new()))
-        .lock()
-        .unwrap_or_else(|p| p.into_inner());
-    map.entry(key)
-        .or_insert_with(|| Arc::new(Mutex::new(())))
-        .clone()
-}
+use crate::oauth_common;
 
 fn home_dir() -> PathBuf {
     std::env::var_os("HOME")
@@ -60,33 +43,6 @@ pub fn load(path: &Path) -> Result<AntigravityCredential> {
         .with_context(|| format!("parse antigravity credential {}", path.display()))
 }
 
-fn write_atomic(path: &Path, data: &[u8]) -> Result<()> {
-    let dir = path.parent().context("credential path missing parent")?;
-    let mut nonce = [0u8; 8];
-    getrandom::fill(&mut nonce).context("credential temp nonce")?;
-    let tmp = dir.join(format!(
-        ".antigravity.{:016x}.tmp",
-        u64::from_be_bytes(nonce)
-    ));
-    let mut options = OpenOptions::new();
-    options.write(true).create_new(true);
-    #[cfg(unix)]
-    options.mode(0o600);
-    let mut file = options
-        .open(&tmp)
-        .with_context(|| format!("create temp credential {}", tmp.display()))?;
-    let result = (|| -> Result<()> {
-        file.write_all(data)?;
-        file.sync_all()?;
-        fs::rename(&tmp, path).with_context(|| format!("replace credential {}", path.display()))?;
-        Ok(())
-    })();
-    if result.is_err() {
-        let _ = fs::remove_file(&tmp);
-    }
-    result
-}
-
 /// 目录 0700,文件 0600;JSON 即 metadata 本身(原子写 + 进程内 path 锁)
 pub fn save(dir: &Path, cred: &AntigravityCredential) -> Result<PathBuf> {
     let path = dir.join(credential_file_name(&cred.email));
@@ -97,23 +53,8 @@ pub fn save(dir: &Path, cred: &AntigravityCredential) -> Result<PathBuf> {
 /// 写回指定凭证文件:运行时刷新落盘到扫描到的原路径,不按 email 重新推导文件名
 /// (对齐 CPA FileTokenStore.resolveAuthPath 优先使用 path 属性)
 pub fn save_to(path: &Path, cred: &AntigravityCredential) -> Result<()> {
-    let dir = path.parent().context("credential path missing parent")?;
-    fs::create_dir_all(dir).with_context(|| format!("create auth dir {}", dir.display()))?;
-    #[cfg(unix)]
-    {
-        fs::set_permissions(dir, fs::Permissions::from_mode(0o700))?;
-    }
     let raw = serde_json::to_vec(cred).context("serialize antigravity credential")?;
-
-    let inproc = path_lock(path);
-    let _guard = inproc.lock().unwrap_or_else(|p| p.into_inner());
-
-    write_atomic(path, &raw)?;
-    #[cfg(unix)]
-    {
-        let _ = fs::set_permissions(path, fs::Permissions::from_mode(0o600));
-    }
-    Ok(())
+    oauth_common::write_credential_file(path, &raw, "antigravity", false)
 }
 
 /// 列出目录下 `antigravity*.json`(忽略坏文件和 client_id 不匹配的凭证)

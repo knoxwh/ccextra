@@ -3,24 +3,9 @@
 use super::constants::{REFRESH_MAX_RETRIES, REFRESH_SKEW_SECS};
 use super::credential::XAICredential;
 use super::{oauth, store};
+use crate::oauth_common::lock_for_refresh_token;
 use anyhow::{anyhow, Result};
-use std::collections::HashMap;
 use std::path::Path;
-use std::sync::{Arc, OnceLock};
-use tokio::sync::Mutex;
-
-static REFRESH_LOCKS: OnceLock<Mutex<HashMap<String, Arc<Mutex<()>>>>> = OnceLock::new();
-
-async fn lock_for_refresh_token(refresh_token: &str) -> Arc<Mutex<()>> {
-    let key = refresh_token.trim().to_string();
-    let mut map = REFRESH_LOCKS
-        .get_or_init(|| Mutex::new(HashMap::new()))
-        .lock()
-        .await;
-    map.entry(key)
-        .or_insert_with(|| Arc::new(Mutex::new(())))
-        .clone()
-}
 
 /// 检查并刷新凭证(如果需要);仅对明确可重试 HTTP 5xx 退避重试
 pub async fn refresh_if_needed(

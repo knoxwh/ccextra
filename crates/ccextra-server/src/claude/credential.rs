@@ -1,5 +1,6 @@
 // Claude 凭证结构 (对齐 CLIProxyAPI ClaudeTokenStorage)
 
+use crate::oauth_common::sanitize_file_segment;
 use serde::{Deserialize, Serialize};
 use std::time::{Duration, SystemTime};
 use time::format_description::well_known::Rfc3339;
@@ -99,21 +100,6 @@ pub fn credential_file_name(email: &str, account_uuid: &str) -> String {
         .map(|d| d.as_millis())
         .unwrap_or(0);
     format!("claude-{ms}.json")
-}
-
-fn sanitize_file_segment(value: &str) -> String {
-    let trimmed = value.trim();
-    if trimmed.is_empty() {
-        return String::new();
-    }
-    let mut out = String::with_capacity(trimmed.len());
-    for c in trimmed.chars() {
-        match c {
-            'a'..='z' | 'A'..='Z' | '0'..='9' | '@' | '.' | '_' | '-' => out.push(c),
-            _ => out.push('-'),
-        }
-    }
-    out.trim_matches('-').to_string()
 }
 
 /// 生成单个 64 hex device id (32 随机字节)
