@@ -11,13 +11,10 @@
 use ccextra_core::convert::{append_replay_turn, build_replay_turn, insert_replay_turns};
 use serde_json::Value;
 use std::collections::HashMap;
-use std::sync::{Arc, Mutex};
-use std::time::{Duration, Instant};
+use std::time::Duration;
 
 use super::parser::SseParser;
-
-/// 驱逐批次(对齐 CPA CodexReasoningReplayCacheEvictBatchSize)
-const EVICT_BATCH_SIZE: usize = 128;
+use super::ttl_lru::TtlLru;
 
 /// 每流一个的 SSE 提取器:累积解析本流 chunk,收集 output_item.done,
 /// 命中 response.completed 补空 output 后写入缓存(对齐 CPA 流式路径的
@@ -222,27 +219,17 @@ fn reasoning_item_has_text(item: &Value) -> bool {
         .unwrap_or(false)
 }
 
-/// 缓存条目
-struct Entry {
-    items: Vec<Value>,
-    stored_at: Instant,
-}
-
-/// replay 缓存(会话 → 上一轮 replay 项)
+/// replay 缓存(会话 → 累积的 replay 项)
 #[derive(Clone)]
 pub struct ReplayCache {
-    inner: Arc<Mutex<HashMap<String, Entry>>>,
-    ttl: Duration,
-    capacity: usize,
+    inner: TtlLru<Vec<Value>>,
 }
 
 impl ReplayCache {
     /// capacity 上限(超限 LRU 驱逐最老批次,对齐 CPA evictOldestXAIReasoningReplayEntriesLocked)
     pub fn new(ttl: Duration, capacity: usize) -> Self {
         Self {
-            inner: Arc::new(Mutex::new(HashMap::new())),
-            ttl,
-            capacity,
+            inner: TtlLru::new(ttl, capacity),
         }
     }
 
@@ -266,33 +253,15 @@ impl ReplayCache {
         let Some(turn) = build_replay_turn(completed, request_fingerprint) else {
             return;
         };
-        let mut map = self.inner.lock().unwrap();
-        if map.len() >= self.capacity && !map.contains_key(session_key) {
-            Self::evict_oldest_locked(&mut map, EVICT_BATCH_SIZE);
-        }
-        let existing = map
-            .get(session_key)
-            .filter(|e| e.stored_at.elapsed() <= self.ttl)
-            .map(|e| e.items.clone())
-            .unwrap_or_default();
-        let merged = append_replay_turn(&existing, &turn);
-        map.insert(
-            session_key.to_string(),
-            Entry {
-                items: merged,
-                stored_at: Instant::now(),
-            },
-        );
+        self.inner.upsert(session_key, |existing| {
+            append_replay_turn(existing.map(Vec::as_slice).unwrap_or_default(), &turn)
+        });
     }
 
     /// 删除该会话缓存(上游拒绝 replay 项时调用,对齐
     /// DeleteXAIReasoningReplayItemRequired)
     pub fn invalidate(&self, session_key: &str) {
-        let trimmed = session_key.trim();
-        if trimmed.is_empty() {
-            return;
-        }
-        self.inner.lock().unwrap().remove(trimmed);
+        self.inner.remove(session_key);
     }
 
     /// 取上一轮 replay 项并注入 body.input(过滤 + 对齐 + 插入全在 core)。
@@ -306,40 +275,10 @@ impl ReplayCache {
         body: &mut Value,
         keep_plain_reasoning: bool,
     ) -> bool {
-        let trimmed = session_key.trim();
-        if trimmed.is_empty() {
+        let Some(items) = self.inner.get_touch(session_key) else {
             return false;
-        }
-        let session_key = trimmed;
-        let items = {
-            let mut map = self.inner.lock().unwrap();
-            match map.get_mut(session_key) {
-                Some(entry) if entry.stored_at.elapsed() <= self.ttl => {
-                    entry.stored_at = Instant::now();
-                    entry.items.clone()
-                }
-                Some(_) => {
-                    map.remove(session_key);
-                    return false;
-                }
-                None => return false,
-            }
         };
         insert_replay_turns(body, items, keep_plain_reasoning)
-    }
-
-    /// LRU 驱逐最老的 count 个条目(对齐 CPA evictOldestCodexReasoningReplayEntries)
-    fn evict_oldest_locked(map: &mut HashMap<String, Entry>, count: usize) {
-        if count == 0 || map.is_empty() {
-            return;
-        }
-        let mut candidates: Vec<(String, Instant)> =
-            map.iter().map(|(k, v)| (k.clone(), v.stored_at)).collect();
-        candidates.sort_by_key(|(_, ts)| *ts);
-        let evict_count = count.min(candidates.len());
-        for (key, _) in candidates.iter().take(evict_count) {
-            map.remove(key);
-        }
     }
 }
 

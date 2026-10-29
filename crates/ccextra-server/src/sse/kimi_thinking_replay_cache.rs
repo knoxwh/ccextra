@@ -9,18 +9,10 @@ use ccextra_core::convert::{
     restore_kimi_thinking_replay, KimiThinkingReplayStreamAccumulator,
 };
 use serde_json::Value;
-use std::collections::HashMap;
-use std::sync::{Arc, Mutex};
-use std::time::{Duration, Instant};
+use std::time::Duration;
 
 use super::parser::SseParser;
-
-const EVICT_BATCH_SIZE: usize = 128;
-
-struct Entry {
-    content: Value,
-    stored_at: Instant,
-}
+use super::ttl_lru::TtlLru;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum KimiReplayApplyOutcome {
@@ -39,67 +31,29 @@ impl KimiReplayApplyOutcome {
 /// 进程内 Kimi thinking 账本。
 #[derive(Clone)]
 pub struct KimiThinkingReplayCache {
-    inner: Arc<Mutex<HashMap<String, Entry>>>,
-    ttl: Duration,
-    capacity: usize,
+    inner: TtlLru<Value>,
 }
 
 impl KimiThinkingReplayCache {
     pub fn new(ttl: Duration, capacity: usize) -> Self {
         Self {
-            inner: Arc::new(Mutex::new(HashMap::new())),
-            ttl,
-            capacity,
+            inner: TtlLru::new(ttl, capacity),
         }
     }
 
     pub fn replace_content(&self, session_key: &str, content: Value) {
-        let trimmed = session_key.trim();
-        if trimmed.is_empty() {
-            return;
+        match normalize_cached_content(&content) {
+            Some(normalized) => self.inner.insert(session_key, normalized),
+            None => self.inner.remove(session_key),
         }
-        let mut map = self.inner.lock().unwrap();
-        let Some(normalized) = normalize_cached_content(&content) else {
-            map.remove(trimmed);
-            return;
-        };
-        if map.len() >= self.capacity && !map.contains_key(trimmed) {
-            Self::evict_oldest_locked(&mut map, EVICT_BATCH_SIZE);
-        }
-        map.insert(
-            trimmed.to_string(),
-            Entry {
-                content: normalized,
-                stored_at: Instant::now(),
-            },
-        );
     }
 
     pub fn invalidate(&self, session_key: &str) {
-        let trimmed = session_key.trim();
-        if trimmed.is_empty() {
-            return;
-        }
-        self.inner.lock().unwrap().remove(trimmed);
+        self.inner.remove(session_key);
     }
 
     fn get_content(&self, session_key: &str) -> Option<Value> {
-        let trimmed = session_key.trim();
-        if trimmed.is_empty() {
-            return None;
-        }
-        let mut map = self.inner.lock().unwrap();
-        match map.get_mut(trimmed) {
-            Some(entry) if entry.stored_at.elapsed() <= self.ttl => {
-                entry.stored_at = Instant::now();
-                Some(entry.content.clone())
-            }
-            Some(_) => {
-                map.remove(trimmed);
-                None
-            }
-            None => None,
-        }
+        self.inner.get_touch(session_key)
     }
 
     /// 将缓存 thinking 写回 Anthropic `messages` body。
@@ -134,18 +88,6 @@ impl KimiThinkingReplayCache {
             Some(c) if content_is_replayable(&c) => self.replace_content(session_key, c),
             Some(_) => self.invalidate(session_key),
             None => {}
-        }
-    }
-
-    fn evict_oldest_locked(map: &mut HashMap<String, Entry>, count: usize) {
-        if count == 0 || map.is_empty() {
-            return;
-        }
-        let mut candidates: Vec<(String, Instant)> =
-            map.iter().map(|(k, v)| (k.clone(), v.stored_at)).collect();
-        candidates.sort_by_key(|(_, t)| *t);
-        for (key, _) in candidates.into_iter().take(count) {
-            map.remove(&key);
         }
     }
 }

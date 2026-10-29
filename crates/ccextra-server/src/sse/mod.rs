@@ -17,6 +17,7 @@ pub mod non_stream;
 pub mod parser;
 pub mod replay_cache;
 pub mod responses;
+mod ttl_lru;
 
 // 重新导出集成测试需要的函数
 pub use chat::relay_openai_chat_to_anthropic;
