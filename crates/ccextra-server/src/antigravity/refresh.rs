@@ -124,24 +124,21 @@ async fn ensure_project_id(
 /// `rejected_token`:上游 401 后传入被拒的 access_token,即使未过期也强制刷新。
 /// 对齐 CPA:token 新鲜但缺 project_id 时仍补发现并落盘。
 pub async fn ensure_credential_fresh(
-    auth_dir: &Path,
-    email: &str,
+    path: &Path,
     proxy_url: Option<&str>,
     rejected_token: Option<&str>,
 ) -> Result<AntigravityCredential> {
-    ensure_credential_fresh_with_ua(auth_dir, email, proxy_url, rejected_token, None).await
+    ensure_credential_fresh_with_ua(path, proxy_url, rejected_token, None).await
 }
 
 /// 同 [`ensure_credential_fresh`],可覆盖 project 发现用的 User-Agent。
 pub async fn ensure_credential_fresh_with_ua(
-    auth_dir: &Path,
-    email: &str,
+    path: &Path,
     proxy_url: Option<&str>,
     rejected_token: Option<&str>,
     request_ua: Option<&str>,
 ) -> Result<AntigravityCredential> {
-    let path = store::credential_path(auth_dir, email);
-    let prelim = store::load(&path)?;
+    let prelim = store::load(path)?;
     let needs_refresh = !usable(&prelim, rejected_token);
     let needs_project = prelim.project_id.trim().is_empty();
     if !needs_refresh && !needs_project {
@@ -156,7 +153,7 @@ pub async fn ensure_credential_fresh_with_ua(
     let lock = lock_for_refresh_token(&lock_key).await;
     let _guard = lock.lock().await;
 
-    let mut cred = store::load(&path)?;
+    let mut cred = store::load(path)?;
     let mut dirty = false;
 
     if rejected_token == Some(cred.access_token.as_str()) {
@@ -175,7 +172,7 @@ pub async fn ensure_credential_fresh_with_ua(
     }
 
     if dirty {
-        store::save(auth_dir, &cred)?;
+        store::save_to(path, &cred)?;
     }
 
     Ok(cred)

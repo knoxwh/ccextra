@@ -16,7 +16,7 @@ pub async fn load_xai_providers(auth_dir: &Path, proxy_url: Option<&str>) -> Vec
         }
     };
 
-    for (_path, mut cred) in credentials {
+    for (path, mut cred) in credentials {
         if cred.disabled {
             tracing::debug!(
                 "跳过已禁用的 xAI 凭证: email={}, sub={}",
@@ -38,7 +38,7 @@ pub async fn load_xai_providers(auth_dir: &Path, proxy_url: Option<&str>) -> Vec
         // 检查并刷新 token (对齐 CLIProxyAPI refreshLead 300s)
         match refresh::refresh_if_needed(&mut cred, proxy_url, constants::REFRESH_SKEW_SECS).await {
             Ok(true) => {
-                if let Err(e) = store::save(auth_dir, &cred) {
+                if let Err(e) = store::save_to(&path, &cred) {
                     tracing::warn!("刷新后保存 xAI 凭证失败: {}: {}", cred.email, e);
                 } else {
                     tracing::info!("xAI token 已刷新并保存: {}", cred.email);
@@ -65,9 +65,10 @@ pub async fn load_xai_providers(auth_dir: &Path, proxy_url: Option<&str>) -> Vec
         let grok_models = models::default_grok_models();
 
         let mut metadata = std::collections::HashMap::new();
+        // 运行时按扫描到的实际文件刷新/落盘(对齐 CPA Auth.Attributes["path"])
         metadata.insert(
-            "auth_dir".to_string(),
-            auth_dir.to_string_lossy().to_string(),
+            "credential_path".to_string(),
+            path.to_string_lossy().to_string(),
         );
         metadata.insert("email".to_string(), cred.email.clone());
         metadata.insert("sub".to_string(), cred.sub.clone());

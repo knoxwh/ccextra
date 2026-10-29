@@ -62,40 +62,30 @@ pub async fn handle_count_tokens(
         })?;
         let mut key = provider.key.clone();
         let proxy_url = provider.proxy_url.clone();
-        let mut claude_oauth: Option<(String, String)> = None; // (auth_dir, id)
+        let mut claude_oauth: Option<String> = None; // 凭证文件实际路径
 
         // Claude 订阅:运行时刷新 access_token;失败硬失败
-        if let Some(meta) = provider.metadata.as_ref() {
-            if meta.get("provider_type").map(|s| s.as_str()) == Some("claude") {
-                if let Some(auth_dir_str) = meta.get("auth_dir") {
-                    let email = meta.get("email").map(|s| s.as_str()).unwrap_or("");
-                    let account_uuid = meta.get("account_uuid").map(|s| s.as_str()).unwrap_or("");
-                    let id = if !email.is_empty() {
-                        email
-                    } else {
-                        account_uuid
-                    };
-                    if !id.is_empty() {
-                        let auth_dir = std::path::Path::new(auth_dir_str);
-                        match crate::claude::ensure_credential_fresh(
-                            auth_dir,
-                            id,
-                            proxy_url.as_deref(),
-                            None,
-                        )
-                        .await
-                        {
-                            Ok(fresh) => {
-                                key = fresh.access_token;
-                                claude_oauth = Some((auth_dir_str.clone(), id.to_string()));
-                            }
-                            Err(e) => {
-                                return Err(AppError::unauthorized(format!(
-                                    "Claude count_tokens 凭证刷新失败,拒绝使用旧 token: {e}"
-                                )));
-                            }
-                        }
-                    }
+        let claude_path = provider
+            .metadata
+            .as_ref()
+            .filter(|m| m.get("provider_type").map(|s| s.as_str()) == Some("claude"))
+            .and_then(|m| m.get("credential_path"));
+        if let Some(path) = claude_path {
+            match crate::claude::ensure_credential_fresh(
+                std::path::Path::new(path),
+                proxy_url.as_deref(),
+                None,
+            )
+            .await
+            {
+                Ok(fresh) => {
+                    key = fresh.access_token;
+                    claude_oauth = Some(path.clone());
+                }
+                Err(e) => {
+                    return Err(AppError::unauthorized(format!(
+                        "Claude count_tokens 凭证刷新失败,拒绝使用旧 token: {e}"
+                    )));
                 }
             }
         }
@@ -144,11 +134,10 @@ pub async fn handle_count_tokens(
 
             // 401:强制刷新后重试一次
             if status.as_u16() == 401 && auth_attempt == 0 {
-                if let Some((ref auth_dir_str, ref id)) = claude_oauth {
+                if let Some(ref path) = claude_oauth {
                     let rejected = attempt_key.clone();
                     match crate::claude::ensure_credential_fresh(
-                        std::path::Path::new(auth_dir_str),
-                        id,
+                        std::path::Path::new(path),
                         proxy_url.as_deref(),
                         Some(&rejected),
                     )

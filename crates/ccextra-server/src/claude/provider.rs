@@ -19,7 +19,7 @@ pub async fn load_claude_providers(
         }
     };
 
-    for (_path, mut cred) in credentials {
+    for (path, mut cred) in credentials {
         if cred.disabled {
             tracing::debug!("跳过已禁用的 Claude 凭证: email={}", cred.email);
             continue;
@@ -32,7 +32,7 @@ pub async fn load_claude_providers(
 
         match refresh::refresh_if_needed(&mut cred, proxy_url, constants::REFRESH_SKEW_SECS).await {
             Ok(true) => {
-                if let Err(e) = store::save(auth_dir, &cred) {
+                if let Err(e) = store::save_to(&path, &cred) {
                     tracing::warn!("刷新后保存 Claude 凭证失败: {}: {}", cred.email, e);
                 } else {
                     tracing::info!("Claude token 已刷新并保存: {}", cred.email);
@@ -64,9 +64,10 @@ pub async fn load_claude_providers(
         let claude_models = models::default_claude_models();
 
         let mut metadata = std::collections::HashMap::new();
+        // 运行时按扫描到的实际文件刷新/落盘(对齐 CPA Auth.Attributes["path"])
         metadata.insert(
-            "auth_dir".to_string(),
-            auth_dir.to_string_lossy().to_string(),
+            "credential_path".to_string(),
+            path.to_string_lossy().to_string(),
         );
         metadata.insert("email".to_string(), cred.email.clone());
         metadata.insert("account_uuid".to_string(), cred.account_uuid.clone());

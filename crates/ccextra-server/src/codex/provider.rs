@@ -16,7 +16,7 @@ pub async fn load_codex_providers(auth_dir: &Path, proxy_url: Option<&str>) -> V
         }
     };
 
-    for (_path, mut cred) in credentials {
+    for (path, mut cred) in credentials {
         if cred.disabled {
             tracing::debug!("跳过已禁用的 Codex 凭证: email={}", cred.email);
             continue;
@@ -30,7 +30,7 @@ pub async fn load_codex_providers(auth_dir: &Path, proxy_url: Option<&str>) -> V
         // 检查并刷新 token (对齐 CPA RefreshLead 24h + 重试 3 次)
         match refresh::refresh_if_needed(&mut cred, proxy_url, constants::REFRESH_SKEW_SECS).await {
             Ok(true) => {
-                if let Err(e) = store::save(auth_dir, &cred) {
+                if let Err(e) = store::save_to(&path, &cred) {
                     tracing::warn!("刷新后保存 Codex 凭证失败: {}: {}", cred.email, e);
                 } else {
                     tracing::info!("Codex token 已刷新并保存: {}", cred.email);
@@ -57,9 +57,10 @@ pub async fn load_codex_providers(auth_dir: &Path, proxy_url: Option<&str>) -> V
         let codex_models = models::default_codex_models();
 
         let mut metadata = std::collections::HashMap::new();
+        // 运行时按扫描到的实际文件刷新/落盘(对齐 CPA Auth.Attributes["path"])
         metadata.insert(
-            "auth_dir".to_string(),
-            auth_dir.to_string_lossy().to_string(),
+            "credential_path".to_string(),
+            path.to_string_lossy().to_string(),
         );
         metadata.insert("email".to_string(), cred.email.clone());
         metadata.insert("account_id".to_string(), cred.account_id.clone());
@@ -95,4 +96,63 @@ pub async fn load_codex_providers(auth_dir: &Path, proxy_url: Option<&str>) -> V
     }
 
     providers
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::codex::CodexCredential;
+
+    fn fresh_cred(email: &str, account_id: &str) -> CodexCredential {
+        CodexCredential {
+            r#type: "codex".to_string(),
+            id_token: String::new(),
+            access_token: "live-access".to_string(),
+            refresh_token: "live-refresh".to_string(),
+            account_id: account_id.to_string(),
+            last_refresh: String::new(),
+            email: email.to_string(),
+            plan_type: "plus".to_string(),
+            expired: "2999-01-01T00:00:00Z".to_string(),
+            disabled: false,
+        }
+    }
+
+    /// 非 canonical 文件名(如 CPA 的 codex-<email>-plus.json)与无 email/account_id 的凭证:
+    /// provider 记录实际路径,运行时按该路径取凭证
+    #[tokio::test]
+    async fn runtime_uses_scanned_credential_path() {
+        let dir = tempfile::tempdir().unwrap();
+        for (file, cred) in [
+            ("codex-a@b.c-plus.json", fresh_cred("a@b.c", "acct-1")),
+            ("codex-anon.json", fresh_cred("", "")),
+        ] {
+            let path = dir.path().join(file);
+            store::save_to(&path, &cred).unwrap();
+        }
+
+        let providers = load_codex_providers(dir.path(), Some("direct")).await;
+        assert_eq!(providers.len(), 2);
+        for provider in &providers {
+            let path = provider.metadata.as_ref().unwrap()["credential_path"].clone();
+            assert!(std::path::Path::new(&path).exists(), "{path}");
+            let cred = refresh::ensure_credential_fresh(std::path::Path::new(&path), None, None)
+                .await
+                .unwrap();
+            assert_eq!(cred.access_token, "live-access");
+        }
+        // 不会额外生成 canonical 文件
+        assert_eq!(
+            std::fs::read_dir(dir.path())
+                .unwrap()
+                .filter(|e| e
+                    .as_ref()
+                    .unwrap()
+                    .path()
+                    .extension()
+                    .is_some_and(|x| x == "json"))
+                .count(),
+            2
+        );
+    }
 }

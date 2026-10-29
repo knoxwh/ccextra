@@ -2615,13 +2615,13 @@ async fn test_codex_provider_sends_account_id_header() {
         expired: "2999-01-01T00:00:00Z".to_string(),
         disabled: false,
     };
-    crate::codex::store::save(dir.path(), &cred).unwrap();
+    let cred_path = crate::codex::store::save(dir.path(), &cred).unwrap();
 
     let state = mock_state();
     let mut metadata = std::collections::HashMap::new();
     metadata.insert(
-        "auth_dir".to_string(),
-        dir.path().to_string_lossy().to_string(),
+        "credential_path".to_string(),
+        cred_path.to_string_lossy().to_string(),
     );
     metadata.insert("email".to_string(), "user@example.com".to_string());
     metadata.insert("account_id".to_string(), "acct-123".to_string());
@@ -2765,13 +2765,13 @@ async fn test_codex_provider_compresses_request_body() {
         expired: "2999-01-01T00:00:00Z".to_string(),
         disabled: false,
     };
-    crate::codex::store::save(dir.path(), &cred).unwrap();
+    let cred_path = crate::codex::store::save(dir.path(), &cred).unwrap();
 
     let state = mock_state();
     let mut metadata = std::collections::HashMap::new();
     metadata.insert(
-        "auth_dir".to_string(),
-        dir.path().to_string_lossy().to_string(),
+        "credential_path".to_string(),
+        cred_path.to_string_lossy().to_string(),
     );
     metadata.insert("email".to_string(), "user@example.com".to_string());
     metadata.insert("account_id".to_string(), "acct-123".to_string());

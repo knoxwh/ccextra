@@ -95,19 +95,17 @@ fn usable(cred: &XAICredential, rejected_token: Option<&str>) -> bool {
 ///
 /// `rejected_token`:上游 401 后传入被拒的 access_token,即使未过期也强制刷新。
 pub async fn ensure_credential_fresh(
-    auth_dir: &Path,
-    email_or_sub: &str,
+    path: &Path,
     proxy_url: Option<&str>,
     rejected_token: Option<&str>,
 ) -> Result<XAICredential> {
-    let path = store::credential_path(auth_dir, email_or_sub);
-    if let Ok(cred) = store::load(&path) {
+    if let Ok(cred) = store::load(path) {
         if usable(&cred, rejected_token) {
             return Ok(cred);
         }
     }
 
-    let prelim = store::load(&path)?;
+    let prelim = store::load(path)?;
     let lock_key = if prelim.refresh_token.trim().is_empty() {
         format!("path:{}", path.display())
     } else {
@@ -116,7 +114,7 @@ pub async fn ensure_credential_fresh(
     let lock = lock_for_refresh_token(&lock_key).await;
     let _guard = lock.lock().await;
 
-    let mut cred = store::load(&path)?;
+    let mut cred = store::load(path)?;
     if usable(&cred, rejected_token) {
         return Ok(cred);
     }
@@ -126,7 +124,7 @@ pub async fn ensure_credential_fresh(
     }
 
     if refresh_if_needed(&mut cred, proxy_url, REFRESH_SKEW_SECS).await? {
-        store::save(auth_dir, &cred)?;
+        store::save_to(path, &cred)?;
     }
 
     Ok(cred)

@@ -21,7 +21,7 @@ pub async fn load_antigravity_providers(
         }
     };
 
-    for (_path, mut cred) in credentials {
+    for (path, mut cred) in credentials {
         if cred.disabled {
             tracing::debug!("跳过已禁用的 antigravity 凭证: {}", cred.email);
             continue;
@@ -36,7 +36,7 @@ pub async fn load_antigravity_providers(
         // 检查并刷新 token（对齐 CLIProxyAPI 的 refreshSkew）
         match refresh::refresh_if_needed(&mut cred, proxy_url, constants::REFRESH_SKEW_SECS).await {
             Ok(true) => {
-                if let Err(e) = store::save(auth_dir, &cred) {
+                if let Err(e) = store::save_to(&path, &cred) {
                     tracing::warn!("刷新后保存凭证失败: {}: {}", cred.email, e);
                 } else {
                     tracing::info!("Antigravity token 已刷新并保存: {}", cred.email);
@@ -62,7 +62,7 @@ pub async fn load_antigravity_providers(
                     match project::fetch_project_id(&client, &cred.access_token, user_agent).await {
                         Ok(id) if !id.trim().is_empty() => {
                             cred.project_id = id;
-                            if let Err(e) = store::save(auth_dir, &cred) {
+                            if let Err(e) = store::save_to(&path, &cred) {
                                 tracing::warn!("project 发现后保存失败: {}: {}", cred.email, e);
                             }
                         }
@@ -119,9 +119,10 @@ pub async fn load_antigravity_providers(
 
         // Antigravity 使用 cloudcode-pa.googleapis.com 的内部 API,不是公开的 generativelanguage API
         let mut metadata = std::collections::HashMap::new();
+        // 运行时按扫描到的实际文件刷新/落盘(对齐 CPA Auth.Attributes["path"])
         metadata.insert(
-            "auth_dir".to_string(),
-            auth_dir.to_string_lossy().to_string(),
+            "credential_path".to_string(),
+            path.to_string_lossy().to_string(),
         );
         metadata.insert("email".to_string(), cred.email.clone());
         metadata.insert("project_id".to_string(), cred.project_id.clone());

@@ -53,10 +53,6 @@ pub fn resolve_auth_dir(raw: Option<&str>) -> PathBuf {
     PathBuf::from(s)
 }
 
-pub fn credential_path(dir: &Path, email: &str) -> PathBuf {
-    dir.join(credential_file_name(email))
-}
-
 pub fn load(path: &Path) -> Result<AntigravityCredential> {
     let raw = fs::read_to_string(path)
         .with_context(|| format!("read antigravity credential {}", path.display()))?;
@@ -93,23 +89,31 @@ fn write_atomic(path: &Path, data: &[u8]) -> Result<()> {
 
 /// 目录 0700,文件 0600;JSON 即 metadata 本身(原子写 + 进程内 path 锁)
 pub fn save(dir: &Path, cred: &AntigravityCredential) -> Result<PathBuf> {
+    let path = dir.join(credential_file_name(&cred.email));
+    save_to(&path, cred)?;
+    Ok(path)
+}
+
+/// 写回指定凭证文件:运行时刷新落盘到扫描到的原路径,不按 email 重新推导文件名
+/// (对齐 CPA FileTokenStore.resolveAuthPath 优先使用 path 属性)
+pub fn save_to(path: &Path, cred: &AntigravityCredential) -> Result<()> {
+    let dir = path.parent().context("credential path missing parent")?;
     fs::create_dir_all(dir).with_context(|| format!("create auth dir {}", dir.display()))?;
     #[cfg(unix)]
     {
         fs::set_permissions(dir, fs::Permissions::from_mode(0o700))?;
     }
-    let path = credential_path(dir, &cred.email);
     let raw = serde_json::to_vec(cred).context("serialize antigravity credential")?;
 
-    let inproc = path_lock(&path);
+    let inproc = path_lock(path);
     let _guard = inproc.lock().unwrap_or_else(|p| p.into_inner());
 
-    write_atomic(&path, &raw)?;
+    write_atomic(path, &raw)?;
     #[cfg(unix)]
     {
-        let _ = fs::set_permissions(&path, fs::Permissions::from_mode(0o600));
+        let _ = fs::set_permissions(path, fs::Permissions::from_mode(0o600));
     }
-    Ok(path)
+    Ok(())
 }
 
 /// 列出目录下 `antigravity*.json`(忽略坏文件和 client_id 不匹配的凭证)

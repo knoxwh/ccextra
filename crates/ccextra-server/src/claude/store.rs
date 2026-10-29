@@ -50,10 +50,6 @@ fn dirs_next() -> Option<PathBuf> {
         .map(PathBuf::from)
 }
 
-pub fn credential_path(auth_dir: &Path, email_or_account: &str) -> PathBuf {
-    auth_dir.join(credential_file_name(email_or_account, ""))
-}
-
 fn write_atomic(path: &Path, data: &[u8]) -> Result<()> {
     let dir = path.parent().context("credential path missing parent")?;
     let mut nonce = [0u8; 8];
@@ -79,17 +75,24 @@ fn write_atomic(path: &Path, data: &[u8]) -> Result<()> {
 }
 
 pub fn save(auth_dir: &Path, cred: &ClaudeCredential) -> Result<PathBuf> {
+    let path = auth_dir.join(credential_file_name(&cred.email, &cred.account_uuid));
+    save_to(&path, cred)?;
+    Ok(path)
+}
+
+/// 写回指定凭证文件:运行时刷新落盘到扫描到的原路径,不按 email 重新推导文件名
+/// (对齐 CPA FileTokenStore.resolveAuthPath 优先使用 path 属性)
+pub fn save_to(path: &Path, cred: &ClaudeCredential) -> Result<()> {
+    let auth_dir = path.parent().context("credential path missing parent")?;
     fs::create_dir_all(auth_dir)
         .with_context(|| format!("创建凭证目录失败: {}", auth_dir.display()))?;
     #[cfg(unix)]
     {
         fs::set_permissions(auth_dir, fs::Permissions::from_mode(0o700))?;
     }
-    let file_name = credential_file_name(&cred.email, &cred.account_uuid);
-    let path = auth_dir.join(file_name);
     let json = serde_json::to_vec_pretty(cred).context("序列化 Claude 凭证失败")?;
 
-    let inproc = path_lock(&path);
+    let inproc = path_lock(path);
     let _guard = inproc.lock().unwrap_or_else(|p| p.into_inner());
 
     let lock_path = PathBuf::from(format!("{}.lock", path.display()));
@@ -99,14 +102,14 @@ pub fn save(auth_dir: &Path, cred: &ClaudeCredential) -> Result<PathBuf> {
         .lock()
         .with_context(|| format!("acquire credential lock {}", lock_path.display()))?;
 
-    write_atomic(&path, &json)?;
+    write_atomic(path, &json)?;
     #[cfg(unix)]
     {
-        let _ = fs::set_permissions(&path, fs::Permissions::from_mode(0o600));
+        let _ = fs::set_permissions(path, fs::Permissions::from_mode(0o600));
         let _ = fs::set_permissions(&lock_path, fs::Permissions::from_mode(0o600));
     }
     let _ = file_lock.unlock();
-    Ok(path)
+    Ok(())
 }
 
 pub fn load(path: &Path) -> Result<ClaudeCredential> {

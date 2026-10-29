@@ -303,13 +303,14 @@ fn prepend_sse_frame(first: Result<Bytes, std::io::Error>, rest: SseStreamPin) -
     Box::pin(futures::stream::once(async move { first }).chain(rest))
 }
 
-/// OAuth 订阅凭证刷新目标(预刷新失败硬失败;上游 401 强制刷新后重试一次)
+/// OAuth 订阅凭证刷新目标(预刷新失败硬失败;上游 401 强制刷新后重试一次)。
+/// `path` 为扫描到的凭证文件实际路径。
 #[derive(Debug, Clone)]
 pub(crate) enum OAuthRefreshTarget {
-    Antigravity { auth_dir: String, email: String },
-    Claude { auth_dir: String, id: String },
-    Codex { auth_dir: String, id: String },
-    Xai { auth_dir: String, id: String },
+    Antigravity { path: String },
+    Claude { path: String },
+    Codex { path: String },
+    Xai { path: String },
 }
 
 pub(crate) struct PreparedMessageRequest {
@@ -787,41 +788,18 @@ pub(crate) async fn prepare_message_request(
         } else {
             None
         };
+        let credential_path = |provider_type: &str| {
+            meta.filter(|m| m.get("provider_type").map(|s| s.as_str()) == Some(provider_type))
+                .and_then(|m| m.get("credential_path").cloned())
+        };
         let antigravity_refresh = if matches!(route.protocol, Protocol::Antigravity) {
-            match (
-                meta.and_then(|m| m.get("auth_dir")).cloned(),
-                meta.and_then(|m| m.get("email")).cloned(),
-            ) {
-                (Some(auth_dir), Some(email)) => Some((auth_dir, email)),
-                _ => None,
-            }
+            meta.and_then(|m| m.get("credential_path")).cloned()
         } else {
             None
         };
-        let xai_refresh = meta
-            .filter(|m| m.get("provider_type").map(|s| s.as_str()) == Some("xai"))
-            .and_then(|m| {
-                let auth_dir = m.get("auth_dir")?.clone();
-                let email = m.get("email").cloned().unwrap_or_default();
-                let sub = m.get("sub").cloned().unwrap_or_default();
-                Some((auth_dir, email, sub))
-            });
-        let codex_refresh = meta
-            .filter(|m| m.get("provider_type").map(|s| s.as_str()) == Some("codex"))
-            .and_then(|m| {
-                let auth_dir = m.get("auth_dir")?.clone();
-                let email = m.get("email").cloned().unwrap_or_default();
-                let account_id = m.get("account_id").cloned().unwrap_or_default();
-                Some((auth_dir, email, account_id))
-            });
-        let claude_refresh = meta
-            .filter(|m| m.get("provider_type").map(|s| s.as_str()) == Some("claude"))
-            .and_then(|m| {
-                let auth_dir = m.get("auth_dir")?.clone();
-                let email = m.get("email").cloned().unwrap_or_default();
-                let account_uuid = m.get("account_uuid").cloned().unwrap_or_default();
-                Some((auth_dir, email, account_uuid))
-            });
+        let xai_refresh = credential_path("xai");
+        let codex_refresh = credential_path("codex");
+        let claude_refresh = credential_path("claude");
         (
             provider.base_urls().to_vec(),
             provider.key.clone(),
@@ -846,11 +824,9 @@ pub(crate) async fn prepare_message_request(
     let mut oauth_refresh: Option<OAuthRefreshTarget> = None;
     let mut codex_account_id: Option<String> = None;
 
-    if let Some((auth_dir_str, email)) = antigravity_refresh {
-        let auth_dir = std::path::Path::new(&auth_dir_str);
+    if let Some(path) = antigravity_refresh {
         match crate::antigravity::ensure_credential_fresh(
-            auth_dir,
-            &email,
+            std::path::Path::new(&path),
             upstream_proxy.as_deref(),
             None,
         )
@@ -867,10 +843,7 @@ pub(crate) async fn prepare_message_request(
                     return Err(AppError::bad_request("antigravity auth missing project_id"));
                 }
                 body_json["project"] = serde_json::Value::String(pid.to_string());
-                oauth_refresh = Some(OAuthRefreshTarget::Antigravity {
-                    auth_dir: auth_dir_str,
-                    email,
-                });
+                oauth_refresh = Some(OAuthRefreshTarget::Antigravity { path });
             }
             Err(e) => {
                 return Err(AppError::unauthorized(format!(
@@ -880,22 +853,17 @@ pub(crate) async fn prepare_message_request(
         }
     }
 
-    if let Some((auth_dir_str, email, sub)) = xai_refresh {
-        let auth_dir = std::path::Path::new(&auth_dir_str);
-        let id = if !email.is_empty() {
-            email.clone()
-        } else {
-            sub.clone()
-        };
-        match crate::xai::ensure_credential_fresh(auth_dir, &id, upstream_proxy.as_deref(), None)
-            .await
+    if let Some(path) = xai_refresh {
+        match crate::xai::ensure_credential_fresh(
+            std::path::Path::new(&path),
+            upstream_proxy.as_deref(),
+            None,
+        )
+        .await
         {
             Ok(fresh_cred) => {
                 upstream_key = fresh_cred.access_token;
-                oauth_refresh = Some(OAuthRefreshTarget::Xai {
-                    auth_dir: auth_dir_str,
-                    id,
-                });
+                oauth_refresh = Some(OAuthRefreshTarget::Xai { path });
             }
             Err(e) => {
                 return Err(AppError::unauthorized(format!(
@@ -905,25 +873,20 @@ pub(crate) async fn prepare_message_request(
         }
     }
 
-    if let Some((auth_dir_str, email, account_id)) = codex_refresh {
-        let auth_dir = std::path::Path::new(&auth_dir_str);
-        let id = if !email.is_empty() {
-            email.clone()
-        } else {
-            account_id.clone()
-        };
-        match crate::codex::ensure_credential_fresh(auth_dir, &id, upstream_proxy.as_deref(), None)
-            .await
+    if let Some(path) = codex_refresh {
+        match crate::codex::ensure_credential_fresh(
+            std::path::Path::new(&path),
+            upstream_proxy.as_deref(),
+            None,
+        )
+        .await
         {
             Ok(fresh_cred) => {
                 upstream_key = fresh_cred.access_token;
                 if !fresh_cred.account_id.is_empty() {
                     codex_account_id = Some(fresh_cred.account_id);
                 }
-                oauth_refresh = Some(OAuthRefreshTarget::Codex {
-                    auth_dir: auth_dir_str,
-                    id,
-                });
+                oauth_refresh = Some(OAuthRefreshTarget::Codex { path });
             }
             Err(e) => {
                 return Err(AppError::unauthorized(format!(
@@ -933,34 +896,22 @@ pub(crate) async fn prepare_message_request(
         }
     }
 
-    if let Some((auth_dir_str, email, account_uuid)) = claude_refresh {
-        let auth_dir = std::path::Path::new(&auth_dir_str);
-        let id = if !email.is_empty() {
-            email.clone()
-        } else {
-            account_uuid.clone()
-        };
-        if !id.is_empty() {
-            match crate::claude::ensure_credential_fresh(
-                auth_dir,
-                &id,
-                upstream_proxy.as_deref(),
-                None,
-            )
-            .await
-            {
-                Ok(fresh_cred) => {
-                    upstream_key = fresh_cred.access_token;
-                    oauth_refresh = Some(OAuthRefreshTarget::Claude {
-                        auth_dir: auth_dir_str,
-                        id,
-                    });
-                }
-                Err(e) => {
-                    return Err(AppError::unauthorized(format!(
-                        "Claude 凭证刷新失败,拒绝使用旧 token: {e}"
-                    )));
-                }
+    if let Some(path) = claude_refresh {
+        match crate::claude::ensure_credential_fresh(
+            std::path::Path::new(&path),
+            upstream_proxy.as_deref(),
+            None,
+        )
+        .await
+        {
+            Ok(fresh_cred) => {
+                upstream_key = fresh_cred.access_token;
+                oauth_refresh = Some(OAuthRefreshTarget::Claude { path });
+            }
+            Err(e) => {
+                return Err(AppError::unauthorized(format!(
+                    "Claude 凭证刷新失败,拒绝使用旧 token: {e}"
+                )));
             }
         }
     }
@@ -1780,11 +1731,9 @@ impl PreparedMessageRequest {
         let rejected = self.upstream_key.clone();
         let proxy = self.upstream_proxy.as_deref();
         match target {
-            OAuthRefreshTarget::Antigravity { auth_dir, email } => {
-                let auth_dir = std::path::Path::new(&auth_dir);
+            OAuthRefreshTarget::Antigravity { path } => {
                 let fresh = crate::antigravity::ensure_credential_fresh(
-                    auth_dir,
-                    &email,
+                    std::path::Path::new(&path),
                     proxy,
                     Some(&rejected),
                 )
@@ -1807,44 +1756,44 @@ impl PreparedMessageRequest {
                 self.reencode_body().await?;
                 Ok(true)
             }
-            OAuthRefreshTarget::Claude { auth_dir, id } => {
-                let auth_dir = std::path::Path::new(&auth_dir);
-                let fresh =
-                    crate::claude::ensure_credential_fresh(auth_dir, &id, proxy, Some(&rejected))
-                        .await
-                        .map_err(|e| {
-                            AppError::unauthorized(format!(
-                                "Claude 401 后刷新失败,拒绝使用旧 token: {e}"
-                            ))
-                        })?;
+            OAuthRefreshTarget::Claude { path } => {
+                let fresh = crate::claude::ensure_credential_fresh(
+                    std::path::Path::new(&path),
+                    proxy,
+                    Some(&rejected),
+                )
+                .await
+                .map_err(|e| {
+                    AppError::unauthorized(format!("Claude 401 后刷新失败,拒绝使用旧 token: {e}"))
+                })?;
                 self.upstream_key = fresh.access_token;
                 Ok(true)
             }
-            OAuthRefreshTarget::Codex { auth_dir, id } => {
-                let auth_dir = std::path::Path::new(&auth_dir);
-                let fresh =
-                    crate::codex::ensure_credential_fresh(auth_dir, &id, proxy, Some(&rejected))
-                        .await
-                        .map_err(|e| {
-                            AppError::unauthorized(format!(
-                                "Codex 401 后刷新失败,拒绝使用旧 token: {e}"
-                            ))
-                        })?;
+            OAuthRefreshTarget::Codex { path } => {
+                let fresh = crate::codex::ensure_credential_fresh(
+                    std::path::Path::new(&path),
+                    proxy,
+                    Some(&rejected),
+                )
+                .await
+                .map_err(|e| {
+                    AppError::unauthorized(format!("Codex 401 后刷新失败,拒绝使用旧 token: {e}"))
+                })?;
                 self.upstream_key = fresh.access_token;
                 self.apply_codex_account_id_after_refresh(&fresh.account_id)
                     .await?;
                 Ok(true)
             }
-            OAuthRefreshTarget::Xai { auth_dir, id } => {
-                let auth_dir = std::path::Path::new(&auth_dir);
-                let fresh =
-                    crate::xai::ensure_credential_fresh(auth_dir, &id, proxy, Some(&rejected))
-                        .await
-                        .map_err(|e| {
-                            AppError::unauthorized(format!(
-                                "xAI 401 后刷新失败,拒绝使用旧 token: {e}"
-                            ))
-                        })?;
+            OAuthRefreshTarget::Xai { path } => {
+                let fresh = crate::xai::ensure_credential_fresh(
+                    std::path::Path::new(&path),
+                    proxy,
+                    Some(&rejected),
+                )
+                .await
+                .map_err(|e| {
+                    AppError::unauthorized(format!("xAI 401 后刷新失败,拒绝使用旧 token: {e}"))
+                })?;
                 self.upstream_key = fresh.access_token;
                 Ok(true)
             }
