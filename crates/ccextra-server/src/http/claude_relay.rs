@@ -83,42 +83,30 @@ pub fn claude_inbound_user_agent(headers: &HeaderMap) -> Option<&str> {
 }
 
 /// 订阅 OAuth (`sk-ant-oat*`) 出站时:入站 anthropic-beta 缺 oauth beta 则追加。
-/// 不改写已有 beta 列表顺序以外的内容;已含则不动。
+/// 多个同名头按出现顺序合并为一个逗号列表再追加(对齐 CPA normalizedClaudeBetaHeader
+/// 读取 `Values("Anthropic-Beta")` 全量);已含则不动。
 pub fn ensure_oauth_beta(headers: &mut HeaderMap) {
     let beta_name = HeaderName::from_static("anthropic-beta");
-    let mut already = false;
-    let mut first: Option<String> = None;
-    for value in headers.get_all(&beta_name) {
-        if let Ok(s) = value.to_str() {
-            if first.is_none() {
-                first = Some(s.to_string());
-            }
-            if beta_list_contains(s, OAUTH_BETA) {
-                already = true;
-                break;
-            }
-        }
-    }
-    if already {
+    let existing: Vec<&str> = headers
+        .get_all(&beta_name)
+        .iter()
+        .filter_map(|value| value.to_str().ok())
+        .filter(|value| !value.trim().is_empty())
+        .collect();
+    if existing
+        .iter()
+        .any(|value| beta_list_contains(value, OAUTH_BETA))
+    {
         return;
     }
-    match first {
-        Some(existing) => {
-            let merged = if existing.trim().is_empty() {
-                OAUTH_BETA.to_string()
-            } else {
-                format!("{existing},{OAUTH_BETA}")
-            };
-            headers.remove(&beta_name);
-            if let Ok(v) = HeaderValue::from_str(&merged) {
-                headers.insert(beta_name, v);
-            }
-        }
-        None => {
-            if let Ok(v) = HeaderValue::from_str(OAUTH_BETA) {
-                headers.insert(beta_name, v);
-            }
-        }
+    let merged = existing
+        .into_iter()
+        .chain([OAUTH_BETA])
+        .collect::<Vec<_>>()
+        .join(",");
+    // insert 覆盖全部同名旧值
+    if let Ok(value) = HeaderValue::from_str(&merged) {
+        headers.insert(beta_name, value);
     }
 }
 
@@ -154,6 +142,28 @@ mod tests {
         ensure_oauth_beta(&mut map);
         let got = map.get("anthropic-beta").unwrap().to_str().unwrap();
         assert_eq!(got, "claude-code-20250219,oauth-2025-04-20");
+    }
+
+    #[test]
+    fn test_ensure_oauth_beta_merges_multiple_headers() {
+        let mut map = HeaderMap::new();
+        let name = HeaderName::from_static("anthropic-beta");
+        map.append(&name, HeaderValue::from_static("claude-code-20250219"));
+        map.append(&name, HeaderValue::from_static("context-1m-2025-08-07"));
+        ensure_oauth_beta(&mut map);
+        let all: Vec<_> = map.get_all(&name).iter().collect();
+        assert_eq!(all.len(), 1);
+        assert_eq!(
+            all[0].to_str().unwrap(),
+            "claude-code-20250219,context-1m-2025-08-07,oauth-2025-04-20"
+        );
+
+        // 第二个头已含 oauth beta:不动
+        let mut map = HeaderMap::new();
+        map.append(&name, HeaderValue::from_static("claude-code-20250219"));
+        map.append(&name, HeaderValue::from_static("oauth-2025-04-20"));
+        ensure_oauth_beta(&mut map);
+        assert_eq!(map.get_all(&name).iter().count(), 2);
     }
 
     #[test]
