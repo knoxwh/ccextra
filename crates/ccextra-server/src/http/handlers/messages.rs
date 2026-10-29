@@ -161,26 +161,36 @@ fn should_clear_ag_replay_on_error(protocol: Protocol, status: u16, body: &[u8])
         && is_antigravity_thought_signature_invalid(body)
 }
 
+/// 流式响应旁路提取 replay 的作用域;按协议互斥(Responses / Antigravity / Kimi)
+enum ReplayTap {
+    None,
+    /// (cache, key, request_fingerprint)
+    Responses(crate::sse::replay_cache::ReplayCache, String, String),
+    /// (cache, key, 读账本快照, 外发 request):提交走 ReplaceIfUnchanged(snapshot)
+    Antigravity(
+        crate::sse::antigravity_replay_cache::AgReplayCache,
+        String,
+        crate::sse::antigravity_replay_cache::AgReplaySnapshot,
+        Value,
+    ),
+    /// Kimi thinking:(cache, key, replay_applied)
+    Kimi(
+        crate::sse::kimi_thinking_replay_cache::KimiThinkingReplayCache,
+        String,
+        bool,
+    ),
+}
+
+/// 每个上游 SSE 字节块喂给 replay 提取器
+type ReplayPush = Box<dyn FnMut(&[u8]) + Send>;
+
 struct RelayParams {
     protocol: Protocol,
     estimated_input_tokens: Option<usize>,
     tool_names: Option<Arc<HashMap<String, String>>>,
     /// 转换前 Claude 请求快照(Gemini/AG 响应用来回剥占位 tool args)
     original_claude_request: Option<Arc<Value>>,
-    replay_scope: Option<(crate::sse::replay_cache::ReplayCache, String, String)>,
-    /// (cache, key, 读账本快照, 外发 request)：提交走 ReplaceIfUnchanged(snapshot)
-    ag_replay_scope: Option<(
-        crate::sse::antigravity_replay_cache::AgReplayCache,
-        String,
-        crate::sse::antigravity_replay_cache::AgReplaySnapshot,
-        Value,
-    )>,
-    /// Kimi thinking：(cache, key, replay_applied)
-    kimi_replay_scope: Option<(
-        crate::sse::kimi_thinking_replay_cache::KimiThinkingReplayCache,
-        String,
-        bool,
-    )>,
+    replay_tap: ReplayTap,
     signature_model: Option<Arc<str>>,
     /// 客户端入站 model 别名(Responses message_start 预填)
     inbound_model: Option<Arc<str>>,
@@ -201,57 +211,26 @@ where
         params.protocol,
         params.drift_usage_scope,
     );
-    if let Some((cache, key, request_fingerprint)) = params.replay_scope {
-        let mut extractor = StreamReplayExtractor::new(cache, key, request_fingerprint);
-        let tapped = stream.inspect(move |result| {
-            if let Ok(bytes) = result {
-                extractor.push(bytes);
-            }
-        });
-        return crate::sse::relay(
-            params.protocol,
-            tapped,
-            params.estimated_input_tokens,
-            params.tool_names,
-            params.signature_model,
-            params.original_claude_request,
-            params.inbound_model.as_deref(),
-        );
-    }
-    if let Some((cache, key, snapshot, request)) = params.ag_replay_scope {
-        let mut extractor = AgStreamReplayExtractor::new(cache, key, snapshot, request);
-        let tapped = stream.inspect(move |result| {
-            if let Ok(bytes) = result {
-                extractor.push(bytes);
-            }
-        });
-        return crate::sse::relay(
-            params.protocol,
-            tapped,
-            params.estimated_input_tokens,
-            params.tool_names,
-            params.signature_model,
-            params.original_claude_request,
-            params.inbound_model.as_deref(),
-        );
-    }
-    if let Some((cache, key, applied)) = params.kimi_replay_scope {
-        let mut extractor = KimiStreamReplayExtractor::new(cache, key, applied);
-        let tapped = stream.inspect(move |result| {
-            if let Ok(bytes) = result {
-                extractor.push(bytes);
-            }
-        });
-        return crate::sse::relay(
-            params.protocol,
-            tapped,
-            params.estimated_input_tokens,
-            params.tool_names,
-            params.signature_model,
-            params.original_claude_request,
-            params.inbound_model.as_deref(),
-        );
-    }
+    let mut push: ReplayPush = match params.replay_tap {
+        ReplayTap::None => Box::new(|_| {}),
+        ReplayTap::Responses(cache, key, request_fingerprint) => {
+            let mut extractor = StreamReplayExtractor::new(cache, key, request_fingerprint);
+            Box::new(move |bytes| extractor.push(bytes))
+        }
+        ReplayTap::Antigravity(cache, key, snapshot, request) => {
+            let mut extractor = AgStreamReplayExtractor::new(cache, key, snapshot, request);
+            Box::new(move |bytes| extractor.push(bytes))
+        }
+        ReplayTap::Kimi(cache, key, applied) => {
+            let mut extractor = KimiStreamReplayExtractor::new(cache, key, applied);
+            Box::new(move |bytes| extractor.push(bytes))
+        }
+    };
+    let stream = stream.inspect(move |result| {
+        if let Ok(bytes) = result {
+            push(bytes);
+        }
+    });
     crate::sse::relay(
         params.protocol,
         stream,
@@ -1187,9 +1166,12 @@ pub(crate) async fn execute_upstream_request(
                     estimated_input_tokens: prepared.estimated_input_tokens,
                     tool_names: prepared.tool_names.clone(),
                     original_claude_request: prepared.original_claude_request.clone(),
-                    replay_scope: prepared.replay_scope.clone(),
-                    ag_replay_scope: None,
-                    kimi_replay_scope: None,
+                    replay_tap: match prepared.replay_scope.clone() {
+                        Some((cache, key, fingerprint)) => {
+                            ReplayTap::Responses(cache, key, fingerprint)
+                        }
+                        None => ReplayTap::None,
+                    },
                     signature_model: prepared.signature_model.clone(),
                     inbound_model: Some(Arc::clone(&prepared.inbound_model)),
                     token_scope: prepared.token_scope.clone(),
@@ -1452,18 +1434,25 @@ pub(crate) async fn deliver_response(
         } else {
             let upstream = executed.upstream.take().expect("上游响应应存在");
             {
-                let ag_scope = prepared.ag_replay_scope.as_ref().map(|(cache, key)| {
-                    (
-                        cache.clone(),
-                        key.clone(),
-                        prepared.ag_replay_snapshot.clone(),
-                        prepared
-                            .body_json
-                            .get("request")
-                            .cloned()
-                            .unwrap_or_else(|| Value::Object(Default::default())),
-                    )
-                });
+                let replay_tap =
+                    if let Some((cache, key, fingerprint)) = prepared.replay_scope.clone() {
+                        ReplayTap::Responses(cache, key, fingerprint)
+                    } else if let Some((cache, key)) = prepared.ag_replay_scope.as_ref() {
+                        ReplayTap::Antigravity(
+                            cache.clone(),
+                            key.clone(),
+                            prepared.ag_replay_snapshot.clone(),
+                            prepared
+                                .body_json
+                                .get("request")
+                                .cloned()
+                                .unwrap_or_else(|| Value::Object(Default::default())),
+                        )
+                    } else if let Some((cache, key, applied)) = prepared.kimi_replay_scope.clone() {
+                        ReplayTap::Kimi(cache, key, applied)
+                    } else {
+                        ReplayTap::None
+                    };
                 relay_with_replay_tap(
                     upstream.body.bytes_stream(),
                     RelayParams {
@@ -1471,9 +1460,7 @@ pub(crate) async fn deliver_response(
                         estimated_input_tokens: prepared.estimated_input_tokens,
                         tool_names: prepared.tool_names.clone(),
                         original_claude_request: prepared.original_claude_request.clone(),
-                        replay_scope: prepared.replay_scope.clone(),
-                        ag_replay_scope: ag_scope,
-                        kimi_replay_scope: prepared.kimi_replay_scope.clone(),
+                        replay_tap,
                         signature_model: prepared.signature_model.clone(),
                         inbound_model: Some(Arc::clone(&prepared.inbound_model)),
                         token_scope: prepared.token_scope.clone(),
