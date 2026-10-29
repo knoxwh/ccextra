@@ -19,7 +19,7 @@ struct GeminiRelayState {
     finished: bool,
     upstream_failed: bool,
     saw_payload: bool,
-    /// 缺失 finishReason 的 clean EOF/[DONE] 时合成终态(Gemini 与 AG 均开启)。
+    /// 缺失 finishReason 的 clean EOF/`[DONE]` 时合成终态(Gemini 与 AG 均开启)。
     synthesize_missing_finish: bool,
 }
 

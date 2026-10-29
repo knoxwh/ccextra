@@ -732,7 +732,7 @@ fn resolve_json_pointer<'a>(root: &'a Value, pointer: &str) -> Option<&'a Value>
     Some(current)
 }
 
-/// 环引用退化:保留 type/nullable/description(超长 description 省略),追加 "See: <name>" 提示
+/// 环引用退化:保留 type/nullable/description(超长 description 省略),追加 `"See: <name>"` 提示
 fn cyclic_ref_fallback(
     node: &Map<String, Value>,
     target: &Value,
@@ -1060,7 +1060,7 @@ fn merge_missing_schema(map: &mut Map<String, Value>, field: &str, incoming: &Va
 }
 
 /// 对齐 CPA flattenAnyOfOneOf(a0fd8448):多分支 anyOf/oneOf 保留;
-/// 单分支 / [T,null] 仍投影; native Schema 载体将 oneOf→anyOf;
+/// 单分支 / `[T,null]` 仍投影; native Schema 载体将 oneOf→anyOf;
 /// required-only 分支用父 properties 具化后留在 union 里。
 fn flatten_any_of_one_of(schema: &mut Value, preserve_one_of: bool, flatten_multi_branch: bool) {
     flatten_any_of_one_of_at(

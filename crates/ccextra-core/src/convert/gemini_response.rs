@@ -90,7 +90,7 @@ pub struct GeminiStreamState {
     prompt_tokens: i64,
     output_tokens: i64,
     cache_read: i64,
-    /// 缓存的 finishReason,供 [DONE] force 使用
+    /// 缓存的 finishReason,供 `[DONE]` force 使用
     finish_reason: String,
 }
 

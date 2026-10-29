@@ -38,7 +38,7 @@ pub fn extract_claude_code_session(headers: &HeaderMap, body: &Value) -> Option<
 }
 
 /// user_id 形态:
-/// - "..._session_<hex-uuid>" 尾缀
+/// - `"..._session_<hex-uuid>"` 尾缀
 /// - JSON 字符串 {"session_id": "..."}
 fn session_id_from_user_id(user_id: &str) -> Option<String> {
     const MARKER: &str = "_session_";

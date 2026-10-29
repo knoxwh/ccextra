@@ -242,7 +242,7 @@ impl ChatRelay {
         self.usage_seen = true;
     }
 
-    /// [DONE] 是 Chat 的显式终态;已开始消息即使缺 finish_reason 也按 end_turn 收尾。
+    /// `[DONE]` 是 Chat 的显式终态;已开始消息即使缺 finish_reason 也按 end_turn 收尾。
     fn finish_done_marker(&mut self) -> Vec<Bytes> {
         if self.finished {
             return Vec::new();

@@ -376,7 +376,7 @@ impl ContextFingerprints {
         }
     }
 
-    /// contents[ci] 起被改写：丢弃覆盖它的前缀缓存（at(k) 只依赖 contents[..k]）。
+    /// `contents[ci]` 起被改写：丢弃覆盖它的前缀缓存（`at(k)` 只依赖 `contents[..k]`）。
     fn invalidate_from(&mut self, ci: usize) {
         let keep = ci + 1;
         if self.hashers.len() > keep {

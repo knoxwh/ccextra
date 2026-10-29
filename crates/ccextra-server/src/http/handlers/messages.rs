@@ -300,7 +300,7 @@ pub(crate) struct PreparedMessageRequest {
     pub encoded_body: bytes::Bytes,
     pub is_stream: bool,
     pub upstream_base_urls: Vec<String>,
-    /// 本轮实际生效的 base_url(多 URL 轮转后记录;内部重试用它,不倒退回 [0])
+    /// 本轮实际生效的 base_url(多 URL 轮转后记录;内部重试用它,不倒退回 `[0]`)
     pub active_base_url: Option<String>,
     pub upstream_key: String,
     /// Antigravity 连接池 scope 用 refresh_token（稳定跨 access 刷新）；其它协议为 None
