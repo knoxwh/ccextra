@@ -38,53 +38,44 @@ pub fn restore_codex_commentary_markers(body: &mut serde_json::Value) -> usize {
     let Some(messages) = body.get_mut("messages").and_then(|m| m.as_array_mut()) else {
         return 0;
     };
+    // 就地改写:无 marker 的消息与块不做拷贝(CPA restored==0 时原样返回 payload)
     let mut restored = 0;
-    let mut kept_messages: Vec<serde_json::Value> = Vec::with_capacity(messages.len());
-    for mut message in messages.drain(..) {
-        let Some(content) = message.get("content").cloned() else {
-            kept_messages.push(message);
-            continue;
+    messages.retain_mut(|message| {
+        let Some(parts) = message.get_mut("content").and_then(|c| c.as_array_mut()) else {
+            return true;
         };
-        let Some(parts) = content.as_array() else {
-            kept_messages.push(message);
-            continue;
-        };
-        let mut kept_parts: Vec<serde_json::Value> = Vec::with_capacity(parts.len());
-        let mut message_modified = false;
-        for part in parts {
-            let is_thinking = part.get("type").and_then(|t| t.as_str()) == Some("thinking");
-            let sig = part.get("signature").and_then(|s| s.as_str()).unwrap_or("");
-            if !is_thinking || !is_codex_commentary_signature_marker(sig) {
-                kept_parts.push(part.clone());
-                continue;
+        if !parts.iter().any(is_commentary_thinking) {
+            return true;
+        }
+        parts.retain_mut(|part| {
+            if !is_commentary_thinking(part) {
+                return true;
             }
             restored += 1;
-            message_modified = true;
-            if let Some(t) = part.get("thinking").and_then(|v| v.as_str()) {
-                if !t.is_empty() {
-                    kept_parts.push(serde_json::json!({"type": "text", "text": t}));
+            let text = part
+                .get("thinking")
+                .and_then(|v| v.as_str())
+                .filter(|t| !t.is_empty())
+                .map(str::to_owned);
+            match text {
+                Some(text) => {
+                    *part = serde_json::json!({"type": "text", "text": text});
+                    true
                 }
+                None => false,
             }
-        }
-        if !message_modified {
-            kept_messages.push(message);
-            continue;
-        }
-        if kept_parts.is_empty() {
-            // 整条消息只剩空 commentary → 丢弃消息(对齐 CPA)
-            continue;
-        }
-        message["content"] = serde_json::Value::Array(kept_parts);
-        kept_messages.push(message);
-    }
-    if restored == 0 {
-        // 还原 drain 的 messages——上面已经 drain 进 kept;若 restored==0
-        // kept_messages 应等于原内容
-        *body.get_mut("messages").unwrap() = serde_json::Value::Array(kept_messages);
-        return 0;
-    }
-    *body.get_mut("messages").unwrap() = serde_json::Value::Array(kept_messages);
+        });
+        // 整条消息只剩空 commentary → 丢弃消息(对齐 CPA)
+        !parts.is_empty()
+    });
     restored
+}
+
+fn is_commentary_thinking(part: &serde_json::Value) -> bool {
+    part.get("type").and_then(|t| t.as_str()) == Some("thinking")
+        && is_codex_commentary_signature_marker(
+            part.get("signature").and_then(|s| s.as_str()).unwrap_or(""),
+        )
 }
 
 /// Kimi 两个观测固定原始长度(对齐 kimiThinkingSignatureLens)
@@ -1880,5 +1871,54 @@ mod tests {
             out[1]["parts"][2]["thoughtSignature"],
             GEMINI_SKIP_THOUGHT_SIGNATURE_VALIDATOR
         );
+    }
+}
+
+#[cfg(test)]
+mod commentary_marker_tests {
+    use super::*;
+    use serde_json::json;
+
+    #[test]
+    fn restore_commentary_markers_rewrites_and_drops() {
+        let mut body = json!({"messages": [
+            {"role": "user", "content": "plain string"},
+            {"role": "assistant", "content": [
+                {"type": "thinking", "thinking": "preamble", "signature": " cpa:commentary:v1 "},
+                {"type": "thinking", "thinking": "real", "signature": "sig"},
+                {"type": "text", "text": "hi"}
+            ]},
+            {"role": "assistant", "content": [
+                {"type": "thinking", "thinking": "", "signature": "cpa:commentary:v1"}
+            ]},
+            {"role": "assistant", "content": []},
+            {"role": "user", "content": [{"type": "text", "text": "next"}]}
+        ]});
+        assert_eq!(restore_codex_commentary_markers(&mut body), 2);
+        assert_eq!(
+            body,
+            json!({"messages": [
+                {"role": "user", "content": "plain string"},
+                {"role": "assistant", "content": [
+                    {"type": "text", "text": "preamble"},
+                    {"type": "thinking", "thinking": "real", "signature": "sig"},
+                    {"type": "text", "text": "hi"}
+                ]},
+                {"role": "assistant", "content": []},
+                {"role": "user", "content": [{"type": "text", "text": "next"}]}
+            ]})
+        );
+    }
+
+    #[test]
+    fn restore_commentary_markers_noop_keeps_body() {
+        let original = json!({"model": "m", "messages": [
+            {"role": "assistant", "content": [{"type": "thinking", "thinking": "t", "signature": "s"}]}
+        ]});
+        let mut body = original.clone();
+        assert_eq!(restore_codex_commentary_markers(&mut body), 0);
+        assert_eq!(body, original);
+        let mut no_messages = json!({"model": "m"});
+        assert_eq!(restore_codex_commentary_markers(&mut no_messages), 0);
     }
 }
