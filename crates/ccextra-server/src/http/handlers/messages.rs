@@ -1245,7 +1245,7 @@ pub(crate) async fn deliver_response(
         let mut retried_ok = false;
 
         // 上游 401:OAuth 凭证强制刷新后重试一次;刷新失败硬失败,不得继续打旧 token
-        if !retried_ok && status.as_u16() == 401 {
+        if status.as_u16() == 401 {
             match prepared.refresh_rejected_token().await {
                 Ok(true) => {
                     tracing::info!(
