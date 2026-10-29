@@ -83,37 +83,29 @@ pub fn claude_inbound_user_agent(headers: &HeaderMap) -> Option<&str> {
 }
 
 /// 订阅 OAuth (`sk-ant-oat*`) 出站时:入站 anthropic-beta 缺 oauth beta 则追加。
-/// 多个同名头按出现顺序合并为一个逗号列表再追加(对齐 CPA normalizedClaudeBetaHeader
-/// 读取 `Values("Anthropic-Beta")` 全量);已含则不动。
+/// 多个同名头按出现顺序合并为一个逗号列表再追加;各项 trim、丢空项(对齐 CPA
+/// normalizedClaudeBetaHeader 读取 `Values("Anthropic-Beta")` 全量后逐项规整);已含则不动。
 pub fn ensure_oauth_beta(headers: &mut HeaderMap) {
     let beta_name = HeaderName::from_static("anthropic-beta");
-    let existing: Vec<&str> = headers
+    let mut betas: Vec<&str> = headers
         .get_all(&beta_name)
         .iter()
         .filter_map(|value| value.to_str().ok())
-        .filter(|value| !value.trim().is_empty())
+        .flat_map(|value| value.split(','))
+        .map(str::trim)
+        .filter(|beta| !beta.is_empty())
         .collect();
-    if existing
+    if betas
         .iter()
-        .any(|value| beta_list_contains(value, OAUTH_BETA))
+        .any(|beta| beta.eq_ignore_ascii_case(OAUTH_BETA))
     {
         return;
     }
-    let merged = existing
-        .into_iter()
-        .chain([OAUTH_BETA])
-        .collect::<Vec<_>>()
-        .join(",");
+    betas.push(OAUTH_BETA);
     // insert 覆盖全部同名旧值
-    if let Ok(value) = HeaderValue::from_str(&merged) {
+    if let Ok(value) = HeaderValue::from_str(&betas.join(",")) {
         headers.insert(beta_name, value);
     }
-}
-
-fn beta_list_contains(list: &str, needle: &str) -> bool {
-    list.split(',')
-        .map(str::trim)
-        .any(|part| part.eq_ignore_ascii_case(needle))
 }
 
 #[cfg(test)]
@@ -164,6 +156,22 @@ mod tests {
         map.append(&name, HeaderValue::from_static("oauth-2025-04-20"));
         ensure_oauth_beta(&mut map);
         assert_eq!(map.get_all(&name).iter().count(), 2);
+    }
+
+    #[test]
+    fn test_ensure_oauth_beta_normalizes_spaces_and_empty_items() {
+        let mut map = HeaderMap::new();
+        let name = HeaderName::from_static("anthropic-beta");
+        map.append(&name, HeaderValue::from_static(" claude-code-20250219 , ,"));
+        map.append(&name, HeaderValue::from_static(""));
+        map.append(&name, HeaderValue::from_static("context-1m-2025-08-07"));
+        ensure_oauth_beta(&mut map);
+        let all: Vec<_> = map.get_all(&name).iter().collect();
+        assert_eq!(all.len(), 1);
+        assert_eq!(
+            all[0].to_str().unwrap(),
+            "claude-code-20250219,context-1m-2025-08-07,oauth-2025-04-20"
+        );
     }
 
     #[test]
