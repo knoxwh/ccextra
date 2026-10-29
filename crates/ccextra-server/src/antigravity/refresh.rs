@@ -162,3 +162,26 @@ pub async fn ensure_credential_fresh_with_ua(
 
     Ok(cred)
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn cred(access_token: &str, expired: &str) -> AntigravityCredential {
+        serde_json::from_value(serde_json::json!({
+            "access_token": access_token,
+            "expired": expired,
+        }))
+        .expect("credential json")
+    }
+
+    #[test]
+    fn usable_requires_fresh_and_not_rejected_token() {
+        let live = cred("tok-live", "2099-01-01T00:00:00Z");
+        assert!(usable(&live, None));
+        assert!(!usable(&live, Some("tok-live")));
+        assert!(usable(&live, Some("other-token")));
+        assert!(!usable(&cred("", "2099-01-01T00:00:00Z"), None));
+        assert!(!usable(&cred("tok", "2000-01-01T00:00:00Z"), None));
+    }
+}

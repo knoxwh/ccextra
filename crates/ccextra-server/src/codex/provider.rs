@@ -155,4 +155,30 @@ mod tests {
             2
         );
     }
+
+    /// 扫描跳过规则:已禁用、access/refresh 皆空、坏 JSON、非 codex type 均不注入
+    #[tokio::test]
+    async fn skips_disabled_empty_and_invalid_credentials() {
+        let dir = tempfile::tempdir().unwrap();
+        let mut disabled = fresh_cred("off@b.c", "");
+        disabled.disabled = true;
+        let mut empty = fresh_cred("empty@b.c", "");
+        empty.access_token = " ".to_string();
+        empty.refresh_token = String::new();
+        let mut other_type = fresh_cred("xai@b.c", "");
+        other_type.r#type = "xai".to_string();
+        for (file, cred) in [
+            ("ok.json", fresh_cred("ok@b.c", "")),
+            ("disabled.json", disabled),
+            ("empty.json", empty),
+            ("other.json", other_type),
+        ] {
+            store::save_to(&dir.path().join(file), &cred).unwrap();
+        }
+        std::fs::write(dir.path().join("bad.json"), "{not json").unwrap();
+
+        let providers = load_codex_providers(dir.path(), Some("direct")).await;
+        let names: Vec<_> = providers.iter().map(|p| p.name.as_str()).collect();
+        assert_eq!(names, ["codex-ok-b-c"]);
+    }
 }

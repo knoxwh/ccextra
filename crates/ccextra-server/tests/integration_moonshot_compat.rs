@@ -26,13 +26,26 @@ async fn test_moonshot_streaming_usage_extraction() {
         frames.push(frame);
     }
 
-    // 验证 message_delta 包含正确的 usage
-    let delta_frame = frames
+    // 按 SSE 帧解析 message_delta 的 data JSON 后断言 usage
+    let delta: serde_json::Value = frames
         .iter()
-        .find(|f| String::from_utf8_lossy(f).contains("message_delta"))
+        .flat_map(|f| {
+            let text = String::from_utf8_lossy(f).into_owned();
+            text.split("\n\n")
+                .filter_map(|event| {
+                    let mut lines = event.lines();
+                    (lines.next()? == "event: message_delta")
+                        .then(|| lines.find_map(|l| l.strip_prefix("data: ")))
+                        .flatten()
+                        .map(str::to_owned)
+                })
+                .collect::<Vec<_>>()
+        })
+        .map(|data| serde_json::from_str(&data).expect("message_delta data is JSON"))
+        .next()
         .expect("should have message_delta");
 
-    let s = String::from_utf8_lossy(delta_frame);
-    assert!(s.contains("\"input_tokens\":120"));
-    assert!(s.contains("\"output_tokens\":10"));
+    assert_eq!(delta["type"], "message_delta");
+    assert_eq!(delta["usage"]["input_tokens"], 120);
+    assert_eq!(delta["usage"]["output_tokens"], 10);
 }
