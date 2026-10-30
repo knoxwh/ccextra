@@ -1647,10 +1647,28 @@ pub(crate) async fn deliver_response(
                     .map_err(|e| AppError::new(anyhow::anyhow!("构造响应失败: {e}")));
             }
         }
-        let payload = converted
-            .and_then(|out| serde_json::to_vec(&out).ok())
-            .map(Bytes::from)
-            .unwrap_or(body_bytes);
+        // 非 Claude 协议必须转换:converted 为 None 表示转换层无输出(非法 JSON、
+        // 缺 choices/response 等形状问题),不得原样透传上游字节(客户端收到非 Anthropic
+        // 形状且状态码 200)。Gemini/AG 的 {"error":…} 由转换层产出空消息,不经此路径。
+        let payload = if !matches!(prepared.route.protocol, Protocol::Claude) {
+            match converted.and_then(|out| serde_json::to_vec(&out).ok()) {
+                Some(bytes) => Bytes::from(bytes),
+                None => {
+                    let preview = String::from_utf8_lossy(&body_bytes[..body_bytes.len().min(200)]);
+                    return Err(AppError::with_status(
+                        axum::http::StatusCode::BAD_GATEWAY,
+                        format!(
+                            "上游返回 200 但响应无法转换为 Anthropic 形状(前 200 字节): {preview}"
+                        ),
+                    ));
+                }
+            }
+        } else {
+            converted
+                .and_then(|out| serde_json::to_vec(&out).ok())
+                .map(Bytes::from)
+                .unwrap_or(body_bytes)
+        };
         Ok(Response::builder()
             .status(status)
             .header(header::CONTENT_TYPE, "application/json")

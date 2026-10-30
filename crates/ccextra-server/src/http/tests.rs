@@ -2785,6 +2785,35 @@ async fn test_empty_base_url_list_rejected() {
     assert!(v["error"]["message"].as_str().unwrap().contains("base_url"));
 }
 
+/// 非 Claude 协议上游返回 200 但 body 非合法 JSON → 502 Anthropic error(不得原样透传)
+#[tokio::test]
+async fn test_non_claude_200_invalid_json_returns_502() {
+    use crate::test_support::TestServer;
+    let server = TestServer::reply(StatusCode::OK, b"not-json{".as_ref()).await;
+    let state = mock_state();
+    let provider: ProviderConfig = yaml_serde::from_str(&format!(
+        "name: badjson\nprotocol: openai_chat\nbase_url: {}\nkey: sk-test\nproxy_url: direct\nmodels:\n  - name: gpt-4\n    alias: badjson\n",
+        server.url
+    ))
+    .unwrap();
+    Arc::make_mut(&mut *state.config.write().await)
+        .providers
+        .push(provider);
+    let response = post_test_request(state, "/v1/messages", "badjson").await;
+    assert_eq!(response.status(), StatusCode::BAD_GATEWAY);
+    let bytes = to_bytes(response.into_body(), 1024 * 1024).await.unwrap();
+    let v: Value = serde_json::from_slice(&bytes).unwrap();
+    assert_eq!(v["type"], "error");
+    assert!(
+        v["error"]["message"]
+            .as_str()
+            .unwrap()
+            .contains("响应无法转换为 Anthropic 形状"),
+        "got {}",
+        v
+    );
+}
+
 async fn post_test_request(state: AppState, path: &str, model: &str) -> axum::response::Response {
     app(state)
         .oneshot(
@@ -3012,7 +3041,7 @@ async fn test_responses_payload_tier_is_serialized_before_input() {
         "/responses",
         StatusCode::OK,
         json!({
-            "id": "resp_routing", "model": "gpt-5",
+            "id": "resp_routing", "object": "response", "model": "gpt-5",
             "output": [{"type": "message", "content": [{"type": "output_text", "text": "ok"}]}],
             "usage": {"input_tokens": 1, "output_tokens": 1}
         })

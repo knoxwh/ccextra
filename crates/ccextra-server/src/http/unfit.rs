@@ -126,8 +126,19 @@ pub fn detect_unfit_from_error(status: u16, body: &str) -> Option<UnfitKind> {
         return Some(UnfitKind::ToolChoiceRefused);
     }
 
-    // tools + reasoning 冲突(Gemini: "thinking" + "tools")
-    if (lower.contains("thinking") || lower.contains("reasoning")) && lower.contains("tool") {
+    // tools + reasoning 冲突(源自 magpie Bedrock 场景:thinking 与 tools 不共存)
+    // 裸 contains("tool")+"reasoning" 过宽:普通错误含两词即触发,永久剥 reasoning
+    // (仅 /reload 清)。要求显式冲突/不支持语义,降低误判。
+    if (lower.contains("thinking") || lower.contains("reasoning"))
+        && lower.contains("tool")
+        && (lower.contains("conflict")
+            || lower.contains("incompatible")
+            || lower.contains("not supported")
+            || lower.contains("unsupported")
+            || lower.contains("cannot")
+            || lower.contains("not allowed")
+            || lower.contains("disabled"))
+    {
         return Some(UnfitKind::ToolsWithoutEffort);
     }
 
@@ -778,5 +789,57 @@ mod tests {
             Protocol::OpenAiResponses
         ));
         assert_eq!(body["reasoning"]["effort"], "low");
+    }
+
+    #[test]
+    fn detect_tools_without_effort_requires_conflict_keyword() {
+        // 真实误触发反例(收紧前会误判):不得触发
+        assert_eq!(
+            detect_unfit_from_error(
+                400,
+                // Anthropic 原文
+                "Expected `thinking` content block but found `tool_use`"
+            ),
+            None,
+        );
+        assert_eq!(
+            detect_unfit_from_error(
+                400,
+                // Kimi 原文
+                "reasoning_content is missing in assistant tool call"
+            ),
+            None,
+        );
+        // 含 "tool" + "reasoning" 但无冲突词 → 不触发
+        assert_eq!(
+            detect_unfit_from_error(
+                400,
+                "The tool 'analyze' requires additional reasoning context"
+            ),
+            None,
+        );
+        // Bedrock 原文正例:含 "not supported" → 触发
+        assert_eq!(
+            detect_unfit_from_error(400, "reasoning is not supported with tools"),
+            Some(UnfitKind::ToolsWithoutEffort),
+        );
+        assert_eq!(
+            detect_unfit_from_error(400, "thinking and tools are incompatible"),
+            Some(UnfitKind::ToolsWithoutEffort),
+        );
+        assert_eq!(
+            detect_unfit_from_error(400, "cannot use reasoning when tools are present"),
+            Some(UnfitKind::ToolsWithoutEffort),
+        );
+        // 422 同样触发
+        assert_eq!(
+            detect_unfit_from_error(422, "tool_calls disabled when thinking is enabled"),
+            Some(UnfitKind::ToolsWithoutEffort),
+        );
+        // 非 400/422 不触发
+        assert_eq!(
+            detect_unfit_from_error(500, "reasoning not supported with tools"),
+            None,
+        );
     }
 }
