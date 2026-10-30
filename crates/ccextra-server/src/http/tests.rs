@@ -2580,6 +2580,80 @@ async fn fallback_attempts_each_url_once() {
     }
 }
 
+/// 61s 后才回响应头的上游:非流式应等到(600s 上限),流式仍按 60s 截断。
+async fn delayed_header_server(body: &'static str) -> crate::test_support::TestServer {
+    crate::test_support::TestServer::spawn(axum::Router::new().fallback(move || async move {
+        tokio::time::sleep(std::time::Duration::from_secs(61)).await;
+        (
+            StatusCode::OK,
+            [(header::CONTENT_TYPE, "application/json")],
+            body,
+        )
+    }))
+    .await
+}
+
+/// 注入单 base_url provider 后发 /v1/messages,返回状态码
+async fn post_delayed(protocol: &str, upstream_model: &str, url: &str, stream: bool) -> StatusCode {
+    let state = mock_state();
+    let provider: ProviderConfig = yaml_serde::from_str(&format!(
+        "name: delayed\nprotocol: {protocol}\nbase_url: {url}\nkey: sk-test\nproxy_url: direct\nmodels:\n  - name: {upstream_model}\n    alias: delayed\n"
+    ))
+    .unwrap();
+    Arc::make_mut(&mut *state.config.write().await)
+        .providers
+        .push(provider);
+    app(state)
+        .oneshot(
+            Request::builder()
+                .uri("/v1/messages")
+                .method("POST")
+                .header("content-type", "application/json")
+                .body(Body::from(
+                    json!({"model": "delayed", "max_tokens": 64, "stream": stream,
+                        "messages": [{"role": "user", "content": "hi"}]})
+                    .to_string(),
+                ))
+                .unwrap(),
+        )
+        .await
+        .unwrap()
+        .status()
+}
+
+#[tokio::test]
+async fn non_stream_waits_past_60s_for_headers_reqwest() {
+    let server = delayed_header_server(
+        r#"{"id":"c1","choices":[{"message":{"role":"assistant","content":"ok"},"finish_reason":"stop"}],"usage":{"prompt_tokens":1,"completion_tokens":1}}"#,
+    )
+    .await;
+    assert_eq!(
+        post_delayed("openai_chat", "gpt-4", &server.url, false).await,
+        StatusCode::OK
+    );
+}
+
+#[tokio::test]
+async fn non_stream_waits_past_60s_for_headers_fingerprint_lane() {
+    let server = delayed_header_server(
+        r#"{"id":"m1","type":"message","role":"assistant","model":"claude-x","content":[{"type":"text","text":"ok"}],"stop_reason":"end_turn","usage":{"input_tokens":1,"output_tokens":1}}"#,
+    )
+    .await;
+    assert_eq!(
+        post_delayed("claude", "claude-x", &server.url, false).await,
+        StatusCode::OK
+    );
+}
+
+#[tokio::test]
+async fn stream_header_wait_still_times_out_at_60s() {
+    let server = delayed_header_server("{}").await;
+    assert_eq!(
+        post_delayed("openai_chat", "gpt-4", &server.url, true).await,
+        StatusCode::REQUEST_TIMEOUT
+    );
+}
+
 #[tokio::test]
 async fn test_codex_provider_sends_account_id_header() {
     let (server, captured) = spawn_captured_server(

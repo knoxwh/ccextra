@@ -16,10 +16,22 @@ pub(crate) const POOL_IDLE_TIMEOUT: Duration = Duration::from_secs(45);
 /// TCP keepalive 首探间隔:半开连接更快被内核发现(指纹 H1 无 h2 ping 时尤其有用)。
 pub(crate) const TCP_KEEPALIVE: Duration = Duration::from_secs(30);
 pub(crate) const CONNECT_TIMEOUT: Duration = Duration::from_secs(10);
-/// send() 上限(等到响应头)。60s:给 GPT max effort / 代理攒首包留余量,
-/// 仍避免无限挂死;流式之后的 chunk idle 走 STREAM_IDLE_TIMEOUT。
+/// 流式 / count_tokens 的 send() 上限(等到响应头)。60s:给 GPT max effort /
+/// 代理攒首包留余量,仍避免无限挂死;流式之后的 chunk idle 走 STREAM_IDLE_TIMEOUT。
 /// 无 Client::timeout,避免掐整条 SSE。
 const SEND_TIMEOUT: Duration = Duration::from_secs(60);
+/// 非流式 send() 上限:上游生成完才回响应头,60s 会截断长生成并触发 URL 回退重发。
+/// 600s 对齐 sub2api `gateway.response_header_timeout` 默认与 Anthropic SDK 10 分钟。
+const NON_STREAM_SEND_TIMEOUT: Duration = Duration::from_secs(600);
+
+/// 按是否流式选等响应头上限(见 [`SEND_TIMEOUT`] / [`NON_STREAM_SEND_TIMEOUT`])
+fn header_wait(is_stream: bool) -> Duration {
+    if is_stream {
+        SEND_TIMEOUT
+    } else {
+        NON_STREAM_SEND_TIMEOUT
+    }
+}
 
 /// 上游请求结果(默认 reqwest 或 Claude Bun 指纹 wreq)。
 #[derive(Debug)]
@@ -629,7 +641,7 @@ impl UpstreamClient {
             for (name, value) in extra_headers {
                 req = req.header(name, value);
             }
-            match send_with_timeout_wreq(req.json(body)).await {
+            match send_with_timeout_wreq(req.json(body), SEND_TIMEOUT).await {
                 Ok(resp) => return Ok(resp),
                 Err(e) if !stale_retried && is_stale_connection(&e) => {
                     tracing::warn!(error = %e, "上游连接失效,丢缓存 Client 后重试一次");
@@ -851,6 +863,7 @@ impl UpstreamClient {
                     api_key,
                     &proxy_key,
                     body,
+                    is_stream,
                     extra_headers,
                     user_agents,
                     inbound_user_agent,
@@ -957,6 +970,7 @@ impl UpstreamClient {
             req.header(reqwest::header::CONTENT_TYPE, "application/json")
                 .body(bytes::Bytes::clone(body)),
             accept_policy,
+            header_wait(is_stream),
         )
         .await?;
 
@@ -975,6 +989,7 @@ impl UpstreamClient {
         api_key: &str,
         proxy_key: &str,
         body: &bytes::Bytes,
+        is_stream: bool,
         extra_headers: &axum::http::HeaderMap,
         user_agents: &crate::http::UserAgentSet,
         inbound_user_agent: Option<&str>,
@@ -994,6 +1009,7 @@ impl UpstreamClient {
         let resp = send_with_timeout_wreq(
             req.header(wreq::header::CONTENT_TYPE, "application/json")
                 .body(bytes::Bytes::clone(body)),
+            header_wait(is_stream),
         )
         .await?;
         let status = resp.status();
@@ -1045,17 +1061,15 @@ fn scrub_outbound_request_headers_wreq(req: &mut wreq::Request) {
 
 pub(crate) async fn send_with_timeout_wreq(
     request: wreq::RequestBuilder,
+    wait: Duration,
 ) -> anyhow::Result<wreq::Response> {
     let (client, built) = request.build_split();
     let mut built = built.map_err(|e| anyhow::anyhow!("构建 fingerprint 上游请求失败: {e}"))?;
     scrub_outbound_request_headers_wreq(&mut built);
-    match tokio::time::timeout(SEND_TIMEOUT, client.execute(built)).await {
+    match tokio::time::timeout(wait, client.execute(built)).await {
         Ok(Ok(resp)) => Ok(resp),
         Ok(Err(e)) => Err(e.into()),
-        Err(_) => Err(anyhow::anyhow!(
-            "上游请求超时 ({}s)",
-            SEND_TIMEOUT.as_secs()
-        )),
+        Err(_) => Err(anyhow::anyhow!("上游请求超时 ({}s)", wait.as_secs())),
     }
 }
 
@@ -1118,22 +1132,21 @@ fn scrub_outbound_request_headers(req: &mut reqwest::Request, accept_policy: Acc
     }
 }
 
-/// send() 等到响应头。流式之后读 body 走 chunk idle,不套 Client::timeout。
+/// send() 等到响应头,上限 `wait`(流式 60s / 非流 600s,见 [`header_wait`])。
+/// 流式之后读 body 走 chunk idle,不套 Client::timeout。
 /// 发送前 scrub 出站头(双 Content-Type / 默认 Accept: */* 等)。
 pub(crate) async fn send_with_timeout(
     request: reqwest::RequestBuilder,
     accept_policy: AcceptScrubPolicy,
+    wait: Duration,
 ) -> anyhow::Result<reqwest::Response> {
     let (client, built) = request.build_split();
     let mut built = built.map_err(|e| anyhow::anyhow!("构建上游请求失败: {e}"))?;
     scrub_outbound_request_headers(&mut built, accept_policy);
-    match tokio::time::timeout(SEND_TIMEOUT, client.execute(built)).await {
+    match tokio::time::timeout(wait, client.execute(built)).await {
         Ok(Ok(resp)) => Ok(resp),
         Ok(Err(e)) => Err(e.into()),
-        Err(_) => Err(anyhow::anyhow!(
-            "上游请求超时 ({}s)",
-            SEND_TIMEOUT.as_secs()
-        )),
+        Err(_) => Err(anyhow::anyhow!("上游请求超时 ({}s)", wait.as_secs())),
     }
 }
 
