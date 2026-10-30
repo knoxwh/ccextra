@@ -2829,10 +2829,11 @@ async fn fallback_attempts_each_url_once() {
     }
 }
 
-/// 61s 后才回响应头的上游:非流式应等到(600s 上限),流式仍按 60s 截断。
+/// 越过 `SEND_TIMEOUT`(生产 60s,测试 3s)才回响应头的上游:
+/// 非流式应等到(600s 上限),流式仍按 `SEND_TIMEOUT` 截断。
 async fn delayed_header_server(body: &'static str) -> crate::test_support::TestServer {
     crate::test_support::TestServer::spawn(axum::Router::new().fallback(move || async move {
-        tokio::time::sleep(std::time::Duration::from_secs(61)).await;
+        tokio::time::sleep(crate::upstream::SEND_TIMEOUT + std::time::Duration::from_secs(1)).await;
         (
             StatusCode::OK,
             [(header::CONTENT_TYPE, "application/json")],
@@ -2871,7 +2872,7 @@ async fn post_delayed(protocol: &str, upstream_model: &str, url: &str, stream: b
 }
 
 #[tokio::test]
-async fn non_stream_waits_past_60s_for_headers_reqwest() {
+async fn non_stream_waits_past_send_timeout_reqwest() {
     let server = delayed_header_server(
         r#"{"id":"c1","choices":[{"message":{"role":"assistant","content":"ok"},"finish_reason":"stop"}],"usage":{"prompt_tokens":1,"completion_tokens":1}}"#,
     )
@@ -2883,7 +2884,7 @@ async fn non_stream_waits_past_60s_for_headers_reqwest() {
 }
 
 #[tokio::test]
-async fn non_stream_waits_past_60s_for_headers_fingerprint_lane() {
+async fn non_stream_waits_past_send_timeout_fingerprint_lane() {
     let server = delayed_header_server(
         r#"{"id":"m1","type":"message","role":"assistant","model":"claude-x","content":[{"type":"text","text":"ok"}],"stop_reason":"end_turn","usage":{"input_tokens":1,"output_tokens":1}}"#,
     )
@@ -2895,7 +2896,7 @@ async fn non_stream_waits_past_60s_for_headers_fingerprint_lane() {
 }
 
 #[tokio::test]
-async fn stream_header_wait_still_times_out_at_60s() {
+async fn stream_header_wait_times_out_at_send_timeout() {
     let server = delayed_header_server("{}").await;
     assert_eq!(
         post_delayed("openai_chat", "gpt-4", &server.url, true).await,

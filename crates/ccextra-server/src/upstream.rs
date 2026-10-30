@@ -19,7 +19,11 @@ pub(crate) const CONNECT_TIMEOUT: Duration = Duration::from_secs(10);
 /// 流式 / count_tokens 的 send() 上限(等到响应头)。60s:给 GPT max effort /
 /// 代理攒首包留余量,仍避免无限挂死;流式之后的 chunk idle 走 STREAM_IDLE_TIMEOUT。
 /// 无 Client::timeout,避免掐整条 SSE。
-const SEND_TIMEOUT: Duration = Duration::from_secs(60);
+#[cfg(not(test))]
+pub(crate) const SEND_TIMEOUT: Duration = Duration::from_secs(60);
+/// 测试构建缩短到 3s:等响应头测试只需越过该值,不必真等 60s(生产值见上)。
+#[cfg(test)]
+pub(crate) const SEND_TIMEOUT: Duration = Duration::from_secs(3);
 /// 非流式 send() 上限:上游生成完才回响应头,60s 会截断长生成并触发 URL 回退重发。
 /// 600s 对齐 sub2api `gateway.response_header_timeout` 默认与 Anthropic SDK 10 分钟。
 const NON_STREAM_SEND_TIMEOUT: Duration = Duration::from_secs(600);
