@@ -39,7 +39,7 @@ xAI Grok 与 Codex 不是独立 protocol。它们使用 OAuth 凭证动态创建
 用户 `models.json`（路径由 `models_file` 指定，默认同目录）。按上游模型 `id` 精确匹配，把 effort 钳到该模型支持的最近档。缺文件或未收录不钳。条目可设 `force_effort` 固定档：凡钳制介入处改写为该值（不钳制）。core 不读文件。
 
 **全局代理与 provider 代理**
-`server.proxy_url` 是默认值；provider `proxy_url` 优先。`"direct"` 或空值表示不走代理。
+`server.proxy_url` 是默认值；provider `proxy_url` 优先。生效代理必须显式配置：`direct`/`none` 表示直连，`http`/`https`/`socks5h` URL 原样使用，`socks5` 改写为 `socks5h`；缺失、空值或其他值为配置错误，不回落环境代理。OAuth 动态 provider 沿用全局代理，有启用凭证时全局代理必填。
 
 **入口认证**
 `secret_key` 启用后，Anthropic API 端点要求 `x-api-key` 或 `Authorization: Bearer`。明文配置会转 bcrypt 并回写。

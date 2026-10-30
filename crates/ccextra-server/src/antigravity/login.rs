@@ -29,7 +29,7 @@ pub struct LoginOptions {
     pub auth_dir: PathBuf,
     pub no_browser: bool,
     pub callback_port: u16,
-    /// 空则继承环境代理
+    /// 取自 `server.proxy_url`;缺失/空值/非法即报错(`direct`/`none` 直连,不读环境代理)
     pub proxy_url: Option<String>,
     /// 覆盖 chat/hub UA；onboard 由其派生。None = REQUEST_UA 缺省。
     pub user_agent: Option<String>,

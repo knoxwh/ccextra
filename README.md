@@ -126,7 +126,7 @@ curl -H "Authorization: Bearer $ANTHROPIC_AUTH_TOKEN" http://127.0.0.1:8222/v1/m
 | 项 | 说明 |
 | :--- | :--- |
 | `models[].alias` | 入站模型名，全局唯一（跨 provider 与同 provider 内均不可重复），可等于其他模型的 `name`；`base_url` 可为回退数组 |
-| `server.proxy_url` / provider `proxy_url` | 后者覆盖前者；`"direct"` = 直连 |
+| `server.proxy_url` / provider `proxy_url` | 后者覆盖前者；必填其一，`"direct"`/`"none"` = 直连，`socks5` 改写为 `socks5h`；缺失/空值/非法值启动或重载报错 |
 | `secret_key` | 入口鉴权；加载时 bcrypt 写回；请求用 `x-api-key` 或 `Bearer` |
 | `payload` | 按模型 glob 覆盖顶层参数，可用 `protocol` 限定 |
 | `prompt_cache_key` | 仅 OpenAI 路径；取 Claude Code 会话 ID，不覆盖已有非空值 |

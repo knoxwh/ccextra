@@ -4,7 +4,7 @@ use crate::http::{AppState, RuntimeConfig};
 use crate::upstream::UpstreamClient;
 use axum::extract::State;
 use axum::Json;
-use ccextra_core::route::validate_providers;
+use ccextra_core::route::{validate_provider_proxies, validate_providers};
 use serde::{Deserialize, Serialize};
 
 /// 热重载结果:收集所有成功与失败项(对齐 magpie syncProjects 错误收集模式)
@@ -37,8 +37,12 @@ pub async fn reload_now(state: &AppState) -> Result<ReloadResult, AppError> {
         Err(e) => return Err(AppError::new(anyhow::anyhow!("配置文件读取失败: {e}"))),
     };
 
-    // 2. 验证 providers(失败记录但尝试继续构建 runtime)
-    let providers_valid = match validate_providers(&data.providers) {
+    // 2. 验证 providers 与生效代理(失败记录但尝试继续构建 runtime;不发布,保留旧配置)
+    let providers_valid = match validate_providers(&data.providers)
+        .and_then(|_| validate_provider_proxies(&data.providers, data.proxy_url.as_deref()))
+        .map_err(anyhow::Error::from)
+        .and_then(|_| data.refresh.validate_oauth_proxy())
+    {
         Ok(_) => {
             result.reloaded.push("providers".into());
             true

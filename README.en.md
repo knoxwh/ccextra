@@ -126,7 +126,7 @@ Full fields: [config.example.yaml](config.example.yaml). Common items:
 | Item | Notes |
 | :--- | :--- |
 | `models[].alias` | Inbound model name; must be unique across providers and must not collide with another model's `name`; `base_url` may be a fallback array |
-| `server.proxy_url` / provider `proxy_url` | Provider overrides server; `"direct"` = no proxy |
+| `server.proxy_url` / provider `proxy_url` | Provider overrides server; one is required, `"direct"`/`"none"` = no proxy, `socks5` is rewritten to `socks5h`; missing / empty / invalid values fail startup and reload |
 | `secret_key` | Entry auth; bcrypt-written on load; requests use `x-api-key` or `Bearer` |
 | `payload` | Glob overrides for top-level params; optional `protocol` scope |
 | `prompt_cache_key` | OpenAI paths only; takes Claude Code session ID; does not overwrite a non-empty value |

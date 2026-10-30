@@ -86,7 +86,7 @@ impl From<RouteError> for AppError {
         match err {
             RouteError::ModelNotFound(_) => Self::not_found(err.to_string()),
             RouteError::AliasConflict(_) => Self::new(err),
-            RouteError::EmptyBaseUrl(_) => Self::new(err),
+            RouteError::EmptyBaseUrl(_) | RouteError::InvalidProxy(..) => Self::new(err),
         }
     }
 }

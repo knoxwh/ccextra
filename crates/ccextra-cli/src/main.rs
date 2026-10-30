@@ -1,4 +1,4 @@
-use anyhow::Result;
+use anyhow::{Context, Result};
 use ccextra_core::cache_stabilization::drift_detector::DriftState;
 use ccextra_core::route::ProviderConfig;
 use ccextra_server::antigravity::{
@@ -208,6 +208,8 @@ async fn main() -> Result<()> {
     tracing::info!("配置加载成功: {} providers", config.providers.len());
 
     let refresh = provider_refresh_config(&cli.config, &config);
+    // OAuth 凭证沿用全局代理:加载前静态校验,缺失/非法即启动失败(与 /reload 一致)
+    refresh.validate_oauth_proxy()?;
 
     // 动态加载 xAI providers
     let xai_auth_dir = pin_auth_dir(
@@ -261,6 +263,10 @@ async fn main() -> Result<()> {
 
     // 静态配置自身先硬校验:跨 provider alias 冲突属用户配置错误,启动即失败
     ccextra_core::route::validate_providers(&config.providers)?;
+    ccextra_core::route::validate_provider_proxies(
+        &config.providers,
+        config.server.proxy_url.as_deref(),
+    )?;
 
     // 合并已知 providers（AG 由后台注入）
     let mut all_providers = merge_providers(config.providers.clone(), Vec::new());
@@ -413,6 +419,12 @@ async fn main() -> Result<()> {
 
 fn load_optional_config(path: &str) -> Option<Config> {
     Config::load(path).ok()
+}
+
+/// 登录命令必须读到配置:代理取 `server.proxy_url`(缺失/非法即报错,见 `ccextra_core::proxy`)。
+/// 读取失败直接报出原因,不当作「未配置代理」。
+fn load_login_config(path: &str) -> Result<Config> {
+    Config::load(path).with_context(|| format!("登录需读取配置 {path} 中的 server.proxy_url"))
 }
 
 fn antigravity_auth_dir_from(config_path: &str, override_dir: Option<String>) -> PathBuf {
@@ -713,10 +725,10 @@ async fn cmd_antigravity_login(
     no_browser: bool,
     callback_port: Option<u16>,
 ) -> Result<()> {
-    let cfg = load_optional_config(config_path);
-    let proxy_url = cfg.as_ref().and_then(|c| c.server.proxy_url.clone());
+    let cfg = load_login_config(config_path)?;
+    let proxy_url = cfg.server.proxy_url.clone();
     let user_agent = Some(
-        build_user_agents(cfg.as_ref().and_then(|c| c.user_agents.as_ref()))
+        build_user_agents(cfg.user_agents.as_ref())
             .antigravity
             .as_str()
             .to_string(),
@@ -778,8 +790,8 @@ async fn cmd_xai_login(
     auth_dir: Option<String>,
     no_browser: bool,
 ) -> Result<()> {
-    let cfg = load_optional_config(config_path);
-    let proxy_url = cfg.as_ref().and_then(|c| c.server.proxy_url.clone());
+    let cfg = load_login_config(config_path)?;
+    let proxy_url = cfg.server.proxy_url.clone();
     let opts = XAILoginOptions {
         auth_dir: xai_auth_dir_from(config_path, auth_dir),
         no_browser,
@@ -836,8 +848,8 @@ async fn cmd_codex_login(
     no_browser: bool,
     callback_port: Option<u16>,
 ) -> Result<()> {
-    let cfg = load_optional_config(config_path);
-    let proxy_url = cfg.as_ref().and_then(|c| c.server.proxy_url.clone());
+    let cfg = load_login_config(config_path)?;
+    let proxy_url = cfg.server.proxy_url.clone();
     let opts = CodexLoginOptions {
         auth_dir: codex_auth_dir_from(config_path, auth_dir),
         no_browser,
@@ -901,8 +913,8 @@ async fn cmd_claude_login(
     no_browser: bool,
     callback_port: Option<u16>,
 ) -> Result<()> {
-    let cfg = load_optional_config(config_path);
-    let proxy_url = cfg.as_ref().and_then(|c| c.server.proxy_url.clone());
+    let cfg = load_login_config(config_path)?;
+    let proxy_url = cfg.server.proxy_url.clone();
     let opts = ClaudeLoginOptions {
         auth_dir: claude_auth_dir_from(config_path, auth_dir),
         no_browser,
@@ -1040,7 +1052,7 @@ mod tests {
                     log_dir: None,
                 },
                 secret: None,
-                upstream: UpstreamClient::new(None),
+                upstream: UpstreamClient::new(Some("direct".into())),
                 user_agents: build_user_agents(None),
                 thinking_registry: Arc::new(vec![]),
             },

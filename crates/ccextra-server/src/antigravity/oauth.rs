@@ -8,32 +8,9 @@ use anyhow::{anyhow, Context, Result};
 use reqwest::Client;
 use serde::Deserialize;
 
-/// 空=继承环境代理;`direct`/`none`=直连;否则走该 URL
-/// 统一 30s 超时(对齐 CPA fetch 路径),防 Google 端点不可达时启动/reload 挂死
+/// 控制面 client:代理规则见 `oauth_common::oauth_http_client`（未配置即报错）
 pub fn http_client(proxy_url: Option<&str>) -> Result<Client> {
-    let trimmed = proxy_url.map(str::trim).unwrap_or("");
-    let mut builder = Client::builder().timeout(std::time::Duration::from_secs(30));
-    if trimmed.is_empty() {
-        return builder.build().context("build antigravity http client");
-    }
-    if trimmed.eq_ignore_ascii_case("direct") || trimmed.eq_ignore_ascii_case("none") {
-        builder = builder.no_proxy();
-        return builder.build().context("build antigravity http client");
-    }
-    let parsed = reqwest::Url::parse(trimmed).context("parse proxy URL failed")?;
-    if parsed.scheme().is_empty() || parsed.host_str().unwrap_or("").is_empty() {
-        return Err(anyhow!("proxy URL missing scheme/host"));
-    }
-    match parsed.scheme() {
-        "socks5" | "socks5h" | "http" | "https" => {}
-        other => return Err(anyhow!("unsupported proxy scheme: {other}")),
-    }
-    let proxy =
-        reqwest::Proxy::all(trimmed).with_context(|| format!("parse proxy URL {trimmed}"))?;
-    builder
-        .proxy(proxy)
-        .build()
-        .context("build antigravity http client")
+    crate::oauth_common::oauth_http_client(proxy_url, "antigravity")
 }
 
 #[derive(Debug, Clone, Deserialize)]
@@ -307,9 +284,11 @@ mod tests {
 
     #[test]
     fn http_client_accepts_direct_and_url() {
-        http_client(None).unwrap();
-        http_client(Some("")).unwrap();
+        // 未配置/空值不再继承环境代理,直接报错
+        assert!(http_client(None).is_err());
+        assert!(http_client(Some("")).is_err());
         http_client(Some("direct")).unwrap();
+        http_client(Some(" NONE ")).unwrap();
         http_client(Some("http://127.0.0.1:7897")).unwrap();
         http_client(Some("socks5://127.0.0.1:1080")).unwrap();
         assert!(http_client(Some("not-a-url")).is_err());

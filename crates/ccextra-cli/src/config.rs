@@ -60,7 +60,7 @@ pub struct UserAgents {
 pub struct ServerConfig {
     pub host: String,
     pub port: u16,
-    /// 全局代理兜底(可选);"direct"/"" = 直连
+    /// 全局代理兜底;provider 未配置代理或存在 OAuth 凭证时必填。`direct`/`none` = 直连,缺失/空值/非法见 `ccextra_core::proxy`
     #[serde(default)]
     pub proxy_url: Option<String>,
 }

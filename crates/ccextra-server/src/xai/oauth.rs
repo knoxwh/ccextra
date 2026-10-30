@@ -59,30 +59,9 @@ struct TokenPollResponse {
     expires_in: i64,
 }
 
+/// 控制面 client:代理规则见 `oauth_common::oauth_http_client`（未配置即报错）
 pub fn http_client(proxy_url: Option<&str>) -> Result<Client> {
-    let trimmed = proxy_url.map(str::trim).unwrap_or("");
-    let mut builder = Client::builder().timeout(Duration::from_secs(30));
-    if trimmed.is_empty() {
-        return builder.build().context("build xai http client");
-    }
-    if trimmed.eq_ignore_ascii_case("direct") || trimmed.eq_ignore_ascii_case("none") {
-        builder = builder.no_proxy();
-        return builder.build().context("build xai http client");
-    }
-    let parsed = reqwest::Url::parse(trimmed).context("parse proxy URL failed")?;
-    if parsed.scheme().is_empty() || parsed.host_str().unwrap_or("").is_empty() {
-        return Err(anyhow!("proxy URL missing scheme/host"));
-    }
-    match parsed.scheme() {
-        "socks5" | "socks5h" | "http" | "https" => {}
-        other => return Err(anyhow!("unsupported proxy scheme: {other}")),
-    }
-    let proxy =
-        reqwest::Proxy::all(trimmed).with_context(|| format!("parse proxy URL {trimmed}"))?;
-    builder
-        .proxy(proxy)
-        .build()
-        .context("build xai http client")
+    crate::oauth_common::oauth_http_client(proxy_url, "xai")
 }
 
 pub fn validate_oauth_endpoint(raw_url: &str, field: &str) -> Result<String> {

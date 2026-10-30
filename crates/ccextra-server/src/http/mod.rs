@@ -70,7 +70,7 @@ pub struct ReloadData {
     pub normalize: NormalizeConfig,
     pub logging: LoggingConfig,
     pub secret: Option<String>,
-    /// 全局代理 URL;"direct"/"" 或 None = 直连
+    /// 全局代理 URL;`direct`/`none` = 直连,缺省/空值/非法为配置错误(见 `ccextra_core::proxy`)
     pub proxy_url: Option<String>,
     /// Antigravity 连接池配置(默认短连接,对齐 CPA connection-pool)
     pub antigravity: Option<crate::upstream::AntigravityConfig>,
@@ -91,6 +91,48 @@ pub struct ProviderRefreshConfig {
     pub antigravity_user_agent: Option<String>,
     pub proxy_url: Option<String>,
     pub static_providers: Vec<ProviderConfig>,
+}
+
+impl ProviderRefreshConfig {
+    /// OAuth 动态 provider(Antigravity/xAI/Codex/Claude)沿用 `server.proxy_url`:
+    /// 任一凭证目录有启用中的凭证时全局代理必须有效。启动与 `/reload` 在加载凭证前静态校验,
+    /// 否则 token 刷新失败只会逐个 warn 跳过凭证,配置错误被吞掉。
+    pub fn validate_oauth_proxy(&self) -> anyhow::Result<()> {
+        let Err(e) = ccextra_core::proxy::parse_proxy(self.proxy_url.as_deref()) else {
+            return Ok(());
+        };
+        // 各目录启用中的凭证数;目录缺失或读取失败按 0(与加载器一致)
+        let enabled =
+            |dir: &Option<std::path::PathBuf>,
+             count: &dyn Fn(&std::path::Path) -> anyhow::Result<usize>| {
+                dir.as_deref().map_or(0, |d| count(d).unwrap_or(0))
+            };
+        let n = enabled(&self.auth_dir, &|d| {
+            Ok(crate::antigravity::list(d)?
+                .iter()
+                .filter(|(_, c)| !c.disabled)
+                .count())
+        }) + enabled(&self.xai_auth_dir, &|d| {
+            Ok(crate::xai::list(d)?
+                .iter()
+                .filter(|(_, c)| !c.disabled)
+                .count())
+        }) + enabled(&self.codex_auth_dir, &|d| {
+            Ok(crate::codex::list(d)?
+                .iter()
+                .filter(|(_, c)| !c.disabled)
+                .count())
+        }) + enabled(&self.claude_auth_dir, &|d| {
+            Ok(crate::claude::list(d)?
+                .iter()
+                .filter(|(_, c)| !c.disabled)
+                .count())
+        });
+        if n > 0 {
+            anyhow::bail!("{n} 个 OAuth 凭证沿用 server.proxy_url,代理配置错误: {e}");
+        }
+        Ok(())
+    }
 }
 
 /// 统一不可变配置快照(对齐阶段 D 规格)

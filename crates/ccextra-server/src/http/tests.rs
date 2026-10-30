@@ -177,7 +177,7 @@ fn mock_state() -> AppState {
             log_dir: None,
         },
         secret: None,
-        upstream: UpstreamClient::new(None),
+        upstream: UpstreamClient::new(Some("direct".into())),
         user_agents: test_user_agents(),
         thinking_registry: Arc::new(vec![]),
     };
@@ -1453,9 +1453,140 @@ async fn test_reload_applies_normalize_and_proxy() {
     assert!(rt.logging.request_body, "logging 应随 /reload 更新");
     assert_eq!(
         rt.upstream.resolve_proxy_for_test(None),
-        "socks5://127.0.0.1:1080",
+        // socks5 规范化为 socks5h(代理端解析 DNS)
+        "socks5h://127.0.0.1:1080",
         "全局代理应随 /reload 生效"
     );
+}
+
+/// 代理非法时 /reload 失败且保留旧配置(对齐 CPA proxyutil.Parse 报错语义)。
+#[tokio::test]
+async fn test_reload_rejects_invalid_proxy_keeps_old() {
+    let mut state = mock_state();
+    state.reload = Arc::new(|| {
+        Box::pin(async {
+            Ok(ReloadData {
+                refresh: ProviderRefreshConfig::default(),
+                providers: vec![],
+                payload_rules: vec![],
+                normalize: NormalizeConfig {
+                    enabled: false,
+                    drift_detector: false,
+                    drift_tools_description: false,
+                },
+                logging: LoggingConfig {
+                    level: "info".into(),
+                    request_body: false,
+                    log_dir: None,
+                },
+                secret: None,
+                proxy_url: Some("ftp://127.0.0.1:21".into()),
+                antigravity: None,
+                user_agents: test_user_agents(),
+                thinking_registry: Arc::new(vec![]),
+            })
+        })
+    });
+    let config = state.config.clone();
+    let req = Request::builder()
+        .uri("/reload")
+        .method("POST")
+        .body(Body::empty())
+        .unwrap();
+    // reload 约定:校验失败仍回 200,在 failed 中列出且 published=false
+    let resp = app(state).oneshot(req).await.unwrap();
+    let body = axum::body::to_bytes(resp.into_body(), usize::MAX)
+        .await
+        .unwrap();
+    let json: serde_json::Value = serde_json::from_slice(&body).unwrap();
+    assert_eq!(json["published"], false, "{json}");
+    let snapshot = config.read().await;
+    assert_eq!(
+        snapshot.runtime.upstream.resolve_proxy_for_test(None),
+        "direct",
+        "非法代理不得发布,旧配置保留"
+    );
+}
+
+/// OAuth 凭证沿用全局代理:有启用凭证而全局缺失/非法时校验失败;无凭证或已禁用则放行。
+#[test]
+fn test_validate_oauth_proxy_requires_global_when_credentials_exist() {
+    let dir = tempfile::tempdir().unwrap();
+    let cfg = |proxy: Option<&str>| ProviderRefreshConfig {
+        auth_dir: Some(dir.path().to_path_buf()),
+        proxy_url: proxy.map(Into::into),
+        ..Default::default()
+    };
+    // 空目录:不需要全局代理
+    cfg(None).validate_oauth_proxy().unwrap();
+    let cred = dir.path().join("antigravity-a.json");
+    std::fs::write(&cred, r#"{"refresh_token":"r","disabled":true}"#).unwrap();
+    cfg(None).validate_oauth_proxy().unwrap();
+    std::fs::write(&cred, r#"{"refresh_token":"r"}"#).unwrap();
+    let err = cfg(None).validate_oauth_proxy().unwrap_err().to_string();
+    assert!(err.contains("未配置代理"), "{err}");
+    assert!(cfg(Some("")).validate_oauth_proxy().is_err());
+    assert!(cfg(Some("ftp://x")).validate_oauth_proxy().is_err());
+    cfg(Some("direct")).validate_oauth_proxy().unwrap();
+    cfg(Some("socks5://127.0.0.1:1080"))
+        .validate_oauth_proxy()
+        .unwrap();
+}
+
+/// /reload:目录有 Antigravity 凭证而全局代理缺失 → 不发布,保留旧快照。
+#[tokio::test]
+async fn test_reload_rejects_oauth_credentials_without_proxy() {
+    let dir = tempfile::tempdir().unwrap();
+    std::fs::write(
+        dir.path().join("antigravity-a.json"),
+        r#"{"refresh_token":"r"}"#,
+    )
+    .unwrap();
+    let auth_dir = dir.path().to_path_buf();
+    let mut state = mock_state();
+    state.reload = Arc::new(move || {
+        let auth_dir = auth_dir.clone();
+        Box::pin(async move {
+            Ok(ReloadData {
+                refresh: ProviderRefreshConfig {
+                    auth_dir: Some(auth_dir),
+                    ..Default::default()
+                },
+                providers: vec![],
+                payload_rules: vec![],
+                normalize: NormalizeConfig {
+                    enabled: true,
+                    drift_detector: false,
+                    drift_tools_description: false,
+                },
+                logging: LoggingConfig {
+                    level: "info".into(),
+                    request_body: false,
+                    log_dir: None,
+                },
+                secret: None,
+                proxy_url: None,
+                antigravity: None,
+                user_agents: test_user_agents(),
+                thinking_registry: Arc::new(vec![]),
+            })
+        })
+    });
+    let config = state.config.clone();
+    let version = config.read().await.version;
+    let req = Request::builder()
+        .uri("/reload")
+        .method("POST")
+        .body(Body::empty())
+        .unwrap();
+    let resp = app(state).oneshot(req).await.unwrap();
+    let body = axum::body::to_bytes(resp.into_body(), usize::MAX)
+        .await
+        .unwrap();
+    let json: serde_json::Value = serde_json::from_slice(&body).unwrap();
+    assert_eq!(json["published"], false, "{json}");
+    assert!(json["failed"].to_string().contains("未配置代理"), "{json}");
+    assert_eq!(config.read().await.version, version, "旧快照保留");
 }
 
 /// 上游等待释放信号时 reload 必须完成,不能依赖固定延迟制造并发窗口。

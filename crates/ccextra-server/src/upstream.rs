@@ -502,22 +502,19 @@ impl UpstreamClient {
         self.global_proxy.as_deref()
     }
 
-    /// 解析最终代理:provider 覆盖 > 全局 > 直连
-    pub(crate) fn resolve_proxy<'a>(&'a self, provider_proxy: Option<&'a str>) -> String {
-        match provider_proxy {
-            Some(p) if !p.is_empty() && p != "direct" => p.to_string(),
-            Some(_) => "direct".to_string(), // "direct"/"" → 直连
-            None => self
-                .global_proxy
-                .clone()
-                .unwrap_or_else(|| "direct".to_string()),
-        }
+    /// 解析最终代理键:provider 覆盖 > 全局;都缺省或非法为错误(见 `ccextra_core::proxy`)。
+    /// 启动与 /reload 已校验,这里是请求时兜底防线。
+    pub(crate) fn resolve_proxy(&self, provider_proxy: Option<&str>) -> anyhow::Result<String> {
+        ccextra_core::proxy::resolve_proxy(provider_proxy, self.global_proxy.as_deref())
+            .map(|p| p.key().to_owned())
+            .map_err(|e| anyhow::anyhow!("{e}"))
     }
 
     /// 暴露 resolve_proxy 供 crate 内测试断言(如 /reload 后全局代理是否生效)
     #[cfg(test)]
     pub(crate) fn resolve_proxy_for_test(&self, provider_proxy: Option<&str>) -> String {
         self.resolve_proxy(provider_proxy)
+            .unwrap_or_else(|e| format!("error: {e}"))
     }
 
     /// 按最终代理 + 协议取(或构建)client
@@ -628,7 +625,7 @@ impl UpstreamClient {
         extra_headers: &axum::http::HeaderMap,
         body: &serde_json::Value,
     ) -> anyhow::Result<wreq::Response> {
-        let proxy_key = self.resolve_proxy(provider_proxy);
+        let proxy_key = self.resolve_proxy(provider_proxy)?;
         let mut stale_retried = false;
         loop {
             #[cfg(test)]
@@ -668,7 +665,10 @@ impl UpstreamClient {
         api_key: &str,
         pool_refresh_token: Option<&str>,
     ) {
-        let proxy_key = self.resolve_proxy(provider_proxy);
+        // 代理无效时请求本身已失败,无缓存 Client 可丢
+        let Ok(proxy_key) = self.resolve_proxy(provider_proxy) else {
+            return;
+        };
         if crate::claude_tls_fp::should_use_fingerprint_lane(matches!(protocol, Protocol::Claude)) {
             // 指纹车道 request_once_fp 固定 no_redirect=false
             let key: FpClientCacheKey = (proxy_key, false);
@@ -846,7 +846,7 @@ impl UpstreamClient {
     ) -> anyhow::Result<UpstreamResponse> {
         #[cfg(test)]
         self.attempts.lock().unwrap().push(base_url.to_owned());
-        let proxy_key = self.resolve_proxy(provider_proxy);
+        let proxy_key = self.resolve_proxy(provider_proxy)?;
         // chatgpt-account-id 仅 Codex OAuth 订阅请求携带:禁 redirect + zstd 压缩标记
         let codex_subscription = extra_headers.contains_key("chatgpt-account-id");
         let cred_scope = ant_credential_scope(
@@ -1491,7 +1491,7 @@ mod tests {
             .await;
             let addr: std::net::SocketAddr =
                 server.url.trim_start_matches("http://").parse().unwrap();
-            let client = UpstreamClient::new(None);
+            let client = UpstreamClient::new(Some("direct".into()));
             client.clients.lock().unwrap().insert(
                 ("direct".into(), false, false, String::new()),
                 Client::builder()
@@ -1809,7 +1809,7 @@ mod tests {
                 axum::http::header::CONTENT_TYPE,
                 "application/json; charset=utf-8".parse().unwrap(),
             );
-            let result = UpstreamClient::new(None)
+            let result = UpstreamClient::new(Some("direct".into()))
                 .request(
                     &server.url,
                     "sk-test",
@@ -1879,26 +1879,38 @@ mod tests {
 
     #[test]
     fn test_proxy_priority() {
-        // provider 覆盖 > 全局 > 直连
+        // provider 覆盖 > 全局;都缺省、空值或非法为错误(不再静默直连)
         let cases = [
             (
                 Some("http://global-proxy:8080"),
                 Some("http://provider-proxy:9090"),
-                "http://provider-proxy:9090",
+                Some("http://provider-proxy:9090"),
             ),
-            (Some("http://global-proxy:8080"), Some("direct"), "direct"),
-            (Some("http://global-proxy:8080"), Some(""), "direct"),
+            (
+                Some("http://global-proxy:8080"),
+                Some("direct"),
+                Some("direct"),
+            ),
+            // 回归:none/DIRECT 曾被 reqwest 补成 http://none:80
+            (
+                Some("http://global-proxy:8080"),
+                Some(" NONE "),
+                Some("direct"),
+            ),
+            (Some("http://global-proxy:8080"), Some(""), None),
             (
                 Some("http://global-proxy:8080"),
                 None,
-                "http://global-proxy:8080",
+                Some("http://global-proxy:8080"),
             ),
-            (None, None, "direct"),
+            (Some("socks5://g:1080"), None, Some("socks5h://g:1080")),
+            (None, Some("127.0.0.1:7897"), None),
+            (None, None, None),
         ];
         for (global, provider, expected) in cases {
             let client = UpstreamClient::new(global.map(Into::into));
             assert_eq!(
-                client.resolve_proxy(provider),
+                client.resolve_proxy(provider).ok().as_deref(),
                 expected,
                 "global={global:?}, provider={provider:?}"
             );
@@ -1906,8 +1918,20 @@ mod tests {
     }
 
     #[test]
+    fn socks5h_proxy_key_builds_both_lanes() {
+        // socks5 被规范为 socks5h:reqwest 与 wreq 车道都须能用该键建 client
+        let client = UpstreamClient::new(Some("socks5://127.0.0.1:1080".into()));
+        let key = client.resolve_proxy(None).unwrap();
+        assert_eq!(key, "socks5h://127.0.0.1:1080");
+        client
+            .client_for(&key, Protocol::OpenAiChat, false, "")
+            .unwrap();
+        client.fp_client_for(&key, false).unwrap();
+    }
+
+    #[test]
     fn drop_pooled_client_removes_cached_reqwest_and_fp() {
-        let client = UpstreamClient::new(None);
+        let client = UpstreamClient::new(Some("direct".into()));
         client
             .client_for("direct", Protocol::OpenAiChat, false, "")
             .unwrap();
@@ -2032,7 +2056,7 @@ mod tests {
                 drop(listener);
                 None
             };
-            let client = UpstreamClient::new(None);
+            let client = UpstreamClient::new(Some("direct".into()));
             client.clients.lock().unwrap().insert(
                 ("direct".into(), false, false, String::new()),
                 Client::builder()
@@ -2071,7 +2095,7 @@ mod tests {
                         .unwrap();
                 }
             });
-            let client = UpstreamClient::new(None);
+            let client = UpstreamClient::new(Some("direct".into()));
             let result = tokio::time::timeout(
                 std::time::Duration::from_secs(5),
                 send_test_request(&client, addr, &mock_user_agents()),
@@ -2105,7 +2129,7 @@ mod tests {
                         .unwrap();
                 }
             });
-            let client = UpstreamClient::new(None);
+            let client = UpstreamClient::new(Some("direct".into()));
             let url = format!("http://{addr}/v1/messages/count_tokens");
             let body = serde_json::json!({"model": "claude-sonnet-4-5", "messages": []});
             let result = tokio::time::timeout(
@@ -2158,7 +2182,7 @@ mod tests {
             axum::serve(source_listener, app).await.unwrap();
         });
 
-        let client = UpstreamClient::new(None);
+        let client = UpstreamClient::new(Some("direct".into()));
         let mut extra = axum::http::HeaderMap::new();
         extra.insert(
             axum::http::HeaderName::from_static("chatgpt-account-id"),
@@ -2223,7 +2247,7 @@ mod tests {
             axum::serve(source_listener, app).await.unwrap();
         });
 
-        let client = UpstreamClient::new(None);
+        let client = UpstreamClient::new(Some("direct".into()));
         let body = serde_json::json!({"model": "gpt-5.6-terra", "input": []});
         let resp = client
             .request(
@@ -2253,7 +2277,7 @@ mod tests {
 
     #[test]
     fn test_client_caching() {
-        let client = UpstreamClient::new(None);
+        let client = UpstreamClient::new(Some("direct".into()));
         let _c1 = client
             .client_for("direct", Protocol::OpenAiChat, false, "")
             .unwrap();
@@ -2272,7 +2296,7 @@ mod tests {
 
     #[test]
     fn test_client_different_proxies() {
-        let client = UpstreamClient::new(None);
+        let client = UpstreamClient::new(Some("direct".into()));
         let _c1 = client
             .client_for("direct", Protocol::OpenAiChat, false, "")
             .unwrap();
@@ -2287,7 +2311,7 @@ mod tests {
 
     #[test]
     fn test_claude_fp_lane_isolates_client_pool() {
-        let client = UpstreamClient::new(None);
+        let client = UpstreamClient::new(Some("direct".into()));
         let _default = client
             .client_for("direct", Protocol::Claude, false, "")
             .unwrap();
@@ -2299,7 +2323,7 @@ mod tests {
     #[test]
     fn test_antigravity_short_connection_isolation() {
         // Antigravity 默认短连接:缓存键独立于其他协议(#ant 后缀)
-        let client = UpstreamClient::new(None);
+        let client = UpstreamClient::new(Some("direct".into()));
         let _c1 = client
             .client_for("direct", Protocol::Antigravity, false, "")
             .unwrap();
@@ -2317,7 +2341,7 @@ mod tests {
         use super::AntigravityConfig;
         let cfg: AntigravityConfig =
             yaml_serde::from_str("connection-pool:\n  enabled: true").unwrap();
-        let client = UpstreamClient::with_ant_pool(None, Some(&cfg));
+        let client = UpstreamClient::with_ant_pool(Some("direct".into()), Some(&cfg));
         assert!(!client.ant_pool.short_mode);
         // refresh 优先：同一 access、不同 refresh → 不同池；access 轮换、refresh 不变 → 同池
         let scope_a =
@@ -2347,7 +2371,7 @@ mod tests {
             .unwrap();
         assert_eq!(client.clients.lock().unwrap().len(), 2);
         // 短连接模式忽略 scope，共用一个 AG 短连接条目
-        let short = UpstreamClient::new(None);
+        let short = UpstreamClient::new(Some("direct".into()));
         let _s1 = short
             .client_for("direct", Protocol::Antigravity, false, &scope_a)
             .unwrap();
@@ -2435,7 +2459,7 @@ mod tests {
             if subscription {
                 extra.insert("chatgpt-account-id", "acct-123".parse().unwrap());
             }
-            let response = UpstreamClient::new(None)
+            let response = UpstreamClient::new(Some("direct".into()))
                 .request(
                     &server.url,
                     "sk-test",

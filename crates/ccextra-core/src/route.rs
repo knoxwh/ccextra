@@ -46,6 +46,9 @@ pub enum RouteError {
 
     #[error("provider {0} 未配置 base_url")]
     EmptyBaseUrl(String),
+
+    #[error("{0} 代理配置错误: {1}")]
+    InvalidProxy(String, crate::proxy::ProxyError),
 }
 
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
@@ -58,7 +61,7 @@ pub struct ProviderConfig {
     )]
     base_url: Vec<String>,
     pub key: String,
-    /// 覆盖全局代理;Some("direct") = 直连(缺省 = 用全局)
+    /// 覆盖全局代理;`direct`/`none` = 直连,缺省 = 用全局(全局也缺省为配置错误,见 [`crate::proxy`])
     #[serde(default)]
     pub proxy_url: Option<String>,
     /// 注入派生 prompt_cache_key(provider 级开关,默认 false;
@@ -206,6 +209,23 @@ pub fn validate_providers(providers: &[ProviderConfig]) -> Result<(), RouteError
     Ok(())
 }
 
+/// 校验全局代理(若配置)与每个 provider 的生效代理(provider 覆盖,否则全局)。
+/// 启动与 `/reload` 共用;缺省或非法均为配置错误(见 [`crate::proxy`])。
+pub fn validate_provider_proxies(
+    providers: &[ProviderConfig],
+    global_proxy: Option<&str>,
+) -> Result<(), RouteError> {
+    if global_proxy.is_some() {
+        crate::proxy::parse_proxy(global_proxy)
+            .map_err(|e| RouteError::InvalidProxy("server.proxy_url".into(), e))?;
+    }
+    for provider in providers {
+        crate::proxy::resolve_proxy(provider.proxy_url.as_deref(), global_proxy)
+            .map_err(|e| RouteError::InvalidProxy(format!("provider {}", provider.name), e))?;
+    }
+    Ok(())
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -275,6 +295,32 @@ models:
         let providers: Vec<ProviderConfig> = yaml_serde::from_str(yaml).unwrap();
         let err = validate_providers(&providers).unwrap_err();
         assert!(matches!(err, RouteError::EmptyBaseUrl(_)));
+    }
+
+    #[test]
+    fn test_validate_provider_proxies() {
+        let yaml = r#"
+- name: inherit
+  protocol: claude
+  base_url: "https://a.com"
+  key: sk-a
+  models: []
+- name: own
+  protocol: claude
+  base_url: "https://b.com"
+  key: sk-b
+  proxy_url: direct
+  models: []
+"#;
+        let providers: Vec<ProviderConfig> = yaml_serde::from_str(yaml).unwrap();
+        // 全局有效:inherit 继承全局,own 直连
+        validate_provider_proxies(&providers, Some("http://127.0.0.1:7897")).unwrap();
+        // 全局缺失:inherit 无可用代理 → 报错并指名 provider
+        let err = validate_provider_proxies(&providers, None).unwrap_err();
+        assert!(matches!(err, RouteError::InvalidProxy(ref n, _) if n == "provider inherit"));
+        // 全局非法:即便所有 provider 自带代理也报错
+        let err = validate_provider_proxies(&providers[1..], Some("ftp://x")).unwrap_err();
+        assert!(matches!(err, RouteError::InvalidProxy(ref n, _) if n == "server.proxy_url"));
     }
 
     #[test]

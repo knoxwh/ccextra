@@ -272,7 +272,7 @@ mod tests {
         let ok_base = spawn_ok_models_server().await;
         let bases = [format!("http://{addr}"), ok_base.url.clone()];
         let base_refs: Vec<&str> = bases.iter().map(String::as_str).collect();
-        let models = fetch_models_from(&base_refs, "tok", None, None, None, &[])
+        let models = fetch_models_from(&base_refs, "tok", None, Some("direct"), None, &[])
             .await
             .unwrap();
         assert_eq!(models.len(), 1);
@@ -288,7 +288,7 @@ mod tests {
         )
         .await;
         let filter: Vec<String> = vec!["gemini-3.8-*".into()];
-        let models = fetch_models_from(&[&server.url], "tok", None, None, None, &filter)
+        let models = fetch_models_from(&[&server.url], "tok", None, Some("direct"), None, &filter)
             .await
             .unwrap();
         assert_eq!(models.len(), 1);
@@ -296,7 +296,7 @@ mod tests {
 
         let no_match: Vec<String> = vec!["zzz-*".into()];
         assert!(
-            fetch_models_from(&[&server.url], "tok", None, None, None, &no_match)
+            fetch_models_from(&[&server.url], "tok", None, Some("direct"), None, &no_match)
                 .await
                 .is_err()
         );

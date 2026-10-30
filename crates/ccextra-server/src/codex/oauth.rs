@@ -7,7 +7,6 @@ use anyhow::{anyhow, Context, Result};
 use reqwest::Client;
 use serde::Deserialize;
 use sha2::{Digest, Sha256};
-use std::time::Duration;
 
 #[derive(Debug, Clone, Deserialize)]
 pub struct TokenData {
@@ -63,31 +62,9 @@ pub fn build_auth_url(state: &str, redirect_uri: &str, pkce: &PkceCodes) -> Stri
     format!("{}?{}", AUTH_URL, query.join("&"))
 }
 
-/// 与项目 xai/antigravity 相同的代理感知 HTTP 客户端
+/// 控制面 client:代理规则见 `oauth_common::oauth_http_client`（未配置即报错）
 pub fn http_client(proxy_url: Option<&str>) -> Result<Client> {
-    let trimmed = proxy_url.map(str::trim).unwrap_or("");
-    let mut builder = Client::builder().timeout(Duration::from_secs(30));
-    if trimmed.is_empty() {
-        return builder.build().context("build codex http client");
-    }
-    if trimmed.eq_ignore_ascii_case("direct") || trimmed.eq_ignore_ascii_case("none") {
-        builder = builder.no_proxy();
-        return builder.build().context("build codex http client");
-    }
-    let parsed = reqwest::Url::parse(trimmed).context("parse proxy URL failed")?;
-    if parsed.scheme().is_empty() || parsed.host_str().unwrap_or("").is_empty() {
-        return Err(anyhow!("proxy URL missing scheme/host"));
-    }
-    match parsed.scheme() {
-        "socks5" | "socks5h" | "http" | "https" => {}
-        other => return Err(anyhow!("unsupported proxy scheme: {other}")),
-    }
-    let proxy =
-        reqwest::Proxy::all(trimmed).with_context(|| format!("parse proxy URL {trimmed}"))?;
-    builder
-        .proxy(proxy)
-        .build()
-        .context("build codex http client")
+    crate::oauth_common::oauth_http_client(proxy_url, "codex")
 }
 
 /// 授权码换 token (对齐 CPA ExchangeCodeForTokens)

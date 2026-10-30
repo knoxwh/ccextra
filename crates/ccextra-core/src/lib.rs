@@ -4,6 +4,7 @@
 // - cache_stabilization/ & normalize: 缓存稳定化与归一化管线
 // - convert/: Claude / OpenAI Chat / Responses / Gemini / Antigravity 协议转换
 // - route/: model → provider 路由决策
+// - proxy: 代理配置解析(数据面与 OAuth 共用)
 // - session/: 会话身份派生
 // - doom_loop: Grok doom loop 检测纯逻辑
 
@@ -12,6 +13,7 @@ pub mod convert;
 pub mod doom_loop;
 pub mod normalize;
 pub mod prompt_cache;
+pub mod proxy;
 pub mod route;
 pub mod secret;
 pub mod session;

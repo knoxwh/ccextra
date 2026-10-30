@@ -46,7 +46,7 @@ ccextra 将 Anthropic Messages 入口接到不同上游协议，同时尽量保�
 
 ## 路由与配置
 
-`alias` 优先匹配；上游真实模型名是回退匹配，便于 `count_tokens` 等辅助请求。重复 alias（跨 provider 或同 provider 内）在启动或重载校验时失败；provider `name` 可重复，路由结果携带命中 provider 的下标，不按名二次查找。`base_url` 支持列表：messages 路径遇网络错误、429 或 5xx（含 Cloudflare 52x）在同轮内立即切换后续地址，耗尽后快速失败，不做本地退避（退避交客户端，`Retry-After` 透传）；OAuth/token refresh 的 5xx 可重试退避（Claude / Antigravity / Codex / xAI）属于凭证层，不参与 messages URL 轮转。provider 代理优先于全局代理，`"direct"` 或空值不使用代理。
+`alias` 优先匹配；上游真实模型名是回退匹配，便于 `count_tokens` 等辅助请求。重复 alias（跨 provider 或同 provider 内）在启动或重载校验时失败；provider `name` 可重复，路由结果携带命中 provider 的下标，不按名二次查找。`base_url` 支持列表：messages 路径遇网络错误、429 或 5xx（含 Cloudflare 52x）在同轮内立即切换后续地址，耗尽后快速失败，不做本地退避（退避交客户端，`Retry-After` 透传）；OAuth/token refresh 的 5xx 可重试退避（Claude / Antigravity / Codex / xAI）属于凭证层，不参与 messages URL 轮转。provider 代理优先于全局代理；生效代理必须显式配置（对齐 CPA `proxyutil.Parse` 的报错语义）：仅 `direct`/`none`（忽略大小写与首尾空白）表示直连，`http`/`https`/`socks5h` 原样使用，`socks5` 改写为 `socks5h`（reqwest/wreq 的 `socks5` 在本地解析 DNS），缺失、空值或其他值均为配置错误，启动失败、`/reload` 失败并保留旧快照；任何路径都不读取环境变量或系统代理。Antigravity/xAI/Codex/Claude 动态 provider 沿用 `server.proxy_url`：任一凭证目录有启用凭证时，启动与 `/reload` 在加载凭证前先校验全局代理，避免 token 刷新失败被逐个告警跳过。OAuth 登录/刷新命令同样使用配置的代理，配置读取失败或代理缺失时明确报错。
 
 配置重载替换 providers、payload、normalize、认证、全局 HTTP client、User-Agent 和 reasoning 注册表。`logging.level` 在启动时创建 `EnvFilter`，因此不能热改。
 

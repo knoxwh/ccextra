@@ -3,7 +3,7 @@
 server:
   host: "127.0.0.1"
   port: 8222
-  # 可选；全局代理兜底，"direct" 表示不走代理
+  # 全局代理兜底；provider 未配置时必填。"direct"/"none" 直连，支持 http/https/socks5h（socks5 改写为 socks5h），缺失/空值/非法值报错
   proxy_url: "http://127.0.0.1:7897"
 
 # User-Agent 自定义(可选)。以下为默认值。
@@ -60,7 +60,7 @@ providers:
     protocol: claude
     base_url: https://xxx
     key: sk-ant-xxx
-    # 可选；覆盖全局代理，"direct" 表示不走代理
+    # 可选；覆盖全局代理，"direct"/"none" 直连，空字符串视为配置错误
     proxy_url: "direct"
     models:
       - name: claude-opus-5

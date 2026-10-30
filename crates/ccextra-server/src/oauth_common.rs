@@ -13,6 +13,23 @@ use std::sync::{Arc, Mutex, OnceLock};
 #[cfg(unix)]
 use std::os::unix::fs::{OpenOptionsExt, PermissionsExt};
 
+/// 四个 OAuth 模块共用的控制面 HTTP client:30s 总超时(对齐 CPA fetch 路径,
+/// 防端点不可达时启动/reload 挂死);代理按 `ccextra_core::proxy::parse_proxy` 解析,
+/// 未配置即报错,不继承环境变量或系统代理。
+pub fn oauth_http_client(proxy_url: Option<&str>, label: &str) -> Result<reqwest::Client> {
+    let setting = ccextra_core::proxy::parse_proxy(proxy_url)
+        .map_err(|e| anyhow!("{label} OAuth 代理配置错误: {e}"))?;
+    let builder = reqwest::Client::builder().timeout(std::time::Duration::from_secs(30));
+    let builder = match &setting {
+        ccextra_core::proxy::ProxySetting::Direct => builder.no_proxy(),
+        ccextra_core::proxy::ProxySetting::Url(url) => builder
+            .proxy(reqwest::Proxy::all(url).with_context(|| format!("parse proxy URL {url}"))?),
+    };
+    builder
+        .build()
+        .with_context(|| format!("build {label} http client"))
+}
+
 static PATH_LOCKS: OnceLock<Mutex<HashMap<PathBuf, Arc<Mutex<()>>>>> = OnceLock::new();
 
 fn path_lock(path: &Path) -> Arc<Mutex<()>> {
