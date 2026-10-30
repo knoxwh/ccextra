@@ -2814,6 +2814,31 @@ async fn test_non_claude_200_invalid_json_returns_502() {
     );
 }
 
+/// 非 Claude 协议上游返回 200 + 合法 JSON 但形状不符(Chat 无 choices / Responses 无信封与 object)
+/// → 502 Anthropic error,不得原样透传
+#[tokio::test]
+async fn test_non_claude_200_wrong_shape_json_returns_502() {
+    use crate::test_support::TestServer;
+    for (protocol, model) in [("openai_chat", "gpt-4"), ("openai_responses", "gpt-5")] {
+        let server =
+            TestServer::reply(StatusCode::OK, r#"{"error":{"message":"x"}}"#.as_bytes()).await;
+        let state = mock_state();
+        let provider: ProviderConfig = yaml_serde::from_str(&format!(
+            "name: badshape\nprotocol: {protocol}\nbase_url: {}\nkey: sk-test\nproxy_url: direct\nmodels:\n  - name: {model}\n    alias: badshape\n",
+            server.url
+        ))
+        .unwrap();
+        Arc::make_mut(&mut *state.config.write().await)
+            .providers
+            .push(provider);
+        let response = post_test_request(state, "/v1/messages", "badshape").await;
+        assert_eq!(response.status(), StatusCode::BAD_GATEWAY, "{protocol}");
+        let bytes = to_bytes(response.into_body(), 1024 * 1024).await.unwrap();
+        let v: Value = serde_json::from_slice(&bytes).unwrap();
+        assert_eq!(v["type"], "error", "{protocol}: {v}");
+    }
+}
+
 async fn post_test_request(state: AppState, path: &str, model: &str) -> axum::response::Response {
     app(state)
         .oneshot(

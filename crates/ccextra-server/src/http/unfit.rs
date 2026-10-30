@@ -797,16 +797,16 @@ mod tests {
         assert_eq!(
             detect_unfit_from_error(
                 400,
-                // Anthropic 原文
-                "Expected `thinking` content block but found `tool_use`"
+                // Anthropic 原文(extended thinking + tool_use 历史缺 thinking 块)
+                r#"{"type":"error","error":{"type":"invalid_request_error","message":"messages.1.content.0.type: Expected `thinking` or `redacted_thinking`, but found `tool_use`. When `thinking` is enabled, a final `assistant` message must start with a thinking block (preceeding the lastmost set of `tool_use` and `tool_result` blocks). We recommend you include thinking blocks from previous turns. To avoid this requirement, disable `thinking`. Please consult our documentation at https://docs.claude.com/en/docs/build-with-claude/extended-thinking"}}"#
             ),
             None,
         );
         assert_eq!(
             detect_unfit_from_error(
                 400,
-                // Kimi 原文
-                "reasoning_content is missing in assistant tool call"
+                // Kimi/Moonshot 原文
+                "thinking is enabled but reasoning_content is missing in assistant tool call message at index 2"
             ),
             None,
         );
@@ -818,7 +818,14 @@ mod tests {
             ),
             None,
         );
-        // Bedrock 原文正例:含 "not supported" → 触发
+        // Bedrock 原文正例(magpie #176 gateway.go 注释 / bedrock_test.go):含 "not supported" → 触发
+        assert_eq!(
+            detect_unfit_from_error(
+                400,
+                r#"{"error":{"code":null,"message":"Amazon Bedrock: Function tools with reasoning_effort are not supported for global.openai.gpt-6-luna in /v1/chat/completions. To use function tools, use /v1/responses or set reasoning_effort to 'none'.","param":null,"type":"invalid_request_error"}}"#
+            ),
+            Some(UnfitKind::ToolsWithoutEffort),
+        );
         assert_eq!(
             detect_unfit_from_error(400, "reasoning is not supported with tools"),
             Some(UnfitKind::ToolsWithoutEffort),
