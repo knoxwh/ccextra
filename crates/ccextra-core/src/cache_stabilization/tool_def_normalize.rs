@@ -189,6 +189,8 @@ pub fn normalize_tool_definitions_responses(body: &mut Value) -> NormalizationAp
             0
         });
 
+        // 注意:responses_tool_sort_key / responses_tool_schema_hash 依赖上方
+        // sort_responses_tool_schema_keys 已将各工具 schema 原地排序,调用顺序不可颠倒。
         if let Some(tools) = walker.tools_mut() {
             if !any_tool_has_cache_control(tools) {
                 let keys: Vec<String> = tools.iter().map(responses_tool_sort_key).collect();
@@ -255,10 +257,9 @@ fn responses_tool_schema_hash(tool: &Value) -> String {
     let Some(schema) = schema else {
         return String::new();
     };
-    let mut normalized = schema.clone();
-    sort_schema_keys_recursive(&mut normalized);
+    // schema 已由 sort_responses_tool_schema_keys 原地排序,直接序列化
     let mut hasher = Sha256::new();
-    hasher.update(serde_json::to_vec(&normalized).unwrap_or_default());
+    hasher.update(serde_json::to_vec(schema).unwrap_or_default());
     let digest = hasher.finalize();
     let mut out = String::with_capacity(64);
     for byte in digest {

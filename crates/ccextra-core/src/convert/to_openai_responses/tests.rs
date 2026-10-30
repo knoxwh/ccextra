@@ -426,6 +426,32 @@ fn test_tool_schema_local_refs_inlined() {
 }
 
 #[test]
+fn normalize_tool_parameters_literal_ref_keeps_defs() {
+    // 字面量 $ref(属性名叫 $ref / default 实例数据里的 $ref):contains_ref 为 true
+    // 但无可内联引用,展开结果与原 schema 相同,$defs 未被内联,不得删除
+    for schema in [
+        json!({
+            "type": "object",
+            "properties": {"$ref": {"type": "string"}},
+            "$defs": {"Foo": {"type": "integer"}}
+        }),
+        json!({
+            "type": "object",
+            "properties": {
+                "a": {"type": "object", "default": {"$ref": "#/$defs/Person"}}
+            },
+            "$defs": {"Person": {"type": "object"}}
+        }),
+    ] {
+        let out = normalize_tool_parameters(&schema);
+        assert!(
+            out.get("$defs").is_some(),
+            "字面量 $ref 不应触发 $defs 删除: {out}"
+        );
+    }
+}
+
+#[test]
 fn test_tool_schema_union_unresolved_ref_simplified() {
     // 无法内联的 $ref 分支不补 type,非 object-only → 整体简化(对齐 CPA)
     let mut body = json!({

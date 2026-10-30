@@ -12,20 +12,19 @@ pub(crate) fn normalize_tool_parameters(schema: &Value) -> Value {
         return json!({"type": "object", "properties": {}});
     }
     // 本地 $ref 内联;内联发生后删除 $defs/definitions 容器
-    // (对齐 CPA normalizeXAITool InlineLocalRefs)
+    // (对齐 CPA normalizeXAITool InlineLocalRefs)。
+    // 无 $ref → None 免 clone;字面量 $ref 展开后与原值相等 → 未内联,保留 $defs
     let mut inlined_owned;
-    let schema: &Value = {
-        let inlined = inline_local_refs(schema);
-        if &inlined == schema {
-            schema
-        } else {
-            inlined_owned = inlined;
+    let schema: &Value = match inline_local_refs(schema) {
+        Some(v) if &v != schema => {
+            inlined_owned = v;
             if let Some(obj) = inlined_owned.as_object_mut() {
                 obj.remove("$defs");
                 obj.remove("definitions");
             }
             &inlined_owned
         }
+        _ => schema,
     };
     // 对齐 CPA 7fac6b15:递归删除 $schema/$id dialect 关键字
     let mut s = schema.clone();

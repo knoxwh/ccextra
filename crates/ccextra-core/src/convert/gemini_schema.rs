@@ -309,7 +309,10 @@ const MAX_INLINED_SCHEMA_BYTES: usize = 256 * 1024;
 const MAX_FALLBACK_DESCRIPTION_BYTES: usize = 512;
 
 /// 公开内联:保留 $defs/definitions,供 xAI 等非 clean 路径使用(对齐 CPA InlineLocalRefs)。
-pub(crate) fn inline_local_refs(schema: &Value) -> Value {
+///
+/// `None` = schema 不含任何 `$ref` 键(免 clone)。`Some` 可能与输入相等(字面量 `$ref`,
+/// 如属性名或 default 实例数据),调用方需判断"确实发生内联"时须自行与输入比较。
+pub(crate) fn inline_local_refs(schema: &Value) -> Option<Value> {
     inline_local_refs_rooted(schema, false)
 }
 
@@ -329,14 +332,19 @@ fn inline_local_refs_for_clean(schema: &Value) -> Value {
             }
         }
     }
-    inline_local_refs_rooted(schema, true)
+    inline_local_refs_rooted(schema, true).expect("contains_ref 已在函数入口确认")
 }
 
-fn inline_local_refs_rooted(schema: &Value, for_clean: bool) -> Value {
+/// `None` = schema 不含 `$ref`;`Some` 可能与输入相等(字面量 `$ref`),语义同 [`inline_local_refs`]。
+fn inline_local_refs_rooted(schema: &Value, for_clean: bool) -> Option<Value> {
     if !contains_ref(schema) {
-        return schema.clone();
+        return None;
     }
-    resolve_schema_root(schema, &mut RefResolveState::new(), for_clean)
+    Some(resolve_schema_root(
+        schema,
+        &mut RefResolveState::new(),
+        for_clean,
+    ))
 }
 
 fn contains_ref(v: &Value) -> bool {
@@ -4024,7 +4032,7 @@ mod tests {
                 }
             }
         });
-        let got = inline_local_refs(&input);
+        let got = inline_local_refs(&input).unwrap();
         assert_eq!(
             got["properties"]["a"]["default"]["$ref"], "#/$defs/Person",
             "literal $ref inside default was expanded: {got}"
@@ -4261,7 +4269,7 @@ mod tests {
                 }
             }
         });
-        let got = inline_local_refs(&input);
+        let got = inline_local_refs(&input).unwrap();
         assert_eq!(
             got["$defs"]["properties"]["default"]["$ref"], "#/$defs/S",
             "literal default inside def named properties expanded: {got}"
@@ -4281,7 +4289,7 @@ mod tests {
             },
             "definitions": {"S": {"type": "string"}}
         });
-        let got = inline_local_refs(&input);
+        let got = inline_local_refs(&input).unwrap();
         assert_eq!(
             got["dependencies"]["default"]["properties"]["x"]["type"], "string",
             "{got}"
