@@ -90,7 +90,7 @@ OpenAI Chat 或 Responses 的 provider 级缓存桶标识。来自 Claude Code �
 Grok Chat/Responses 请求使用 `x-grok-client-identifier: grok-pager`、`x-grok-client-mode: interactive` 与 `grok-pager/{version} grok-shell/{version} ({os}; {arch})`。版本默认 `1.0.46`，可由 `user_agents.grok_version` 覆盖；`x-authenticateresponse: authenticate-response` 仅官方 `cli-chat-proxy.grok.com` 添加，不用于普通 API 或其他模型/协议。
 
 **重试与回退**
-messages 路径不做本地退避：429/5xx（含 52x）与网络错误在同轮内轮转多 `base_url`，耗尽后快速失败，把末次上游错误返给客户端，透传 `Retry-After`，退避重试交客户端（如 Claude Code）。流式首帧 error 内部重试一次，仍失败返回 502，不提交 200。
+messages 路径不做本地退避：429/5xx（含 52x）与网络错误在同轮内轮转多 `base_url`，耗尽后快速失败，把末次上游错误返给客户端，透传 `Retry-After`（Antigravity 429 无头时从 body RetryInfo 补），退避重试交客户端（如 Claude Code）。流式首帧 error 内部重试一次，仍失败返回 502，不提交 200。
 
 **有界读取**
 非流响应 body 的统一读取边界：成功 body 16 MiB（恰好上限可读，多 1 字节拒绝），错误 body 256 KiB（超出停止读取并标记截断，截断前缀不当作完整 JSON 解析）；读取停顿与流 chunk idle 共用 180s，每次非空数据后重置。成功 body 超限返回 502、停顿返回 504；错误 body 截断或读取失败保留上游状态码（429/401 不被改写）；OAuth/project/model 保留各自 30s 请求总超时。

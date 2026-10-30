@@ -1719,6 +1719,64 @@ fn upstream_error_type_falls_back_by_status() {
     assert_eq!(out["error"]["type"], "invalid_request_error");
 }
 
+const AG_429_RETRY_INFO: &str = r#"{"error":{"code":429,"message":"exhausted","status":"RESOURCE_EXHAUSTED","details":[{"@type":"type.googleapis.com/google.rpc.RetryInfo","retryDelay":"29.2s"}]}}"#;
+
+/// 单 base_url provider 回 429(可选 Retry-After 头),返回客户端看到的 retry-after
+async fn retry_after_for_429(
+    protocol: &str,
+    upstream_retry_after: Option<&'static str>,
+) -> Option<String> {
+    let server =
+        crate::test_support::TestServer::spawn(axum::Router::new().fallback(move || async move {
+            let mut headers = HeaderMap::new();
+            headers.insert(header::CONTENT_TYPE, "application/json".parse().unwrap());
+            if let Some(ra) = upstream_retry_after {
+                headers.insert(header::RETRY_AFTER, ra.parse().unwrap());
+            }
+            (StatusCode::TOO_MANY_REQUESTS, headers, AG_429_RETRY_INFO)
+        }))
+        .await;
+    let state = mock_state();
+    let provider: ProviderConfig = yaml_serde::from_str(&format!(
+        "name: rl\nprotocol: {protocol}\nbase_url: {}\nkey: sk-test\nproxy_url: direct\nmodels:\n  - name: gemini-x\n    alias: rl\n",
+        server.url
+    ))
+    .unwrap();
+    Arc::make_mut(&mut *state.config.write().await)
+        .providers
+        .push(provider);
+    let resp = post_test_request(state, "/v1/messages", "rl").await;
+    assert_eq!(resp.status(), StatusCode::TOO_MANY_REQUESTS);
+    resp.headers()
+        .get(header::RETRY_AFTER)
+        .map(|v| v.to_str().unwrap().to_owned())
+}
+
+#[tokio::test]
+async fn antigravity_429_body_retry_info_fills_retry_after() {
+    // AG 429 无头:按 body RetryInfo 29.2s 向上取整为 30
+    assert_eq!(
+        retry_after_for_429("antigravity", None).await.as_deref(),
+        Some("30")
+    );
+}
+
+#[tokio::test]
+async fn antigravity_429_upstream_header_wins_over_body() {
+    assert_eq!(
+        retry_after_for_429("antigravity", Some("7"))
+            .await
+            .as_deref(),
+        Some("7")
+    );
+}
+
+#[tokio::test]
+async fn non_antigravity_429_body_delay_not_used() {
+    // 只对 Antigravity 生效(CPA 仅 antigravity executor 调 ParseRetryDelay)
+    assert_eq!(retry_after_for_429("gemini", None).await, None);
+}
+
 use crate::test_support::spawn_captured_server;
 
 #[tokio::test]

@@ -164,7 +164,7 @@ curl -H "Authorization: Bearer $ANTHROPIC_AUTH_TOKEN" http://127.0.0.1:8222/v1/m
 
 - **兼容**：OpenAI 清 `required: null`；Chat 将 schema 位 `true`→`{}`；Gemini/AG 补 `type: object`；阻断码映射 `refusal`；AG 中和 Claude Code 身份句并清洗非标 session 头
 - **流式**：Claude 正文直通，其余转 Anthropic SSE；10s `: keepalive`
-- **重试**：同轮多 `base_url` 轮转 429/5xx/网络错误；耗尽快速失败并透传 `Retry-After`；流式首帧 error 内部再试一次
+- **重试**：同轮多 `base_url` 轮转 429/5xx/网络错误；耗尽快速失败并透传 `Retry-After`（Antigravity 429 无头时从 body RetryInfo 补）；流式首帧 error 内部再试一次
 - **读取上限**：成功正文 16 MiB、错误 256 KiB、idle 180s；OAuth / project / 模型读取 30s 总超时
 - **Claude 头**：保留允许的身份头；`anthropic-beta` 默认透传；`sk-ant-oat*` 缺 `oauth-2025-04-20` 时补上
 

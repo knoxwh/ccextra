@@ -35,7 +35,7 @@ use crate::http::claude_relay::{
     claude_inbound_user_agent, claude_passthrough_headers, ensure_oauth_beta,
 };
 use crate::http::error::{to_anthropic_error, AppError};
-use crate::http::retry::parse_retry_after;
+use crate::http::retry::{parse_google_retry_delay, parse_retry_after, retry_after_header_secs};
 use crate::http::{AppState, PayloadRule};
 use crate::sse::antigravity_replay_cache::AgStreamReplayExtractor;
 use crate::sse::kimi_thinking_replay_cache::KimiStreamReplayExtractor;
@@ -1415,6 +1415,15 @@ pub(crate) async fn deliver_response(
             } else {
                 to_anthropic_error(&final_bytes, final_status)
             };
+            // Antigravity 429 常不带 Retry-After 头,等待时长在 body 的 RetryInfo 等字段里;
+            // 上游头优先(对齐 CPA antigravity executor ParseRetryDelay)
+            if retry_after.is_none()
+                && final_status == axum::http::StatusCode::TOO_MANY_REQUESTS
+                && !final_truncated
+                && matches!(prepared.route.protocol, Protocol::Antigravity)
+            {
+                retry_after = parse_google_retry_delay(&final_bytes).map(retry_after_header_secs);
+            }
             let mut builder = Response::builder()
                 .status(final_status)
                 .header(header::CONTENT_TYPE, "application/json");
