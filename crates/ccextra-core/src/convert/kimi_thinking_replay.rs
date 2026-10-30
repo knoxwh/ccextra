@@ -200,8 +200,9 @@ fn values_equal(a: &[Value], b: &[Value]) -> bool {
     a.len() == b.len() && a.iter().zip(b.iter()).all(|(l, r)| l == r)
 }
 
+// canonicalize_value 只重排键,而 Map 相等本就忽略键序,直接比较即可
 fn content_equal(a: &Value, b: &Value) -> bool {
-    canonicalize_value(a) == canonicalize_value(b)
+    a == b
 }
 
 /// 将缓存的完整 assistant content 写回 body.messages 中匹配的最后一条 assistant。

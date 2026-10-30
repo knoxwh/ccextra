@@ -116,8 +116,12 @@ pub fn detect_unfit_from_error(status: u16, body: &str) -> Option<UnfitKind> {
         return Some(UnfitKind::RefusesFormat);
     }
 
-    // reasoning effort "off" 拒绝
-    if lower.contains("reasoning") && lower.contains("off") {
+    // reasoning effort "off" 拒绝:"off" 须为独立词(排除 offline/offset/offload 等)
+    if lower.contains("reasoning")
+        && lower
+            .split(|c: char| !c.is_ascii_alphanumeric() && c != '_')
+            .any(|tok| tok == "off")
+    {
         return Some(UnfitKind::OffRefused);
     }
 
@@ -846,6 +850,32 @@ mod tests {
         // 非 400/422 不触发
         assert_eq!(
             detect_unfit_from_error(500, "reasoning not supported with tools"),
+            None,
+        );
+    }
+
+    #[test]
+    fn detect_off_refused_requires_standalone_off() {
+        // 负例:offline / offset 含 "off" 子串但非独立词,不得触发
+        assert_eq!(
+            detect_unfit_from_error(400, "reasoning system went offline due to timeout"),
+            None,
+        );
+        assert_eq!(
+            detect_unfit_from_error(400, "reasoning offset exceeded maximum"),
+            None,
+        );
+        // 正例(示例文案,非真实上游原文):effort="off" 被拒
+        assert_eq!(
+            detect_unfit_from_error(
+                400,
+                "Invalid value for 'reasoning_effort': 'off' is not supported. Use 'low', 'medium', or 'high'."
+            ),
+            Some(UnfitKind::OffRefused),
+        );
+        // 非 400/422 不触发
+        assert_eq!(
+            detect_unfit_from_error(500, "reasoning_effort 'off' not supported"),
             None,
         );
     }

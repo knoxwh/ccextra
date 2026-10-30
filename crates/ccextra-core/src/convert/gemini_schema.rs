@@ -87,9 +87,9 @@ pub fn clean_nested_schema_for_antigravity_tool(
     require_placeholder: bool,
 ) -> Value {
     let wrapped = json!({"schema": schema});
-    let cleaned = clean_json_schema_for_antigravity_tool(&wrapped, require_placeholder);
-    match cleaned.get("schema") {
-        Some(inner) => inner.clone(),
+    let mut cleaned = clean_json_schema_for_antigravity_tool(&wrapped, require_placeholder);
+    match cleaned.as_object_mut().and_then(|m| m.remove("schema")) {
+        Some(inner) => inner,
         None => clean_json_schema_for_antigravity_tool(schema, require_placeholder),
     }
 }
@@ -112,9 +112,9 @@ pub fn clean_json_schema_for_antigravity_claude_tool(schema: &Value) -> Value {
 /// 对齐 CPA cleanNestedSchema + CleanJSONSchemaForAntigravityClaudeTool。
 pub fn clean_nested_schema_for_antigravity_claude(schema: &Value) -> Value {
     let wrapped = json!({"schema": schema});
-    let cleaned = clean_json_schema_for_antigravity_claude_tool(&wrapped);
-    match cleaned.get("schema") {
-        Some(inner) => inner.clone(),
+    let mut cleaned = clean_json_schema_for_antigravity_claude_tool(&wrapped);
+    match cleaned.as_object_mut().and_then(|m| m.remove("schema")) {
+        Some(inner) => inner,
         None => clean_json_schema_for_antigravity_claude_tool(schema),
     }
 }
