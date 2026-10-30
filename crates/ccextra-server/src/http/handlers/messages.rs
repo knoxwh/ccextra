@@ -1413,7 +1413,7 @@ pub(crate) async fn deliver_response(
                 }))
                 .unwrap_or_default()
             } else {
-                to_anthropic_error(&final_bytes)
+                to_anthropic_error(&final_bytes, final_status)
             };
             let mut builder = Response::builder()
                 .status(final_status)

@@ -1611,7 +1611,8 @@ async fn test_config_snapshot_version_guards_against_stale_injection() {
 fn upstream_error_openai_standard_shape() {
     // OpenAI 标准 {"error":{type,message}},透传 type 并映射
     let body = br#"{"error":{"type":"rate_limit_error","message":"You are sending requests too quickly"}}"#;
-    let out: Value = serde_json::from_slice(&to_anthropic_error(body)).unwrap();
+    let out: Value =
+        serde_json::from_slice(&to_anthropic_error(body, StatusCode::TOO_MANY_REQUESTS)).unwrap();
     assert_eq!(out["error"]["type"], "rate_limit_error");
     assert_eq!(
         out["error"]["message"],
@@ -1623,7 +1624,8 @@ fn upstream_error_openai_standard_shape() {
 fn upstream_error_bailian_nested_message() {
     // 阿里云百炼:code/message 平铺,messages 是嵌套 JSON 字符串
     let body = br#"{"code":"Throttling.RateQuota","message":"{\"error\":{\"message\":\"The engine is currently overloaded, please try again later\",\"type\":\"EngineOverloadedError\",\"param\":null,\"code\":\"EngineOverloadedError\"}}"}"#;
-    let out: Value = serde_json::from_slice(&to_anthropic_error(body)).unwrap();
+    let out: Value =
+        serde_json::from_slice(&to_anthropic_error(body, StatusCode::BAD_REQUEST)).unwrap();
     // EngineOverloadedError 含 overload → overloaded_error
     assert_eq!(out["error"]["type"], "overloaded_error");
     assert_eq!(
@@ -1636,7 +1638,8 @@ fn upstream_error_bailian_nested_message() {
 fn upstream_error_bailian_plain_code_message() {
     // code 含 quota → rate_limit_error;message 为普通字符串直接透传
     let body = br#"{"code":"Throttling.RateQuota","message":"limit exceeded"}"#;
-    let out: Value = serde_json::from_slice(&to_anthropic_error(body)).unwrap();
+    let out: Value =
+        serde_json::from_slice(&to_anthropic_error(body, StatusCode::BAD_REQUEST)).unwrap();
     assert_eq!(out["error"]["type"], "rate_limit_error");
     assert_eq!(out["error"]["message"], "limit exceeded");
 }
@@ -1645,7 +1648,8 @@ fn upstream_error_bailian_plain_code_message() {
 fn upstream_error_bailian_invalid_auth_code() {
     // code 含 auth → authentication_error
     let body = br#"{"code":"InvalidApiKey","message":"invalid api key"}"#;
-    let out: Value = serde_json::from_slice(&to_anthropic_error(body)).unwrap();
+    let out: Value =
+        serde_json::from_slice(&to_anthropic_error(body, StatusCode::BAD_REQUEST)).unwrap();
     assert_eq!(out["error"]["type"], "authentication_error");
     assert_eq!(out["error"]["message"], "invalid api key");
 }
@@ -1653,10 +1657,66 @@ fn upstream_error_bailian_invalid_auth_code() {
 #[test]
 fn upstream_error_unparseable_falls_back_to_raw() {
     // 非 JSON body:兜底 "upstream error"
-    let out: Value =
-        serde_json::from_slice(&to_anthropic_error(b"<html>502 bad gateway</html>")).unwrap();
+    let out: Value = serde_json::from_slice(&to_anthropic_error(
+        b"<html>502 bad gateway</html>",
+        StatusCode::BAD_GATEWAY,
+    ))
+    .unwrap();
     assert_eq!(out["error"]["type"], "api_error");
     assert_eq!(out["error"]["message"], "<html>502 bad gateway</html>");
+}
+
+#[test]
+fn upstream_error_official_types_kept_with_request_id() {
+    // Anthropic 官方 type 原样保留,不受状态码兜底影响;顶层 request_id 保留
+    for t in [
+        "invalid_request_error",
+        "authentication_error",
+        "billing_error",
+        "permission_error",
+        "not_found_error",
+        "conflict_error",
+        "request_too_large",
+        "rate_limit_error",
+        "timeout_error",
+        "api_error",
+        "overloaded_error",
+    ] {
+        let body =
+            json!({"type": "error", "error": {"type": t, "message": "m"}, "request_id": "req_1"})
+                .to_string();
+        let out: Value = serde_json::from_slice(&to_anthropic_error(
+            body.as_bytes(),
+            StatusCode::INTERNAL_SERVER_ERROR,
+        ))
+        .unwrap();
+        assert_eq!(out["error"]["type"], t);
+        assert_eq!(out["request_id"], "req_1");
+    }
+}
+
+#[test]
+fn upstream_error_type_falls_back_by_status() {
+    // 无可识别 type:按状态码兜底(对齐 CPA claudeErrorTypeFromStatus)
+    for (status, want) in [
+        (StatusCode::PAYLOAD_TOO_LARGE, "request_too_large"),
+        (StatusCode::GATEWAY_TIMEOUT, "timeout_error"),
+        (StatusCode::BAD_REQUEST, "invalid_request_error"),
+        (StatusCode::PAYMENT_REQUIRED, "billing_error"),
+        (StatusCode::from_u16(529).unwrap(), "overloaded_error"),
+    ] {
+        let out: Value =
+            serde_json::from_slice(&to_anthropic_error(b"<html>nginx</html>", status)).unwrap();
+        assert_eq!(out["error"]["type"], want, "{status}");
+        assert!(out.get("request_id").is_none());
+    }
+    // OpenAI 非官方 type(invalid_value)按 400 兜底
+    let out: Value = serde_json::from_slice(&to_anthropic_error(
+        br#"{"error":{"type":"invalid_value","message":"bad"}}"#,
+        StatusCode::BAD_REQUEST,
+    ))
+    .unwrap();
+    assert_eq!(out["error"]["type"], "invalid_request_error");
 }
 
 use crate::test_support::spawn_captured_server;

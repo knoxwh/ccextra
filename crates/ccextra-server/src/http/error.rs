@@ -115,21 +115,29 @@ fn is_upstream_send_timeout(err: &anyhow::Error) -> bool {
 }
 
 /// 上游错误 body → anthropic 错误形状
-/// `{"type":"error","error":{"type":...,"message":...}}`
+/// `{"type":"error","error":{"type":...,"message":...},"request_id"?}`
 ///
 /// 兼容两类上游错误结构:
 /// 1. OpenAI 标准 `{"error":{"type":...,"message":...}}`
 /// 2. 阿里云百炼 `{"code":"Throttling.RateQuota","message":"{\"error\":{...}}"}`——
 ///    code/message 平铺在顶层,且 message 是嵌套 JSON 字符串,真实错误藏在里面。
 ///    提取不到 error 时不丢真实信息,用顶层 code/message 兜底。
-pub fn to_anthropic_error(body: &[u8]) -> Vec<u8> {
+///
+/// Anthropic 官方 type 原样保留;无法识别时按上游 `status` 兜底
+/// (对齐 CPA `claudeErrorTypeFromStatus`)。顶层字符串 `request_id` 保留(官方错误形状)。
+pub fn to_anthropic_error(body: &[u8], status: StatusCode) -> Vec<u8> {
     let (raw_type, raw_message) = extract_upstream_error(body);
     let err_type = match raw_type.to_lowercase().as_str() {
         t @ ("invalid_request_error"
         | "authentication_error"
+        | "billing_error"
         | "permission_error"
         | "not_found_error"
+        | "conflict_error"
+        | "request_too_large"
         | "rate_limit_error"
+        | "timeout_error"
+        | "api_error"
         | "overloaded_error") => t.to_string(),
         "rate_limit" | "requests" | "tokens" => "rate_limit_error".to_string(),
         // 阿里云百炼/OpenAI 的裸类型名(EngineOverloadedError 等)归入语义相近的错误
@@ -138,18 +146,41 @@ pub fn to_anthropic_error(body: &[u8]) -> Vec<u8> {
         t if t.contains("auth") || t.contains("apikey") || t.contains("forbidden") => {
             "authentication_error".to_string()
         }
-        _ => "api_error".to_string(),
+        _ => error_type_from_status(status).to_string(),
     };
     let message = if raw_message.is_empty() {
         "upstream error".to_string()
     } else {
         raw_message
     };
-    serde_json::to_vec(&json!({
+    let mut out = json!({
         "type": "error",
         "error": {"type": err_type, "message": message}
-    }))
-    .unwrap_or_default()
+    });
+    if let Some(id) = serde_json::from_slice::<Value>(body)
+        .ok()
+        .and_then(|v| v.get("request_id")?.as_str().map(str::to_owned))
+    {
+        out["request_id"] = Value::String(id);
+    }
+    serde_json::to_vec(&out).unwrap_or_default()
+}
+
+/// 无可识别 type 时按 HTTP 状态选 Anthropic error type(对齐 CPA `claudeErrorTypeFromStatus`)
+fn error_type_from_status(status: StatusCode) -> &'static str {
+    match status.as_u16() {
+        401 => "authentication_error",
+        402 => "billing_error",
+        403 => "permission_error",
+        404 => "not_found_error",
+        409 => "conflict_error",
+        413 => "request_too_large",
+        429 => "rate_limit_error",
+        408 | 504 => "timeout_error",
+        529 => "overloaded_error",
+        s if s >= 500 => "api_error",
+        _ => "invalid_request_error",
+    }
 }
 
 /// 从上游错误 body 提取 (type, message)。优先标准 `error` 对象,其次
