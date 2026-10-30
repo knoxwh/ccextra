@@ -1322,8 +1322,9 @@ pub(crate) async fn deliver_response(
                     }
                     let retry = prepared.send_retry(upstream_client, user_agents).await?;
                     final_status = retry.status;
+                    // 后续门禁(AG/Kimi 账本清理、trim)看重试后的状态,与 401 分支一致
+                    status = retry.status;
                     if retry.status.is_success() {
-                        status = retry.status;
                         executed.upstream = Some(retry);
                         retried_ok = true;
                     } else {
@@ -1386,8 +1387,9 @@ pub(crate) async fn deliver_response(
             }
             let retry = prepared.send_retry(upstream_client, user_agents).await?;
             final_status = retry.status;
+            // 后续门禁(AG/Kimi 账本清理、trim)看重试后的状态,与 401 分支一致
+            status = retry.status;
             if retry.status.is_success() {
-                status = retry.status;
                 executed.upstream = Some(retry);
                 retried_ok = true;
             } else {
