@@ -565,6 +565,14 @@ fn append_block_parts(
                 });
 
             let (result, images) = convert_tool_result_content(block.get("content"));
+            // 对齐 CPA 81de4b9c/068fe153:仅 `is_error: true`(布尔)写 response.error,
+            // 否则 response.result,保留工具失败语义
+            let response_key = if block.get("is_error").and_then(Value::as_bool) == Some(true) {
+                "error"
+            } else {
+                "result"
+            };
+            let response = json!({ response_key: result });
 
             // 对齐 CPA 6a26e92a:Antigravity 冲突工具名加 external_ 前缀
             let upstream_func_name = if antigravity {
@@ -595,7 +603,7 @@ fn append_block_parts(
                     "functionResponse": {
                         "id": sanitize_gemini_tool_id(tool_use_id, antigravity),
                         "name": upstream_func_name,
-                        "response": { "result": result },
+                        "response": response,
                         "parts": image_parts
                     }
                 }));
@@ -604,7 +612,7 @@ fn append_block_parts(
                     "functionResponse": {
                         "id": sanitize_gemini_tool_id(tool_use_id, antigravity),
                         "name": upstream_func_name,
-                        "response": { "result": result }
+                        "response": response
                     }
                 }));
                 for (mime_type, data) in images {
@@ -895,6 +903,76 @@ mod tests {
             parts[0]["functionResponse"]["response"]["result"],
             "File contents here"
         );
+    }
+
+    /// 对齐 CPA 81de4b9c/068fe153:`is_error: true` 写 response.error,其余(缺省、
+    /// false、非布尔)写 response.result;Gemini 直连与 Antigravity、含图与不含图一致
+    #[test]
+    fn test_convert_messages_tool_result_error_semantics() {
+        let image = json!({"type": "image", "source": {"type": "base64", "media_type": "image/png", "data": "AAAA"}});
+        let cases = [
+            (
+                json!({"content": "denied"}),
+                "result",
+                json!("denied"),
+                false,
+            ),
+            (
+                json!({"is_error": false, "content": "ok"}),
+                "result",
+                json!("ok"),
+                false,
+            ),
+            (
+                json!({"is_error": "true", "content": "denied"}),
+                "result",
+                json!("denied"),
+                false,
+            ),
+            (
+                json!({"is_error": true, "content": "denied"}),
+                "error",
+                json!("denied"),
+                false,
+            ),
+            (json!({"is_error": true}), "error", json!(""), false),
+            (
+                json!({"is_error": true, "content": [{"type": "text", "text": "denied"}, image]}),
+                "error",
+                json!(r#"{"type":"text","text":"denied"}"#),
+                true,
+            ),
+        ];
+        for antigravity in [false, true] {
+            for (fields, key, want, has_image) in &cases {
+                let mut block = json!({"type": "tool_result", "tool_use_id": "Read-1"});
+                for (k, v) in fields.as_object().unwrap() {
+                    block[k] = v.clone();
+                }
+                let messages = vec![json!({"role": "user", "content": [block]})];
+                let contents =
+                    convert_messages(&messages, &HashMap::new(), antigravity, "gemini-3-flash");
+                let parts = contents[0]["parts"].as_array().unwrap();
+                let response = &parts[0]["functionResponse"]["response"];
+                assert_eq!(
+                    response,
+                    &json!({ *key: want.clone() }),
+                    "antigravity={antigravity} fields={fields}"
+                );
+                let image_count = if antigravity {
+                    parts[0]["functionResponse"]["parts"]
+                        .as_array()
+                        .map_or(0, Vec::len)
+                } else {
+                    parts.len() - 1
+                };
+                assert_eq!(
+                    image_count,
+                    usize::from(*has_image),
+                    "antigravity={antigravity}"
+                );
+            }
+        }
     }
 
     #[test]
