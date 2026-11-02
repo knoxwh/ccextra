@@ -4,11 +4,26 @@
 // 保证同一请求内名字不重复。响应侧用反向映射还原原名。
 
 use std::collections::HashMap;
+use std::sync::OnceLock;
+
+use regex::Regex;
 
 /// 名长上限(OpenAI Responses 限制)
 const NAME_LIMIT: usize = 64;
 
-/// mcp__ 前缀工具名缩短:保留 mcp__ + 末段 __ 后的名字
+/// 网关 MCP 工具 id `[mcp_]<server 词>-<hex 实例 id...>_<tool>`
+/// (对齐 CPA 08437a67 gatewayToolNamePattern)
+fn gateway_tool_name_pattern() -> &'static Regex {
+    static PATTERN: OnceLock<Regex> = OnceLock::new();
+    PATTERN.get_or_init(|| {
+        Regex::new(r"^(?:mcp_)?([a-z][a-z0-9-]*?)-[0-9a-f]{6,}(?:-[0-9a-f]+)*_(.+)$")
+            .expect("gateway tool name pattern")
+    })
+}
+
+/// mcp__ 前缀工具名缩短:保留 mcp__ + 末段 __ 后的名字;仍超长且末段是网关
+/// MCP 工具 id 时剥掉中间 hex 实例 id,保留 server 词 + 工具名(对齐 CPA 08437a67,
+/// 避免同一长名 server 的工具都截成同一前缀)
 /// 对齐 CPA capResponsesChatToolName:截断后去除前导分隔符(部分严格上游拒绝非字母数字开头)
 pub fn shorten_name_if_needed(name: &str) -> String {
     if name.len() <= NAME_LIMIT {
@@ -16,11 +31,18 @@ pub fn shorten_name_if_needed(name: &str) -> String {
     }
     let truncated = if let Some(rest) = name.strip_prefix("mcp__") {
         if let Some(idx) = rest.rfind("__") {
-            let cand = format!("mcp__{}", &rest[idx + 2..]);
-            if cand.len() > NAME_LIMIT {
-                cand[..NAME_LIMIT].to_string()
-            } else {
+            let tail = &rest[idx + 2..];
+            let cand = format!("mcp__{tail}");
+            if cand.len() <= NAME_LIMIT {
                 cand
+            } else if let Some(readable) = gateway_tool_name_pattern()
+                .captures(tail)
+                .map(|c| format!("mcp__{}_{}", &c[1], &c[2]))
+                .filter(|r| r.len() <= NAME_LIMIT)
+            {
+                readable
+            } else {
+                cand[..NAME_LIMIT].to_string()
             }
         } else {
             name[..NAME_LIMIT].to_string()
@@ -143,6 +165,53 @@ mod tests {
         let short = &m[&name];
         assert_eq!(short.len(), 64);
         assert_eq!(short, &"_".repeat(64));
+    }
+
+    const GATEWAY_PREFIX: &str =
+        "mcp__gateway__mcp_github-12345678-9abc-def0-1234-56789abcdef0-12345678_";
+
+    /// 对齐 CPA 08437a67:超长网关 MCP 名剥 hex 实例 id,保留 server 词 + 工具名
+    #[test]
+    fn test_gateway_tool_names_stay_readable_and_distinct() {
+        let names: Vec<String> = [
+            format!("{GATEWAY_PREFIX}add-comment-to-pending-review"),
+            format!("{GATEWAY_PREFIX}create-branch"),
+            format!("{GATEWAY_PREFIX}get_file_contents"),
+            "mcp__gateway__mcp_playwright-browser-67892a0b_browser_click".to_string(),
+            "Bash".to_string(),
+        ]
+        .into();
+        let m = build_short_name_map(&names);
+        for (orig, want) in names.iter().zip([
+            "mcp__github_add-comment-to-pending-review",
+            "mcp__github_create-branch",
+            "mcp__github_get_file_contents",
+            "mcp__gateway__mcp_playwright-browser-67892a0b_browser_click",
+            "Bash",
+        ]) {
+            assert_eq!(m[orig], want);
+        }
+        let rev = build_reverse_map(&m);
+        assert_eq!(rev["mcp__github_create-branch"], names[1]);
+    }
+
+    #[test]
+    fn test_gateway_same_tool_on_two_servers_disambiguated() {
+        let a = format!("{GATEWAY_PREFIX}create-branch");
+        let b =
+            "mcp__gateway__mcp_github-0b9e7c1d-1111-2222-3333-444455556666-89abcdef_create-branch"
+                .to_string();
+        let m = build_short_name_map(&[a.clone(), b.clone()]);
+        assert_ne!(m[&a], m[&b]);
+        assert!(m[&b].starts_with("mcp__github_create-branch"), "{}", m[&b]);
+    }
+
+    #[test]
+    fn test_non_gateway_long_mcp_name_falls_back_to_truncation() {
+        let long = format!("mcp__srv__{}", "x".repeat(80));
+        let short = shorten_name_if_needed(&long);
+        assert_eq!(short.len(), 64);
+        assert!(short.starts_with("mcp__xxx"));
     }
 
     #[test]
