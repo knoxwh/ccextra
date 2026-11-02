@@ -1,6 +1,6 @@
 //! Claude Bun fingerprint-lane HTTP client (wreq + BoringSSL).
 //!
-//! Matches Claude Code 2.1.296 / Bun 1.4.3 peet baseline (JA3/JA4 + HTTP/1.1).
+//! Matches Claude Code 2.1.316 / Bun 1.4.4 local ClientHello sample (JA3/JA4 + HTTP/1.1).
 //! Default (non-Claude) protocols keep reqwest+rustls; all `protocol: claude` use this lane.
 
 use std::borrow::Cow;
@@ -47,6 +47,12 @@ TLS_RSA_WITH_AES_128_GCM_SHA256:TLS_RSA_WITH_AES_256_GCM_SHA384:\
 TLS_RSA_WITH_AES_128_CBC_SHA:TLS_RSA_WITH_AES_256_CBC_SHA"
 }
 
+/// signature_algorithms in ClientHello order (BoringSSL names; CC 2.1.316 adds
+/// ed25519 + ecdsa_secp521r1_sha512 before rsa_pkcs1_sha1).
+const SIGALGS_LIST: &str = "ecdsa_secp256r1_sha256:rsa_pss_rsae_sha256:rsa_pkcs1_sha256:\
+ecdsa_secp384r1_sha384:rsa_pss_rsae_sha384:rsa_pkcs1_sha384:\
+rsa_pss_rsae_sha512:rsa_pkcs1_sha512:ed25519:ecdsa_secp521r1_sha512:rsa_pkcs1_sha1";
+
 fn bun_tls_options() -> TlsOptions {
     // peet JA3 extensions: 0-23-65281-10-11-35-16-5-13-18-51-45-43
     let ext_order: Vec<ExtensionType> = [0u16, 23, 65281, 10, 11, 35, 16, 5, 13, 18, 51, 45, 43]
@@ -67,14 +73,27 @@ fn bun_tls_options() -> TlsOptions {
         .permute_extensions(false)
         .enable_ech_grease(false)
         .curves_list("X25519MLKEM768:X25519:P-256:P-384")
-        .sigalgs_list(
-            "ecdsa_secp256r1_sha256:rsa_pss_rsae_sha256:rsa_pkcs1_sha256:\
-ecdsa_secp384r1_sha384:rsa_pss_rsae_sha384:rsa_pkcs1_sha384:\
-rsa_pss_rsae_sha512:rsa_pkcs1_sha512:rsa_pkcs1_sha1",
-        )
+        .sigalgs_list(SIGALGS_LIST)
         .cipher_list(bun_cipher_list())
         .preserve_tls13_cipher_list(true)
         .key_shares(Cow::Owned(key_shares))
         .extension_permutation(Cow::Owned(ext_order))
         .build()
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn sigalgs_match_vendored_profile() {
+        let v: serde_json::Value = serde_json::from_str(super::super::PROFILE_JSON).unwrap();
+        let names: Vec<&str> = v["signature_algorithms"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .map(|n| n.as_str().unwrap())
+            .collect();
+        assert_eq!(SIGALGS_LIST, names.join(":"));
+    }
 }

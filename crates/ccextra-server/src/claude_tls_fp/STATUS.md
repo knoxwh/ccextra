@@ -6,12 +6,18 @@ Verified 2026-10-14: Claude Code **2.1.299** (still Bun 1.4.3) re-sampled; JA3 /
 
 Verified 2026-10-18: Claude Code **2.1.303** (embedded Bun string **1.4.4**) — local ClientHello / JA3 inputs and HTTP messages still match the 2.1.296 baseline; no TLS constant changes. Full peetprint pending public Bun 1.4.4 peet package.
 
+Updated 2026-11-01: Claude Code **2.1.316** (Bun 1.4.4) local ClientHello re-sample shows sigalgs gained
+`ed25519` (0x0807) + `ecdsa_secp521r1_sha512` (0x0603) after `rsa_pkcs1_sha512` (already present in
+2.1.312; the 2.1.303 check above missed it — raw Hello was +4 bytes). JA3 unchanged; JA4 part c moved
+`6a3d802a7139` → `7f527383e249`. Lane sigalgs + profile bumped to `bun-1.4.4-claude-2.1.316`; local
+ClientHello probe of the lane matches the 2.1.316 sample field-for-field (no live peet run).
+
 ## Goal
 
-Match peet baseline:
+Match Claude Code 2.1.316 ClientHello:
 
 - JA3 hash `1523504b38f0fae0d881d4b6554aac1b`
-- JA4 `t13d1713h1_5b57614c22b0_6a3d802a7139`
+- JA4 `t13d1713h1_5b57614c22b0_7f527383e249`
 - HTTP/1.1 only (ALPN `http/1.1`)
 
 ## Current solution (wreq / BoringSSL)
