@@ -283,6 +283,26 @@ mod tests {
     }
 
     #[test]
+    fn auth_url_includes_aicode_scope() {
+        // 对齐 CPA 7c627ffb:授权 scope 含 aicode,位于 userinfo.profile 与 cclog 之间
+        let url = build_auth_url("st8", "");
+        let parsed = reqwest::Url::parse(&url).unwrap();
+        let scope = parsed
+            .query_pairs()
+            .find(|(k, _)| k == "scope")
+            .map(|(_, v)| v.into_owned())
+            .unwrap();
+        let scopes: Vec<&str> = scope.split_whitespace().collect();
+        let at = |s: &str| scopes.iter().position(|x| *x == s).unwrap();
+        let aicode = at("https://www.googleapis.com/auth/aicode");
+        assert_eq!(
+            at("https://www.googleapis.com/auth/userinfo.profile") + 1,
+            aicode
+        );
+        assert_eq!(at("https://www.googleapis.com/auth/cclog"), aicode + 1);
+    }
+
+    #[test]
     fn http_client_accepts_direct_and_url() {
         // 未配置/空值不再继承环境代理,直接报错
         assert!(http_client(None).is_err());
