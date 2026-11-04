@@ -504,7 +504,8 @@ pub fn gemini_malformed_function_call_error() -> Value {
     })
 }
 
-/// 对齐 CPA resolveGeminiClaudeStopReason (7f2f17d7:MALFORMED 不再映射 refusal)
+/// 对齐 CPA resolveGeminiClaudeStopReason (7f2f17d7:MALFORMED_FUNCTION_CALL 不再映射
+/// refusal;3f5d3a16/24b04548:MALFORMED_RESPONSE 映射 refusal)
 pub(crate) fn resolve_gemini_claude_stop_reason(
     finish_reason: &str,
     saw_tool_call: bool,
@@ -514,9 +515,8 @@ pub(crate) fn resolve_gemini_claude_stop_reason(
     }
     match finish_reason {
         "MAX_TOKENS" => "max_tokens",
-        "SAFETY" | "RECITATION" | "PROHIBITED_CONTENT" | "SPII" | "BLOCKLIST" | "IMAGE_SAFETY" => {
-            "refusal"
-        }
+        "SAFETY" | "RECITATION" | "PROHIBITED_CONTENT" | "SPII" | "BLOCKLIST" | "IMAGE_SAFETY"
+        | "MALFORMED_RESPONSE" => "refusal",
         "STOP" | "FINISH_REASON_UNSPECIFIED" | "UNKNOWN" | "" => "end_turn",
         _ => "end_turn",
     }
@@ -974,7 +974,8 @@ mod tests {
 
     #[test]
     fn test_convert_gemini_response_refusal_finish_reasons() {
-        // 对齐 CPA 7f2f17d7:SAFETY/RECITATION 等仍为 refusal;MALFORMED 单独走 api_error
+        // 对齐 CPA 7f2f17d7:SAFETY/RECITATION 等仍为 refusal;MALFORMED_FUNCTION_CALL 单独走
+        // api_error;对齐 CPA 3f5d3a16/24b04548:MALFORMED_RESPONSE 为 refusal
         for reason in [
             "SAFETY",
             "RECITATION",
@@ -982,6 +983,7 @@ mod tests {
             "SPII",
             "BLOCKLIST",
             "IMAGE_SAFETY",
+            "MALFORMED_RESPONSE",
         ] {
             let gemini = json!({
                 "candidates": [{
