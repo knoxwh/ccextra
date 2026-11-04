@@ -42,7 +42,7 @@ struct ToolHistory {
 ///
 /// original_to_short: 原始工具名 → 上游清洗短名(本轮 tools 声明)
 /// antigravity: Antigravity 语义(保留带非空 signature 的 thinking 块,
-/// 工具图嵌进 functionResponse.parts);Gemini 直连保持兄弟 inline_data
+/// 工具图缺省 mimeType 补 image/png);工具图均嵌进 functionResponse.parts
 /// upstream_model: 目标模型名(用于签名兼容性检查)
 pub fn convert_messages(
     messages: &[Value],
@@ -581,15 +581,14 @@ fn append_block_parts(
                 func_name
             };
 
-            // 对齐 CPA fixCLIToolResponse 归一化:Antigravity 把工具图嵌进
-            // functionResponse.parts(inlineData 驼峰 + 显式 mimeType,缺省
-            // image/png——Cloud Code Assist 忽略无 mimeType 的 inlineData),
-            // Gemini 直连保持 sibling inline_data
-            if antigravity && !images.is_empty() {
+            // 工具图嵌进 functionResponse.parts(inlineData 驼峰)。Gemini 直连对齐
+            // CPA be864305(mimeType 原值);Antigravity 对齐 CPA fixCLIToolResponse
+            // 归一化,缺省 image/png——Cloud Code Assist 忽略无 mimeType 的 inlineData
+            if !images.is_empty() {
                 let image_parts: Vec<Value> = images
                     .into_iter()
                     .map(|(mime_type, data)| {
-                        let mime_type = if mime_type.is_empty() {
+                        let mime_type = if antigravity && mime_type.is_empty() {
                             "image/png".to_string()
                         } else {
                             mime_type
@@ -615,11 +614,6 @@ fn append_block_parts(
                         "response": response
                     }
                 }));
-                for (mime_type, data) in images {
-                    parts.push(json!({
-                        "inline_data": { "mime_type": mime_type, "data": data }
-                    }));
-                }
             }
         }
         "image" => {
@@ -666,7 +660,7 @@ fn append_block_parts(
 /// - 字符串 → 原样保持字符串
 /// - 单个非图块 → 序列化为 JSON 字符串
 /// - 多个非图块 → 序列化数组为 JSON 字符串
-/// - base64 图片块 → 拆出为 inline_data parts
+/// - base64 图片块 → 拆出,由调用方嵌进 functionResponse.parts
 /// - 对象 → 序列化为 JSON 字符串
 /// - 缺失/空 → 空串
 ///
@@ -959,13 +953,10 @@ mod tests {
                     &json!({ *key: want.clone() }),
                     "antigravity={antigravity} fields={fields}"
                 );
-                let image_count = if antigravity {
-                    parts[0]["functionResponse"]["parts"]
-                        .as_array()
-                        .map_or(0, Vec::len)
-                } else {
-                    parts.len() - 1
-                };
+                assert_eq!(parts.len(), 1, "antigravity={antigravity}");
+                let image_count = parts[0]["functionResponse"]["parts"]
+                    .as_array()
+                    .map_or(0, Vec::len);
                 assert_eq!(
                     image_count,
                     usize::from(*has_image),
@@ -990,16 +981,50 @@ mod tests {
         })];
         let contents = convert_messages(&messages, &HashMap::new(), false, "gemini-2.0");
         let parts = contents[0]["parts"].as_array().unwrap();
-        // functionResponse + 拆出的 inline_data 图片
-        assert_eq!(parts.len(), 2);
-        assert_eq!(parts[0]["functionResponse"]["name"], "Read");
+        // 对齐 CPA be864305:图嵌进 functionResponse.parts,无兄弟 part
+        assert_eq!(parts.len(), 1);
+        let fr = &parts[0]["functionResponse"];
+        assert_eq!(fr["name"], "Read");
         // 对齐 CPA 9d0a60bf:单个非图块 → 序列化为 JSON 字符串
         assert_eq!(
-            parts[0]["functionResponse"]["response"]["result"],
+            fr["response"]["result"],
             r#"{"type":"text","text":"see image"}"#
         );
-        assert_eq!(parts[1]["inline_data"]["mime_type"], "image/png");
-        assert_eq!(parts[1]["inline_data"]["data"], "AAAA");
+        assert_eq!(fr["parts"].as_array().unwrap().len(), 1);
+        assert_eq!(fr["parts"][0]["inlineData"]["mimeType"], "image/png");
+        assert_eq!(fr["parts"][0]["inlineData"]["data"], "AAAA");
+    }
+
+    #[test]
+    fn test_convert_messages_gemini_nests_tool_images_in_order() {
+        // 对齐 CPA be864305:纯图 tool_result result 为空串;多图按序嵌入
+        // 各自的 functionResponse.parts;Gemini 直连 mimeType 原值不补缺省
+        let img = |mime: &str, data: &str| json!({"type": "image", "source": {"type": "base64", "media_type": mime, "data": data}});
+        let messages = vec![json!({
+            "role": "user",
+            "content": [
+                {"type": "tool_result", "tool_use_id": "Read-1",
+                 "content": [img("image/jpeg", "B1"), img("image/webp", "B2")]},
+                {"type": "tool_result", "tool_use_id": "Read-2",
+                 "content": [img("", "A1")]}
+            ]
+        })];
+        let contents = convert_messages(&messages, &HashMap::new(), false, "gemini-3-flash");
+        let parts = contents[0]["parts"].as_array().unwrap();
+        assert_eq!(parts.len(), 2);
+        let fr = &parts[0]["functionResponse"];
+        assert_eq!(fr["response"], json!({"result": ""}));
+        assert_eq!(
+            fr["parts"],
+            json!([
+                {"inlineData": {"mimeType": "image/jpeg", "data": "B1"}},
+                {"inlineData": {"mimeType": "image/webp", "data": "B2"}}
+            ])
+        );
+        assert_eq!(
+            parts[1]["functionResponse"]["parts"],
+            json!([{"inlineData": {"mimeType": "", "data": "A1"}}])
+        );
     }
 
     #[test]
