@@ -179,12 +179,9 @@ impl ChatRelay {
             }
         }
 
-        // content → text
-        if let Some(text) = delta.get("content").and_then(|v| v.as_str()) {
-            if !text.is_empty() {
-                self.has_text = true;
-                frames.extend(self.emit_content_delta(BlockType::Text, text));
-            }
+        // content → text / typed parts 数组(对齐 CPA 6044c5d1)
+        if let Some(content) = delta.get("content") {
+            frames.extend(self.emit_delta_content(content));
         }
 
         // tool_calls (对齐 CPA 6c6473f8:忽略空数组,防止错误停止 reasoning)
@@ -659,6 +656,56 @@ impl ChatRelay {
         frames
     }
 
+    /// 处理 delta.content:字符串或 typed parts 数组
+    /// (对齐 CPA 6044c5d1 convertOpenAIStreamingChunkToAnthropic content 分支)
+    fn emit_delta_content(&mut self, content: &Value) -> Vec<Bytes> {
+        match content {
+            Value::String(text) if !text.is_empty() => {
+                self.has_text = true;
+                self.emit_content_delta(BlockType::Text, text)
+            }
+            Value::Array(parts) => {
+                let mut frames = Vec::new();
+                for part in parts {
+                    match part {
+                        Value::String(text) if !text.is_empty() => {
+                            self.has_text = true;
+                            frames.extend(self.emit_content_delta(BlockType::Text, text));
+                        }
+                        Value::Object(_) => match part.get("type").and_then(|v| v.as_str()) {
+                            Some("thinking") | Some("reasoning") => {
+                                let text = extract_content_part_thinking_text(part);
+                                if !text.is_empty() && self.thinking_distinct(&text) {
+                                    frames.extend(
+                                        self.emit_content_delta(BlockType::Thinking, &text),
+                                    );
+                                }
+                            }
+                            Some("text") => {
+                                let text = part.get("text").and_then(|v| v.as_str()).unwrap_or("");
+                                if !text.is_empty() {
+                                    self.has_text = true;
+                                    frames.extend(self.emit_content_delta(BlockType::Text, text));
+                                }
+                            }
+                            _ => {
+                                // 未知 part 透传为 text JSON(对齐 CPA default → part.String())
+                                let raw = part.to_string();
+                                if !raw.is_empty() {
+                                    self.has_text = true;
+                                    frames.extend(self.emit_content_delta(BlockType::Text, &raw));
+                                }
+                            }
+                        },
+                        _ => {}
+                    }
+                }
+                frames
+            }
+            _ => Vec::new(),
+        }
+    }
+
     /// thinking 去重:空白或重复片段跳过
     /// 对齐 appendReasoningTextIfDistinct:片段等于任一已发片段、
     /// 或等于全部已发拼接(累积快照式 provider)都丢弃
@@ -677,6 +724,21 @@ impl ChatRelay {
         self.thinking_parts.push(text.to_string());
         true
     }
+}
+
+/// 从 content part 抽取 thinking 文本(对齐 CPA extractOpenAIContentPartThinkingText:
+/// thinking / reasoning / reasoning_content / text,嵌套数组 join(""))
+fn extract_content_part_thinking_text(part: &Value) -> String {
+    for field in ["thinking", "reasoning", "reasoning_content", "text"] {
+        if let Some(v) = part.get(field) {
+            let mut texts = Vec::new();
+            collect_reasoning_value(v, &mut texts);
+            if !texts.is_empty() {
+                return texts.join("");
+            }
+        }
+    }
+    String::new()
 }
 
 /// 从 delta 的多种字段提取 reasoning 文本
@@ -1705,6 +1767,113 @@ mod tests {
         assert!(
             s.contains("\"type\":\"timeout_error\""),
             "读失败应为 timeout_error,实际: {s}"
+        );
+    }
+
+    #[test]
+    fn test_delta_content_typed_parts_nested_thinking_and_text() {
+        // 对齐 CPA TestStreaming_DeltaContentTypedPartsArrayEmitsThinkingAndTextBlocks
+        let mut r = ChatRelay::new(None);
+        let out1 = r.process(&sse_ev(
+            r#"{"choices":[{"index":0,"delta":{"content":[{"type":"thinking","thinking":[{"type":"text","text":"The"}],"closed":true}]},"finish_reason":null}]}"#,
+        ));
+        let out2 = r.process(&sse_ev(
+            r#"{"choices":[{"index":0,"delta":{"content":[{"type":"thinking","thinking":[{"type":"text","text":" done."}],"closed":true},{"type":"text","text":"hello"}]},"finish_reason":null}]}"#,
+        ));
+        let out3 = process_then_done(
+            &mut r,
+            r#"{"choices":[{"index":0,"delta":{"content":""},"finish_reason":"stop"}],"usage":{"prompt_tokens":19,"completion_tokens":38}}"#,
+        );
+        let buf = [out1, out2, out3].concat().concat();
+        let s = String::from_utf8_lossy(&buf);
+
+        let mut block_starts = Vec::new();
+        let mut thinking_deltas = Vec::new();
+        let mut text_deltas = Vec::new();
+        for block in s.split("event: ") {
+            if block.starts_with("content_block_start") {
+                if let Some(data) = block.split_once("data: ").map(|(_, rest)| rest) {
+                    let json = data.split("\n\n").next().unwrap_or(data).trim();
+                    if let Ok(v) = serde_json::from_str::<Value>(json) {
+                        if let Some(t) = v["content_block"]["type"].as_str() {
+                            block_starts.push(t.to_string());
+                        }
+                    }
+                }
+            } else if block.starts_with("content_block_delta") {
+                if let Some(data) = block.split_once("data: ").map(|(_, rest)| rest) {
+                    let json = data.split("\n\n").next().unwrap_or(data).trim();
+                    if let Ok(v) = serde_json::from_str::<Value>(json) {
+                        match v["delta"]["type"].as_str() {
+                            Some("thinking_delta") => thinking_deltas
+                                .push(v["delta"]["thinking"].as_str().unwrap_or("").to_string()),
+                            Some("text_delta") => text_deltas
+                                .push(v["delta"]["text"].as_str().unwrap_or("").to_string()),
+                            _ => {}
+                        }
+                    }
+                }
+            }
+        }
+        assert_eq!(
+            block_starts,
+            ["thinking", "text"],
+            "实际 starts={block_starts:?} s={s}"
+        );
+        assert_eq!(
+            thinking_deltas,
+            ["The", " done."],
+            "实际 thinking={thinking_deltas:?}"
+        );
+        assert_eq!(text_deltas, ["hello"], "实际 text={text_deltas:?}");
+    }
+
+    #[test]
+    fn test_delta_content_typed_parts_plain_and_unknown_passthrough() {
+        // 对齐 CPA TestStreaming_DeltaContentTypedPartsArrayPlainThinkingAndUnknownPassthrough
+        let mut r = ChatRelay::new(None);
+        r.process(&sse_ev(
+            r#"{"choices":[{"index":0,"delta":{"content":[]},"finish_reason":null}]}"#,
+        ));
+        let out = r.process(&sse_ev(
+            r#"{"choices":[{"index":0,"delta":{"content":[{"type":"thinking","thinking":"step 1"},{"type":"reasoning","text":" step 2"},{"type":"text","text":"answer: "},{"type":"custom_part","payload":"raw"}]},"finish_reason":null}]}"#,
+        ));
+        let fin = process_then_done(
+            &mut r,
+            r#"{"choices":[{"index":0,"delta":{},"finish_reason":"stop"}]}"#,
+        );
+        let buf = [out, fin].concat().concat();
+        let s = String::from_utf8_lossy(&buf);
+
+        let mut thinking_deltas = Vec::new();
+        let mut text_deltas = Vec::new();
+        for block in s.split("event: ") {
+            if block.starts_with("content_block_delta") {
+                if let Some(data) = block.split_once("data: ").map(|(_, rest)| rest) {
+                    let json = data.split("\n\n").next().unwrap_or(data).trim();
+                    if let Ok(v) = serde_json::from_str::<Value>(json) {
+                        match v["delta"]["type"].as_str() {
+                            Some("thinking_delta") => thinking_deltas
+                                .push(v["delta"]["thinking"].as_str().unwrap_or("").to_string()),
+                            Some("text_delta") => text_deltas
+                                .push(v["delta"]["text"].as_str().unwrap_or("").to_string()),
+                            _ => {}
+                        }
+                    }
+                }
+            }
+        }
+        assert_eq!(
+            thinking_deltas.join(""),
+            "step 1 step 2",
+            "thinking={thinking_deltas:?}"
+        );
+        assert_eq!(text_deltas.len(), 2, "text={text_deltas:?} s={s}");
+        assert_eq!(text_deltas[0], "answer: ");
+        assert!(
+            text_deltas[1].contains("custom_part") && text_deltas[1].contains("raw"),
+            "unknown 应透传 JSON,实际: {}",
+            text_deltas[1]
         );
     }
 }

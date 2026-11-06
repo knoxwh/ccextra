@@ -340,20 +340,14 @@ pub fn openai_chat_to_anthropic(body: &Value) -> Option<Value> {
         }));
     }
 
-    // content:text 字符串或 [{type:"text"}]
+    // content:text 字符串或 typed parts 数组(对齐 CPA 6044c5d1
+    // appendOpenAINonStreamingMessageContent;不做 content 内 tool_calls)
     match message.get("content") {
         Some(Value::String(s)) if !s.is_empty() => {
             content.push(json!({"type": "text", "text": s}));
         }
         Some(Value::Array(parts)) => {
-            for part in parts {
-                if part.get("type").and_then(|v| v.as_str()) == Some("text") {
-                    let t = part.get("text").and_then(|v| v.as_str()).unwrap_or("");
-                    if !t.is_empty() {
-                        content.push(json!({"type": "text", "text": t}));
-                    }
-                }
-            }
+            append_openai_chat_content_parts(parts, &mut content);
         }
         _ => {}
     }
@@ -458,6 +452,90 @@ fn build_message(
         out["usage"]["output_tokens_details"] = json!({"thinking_tokens": thinking_tokens});
     }
     out
+}
+
+/// 非流 content parts 数组 → thinking/text 块
+/// (对齐 CPA appendOpenAINonStreamingMessageContent 的 text/thinking/reasoning;
+/// 未知 type 只 flush,不透传;不做 tool_calls-in-content)
+fn append_openai_chat_content_parts(parts: &[Value], content: &mut Vec<Value>) {
+    let mut text_buf = String::new();
+    let mut thinking_buf = String::new();
+
+    let flush_text = |buf: &mut String, content: &mut Vec<Value>| {
+        if !buf.is_empty() {
+            content.push(json!({"type": "text", "text": buf.as_str()}));
+            buf.clear();
+        }
+    };
+    let flush_thinking = |buf: &mut String, content: &mut Vec<Value>| {
+        if !buf.is_empty() {
+            content.push(json!({
+                "type": "thinking",
+                "thinking": buf.as_str(),
+                "signature": ""
+            }));
+            buf.clear();
+        }
+    };
+
+    for part in parts {
+        match part.get("type").and_then(|v| v.as_str()).unwrap_or("") {
+            "text" => {
+                let t = part.get("text").and_then(|v| v.as_str()).unwrap_or("");
+                if !t.is_empty() {
+                    flush_thinking(&mut thinking_buf, content);
+                    text_buf.push_str(t);
+                }
+            }
+            "thinking" | "reasoning" => {
+                let t = extract_content_part_thinking_text(part);
+                if !t.is_empty() {
+                    flush_text(&mut text_buf, content);
+                    thinking_buf.push_str(&t);
+                }
+            }
+            _ => {
+                flush_thinking(&mut thinking_buf, content);
+                flush_text(&mut text_buf, content);
+            }
+        }
+    }
+    flush_thinking(&mut thinking_buf, content);
+    flush_text(&mut text_buf, content);
+}
+
+/// 从 content part 抽取 thinking 文本(对齐 CPA extractOpenAIContentPartThinkingText;
+/// 嵌套 text parts 用 "" 拼接,不用顶层 reasoning 的换行语义)
+fn extract_content_part_thinking_text(part: &Value) -> String {
+    for field in ["thinking", "reasoning", "reasoning_content", "text"] {
+        if let Some(v) = part.get(field) {
+            let mut texts = Vec::new();
+            collect_part_thinking_fragments(v, &mut texts);
+            if !texts.is_empty() {
+                return texts.join("");
+            }
+        }
+    }
+    String::new()
+}
+
+fn collect_part_thinking_fragments(node: &Value, out: &mut Vec<String>) {
+    match node {
+        Value::String(s) if !s.is_empty() => out.push(s.clone()),
+        Value::Array(arr) => {
+            for item in arr {
+                collect_part_thinking_fragments(item, out);
+            }
+        }
+        Value::Object(obj) => {
+            if let Some(Value::String(s)) = obj.get("text") {
+                if !s.is_empty() {
+                    out.push(s.clone());
+                }
+            }
+        }
+        _ => {}
+    }
 }
 
 /// reasoning_content:字符串 / 对象 {text} / 数组(对齐 collectOpenAIReasoningTexts)
@@ -1022,5 +1100,63 @@ mod tests {
             out["content"][1]["content"][0]["url"],
             "https://example.com"
         );
+    }
+
+    #[test]
+    fn test_chat_nonstream_content_parts_thinking_and_block_order() {
+        // 对齐 CPA TestNonStream_ContentPartsArrayThinkingAndBlockOrder
+        let body = json!({
+            "id": "chatcmpl-1",
+            "object": "chat.completion",
+            "model": "zai-glm-5-3",
+            "choices": [{
+                "index": 0,
+                "message": {
+                    "role": "assistant",
+                    "content": [
+                        {
+                            "type": "thinking",
+                            "thinking": [
+                                {"type": "text", "text": "First "},
+                                {"type": "text", "text": "thought."}
+                            ],
+                            "closed": true
+                        },
+                        {"type": "text", "text": "hello"}
+                    ]
+                },
+                "finish_reason": "stop"
+            }]
+        });
+        let out = openai_chat_to_anthropic(&body).unwrap();
+        let blocks = out["content"].as_array().unwrap();
+        assert_eq!(blocks.len(), 2, "out={out}");
+        assert_eq!(blocks[0]["type"], "thinking");
+        assert_eq!(blocks[0]["thinking"], "First thought.");
+        assert_eq!(blocks[1]["type"], "text");
+        assert_eq!(blocks[1]["text"], "hello");
+
+        // 顶层 reasoning_content + 字符串 content → [thinking, text]
+        let body2 = json!({
+            "id": "chatcmpl-2",
+            "object": "chat.completion",
+            "model": "deepseek",
+            "choices": [{
+                "index": 0,
+                "message": {
+                    "role": "assistant",
+                    "content": "Final answer",
+                    "reasoning_content": "Step by step"
+                },
+                "finish_reason": "stop"
+            }]
+        });
+        let out2 = openai_chat_to_anthropic(&body2).unwrap();
+        let blocks2 = out2["content"].as_array().unwrap();
+        assert_eq!(blocks2.len(), 2, "out2={out2}");
+        assert_eq!(blocks2[0]["type"], "thinking");
+        assert_eq!(blocks2[0]["thinking"], "Step by step");
+        assert_eq!(blocks2[1]["type"], "text");
+        assert_eq!(blocks2[1]["text"], "Final answer");
     }
 }
