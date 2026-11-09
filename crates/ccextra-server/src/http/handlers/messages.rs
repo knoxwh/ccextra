@@ -1484,39 +1484,13 @@ pub(crate) async fn deliver_response(
         }
 
         if !retried_ok {
-            let body = if final_truncated {
-                serde_json::to_vec(&json!({
-                    "type": "error",
-                    "error": {
-                        "type": "api_error",
-                        "message": format!(
-                            "上游错误 body 超过 256 KiB 上限,已截断(status {})",
-                            final_status.as_u16()
-                        )
-                    }
-                }))
-                .unwrap_or_default()
-            } else {
-                to_anthropic_error(&final_bytes, final_status)
-            };
-            // Antigravity 429 常不带 Retry-After 头,等待时长在 body 的 RetryInfo 等字段里;
-            // 上游头优先(对齐 CPA antigravity executor ParseRetryDelay)
-            if retry_after.is_none()
-                && final_status == axum::http::StatusCode::TOO_MANY_REQUESTS
-                && !final_truncated
-                && matches!(prepared.route.protocol, Protocol::Antigravity)
-            {
-                retry_after = parse_google_retry_delay(&final_bytes).map(retry_after_header_secs);
-            }
-            let mut builder = Response::builder()
-                .status(final_status)
-                .header(header::CONTENT_TYPE, "application/json");
-            if let Some(ra) = retry_after {
-                builder = builder.header("retry-after", ra.as_secs());
-            }
-            return builder
-                .body(Body::from(body))
-                .map_err(|e| AppError::new(anyhow::anyhow!("构造错误响应失败: {e}")));
+            return build_upstream_error_response(
+                prepared.route.protocol,
+                final_status,
+                &final_bytes,
+                final_truncated,
+                retry_after,
+            );
         }
     }
 
@@ -1526,41 +1500,7 @@ pub(crate) async fn deliver_response(
             out
         } else {
             let upstream = executed.upstream.take().expect("上游响应应存在");
-            {
-                let replay_tap =
-                    if let Some((cache, key, fingerprint)) = prepared.replay_scope.clone() {
-                        ReplayTap::Responses(cache, key, fingerprint)
-                    } else if let Some((cache, key)) = prepared.ag_replay_scope.as_ref() {
-                        ReplayTap::Antigravity(
-                            cache.clone(),
-                            key.clone(),
-                            prepared.ag_replay_snapshot.clone(),
-                            prepared
-                                .body_json
-                                .get("request")
-                                .cloned()
-                                .unwrap_or_else(|| Value::Object(Default::default())),
-                        )
-                    } else if let Some((cache, key, applied)) = prepared.kimi_replay_scope.clone() {
-                        ReplayTap::Kimi(cache, key, applied)
-                    } else {
-                        ReplayTap::None
-                    };
-                relay_with_replay_tap(
-                    upstream.body.bytes_stream(),
-                    RelayParams {
-                        protocol: prepared.route.protocol,
-                        estimated_input_tokens: prepared.estimated_input_tokens,
-                        tool_names: prepared.tool_names.clone(),
-                        original_claude_request: prepared.original_claude_request.clone(),
-                        replay_tap,
-                        signature_model: prepared.signature_model.clone(),
-                        inbound_model: Some(Arc::clone(&prepared.inbound_model)),
-                        token_scope: prepared.token_scope.clone(),
-                        drift_usage_scope: prepared.drift_usage_scope.clone(),
-                    },
-                )
-            }
+            build_stream_relay(prepared, upstream)
         };
         Ok(Response::builder()
             .status(status)
@@ -1574,136 +1514,12 @@ pub(crate) async fn deliver_response(
         // 成功 body 只解析一次,供 replay / AG / Kimi / drift / 协议转换复用
         let parsed: Option<Value> = serde_json::from_slice(&body_bytes).ok();
         if let Some(ref v) = parsed {
-            if let Some((cache, key, fingerprint)) = prepared.replay_scope.as_ref() {
-                if matches!(prepared.route.protocol, Protocol::OpenAiResponses)
-                    && v.get("object").and_then(|o| o.as_str()) == Some("response")
-                {
-                    let wrapped = json!({"response": v});
-                    cache.store_from_completed(key, &wrapped, fingerprint);
-                }
-            }
-            if let Some((cache, key)) = prepared.ag_replay_scope.as_ref() {
-                if matches!(prepared.route.protocol, Protocol::Antigravity) {
-                    if let Some(request) = prepared.body_json.get("request") {
-                        cache.store_from_response(key, &prepared.ag_replay_snapshot, request, v);
-                    }
-                }
-            }
-            if let Some((cache, key, _)) = prepared.kimi_replay_scope.as_ref() {
-                if matches!(prepared.route.protocol, Protocol::Claude) {
-                    cache.store_from_message_response(key, v);
-                }
-            }
-            if let Some((drift, parent)) = prepared.drift_usage_scope.as_ref() {
-                let (cache_read, cache_creation) = match prepared.route.protocol {
-                    Protocol::Claude => (
-                        v.pointer("/usage/cache_read_input_tokens")
-                            .and_then(|t| t.as_i64())
-                            .unwrap_or(0),
-                        v.pointer("/usage/cache_creation_input_tokens")
-                            .and_then(|t| t.as_i64())
-                            .unwrap_or(0),
-                    ),
-                    Protocol::OpenAiChat => (
-                        v.pointer("/usage/prompt_tokens_details/cached_tokens")
-                            .and_then(|t| t.as_i64())
-                            .unwrap_or(0),
-                        v.pointer("/usage/prompt_tokens_details/cache_write_tokens")
-                            .or_else(|| {
-                                v.pointer("/usage/prompt_tokens_details/cache_creation_tokens")
-                            })
-                            .and_then(|t| t.as_i64())
-                            .unwrap_or(0),
-                    ),
-                    Protocol::OpenAiResponses => (
-                        v.pointer("/usage/input_tokens_details/cached_tokens")
-                            .and_then(|t| t.as_i64())
-                            .unwrap_or(0),
-                        v.pointer("/usage/input_tokens_details/cache_write_tokens")
-                            .or_else(|| {
-                                v.pointer("/usage/input_tokens_details/cache_creation_tokens")
-                            })
-                            .and_then(|t| t.as_i64())
-                            .unwrap_or(0),
-                    ),
-                    _ => (0, 0),
-                };
-                if matches!(
-                    prepared.route.protocol,
-                    Protocol::Claude | Protocol::OpenAiChat | Protocol::OpenAiResponses
-                ) {
-                    observe_cache_usage(drift, parent, cache_read, cache_creation);
-                }
-            }
+            observe_non_stream_success(prepared, v);
         }
         let converted = match parsed {
             Some(v) => {
-                if let Some(sid) = prepared.session_id.as_deref() {
-                    let input_tokens = match prepared.route.protocol {
-                        Protocol::OpenAiChat => {
-                            v.pointer("/usage/prompt_tokens").and_then(|t| t.as_i64())
-                        }
-                        Protocol::OpenAiResponses => {
-                            v.pointer("/usage/input_tokens").and_then(|t| t.as_i64())
-                        }
-                        Protocol::Gemini | Protocol::Antigravity => {
-                            let inner = if prepared.route.protocol == Protocol::Antigravity {
-                                v.get("response").unwrap_or(&v)
-                            } else {
-                                &v
-                            };
-                            inner
-                                .pointer("/usageMetadata/promptTokenCount")
-                                .and_then(|t| t.as_i64())
-                        }
-                        Protocol::Claude => None,
-                    };
-                    if let Some(tokens) = input_tokens {
-                        if tokens > 0 {
-                            let _ =
-                                state.last_input_tokens.lock().ok().map(|mut cache| {
-                                    cache.insert(sid.to_string(), tokens as usize)
-                                });
-                        }
-                    }
-                }
-                match prepared.route.protocol {
-                    Protocol::Claude => None,
-                    Protocol::OpenAiChat => crate::sse::non_stream::openai_chat_to_anthropic(&v),
-                    Protocol::OpenAiResponses => crate::sse::non_stream::responses_to_anthropic(
-                        &v,
-                        prepared.tool_names.as_deref(),
-                    ),
-                    Protocol::Gemini => {
-                        use ccextra_core::convert::convert_gemini_response;
-                        Some(convert_gemini_response(
-                            &v,
-                            prepared.tool_names.as_deref().unwrap_or(&HashMap::new()),
-                            None,
-                            prepared.original_claude_request.as_deref(),
-                        ))
-                    }
-                    Protocol::Antigravity => {
-                        use ccextra_core::convert::convert_gemini_response;
-                        let mut inner = v.get("response").cloned().unwrap_or_else(|| v.clone());
-                        if inner.get("usageMetadata").is_none() {
-                            let usage = inner
-                                .get("cpaUsageMetadata")
-                                .or_else(|| v.get("usageMetadata"))
-                                .or_else(|| v.get("cpaUsageMetadata"))
-                                .cloned();
-                            if let Some(usage) = usage {
-                                inner["usageMetadata"] = usage;
-                            }
-                        }
-                        Some(convert_gemini_response(
-                            &inner,
-                            prepared.tool_names.as_deref().unwrap_or(&HashMap::new()),
-                            Some(prepared.route.upstream_model.as_str()),
-                            prepared.original_claude_request.as_deref(),
-                        ))
-                    }
-                }
+                record_non_stream_input_tokens(state, prepared, &v);
+                convert_non_stream_success(prepared, &v)
             }
             None => None,
         };
@@ -1953,6 +1769,219 @@ pub async fn handle_messages(
             Err(e)
         }
     }
+}
+
+/// 非流成功旁路:Responses/AG/Kimi replay 落账与 drift cache usage 观测(只读响应)。
+fn observe_non_stream_success(prepared: &PreparedMessageRequest, v: &Value) {
+    if let Some((cache, key, fingerprint)) = prepared.replay_scope.as_ref() {
+        if matches!(prepared.route.protocol, Protocol::OpenAiResponses)
+            && v.get("object").and_then(|o| o.as_str()) == Some("response")
+        {
+            let wrapped = json!({"response": v});
+            cache.store_from_completed(key, &wrapped, fingerprint);
+        }
+    }
+    if let Some((cache, key)) = prepared.ag_replay_scope.as_ref() {
+        if matches!(prepared.route.protocol, Protocol::Antigravity) {
+            if let Some(request) = prepared.body_json.get("request") {
+                cache.store_from_response(key, &prepared.ag_replay_snapshot, request, v);
+            }
+        }
+    }
+    if let Some((cache, key, _)) = prepared.kimi_replay_scope.as_ref() {
+        if matches!(prepared.route.protocol, Protocol::Claude) {
+            cache.store_from_message_response(key, v);
+        }
+    }
+    if let Some((drift, parent)) = prepared.drift_usage_scope.as_ref() {
+        let (cache_read, cache_creation) = match prepared.route.protocol {
+            Protocol::Claude => (
+                v.pointer("/usage/cache_read_input_tokens")
+                    .and_then(|t| t.as_i64())
+                    .unwrap_or(0),
+                v.pointer("/usage/cache_creation_input_tokens")
+                    .and_then(|t| t.as_i64())
+                    .unwrap_or(0),
+            ),
+            Protocol::OpenAiChat => (
+                v.pointer("/usage/prompt_tokens_details/cached_tokens")
+                    .and_then(|t| t.as_i64())
+                    .unwrap_or(0),
+                v.pointer("/usage/prompt_tokens_details/cache_write_tokens")
+                    .or_else(|| v.pointer("/usage/prompt_tokens_details/cache_creation_tokens"))
+                    .and_then(|t| t.as_i64())
+                    .unwrap_or(0),
+            ),
+            Protocol::OpenAiResponses => (
+                v.pointer("/usage/input_tokens_details/cached_tokens")
+                    .and_then(|t| t.as_i64())
+                    .unwrap_or(0),
+                v.pointer("/usage/input_tokens_details/cache_write_tokens")
+                    .or_else(|| v.pointer("/usage/input_tokens_details/cache_creation_tokens"))
+                    .and_then(|t| t.as_i64())
+                    .unwrap_or(0),
+            ),
+            _ => (0, 0),
+        };
+        if matches!(
+            prepared.route.protocol,
+            Protocol::Claude | Protocol::OpenAiChat | Protocol::OpenAiResponses
+        ) {
+            observe_cache_usage(drift, parent, cache_read, cache_creation);
+        }
+    }
+}
+
+/// 非流成功:按协议提取 input tokens 写会话缓存(供后续流式 message_start 占位)。
+fn record_non_stream_input_tokens(state: &AppState, prepared: &PreparedMessageRequest, v: &Value) {
+    if let Some(sid) = prepared.session_id.as_deref() {
+        let input_tokens = match prepared.route.protocol {
+            Protocol::OpenAiChat => v.pointer("/usage/prompt_tokens").and_then(|t| t.as_i64()),
+            Protocol::OpenAiResponses => v.pointer("/usage/input_tokens").and_then(|t| t.as_i64()),
+            Protocol::Gemini | Protocol::Antigravity => {
+                let inner = if prepared.route.protocol == Protocol::Antigravity {
+                    v.get("response").unwrap_or(v)
+                } else {
+                    v
+                };
+                inner
+                    .pointer("/usageMetadata/promptTokenCount")
+                    .and_then(|t| t.as_i64())
+            }
+            Protocol::Claude => None,
+        };
+        if let Some(tokens) = input_tokens {
+            if tokens > 0 {
+                let _ = state
+                    .last_input_tokens
+                    .lock()
+                    .ok()
+                    .map(|mut cache| cache.insert(sid.to_string(), tokens as usize));
+            }
+        }
+    }
+}
+
+/// 非流成功:按协议把上游 JSON 转回 Anthropic message;Claude 直通返回 None。
+fn convert_non_stream_success(prepared: &PreparedMessageRequest, v: &Value) -> Option<Value> {
+    match prepared.route.protocol {
+        Protocol::Claude => None,
+        Protocol::OpenAiChat => crate::sse::non_stream::openai_chat_to_anthropic(v),
+        Protocol::OpenAiResponses => {
+            crate::sse::non_stream::responses_to_anthropic(v, prepared.tool_names.as_deref())
+        }
+        Protocol::Gemini => {
+            use ccextra_core::convert::convert_gemini_response;
+            Some(convert_gemini_response(
+                v,
+                prepared.tool_names.as_deref().unwrap_or(&HashMap::new()),
+                None,
+                prepared.original_claude_request.as_deref(),
+            ))
+        }
+        Protocol::Antigravity => {
+            use ccextra_core::convert::convert_gemini_response;
+            let mut inner = v.get("response").cloned().unwrap_or_else(|| v.clone());
+            if inner.get("usageMetadata").is_none() {
+                let usage = inner
+                    .get("cpaUsageMetadata")
+                    .or_else(|| v.get("usageMetadata"))
+                    .or_else(|| v.get("cpaUsageMetadata"))
+                    .cloned();
+                if let Some(usage) = usage {
+                    inner["usageMetadata"] = usage;
+                }
+            }
+            Some(convert_gemini_response(
+                &inner,
+                prepared.tool_names.as_deref().unwrap_or(&HashMap::new()),
+                Some(prepared.route.upstream_model.as_str()),
+                prepared.original_claude_request.as_deref(),
+            ))
+        }
+    }
+}
+
+/// 上游最终失败:转 Anthropic error 形状,透传/补齐 Retry-After。
+fn build_upstream_error_response(
+    protocol: Protocol,
+    final_status: axum::http::StatusCode,
+    final_bytes: &[u8],
+    final_truncated: bool,
+    mut retry_after: Option<std::time::Duration>,
+) -> Result<Response, AppError> {
+    let body = if final_truncated {
+        serde_json::to_vec(&json!({
+            "type": "error",
+            "error": {
+                "type": "api_error",
+                "message": format!(
+                    "上游错误 body 超过 256 KiB 上限,已截断(status {})",
+                    final_status.as_u16()
+                )
+            }
+        }))
+        .unwrap_or_default()
+    } else {
+        to_anthropic_error(final_bytes, final_status)
+    };
+    // Antigravity 429 常不带 Retry-After 头,等待时长在 body 的 RetryInfo 等字段里;
+    // 上游头优先(对齐 CPA antigravity executor ParseRetryDelay)
+    if retry_after.is_none()
+        && final_status == axum::http::StatusCode::TOO_MANY_REQUESTS
+        && !final_truncated
+        && matches!(protocol, Protocol::Antigravity)
+    {
+        retry_after = parse_google_retry_delay(final_bytes).map(retry_after_header_secs);
+    }
+    let mut builder = Response::builder()
+        .status(final_status)
+        .header(header::CONTENT_TYPE, "application/json");
+    if let Some(ra) = retry_after {
+        builder = builder.header("retry-after", ra.as_secs());
+    }
+    builder
+        .body(Body::from(body))
+        .map_err(|e| AppError::new(anyhow::anyhow!("构造错误响应失败: {e}")))
+}
+
+/// 流式成功:按协议挂 replay 旁路并接 SSE 状态机。
+fn build_stream_relay(
+    prepared: &PreparedMessageRequest,
+    upstream: UpstreamResponse,
+) -> SseStreamPin {
+    let replay_tap = if let Some((cache, key, fingerprint)) = prepared.replay_scope.clone() {
+        ReplayTap::Responses(cache, key, fingerprint)
+    } else if let Some((cache, key)) = prepared.ag_replay_scope.as_ref() {
+        ReplayTap::Antigravity(
+            cache.clone(),
+            key.clone(),
+            prepared.ag_replay_snapshot.clone(),
+            prepared
+                .body_json
+                .get("request")
+                .cloned()
+                .unwrap_or_else(|| Value::Object(Default::default())),
+        )
+    } else if let Some((cache, key, applied)) = prepared.kimi_replay_scope.clone() {
+        ReplayTap::Kimi(cache, key, applied)
+    } else {
+        ReplayTap::None
+    };
+    relay_with_replay_tap(
+        upstream.body.bytes_stream(),
+        RelayParams {
+            protocol: prepared.route.protocol,
+            estimated_input_tokens: prepared.estimated_input_tokens,
+            tool_names: prepared.tool_names.clone(),
+            original_claude_request: prepared.original_claude_request.clone(),
+            replay_tap,
+            signature_model: prepared.signature_model.clone(),
+            inbound_model: Some(Arc::clone(&prepared.inbound_model)),
+            token_scope: prepared.token_scope.clone(),
+            drift_usage_scope: prepared.drift_usage_scope.clone(),
+        },
+    )
 }
 
 #[cfg(test)]
