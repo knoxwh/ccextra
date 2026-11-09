@@ -5,7 +5,7 @@ use crate::oauth_common::lock_for_refresh_token;
 use anyhow::{anyhow, Result};
 use std::path::Path;
 
-/// 检查并刷新凭证(如果需要);仅对明确可重试 HTTP 5xx 退避重试
+/// 检查并刷新凭证(如果需要);仅对可重试错误(HTTP 5xx / 连接建立失败)退避重试
 /// skew_secs: 提前刷新的时间窗口（秒），对齐 CPA antigravityRequestTokenSafetyWindow = 300s
 pub async fn refresh_if_needed(
     cred: &mut AntigravityCredential,

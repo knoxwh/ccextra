@@ -118,7 +118,7 @@ async fn fetch_user_email_at(
     Ok(email)
 }
 
-/// 刷新结果错误分类:仅明确 HTTP 5xx 可重试;其余(含传输/解码)不盲重放
+/// 刷新结果错误分类:HTTP 5xx 与连接建立失败可重试;其余(请求已发出后的读/解码失败等)不盲重放
 #[derive(Debug)]
 pub struct RefreshError {
     pub status: Option<u16>,
@@ -144,6 +144,25 @@ impl std::error::Error for RefreshError {}
 /// 仅明确 HTTP 5xx 可重试(对齐 Claude oauth::RefreshError)
 pub fn refresh_status_retryable(status: u16) -> bool {
     status >= 500
+}
+
+/// 传输错误是否可重试:仅连接建立失败——请求未发出,refresh token 不可能被消费;
+/// 发出后的读/超时失败上游可能已消费 refresh,仍不重放
+fn transport_error_retryable(e: &reqwest::Error) -> bool {
+    e.is_connect()
+}
+
+/// 拼接完整 source 链(reqwest 顶层 Display 不含根因,如代理拒连/DNS)。
+/// 链上只有 URL 与 OS/TLS 错误文本,不含表单里的 refresh token。
+fn error_chain(e: &dyn std::error::Error) -> String {
+    let mut out = e.to_string();
+    let mut source = e.source();
+    while let Some(cause) = source {
+        out.push_str(": ");
+        out.push_str(&cause.to_string());
+        source = cause.source();
+    }
+    out
 }
 
 /// 刷新 token;失败不自动重试——由 refresh.rs 按 retryable 决定
@@ -172,12 +191,12 @@ pub async fn refresh_token(client: &Client, refresh: &str) -> Result<TokenRespon
         .await
     {
         Ok(r) => r,
-        // 传输错误:上游可能已消费 refresh,不可重放
+        // 传输错误:仅连接建立失败可重放(见 transport_error_retryable)
         Err(e) => {
             return Err(RefreshError {
                 status: None,
-                message: format!("request failed: {e}"),
-                retryable: false,
+                message: format!("request failed: {}", error_chain(&e)),
+                retryable: transport_error_retryable(&e),
             })
         }
     };
@@ -312,6 +331,46 @@ mod tests {
         http_client(Some("http://127.0.0.1:7897")).unwrap();
         http_client(Some("socks5://127.0.0.1:1080")).unwrap();
         assert!(http_client(Some("not-a-url")).is_err());
+    }
+
+    #[tokio::test]
+    async fn connect_failure_is_retryable_and_reports_source_chain() {
+        // 绑定后立即释放端口:连接被拒,请求未发出
+        let addr = std::net::TcpListener::bind("127.0.0.1:0")
+            .unwrap()
+            .local_addr()
+            .unwrap();
+        let err = http_client(Some("direct"))
+            .unwrap()
+            .post(format!("http://{addr}/token"))
+            .send()
+            .await
+            .unwrap_err();
+        assert!(transport_error_retryable(&err));
+        let chain = error_chain(&err);
+        assert!(chain.starts_with(&err.to_string()));
+        assert!(chain.len() > err.to_string().len(), "缺根因: {chain}");
+    }
+
+    #[tokio::test]
+    async fn read_failure_after_send_is_not_retryable() {
+        // 收到请求后不回响应直接断开:请求已发出,不得重放
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        tokio::spawn(async move {
+            let (mut sock, _) = listener.accept().await.unwrap();
+            let mut buf = [0u8; 4096];
+            let _ = tokio::io::AsyncReadExt::read(&mut sock, &mut buf).await;
+        });
+        let err = http_client(Some("direct"))
+            .unwrap()
+            .post(format!("http://{addr}/token"))
+            .body("grant_type=refresh_token")
+            .send()
+            .await
+            .unwrap_err();
+        assert!(!err.is_connect(), "{err:?}");
+        assert!(!transport_error_retryable(&err));
     }
 
     #[tokio::test]

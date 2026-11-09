@@ -623,18 +623,37 @@ where
 /// Antigravity 注入任务:启动即拉取,成功注入后每 3 小时刷新;失败保旧。
 /// 每轮从当前快照获取参数,不发布尚未成功 reload 的磁盘配置。
 async fn run_antigravity_injection(state: AppState) {
-    /// 刷新周期(对齐 CPA modelsRefreshInterval = 3h)
+    antigravity_injection_loop(state.config.clone(), |refresh, current| {
+        load_refreshed_providers(refresh, current)
+    })
+    .await
+}
+
+/// 首次未就绪的短退避:30s 起翻倍,封顶 5min(对齐 CPA refreshFailureBackoff = 5min)
+fn startup_retry_delay(attempt: u32) -> std::time::Duration {
+    const BASE_SECS: u64 = 30;
+    const MAX_SECS: u64 = 300;
+    let secs = BASE_SECS.saturating_mul(1u64 << attempt.min(8));
+    std::time::Duration::from_secs(secs.min(MAX_SECS))
+}
+
+/// 注入循环:立即拉取一次;尚未拉到过 provider 时按 [`startup_retry_delay`] 短退避重试,
+/// 一旦拉到(含与现有快照相同)即转入 3 小时周期(对齐 CPA modelsRefreshInterval = 3h)。
+async fn antigravity_injection_loop<F, Fut>(config: Arc<RwLock<Arc<ConfigSnapshot>>>, load: F)
+where
+    F: Fn(ProviderRefreshConfig, Vec<ProviderConfig>) -> Fut,
+    Fut: std::future::Future<Output = Option<Vec<ProviderConfig>>>,
+{
     const REFRESH_INTERVAL: std::time::Duration = std::time::Duration::from_secs(3 * 3600);
 
-    let config = state.config.clone();
-    let mut ticker = tokio::time::interval(REFRESH_INTERVAL);
-    // 首次 tick 立即到期,启动后马上拉取一次(CPA tryStartupRefresh 同构)
-    ticker.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
     let mut ready = false;
+    let mut retry_attempt: u32 = 0;
     loop {
-        ticker.tick().await;
-        let result = refresh_providers(&config, |refresh, current| {
-            load_refreshed_providers(refresh, current)
+        let loaded = std::sync::atomic::AtomicBool::new(false);
+        let result = refresh_providers(&config, |refresh, current| async {
+            let out = load(refresh, current).await;
+            loaded.store(out.is_some(), std::sync::atomic::Ordering::Relaxed);
+            out
         })
         .await;
         match result {
@@ -642,13 +661,22 @@ async fn run_antigravity_injection(state: AppState) {
                 if ready {
                     tracing::info!("Antigravity 周期刷新完成");
                 } else {
-                    ready = true;
                     tracing::info!("Antigravity providers 已就绪");
                 }
             }
             Ok(false) => {}
             Err(error) => tracing::warn!("provider 刷新校验失败,保持现有数据: {error}"),
         }
+        ready |= loaded.load(std::sync::atomic::Ordering::Relaxed);
+        let delay = if ready {
+            REFRESH_INTERVAL
+        } else {
+            let delay = startup_retry_delay(retry_attempt);
+            retry_attempt = retry_attempt.saturating_add(1);
+            tracing::warn!("Antigravity 尚未就绪,{}s 后重试", delay.as_secs());
+            delay
+        };
+        tokio::time::sleep(delay).await;
     }
 }
 
@@ -1002,9 +1030,10 @@ fn build_user_agents(config: Option<&config::UserAgents>) -> UserAgentSet {
 #[cfg(test)]
 mod tests {
     use super::{
-        build_user_agents, load_refreshed_providers, load_thinking_registry, merge_providers,
-        pin_auth_dir, pin_path, provider_refresh_config, refresh_providers, with_pinned_log_dir,
-        Arc, Config, ProviderConfig, RuntimeConfig, RwLock, UpstreamClient,
+        antigravity_injection_loop, build_user_agents, load_refreshed_providers,
+        load_thinking_registry, merge_providers, pin_auth_dir, pin_path, provider_refresh_config,
+        refresh_providers, startup_retry_delay, with_pinned_log_dir, Arc, Config, ProviderConfig,
+        RuntimeConfig, RwLock, UpstreamClient,
     };
     use ccextra_core::route::{ModelConfig, Protocol};
     use ccextra_server::antigravity::resolve_auth_dir as resolve_antigravity_auth_dir;
@@ -1089,6 +1118,48 @@ mod tests {
         .unwrap();
         assert!(published);
         assert_eq!(state.read().await.providers[0].name, "new-account");
+    }
+
+    #[test]
+    fn startup_retry_delay_doubles_and_caps_at_five_minutes() {
+        let secs: Vec<u64> = (0..7).map(|n| startup_retry_delay(n).as_secs()).collect();
+        assert_eq!(secs, vec![30, 60, 120, 240, 300, 300, 300]);
+        assert_eq!(startup_retry_delay(u32::MAX).as_secs(), 300);
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn injection_retries_with_backoff_until_ready_then_waits_three_hours() {
+        let state = refresh_state();
+        let start = tokio::time::Instant::now();
+        let calls = Arc::new(std::sync::Mutex::new(Vec::<u64>::new()));
+        let recorded = calls.clone();
+        let task = tokio::spawn(antigravity_injection_loop(state.clone(), move |_, _| {
+            let recorded = recorded.clone();
+            async move {
+                let n = {
+                    let mut calls = recorded.lock().unwrap();
+                    calls.push(start.elapsed().as_secs());
+                    calls.len()
+                };
+                // 前 3 次未拉到(模拟启动时代理未就绪),第 4 次起成功
+                (n > 3).then(|| {
+                    vec![ProviderConfig::new(
+                        "ag-account".into(),
+                        Protocol::Antigravity,
+                        vec!["https://example.invalid".into()],
+                        "fixture-key".into(),
+                        None,
+                        false,
+                        vec![],
+                    )]
+                })
+            }
+        }));
+        tokio::time::sleep(std::time::Duration::from_secs(4 * 3600)).await;
+        task.abort();
+        // 0 → +30s → +60s → +120s 成功 → 之后回到 3h 周期
+        assert_eq!(*calls.lock().unwrap(), vec![0, 30, 90, 210, 210 + 3 * 3600]);
+        assert_eq!(state.read().await.providers[0].name, "ag-account");
     }
 
     #[tokio::test]

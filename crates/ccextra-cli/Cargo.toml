@@ -32,3 +32,5 @@ time = { version = "0.3", features = ["formatting", "local-offset"] }
 
 [dev-dependencies]
 tempfile = "3"
+# start_paused 测试时钟(Antigravity 启动退避用例)
+tokio = { workspace = true, features = ["test-util"] }
