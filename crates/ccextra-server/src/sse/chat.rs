@@ -14,7 +14,7 @@
 use std::collections::HashMap;
 
 use async_stream::stream;
-use bytes::Bytes;
+use bytes::{Bytes, BytesMut};
 use futures::Stream;
 use serde_json::Value;
 
@@ -825,22 +825,67 @@ pub(super) fn resolve_finish_reason(
     finish_reason.to_string()
 }
 
-/// Claude 直通:字节级转发,不解析
+/// SSE 事件边界(空行 `\n\n` / `\r\n\r\n`)在 `buf` 中最后一次的结束位置(独占下标)。
+/// 只找结束字节落在 `from..` 的分隔符;分隔符可起于 `from` 之前(跨 chunk)。
+fn last_event_boundary(buf: &[u8], from: usize) -> Option<usize> {
+    (from..buf.len()).rev().find_map(|j| {
+        let end = j + 1;
+        let head = &buf[..end];
+        (buf[j] == b'\n' && (head.ends_with(b"\n\n") || head.ends_with(b"\r\n\r\n"))).then_some(end)
+    })
+}
+
+/// 把新 chunk 并入未完结尾部,取出截至最后一个事件边界的完整事件字节。
+/// 不变式:`pending` 内不含完整边界;字节内容与顺序不改。
+fn take_complete_events(pending: &mut BytesMut, chunk: Bytes) -> Option<Bytes> {
+    if pending.is_empty() {
+        // 常见路径:chunk 恰好以边界结尾,零拷贝放行
+        return match last_event_boundary(&chunk, 0) {
+            Some(end) if end == chunk.len() => Some(chunk),
+            Some(end) => {
+                pending.extend_from_slice(&chunk[end..]);
+                Some(chunk.slice(..end))
+            }
+            None => {
+                pending.extend_from_slice(&chunk);
+                None
+            }
+        };
+    }
+    let from = pending.len();
+    pending.extend_from_slice(&chunk);
+    let end = last_event_boundary(pending, from)?;
+    Some(pending.split_to(end).freeze())
+}
+
+/// Claude 直通:字节级转发,不解析。
+/// 只在完整事件边界放行(未完结尾部暂存),心跳/错误帧因此不会插进半截事件;
+/// EOF 原样冲刷剩余字节,读失败/空闲超时丢弃半截事件再发 error。
 pub fn relay_claude_passthrough<S>(stream: S) -> SseStreamPin
 where
     S: Stream<Item = Result<Bytes, std::io::Error>> + Send + 'static,
 {
     Box::pin(stream! {
         let mut stream = Box::pin(stream);
+        let mut pending = BytesMut::new();
         loop {
             match crate::sse::next_upstream_chunk(&mut stream).await {
-                Ok(Some(Ok(chunk))) => yield Ok(chunk),
+                Ok(Some(Ok(chunk))) => {
+                    if let Some(events) = take_complete_events(&mut pending, chunk) {
+                        yield Ok(events);
+                    }
+                }
                 Ok(Some(Err(e))) => {
                     // 读失败发 timeout_error,避免下游只见 io::Error 断流
                     yield Ok(crate::sse::emit::timeout_error_event(&format!("上游流中断: {e}")));
                     return;
                 }
-                Ok(None) => return,
+                Ok(None) => {
+                    if !pending.is_empty() {
+                        yield Ok(pending.split().freeze());
+                    }
+                    return;
+                }
                 Err(msg) => {
                     yield Ok(crate::sse::emit::timeout_error_event(msg));
                     return;
@@ -1768,6 +1813,112 @@ mod tests {
             s.contains("\"type\":\"timeout_error\""),
             "读失败应为 timeout_error,实际: {s}"
         );
+    }
+
+    fn passthrough_chunks(chunks: &[&'static str]) -> Vec<Result<Bytes, std::io::Error>> {
+        chunks
+            .iter()
+            .map(|c| Ok(Bytes::from_static(c.as_bytes())))
+            .collect()
+    }
+
+    async fn collect_passthrough(items: Vec<Result<Bytes, std::io::Error>>) -> Vec<Bytes> {
+        use futures::StreamExt;
+        relay_claude_passthrough(futures::stream::iter(items))
+            .map(|r| r.unwrap())
+            .collect()
+            .await
+    }
+
+    #[tokio::test]
+    async fn test_claude_passthrough_releases_only_complete_events_byte_exact() {
+        // 边界跨 chunk(`\n` | `\n`)、CRLF 边界跨 chunk、单 chunk 多事件 + 半截尾部
+        let chunks = [
+            "event: a\ndata: {\"x\":",
+            "1}\n",
+            "\nevent: b\r\ndata: 2\r\n\r",
+            "\nevent: c\ndata: 3\n\nevent: d\nda",
+            "ta: 4\n\n",
+        ];
+        let out = collect_passthrough(passthrough_chunks(&chunks)).await;
+        let frames: Vec<String> = out
+            .iter()
+            .map(|b| String::from_utf8_lossy(b).into_owned())
+            .collect();
+        assert_eq!(
+            frames,
+            vec![
+                "event: a\ndata: {\"x\":1}\n\n",
+                // CRLF 边界 `\r` | `\n` 跨 chunk;同批完整事件合并放行
+                "event: b\r\ndata: 2\r\n\r\nevent: c\ndata: 3\n\n",
+                "event: d\ndata: 4\n\n",
+            ]
+        );
+        assert_eq!(frames.concat(), chunks.concat(), "字节必须逐字一致");
+    }
+
+    #[tokio::test]
+    async fn test_claude_passthrough_flushes_unterminated_tail_on_eof() {
+        let chunks = ["event: a\ndata: 1\n\n", "data: tail-without-boundary"];
+        let out = collect_passthrough(passthrough_chunks(&chunks)).await;
+        assert_eq!(out.len(), 2);
+        assert_eq!(out.concat(), chunks.concat().into_bytes());
+    }
+
+    #[tokio::test]
+    async fn test_claude_passthrough_error_drops_partial_event() {
+        let mut items = passthrough_chunks(&["event: a\ndata: 1\n\nevent: b\ndata: {\"half"]);
+        items.push(Err(std::io::Error::other("upstream read failed")));
+        let out = collect_passthrough(items).await;
+        assert_eq!(out.len(), 2, "{out:?}");
+        assert_eq!(&out[0][..], b"event: a\ndata: 1\n\n");
+        let err = String::from_utf8_lossy(&out[1]);
+        assert!(
+            err.starts_with("event: error\n"),
+            "错误帧须起于事件边界: {err}"
+        );
+        assert!(!err.contains("half"), "半截事件不得拼入: {err}");
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn test_claude_passthrough_keepalive_never_splits_event() {
+        use futures::StreamExt;
+        // 半截事件后静默 25s(> 10s 心跳间隔):心跳只能落在事件边界
+        let upstream = stream! {
+            yield Ok::<_, std::io::Error>(Bytes::from_static(b"event: a\ndata: 1\n\nevent: b\nda"));
+            tokio::time::sleep(std::time::Duration::from_secs(25)).await;
+            yield Ok(Bytes::from_static(b"ta: 2\n\n"));
+        };
+        let out: Vec<Bytes> = crate::sse::relay(
+            ccextra_core::route::Protocol::Claude,
+            upstream,
+            None,
+            None,
+            None,
+            None,
+            None,
+        )
+        .map(|r| r.unwrap())
+        .collect()
+        .await;
+        let keepalive: &[u8] = b": keepalive\n\n";
+        assert!(
+            out.iter().any(|f| &f[..] == keepalive),
+            "静默期应有心跳: {out:?}"
+        );
+        let business: Vec<u8> = out
+            .iter()
+            .filter(|f| &f[..] != keepalive)
+            .flat_map(|f| f.to_vec())
+            .collect();
+        assert_eq!(
+            business,
+            b"event: a\ndata: 1\n\nevent: b\ndata: 2\n\n".to_vec()
+        );
+        assert!(out
+            .iter()
+            .filter(|f| &f[..] != keepalive)
+            .all(|f| f.ends_with(b"\n\n")));
     }
 
     #[test]
