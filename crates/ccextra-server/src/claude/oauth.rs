@@ -5,10 +5,10 @@ use super::constants::{
     AUTH_SCOPE, AUTH_URL, CLIENT_ID, PROFILE_URL, REDIRECT_URI, REFRESH_TOKEN_URL, TOKEN_URL,
 };
 use crate::oauth_common::urlencode;
+pub use crate::oauth_common::{generate_pkce_codes, PkceCodes};
 use anyhow::{anyhow, Context, Result};
 use reqwest::Client;
 use serde::{Deserialize, Serialize};
-use sha2::{Digest, Sha256};
 
 #[derive(Debug, Clone, Deserialize)]
 pub struct TokenData {
@@ -72,26 +72,6 @@ struct AuthorizationCodeExchangeRequest<'a> {
     client_id: &'a str,
     code_verifier: &'a str,
     state: &'a str,
-}
-
-/// PKCE 校验对 (96 随机字节 base64url 无填充 → SHA256 challenge)
-pub struct PkceCodes {
-    pub code_verifier: String,
-    pub code_challenge: String,
-}
-
-pub fn generate_pkce_codes() -> Result<PkceCodes> {
-    let mut bytes = [0u8; 96];
-    getrandom::fill(&mut bytes).context("generate pkce verifier")?;
-    use base64::Engine;
-    let engine = base64::engine::general_purpose::URL_SAFE_NO_PAD;
-    let code_verifier = engine.encode(bytes);
-    let digest = Sha256::digest(code_verifier.as_bytes());
-    let code_challenge = engine.encode(digest);
-    Ok(PkceCodes {
-        code_verifier,
-        code_challenge,
-    })
 }
 
 /// 构造授权 URL (对齐 CPA GenerateAuthURL)

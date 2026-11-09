@@ -163,6 +163,27 @@ fn acquire_refresh_lock(
         .clone()
 }
 
+/// Claude/Codex 共用的 PKCE 校验对(对齐 CPA:96 随机字节 base64url 无填充)。
+pub struct PkceCodes {
+    pub code_verifier: String,
+    pub code_challenge: String,
+}
+
+pub fn generate_pkce_codes() -> Result<PkceCodes> {
+    let mut bytes = [0u8; 96];
+    getrandom::fill(&mut bytes).context("generate pkce verifier")?;
+    use base64::Engine;
+    use sha2::{Digest, Sha256};
+    let engine = base64::engine::general_purpose::URL_SAFE_NO_PAD;
+    let code_verifier = engine.encode(bytes);
+    let digest = Sha256::digest(code_verifier.as_bytes());
+    let code_challenge = engine.encode(digest);
+    Ok(PkceCodes {
+        code_verifier,
+        code_challenge,
+    })
+}
+
 /// OAuth state:16 字节随机数 hex
 pub(crate) fn random_state() -> Result<String> {
     let mut bytes = [0u8; 16];
@@ -200,6 +221,57 @@ pub(crate) fn urlencode(value: &str) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn pkce_verifier_format_and_s256_challenge() {
+        use base64::Engine;
+        use sha2::{Digest, Sha256};
+
+        let pkce = generate_pkce_codes().unwrap();
+        let engine = base64::engine::general_purpose::URL_SAFE_NO_PAD;
+        let is_base64url = |value: &str| {
+            value
+                .bytes()
+                .all(|b| b.is_ascii_alphanumeric() || b == b'-' || b == b'_')
+        };
+        assert_eq!(pkce.code_verifier.len(), 128);
+        assert!(is_base64url(&pkce.code_verifier));
+        assert_eq!(engine.decode(&pkce.code_verifier).unwrap().len(), 96);
+        assert_eq!(pkce.code_challenge.len(), 43);
+        assert!(is_base64url(&pkce.code_challenge));
+        assert_eq!(
+            engine.decode(&pkce.code_challenge).unwrap(),
+            Sha256::digest(pkce.code_verifier.as_bytes()).to_vec()
+        );
+        let next = generate_pkce_codes().unwrap();
+        assert!(pkce.code_verifier != next.code_verifier);
+    }
+
+    #[test]
+    fn pkce_public_paths_share_type_and_auth_url_contract() {
+        let claude: crate::claude::oauth::PkceCodes =
+            crate::codex::oauth::generate_pkce_codes().unwrap();
+        let codex: crate::codex::oauth::PkceCodes =
+            crate::claude::oauth::generate_pkce_codes().unwrap();
+        let urls = [
+            (
+                crate::claude::oauth::build_auth_url("state", &claude),
+                &claude,
+            ),
+            (
+                crate::codex::oauth::build_auth_url("state", "http://localhost/callback", &codex),
+                &codex,
+            ),
+        ];
+        for (url, pkce) in urls {
+            let query = url.split_once('?').unwrap().1;
+            assert!(query
+                .split('&')
+                .any(|p| p == format!("code_challenge={}", pkce.code_challenge)));
+            assert!(query.split('&').any(|p| p == "code_challenge_method=S256"));
+            assert!(!query.split('&').any(|p| p.starts_with("code_verifier=")));
+        }
+    }
 
     #[test]
     fn refresh_lock_shared_while_held_and_pruned_when_idle() {
