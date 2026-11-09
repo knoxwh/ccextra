@@ -1,3 +1,4 @@
+pub(crate) mod access_log;
 pub mod auth;
 pub mod claude_relay;
 pub mod error;

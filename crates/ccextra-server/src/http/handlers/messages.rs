@@ -1823,39 +1823,54 @@ pub async fn handle_messages(
     headers: HeaderMap,
     body: Body,
 ) -> Result<Response, AppError> {
-    // 同读锁捕获快照与 unfit 世代,与 /reload 写锁内 clear 成对:
-    // prepare 中途 await 期间 reload 增代后,旧快照请求的 mark 必被丢弃。
-    let (effective_snapshot, unfit_generation) = state.snapshot_and_unfit_generation().await;
-    check_secret(&headers, &effective_snapshot.runtime.secret).await?;
-    let bytes = to_bytes(body, crate::limits::INBOUND_BODY_LIMIT)
+    let started = std::time::Instant::now();
+    let mut fields: Option<crate::http::access_log::AccessFields> = None;
+    let result = async {
+        // 同读锁捕获快照与 unfit 世代,与 /reload 写锁内 clear 成对:
+        // prepare 中途 await 期间 reload 增代后,旧快照请求的 mark 必被丢弃。
+        let (effective_snapshot, unfit_generation) = state.snapshot_and_unfit_generation().await;
+        check_secret(&headers, &effective_snapshot.runtime.secret).await?;
+        let bytes = to_bytes(body, crate::limits::INBOUND_BODY_LIMIT)
+            .await
+            .map_err(|e| AppError::new(anyhow::anyhow!("读请求体失败: {e}")))?;
+
+        let mut prepared = prepare_message_request(
+            &state,
+            &headers,
+            &bytes,
+            &effective_snapshot,
+            uri.query(),
+            unfit_generation,
+        )
+        .await?;
+        fields = Some(crate::http::access_log::AccessFields::from_prepared(
+            &prepared,
+        ));
+
+        let executed = execute_upstream_request(
+            &mut prepared,
+            &effective_snapshot.runtime.upstream,
+            &effective_snapshot.runtime.user_agents,
+        )
+        .await?;
+
+        deliver_response(
+            &state,
+            &mut prepared,
+            executed,
+            &effective_snapshot.runtime.upstream,
+            &effective_snapshot.runtime.user_agents,
+        )
         .await
-        .map_err(|e| AppError::new(anyhow::anyhow!("读请求体失败: {e}")))?;
-
-    let mut prepared = prepare_message_request(
-        &state,
-        &headers,
-        &bytes,
-        &effective_snapshot,
-        uri.query(),
-        unfit_generation,
-    )
-    .await?;
-
-    let executed = execute_upstream_request(
-        &mut prepared,
-        &effective_snapshot.runtime.upstream,
-        &effective_snapshot.runtime.user_agents,
-    )
-    .await?;
-
-    deliver_response(
-        &state,
-        &mut prepared,
-        executed,
-        &effective_snapshot.runtime.upstream,
-        &effective_snapshot.runtime.user_agents,
-    )
-    .await
+    }
+    .await;
+    match result {
+        Ok(resp) => Ok(crate::http::access_log::finish(resp, fields, started)),
+        Err(e) => {
+            crate::http::access_log::log_error(fields.as_ref(), e.status.as_u16(), started);
+            Err(e)
+        }
+    }
 }
 
 #[cfg(test)]
@@ -1940,6 +1955,34 @@ mod tests {
             drift_usage_scope: None,
             unfit_generation: 0,
         }
+    }
+
+    /// 访问日志只含路由元数据:上游 key、header、body 内容均不得出现。
+    #[test]
+    fn access_line_contains_route_but_no_secrets() {
+        let mut prepared = stub_prepared_without_account_id();
+        prepared.upstream_key = "sk-fixture-secret-key".into();
+        prepared.body_json =
+            json!({"model": "gpt-test", "input": [{"content": "secret-body-text"}]});
+        prepared.extra_headers.insert(
+            "authorization",
+            "Bearer sk-fixture-header-token".parse().unwrap(),
+        );
+        prepared.is_stream = true;
+        let fields = crate::http::access_log::AccessFields::from_prepared(&prepared);
+        let line = crate::http::access_log::access_line(Some(&fields), 200, 12, 345);
+        assert_eq!(
+            line,
+            "access model=gpt-test provider=codex protocol=OpenAiResponses \
+             upstream_model=gpt-test stream=true status=200 first_byte_ms=12 total_ms=345"
+        );
+        for secret in ["sk-fixture", "secret-body", "Bearer", "authorization"] {
+            assert!(!line.contains(secret), "泄露 {secret}: {line}");
+        }
+        assert_eq!(
+            crate::http::access_log::access_line(None, 401, 3, 3),
+            "access status=401 first_byte_ms=3 total_ms=3"
+        );
     }
 
     /// AG 账本清理门禁对齐 CPA：仅 400；422 / 401 / 其它协议不清；含 "signature" 即命中。

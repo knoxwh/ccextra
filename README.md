@@ -139,6 +139,7 @@ curl -H "Authorization: Bearer $ANTHROPIC_AUTH_TOKEN" http://127.0.0.1:8222/v1/m
 
 - `user_agents` — 覆盖 Claude / Codex / Grok / Antigravity 标识
 - `logging.request_body` — 诊断请求写入配置文件目录下的 `logs/`（不跟 cwd）
+- 访问日志 — `/v1/messages` 每请求一行 INFO `access …`（model / provider / protocol / upstream_model / stream / status / first_byte_ms / total_ms；流式在流结束或断开时记总耗时），不含 header、body 与 key
 - 热重载 — 监视 `config.yaml` 与启动时钉死的 `models.json`（保存即重载，150ms debounce + 内容 hash）；亦可 `POST /reload`。原子发布 providers、payload、归一化、认证、代理、UA、reasoning 表与刷新参数；失败不改快照；`logging.level` 需重启
 - 后台刷新用最近成功发布的静态配置；显式 reload 优先应用删除 / 禁用 / 目录切换
 - `antigravity.connection-pool` — 默认短连接；`enabled: true` 后按 idle / per-host 上限保留池
