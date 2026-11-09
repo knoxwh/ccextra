@@ -21,7 +21,7 @@ fi
 
 echo "=== Building ccextra ==="
 
-cargo build --release
+cargo build --release --locked
 
 echo "=== Build complete ==="
 

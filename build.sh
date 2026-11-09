@@ -5,7 +5,7 @@ SCRIPT_DIR="$(cd "$(dirname "$0")" && pwd)"
 
 echo "=== Building ccextra ==="
 
-cargo build --release
+cargo build --release --locked
 
 echo "=== Build complete ==="
 
