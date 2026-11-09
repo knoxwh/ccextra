@@ -141,393 +141,32 @@ pub fn convert_to_openai_responses_with(
     }
 
     // --- messages → input[] ---
-    // custom 工具调用的 call_id 集合(tool_result 需转 custom_tool_call_output)
-    let mut custom_call_ids: HashSet<String> = HashSet::new();
-    // 已发射 function_call 的 call_id 集合(孤儿 tool_result 判定用)
-    let mut emitted_call_ids: HashSet<String> = HashSet::new();
-    let mut pending_tool_use_ids: Vec<String> = Vec::new();
-    let mut pending_system_reminders: Vec<Value> = Vec::new();
-
     if let Some(messages) = body.get("messages").and_then(|v| v.as_array()) {
-        for msg in messages {
-            let role = msg.get("role").and_then(|v| v.as_str()).unwrap_or("user");
-
-            // role=system 消息:reminder 文本 → user message(对齐 ClaudeMessageSystemReminderText)
-            // 当存在未应答 tool_use 时暂存 reminder,保持 tool 调用紧邻配对
-            if role == "system" {
-                if let Some(text) = system_reminder_text(msg.get("content"), upstream_model) {
-                    let reminder_msg = json!({
-                        "type": "message",
-                        "role": "user",
-                        "content": [{"type": "input_text", "text": text}]
-                    });
-                    if !pending_tool_use_ids.is_empty() {
-                        pending_system_reminders.push(reminder_msg);
-                    } else {
-                        openai["input"].as_array_mut().unwrap().push(reminder_msg);
-                    }
-                }
-                continue;
-            }
-
-            let Some(raw_content) = msg.get("content") else {
-                continue;
-            };
-            if raw_content.is_null() {
-                continue;
-            }
-
-            // user 消息按 preceding tool_use_ids 对齐 tool_result
-            let content = if role == "user" && !pending_tool_use_ids.is_empty() {
-                super::message_convert::align_tool_results(raw_content, &pending_tool_use_ids)
-            } else {
-                raw_content.clone()
-            };
-            pending_tool_use_ids.clear();
-
-            let mut content_items: Vec<Value> = Vec::new();
-            let mut out_items: Vec<Value> = Vec::new();
-            // tool_result 抽出的图片 parts(对齐 sub2api toolResultImageParts,
-            // 追加成该消息末尾的独立 user message)
-            let mut result_image_parts: Vec<Value> = Vec::new();
-            let flush_message = |content_items: &mut Vec<Value>, out_items: &mut Vec<Value>| {
-                if !content_items.is_empty() {
-                    out_items.push(json!({
-                        "type": "message",
-                        "role": role,
-                        "content": std::mem::take(content_items)
-                    }));
-                }
-            };
-
-            // 字符串内容(对齐 extractStandardInputTextContent:空串直接跳过)
-            if let Some(s) = content.as_str() {
-                if s.is_empty() {
-                    continue;
-                }
-                if !pending_system_reminders.is_empty() {
-                    openai["input"]
-                        .as_array_mut()
-                        .unwrap()
-                        .extend(std::mem::take(&mut pending_system_reminders));
-                }
-                let item_type = if role == "assistant" {
-                    "output_text"
-                } else {
-                    "input_text"
-                };
-                openai["input"].as_array_mut().unwrap().push(json!({
-                    "type": "message", "role": role, "content": vec![json!({"type": item_type, "text": s})]
-                }));
-                continue;
-            }
-
-            let Some(parts) = content.as_array() else {
-                continue;
-            };
-
-            let mut tool_result_items: Vec<Value> = Vec::new();
-
-            for part in parts {
-                let ptype = part.get("type").and_then(|v| v.as_str()).unwrap_or("");
-                match ptype {
-                    "text" => {
-                        if let Some(t) = part.get("text").and_then(|v| v.as_str()) {
-                            let item_type = if role == "assistant" {
-                                "output_text"
-                            } else {
-                                "input_text"
-                            };
-                            content_items.push(json!({"type": item_type, "text": t}));
-                        }
-                    }
-                    "thinking" => {
-                        // GPT/Codex/Grok 仅回放可识别的加密信封；无签名明文不进入请求
-                        // (对齐 reasoning replay 缓存只认 encrypted_content,明文 reasoning
-                        // 无法回放会导致 grok 多轮丢失决策记忆陷入工具调用死循环)。
-                        // 其余 Responses 上游保留既有明文 reasoning 回放。
-                        if role == "assistant" {
-                            let sig = part.get("signature").and_then(|v| v.as_str());
-                            // 对齐 CPA 531721bf:commentary marker → phase:commentary message
-                            if matches!(sig, Some(s) if is_codex_commentary_signature_marker(s)) {
-                                if let Some(t) = part.get("thinking").and_then(|v| v.as_str()) {
-                                    if !t.is_empty() {
-                                        flush_message(&mut content_items, &mut out_items);
-                                        out_items.push(json!({
-                                            "type": "message",
-                                            "role": "assistant",
-                                            "phase": "commentary",
-                                            "content": [{"type": "output_text", "text": t}],
-                                        }));
-                                    }
-                                }
-                            } else if matches!(sig, Some(s) if !s.trim().is_empty()) {
-                                if let Some(good) = gpt_compatible_signature(sig, upstream_model) {
-                                    flush_message(&mut content_items, &mut out_items);
-                                    let mut reasoning = json!({
-                                        "type": "reasoning",
-                                        "content": null,
-                                        "encrypted_content": good
-                                    });
-                                    if is_gpt_upstream(upstream_model) {
-                                        reasoning["summary"] = json!([]);
-                                    }
-                                    out_items.push(reasoning);
-                                }
-                            } else if !is_gpt_upstream(upstream_model)
-                                && !upstream_model.to_ascii_lowercase().contains("grok")
-                            {
-                                if let Some(t) = part.get("thinking").and_then(|v| v.as_str()) {
-                                    if !t.trim().is_empty() {
-                                        flush_message(&mut content_items, &mut out_items);
-                                        out_items.push(json!({
-                                            "type": "reasoning",
-                                            "content": t
-                                        }));
-                                    }
-                                }
-                            }
-                        }
-                    }
-                    "redacted_thinking" => {
-                        // Claude→Codex 请求侧丢弃(对齐 CPA codex_claude_request 无此分支)
-                    }
-                    "image" => {
-                        if let Some(img) = image_to_input_image(part) {
-                            content_items.push(img);
-                        }
-                    }
-                    "document" | "container_upload" => {
-                        if let Some(doc) = document_to_input_file(part) {
-                            content_items.push(doc);
-                        }
-                    }
-                    "tool_use" => {
-                        flush_message(&mut content_items, &mut out_items);
-                        let id = part.get("id").and_then(|v| v.as_str()).unwrap_or("");
-                        if !id.is_empty() {
-                            pending_tool_use_ids.push(id.to_string());
-                        }
-                        let name = part.get("name").and_then(|v| v.as_str()).unwrap_or("");
-                        let short_name = if let Some(s) = tool_name_map.get(name) {
-                            s.clone()
-                        } else {
-                            shorten_name_if_needed(name)
-                        };
-                        let is_custom = custom_tool_names.contains(name);
-                        let short_id = shorten_call_id(id);
-                        emitted_call_ids.insert(short_id.clone());
-                        if is_custom {
-                            // custom 工具:Claude tool_use.input 是 {"input": str} 对象,
-                            // 解包回字符串,发 custom_tool_call(对齐转换 custom 分支)
-                            custom_call_ids.insert(short_id.clone());
-                            let input_str = unwrap_custom_tool_input(part.get("input"));
-                            out_items.push(json!({
-                                "type": "custom_tool_call",
-                                "call_id": short_id,
-                                "name": short_name,
-                                "input": input_str
-                            }));
-                        } else {
-                            let args = match part.get("input") {
-                                Some(Value::String(s)) if s.trim().is_empty() => "{}".to_string(),
-                                Some(input) => input.to_string(),
-                                None => "{}".to_string(),
-                            };
-                            out_items.push(json!({
-                                "type": "function_call",
-                                "call_id": short_id,
-                                "name": short_name,
-                                "arguments": args
-                            }));
-                        }
-                    }
-                    "tool_result" => {
-                        let call_id = part
-                            .get("tool_use_id")
-                            .and_then(|v| v.as_str())
-                            .unwrap_or("");
-                        let (output, images) =
-                            tool_result_output(part.get("content").unwrap_or(&json!("")));
-                        result_image_parts.extend(images);
-                        let short_id = shorten_call_id(call_id);
-                        if custom_call_ids.contains(&short_id) {
-                            tool_result_items.push(json!({
-                                "type": "custom_tool_call_output",
-                                "call_id": short_id,
-                                "output": output
-                            }));
-                        } else if !emitted_call_ids.contains(&short_id) {
-                            // 孤儿 output(无配对 function_call)不发,转 user text
-                            // (对齐 CPA 8c984672 appendStandaloneResponsesToolOutputAsUser)
-                            if let Some(item) = orphan_tool_output_as_user(part.get("content")) {
-                                tool_result_items.push(item);
-                            }
-                        } else {
-                            tool_result_items.push(json!({
-                                "type": "function_call_output",
-                                "call_id": short_id,
-                                "output": output
-                            }));
-                        }
-                    }
-                    _ => {}
-                }
-            }
-            flush_message(&mut content_items, &mut out_items);
-            // 抽出的 tool_result 图片 → 该消息末尾独立 user message
-            if !result_image_parts.is_empty() {
-                out_items.push(json!({
-                    "type": "message",
-                    "role": "user",
-                    "content": result_image_parts
-                }));
-            }
-
-            // 发射时序对齐 CPA: tool_result 先发 -> pending reminders -> 正文 out_items
-            if !tool_result_items.is_empty() {
-                openai["input"]
-                    .as_array_mut()
-                    .unwrap()
-                    .extend(tool_result_items);
-            }
-            if !pending_system_reminders.is_empty() {
-                openai["input"]
-                    .as_array_mut()
-                    .unwrap()
-                    .extend(std::mem::take(&mut pending_system_reminders));
-            }
-            openai["input"].as_array_mut().unwrap().extend(out_items);
-        }
-
-        // EOF flush: 残余 reminder 照发
-        if !pending_system_reminders.is_empty() {
-            openai["input"]
-                .as_array_mut()
-                .unwrap()
-                .extend(pending_system_reminders);
-        }
+        let input = openai["input"].as_array_mut().unwrap();
+        convert_messages_to_input(
+            messages,
+            upstream_model,
+            &tool_name_map,
+            &custom_tool_names,
+            input,
+        );
     }
 
     // --- tools → codex tools(对齐 tools 分支) ---
     let mut has_web_search = false;
     if let Some(tools) = body.get("tools").and_then(|v| v.as_array()) {
-        let mut tool_items: Vec<Value> = Vec::new();
-        for tool in tools {
-            let tool_type = tool.get("type").and_then(|v| v.as_str()).unwrap_or("");
-            // web search 工具特殊映射(对齐 convertClaudeWebSearchToolToCodex)
-            if super::is_web_search_tool_type(tool_type) {
-                let mut ws = json!({"type": "web_search"});
-                // 对齐 grok-build xai-grok-sampling-types tool_overrides::to_tool_entry:
-                // xAI filters 域过滤键为 excluded_domains(OpenAI 官方为 blocked_domains);
-                // 两者互斥,并存时按 allowed 优先(与上游 validate 报错一致)
-                if let Some(domains) = tool.get("allowed_domains").and_then(|v| v.as_array()) {
-                    ws["filters"] = json!({"allowed_domains": domains});
-                } else if let Some(domains) = tool.get("blocked_domains").and_then(|v| v.as_array())
-                {
-                    let key = if is_grok_upstream(upstream_model) {
-                        "excluded_domains"
-                    } else {
-                        "blocked_domains"
-                    };
-                    ws["filters"] = json!({key: domains});
-                }
-                if let Some(loc) = tool.get("user_location") {
-                    if loc.is_object() {
-                        ws["user_location"] = loc.clone();
-                    }
-                }
-                tool_items.push(ws);
-                has_web_search = true;
-                continue;
-            }
-
-            let mut t = tool.clone();
-            if tool_type == "custom" {
-                // custom 工具保留 type,不套 input_schema(对齐转换 custom 分支)
-                if let Some(obj) = t.as_object_mut() {
-                    obj.remove("input_schema");
-                    obj.remove("cache_control");
-                    obj.remove("defer_loading");
-                }
-                tool_items.push(t);
-                continue;
-            }
-            if t.get("type").and_then(|v| v.as_str()) != Some("function") {
-                t["type"] = json!("function");
-            }
-            // 名称缩短
-            if let Some(orig) = t.get("name").and_then(|v| v.as_str()) {
-                let short = if let Some(s) = tool_name_map.get(orig) {
-                    s.clone()
-                } else {
-                    shorten_name_if_needed(orig)
-                };
-                if short != orig {
-                    t["name"] = json!(short);
-                }
-            }
-            // input_schema → parameters
-            let schema = tool.get("input_schema").cloned().unwrap_or(json!(null));
-            let mut params = normalize_tool_parameters(&schema);
-            simplify_pure_const_unions(&mut params);
-            t["parameters"] = params;
-            // 剥 codex 不认的字段(一致)
-            if let Some(obj) = t.as_object_mut() {
-                obj.remove("input_schema");
-                obj.remove("cache_control");
-                obj.remove("defer_loading");
-                if let Some(p) = obj.get_mut("parameters") {
-                    if let Some(po) = p.as_object_mut() {
-                        po.remove("$schema");
-                    }
-                }
-            }
-            if t.get("strict") != Some(&json!(false)) {
-                t["strict"] = json!(false);
-            }
-            tool_items.push(t);
-        }
+        let (tool_items, web_search) = convert_tools(tools, upstream_model, &tool_name_map);
+        has_web_search = web_search;
         openai["tools"] = json!(tool_items);
     }
 
     // --- tool_choice(对齐 convertClaudeToolChoiceToCodex) ---
-    match body.get("tool_choice") {
-        None | Some(Value::Null) => {
-            openai["tool_choice"] = json!("auto");
-        }
-        Some(tc) => {
-            let ty = tc
-                .get("type")
-                .and_then(|v| v.as_str())
-                .or_else(|| tc.as_str())
-                .unwrap_or("");
-            match ty {
-                "auto" | "" => openai["tool_choice"] = json!("auto"),
-                "any" => openai["tool_choice"] = json!("required"),
-                "none" => openai["tool_choice"] = json!("none"),
-                "tool" => {
-                    let name = tc.get("name").and_then(|v| v.as_str()).unwrap_or("");
-                    if web_search_names.contains(name) {
-                        openai["tool_choice"] = json!({"type": "web_search"});
-                    } else if !tool_name_map.contains_key(name) {
-                        // 命名工具未声明 → 降级 auto(对齐 chat 侧 declared 校验;
-                        // sub2api responses 侧无该校验,这里补同一语义)
-                        openai["tool_choice"] = json!("auto");
-                    } else {
-                        // 已校验声明:map 必有非空 short,不再判空
-                        let short = tool_name_map.get(name).cloned().unwrap();
-                        if custom_tool_names.contains(name) {
-                            openai["tool_choice"] = json!({"type": "custom", "name": short});
-                        } else {
-                            openai["tool_choice"] = json!({"type": "function", "name": short});
-                        }
-                    }
-                }
-                _ => openai["tool_choice"] = json!("auto"),
-            }
-        }
-    }
+    openai["tool_choice"] = convert_tool_choice(
+        body.get("tool_choice"),
+        &web_search_names,
+        &tool_name_map,
+        &custom_tool_names,
+    );
 
     // --- parallel_tool_calls(默认开,disable_parallel_tool_use 关闭) ---
     let disable_parallel = body
@@ -650,4 +289,396 @@ pub fn convert_to_openai_responses_with(
 
     *body = openai;
     Ok(reverse)
+}
+
+/// messages → input[]:按 CPA 发射时序(tool_result → 暂存 reminder → 正文)追加到 `input`。
+fn convert_messages_to_input(
+    messages: &[Value],
+    upstream_model: &str,
+    tool_name_map: &HashMap<String, String>,
+    custom_tool_names: &HashSet<String>,
+    input: &mut Vec<Value>,
+) {
+    // custom 工具调用的 call_id 集合(tool_result 需转 custom_tool_call_output)
+    let mut custom_call_ids: HashSet<String> = HashSet::new();
+    // 已发射 function_call 的 call_id 集合(孤儿 tool_result 判定用)
+    let mut emitted_call_ids: HashSet<String> = HashSet::new();
+    let mut pending_tool_use_ids: Vec<String> = Vec::new();
+    let mut pending_system_reminders: Vec<Value> = Vec::new();
+
+    for msg in messages {
+        let role = msg.get("role").and_then(|v| v.as_str()).unwrap_or("user");
+
+        // role=system 消息:reminder 文本 → user message(对齐 ClaudeMessageSystemReminderText)
+        // 当存在未应答 tool_use 时暂存 reminder,保持 tool 调用紧邻配对
+        if role == "system" {
+            if let Some(text) = system_reminder_text(msg.get("content"), upstream_model) {
+                let reminder_msg = json!({
+                    "type": "message",
+                    "role": "user",
+                    "content": [{"type": "input_text", "text": text}]
+                });
+                if !pending_tool_use_ids.is_empty() {
+                    pending_system_reminders.push(reminder_msg);
+                } else {
+                    input.push(reminder_msg);
+                }
+            }
+            continue;
+        }
+
+        let Some(raw_content) = msg.get("content") else {
+            continue;
+        };
+        if raw_content.is_null() {
+            continue;
+        }
+
+        // user 消息按 preceding tool_use_ids 对齐 tool_result
+        let content = if role == "user" && !pending_tool_use_ids.is_empty() {
+            super::message_convert::align_tool_results(raw_content, &pending_tool_use_ids)
+        } else {
+            raw_content.clone()
+        };
+        pending_tool_use_ids.clear();
+
+        let mut content_items: Vec<Value> = Vec::new();
+        let mut out_items: Vec<Value> = Vec::new();
+        // tool_result 抽出的图片 parts(对齐 sub2api toolResultImageParts,
+        // 追加成该消息末尾的独立 user message)
+        let mut result_image_parts: Vec<Value> = Vec::new();
+        let flush_message = |content_items: &mut Vec<Value>, out_items: &mut Vec<Value>| {
+            if !content_items.is_empty() {
+                out_items.push(json!({
+                    "type": "message",
+                    "role": role,
+                    "content": std::mem::take(content_items)
+                }));
+            }
+        };
+
+        // 字符串内容(对齐 extractStandardInputTextContent:空串直接跳过)
+        if let Some(s) = content.as_str() {
+            if s.is_empty() {
+                continue;
+            }
+            if !pending_system_reminders.is_empty() {
+                input.extend(std::mem::take(&mut pending_system_reminders));
+            }
+            let item_type = if role == "assistant" {
+                "output_text"
+            } else {
+                "input_text"
+            };
+            input.push(json!({
+                "type": "message", "role": role, "content": vec![json!({"type": item_type, "text": s})]
+            }));
+            continue;
+        }
+
+        let Some(parts) = content.as_array() else {
+            continue;
+        };
+
+        let mut tool_result_items: Vec<Value> = Vec::new();
+
+        for part in parts {
+            let ptype = part.get("type").and_then(|v| v.as_str()).unwrap_or("");
+            match ptype {
+                "text" => {
+                    if let Some(t) = part.get("text").and_then(|v| v.as_str()) {
+                        let item_type = if role == "assistant" {
+                            "output_text"
+                        } else {
+                            "input_text"
+                        };
+                        content_items.push(json!({"type": item_type, "text": t}));
+                    }
+                }
+                "thinking" => {
+                    // GPT/Codex/Grok 仅回放可识别的加密信封；无签名明文不进入请求
+                    // (对齐 reasoning replay 缓存只认 encrypted_content,明文 reasoning
+                    // 无法回放会导致 grok 多轮丢失决策记忆陷入工具调用死循环)。
+                    // 其余 Responses 上游保留既有明文 reasoning 回放。
+                    if role == "assistant" {
+                        let sig = part.get("signature").and_then(|v| v.as_str());
+                        // 对齐 CPA 531721bf:commentary marker → phase:commentary message
+                        if matches!(sig, Some(s) if is_codex_commentary_signature_marker(s)) {
+                            if let Some(t) = part.get("thinking").and_then(|v| v.as_str()) {
+                                if !t.is_empty() {
+                                    flush_message(&mut content_items, &mut out_items);
+                                    out_items.push(json!({
+                                        "type": "message",
+                                        "role": "assistant",
+                                        "phase": "commentary",
+                                        "content": [{"type": "output_text", "text": t}],
+                                    }));
+                                }
+                            }
+                        } else if matches!(sig, Some(s) if !s.trim().is_empty()) {
+                            if let Some(good) = gpt_compatible_signature(sig, upstream_model) {
+                                flush_message(&mut content_items, &mut out_items);
+                                let mut reasoning = json!({
+                                    "type": "reasoning",
+                                    "content": null,
+                                    "encrypted_content": good
+                                });
+                                if is_gpt_upstream(upstream_model) {
+                                    reasoning["summary"] = json!([]);
+                                }
+                                out_items.push(reasoning);
+                            }
+                        } else if !is_gpt_upstream(upstream_model)
+                            && !upstream_model.to_ascii_lowercase().contains("grok")
+                        {
+                            if let Some(t) = part.get("thinking").and_then(|v| v.as_str()) {
+                                if !t.trim().is_empty() {
+                                    flush_message(&mut content_items, &mut out_items);
+                                    out_items.push(json!({
+                                        "type": "reasoning",
+                                        "content": t
+                                    }));
+                                }
+                            }
+                        }
+                    }
+                }
+                "redacted_thinking" => {
+                    // Claude→Codex 请求侧丢弃(对齐 CPA codex_claude_request 无此分支)
+                }
+                "image" => {
+                    if let Some(img) = image_to_input_image(part) {
+                        content_items.push(img);
+                    }
+                }
+                "document" | "container_upload" => {
+                    if let Some(doc) = document_to_input_file(part) {
+                        content_items.push(doc);
+                    }
+                }
+                "tool_use" => {
+                    flush_message(&mut content_items, &mut out_items);
+                    let id = part.get("id").and_then(|v| v.as_str()).unwrap_or("");
+                    if !id.is_empty() {
+                        pending_tool_use_ids.push(id.to_string());
+                    }
+                    let name = part.get("name").and_then(|v| v.as_str()).unwrap_or("");
+                    let short_name = if let Some(s) = tool_name_map.get(name) {
+                        s.clone()
+                    } else {
+                        shorten_name_if_needed(name)
+                    };
+                    let is_custom = custom_tool_names.contains(name);
+                    let short_id = shorten_call_id(id);
+                    emitted_call_ids.insert(short_id.clone());
+                    if is_custom {
+                        // custom 工具:Claude tool_use.input 是 {"input": str} 对象,
+                        // 解包回字符串,发 custom_tool_call(对齐转换 custom 分支)
+                        custom_call_ids.insert(short_id.clone());
+                        let input_str = unwrap_custom_tool_input(part.get("input"));
+                        out_items.push(json!({
+                            "type": "custom_tool_call",
+                            "call_id": short_id,
+                            "name": short_name,
+                            "input": input_str
+                        }));
+                    } else {
+                        let args = match part.get("input") {
+                            Some(Value::String(s)) if s.trim().is_empty() => "{}".to_string(),
+                            Some(input) => input.to_string(),
+                            None => "{}".to_string(),
+                        };
+                        out_items.push(json!({
+                            "type": "function_call",
+                            "call_id": short_id,
+                            "name": short_name,
+                            "arguments": args
+                        }));
+                    }
+                }
+                "tool_result" => {
+                    let call_id = part
+                        .get("tool_use_id")
+                        .and_then(|v| v.as_str())
+                        .unwrap_or("");
+                    let (output, images) =
+                        tool_result_output(part.get("content").unwrap_or(&json!("")));
+                    result_image_parts.extend(images);
+                    let short_id = shorten_call_id(call_id);
+                    if custom_call_ids.contains(&short_id) {
+                        tool_result_items.push(json!({
+                            "type": "custom_tool_call_output",
+                            "call_id": short_id,
+                            "output": output
+                        }));
+                    } else if !emitted_call_ids.contains(&short_id) {
+                        // 孤儿 output(无配对 function_call)不发,转 user text
+                        // (对齐 CPA 8c984672 appendStandaloneResponsesToolOutputAsUser)
+                        if let Some(item) = orphan_tool_output_as_user(part.get("content")) {
+                            tool_result_items.push(item);
+                        }
+                    } else {
+                        tool_result_items.push(json!({
+                            "type": "function_call_output",
+                            "call_id": short_id,
+                            "output": output
+                        }));
+                    }
+                }
+                _ => {}
+            }
+        }
+        flush_message(&mut content_items, &mut out_items);
+        // 抽出的 tool_result 图片 → 该消息末尾独立 user message
+        if !result_image_parts.is_empty() {
+            out_items.push(json!({
+                "type": "message",
+                "role": "user",
+                "content": result_image_parts
+            }));
+        }
+
+        // 发射时序对齐 CPA: tool_result 先发 -> pending reminders -> 正文 out_items
+        if !tool_result_items.is_empty() {
+            input.extend(tool_result_items);
+        }
+        if !pending_system_reminders.is_empty() {
+            input.extend(std::mem::take(&mut pending_system_reminders));
+        }
+        input.extend(out_items);
+    }
+
+    // EOF flush: 残余 reminder 照发
+    if !pending_system_reminders.is_empty() {
+        input.extend(pending_system_reminders);
+    }
+}
+
+/// tools → codex tools(web_search 映射、custom 保留、function 名称缩短与 parameters 归一)。
+/// 返回 (工具项, 是否映射了 web_search)。
+fn convert_tools(
+    tools: &[Value],
+    upstream_model: &str,
+    tool_name_map: &HashMap<String, String>,
+) -> (Vec<Value>, bool) {
+    let mut has_web_search = false;
+    let mut tool_items: Vec<Value> = Vec::new();
+    for tool in tools {
+        let tool_type = tool.get("type").and_then(|v| v.as_str()).unwrap_or("");
+        // web search 工具特殊映射(对齐 convertClaudeWebSearchToolToCodex)
+        if super::is_web_search_tool_type(tool_type) {
+            let mut ws = json!({"type": "web_search"});
+            // 对齐 grok-build xai-grok-sampling-types tool_overrides::to_tool_entry:
+            // xAI filters 域过滤键为 excluded_domains(OpenAI 官方为 blocked_domains);
+            // 两者互斥,并存时按 allowed 优先(与上游 validate 报错一致)
+            if let Some(domains) = tool.get("allowed_domains").and_then(|v| v.as_array()) {
+                ws["filters"] = json!({"allowed_domains": domains});
+            } else if let Some(domains) = tool.get("blocked_domains").and_then(|v| v.as_array()) {
+                let key = if is_grok_upstream(upstream_model) {
+                    "excluded_domains"
+                } else {
+                    "blocked_domains"
+                };
+                ws["filters"] = json!({key: domains});
+            }
+            if let Some(loc) = tool.get("user_location") {
+                if loc.is_object() {
+                    ws["user_location"] = loc.clone();
+                }
+            }
+            tool_items.push(ws);
+            has_web_search = true;
+            continue;
+        }
+
+        let mut t = tool.clone();
+        if tool_type == "custom" {
+            // custom 工具保留 type,不套 input_schema(对齐转换 custom 分支)
+            if let Some(obj) = t.as_object_mut() {
+                obj.remove("input_schema");
+                obj.remove("cache_control");
+                obj.remove("defer_loading");
+            }
+            tool_items.push(t);
+            continue;
+        }
+        if t.get("type").and_then(|v| v.as_str()) != Some("function") {
+            t["type"] = json!("function");
+        }
+        // 名称缩短
+        if let Some(orig) = t.get("name").and_then(|v| v.as_str()) {
+            let short = if let Some(s) = tool_name_map.get(orig) {
+                s.clone()
+            } else {
+                shorten_name_if_needed(orig)
+            };
+            if short != orig {
+                t["name"] = json!(short);
+            }
+        }
+        // input_schema → parameters
+        let schema = tool.get("input_schema").cloned().unwrap_or(json!(null));
+        let mut params = normalize_tool_parameters(&schema);
+        simplify_pure_const_unions(&mut params);
+        t["parameters"] = params;
+        // 剥 codex 不认的字段(一致)
+        if let Some(obj) = t.as_object_mut() {
+            obj.remove("input_schema");
+            obj.remove("cache_control");
+            obj.remove("defer_loading");
+            if let Some(p) = obj.get_mut("parameters") {
+                if let Some(po) = p.as_object_mut() {
+                    po.remove("$schema");
+                }
+            }
+        }
+        if t.get("strict") != Some(&json!(false)) {
+            t["strict"] = json!(false);
+        }
+        tool_items.push(t);
+    }
+    (tool_items, has_web_search)
+}
+
+/// tool_choice → codex tool_choice;命名工具未声明降级 auto。
+fn convert_tool_choice(
+    tool_choice: Option<&Value>,
+    web_search_names: &HashSet<String>,
+    tool_name_map: &HashMap<String, String>,
+    custom_tool_names: &HashSet<String>,
+) -> Value {
+    match tool_choice {
+        None | Some(Value::Null) => json!("auto"),
+        Some(tc) => {
+            let ty = tc
+                .get("type")
+                .and_then(|v| v.as_str())
+                .or_else(|| tc.as_str())
+                .unwrap_or("");
+            match ty {
+                "auto" | "" => json!("auto"),
+                "any" => json!("required"),
+                "none" => json!("none"),
+                "tool" => {
+                    let name = tc.get("name").and_then(|v| v.as_str()).unwrap_or("");
+                    if web_search_names.contains(name) {
+                        json!({"type": "web_search"})
+                    } else if !tool_name_map.contains_key(name) {
+                        // 命名工具未声明 → 降级 auto(对齐 chat 侧 declared 校验;
+                        // sub2api responses 侧无该校验,这里补同一语义)
+                        json!("auto")
+                    } else {
+                        // 已校验声明:map 必有非空 short,不再判空
+                        let short = tool_name_map.get(name).cloned().unwrap();
+                        if custom_tool_names.contains(name) {
+                            json!({"type": "custom", "name": short})
+                        } else {
+                            json!({"type": "function", "name": short})
+                        }
+                    }
+                }
+                _ => json!("auto"),
+            }
+        }
+    }
 }
