@@ -9,7 +9,8 @@ resolver = "2"
 [workspace.package]
 version = "2.0.0"
 edition = "2021"
-rust-version = "1.75"
+# 实际下限由 wreq 0.16.1(rust-version 1.98)决定
+rust-version = "1.98"
 authors = ["wanghao"]
 license = "MIT"
 repository = "https://github.com/knoxwh/ccextra"
@@ -26,7 +27,7 @@ serde_json = { version = "1.0", features = ["preserve_order", "arbitrary_precisi
 yaml_serde = "0.10"
 
 # HTTP server
-axum = { version = "0.8", features = ["macros"] }
+axum = "0.8"
 tokio = { version = "1.35", features = ["full"] }
 tower = { version = "0.5", features = ["util"] }
 

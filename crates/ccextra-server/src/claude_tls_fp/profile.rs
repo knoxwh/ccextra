@@ -2,7 +2,8 @@
 //!
 //! Source of truth for wire capture:
 //! `claude-tls-fp-sampler` samples (e.g. `20261102T0923-claude-2.1.316-local-clienthello-ja4.json`;
-//! JA3 unchanged since the `claude-code-2.1.296-peet-api-all.json` baseline)
+//! JA3 unchanged since the `claude-code-2.1.296-peet-api-all.json` baseline; the 2.1.318 sample
+//! matches JA3/JA4 and 2.1.319 embeds the same Bun 1.4.4, so the profile id stays at 2.1.316)
 //!
 //! This module does **not** forge a live Hello; it pins acceptance constants and builds the
 //! canonical JA3 string from profile fields so upgrades fail tests loudly.

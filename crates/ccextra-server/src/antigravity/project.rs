@@ -165,11 +165,7 @@ pub(crate) async fn onboard_user_at(
         if !status.is_success() {
             let preview = String::from_utf8_lossy(&body.bytes);
             let preview = preview.trim();
-            let preview = if preview.len() > 200 {
-                &preview[..200]
-            } else {
-                preview
-            };
+            let preview = crate::limits::truncate_at_char_boundary(preview, 200);
             let note = if body.truncated { "…(已截断)" } else { "" };
             return Err(anyhow!(
                 "onboardUser http {}: {preview}{note}",

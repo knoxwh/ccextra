@@ -15,10 +15,10 @@ pub fn parse_retry_after(headers: &axum::http::HeaderMap) -> Option<std::time::D
 /// 2. `google.rpc.ErrorInfo.metadata.quotaResetDelay`
 /// 3. `error.message` 的 `after Ns`,再试小写后的 `after 1h2m3s`(须 > 0)
 pub fn parse_google_retry_delay(body: &[u8]) -> Option<std::time::Duration> {
-    use once_cell::sync::Lazy;
-    static AFTER_SECS: Lazy<regex::Regex> =
-        Lazy::new(|| regex::Regex::new(r"after\s+(\d+)s\.?").expect("valid regex"));
-    static AFTER_HUMAN: Lazy<regex::Regex> = Lazy::new(|| {
+    use std::sync::LazyLock;
+    static AFTER_SECS: LazyLock<regex::Regex> =
+        LazyLock::new(|| regex::Regex::new(r"after\s+(\d+)s\.?").expect("valid regex"));
+    static AFTER_HUMAN: LazyLock<regex::Regex> = LazyLock::new(|| {
         regex::Regex::new(r"after\s+((?:\d+h)?(?:\d+m)?(?:\d+s)?)\.?").expect("valid regex")
     });
 
@@ -68,6 +68,7 @@ pub fn retry_after_header_secs(delay: std::time::Duration) -> std::time::Duratio
 
 /// Go `time.ParseDuration` 子集:`[+]?(数字[.数字]单位)+` 或 `0`;单位 ns/us/µs/μs/ms/s/m/h。
 /// 负值返回 None(Duration 无负数)。
+/// 与 `upstream::parse_go_duration` 语义不同(那边单段、负值归零、Err 带原因),故不合并。
 fn parse_go_duration(raw: &str) -> Option<std::time::Duration> {
     let s = raw.strip_prefix('+').unwrap_or(raw);
     if s == "0" {

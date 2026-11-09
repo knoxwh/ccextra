@@ -92,8 +92,8 @@ impl UnfitRegistry {
 }
 
 /// 全局 unfit 注册表(lazy 初始化)
-static UNFIT_REGISTRY: once_cell::sync::Lazy<Arc<UnfitRegistry>> =
-    once_cell::sync::Lazy::new(|| Arc::new(UnfitRegistry::new()));
+static UNFIT_REGISTRY: std::sync::LazyLock<Arc<UnfitRegistry>> =
+    std::sync::LazyLock::new(|| Arc::new(UnfitRegistry::new()));
 
 pub fn global_registry() -> &'static Arc<UnfitRegistry> {
     &UNFIT_REGISTRY

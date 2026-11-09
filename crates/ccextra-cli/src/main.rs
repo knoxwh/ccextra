@@ -997,7 +997,7 @@ fn cmd_claude_status(config_path: &str, auth_dir: Option<String>) -> Result<()> 
 
 /// 构建 UserAgentSet(从配置或使用默认值)
 fn build_user_agents(config: Option<&config::UserAgents>) -> UserAgentSet {
-    const DEFAULT_CLAUDE_CLI: &str = "claude-cli/2.1.258";
+    const DEFAULT_CLAUDE_CLI: &str = "claude-cli/2.1.319";
     const DEFAULT_CODEX_TUI: &str = "codex_cli_rs/0.153.3 (Mac OS 26.6.2; arm64)";
     const DEFAULT_GROK_VERSION: &str = "1.0.46";
     // 与 antigravity::constants::REQUEST_UA 同源，禁止再写死一份版本

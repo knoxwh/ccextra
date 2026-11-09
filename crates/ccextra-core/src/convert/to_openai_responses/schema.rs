@@ -81,7 +81,7 @@ pub(crate) fn normalize_tool_parameters(schema: &Value) -> Value {
         Some(Value::Array(arr)) => arr.iter().any(|e| e.as_str() == Some("object")),
         _ => false,
     };
-    if type_is_object && s.get("properties").map_or(true, |v| !v.is_object()) {
+    if type_is_object && s.get("properties").is_none_or(|v| !v.is_object()) {
         s["properties"] = json!({});
     }
     s

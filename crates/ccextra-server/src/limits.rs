@@ -15,6 +15,33 @@ pub(crate) const ERROR_BODY_LIMIT: usize = 256 * 1024;
 /// body 读取 idle:与 SSE chunk idle 共用一份常量;每次非空数据后重置,空 chunk 不续期
 pub(crate) const BODY_READ_IDLE: std::time::Duration = crate::sse::STREAM_IDLE_TIMEOUT;
 
+/// 读入站请求 body:超 INBOUND_BODY_LIMIT → 413,其余读错误保持原 500
+pub(crate) async fn read_inbound_body(body: axum::body::Body) -> Result<Bytes, AppError> {
+    axum::body::to_bytes(body, INBOUND_BODY_LIMIT)
+        .await
+        .map_err(|e| {
+            let too_large = std::error::Error::source(&e)
+                .is_some_and(|s| s.is::<http_body_util::LengthLimitError>());
+            if too_large {
+                AppError::with_status(
+                    StatusCode::PAYLOAD_TOO_LARGE,
+                    format!("请求体超过 {} MiB 上限", INBOUND_BODY_LIMIT / (1024 * 1024)),
+                )
+            } else {
+                AppError::new(anyhow::anyhow!("读请求体失败: {e}"))
+            }
+        })
+}
+
+/// 截到至多 `max` 字节;落在多字节字符中间时回退到前一个字符边界
+pub(crate) fn truncate_at_char_boundary(s: &str, max: usize) -> &str {
+    let mut cut = max.min(s.len());
+    while !s.is_char_boundary(cut) {
+        cut -= 1;
+    }
+    &s[..cut]
+}
+
 /// 有界读取结果:truncated 表示超过上限,已停止读取并保留前 limit 字节
 #[derive(Debug)]
 pub(crate) struct BoundedBody {
@@ -331,5 +358,25 @@ mod tests {
             assert!(err.err.to_string().contains("停顿"));
             assert_eq!(err.into_response().status(), status);
         }
+    }
+
+    #[test]
+    fn truncate_at_char_boundary_backs_off_inside_multibyte_char() {
+        assert_eq!(truncate_at_char_boundary("abc", 200), "abc");
+        // "a" + "中"(3 字节):上限 2 落在字符中间 → 回退到 1
+        assert_eq!(truncate_at_char_boundary("a中", 2), "a");
+        assert_eq!(truncate_at_char_boundary("a中", 4), "a中");
+    }
+
+    #[tokio::test]
+    async fn inbound_body_over_limit_is_413_and_exact_limit_reads() {
+        let exact = read_inbound_body(axum::body::Body::from(vec![0u8; INBOUND_BODY_LIMIT]))
+            .await
+            .unwrap();
+        assert_eq!(exact.len(), INBOUND_BODY_LIMIT);
+        let err = read_inbound_body(axum::body::Body::from(vec![0u8; INBOUND_BODY_LIMIT + 1]))
+            .await
+            .unwrap_err();
+        assert_eq!(err.status, StatusCode::PAYLOAD_TOO_LARGE);
     }
 }

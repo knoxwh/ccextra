@@ -52,7 +52,7 @@ pub fn parse_proxy(raw: Option<&str>) -> Result<ProxySetting, ProxyError> {
         .split_once("://")
         .ok_or_else(|| invalid("缺少 scheme(http/https/socks5/socks5h)"))?;
     let uri: http::Uri = trimmed.parse().map_err(|_| invalid("URL 非法"))?;
-    if uri.host().map_or(true, str::is_empty) {
+    if uri.host().is_none_or(str::is_empty) {
         return Err(invalid("缺少 host"));
     }
     let scheme = scheme.to_ascii_lowercase();

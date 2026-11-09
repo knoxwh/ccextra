@@ -201,7 +201,7 @@ mod tests {
                 });
                 let raw = serde_json::to_vec(&payload).unwrap();
                 let enc = base64::engine::general_purpose::URL_SAFE_NO_PAD.encode(&raw);
-                if (enc.contains('-') || enc.contains('_')) && enc.len() % 4 != 0 {
+                if (enc.contains('-') || enc.contains('_')) && !enc.len().is_multiple_of(4) {
                     break enc;
                 }
                 n += 1;

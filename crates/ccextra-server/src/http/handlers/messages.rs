@@ -1,5 +1,5 @@
 use axum::{
-    body::{to_bytes, Body},
+    body::Body,
     extract::State,
     http::{header, HeaderMap},
     response::Response,
@@ -1728,9 +1728,7 @@ pub async fn handle_messages(
         // prepare 中途 await 期间 reload 增代后,旧快照请求的 mark 必被丢弃。
         let (effective_snapshot, unfit_generation) = state.snapshot_and_unfit_generation().await;
         check_secret(&headers, &effective_snapshot.runtime.secret).await?;
-        let bytes = to_bytes(body, crate::limits::INBOUND_BODY_LIMIT)
-            .await
-            .map_err(|e| AppError::new(anyhow::anyhow!("读请求体失败: {e}")))?;
+        let bytes = crate::limits::read_inbound_body(body).await?;
 
         let mut prepared = prepare_message_request(
             &state,

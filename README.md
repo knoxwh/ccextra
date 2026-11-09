@@ -9,7 +9,7 @@
 <br>
 
 [![License](https://img.shields.io/badge/License-MIT-black.svg?style=flat-square)](LICENSE)
-[![Rust](https://img.shields.io/badge/Rust-1.75+-black.svg?style=flat-square&logo=rust)](Cargo.toml)
+[![Rust](https://img.shields.io/badge/Rust-1.98+-black.svg?style=flat-square&logo=rust)](Cargo.toml)
 [![Version](https://img.shields.io/badge/Version-1.0.0-black.svg?style=flat-square)](Cargo.toml)
 
 **中文** · [English](README.en.md)

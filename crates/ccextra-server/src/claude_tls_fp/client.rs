@@ -1,6 +1,7 @@
 //! Claude Bun fingerprint-lane HTTP client (wreq + BoringSSL).
 //!
-//! Matches Claude Code 2.1.316 / Bun 1.4.4 local ClientHello sample (JA3/JA4 + HTTP/1.1).
+//! Matches Claude Code 2.1.316 / Bun 1.4.4 local ClientHello sample (JA3/JA4 + HTTP/1.1);
+//! the 2.1.318 sample is identical and 2.1.319 embeds the same Bun 1.4.4.
 //! Default (non-Claude) protocols keep reqwest+rustls; all `protocol: claude` use this lane.
 
 use std::borrow::Cow;
@@ -36,7 +37,7 @@ pub fn build_fingerprint_client(proxy_key: &str, no_redirect: bool) -> anyhow::R
 }
 
 fn bun_cipher_list() -> &'static str {
-    // Bun 1.4.3 ClientHello cipher order (peet baseline).
+    // Bun ClientHello cipher order (Bun 1.4.3 peet baseline; unchanged through Bun 1.4.4).
     "TLS_AES_128_GCM_SHA256:TLS_AES_256_GCM_SHA384:TLS_CHACHA20_POLY1305_SHA256:\
 TLS_ECDHE_ECDSA_WITH_AES_128_GCM_SHA256:TLS_ECDHE_RSA_WITH_AES_128_GCM_SHA256:\
 TLS_ECDHE_ECDSA_WITH_AES_256_GCM_SHA384:TLS_ECDHE_RSA_WITH_AES_256_GCM_SHA384:\
@@ -47,7 +48,7 @@ TLS_RSA_WITH_AES_128_GCM_SHA256:TLS_RSA_WITH_AES_256_GCM_SHA384:\
 TLS_RSA_WITH_AES_128_CBC_SHA:TLS_RSA_WITH_AES_256_CBC_SHA"
 }
 
-/// signature_algorithms in ClientHello order (BoringSSL names; CC 2.1.316 adds
+/// signature_algorithms in ClientHello order (BoringSSL names; CC 2.1.316+ adds
 /// ed25519 + ecdsa_secp521r1_sha512 before rsa_pkcs1_sha1).
 const SIGALGS_LIST: &str = "ecdsa_secp256r1_sha256:rsa_pss_rsae_sha256:rsa_pkcs1_sha256:\
 ecdsa_secp384r1_sha384:rsa_pss_rsae_sha384:rsa_pkcs1_sha384:\

@@ -12,6 +12,11 @@ Updated 2026-11-01: Claude Code **2.1.316** (Bun 1.4.4) local ClientHello re-sam
 `6a3d802a7139` → `7f527383e249`. Lane sigalgs + profile bumped to `bun-1.4.4-claude-2.1.316`; local
 ClientHello probe of the lane matches the 2.1.316 sample field-for-field (no live peet run).
 
+Checked 2026-11-09: Claude Code **2.1.318** local ClientHello sample (`20261104T0859`) has the same JA3
+`1523504b38f0fae0d881d4b6554aac1b` / JA4 `t13d1713h1_5b57614c22b0_7f527383e249`; the installed
+**2.1.319** binary embeds the same `Bun v1.4.4` (no new ClientHello sample). No TLS constant changes;
+profile stays `bun-1.4.4-claude-2.1.316`. Default Claude UA bumped to `claude-cli/2.1.319`.
+
 ## Goal
 
 Match Claude Code 2.1.316 ClientHello:

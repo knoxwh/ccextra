@@ -42,13 +42,13 @@ pub fn shorten_name_if_needed(name: &str) -> String {
             {
                 readable
             } else {
-                cand[..NAME_LIMIT].to_string()
+                truncate_to_limit(&cand)
             }
         } else {
-            name[..NAME_LIMIT].to_string()
+            truncate_to_limit(name)
         }
     } else {
-        name[..NAME_LIMIT].to_string()
+        truncate_to_limit(name)
     };
     // 去除前导 _ 和 - (对齐 CPA strings.TrimLeft(truncated, "_-"))
     let trimmed = truncated.trim_start_matches(&['_', '-'][..]);
@@ -57,6 +57,15 @@ pub fn shorten_name_if_needed(name: &str) -> String {
     } else {
         truncated
     }
+}
+
+/// 截到 NAME_LIMIT 字节;落在多字节字符中间时回退到前一个字符边界(避免切片 panic)
+fn truncate_to_limit(s: &str) -> String {
+    let mut cut = NAME_LIMIT.min(s.len());
+    while !s.is_char_boundary(cut) {
+        cut -= 1;
+    }
+    s[..cut].to_string()
 }
 
 /// 候选名冲突时追加 `_N` 后缀直到唯一
@@ -222,5 +231,16 @@ mod tests {
         for (orig, short) in &short_map {
             assert_eq!(rev[short], *orig);
         }
+    }
+
+    #[test]
+    fn test_over_limit_multibyte_name_truncates_on_char_boundary() {
+        // 63 个 ASCII + "工具…":第 64 字节落在多字节字符中间,不得 panic
+        let name = format!("{}工具名称", "a".repeat(63));
+        assert_eq!(shorten_name_if_needed(&name), "a".repeat(63));
+        let mcp = format!("mcp__srv__{}工具名称", "b".repeat(58));
+        let short = shorten_name_if_needed(&mcp);
+        assert!(short.len() <= NAME_LIMIT);
+        assert_eq!(short, format!("mcp__{}", "b".repeat(58)));
     }
 }

@@ -34,7 +34,7 @@ ccextra 将 Anthropic Messages 入口接到不同上游协议，同时尽量保�
 
 ## 请求管线
 
-1. 读取请求体并校验 `x-api-key` 或 `Authorization: Bearer`。
+1. 读取请求体（上限 10 MiB，超出返回 413）并校验 `x-api-key` 或 `Authorization: Bearer`。
 2. 由入站 `model` 解析 `(provider, protocol, upstream_model)`。
 3. 按协议执行转换前归一化。
 4. 转换成目标请求体，或在 Claude 路径只替换 `model`，再清洗非 Claude 模型的 system 并钳制其越档 effort。

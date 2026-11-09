@@ -2027,7 +2027,7 @@ fn repair_schema_node(
     // (对齐 CPA b5cde4ba + ffe6ad3c)。显式非 array type 的 items 留给 sanitize_array_items 剥离。
     // 仍挂未解析 $ref 的节点不加占位 items / 不合成 type,否则内联时会变成兄弟键盖掉定义(CPA c558d320)。
     // 对齐 CPA clone["$ref"] == nil:键缺失或值为 JSON null 都视为无 $ref
-    if add_missing_array_items && clone.get("$ref").map_or(true, Value::is_null) {
+    if add_missing_array_items && clone.get("$ref").is_none_or(Value::is_null) {
         if is_array_declared_type(clone.get("type")) && !clone.contains_key("items") {
             clone.insert("items".to_string(), json!({"type": "string"}));
             modified = true;

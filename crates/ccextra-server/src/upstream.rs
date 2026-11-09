@@ -406,7 +406,8 @@ impl AntigravityPoolSettings {
 
 /// 解析 Go time.Duration 字符串子集:ns/us/ms/s/m/h,支持十进制小数
 /// (如 "1.5s",对齐 Go time.ParseDuration 浮点形式);负值或 0 归一为
-/// ZERO(调用方据此回退短连接,对齐 CPA d <= 0),其余非法输入返回 Err
+/// ZERO(调用方据此回退短连接,对齐 CPA d <= 0),其余非法输入返回 Err。
+/// 与 `http::retry::parse_go_duration`(多段 `1h2m3s`、负值 None、裸 `0` 合法)语义不同,故不合并。
 fn parse_go_duration(raw: &str) -> anyhow::Result<Duration> {
     let raw = raw.trim();
     let split = raw

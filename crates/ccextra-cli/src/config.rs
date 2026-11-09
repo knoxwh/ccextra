@@ -46,7 +46,7 @@ pub struct Config {
 
 #[derive(Debug, Deserialize, Clone)]
 pub struct UserAgents {
-    /// Claude CLI UA,默认 "claude-cli/2.1.258"
+    /// Claude CLI UA,默认 "claude-cli/2.1.319"
     pub claude_cli: Option<String>,
     /// Codex CLI UA,默认 "codex_cli_rs/0.153.3 (Mac OS 26.6.2; arm64)"
     pub codex_tui: Option<String>,

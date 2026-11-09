@@ -1,5 +1,5 @@
 use axum::{
-    body::{to_bytes, Body},
+    body::Body,
     extract::State,
     http::{header, HeaderMap, StatusCode},
     response::Response,
@@ -30,9 +30,7 @@ pub async fn handle_count_tokens(
     let upstream_client = &snapshot.runtime.upstream;
     let user_agents = &snapshot.runtime.user_agents;
     check_secret(&headers, &snapshot.runtime.secret).await?;
-    let bytes = to_bytes(body, crate::limits::INBOUND_BODY_LIMIT)
-        .await
-        .map_err(|e| AppError::new(anyhow::anyhow!("读请求体失败: {e}")))?;
+    let bytes = crate::limits::read_inbound_body(body).await?;
 
     // 解析 model 字段
     let mut body_json: Value = serde_json::from_slice(&bytes)

@@ -32,9 +32,10 @@ wreq = { version = "0.16.1", default-features = true, features = ["json", "strea
 
 time = { version = "0.3", features = ["formatting", "parsing", "std"] }
 getrandom = "0.4"
-once_cell = "1.19"
 fslock = "0.2"
 regex = "1"
+# 入站 body 超限识别(LengthLimitError → 413)
+http-body-util = "0.1"
 
 [dev-dependencies]
 tower.workspace = true
