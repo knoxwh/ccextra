@@ -584,83 +584,15 @@ pub(crate) async fn prepare_message_request(
                 tool_names = Some(Arc::new(short_to_original));
             }
             if ccextra_core::antigravity_uses_reasoning_replay(&route.upstream_model) {
-                // 工具表（对齐 CPA toolSchemas 来源：原始 Claude 请求）+ 上游短名映射
-                let replay_tools = ccextra_core::convert::AgReplayToolContext {
-                    original_request: original_claude_request.as_deref(),
-                    short_to_original: tool_names.as_deref(),
-                };
-                if let (Some(sess), Some(key)) = (cc_session.as_deref(), ag_replay_key.as_deref()) {
-                    use crate::sse::antigravity_replay_cache::AgReplayApplyOutcome;
-                    let (outcome, snapshot) = state
-                        .ag_replay_cache
-                        .apply_to_antigravity_body_with_tools(key, &mut body_json, replay_tools);
-                    ag_replay_snapshot = snapshot;
-                    match outcome {
-                        AgReplayApplyOutcome::Applied { items } => {
-                            tracing::debug!(
-                                session = %sess,
-                                model = %route.upstream_model,
-                                items,
-                                "antigravity reasoning replay 已注入"
-                            );
-                        }
-                        AgReplayApplyOutcome::Unchanged { items } => {
-                            tracing::debug!(
-                                session = %sess,
-                                model = %route.upstream_model,
-                                items,
-                                "antigravity reasoning replay 账本未改写"
-                            );
-                        }
-                        AgReplayApplyOutcome::Invalid { items } => {
-                            tracing::warn!(
-                                session = %sess,
-                                model = %route.upstream_model,
-                                items,
-                                "antigravity reasoning replay 账本规范化失败，跳过注入"
-                            );
-                        }
-                        AgReplayApplyOutcome::MissingRequest => {
-                            tracing::warn!(
-                                session = %sess,
-                                model = %route.upstream_model,
-                                "antigravity reasoning replay 缺少 request 字段，跳过注入"
-                            );
-                        }
-                        AgReplayApplyOutcome::RolledBack { items } => {
-                            tracing::debug!(
-                                session = %sess,
-                                model = %route.upstream_model,
-                                items,
-                                "antigravity reasoning replay 破坏配对，已退回原始请求并按快照清账本"
-                            );
-                        }
-                        AgReplayApplyOutcome::Miss => {
-                            // 对齐 CPA：普通 miss 保持安静，避免每轮刷屏
-                        }
-                        AgReplayApplyOutcome::PairingInvalid { message } => {
-                            // 对齐 CPA statusErr 400 → Claude invalid_request_error。每个 AG Gemini
-                            // 族请求都校验；历史坏了时每轮同样 400，直到用户 rewind 或 /clear。
-                            tracing::debug!(
-                                session = %sess,
-                                model = %route.upstream_model,
-                                "antigravity replay 历史配对无效，本地 400"
-                            );
-                            return Err(AppError::bad_request(message));
-                        }
-                    }
-                } else {
-                    // 无会话：无账本，但历史稳定 id 仍须降级（对齐 CPA 兜底不依赖 scope）；
-                    // 配对无效同样本地 400（见上，坏历史每轮重现）
-                    if let Some(message) =
-                        crate::sse::antigravity_replay_cache::prepare_antigravity_body_without_ledger(
-                            &mut body_json,
-                            replay_tools,
-                        )
-                    {
-                        return Err(AppError::bad_request(message));
-                    }
-                }
+                ag_replay_snapshot = apply_antigravity_reasoning_replay(
+                    state,
+                    &route,
+                    cc_session.as_deref(),
+                    ag_replay_key.as_deref(),
+                    original_claude_request.as_deref(),
+                    tool_names.as_deref(),
+                    &mut body_json,
+                )?;
             }
         }
     }
@@ -680,69 +612,7 @@ pub(crate) async fn prepare_message_request(
     let outbound_model =
         resolve_outbound_model(&mut body_json, &route.upstream_model, route.protocol);
 
-    if matches!(route.protocol, Protocol::OpenAiResponses) && is_gpt_model(&outbound_model) {
-        if let Some(obj) = body_json.as_object_mut() {
-            // ChatGPT Codex OAuth 拒收采样/兼容字段(对齐 CPA delete + sub2api
-            // openAICodexOAuthUnsupportedFields);须在 payload_overrides 之后剥,
-            // 否则 *gpt* 规则注入的 temperature 等会打到订阅上游 400。
-            for key in [
-                "previous_response_id",
-                "generate",
-                "safety_identifier",
-                "stream_options",
-                "max_output_tokens",
-                "max_completion_tokens",
-                "temperature",
-                "top_p",
-                "frequency_penalty",
-                "presence_penalty",
-                "chat_template_kwargs",
-                "user",
-                "metadata",
-                "truncation",
-                "stop_sequences",
-                "background",
-            ] {
-                obj.remove(key);
-            }
-            // 空 instructions 对齐 CPA DeleteBytes:省略而非发 ""
-            if obj.get("instructions").and_then(|v| v.as_str()) == Some("") {
-                obj.remove("instructions");
-            }
-        }
-        if sanitize_gpt_reasoning_items(&mut body_json) {
-            tracing::debug!("已清理无效 GPT reasoning encrypted_content");
-        }
-    }
-
-    // Grok Responses:对齐 CPA xai_executor 明确 DeleteBytes 的字段;
-    // 保留 temperature/top_p/max_output_tokens(CPA preserveXAIResponsesOutputControls /
-    // 原生 ModelEntry 可带采样)。须在 payload_overrides 之后。
-    if matches!(route.protocol, Protocol::OpenAiResponses) && is_grok_model(&outbound_model) {
-        if let Some(obj) = body_json.as_object_mut() {
-            for key in [
-                "previous_response_id",
-                "prompt_cache_retention",
-                "safety_identifier",
-                "stream_options",
-                "stop",
-            ] {
-                obj.remove(key);
-            }
-        }
-    }
-
-    // OpenAI Chat:payload 后再守卫(kimi 温度 / 非 qwen|glm 剥 tool_stream / MCT 键对齐)
-    if matches!(route.protocol, Protocol::OpenAiChat) {
-        sanitize_openai_chat_after_payload(&mut body_json, &outbound_model);
-    }
-
-    // 6. 对齐 StripPromptCacheRetention
-    if !matches!(route.protocol, Protocol::Claude) {
-        body_json
-            .as_object_mut()
-            .map(|m| m.remove("prompt_cache_retention"));
-    }
+    strip_upstream_unsupported_fields(&mut body_json, route.protocol, &outbound_model);
 
     // 7. 上游连接参数提取并释放读锁
     let (
@@ -800,100 +670,19 @@ pub(crate) async fn prepare_message_request(
     }
 
     // OAuth 订阅:运行时 token 校验与自动刷新;失败硬失败,不得继续打旧 token
-    let mut oauth_refresh: Option<OAuthRefreshTarget> = None;
-    let mut codex_account_id: Option<String> = None;
-
-    if let Some(path) = antigravity_refresh {
-        match crate::antigravity::ensure_credential_fresh(
-            std::path::Path::new(&path),
-            upstream_proxy.as_deref(),
-            None,
-        )
-        .await
-        {
-            Ok(fresh_cred) => {
-                upstream_key = fresh_cred.access_token;
-                if !fresh_cred.refresh_token.trim().is_empty() {
-                    pool_refresh_token = Some(fresh_cred.refresh_token);
-                }
-                // 对齐 CPA projectIDForRequest:缺 project 硬失败;发现结果写回出站 body
-                let pid = fresh_cred.project_id.trim();
-                if pid.is_empty() {
-                    return Err(AppError::bad_request("antigravity auth missing project_id"));
-                }
-                body_json["project"] = serde_json::Value::String(pid.to_string());
-                oauth_refresh = Some(OAuthRefreshTarget::Antigravity { path });
-            }
-            Err(e) => {
-                return Err(AppError::unauthorized(format!(
-                    "Antigravity 凭证刷新失败,拒绝使用旧 token: {e}"
-                )));
-            }
-        }
-    }
-
-    if let Some(path) = xai_refresh {
-        match crate::xai::ensure_credential_fresh(
-            std::path::Path::new(&path),
-            upstream_proxy.as_deref(),
-            None,
-        )
-        .await
-        {
-            Ok(fresh_cred) => {
-                upstream_key = fresh_cred.access_token;
-                oauth_refresh = Some(OAuthRefreshTarget::Xai { path });
-            }
-            Err(e) => {
-                return Err(AppError::unauthorized(format!(
-                    "xAI 凭证刷新失败,拒绝使用旧 token: {e}"
-                )));
-            }
-        }
-    }
-
-    if let Some(path) = codex_refresh {
-        match crate::codex::ensure_credential_fresh(
-            std::path::Path::new(&path),
-            upstream_proxy.as_deref(),
-            None,
-        )
-        .await
-        {
-            Ok(fresh_cred) => {
-                upstream_key = fresh_cred.access_token;
-                if !fresh_cred.account_id.is_empty() {
-                    codex_account_id = Some(fresh_cred.account_id);
-                }
-                oauth_refresh = Some(OAuthRefreshTarget::Codex { path });
-            }
-            Err(e) => {
-                return Err(AppError::unauthorized(format!(
-                    "Codex 凭证刷新失败,拒绝使用旧 token: {e}"
-                )));
-            }
-        }
-    }
-
-    if let Some(path) = claude_refresh {
-        match crate::claude::ensure_credential_fresh(
-            std::path::Path::new(&path),
-            upstream_proxy.as_deref(),
-            None,
-        )
-        .await
-        {
-            Ok(fresh_cred) => {
-                upstream_key = fresh_cred.access_token;
-                oauth_refresh = Some(OAuthRefreshTarget::Claude { path });
-            }
-            Err(e) => {
-                return Err(AppError::unauthorized(format!(
-                    "Claude 凭证刷新失败,拒绝使用旧 token: {e}"
-                )));
-            }
-        }
-    }
+    let (oauth_refresh, codex_account_id) = ensure_oauth_credentials_fresh(
+        OAuthRefreshPaths {
+            antigravity: antigravity_refresh,
+            xai: xai_refresh,
+            codex: codex_refresh,
+            claude: claude_refresh,
+        },
+        upstream_proxy.as_deref(),
+        &mut upstream_key,
+        &mut pool_refresh_token,
+        &mut body_json,
+    )
+    .await?;
 
     // prompt_cache_key 注入
     if should_inject_prompt_cache_key(provider_prompt_cache_key, route.protocol, &outbound_model)
@@ -922,41 +711,13 @@ pub(crate) async fn prepare_message_request(
     }
 
     // 诊断落盘
-    let sess = cc_session
-        .as_deref()
-        .map(|s| s.chars().take(8).collect::<String>())
-        .unwrap_or_else(|| "nosess".into());
-    let ts = std::time::SystemTime::now()
-        .duration_since(std::time::UNIX_EPOCH)
-        .map(|d| d.as_millis() as u64)
-        .unwrap_or(0);
-    let proto = format!("{:?}", route.protocol).to_lowercase();
-    let request_seq = if log_request_body {
-        UPSTREAM_LOG_SEQUENCE.fetch_add(1, Ordering::Relaxed)
-    } else {
-        0
-    };
-    let log_stem = upstream_log_stem(&sess, ts, request_seq, &proto);
-    if log_request_body {
-        let log_dir = config_snapshot
-            .runtime
-            .logging
-            .log_dir
-            .as_deref()
-            .unwrap_or_else(|| std::path::Path::new("logs"));
-        let _ = std::fs::create_dir_all(log_dir);
-        let dump_obj = json!({
-            "inbound_headers": inbound_headers_json(headers),
-            "upstream_body": body_json,
-        });
-        let path = log_dir.join(format!("upstream_request_{log_stem}.json"));
-        let dumped = serde_json::to_vec_pretty(&dump_obj)
-            .ok()
-            .and_then(|bytes| std::fs::write(&path, bytes).ok());
-        if dumped.is_none() {
-            tracing::warn!(path = %path.display(), "上游请求诊断信息落盘失败");
-        }
-    }
+    dump_upstream_request(
+        config_snapshot,
+        headers,
+        cc_session.as_deref(),
+        route.protocol,
+        &body_json,
+    );
 
     let inbound_user_agent = if matches!(route.protocol, Protocol::Claude) {
         claude_inbound_user_agent(headers)
@@ -1074,6 +835,327 @@ pub(crate) async fn prepare_message_request(
         drift_usage_scope: drift_parent_for_usage.map(|parent| (state.drift.clone(), parent)),
         unfit_generation,
     })
+}
+
+/// 动态 OAuth provider 的凭证文件路径(按 provider metadata 提取;非 OAuth 均为 None)
+struct OAuthRefreshPaths {
+    antigravity: Option<String>,
+    xai: Option<String>,
+    codex: Option<String>,
+    claude: Option<String>,
+}
+
+/// OAuth 订阅:运行时 token 校验与自动刷新;失败硬失败,不得继续打旧 token。
+/// 返回 (401 重试用的刷新目标, Codex 订阅账号 id)。
+async fn ensure_oauth_credentials_fresh(
+    paths: OAuthRefreshPaths,
+    upstream_proxy: Option<&str>,
+    upstream_key: &mut String,
+    pool_refresh_token: &mut Option<String>,
+    body_json: &mut Value,
+) -> Result<(Option<OAuthRefreshTarget>, Option<String>), AppError> {
+    let mut oauth_refresh: Option<OAuthRefreshTarget> = None;
+    let mut codex_account_id: Option<String> = None;
+
+    if let Some(path) = paths.antigravity {
+        match crate::antigravity::ensure_credential_fresh(
+            std::path::Path::new(&path),
+            upstream_proxy,
+            None,
+        )
+        .await
+        {
+            Ok(fresh_cred) => {
+                *upstream_key = fresh_cred.access_token;
+                if !fresh_cred.refresh_token.trim().is_empty() {
+                    *pool_refresh_token = Some(fresh_cred.refresh_token);
+                }
+                // 对齐 CPA projectIDForRequest:缺 project 硬失败;发现结果写回出站 body
+                let pid = fresh_cred.project_id.trim();
+                if pid.is_empty() {
+                    return Err(AppError::bad_request("antigravity auth missing project_id"));
+                }
+                body_json["project"] = serde_json::Value::String(pid.to_string());
+                oauth_refresh = Some(OAuthRefreshTarget::Antigravity { path });
+            }
+            Err(e) => {
+                return Err(AppError::unauthorized(format!(
+                    "Antigravity 凭证刷新失败,拒绝使用旧 token: {e}"
+                )));
+            }
+        }
+    }
+
+    if let Some(path) = paths.xai {
+        match crate::xai::ensure_credential_fresh(std::path::Path::new(&path), upstream_proxy, None)
+            .await
+        {
+            Ok(fresh_cred) => {
+                *upstream_key = fresh_cred.access_token;
+                oauth_refresh = Some(OAuthRefreshTarget::Xai { path });
+            }
+            Err(e) => {
+                return Err(AppError::unauthorized(format!(
+                    "xAI 凭证刷新失败,拒绝使用旧 token: {e}"
+                )));
+            }
+        }
+    }
+
+    if let Some(path) = paths.codex {
+        match crate::codex::ensure_credential_fresh(
+            std::path::Path::new(&path),
+            upstream_proxy,
+            None,
+        )
+        .await
+        {
+            Ok(fresh_cred) => {
+                *upstream_key = fresh_cred.access_token;
+                if !fresh_cred.account_id.is_empty() {
+                    codex_account_id = Some(fresh_cred.account_id);
+                }
+                oauth_refresh = Some(OAuthRefreshTarget::Codex { path });
+            }
+            Err(e) => {
+                return Err(AppError::unauthorized(format!(
+                    "Codex 凭证刷新失败,拒绝使用旧 token: {e}"
+                )));
+            }
+        }
+    }
+
+    if let Some(path) = paths.claude {
+        match crate::claude::ensure_credential_fresh(
+            std::path::Path::new(&path),
+            upstream_proxy,
+            None,
+        )
+        .await
+        {
+            Ok(fresh_cred) => {
+                *upstream_key = fresh_cred.access_token;
+                oauth_refresh = Some(OAuthRefreshTarget::Claude { path });
+            }
+            Err(e) => {
+                return Err(AppError::unauthorized(format!(
+                    "Claude 凭证刷新失败,拒绝使用旧 token: {e}"
+                )));
+            }
+        }
+    }
+
+    Ok((oauth_refresh, codex_account_id))
+}
+
+/// payload 覆盖之后按目标上游剥离不支持的字段(GPT Codex OAuth / Grok Responses /
+/// OpenAI Chat 守卫 / StripPromptCacheRetention)。
+fn strip_upstream_unsupported_fields(
+    body_json: &mut Value,
+    protocol: Protocol,
+    outbound_model: &str,
+) {
+    if matches!(protocol, Protocol::OpenAiResponses) && is_gpt_model(outbound_model) {
+        if let Some(obj) = body_json.as_object_mut() {
+            // ChatGPT Codex OAuth 拒收采样/兼容字段(对齐 CPA delete + sub2api
+            // openAICodexOAuthUnsupportedFields);须在 payload_overrides 之后剥,
+            // 否则 *gpt* 规则注入的 temperature 等会打到订阅上游 400。
+            for key in [
+                "previous_response_id",
+                "generate",
+                "safety_identifier",
+                "stream_options",
+                "max_output_tokens",
+                "max_completion_tokens",
+                "temperature",
+                "top_p",
+                "frequency_penalty",
+                "presence_penalty",
+                "chat_template_kwargs",
+                "user",
+                "metadata",
+                "truncation",
+                "stop_sequences",
+                "background",
+            ] {
+                obj.remove(key);
+            }
+            // 空 instructions 对齐 CPA DeleteBytes:省略而非发 ""
+            if obj.get("instructions").and_then(|v| v.as_str()) == Some("") {
+                obj.remove("instructions");
+            }
+        }
+        if sanitize_gpt_reasoning_items(body_json) {
+            tracing::debug!("已清理无效 GPT reasoning encrypted_content");
+        }
+    }
+
+    // Grok Responses:对齐 CPA xai_executor 明确 DeleteBytes 的字段;
+    // 保留 temperature/top_p/max_output_tokens(CPA preserveXAIResponsesOutputControls /
+    // 原生 ModelEntry 可带采样)。须在 payload_overrides 之后。
+    if matches!(protocol, Protocol::OpenAiResponses) && is_grok_model(outbound_model) {
+        if let Some(obj) = body_json.as_object_mut() {
+            for key in [
+                "previous_response_id",
+                "prompt_cache_retention",
+                "safety_identifier",
+                "stream_options",
+                "stop",
+            ] {
+                obj.remove(key);
+            }
+        }
+    }
+
+    // OpenAI Chat:payload 后再守卫(kimi 温度 / 非 qwen|glm 剥 tool_stream / MCT 键对齐)
+    if matches!(protocol, Protocol::OpenAiChat) {
+        sanitize_openai_chat_after_payload(body_json, outbound_model);
+    }
+
+    // 6. 对齐 StripPromptCacheRetention
+    if !matches!(protocol, Protocol::Claude) {
+        body_json
+            .as_object_mut()
+            .map(|m| m.remove("prompt_cache_retention"));
+    }
+}
+
+/// 诊断落盘:`logging.request_body` 开启时把脱敏入站头与最终出站 body 写入日志目录。
+fn dump_upstream_request(
+    config_snapshot: &crate::http::ConfigSnapshot,
+    headers: &HeaderMap,
+    cc_session: Option<&str>,
+    protocol: Protocol,
+    body_json: &Value,
+) {
+    let log_request_body = config_snapshot.runtime.logging.request_body;
+    let sess = cc_session
+        .map(|s| s.chars().take(8).collect::<String>())
+        .unwrap_or_else(|| "nosess".into());
+    let ts = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map(|d| d.as_millis() as u64)
+        .unwrap_or(0);
+    let proto = format!("{:?}", protocol).to_lowercase();
+    let request_seq = if log_request_body {
+        UPSTREAM_LOG_SEQUENCE.fetch_add(1, Ordering::Relaxed)
+    } else {
+        0
+    };
+    let log_stem = upstream_log_stem(&sess, ts, request_seq, &proto);
+    if log_request_body {
+        let log_dir = config_snapshot
+            .runtime
+            .logging
+            .log_dir
+            .as_deref()
+            .unwrap_or_else(|| std::path::Path::new("logs"));
+        let _ = std::fs::create_dir_all(log_dir);
+        let dump_obj = json!({
+            "inbound_headers": inbound_headers_json(headers),
+            "upstream_body": body_json,
+        });
+        let path = log_dir.join(format!("upstream_request_{log_stem}.json"));
+        let dumped = serde_json::to_vec_pretty(&dump_obj)
+            .ok()
+            .and_then(|bytes| std::fs::write(&path, bytes).ok());
+        if dumped.is_none() {
+            tracing::warn!(path = %path.display(), "上游请求诊断信息落盘失败");
+        }
+    }
+}
+
+/// Antigravity reasoning replay:有会话账本时注入并返回读账本快照;无会话仍做历史稳定 id 降级。
+/// 配对无效本地 400(对齐 CPA statusErr 400)。
+fn apply_antigravity_reasoning_replay(
+    state: &AppState,
+    route: &ccextra_core::route::RouteDecision,
+    cc_session: Option<&str>,
+    ag_replay_key: Option<&str>,
+    original_claude_request: Option<&Value>,
+    tool_names: Option<&HashMap<String, String>>,
+    body_json: &mut Value,
+) -> Result<crate::sse::antigravity_replay_cache::AgReplaySnapshot, AppError> {
+    // 工具表（对齐 CPA toolSchemas 来源：原始 Claude 请求）+ 上游短名映射
+    let replay_tools = ccextra_core::convert::AgReplayToolContext {
+        original_request: original_claude_request,
+        short_to_original: tool_names,
+    };
+    if let (Some(sess), Some(key)) = (cc_session, ag_replay_key) {
+        use crate::sse::antigravity_replay_cache::AgReplayApplyOutcome;
+        let (outcome, snapshot) = state.ag_replay_cache.apply_to_antigravity_body_with_tools(
+            key,
+            body_json,
+            replay_tools,
+        );
+        match outcome {
+            AgReplayApplyOutcome::Applied { items } => {
+                tracing::debug!(
+                    session = %sess,
+                    model = %route.upstream_model,
+                    items,
+                    "antigravity reasoning replay 已注入"
+                );
+            }
+            AgReplayApplyOutcome::Unchanged { items } => {
+                tracing::debug!(
+                    session = %sess,
+                    model = %route.upstream_model,
+                    items,
+                    "antigravity reasoning replay 账本未改写"
+                );
+            }
+            AgReplayApplyOutcome::Invalid { items } => {
+                tracing::warn!(
+                    session = %sess,
+                    model = %route.upstream_model,
+                    items,
+                    "antigravity reasoning replay 账本规范化失败，跳过注入"
+                );
+            }
+            AgReplayApplyOutcome::MissingRequest => {
+                tracing::warn!(
+                    session = %sess,
+                    model = %route.upstream_model,
+                    "antigravity reasoning replay 缺少 request 字段，跳过注入"
+                );
+            }
+            AgReplayApplyOutcome::RolledBack { items } => {
+                tracing::debug!(
+                    session = %sess,
+                    model = %route.upstream_model,
+                    items,
+                    "antigravity reasoning replay 破坏配对，已退回原始请求并按快照清账本"
+                );
+            }
+            AgReplayApplyOutcome::Miss => {
+                // 对齐 CPA：普通 miss 保持安静，避免每轮刷屏
+            }
+            AgReplayApplyOutcome::PairingInvalid { message } => {
+                // 对齐 CPA statusErr 400 → Claude invalid_request_error。每个 AG Gemini
+                // 族请求都校验；历史坏了时每轮同样 400，直到用户 rewind 或 /clear。
+                tracing::debug!(
+                    session = %sess,
+                    model = %route.upstream_model,
+                    "antigravity replay 历史配对无效，本地 400"
+                );
+                return Err(AppError::bad_request(message));
+            }
+        }
+        Ok(snapshot)
+    } else {
+        // 无会话：无账本，但历史稳定 id 仍须降级（对齐 CPA 兜底不依赖 scope）；
+        // 配对无效同样本地 400（见上，坏历史每轮重现）
+        if let Some(message) =
+            crate::sse::antigravity_replay_cache::prepare_antigravity_body_without_ledger(
+                body_json,
+                replay_tools,
+            )
+        {
+            return Err(AppError::bad_request(message));
+        }
+        Ok(Default::default())
+    }
 }
 
 pub(crate) async fn execute_upstream_request(
