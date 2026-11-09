@@ -489,7 +489,8 @@ fn append_openai_chat_content_parts(parts: &[Value], content: &mut Vec<Value>) {
             }
             "thinking" | "reasoning" => {
                 let t = extract_content_part_thinking_text(part);
-                if !t.is_empty() {
+                // 对齐 CPA 69637a66:仅空白不能新开 thinking;已有有效内容时可续写空白
+                if !thinking_buf.is_empty() || !t.trim().is_empty() {
                     flush_text(&mut text_buf, content);
                     thinking_buf.push_str(&t);
                 }
@@ -1158,5 +1159,80 @@ mod tests {
         assert_eq!(blocks2[0]["thinking"], "Step by step");
         assert_eq!(blocks2[1]["type"], "text");
         assert_eq!(blocks2[1]["text"], "Final answer");
+    }
+
+    #[test]
+    fn test_chat_nonstream_whitespace_reasoning_never_opens_thinking() {
+        // 对齐 CPA TestNonStream_WhitespaceReasoningNeverOpensThinkingBlock
+        // 1) 顶层仅空白 reasoning_content → 不开 thinking
+        let body = json!({
+            "id": "c1",
+            "object": "chat.completion",
+            "model": "m",
+            "choices": [{
+                "index": 0,
+                "message": {
+                    "role": "assistant",
+                    "content": "Hi",
+                    "reasoning_content": " "
+                },
+                "finish_reason": "stop"
+            }]
+        });
+        let out = openai_chat_to_anthropic(&body).unwrap();
+        let blocks = out["content"].as_array().unwrap();
+        assert_eq!(blocks.len(), 1, "out={out}");
+        assert_eq!(blocks[0]["type"], "text");
+        assert_eq!(blocks[0]["text"], "Hi");
+
+        // 2) content-part 仅空白 thinking → 不开 thinking
+        let body2 = json!({
+            "id": "c2",
+            "object": "chat.completion",
+            "model": "m",
+            "choices": [{
+                "index": 0,
+                "message": {
+                    "role": "assistant",
+                    "content": [
+                        {"type": "thinking", "thinking": " "},
+                        {"type": "text", "text": "Hi"}
+                    ]
+                },
+                "finish_reason": "stop"
+            }]
+        });
+        let out2 = openai_chat_to_anthropic(&body2).unwrap();
+        let blocks2 = out2["content"].as_array().unwrap();
+        assert_eq!(blocks2.len(), 1, "out2={out2}");
+        assert_eq!(blocks2[0]["type"], "text");
+        assert_eq!(blocks2[0]["text"], "Hi");
+
+        // 3) 已有有效 thinking 后续写空白 → 保留空白
+        let body3 = json!({
+            "id": "c3",
+            "object": "chat.completion",
+            "model": "m",
+            "choices": [{
+                "index": 0,
+                "message": {
+                    "role": "assistant",
+                    "content": [
+                        {"type": "thinking", "thinking": "a"},
+                        {"type": "thinking", "thinking": " "},
+                        {"type": "thinking", "thinking": "b"},
+                        {"type": "text", "text": "Hi"}
+                    ]
+                },
+                "finish_reason": "stop"
+            }]
+        });
+        let out3 = openai_chat_to_anthropic(&body3).unwrap();
+        let blocks3 = out3["content"].as_array().unwrap();
+        assert_eq!(blocks3.len(), 2, "out3={out3}");
+        assert_eq!(blocks3[0]["type"], "thinking");
+        assert_eq!(blocks3[0]["thinking"], "a b");
+        assert_eq!(blocks3[1]["type"], "text");
+        assert_eq!(blocks3[1]["text"], "Hi");
     }
 }
