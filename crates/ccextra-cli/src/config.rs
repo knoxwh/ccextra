@@ -15,7 +15,7 @@ pub struct Config {
     pub payload: Option<Vec<PayloadRule>>,
     pub normalize: NormalizeConfig,
     pub logging: LoggingConfig,
-    /// 入口 secret key(可选);配置后 /v1/models 与 /v1/messages 需 x-api-key 匹配
+    /// 入口 secret key(可选);配置后 /v1/messages(含 count_tokens)与 /v1/models 需 x-api-key 或 Bearer 匹配
     #[serde(default)]
     pub secret_key: Option<String>,
     /// Antigravity 凭证目录(可选);默认配置文件旁 `.cache/antigravity`

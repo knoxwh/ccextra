@@ -1,6 +1,7 @@
 # Claude TLS fingerprint — status
 
-Current profile: `bun-1.4.4-claude-2.1.316` (JA3/JA4 below). History, oldest first:
+Current profile: `bun-1.4.4-claude-2.1.316` (JA3/JA4 below). History, oldest first (original
+baseline 2026-10-13: Claude Code 2.1.296 / Bun 1.4.3):
 
 Verified 2026-10-14: Claude Code **2.1.299** (still Bun 1.4.3) re-sampled; JA3 / JA4 / peetprint match the 2.1.296 baseline — no TLS constant changes needed.
 
