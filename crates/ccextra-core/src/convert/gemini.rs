@@ -144,14 +144,14 @@ pub fn convert_to_gemini_with_registry(
     // user;纯 functionResponse 保留(上游期望模型续写),但 FR 嵌套媒体时仍补
     // (#6524)。Antigravity claude 目标全部跳过(adapter 拒空 text part)。
     // 顺序：Antigravity 对齐 CPA ensureAntigravityGeminiBoundaryUserContent（剥 → 首 → 尾，
-    // antigravity_executor.go:525-531）；Gemini 直连保持原有「首 → 剥 → 尾」不变。
+    // antigravity_executor.go）；Gemini 直连保持原有「首 → 剥 → 尾」不变。
     let is_claude_target = upstream_model.to_lowercase().contains("claude");
     if let Some(contents) = gemini.get_mut("contents").and_then(|c| c.as_array_mut()) {
         match flavor {
             SchemaFlavor::Antigravity if is_claude_target => {}
             SchemaFlavor::Antigravity => ensure_antigravity_gemini_boundary_user_content(contents),
             SchemaFlavor::Gemini => {
-                // 对齐 CPA gemini_executor.go:166/:300（及 vertex 同位置）：外发前
+                // 对齐 CPA gemini_executor.go Execute/ExecuteStream（及 vertex 同位置）：外发前
                 // SanitizeGeminiRequestThoughtSignatures(body, "contents")，再补边界 user 回合
                 super::signature::sanitize_gemini_request_thought_signatures(contents);
                 ensure_gemini_boundary_user_content(contents)
@@ -1402,7 +1402,7 @@ IMPORTANT: Assist with authorized security testing.
         assert_eq!(a[2], empty_user);
     }
 
-    /// 对齐 CPA gemini_executor.go:166/:300：Gemini 直连外发前跑
+    /// 对齐 CPA gemini_executor.go Execute/ExecuteStream：Gemini 直连外发前跑
     /// SanitizeGeminiRequestThoughtSignatures——并行 call 只有首个带哨兵，兄弟 call 去签名；
     /// Antigravity 走 prepare 链，不在 converter 里 sanitize。
     #[test]

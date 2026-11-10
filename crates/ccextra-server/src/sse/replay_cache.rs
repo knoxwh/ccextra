@@ -29,7 +29,7 @@ pub struct StreamReplayExtractor {
     /// 无 output_index 的 done 项(对齐 outputItemsFallback)
     items_fallback: Vec<Value>,
     /// 流式 reasoning 文本累积器(对齐 grok-build stream/responses.rs
-    /// L273 reasoning_acc.push_str:不分 output_index 单一累积)
+    /// reasoning_acc.push_str:不分 output_index 单一累积)
     reasoning_acc: String,
 }
 
@@ -47,8 +47,8 @@ impl StreamReplayExtractor {
     }
 
     /// 喂入上游 chunk,收集 output_item.done + reasoning_text.delta,
-    /// 遇 completed 补空 output 后缓存(对齐 grok-build stream_responses
-    /// L273 reasoning_acc 累积 + L549-550 inject_streaming_reasoning_fallback)
+    /// 遇 completed 补空 output 后缓存(对齐 grok-build stream/responses.rs
+    /// reasoning_acc 累积 + 结束时 inject_streaming_reasoning_fallback)
     pub fn push(&mut self, bytes: &[u8]) {
         for event in self.parser.push(bytes) {
             let value: Value = match serde_json::from_str(&event.data) {
@@ -82,7 +82,7 @@ impl StreamReplayExtractor {
         }
     }
 
-    /// 收集 reasoning_text.delta(对齐 grok-build L273 reasoning_acc.push_str,
+    /// 收集 reasoning_text.delta(对齐 grok-build reasoning_acc.push_str,
     /// 官方不分 output_index 单一累积)
     fn collect_reasoning_delta(&mut self, event_data: &Value) {
         let Some(delta) = event_data.get("delta").and_then(|v| v.as_str()) else {
@@ -108,7 +108,7 @@ impl StreamReplayExtractor {
 
     /// completed 若无 output,用收集的 items 补上(对齐 xaiPatchCompletedOutput);
     /// 之后统一注入流式 reasoning 兜底(对齐 grok-build 流式路径在最终
-    /// response 上调用 inject_streaming_reasoning_fallback L549-550)
+    /// response 上调用 inject_streaming_reasoning_fallback)
     fn patch_completed_output(&self, mut completed: Value) -> Value {
         let has_output = completed
             .pointer("/response/output")
@@ -136,7 +136,7 @@ impl StreamReplayExtractor {
     }
 
     /// 流式 reasoning 兜底注入(对齐 grok-build
-    /// inject_streaming_reasoning_fallback L1493-1526):
+    /// conversation.rs inject_streaming_reasoning_fallback):
     /// - 无累积文本 → 不动
     /// - output 任一 reasoning 已带 summary 文本 → 不动
     /// - 有 reasoning 无文本 → 把累积文本 push 进第一个的 summary(不覆盖)
@@ -439,7 +439,7 @@ mod tests {
         let key = "sess-deltas".to_string();
         let mut extractor = StreamReplayExtractor::new(cache.clone(), key.clone(), String::new());
 
-        // 流式 reasoning 文本累积(对齐 grok-build L273 reasoning_acc.push_str)
+        // 流式 reasoning 文本累积(对齐 grok-build reasoning_acc.push_str)
         extractor.push(
             b"event: response.reasoning_text.delta\ndata: {\"output_index\":0,\"delta\":\"thinking \"}\n\n",
         );
@@ -523,7 +523,7 @@ mod tests {
 
         extractor.push(b"event: response.reasoning_text.delta\ndata: {\"delta\":\"think\"}\n\n");
         // completed 自带 output 且无 reasoning 项 → 合成 reasoning 前插
-        // (对齐官方 L1518-1525 无 Reasoning 时 insert 合成项)
+        // (对齐 grok-build inject_streaming_reasoning_fallback:无 Reasoning 时 insert 合成项)
         extractor.push(b"event: response.completed\ndata: {\"type\":\"response.completed\",\"response\":{\"output\":[{\"type\":\"function_call\",\"call_id\":\"c2\",\"name\":\"f\",\"arguments\":\"{}\"}]}}\n\n");
 
         let mut body = json!({"input": [
@@ -570,7 +570,7 @@ mod tests {
         // 累积流式文本
         extractor.push(b"event: response.reasoning_text.delta\ndata: {\"output_index\":0,\"delta\":\"orphan delta\"}\n\n");
 
-        // output_item.done 已带 summary → 不用流式文本覆盖(对齐 grok-build L1503 any_with_text return)
+        // output_item.done 已带 summary → 不用流式文本覆盖(对齐 grok-build any_with_text 提前返回)
         extractor.push(b"event: response.output_item.done\ndata: {\"output_index\":0,\"item\":{\"type\":\"reasoning\",\"encrypted_content\":\"gAAA\",\"summary\":[{\"type\":\"summary_text\",\"text\":\"original summary\"}]}}\n\n");
 
         let completed_empty = b"event: response.completed\ndata: {\"type\":\"response.completed\",\"response\":{\"id\":\"r5\"}}\n\n";

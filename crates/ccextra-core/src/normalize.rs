@@ -1,8 +1,9 @@
 // 归一化:编排缓存稳定化模块
 //
 // 三条管线:
-// - normalize_anthropic_full:  入站 anthropic 转换前,全量管线
-// - normalize_target_post:     转换后目标 body 二次归一化(openai chat / responses)
+// - normalize_anthropic_full:         claude 直通,全量管线
+// - normalize_anthropic_pretransform: 转换路径转换前,精简子集
+// - normalize_target_post:            转换后目标 body 二次归一化(openai chat / responses)
 //
 // 说明:
 // - 本模块只做纯函数变更(改 body),不持有 DriftState。

@@ -1,7 +1,8 @@
 // Anthropic → OpenAI responses 转换(对齐转换路径字段映射)
 //
 // 主要映射(逐条一致):
-// - system → instructions 字段(合并 text blocks,过滤计费归属块,对齐 codex base_instructions)
+// - system → instructions 字段(合并 text blocks,过滤计费归属块,对齐 codex base_instructions);
+//   GPT/Grok 留空 instructions,改发 developer 适配块 + 白名单段落
 // - messages → input[]:text→input_text/output_text、thinking(带签名)→reasoning、
 //   image→input_image(data/url/file_id)、document|container_upload→input_file、
 //   tool_use→function_call、tool_result→function_call_output
@@ -12,7 +13,7 @@
 // - tools → codex tools(原名超 64 缩短 + 唯一 _N 后缀;web_search_* → type:"web_search")、
 //   input_schema→parameters(strict=false,剥 cache_control/defer_loading/$schema)
 // - 会话中途 role=system 的 tool_addition 定义 → additional_tools 项(Grok 并入顶层 tools)
-// - thinking.budget_tokens → reasoning.effort(直映射,不钳制)
+// - thinking.budget_tokens → reasoning.effort(按 models.json 钳到模型支持档;force_effort 优先)
 // - service_tier: speed=fast → priority
 // - output_config.format(json_schema)→ text.format(name 缺省、strict 默认 true)
 // - store=false;include=["reasoning.encrypted_content"(+web_search sources)];parallel_tool_calls
@@ -213,7 +214,7 @@ pub fn convert_to_openai_responses_with(
     // 透传 max_output_tokens 超 grok 上限会 400 触发客户端重试死循环) ---
 
     // --- reasoning.effort(对齐 thinking 分支;GPT-6 Astra 默认 low,其余 medium) ---
-    // 保留入站 reasoning.effort,钳制到模型支持级别(对齐 codex compact.rs:704 保留 turn_context.reasoning_effort)
+    // 保留入站 reasoning.effort,钳制到模型支持级别(对齐 codex compact.rs 沿用会话 reasoning effort)
     let default_effort = if is_gpt6_astra(upstream_model) {
         "low"
     } else {

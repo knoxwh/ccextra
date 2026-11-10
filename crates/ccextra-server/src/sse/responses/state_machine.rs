@@ -193,7 +193,7 @@ impl ResponsesRelay {
             }
             "response.reasoning_summary_text.delta" => self.plaintext_reasoning_delta(&root),
             "response.reasoning_summary_text.done" => {
-                // 对齐 CPA codex_openai_response.go:126-133:
+                // 对齐 CPA codex_openai_response.go:
                 // reasoning_summary_text.done 发 "\n\n" 分隔 summary 与后续内容
                 self.thinking_summary_seen = true;
                 if self.thinking_open {

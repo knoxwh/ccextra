@@ -72,7 +72,7 @@ pub fn responses_to_anthropic(
         for item in output {
             match item.get("type").and_then(|v| v.as_str()).unwrap_or("") {
                 "reasoning" => {
-                    // summary + content 拼接(对齐 CPA codex_openai_response.go:433-458)
+                    // summary + content 拼接(对齐 CPA codex_openai_response.go)
                     let mut text = String::new();
                     // summary:仅取首个 summary_text 的 text
                     if let Some(summary) = item.get("summary").and_then(|v| v.as_array()) {

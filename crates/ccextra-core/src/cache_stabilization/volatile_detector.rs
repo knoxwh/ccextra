@@ -1,4 +1,4 @@
-//! PR-E5：易变内容检测与剥离。
+//! PR-E5：易变内容检测与日期指纹句归一。
 //!
 //! 扫描入站 LLM 请求体，查找当它们出现在缓存前缀（cached prefix）中时
 //! 已知会破坏 prompt-cache 命中的子串——即 system prompt、tool 定义、
@@ -41,8 +41,7 @@
 //! - **样本截断到 80 字符。** 我们记录一小段切片，以便客户定位违规内容，
 //!   但绝不记录大批量客户数据。
 //! - **路径作用域。** OpenAI 与 Anthropic 的 JSON 请求体结构不同；
-//!   [`ApiKind`] 枚举选择正确的遍历器。Bedrock / Vertex 等会放在
-//!   Phase E 的后续工作中——本 PR 保持接口面紧凑。
+//!   [`ApiKind`] 枚举选择正确的遍历器。Bedrock / Vertex 等形态未覆盖。
 
 use serde_json::Value;
 
@@ -845,11 +844,10 @@ mod tests {
 
     #[test]
     fn does_not_scan_messages_for_volatile_content() {
-        // messages[] are intentionally NOT scanned: strip_volatile_from_prefix
-        // cannot touch them, the cache prefix is derived from system +
-        // tools only, and scanning messages only produced noise (historical
-        // tool_result timestamps / UUIDs). A UUID in a user message must
-        // produce no finding.
+        // messages[] are intentionally NOT scanned: the scan targets the
+        // system + tools prefix, and scanning messages only produced noise
+        // (historical tool_result timestamps / UUIDs). A UUID in a user
+        // message must produce no finding.
         let body = json!({
             "messages": [
                 {"role": "user", "content": "trace=550e8400-e29b-41d4-a716-446655440000"},
@@ -1064,11 +1062,6 @@ mod tests {
         let _ = out.as_bytes();
         assert!(out.ends_with('…'));
     }
-
-    // ─── strip_volatile_from_prefix 测试 ────────────────────────────
-    //
-    // 策略：system/instructions/developer 消息 AND tools 会被剥离。
-    // user/assistant 消息不会被剥离。
 
     // ─── 内联 ID 测试 ────────────────────────────────────────
 
@@ -1327,6 +1320,4 @@ mod tests {
         assert_eq!(findings[0].kind, VolatileKind::Timestamp);
         assert!(findings[0].location.starts_with("input[0]"));
     }
-
-    // ─── input[] 中的 system/developer 消息会被剥离 ─────────
 }

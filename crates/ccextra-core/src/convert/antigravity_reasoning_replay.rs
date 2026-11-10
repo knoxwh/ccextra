@@ -1568,7 +1568,7 @@ fn repair_function_response_names(contents: &mut [Value]) {
     }
 }
 
-/// 对齐 CPA normalizeAntigravityGeminiFunctionResponseRoles（antigravity_executor.go:545）：
+/// 对齐 CPA normalizeAntigravityGeminiFunctionResponseRoles（antigravity_executor.go）：
 /// 先修 functionResponse 名；紧跟 functionCall 回合的 response 回合按 call 顺序重排
 /// response parts（其余 part 追加在后）；纯 functionResponse 回合 role 改为 `model`。
 /// 改写的是外发 payload（CPA 在 sanitize 与 prepare 中都把结果作为后续 payload）。
@@ -1688,7 +1688,7 @@ pub struct AgReplayPrepareReport {
 
 /// 对齐 CPA 外发前处理链（调用方须仅对 `antigravity_uses_reasoning_replay` 模型调用，
 /// 与 CPA 门控一致；与有无会话 / 账本 / 稳定 id 无关）：
-/// 0. sanitize 阶段（antigravity_executor.go:493-498）：SanitizeGeminiRequestThoughtSignatures
+/// 0. sanitize 阶段（antigravity_executor.go sanitizeAntigravityGeminiRequestSignatures）：SanitizeGeminiRequestThoughtSignatures
 ///    + functionResponse 角色归一；
 /// 1. 应用账本（可空）→ 归一；2. 历史含稳定 id → 合成 id 降级 → 归一；
 /// 3. 回合首个 functionCall 补哨兵；4. 最终配对无效：账本确有改写且原始配对有效 → 整体退回

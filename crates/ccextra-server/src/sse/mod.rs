@@ -7,6 +7,7 @@
 // - emit:     无状态帧构造函数(chat/responses 共用)
 // - gemini / non_stream
 // - replay_cache / antigravity_replay_cache / kimi_thinking_replay_cache
+// - ttl_lru:  replay 账本共用的 TTL + 容量上限缓存
 
 pub mod antigravity_replay_cache;
 pub mod chat;

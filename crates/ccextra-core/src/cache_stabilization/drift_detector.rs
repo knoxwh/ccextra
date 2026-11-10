@@ -52,7 +52,7 @@
 //!
 //! - 对 (system, tools, early_messages) 各做一次 SHA-256 更新。
 //!   在 8 KB 的 system prompt 上总计约 200us。
-//! - 一次 LRU 查找 + 插入。`lru = "0.12"` 摊还 O(1)。
+//! - 一次 LRU 查找 + 插入（`lru` crate，摊还 O(1)）。
 //! - 一次 `tracing::debug!` 或 `tracing::warn!`。
 
 use std::num::NonZeroUsize;

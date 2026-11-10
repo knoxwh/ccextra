@@ -17,7 +17,7 @@
 //! 字段以及字符串形式的 `system` / OpenAI `content` **包含 `</system-reminder>`**
 //! 时才修改它们。其他块以及不含标记的文本块保持不变。工具输出——Anthropic
 //! `tool_result.content` 和 OpenAI `role:"tool"` 的 content——不修改
-//! （该 drift 形式 smoosh-split 被推迟处理）。
+//! （`tool_result` 内揉合的 reminder 由 `smoosh_split` 拆出，仅 Anthropic）。
 //!
 //! # 范围
 //!

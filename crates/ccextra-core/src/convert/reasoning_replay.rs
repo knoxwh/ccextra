@@ -324,7 +324,7 @@ fn output_call_ids(input_items: &[Value]) -> std::collections::HashMap<String, S
 
 /// replay 工具调用项 call_id 对齐到 input 已有 output 的形态
 /// (对齐 codexAlignReasoningReplayToolCallIDs);reasoning 项注入前剥掉
-/// status 字段(对齐 grok-build conversation/responses.rs L219-221:
+/// status 字段(对齐 grok-build conversation/responses.rs:
 /// status output-only,输入侧拒绝)。
 fn align_replay_call_ids(input_items: &[Value], replay_items: Vec<Value>) -> Vec<Value> {
     let outputs = output_call_ids(input_items);
@@ -1043,7 +1043,7 @@ mod tests {
             .iter()
             .find(|i| i["type"] == "reasoning")
             .unwrap();
-        // 对齐官方 L219-221:status output-only,注入前剥掉
+        // 对齐 grok-build conversation/responses.rs:status output-only,注入前剥掉
         assert!(reasoning.get("status").is_none());
         assert_eq!(reasoning["encrypted_content"], "gAAA");
     }

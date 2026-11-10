@@ -3,9 +3,12 @@
 // 职责:
 // - cache_stabilization/ & normalize: 缓存稳定化与归一化管线
 // - convert/: Claude / OpenAI Chat / Responses / Gemini / Antigravity 协议转换
-// - route/: model → provider 路由决策
+// - route: model → provider 路由决策
 // - proxy: 代理配置解析(数据面与 OAuth 共用)
-// - session/: 会话身份派生
+// - session: 会话身份派生
+// - prompt_cache: prompt_cache_key 注入
+// - thinking: 思考级别映射与模型能力注册表
+// - secret: 入口 secret 辅助
 // - doom_loop: Grok doom loop 检测纯逻辑
 
 pub mod cache_stabilization;
