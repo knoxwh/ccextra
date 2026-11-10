@@ -2597,3 +2597,240 @@ fn test_strips_out_of_range_int64_bounds() {
     let again = normalize_tool_parameters(&out);
     assert_eq!(again, out);
 }
+
+// --- 会话中途 tool_addition(对齐 CPA 12d97cfe) ---
+
+fn tool_addition_def(name: &str) -> Value {
+    json!({"type": "tool_addition", "tool": {"type": "tool_definition", "definition": {
+        "name": name,
+        "description": format!("{name} desc"),
+        "input_schema": {"type": "object", "properties": {"x": {"type": "string"}}}
+    }}})
+}
+
+fn additional_tools_items(body: &Value) -> Vec<&Value> {
+    body["input"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .filter(|i| i["type"] == "additional_tools")
+        .collect()
+}
+
+#[test]
+fn test_tool_addition_emits_additional_tools_in_place() {
+    let mut body = json!({
+        "model": "test",
+        "tools": [{"name": "Read", "input_schema": {"type": "object", "properties": {}}}],
+        "messages": [
+            {"role": "user", "content": "hi"},
+            {"role": "system", "content": [
+                {"type": "text", "text": "Handback is now available."},
+                tool_addition_def("SubagentHandback")
+            ]},
+            {"role": "user", "content": "go"}
+        ]
+    });
+    convert_to_openai_responses(&mut body, "gpt-5.5").unwrap();
+    let input = body["input"].as_array().unwrap();
+    let pos = input
+        .iter()
+        .position(|i| i["type"] == "additional_tools")
+        .unwrap();
+    // reminder 文本保留在 additional_tools 之前
+    assert_eq!(input[pos - 1]["role"], "user");
+    assert!(input[pos - 1]["content"][0]["text"]
+        .as_str()
+        .unwrap()
+        .contains("Handback is now available."));
+    assert_eq!(input[pos]["role"], "developer");
+    let tools = input[pos]["tools"].as_array().unwrap();
+    assert_eq!(tools.len(), 1);
+    assert_eq!(tools[0]["name"], "SubagentHandback");
+    assert_eq!(tools[0]["type"], "function");
+    // 后续 user 消息在其后
+    assert_eq!(input[pos + 1]["content"][0]["text"], "go");
+    // 顶层 tools 不变
+    let top = body["tools"].as_array().unwrap();
+    assert_eq!(top.len(), 1);
+    assert_eq!(top[0]["name"], "Read");
+}
+
+#[test]
+fn test_tool_addition_deferred_after_pending_tool_result() {
+    let mut body = json!({
+        "model": "test",
+        "tools": [{"name": "Read", "input_schema": {"type": "object", "properties": {}}}],
+        "messages": [
+            {"role": "user", "content": "hi"},
+            {"role": "assistant", "content": [
+                {"type": "tool_use", "id": "call_1", "name": "Read", "input": {}}
+            ]},
+            {"role": "system", "content": [tool_addition_def("Late")]},
+            {"role": "user", "content": [
+                {"type": "tool_result", "tool_use_id": "call_1", "content": "ok"}
+            ]}
+        ]
+    });
+    convert_to_openai_responses(&mut body, "gpt-5.5").unwrap();
+    let types: Vec<&str> = body["input"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .map(|i| i["type"].as_str().unwrap())
+        .collect();
+    let call = types.iter().position(|t| *t == "function_call").unwrap();
+    assert_eq!(types[call + 1], "function_call_output");
+    assert_eq!(types[call + 2], "additional_tools");
+}
+
+#[test]
+fn test_tool_addition_long_name_shortened_and_reverse_mapped() {
+    let long = format!("mcp__server__{}", "a".repeat(70));
+    let mut body = json!({
+        "model": "test",
+        "tools": [{"name": "Read", "input_schema": {"type": "object", "properties": {}}}],
+        "messages": [
+            {"role": "user", "content": "hi"},
+            {"role": "system", "content": [tool_addition_def(&long)]},
+            {"role": "assistant", "content": [
+                {"type": "tool_use", "id": "call_1", "name": long, "input": {}}
+            ]},
+            {"role": "user", "content": [
+                {"type": "tool_result", "tool_use_id": "call_1", "content": "ok"}
+            ]}
+        ]
+    });
+    let reverse = convert_to_openai_responses(&mut body, "gpt-5.5").unwrap();
+    let items = additional_tools_items(&body);
+    let short = items[0]["tools"][0]["name"].as_str().unwrap().to_string();
+    assert!(short.len() <= 64);
+    assert_ne!(short, long);
+    assert_eq!(reverse.get(&short), Some(&long));
+    // 历史 tool_use 用同一缩名
+    let call = body["input"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .find(|i| i["type"] == "function_call")
+        .unwrap();
+    assert_eq!(call["name"], short);
+    // 顶层工具缩名不受影响
+    assert_eq!(reverse.get("Read").map(String::as_str), Some("Read"));
+}
+
+#[test]
+fn test_tool_reference_and_removal_ignored_text_kept() {
+    let mut body = json!({
+        "model": "test",
+        "tools": [{"name": "Deferred", "defer_loading": true,
+                   "input_schema": {"type": "object", "properties": {}}}],
+        "messages": [
+            {"role": "user", "content": "hi"},
+            {"role": "system", "content": [
+                {"type": "text", "text": "tools changed"},
+                {"type": "tool_addition", "tool": {"type": "tool_reference", "name": "Deferred"}},
+                {"type": "tool_removal", "tool": {"type": "tool_reference", "name": "Old"}}
+            ]}
+        ]
+    });
+    convert_to_openai_responses(&mut body, "gpt-5.5").unwrap();
+    assert!(additional_tools_items(&body).is_empty());
+    let texts: Vec<&str> = body["input"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .filter_map(|i| i["content"][0]["text"].as_str())
+        .collect();
+    assert!(texts.iter().any(|t| t.contains("tools changed")));
+    assert_eq!(body["tools"].as_array().unwrap().len(), 1);
+}
+
+#[test]
+fn test_tool_addition_duplicate_names_last_wins_and_map_dedup() {
+    let mut second = tool_addition_def("Dup");
+    second["tool"]["definition"]["description"] = json!("second");
+    let mut body = json!({
+        "model": "test",
+        "tools": [{"name": "Read", "input_schema": {"type": "object", "properties": {}}}],
+        "messages": [
+            {"role": "user", "content": "hi"},
+            {"role": "system", "content": [tool_addition_def("Dup"), second, tool_addition_def("Read")]}
+        ]
+    });
+    let reverse = convert_to_openai_responses(&mut body, "gpt-5.5").unwrap();
+    let items = additional_tools_items(&body);
+    let tools = items[0]["tools"].as_array().unwrap();
+    assert_eq!(tools.len(), 2);
+    assert_eq!(tools[0]["name"], "Dup");
+    assert_eq!(tools[0]["description"], "second");
+    // 与 tools[] 同名不产生 _N 后缀映射
+    assert_eq!(tools[1]["name"], "Read");
+    assert_eq!(reverse.len(), 2);
+    assert_eq!(reverse.get("Read").map(String::as_str), Some("Read"));
+}
+
+#[test]
+fn test_tool_addition_grok_promoted_to_top_level() {
+    let mut body = json!({
+        "model": "test",
+        "tools": [{"name": "Read", "description": "top", "input_schema": {"type": "object", "properties": {}}}],
+        "messages": [
+            {"role": "user", "content": "hi"},
+            {"role": "system", "content": [tool_addition_def("Read"), tool_addition_def("Late")]}
+        ]
+    });
+    convert_to_openai_responses(&mut body, "grok-4.3").unwrap();
+    assert!(additional_tools_items(&body).is_empty());
+    let top = body["tools"].as_array().unwrap();
+    let names: Vec<&str> = top.iter().map(|t| t["name"].as_str().unwrap()).collect();
+    assert_eq!(names, vec!["Read", "Late"]);
+    // 先到者优先:顶层定义保留
+    assert_eq!(top[0]["description"], "top");
+}
+
+#[test]
+fn test_no_tool_addition_no_additional_tools() {
+    let mut body = json!({
+        "model": "test",
+        "tools": [{"name": "Read", "input_schema": {"type": "object", "properties": {}}}],
+        "messages": [
+            {"role": "user", "content": "hi"},
+            {"role": "system", "content": [{"type": "text", "text": "plain reminder"}]}
+        ]
+    });
+    let reverse = convert_to_openai_responses(&mut body, "gpt-5.5").unwrap();
+    assert!(additional_tools_items(&body).is_empty());
+    assert_eq!(body["tools"].as_array().unwrap().len(), 1);
+    assert_eq!(reverse.len(), 1);
+}
+
+#[test]
+fn test_tool_addition_schema_normalized() {
+    let branches: Vec<Value> = (0..8).map(|i| json!({"const": format!("v{i}")})).collect();
+    let mut body = json!({
+        "model": "test",
+        "messages": [
+            {"role": "user", "content": "hi"},
+            {"role": "system", "content": [{"type": "tool_addition", "tool": {"type": "tool_definition", "definition": {
+                "name": "Mode",
+                "cache_control": {"type": "ephemeral"},
+                "input_schema": {
+                    "$schema": "http://json-schema.org/draft-07/schema#",
+                    "type": "object",
+                    "properties": {"mode": {"anyOf": branches}}
+                }
+            }}}]}
+        ]
+    });
+    convert_to_openai_responses(&mut body, "gpt-5.5").unwrap();
+    let items = additional_tools_items(&body);
+    let tool = &items[0]["tools"][0];
+    assert_eq!(tool["strict"], false);
+    assert!(tool.get("input_schema").is_none());
+    assert!(tool.get("cache_control").is_none());
+    assert!(tool["parameters"].get("$schema").is_none());
+    let mode = &tool["parameters"]["properties"]["mode"];
+    assert!(mode.get("anyOf").is_none());
+    assert_eq!(mode["enum"].as_array().unwrap().len(), 8);
+}

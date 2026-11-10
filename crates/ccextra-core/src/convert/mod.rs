@@ -173,6 +173,27 @@ pub(crate) fn system_reminder_text(
     Some(format!("<system-reminder>\n{text}\n</system-reminder>"))
 }
 
+/// 会话中途 role=system 消息内的 tool_addition 工具定义(对齐 CPA 12d97cfe):
+/// 仅取带 definition 对象且 name 非空者;tool_reference / tool_removal 不处理。
+pub(crate) fn tool_addition_definitions(
+    content: Option<&serde_json::Value>,
+) -> Vec<&serde_json::Value> {
+    let Some(parts) = content.and_then(|c| c.as_array()) else {
+        return Vec::new();
+    };
+    parts
+        .iter()
+        .filter(|p| p.get("type").and_then(|v| v.as_str()) == Some("tool_addition"))
+        .filter_map(|p| p.pointer("/tool/definition"))
+        .filter(|d| {
+            d.is_object()
+                && d.get("name")
+                    .and_then(|v| v.as_str())
+                    .is_some_and(|n| !n.is_empty())
+        })
+        .collect()
+}
+
 /// 是否为 Claude 服务端工具(web_search 系列)。此类工具在 chat 转换时
 /// 直接丢弃(无 Chat Completions 等价,对齐 anthropicToolsToChatTools);
 /// responses 转换时映射为 {"type":"web_search"}。

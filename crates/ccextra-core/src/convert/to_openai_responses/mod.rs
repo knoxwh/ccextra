@@ -11,6 +11,7 @@
 //   (对齐 reasoning replay 缓存只认 encrypted_content;其余 responses 上游保留明文)
 // - tools → codex tools(原名超 64 缩短 + 唯一 _N 后缀;web_search_* → type:"web_search")、
 //   input_schema→parameters(strict=false,剥 cache_control/defer_loading/$schema)
+// - 会话中途 role=system 的 tool_addition 定义 → additional_tools 项(Grok 并入顶层 tools)
 // - thinking.budget_tokens → reasoning.effort(直映射,不钳制)
 // - service_tier: speed=fast → priority
 // - output_config.format(json_schema)→ text.format(name 缺省、strict 默认 true)
@@ -112,8 +113,8 @@ pub fn convert_to_openai_responses_with(
     let mut web_search_names: HashSet<String> = HashSet::new();
     // custom 工具(freeform,无 input_schema)→ Responses type:"custom",input 是字符串
     let mut custom_tool_names: HashSet<String> = HashSet::new();
+    let mut names: Vec<String> = Vec::new();
     if let Some(tools) = body.get("tools").and_then(|v| v.as_array()) {
-        let mut names: Vec<String> = Vec::new();
         for tool in tools {
             let tool_type = tool.get("type").and_then(|v| v.as_str()).unwrap_or("");
             if super::is_web_search_tool_type(tool_type) {
@@ -139,6 +140,33 @@ pub fn convert_to_openai_responses_with(
         }
         tool_name_map = build_short_name_map(&names);
     }
+    // 会话中途 tool_addition 定义名追加在 tools[] 之后(已有缩名不变),去重后重建映射
+    if let Some(messages) = body.get("messages").and_then(|v| v.as_array()) {
+        let mut seen: HashSet<String> = names.iter().cloned().collect();
+        let mut added = false;
+        for msg in messages {
+            if msg.get("role").and_then(|v| v.as_str()) != Some("system") {
+                continue;
+            }
+            for def in super::tool_addition_definitions(msg.get("content")) {
+                let tool_type = def.get("type").and_then(|v| v.as_str()).unwrap_or("");
+                if super::is_web_search_tool_type(tool_type) {
+                    continue;
+                }
+                let name = def["name"].as_str().unwrap_or_default();
+                if seen.insert(name.to_string()) {
+                    if tool_type == "custom" {
+                        custom_tool_names.insert(name.to_string());
+                    }
+                    names.push(name.to_string());
+                    added = true;
+                }
+            }
+        }
+        if added {
+            tool_name_map = build_short_name_map(&names);
+        }
+    }
 
     // --- messages → input[] ---
     if let Some(messages) = body.get("messages").and_then(|v| v.as_array()) {
@@ -158,6 +186,10 @@ pub fn convert_to_openai_responses_with(
         let (tool_items, web_search) = convert_tools(tools, upstream_model, &tool_name_map);
         has_web_search = web_search;
         openai["tools"] = json!(tool_items);
+    }
+    // xAI 不认 additional_tools:并入顶层 tools,同名先到者优先(对齐 CPA promoteXAIAdditionalTools)
+    if is_grok_upstream(upstream_model) {
+        promote_additional_tools(&mut openai);
     }
 
     // --- tool_choice(对齐 convertClaudeToolChoiceToCodex) ---
@@ -291,6 +323,43 @@ pub fn convert_to_openai_responses_with(
     Ok(reverse)
 }
 
+/// input[] 内 additional_tools 项移出,其工具并入顶层 tools(按 name 去重,先到者优先)。
+fn promote_additional_tools(openai: &mut Value) {
+    let Some(input) = openai["input"].as_array_mut() else {
+        return;
+    };
+    let mut promoted: Vec<Value> = Vec::new();
+    input.retain_mut(|item| {
+        if item.get("type").and_then(|v| v.as_str()) != Some("additional_tools") {
+            return true;
+        }
+        if let Some(tools) = item.get_mut("tools").and_then(|v| v.as_array_mut()) {
+            promoted.append(tools);
+        }
+        false
+    });
+    if promoted.is_empty() {
+        return;
+    }
+    if !openai["tools"].is_array() {
+        openai["tools"] = json!([]);
+    }
+    let tools = openai["tools"].as_array_mut().unwrap();
+    let mut seen: HashSet<String> = tools
+        .iter()
+        .filter_map(|t| t.get("name").and_then(|v| v.as_str()))
+        .map(str::to_string)
+        .collect();
+    for tool in promoted {
+        if let Some(name) = tool.get("name").and_then(|v| v.as_str()) {
+            if !seen.insert(name.to_string()) {
+                continue;
+            }
+        }
+        tools.push(tool);
+    }
+}
+
 /// messages → input[]:按 CPA 发射时序(tool_result → 暂存 reminder → 正文)追加到 `input`。
 fn convert_messages_to_input(
     messages: &[Value],
@@ -322,6 +391,17 @@ fn convert_messages_to_input(
                     pending_system_reminders.push(reminder_msg);
                 } else {
                     input.push(reminder_msg);
+                }
+            }
+            // tool_addition 定义 → additional_tools(对齐 CPA convertClaudeSystemAdditionalTools,
+            // 原位发射保 prompt cache 前缀;暂存规则同 reminder)
+            let tools = system_additional_tools(msg.get("content"), upstream_model, tool_name_map);
+            if !tools.is_empty() {
+                let item = json!({"type": "additional_tools", "role": "developer", "tools": tools});
+                if !pending_tool_use_ids.is_empty() {
+                    pending_system_reminders.push(item);
+                } else {
+                    input.push(item);
                 }
             }
             continue;
@@ -564,80 +644,114 @@ fn convert_tools(
     let mut has_web_search = false;
     let mut tool_items: Vec<Value> = Vec::new();
     for tool in tools {
-        let tool_type = tool.get("type").and_then(|v| v.as_str()).unwrap_or("");
-        // web search 工具特殊映射(对齐 convertClaudeWebSearchToolToCodex)
-        if super::is_web_search_tool_type(tool_type) {
-            let mut ws = json!({"type": "web_search"});
-            // 对齐 grok-build xai-grok-sampling-types tool_overrides::to_tool_entry:
-            // xAI filters 域过滤键为 excluded_domains(OpenAI 官方为 blocked_domains);
-            // 两者互斥,并存时按 allowed 优先(与上游 validate 报错一致)
-            if let Some(domains) = tool.get("allowed_domains").and_then(|v| v.as_array()) {
-                ws["filters"] = json!({"allowed_domains": domains});
-            } else if let Some(domains) = tool.get("blocked_domains").and_then(|v| v.as_array()) {
-                let key = if is_grok_upstream(upstream_model) {
-                    "excluded_domains"
-                } else {
-                    "blocked_domains"
-                };
-                ws["filters"] = json!({key: domains});
-            }
-            if let Some(loc) = tool.get("user_location") {
-                if loc.is_object() {
-                    ws["user_location"] = loc.clone();
-                }
-            }
-            tool_items.push(ws);
-            has_web_search = true;
-            continue;
-        }
+        let (item, web_search) = convert_one_tool(tool, upstream_model, tool_name_map);
+        has_web_search |= web_search;
+        tool_items.push(item);
+    }
+    (tool_items, has_web_search)
+}
 
-        let mut t = tool.clone();
-        if tool_type == "custom" {
-            // custom 工具保留 type,不套 input_schema(对齐转换 custom 分支)
-            if let Some(obj) = t.as_object_mut() {
-                obj.remove("input_schema");
-                obj.remove("cache_control");
-                obj.remove("defer_loading");
-            }
-            tool_items.push(t);
-            continue;
-        }
-        if t.get("type").and_then(|v| v.as_str()) != Some("function") {
-            t["type"] = json!("function");
-        }
-        // 名称缩短
-        if let Some(orig) = t.get("name").and_then(|v| v.as_str()) {
-            let short = if let Some(s) = tool_name_map.get(orig) {
-                s.clone()
+/// 单个 Claude 工具 → codex 工具项。返回 (工具项, 是否 web_search)。
+fn convert_one_tool(
+    tool: &Value,
+    upstream_model: &str,
+    tool_name_map: &HashMap<String, String>,
+) -> (Value, bool) {
+    let tool_type = tool.get("type").and_then(|v| v.as_str()).unwrap_or("");
+    // web search 工具特殊映射(对齐 convertClaudeWebSearchToolToCodex)
+    if super::is_web_search_tool_type(tool_type) {
+        let mut ws = json!({"type": "web_search"});
+        // 对齐 grok-build xai-grok-sampling-types tool_overrides::to_tool_entry:
+        // xAI filters 域过滤键为 excluded_domains(OpenAI 官方为 blocked_domains);
+        // 两者互斥,并存时按 allowed 优先(与上游 validate 报错一致)
+        if let Some(domains) = tool.get("allowed_domains").and_then(|v| v.as_array()) {
+            ws["filters"] = json!({"allowed_domains": domains});
+        } else if let Some(domains) = tool.get("blocked_domains").and_then(|v| v.as_array()) {
+            let key = if is_grok_upstream(upstream_model) {
+                "excluded_domains"
             } else {
-                shorten_name_if_needed(orig)
+                "blocked_domains"
             };
-            if short != orig {
-                t["name"] = json!(short);
+            ws["filters"] = json!({key: domains});
+        }
+        if let Some(loc) = tool.get("user_location") {
+            if loc.is_object() {
+                ws["user_location"] = loc.clone();
             }
         }
-        // input_schema → parameters
-        let schema = tool.get("input_schema").cloned().unwrap_or(json!(null));
-        let mut params = normalize_tool_parameters(&schema);
-        simplify_pure_const_unions(&mut params);
-        t["parameters"] = params;
-        // 剥 codex 不认的字段(一致)
+        return (ws, true);
+    }
+
+    let mut t = tool.clone();
+    if tool_type == "custom" {
+        // custom 工具保留 type,不套 input_schema(对齐转换 custom 分支)
         if let Some(obj) = t.as_object_mut() {
             obj.remove("input_schema");
             obj.remove("cache_control");
             obj.remove("defer_loading");
-            if let Some(p) = obj.get_mut("parameters") {
-                if let Some(po) = p.as_object_mut() {
-                    po.remove("$schema");
-                }
+        }
+        return (t, false);
+    }
+    if t.get("type").and_then(|v| v.as_str()) != Some("function") {
+        t["type"] = json!("function");
+    }
+    // 名称缩短
+    if let Some(orig) = t.get("name").and_then(|v| v.as_str()) {
+        let short = if let Some(s) = tool_name_map.get(orig) {
+            s.clone()
+        } else {
+            shorten_name_if_needed(orig)
+        };
+        if short != orig {
+            t["name"] = json!(short);
+        }
+    }
+    // input_schema → parameters
+    let schema = tool.get("input_schema").cloned().unwrap_or(json!(null));
+    let mut params = normalize_tool_parameters(&schema);
+    simplify_pure_const_unions(&mut params);
+    t["parameters"] = params;
+    // 剥 codex 不认的字段(一致)
+    if let Some(obj) = t.as_object_mut() {
+        obj.remove("input_schema");
+        obj.remove("cache_control");
+        obj.remove("defer_loading");
+        if let Some(p) = obj.get_mut("parameters") {
+            if let Some(po) = p.as_object_mut() {
+                po.remove("$schema");
             }
         }
-        if t.get("strict") != Some(&json!(false)) {
-            t["strict"] = json!(false);
-        }
-        tool_items.push(t);
     }
-    (tool_items, has_web_search)
+    if t.get("strict") != Some(&json!(false)) {
+        t["strict"] = json!(false);
+    }
+    (t, false)
+}
+
+/// role=system 内 tool_addition 定义 → additional_tools.tools(同 convert_one_tool 转换;
+/// 跳过 web_search;同消息内同名后者替换前者)
+fn system_additional_tools(
+    content: Option<&Value>,
+    upstream_model: &str,
+    tool_name_map: &HashMap<String, String>,
+) -> Vec<Value> {
+    let mut names: Vec<&str> = Vec::new();
+    let mut items: Vec<Value> = Vec::new();
+    for def in super::tool_addition_definitions(content) {
+        let tool_type = def.get("type").and_then(|v| v.as_str()).unwrap_or("");
+        if super::is_web_search_tool_type(tool_type) {
+            continue;
+        }
+        let name = def["name"].as_str().unwrap_or_default();
+        let (item, _) = convert_one_tool(def, upstream_model, tool_name_map);
+        if let Some(idx) = names.iter().position(|n| *n == name) {
+            items[idx] = item;
+        } else {
+            names.push(name);
+            items.push(item);
+        }
+    }
+    items
 }
 
 /// tool_choice → codex tool_choice;命名工具未声明降级 auto。

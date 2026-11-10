@@ -115,6 +115,8 @@ pub fn convert_to_openai_chat_with(
     }
 
     let mut messages: Vec<Value> = Vec::new();
+    // 会话中途 role=system 内 tool_addition 定义(按出现顺序)
+    let mut mid_conversation_tool_defs: Vec<Value> = Vec::new();
 
     // System → messages[0](清洗 Claude 触发块,逐块剥离计费归属、非 Claude 目标身份声明与空白,输出 text 数组,一致)
     if let Some(system) = body.get("system") {
@@ -169,6 +171,12 @@ pub fn convert_to_openai_chat_with(
             // messages 内 role=system:提取文本包 <system-reminder> 转 user
             // 当存在未应答 tool_use 时暂存 reminder,保持 tool 调用紧邻配对
             if role == "system" {
+                // tool_addition 定义收集,后续并入 tools[](对齐 CPA midConversationToolDefs)
+                mid_conversation_tool_defs.extend(
+                    super::tool_addition_definitions(Some(&content))
+                        .into_iter()
+                        .cloned(),
+                );
                 if let Some(reminder) = super::system_reminder_text(Some(&content), upstream_model)
                 {
                     let reminder_msg = json!({
@@ -235,50 +243,37 @@ pub fn convert_to_openai_chat_with(
     // declared 集合语义)。无存活工具时不写 tools 字段(对齐 sub2api
     // `len(out.Tools) > 0` 才处理)。
     let mut declared_tools: HashSet<String> = HashSet::new();
+    let mut openai_tools: Vec<Value> = Vec::new();
+    let mut tool_index_by_name: HashMap<String, usize> = HashMap::new();
     if let Some(tools) = body.get("tools").and_then(|v| v.as_array()) {
-        let mut openai_tools = Vec::new();
         for tool in tools {
-            let name = tool.get("name").and_then(|v| v.as_str()).unwrap_or("");
-            // web 服务端工具丢弃(无 Chat Completions 等价,对齐 anthropicToolsToChatTools)
-            let tool_type = tool.get("type").and_then(|v| v.as_str()).unwrap_or("");
-            if super::is_web_search_tool_type(tool_type) {
+            let Some(fn_obj) = convert_chat_tool(tool) else {
                 continue;
-            }
+            };
+            let name = tool.get("name").and_then(|v| v.as_str()).unwrap_or("");
             if !name.is_empty() {
                 declared_tools.insert(name.to_string());
-            }
-            let description = tool
-                .get("description")
-                .and_then(|v| v.as_str())
-                .unwrap_or("");
-            let mut fn_obj = json!({
-                "type": "function",
-                "function": {
-                    "name": name,
-                    "description": description,
-                    "parameters": {"type": "object", "properties": {}, "required": []}
-                }
-            });
-            if let Some(schema) = tool.get("input_schema") {
-                fn_obj["function"]["parameters"] =
-                    super::normalize_object_schema_properties(schema.clone());
-            }
-            // required 缺省时补空数组；显式 null 已在 schema 归一化中删除，须保持缺省。
-            let params = &mut fn_obj["function"]["parameters"];
-            if params.get("type").and_then(|v| v.as_str()) == Some("object")
-                && params.get("properties").is_some()
-                && params.get("required").is_none()
-                && !tool
-                    .pointer("/input_schema/required")
-                    .is_some_and(Value::is_null)
-            {
-                params["required"] = json!([]);
+                tool_index_by_name.insert(name.to_string(), openai_tools.len());
             }
             openai_tools.push(fn_obj);
         }
-        if !openai_tools.is_empty() {
-            openai.insert("tools".into(), json!(openai_tools));
+    }
+    // tool_addition 定义并入 tools[]:同名原地替换,否则追加(对齐 CPA 12d97cfe)
+    for def in &mid_conversation_tool_defs {
+        let Some(fn_obj) = convert_chat_tool(def) else {
+            continue;
+        };
+        let name = def["name"].as_str().unwrap_or_default();
+        declared_tools.insert(name.to_string());
+        if let Some(&idx) = tool_index_by_name.get(name) {
+            openai_tools[idx] = fn_obj;
+        } else {
+            tool_index_by_name.insert(name.to_string(), openai_tools.len());
+            openai_tools.push(fn_obj);
         }
+    }
+    if !openai_tools.is_empty() {
+        openai.insert("tools".into(), json!(openai_tools));
     }
 
     // tool_choice 映射(仅当有存活工具时处理,对齐 sub2api 请求侧入口判断)
@@ -977,6 +972,44 @@ fn document_to_openai_file(part: &Value) -> Option<Value> {
 /// tool_choice 映射:auto→auto, any→required, tool→specific function
 /// 命名 choice(tool)只有在指向已声明工具时保留,否则丢弃
 /// (对齐 sub2api convertAnthropicToolChoiceToChat 的 tool 分支)。
+/// 单个 Claude 工具 → Chat function 工具;web 服务端工具返回 None
+/// (无 Chat Completions 等价,对齐 anthropicToolsToChatTools)。
+fn convert_chat_tool(tool: &Value) -> Option<Value> {
+    let name = tool.get("name").and_then(|v| v.as_str()).unwrap_or("");
+    let tool_type = tool.get("type").and_then(|v| v.as_str()).unwrap_or("");
+    if super::is_web_search_tool_type(tool_type) {
+        return None;
+    }
+    let description = tool
+        .get("description")
+        .and_then(|v| v.as_str())
+        .unwrap_or("");
+    let mut fn_obj = json!({
+        "type": "function",
+        "function": {
+            "name": name,
+            "description": description,
+            "parameters": {"type": "object", "properties": {}, "required": []}
+        }
+    });
+    if let Some(schema) = tool.get("input_schema") {
+        fn_obj["function"]["parameters"] =
+            super::normalize_object_schema_properties(schema.clone());
+    }
+    // required 缺省时补空数组；显式 null 已在 schema 归一化中删除，须保持缺省。
+    let params = &mut fn_obj["function"]["parameters"];
+    if params.get("type").and_then(|v| v.as_str()) == Some("object")
+        && params.get("properties").is_some()
+        && params.get("required").is_none()
+        && !tool
+            .pointer("/input_schema/required")
+            .is_some_and(Value::is_null)
+    {
+        params["required"] = json!([]);
+    }
+    Some(fn_obj)
+}
+
 fn convert_tool_choice(tc: &Value, declared: &HashSet<String>) -> Option<Value> {
     let ty = tc.get("type").and_then(|v| v.as_str())?;
     match ty {
@@ -2621,5 +2654,65 @@ IMPORTANT: Assist with authorized security testing.
         let original = messages.clone();
         let got = align_openai_tool_call_messages(messages);
         assert_eq!(got, original);
+    }
+
+    #[test]
+    fn test_tool_addition_merged_into_tools_and_tool_choice_kept() {
+        let mut body = json!({
+            "model": "test",
+            "tools": [
+                {"name": "Read", "description": "old", "input_schema": {"type": "object", "properties": {}}},
+                {"name": "Write", "input_schema": {"type": "object", "properties": {}}}
+            ],
+            "tool_choice": {"type": "tool", "name": "Late"},
+            "messages": [
+                {"role": "user", "content": "hi"},
+                {"role": "system", "content": [
+                    {"type": "text", "text": "tools changed"},
+                    {"type": "tool_addition", "tool": {"type": "tool_definition", "definition": {
+                        "name": "Read", "description": "new",
+                        "input_schema": {"type": "object", "properties": {}}
+                    }}},
+                    {"type": "tool_addition", "tool": {"type": "tool_definition", "definition": {
+                        "name": "Late", "input_schema": {"type": "object", "properties": {"x": {"type": "string"}}}
+                    }}}
+                ]}
+            ]
+        });
+        convert_to_openai_chat(&mut body, "doubao-seed-2.0").unwrap();
+        let tools = body["tools"].as_array().unwrap();
+        let names: Vec<&str> = tools
+            .iter()
+            .map(|t| t["function"]["name"].as_str().unwrap())
+            .collect();
+        assert_eq!(names, vec!["Read", "Write", "Late"]);
+        // 同名原地替换
+        assert_eq!(tools[0]["function"]["description"], "new");
+        assert_eq!(body["tool_choice"]["function"]["name"], "Late");
+        // reminder 文本保留
+        let msgs = body["messages"].as_array().unwrap();
+        assert!(msgs.iter().any(|m| m["content"][0]["text"]
+            .as_str()
+            .is_some_and(|t| t.contains("tools changed"))));
+    }
+
+    #[test]
+    fn test_tool_reference_and_removal_ignored_in_chat() {
+        let mut body = json!({
+            "model": "test",
+            "tools": [{"name": "Deferred", "defer_loading": true,
+                       "input_schema": {"type": "object", "properties": {}}}],
+            "messages": [
+                {"role": "user", "content": "hi"},
+                {"role": "system", "content": [
+                    {"type": "tool_addition", "tool": {"type": "tool_reference", "name": "Deferred"}},
+                    {"type": "tool_removal", "tool": {"type": "tool_reference", "name": "Deferred"}}
+                ]}
+            ]
+        });
+        convert_to_openai_chat(&mut body, "doubao-seed-2.0").unwrap();
+        let tools = body["tools"].as_array().unwrap();
+        assert_eq!(tools.len(), 1);
+        assert_eq!(tools[0]["function"]["name"], "Deferred");
     }
 }
