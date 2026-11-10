@@ -11,10 +11,10 @@ ccextra 将 Anthropic Messages 入口接到不同上游协议，同时尽量保�
 - `ccextra-core`：纯逻辑。负责路由、归一化、会话派生、thinking 映射和协议转换；不依赖 `tokio`、`reqwest` 或文件系统。reasoning 注册表由调用方传入，core 只解析字符串。
   - `convert/`：协议请求体转换（含 `to_openai_responses/` 专用子模块：`instructions`、`messages`、`reasoning`、`schema`）。
 - `ccextra-server`：HTTP、上游请求、SSE、OAuth provider 运行时注入和响应状态机。
-  - `http/`：请求处理与路由装配（`handlers/`、`auth`、`retry`、`claude_relay`、`error`）。
+  - `http/`：请求处理与路由装配（`handlers/`、`auth`、`retry`、`claude_relay`、`error`、`unfit`、`session_tokens`、`access_log`）。
   - `sse/`：响应流状态机（含 `responses/` 专用子模块：`state_machine`、`function_call`、`thinking`、`compensations`、`web_search`）。
   - `antigravity/`、`claude/`、`codex/`、`xai/`：四类 OAuth 订阅，各含 `credential`/`store`/`oauth`/`refresh`/`login`/`provider`/`models`；共用的凭证写回、刷新锁与登录辅助在 `oauth_common`。
-  - `claude_tls_fp/`：Claude OAuth 出站的 TLS 指纹客户端（对齐 Claude Code / Bun 基线，仅 HTTP/1.1）。
+  - `claude_tls_fp/`：`protocol: claude` 出站（含 Claude 订阅与静态 API / 中转）的 TLS 指纹客户端（对齐 Claude Code / Bun 基线，仅 HTTP/1.1）。
   - `upstream`：上游 HTTP 客户端（URL 轮转、请求体编码/压缩、协议头）。
 - `ccextra-cli`：命令行、YAML 配置加载、日志初始化和进程启动。用户 `models.json` 在此读取。
 

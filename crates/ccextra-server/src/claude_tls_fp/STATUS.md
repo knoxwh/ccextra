@@ -1,6 +1,6 @@
 # Claude TLS fingerprint — status
 
-Status as of 2026-10-13 (Claude Code 2.1.296 / Bun 1.4.3 baseline).
+Current profile: `bun-1.4.4-claude-2.1.316` (JA3/JA4 below). History, oldest first:
 
 Verified 2026-10-14: Claude Code **2.1.299** (still Bun 1.4.3) re-sampled; JA3 / JA4 / peetprint match the 2.1.296 baseline — no TLS constant changes needed.
 
@@ -16,6 +16,9 @@ Checked 2026-11-09: Claude Code **2.1.318** local ClientHello sample (`20261104T
 `1523504b38f0fae0d881d4b6554aac1b` / JA4 `t13d1713h1_5b57614c22b0_7f527383e249`; the installed
 **2.1.319** binary embeds the same `Bun v1.4.4` (no new ClientHello sample). No TLS constant changes;
 profile stays `bun-1.4.4-claude-2.1.316`. Default Claude UA bumped to `claude-cli/2.1.319`.
+
+Checked 2026-11-09: the installed Claude Code **2.1.321** binary embeds the same `Bun v1.4.4` (binary
+string check only; no new ClientHello sample). No TLS constant or default UA changes.
 
 ## Goal
 
@@ -39,7 +42,7 @@ no config flag).
 
 `cargo run -p ccextra-server --example peet_fp` must print matching `ja3_hash` and JA4 with `h1`.
 
-## Live peet spike (wreq lane, 2026-10-13)
+## Live peet spike (wreq lane, 2026-10-13, against the 2.1.296 baseline)
 
 | Field | Result |
 |-------|--------|
