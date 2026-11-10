@@ -313,25 +313,6 @@ impl KimiThinkingReplayStreamAccumulator {
         }
     }
 
-    /// 观察原始 SSE 文本（可含多行 `data:`）。
-    pub fn observe_sse_chunk(&mut self, chunk: &[u8]) {
-        for line in chunk.split(|&b| b == b'\n') {
-            let line = trim_ascii(line);
-            let Some(rest) = line.strip_prefix(b"data:") else {
-                continue;
-            };
-            let payload = trim_ascii(rest);
-            if payload.is_empty() || payload == b"[DONE]" {
-                continue;
-            }
-            let Ok(value) = serde_json::from_slice::<Value>(payload) else {
-                self.abandon();
-                continue;
-            };
-            self.observe_payload(&value);
-        }
-    }
-
     fn observe_block_start(&mut self, root: &Value) {
         let index = root.get("index").and_then(|v| v.as_i64()).unwrap_or(0);
         let Some(block) = root.get("content_block").filter(|v| v.is_object()) else {
@@ -545,18 +526,6 @@ impl KimiThinkingReplayStreamAccumulator {
         }
         Some(content)
     }
-}
-
-fn trim_ascii(s: &[u8]) -> &[u8] {
-    let mut start = 0;
-    let mut end = s.len();
-    while start < end && s[start].is_ascii_whitespace() {
-        start += 1;
-    }
-    while end > start && s[end - 1].is_ascii_whitespace() {
-        end -= 1;
-    }
-    &s[start..end]
 }
 
 #[cfg(test)]
