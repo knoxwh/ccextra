@@ -47,14 +47,18 @@ pub fn list(auth_dir: &Path) -> Result<Vec<(PathBuf, XAICredential)>> {
         let entry = entry?;
         let path = entry.path();
         if path.is_file() && path.extension().is_some_and(|ext| ext == "json") {
-            if let Ok(cred) = load(&path) {
-                if cred.r#type == "xai" || cred.r#type.is_empty() {
-                    if let Err(reason) = verify_client_id(&cred) {
-                        tracing::warn!("skip {} (email: {}): {reason}", path.display(), cred.email);
-                        continue;
+            match load(&path) {
+                Ok(cred) => {
+                    if cred.r#type == "xai" || cred.r#type.is_empty() {
+                        if let Err(reason) = verify_client_id(&cred) {
+                            tracing::warn!("skip {} (email: {}): {reason}", path.display(), cred.email);
+                            continue;
+                        }
+                        entries.push((path, cred));
                     }
-                    entries.push((path, cred));
                 }
+                // 对齐 antigravity:坏文件告警,不静默丢 provider
+                Err(err) => tracing::warn!("skip {}: {err}", path.display()),
             }
         }
     }
@@ -125,5 +129,17 @@ mod tests {
         assert_eq!(path2.file_name().unwrap(), "xai-sub_only.json");
         let list_res2 = list(dir.path()).unwrap();
         assert_eq!(list_res2.len(), 2);
+    }
+
+    /// 坏凭证文件:list 跳过并告警(对齐 antigravity),不静默丢 provider
+    #[test]
+    fn list_warns_on_corrupt_credential_file() {
+        let dir = tempfile::tempdir().unwrap();
+        fs::write(dir.path().join("bad.json"), "{not json").unwrap();
+        let out = crate::test_support::capture_tracing(|| {
+            assert!(list(dir.path()).unwrap().is_empty());
+        });
+        assert!(out.contains("skip"), "{out}");
+        assert!(out.contains("bad.json"), "{out}");
     }
 }

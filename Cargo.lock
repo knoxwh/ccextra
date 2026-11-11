@@ -427,6 +427,7 @@ dependencies = [
  "tokio",
  "tower",
  "tracing",
+ "tracing-subscriber",
  "wreq",
  "yaml_serde",
  "zstd",

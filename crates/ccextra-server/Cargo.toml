@@ -43,3 +43,5 @@ tempfile = "3"
 yaml_serde = "0.10"
 # start_paused 测试时钟(limits 停顿用例)
 tokio = { version = "1.35", features = ["test-util"] }
+# 坏凭证告警用例:捕获 tracing 输出
+tracing-subscriber.workspace = true
