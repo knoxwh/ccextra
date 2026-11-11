@@ -108,8 +108,22 @@ fn persist_secret(path: &str, content: &str, hashed: &str) -> Result<()> {
             out.push('\n');
         }
     }
-    fs::write(path, out)?;
-    Ok(())
+    // 原子写:临时文件 + rename,写到一半崩溃不留半截配置(对齐凭证文件)
+    let tmp = format!("{path}.{}.tmp", std::process::id());
+    let result = (|| -> Result<()> {
+        fs::write(&tmp, out)?;
+        // 保留原文件权限(配置含密钥,重写不得放宽)
+        #[cfg(unix)]
+        if let Ok(meta) = fs::metadata(path) {
+            fs::set_permissions(&tmp, meta.permissions())?;
+        }
+        fs::rename(&tmp, path)?;
+        Ok(())
+    })();
+    if result.is_err() {
+        let _ = fs::remove_file(&tmp);
+    }
+    result
 }
 
 /// 提取行尾注释(引号外的 `#` 之后),保留重写行时不会丢注释
@@ -384,6 +398,46 @@ logging:
         let content = fs::read_to_string(&path).unwrap();
         assert!(content.contains("secret_key: \"$2b$12$abc\""));
         assert!(!content.contains("sk-u"));
+    }
+
+    /// 原子写:成功保留权限且无临时文件残留;失败清理临时文件
+    #[test]
+    fn test_persist_secret_atomic_write() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("config.yaml");
+        let yaml = "secret_key: \"sk-a\"\n";
+        fs::write(&path, yaml).unwrap();
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt;
+            fs::set_permissions(&path, fs::Permissions::from_mode(0o600)).unwrap();
+        }
+        let path_str = path.to_str().unwrap().to_string();
+        persist_secret(&path_str, yaml, "$2b$12$abc").unwrap();
+        assert!(fs::read_to_string(&path).unwrap().contains("$2b$12$abc"));
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt;
+            assert_eq!(
+                fs::metadata(&path).unwrap().permissions().mode() & 0o777,
+                0o600
+            );
+        }
+        let tmp_leftovers = || {
+            fs::read_dir(dir.path())
+                .unwrap()
+                .filter_map(|e| e.ok())
+                .filter(|e| e.path().extension().is_some_and(|x| x == "tmp"))
+                .count()
+        };
+        assert_eq!(tmp_leftovers(), 0);
+
+        // 失败路径:目标是目录 → rename 失败,临时文件被清理
+        let dir_target = dir.path().join("subdir");
+        fs::create_dir(&dir_target).unwrap();
+        let bad = dir_target.to_str().unwrap().to_string();
+        assert!(persist_secret(&bad, yaml, "$2b$12$abc").is_err());
+        assert_eq!(tmp_leftovers(), 0);
     }
 
     #[test]
