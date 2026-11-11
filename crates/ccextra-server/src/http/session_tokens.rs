@@ -22,6 +22,12 @@ where
     // Claude 协议不提取 input tokens(下方 match 恒 None),整体跳过解析;
     // scope 缺失同样零成本透传。
     let active = scope.is_some() && !matches!(protocol, Protocol::Claude);
+    // 预过滤关键词按协议选:Gemini/AG 的 cpaUsageMetadata 是大写 Usage,
+    // 小写 "usage" 会漏帧;其四条取值路径均含 promptTokenCount。
+    let usage_keyword = match protocol {
+        Protocol::Gemini | Protocol::Antigravity => "promptTokenCount",
+        _ => "usage",
+    };
     let mut parser = crate::sse::parser::SseParser::new();
     async_stream::stream! {
         futures::pin_mut!(stream);
@@ -36,7 +42,7 @@ where
                     };
                     for event in events {
                         // 子串预过滤:usage 只出现在少数帧,免每事件全量 JSON 解析
-                        if !event.data.contains("usage") {
+                        if !event.data.contains(usage_keyword) {
                             continue;
                         }
                         let Ok(value) = serde_json::from_str::<serde_json::Value>(&event.data) else {
@@ -308,7 +314,12 @@ mod tests {
             "data: {\"choices\":[{\"delta\":{\"content\":\"hi\"}}]}\n\n".to_string(),
             "data: {\"usage\":{\"prompt_tokens\":77}}\n\n".to_string(),
         ];
-        drain_tap(ccextra_core::route::Protocol::OpenAiChat, Some(scope.clone()), frames).await;
+        drain_tap(
+            ccextra_core::route::Protocol::OpenAiChat,
+            Some(scope.clone()),
+            frames,
+        )
+        .await;
         assert_eq!(scope.0.lock().unwrap().get("s"), Some(77));
     }
 
@@ -316,7 +327,12 @@ mod tests {
     async fn tap_skips_claude_protocol_entirely() {
         let scope = scope();
         let frames = vec!["data: {\"usage\":{\"input_tokens\":77}}\n\n".to_string()];
-        drain_tap(ccextra_core::route::Protocol::Claude, Some(scope.clone()), frames).await;
+        drain_tap(
+            ccextra_core::route::Protocol::Claude,
+            Some(scope.clone()),
+            frames,
+        )
+        .await;
         assert_eq!(scope.0.lock().unwrap().get("s"), None);
     }
 
@@ -324,11 +340,31 @@ mod tests {
     async fn tap_gemini_usage_survives_substring_prefilter() {
         let scope = scope();
         let frames = vec![
-            "data: {\"candidates\":[{\"content\":{\"parts\":[{\"text\":\"hi\"}]}}]}\n\n".to_string(),
+            "data: {\"candidates\":[{\"content\":{\"parts\":[{\"text\":\"hi\"}]}}]}\n\n"
+                .to_string(),
             "data: {\"usageMetadata\":{\"promptTokenCount\":9}}\n\n".to_string(),
         ];
-        drain_tap(ccextra_core::route::Protocol::Gemini, Some(scope.clone()), frames).await;
+        drain_tap(
+            ccextra_core::route::Protocol::Gemini,
+            Some(scope.clone()),
+            frames,
+        )
+        .await;
         assert_eq!(scope.0.lock().unwrap().get("s"), Some(9));
+    }
+
+    /// AG 会发只带 cpaUsageMetadata(大写 Usage)的帧,预过滤不得漏掉
+    #[tokio::test]
+    async fn tap_antigravity_cpa_usage_metadata_survives_prefilter() {
+        let scope = scope();
+        let frames = vec!["data: {\"cpaUsageMetadata\":{\"promptTokenCount\":11}}\n\n".to_string()];
+        drain_tap(
+            ccextra_core::route::Protocol::Antigravity,
+            Some(scope.clone()),
+            frames,
+        )
+        .await;
+        assert_eq!(scope.0.lock().unwrap().get("s"), Some(11));
     }
 
     #[tokio::test]
@@ -338,7 +374,12 @@ mod tests {
             "data: {\"usage\": broken json\n\n".to_string(),
             "data: {\"usage\":{\"prompt_tokens\":5}}\n\n".to_string(),
         ];
-        drain_tap(ccextra_core::route::Protocol::OpenAiChat, Some(scope.clone()), frames).await;
+        drain_tap(
+            ccextra_core::route::Protocol::OpenAiChat,
+            Some(scope.clone()),
+            frames,
+        )
+        .await;
         assert_eq!(scope.0.lock().unwrap().get("s"), Some(5));
     }
 }
