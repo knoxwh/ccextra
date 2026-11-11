@@ -111,12 +111,22 @@ fn persist_secret(path: &str, content: &str, hashed: &str) -> Result<()> {
     // 原子写:临时文件 + rename,写到一半崩溃不留半截配置(对齐凭证文件)
     let tmp = format!("{path}.{}.tmp", std::process::id());
     let result = (|| -> Result<()> {
-        fs::write(&tmp, out)?;
-        // 保留原文件权限(配置含密钥,重写不得放宽)
+        use std::io::Write;
+        let mut options = fs::OpenOptions::new();
+        options.write(true).create_new(true);
+        // 创建即限权:临时文件含全部 provider key,不得宽于原文件;无原文件默认 0600
         #[cfg(unix)]
-        if let Ok(meta) = fs::metadata(path) {
-            fs::set_permissions(&tmp, meta.permissions())?;
+        {
+            use std::os::unix::fs::{OpenOptionsExt, PermissionsExt};
+            let mode = fs::metadata(path)
+                .map(|m| m.permissions().mode() & 0o777)
+                .unwrap_or(0o600);
+            options.mode(mode);
         }
+        let mut file = options.open(&tmp)?;
+        file.write_all(out.as_bytes())?;
+        // rename 前落盘,断电不留空文件(对齐 write_atomic)
+        file.sync_all()?;
         fs::rename(&tmp, path)?;
         Ok(())
     })();
@@ -438,6 +448,19 @@ logging:
         let bad = dir_target.to_str().unwrap().to_string();
         assert!(persist_secret(&bad, yaml, "$2b$12$abc").is_err());
         assert_eq!(tmp_leftovers(), 0);
+
+        // 无原文件:新建默认 0600,不暴露 key
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt;
+            let fresh = dir.path().join("fresh.yaml");
+            let fresh_str = fresh.to_str().unwrap().to_string();
+            persist_secret(&fresh_str, yaml, "$2b$12$abc").unwrap();
+            assert_eq!(
+                fs::metadata(&fresh).unwrap().permissions().mode() & 0o777,
+                0o600
+            );
+        }
     }
 
     #[test]
