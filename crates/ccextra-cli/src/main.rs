@@ -298,7 +298,8 @@ async fn main() -> Result<()> {
                 cfg.antigravity_models.as_deref().unwrap_or(&[]),
                 Some(reload_ua.antigravity.as_str()),
             )
-            .await;
+            .await
+            .into_providers();
 
             let xai_auth_dir = pin_auth_dir(&config_path, cfg.xai_auth_dir.as_deref(), resolve_xai_auth_dir);
             let xai_providers = ccextra_server::xai::load_xai_providers(
@@ -567,6 +568,7 @@ fn provider_refresh_config(config_path: &str, config: &Config) -> ProviderRefres
 }
 
 /// 动态拉取失败时保留整个已发布集合;静态配置仅由成功的 reload 更新。
+/// AG 无凭证属正常空结果,照常发布;有凭证但全失败才保旧。
 async fn load_refreshed_providers(
     refresh: ProviderRefreshConfig,
     _current_providers: Vec<ProviderConfig>,
@@ -587,17 +589,22 @@ async fn load_refreshed_providers(
     } else {
         Vec::new()
     };
-    let injected = ccextra_server::antigravity::load_antigravity_providers(
+    use ccextra_server::antigravity::AntigravityLoad;
+    let injected = match ccextra_server::antigravity::load_antigravity_providers(
         auth_dir,
         refresh.proxy_url.as_deref(),
         refresh.antigravity_models.as_deref().unwrap_or(&[]),
         refresh.antigravity_user_agent.as_deref(),
     )
-    .await;
-    if injected.is_empty() {
-        tracing::warn!("Antigravity 无可用模型/provider,保持现有数据");
-        return None;
-    }
+    .await
+    {
+        AntigravityLoad::NoCredentials => Vec::new(),
+        AntigravityLoad::Loaded(providers) if providers.is_empty() => {
+            tracing::warn!("Antigravity 凭证存在但拉取失败,保持现有数据");
+            return None;
+        }
+        AntigravityLoad::Loaded(providers) => providers,
+    };
     let set = merge_providers(refresh.static_providers, xai);
     let set = merge_providers(set, codex);
     let set = merge_providers(set, claude);
@@ -1162,15 +1169,68 @@ mod tests {
         assert_eq!(state.read().await.providers[0].name, "ag-account");
     }
 
+    /// AG 未配置(目录不存在):空结果属正常,其它 provider 与静态配置照常发布
     #[tokio::test]
-    async fn refresh_failure_keeps_entire_published_snapshot() {
+    async fn refresh_publishes_when_antigravity_has_no_credentials() {
         let state = refresh_state();
         let directory = tempfile::tempdir().unwrap();
+        let static_provider = ProviderConfig::new(
+            "static".into(),
+            Protocol::Claude,
+            vec!["https://example.invalid".into()],
+            "fixture-key".into(),
+            None,
+            false,
+            vec![],
+        );
         {
             let mut current = state.write().await;
             let snapshot = Arc::make_mut(&mut current);
             snapshot.refresh.auth_dir = Some(directory.path().join("antigravity"));
             snapshot.refresh.xai_auth_dir = Some(directory.path().join("xai"));
+            snapshot.refresh.codex_auth_dir = Some(directory.path().join("codex"));
+            snapshot.refresh.claude_auth_dir = Some(directory.path().join("claude"));
+            snapshot.refresh.static_providers = vec![static_provider];
+        }
+        assert!(refresh_providers(&state, |refresh, current| {
+            load_refreshed_providers(refresh, current)
+        })
+        .await
+        .unwrap());
+        let snapshot = state.read().await;
+        assert_eq!(snapshot.providers.len(), 1);
+        assert_eq!(snapshot.providers[0].name, "static");
+    }
+
+    /// AG 有凭证但刷新失败(非法代理,无网络):保留整个已发布快照
+    #[tokio::test]
+    async fn refresh_keeps_old_when_antigravity_credentials_fail() {
+        let state = refresh_state();
+        let directory = tempfile::tempdir().unwrap();
+        let ag_dir = directory.path().join("antigravity");
+        std::fs::create_dir_all(&ag_dir).unwrap();
+        let cred: ccextra_server::antigravity::AntigravityCredential =
+            serde_json::from_value(serde_json::json!({
+                "access_token": "old-access",
+                "refresh_token": "rt",
+                "expired": "2000-01-01T00:00:00Z",
+                "email": "fail@b.c",
+                "project_id": "proj",
+            }))
+            .unwrap();
+        ccextra_server::antigravity::store::save_to(
+            &ag_dir.join("antigravity-fail.json"),
+            &cred,
+        )
+        .unwrap();
+        {
+            let mut current = state.write().await;
+            let snapshot = Arc::make_mut(&mut current);
+            snapshot.refresh.auth_dir = Some(ag_dir);
+            snapshot.refresh.xai_auth_dir = Some(directory.path().join("xai"));
+            snapshot.refresh.codex_auth_dir = Some(directory.path().join("codex"));
+            snapshot.refresh.claude_auth_dir = Some(directory.path().join("claude"));
+            snapshot.refresh.proxy_url = Some("invalid-proxy".into());
         }
         let before = state.read().await.clone();
         assert!(!refresh_providers(&state, |refresh, current| {
