@@ -58,19 +58,21 @@ pub async fn load_antigravity_providers(
 
         // 刷新与 project 发现走单飞 ensure(对齐 CLIProxyAPI refreshSkew):与请求路径
         // 共用 refresh_token 锁,避免轮换型 refresh token 被后台与请求双消费(invalid_grant)
-        let cred =
-            match refresh::ensure_credential_fresh_with_ua(&path, proxy_url, None, user_agent).await
-            {
-                Ok(cred) => cred,
-                Err(e) => {
-                    tracing::warn!(
-                        "刷新 Antigravity token 失败,跳过该凭证: {}: {}",
-                        cred.email,
-                        e
-                    );
-                    continue;
-                }
-            };
+        let cred = match refresh::ensure_credential_fresh_with_ua(
+            &path, proxy_url, None, user_agent,
+        )
+        .await
+        {
+            Ok(cred) => cred,
+            Err(e) => {
+                tracing::warn!(
+                    "刷新 Antigravity token 失败,跳过该凭证: {}: {}",
+                    cred.email,
+                    e
+                );
+                continue;
+            }
+        };
 
         // 对齐 CPA ensureAntigravityProjectID:补发现后仍缺 project 则跳过
         if cred.project_id.trim().is_empty() {
@@ -198,8 +200,7 @@ mod tests {
             "proj".into(),
         );
         store::save_to(&dir.path().join("antigravity-ok.json"), &cred).unwrap();
-        let load =
-            load_antigravity_providers(dir.path(), Some("invalid-proxy"), &[], None).await;
+        let load = load_antigravity_providers(dir.path(), Some("invalid-proxy"), &[], None).await;
         match load {
             AntigravityLoad::Loaded(providers) => {
                 assert_eq!(providers.len(), 1);

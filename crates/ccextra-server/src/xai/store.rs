@@ -51,7 +51,11 @@ pub fn list(auth_dir: &Path) -> Result<Vec<(PathBuf, XAICredential)>> {
                 Ok(cred) => {
                     if cred.r#type == "xai" || cred.r#type.is_empty() {
                         if let Err(reason) = verify_client_id(&cred) {
-                            tracing::warn!("skip {} (email: {}): {reason}", path.display(), cred.email);
+                            tracing::warn!(
+                                "skip {} (email: {}): {reason}",
+                                path.display(),
+                                cred.email
+                            );
                             continue;
                         }
                         entries.push((path, cred));

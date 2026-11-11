@@ -1218,11 +1218,8 @@ mod tests {
                 "project_id": "proj",
             }))
             .unwrap();
-        ccextra_server::antigravity::store::save_to(
-            &ag_dir.join("antigravity-fail.json"),
-            &cred,
-        )
-        .unwrap();
+        ccextra_server::antigravity::store::save_to(&ag_dir.join("antigravity-fail.json"), &cred)
+            .unwrap();
         {
             let mut current = state.write().await;
             let snapshot = Arc::make_mut(&mut current);
