@@ -36,7 +36,7 @@ pub async fn load_antigravity_providers(
         Ok(creds) => creds,
         Err(e) => {
             // 扫描失败按「拉取失败」处理,保留旧快照
-            tracing::debug!("扫描 antigravity 凭证失败: {}", e);
+            tracing::warn!("扫描 antigravity 凭证失败: {}", e);
             return AntigravityLoad::Loaded(providers);
         }
     };
@@ -144,6 +144,11 @@ pub async fn load_antigravity_providers(
     }
 
     if usable_seen {
+        // 所有 provider 模型都空 = 模型拉取全失败:按失败处理保留旧快照,
+        // 不发布空路由干等 3 小时
+        if !providers.is_empty() && providers.iter().all(|p| p.models.is_empty()) {
+            return AntigravityLoad::Loaded(Vec::new());
+        }
         AntigravityLoad::Loaded(providers)
     } else {
         AntigravityLoad::NoCredentials
@@ -188,9 +193,9 @@ mod tests {
         ));
     }
 
-    /// 有可用凭证即 Loaded;模型拉取失败(非法代理)只清空模型,不改变分类
+    /// 有可用凭证但模型拉取全失败(非法代理):全空模型按失败归类,保留旧快照
     #[tokio::test]
-    async fn loaded_when_usable_credential_exists() {
+    async fn all_empty_models_treated_as_failure() {
         let dir = tempfile::tempdir().unwrap();
         let cred = AntigravityCredential::new(
             "tok".into(),
@@ -202,11 +207,8 @@ mod tests {
         store::save_to(&dir.path().join("antigravity-ok.json"), &cred).unwrap();
         let load = load_antigravity_providers(dir.path(), Some("invalid-proxy"), &[], None).await;
         match load {
-            AntigravityLoad::Loaded(providers) => {
-                assert_eq!(providers.len(), 1);
-                assert!(providers[0].models.is_empty());
-            }
-            AntigravityLoad::NoCredentials => panic!("可用凭证应归类 Loaded"),
+            AntigravityLoad::Loaded(providers) => assert!(providers.is_empty()),
+            AntigravityLoad::NoCredentials => panic!("可用凭证应归类 Loaded(失败)"),
         }
     }
 }
