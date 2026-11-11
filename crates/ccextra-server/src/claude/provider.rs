@@ -19,7 +19,7 @@ pub async fn load_claude_providers(
         }
     };
 
-    for (path, mut cred) in credentials {
+    for (path, cred) in credentials {
         if cred.disabled {
             tracing::debug!("跳过已禁用的 Claude 凭证: email={}", cred.email);
             continue;
@@ -30,22 +30,15 @@ pub async fn load_claude_providers(
             continue;
         }
 
-        match refresh::refresh_if_needed(&mut cred, proxy_url, constants::REFRESH_SKEW_SECS).await {
-            Ok(true) => {
-                if let Err(e) = store::save_to(&path, &cred) {
-                    tracing::warn!("刷新后保存 Claude 凭证失败: {}: {}", cred.email, e);
-                } else {
-                    tracing::info!("Claude token 已刷新并保存: {}", cred.email);
-                }
-            }
-            Ok(false) => {
-                tracing::debug!("Claude token 仍然有效: {}", cred.email);
-            }
+        // 刷新走单飞 ensure:与请求路径共用 refresh_token 锁,
+        // 避免轮换型 refresh token 被后台与请求双消费(invalid_grant)
+        let cred = match refresh::ensure_credential_fresh(&path, proxy_url, None).await {
+            Ok(cred) => cred,
             Err(e) => {
                 tracing::warn!("刷新 Claude token 失败,跳过该凭证: {}: {}", cred.email, e);
                 continue;
             }
-        }
+        };
 
         if cred.access_token.trim().is_empty() {
             tracing::warn!("Claude 凭证无 access_token,跳过: email={}", cred.email);

@@ -16,7 +16,7 @@ pub async fn load_codex_providers(auth_dir: &Path, proxy_url: Option<&str>) -> V
         }
     };
 
-    for (path, mut cred) in credentials {
+    for (path, cred) in credentials {
         if cred.disabled {
             tracing::debug!("跳过已禁用的 Codex 凭证: email={}", cred.email);
             continue;
@@ -27,23 +27,15 @@ pub async fn load_codex_providers(auth_dir: &Path, proxy_url: Option<&str>) -> V
             continue;
         }
 
-        // 检查并刷新 token (对齐 CPA RefreshLead 24h + 重试 3 次)
-        match refresh::refresh_if_needed(&mut cred, proxy_url, constants::REFRESH_SKEW_SECS).await {
-            Ok(true) => {
-                if let Err(e) = store::save_to(&path, &cred) {
-                    tracing::warn!("刷新后保存 Codex 凭证失败: {}: {}", cred.email, e);
-                } else {
-                    tracing::info!("Codex token 已刷新并保存: {}", cred.email);
-                }
-            }
-            Ok(false) => {
-                tracing::debug!("Codex token 仍然有效: {}", cred.email);
-            }
+        // 刷新走单飞 ensure(对齐 CPA RefreshLead 24h + 重试 3 次):与请求路径共用
+        // refresh_token 锁,避免轮换型 refresh token 被后台与请求双消费(invalid_grant)
+        let cred = match refresh::ensure_credential_fresh(&path, proxy_url, None).await {
+            Ok(cred) => cred,
             Err(e) => {
                 tracing::warn!("刷新 Codex token 失败,跳过该凭证: {}: {}", cred.email, e);
                 continue;
             }
-        }
+        };
 
         let id = if !cred.email.is_empty() {
             cred.email.clone()

@@ -16,7 +16,7 @@ pub async fn load_xai_providers(auth_dir: &Path, proxy_url: Option<&str>) -> Vec
         }
     };
 
-    for (path, mut cred) in credentials {
+    for (path, cred) in credentials {
         if cred.disabled {
             tracing::debug!(
                 "跳过已禁用的 xAI 凭证: email={}, sub={}",
@@ -35,23 +35,15 @@ pub async fn load_xai_providers(auth_dir: &Path, proxy_url: Option<&str>) -> Vec
             continue;
         }
 
-        // 检查并刷新 token (对齐 CLIProxyAPI refreshLead 300s)
-        match refresh::refresh_if_needed(&mut cred, proxy_url, constants::REFRESH_SKEW_SECS).await {
-            Ok(true) => {
-                if let Err(e) = store::save_to(&path, &cred) {
-                    tracing::warn!("刷新后保存 xAI 凭证失败: {}: {}", cred.email, e);
-                } else {
-                    tracing::info!("xAI token 已刷新并保存: {}", cred.email);
-                }
-            }
-            Ok(false) => {
-                tracing::debug!("xAI token 仍然有效: {}", cred.email);
-            }
+        // 刷新走单飞 ensure(对齐 CLIProxyAPI refreshLead 300s):与请求路径共用
+        // refresh_token 锁,避免轮换型 refresh token 被后台与请求双消费(invalid_grant)
+        let cred = match refresh::ensure_credential_fresh(&path, proxy_url, None).await {
+            Ok(cred) => cred,
             Err(e) => {
                 tracing::warn!("刷新 xAI token 失败,跳过该凭证: {}: {}", cred.email, e);
                 continue;
             }
-        }
+        };
 
         let id = if !cred.email.is_empty() {
             cred.email.clone()
@@ -106,4 +98,74 @@ pub async fn load_xai_providers(auth_dir: &Path, proxy_url: Option<&str>) -> Vec
     }
 
     providers
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::test_support::TestServer;
+    use crate::xai::XAICredential;
+    use axum::http::StatusCode;
+    use std::sync::atomic::{AtomicUsize, Ordering};
+
+    /// 后台(load)与请求(ensure)并发刷新:轮换型 refresh token 只被消费一次。
+    /// mock 端点轮换 rt-0 → rt-1,重用 rt-0 返回 invalid_grant(与真实 OAuth 一致)。
+    #[tokio::test]
+    async fn concurrent_background_and_request_refresh_consumes_token_once() {
+        let calls = std::sync::Arc::new(AtomicUsize::new(0));
+        let router = axum::Router::new().route(
+            "/token",
+            axum::routing::post({
+                let calls = calls.clone();
+                move |body: String| {
+                    let calls = calls.clone();
+                    async move {
+                        calls.fetch_add(1, Ordering::SeqCst);
+                        let rt = body
+                            .split('&')
+                            .find_map(|kv| kv.strip_prefix("refresh_token="))
+                            .unwrap_or("");
+                        if rt != "rt-0" {
+                            return (
+                                StatusCode::BAD_REQUEST,
+                                axum::Json(serde_json::json!({"error": "invalid_grant"})),
+                            );
+                        }
+                        (
+                            StatusCode::OK,
+                            axum::Json(serde_json::json!({
+                                "access_token": "new-access",
+                                "refresh_token": "rt-1",
+                                "expires_in": 3600,
+                            })),
+                        )
+                    }
+                }
+            }),
+        );
+        let server = TestServer::spawn(router).await;
+
+        let dir = tempfile::tempdir().unwrap();
+        let cred: XAICredential = serde_json::from_value(serde_json::json!({
+            "access_token": "old-access",
+            "refresh_token": "rt-0",
+            "expired": "2000-01-01T00:00:00Z",
+            "token_endpoint": format!("{}/token", server.url),
+            "email": "race@b.c",
+        }))
+        .unwrap();
+        let path = dir.path().join("xai-race.json");
+        store::save_to(&path, &cred).unwrap();
+
+        let (providers, fresh) = tokio::join!(
+            load_xai_providers(dir.path(), Some("direct")),
+            refresh::ensure_credential_fresh(&path, Some("direct"), None),
+        );
+        let fresh = fresh.unwrap();
+        assert_eq!(calls.load(Ordering::SeqCst), 1, "refresh token 只消费一次");
+        assert_eq!(providers.len(), 1);
+        assert_eq!(providers[0].key, "new-access");
+        assert_eq!(fresh.access_token, "new-access");
+        assert_eq!(store::load(&path).unwrap().refresh_token, "rt-1");
+    }
 }

@@ -1,5 +1,5 @@
 // Antigravity 动态 provider 注入
-use crate::antigravity::{constants, models, oauth, project, refresh, store};
+use crate::antigravity::{constants, models, refresh, store};
 use ccextra_core::route::{Protocol, ProviderConfig};
 use std::path::Path;
 
@@ -21,7 +21,7 @@ pub async fn load_antigravity_providers(
         }
     };
 
-    for (path, mut cred) in credentials {
+    for (path, cred) in credentials {
         if cred.disabled {
             tracing::debug!("跳过已禁用的 antigravity 凭证: {}", cred.email);
             continue;
@@ -33,62 +33,26 @@ pub async fn load_antigravity_providers(
             continue;
         }
 
-        // 检查并刷新 token（对齐 CLIProxyAPI 的 refreshSkew）
-        match refresh::refresh_if_needed(&mut cred, proxy_url, constants::REFRESH_SKEW_SECS).await {
-            Ok(true) => {
-                if let Err(e) = store::save_to(&path, &cred) {
-                    tracing::warn!("刷新后保存凭证失败: {}: {}", cred.email, e);
-                } else {
-                    tracing::info!("Antigravity token 已刷新并保存: {}", cred.email);
-                }
-            }
-            Ok(false) => {
-                tracing::debug!("Antigravity token 仍然有效: {}", cred.email);
-            }
-            Err(e) => {
-                tracing::warn!(
-                    "刷新 Antigravity token 失败,跳过该凭证: {}: {}",
-                    cred.email,
-                    e
-                );
-                continue;
-            }
-        }
-
-        // 对齐 CPA ensureAntigravityProjectID:缺 project 时补发现,仍空则跳过
-        if cred.project_id.trim().is_empty() {
-            match oauth::http_client(proxy_url) {
-                Ok(client) => {
-                    match project::fetch_project_id(&client, &cred.access_token, user_agent).await {
-                        Ok(id) if !id.trim().is_empty() => {
-                            cred.project_id = id;
-                            if let Err(e) = store::save_to(&path, &cred) {
-                                tracing::warn!("project 发现后保存失败: {}: {}", cred.email, e);
-                            }
-                        }
-                        Ok(_) => {
-                            tracing::warn!("跳过无 project_id 的 antigravity 凭证: {}", cred.email);
-                            continue;
-                        }
-                        Err(e) => {
-                            tracing::warn!(
-                                "跳过无 project_id 的 antigravity 凭证: {}: {}",
-                                cred.email,
-                                e
-                            );
-                            continue;
-                        }
-                    }
-                }
+        // 刷新与 project 发现走单飞 ensure(对齐 CLIProxyAPI refreshSkew):与请求路径
+        // 共用 refresh_token 锁,避免轮换型 refresh token 被后台与请求双消费(invalid_grant)
+        let cred =
+            match refresh::ensure_credential_fresh_with_ua(&path, proxy_url, None, user_agent).await
+            {
+                Ok(cred) => cred,
                 Err(e) => {
                     tracing::warn!(
-                        "跳过无 project_id 的 antigravity 凭证: {}: {}",
+                        "刷新 Antigravity token 失败,跳过该凭证: {}: {}",
                         cred.email,
                         e
                     );
                     continue;
                 }
-            }
+            };
+
+        // 对齐 CPA ensureAntigravityProjectID:补发现后仍缺 project 则跳过
+        if cred.project_id.trim().is_empty() {
+            tracing::warn!("跳过无 project_id 的 antigravity 凭证: {}", cred.email);
+            continue;
         }
 
         // 使用 email 作为 provider 名称（如果为空则使用 "antigravity"）
