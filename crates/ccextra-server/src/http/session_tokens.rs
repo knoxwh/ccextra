@@ -19,36 +19,45 @@ where
 {
     use ccextra_core::route::Protocol;
     use futures::StreamExt;
+    // Claude 协议不提取 input tokens(下方 match 恒 None),整体跳过解析;
+    // scope 缺失同样零成本透传。
+    let active = scope.is_some() && !matches!(protocol, Protocol::Claude);
     let mut parser = crate::sse::parser::SseParser::new();
     async_stream::stream! {
         futures::pin_mut!(stream);
         loop {
             let chunk = stream.next().await;
-            if let Some((cache, session)) = scope.as_ref() {
-                let events = match &chunk {
-                    Some(Ok(bytes)) => parser.push(bytes),
-                    None => parser.finish(),
-                    Some(Err(_)) => Vec::new(),
-                };
-                for event in events {
-                    let Ok(value) = serde_json::from_str::<serde_json::Value>(&event.data) else {
-                        continue;
+            if active {
+                if let Some((cache, session)) = scope.as_ref() {
+                    let events = match &chunk {
+                        Some(Ok(bytes)) => parser.push(bytes),
+                        None => parser.finish(),
+                        Some(Err(_)) => Vec::new(),
                     };
-                    let tokens = match protocol {
-                        Protocol::OpenAiChat => value.pointer("/usage/prompt_tokens")
-                            .or_else(|| value.pointer("/choices/0/usage/prompt_tokens")),
-                        Protocol::OpenAiResponses => value.pointer("/response/usage/input_tokens"),
-                        Protocol::Gemini | Protocol::Antigravity => value.pointer("/response/usageMetadata/promptTokenCount")
-                            .or_else(|| value.pointer("/response/cpaUsageMetadata/promptTokenCount"))
-                            .or_else(|| value.pointer("/usageMetadata/promptTokenCount"))
-                            .or_else(|| value.pointer("/cpaUsageMetadata/promptTokenCount")),
-                        Protocol::Claude => None,
-                    }.and_then(serde_json::Value::as_u64)
-                        .and_then(|tokens| usize::try_from(tokens).ok())
-                        .filter(|tokens| *tokens > 0);
-                    if let Some(tokens) = tokens {
-                        if let Ok(mut cache) = cache.lock() {
-                            cache.insert(session.clone(), tokens);
+                    for event in events {
+                        // 子串预过滤:usage 只出现在少数帧,免每事件全量 JSON 解析
+                        if !event.data.contains("usage") {
+                            continue;
+                        }
+                        let Ok(value) = serde_json::from_str::<serde_json::Value>(&event.data) else {
+                            continue;
+                        };
+                        let tokens = match protocol {
+                            Protocol::OpenAiChat => value.pointer("/usage/prompt_tokens")
+                                .or_else(|| value.pointer("/choices/0/usage/prompt_tokens")),
+                            Protocol::OpenAiResponses => value.pointer("/response/usage/input_tokens"),
+                            Protocol::Gemini | Protocol::Antigravity => value.pointer("/response/usageMetadata/promptTokenCount")
+                                .or_else(|| value.pointer("/response/cpaUsageMetadata/promptTokenCount"))
+                                .or_else(|| value.pointer("/usageMetadata/promptTokenCount"))
+                                .or_else(|| value.pointer("/cpaUsageMetadata/promptTokenCount")),
+                            Protocol::Claude => None,
+                        }.and_then(serde_json::Value::as_u64)
+                            .and_then(|tokens| usize::try_from(tokens).ok())
+                            .filter(|tokens| *tokens > 0);
+                        if let Some(tokens) = tokens {
+                            if let Ok(mut cache) = cache.lock() {
+                                cache.insert(session.clone(), tokens);
+                            }
                         }
                     }
                 }
@@ -93,6 +102,10 @@ where
                         Some(Err(_)) => Vec::new(),
                     };
                     for event in events {
+                        // 子串预过滤:各协议 cache usage 均在 usage 对象内,免每事件全量解析
+                        if !event.data.contains("usage") {
+                            continue;
+                        }
                         let Ok(value) = serde_json::from_str::<serde_json::Value>(&event.data) else {
                             continue;
                         };
@@ -259,5 +272,73 @@ mod tests {
         cache.insert_at("session", 1, Instant::now() - TTL + Duration::from_secs(1));
         cache.insert("session", 2);
         assert_eq!(cache.get("session"), Some(2));
+    }
+
+    fn scope() -> TokenCacheScope {
+        (
+            std::sync::Arc::new(std::sync::Mutex::new(SessionTokenCache::new())),
+            "s".to_string(),
+        )
+    }
+
+    /// 驱动 tap 流到 EOF,返回透传字节(必须与输入逐帧一致)
+    async fn drain_tap(
+        protocol: ccextra_core::route::Protocol,
+        scope: Option<TokenCacheScope>,
+        frames: Vec<String>,
+    ) -> Vec<bytes::Bytes> {
+        use futures::StreamExt;
+        let input: Vec<bytes::Bytes> = frames.into_iter().map(bytes::Bytes::from).collect();
+        let expected = input.clone();
+        let stream = futures::stream::iter(input.into_iter().map(Ok));
+        let tapped = tap_input_tokens(stream, protocol, scope);
+        futures::pin_mut!(tapped);
+        let mut out = Vec::new();
+        while let Some(chunk) = tapped.next().await {
+            out.push(chunk.unwrap());
+        }
+        assert_eq!(out, expected);
+        out
+    }
+
+    #[tokio::test]
+    async fn tap_extracts_openai_chat_usage_and_passes_frames_through() {
+        let scope = scope();
+        let frames = vec![
+            "data: {\"choices\":[{\"delta\":{\"content\":\"hi\"}}]}\n\n".to_string(),
+            "data: {\"usage\":{\"prompt_tokens\":77}}\n\n".to_string(),
+        ];
+        drain_tap(ccextra_core::route::Protocol::OpenAiChat, Some(scope.clone()), frames).await;
+        assert_eq!(scope.0.lock().unwrap().get("s"), Some(77));
+    }
+
+    #[tokio::test]
+    async fn tap_skips_claude_protocol_entirely() {
+        let scope = scope();
+        let frames = vec!["data: {\"usage\":{\"input_tokens\":77}}\n\n".to_string()];
+        drain_tap(ccextra_core::route::Protocol::Claude, Some(scope.clone()), frames).await;
+        assert_eq!(scope.0.lock().unwrap().get("s"), None);
+    }
+
+    #[tokio::test]
+    async fn tap_gemini_usage_survives_substring_prefilter() {
+        let scope = scope();
+        let frames = vec![
+            "data: {\"candidates\":[{\"content\":{\"parts\":[{\"text\":\"hi\"}]}}]}\n\n".to_string(),
+            "data: {\"usageMetadata\":{\"promptTokenCount\":9}}\n\n".to_string(),
+        ];
+        drain_tap(ccextra_core::route::Protocol::Gemini, Some(scope.clone()), frames).await;
+        assert_eq!(scope.0.lock().unwrap().get("s"), Some(9));
+    }
+
+    #[tokio::test]
+    async fn tap_ignores_malformed_usage_frame_and_keeps_later_one() {
+        let scope = scope();
+        let frames = vec![
+            "data: {\"usage\": broken json\n\n".to_string(),
+            "data: {\"usage\":{\"prompt_tokens\":5}}\n\n".to_string(),
+        ];
+        drain_tap(ccextra_core::route::Protocol::OpenAiChat, Some(scope.clone()), frames).await;
+        assert_eq!(scope.0.lock().unwrap().get("s"), Some(5));
     }
 }

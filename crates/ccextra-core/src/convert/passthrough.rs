@@ -132,6 +132,18 @@ fn sanitize_system_field(body: &mut Value, upstream_model: &str) -> bool {
 
 /// messages 内 role=system 项同样清洗;内容清空后整条丢弃(对齐 chat)
 fn sanitize_system_messages(body: &mut Value, upstream_model: &str) -> bool {
+    // 预检:无 role=system 消息直接返回。Claude Code 不发 system 消息,
+    // 避免长会话每请求为找 system 白克隆全量 messages(MB 级)。
+    let has_system = body
+        .get("messages")
+        .and_then(|m| m.as_array())
+        .is_some_and(|msgs| {
+            msgs.iter()
+                .any(|m| m.get("role").and_then(|r| r.as_str()) == Some("system"))
+        });
+    if !has_system {
+        return false;
+    }
     let Some(messages) = body.get("messages").and_then(|m| m.as_array()).cloned() else {
         return false;
     };

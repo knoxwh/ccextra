@@ -746,6 +746,11 @@ fn find_sub(hay: &[u8], from: usize, needle: &[u8]) -> Option<usize> {
 /// `reminder_scoped_only` 为 true 时只处理 `<system-reminder>` 块内的子串
 /// （messages 内容用），false 时全量（system/instructions 用）。
 fn normalize_dateline_text(s: &mut String, reminder_scoped_only: bool) -> usize {
+    // 门控:改写必命中 "Today" 前缀(DATELINE_PREFIX_ASCII),无该子串语义等价
+    // 直接返回,免长文本块每请求全量克隆+重拼。
+    if !s.contains("Today") {
+        return 0;
+    }
     let hay = s.clone();
     let mut regions: Vec<(usize, usize)> = Vec::new();
     if reminder_scoped_only {
@@ -1319,5 +1324,19 @@ mod tests {
         assert_eq!(findings.len(), 1);
         assert_eq!(findings[0].kind, VolatileKind::Timestamp);
         assert!(findings[0].location.starts_with("input[0]"));
+    }
+
+    /// 门控回归:不含 "Today" 的文本零改写、body 不变
+    #[test]
+    fn dateline_gate_skips_text_without_today() {
+        let mut body = json!({
+            "system": "plain prose without the trigger word",
+            "messages": [
+                {"role": "user", "content": [{"type": "text", "text": "hello world"}]}
+            ]
+        });
+        let before = body.clone();
+        assert_eq!(normalize_client_dateline(&mut body, ApiKind::Anthropic), 0);
+        assert_eq!(body, before);
     }
 }
