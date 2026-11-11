@@ -184,11 +184,21 @@ enum ReplayTap {
 /// 每个上游 SSE 字节块喂给 replay 提取器
 type ReplayPush = Box<dyn FnMut(&[u8]) + Send>;
 
+/// Gemini/AG 响应侧回剥占位 tool args 只读原始请求的 tools;
+/// 快照仅保留 tools,避免长会话全量 body 深克隆。
+fn tools_only_snapshot(body: &Value) -> Value {
+    let mut snapshot = serde_json::Map::new();
+    if let Some(tools) = body.get("tools") {
+        snapshot.insert("tools".to_string(), tools.clone());
+    }
+    Value::Object(snapshot)
+}
+
 struct RelayParams {
     protocol: Protocol,
     estimated_input_tokens: Option<usize>,
     tool_names: Option<Arc<HashMap<String, String>>>,
-    /// 转换前 Claude 请求快照(Gemini/AG 响应用来回剥占位 tool args)
+    /// 转换前 Claude 请求 tools 快照(Gemini/AG 响应用来回剥占位 tool args)
     original_claude_request: Option<Arc<Value>>,
     replay_tap: ReplayTap,
     signature_model: Option<Arc<str>>,
@@ -316,7 +326,7 @@ pub(crate) struct PreparedMessageRequest {
     pub inbound_query: Option<String>,
     pub estimated_input_tokens: Option<usize>,
     pub tool_names: Option<Arc<HashMap<String, String>>>,
-    /// 转换前 Claude 请求快照(仅 Gemini/AG;响应用来回剥占位 tool args)
+    /// 转换前 Claude 请求 tools 快照(仅 Gemini/AG;响应用来回剥占位 tool args)
     pub original_claude_request: Option<Arc<Value>>,
     pub replay_scope: Option<(crate::sse::replay_cache::ReplayCache, String, String)>,
     /// Antigravity thoughtSignature 账本 scope：(cache, key)，key 见 `ag_replay_session_key`
@@ -540,7 +550,7 @@ pub(crate) async fn prepare_message_request(
             }
         }
         Protocol::Gemini => {
-            original_claude_request = Some(Arc::new(body_json.clone()));
+            original_claude_request = Some(Arc::new(tools_only_snapshot(&body_json)));
             let (gemini_body, short_to_original) = convert_to_gemini_with_registry(
                 &body_json,
                 &route.upstream_model,
@@ -553,7 +563,7 @@ pub(crate) async fn prepare_message_request(
             }
         }
         Protocol::Antigravity => {
-            original_claude_request = Some(Arc::new(body_json.clone()));
+            original_claude_request = Some(Arc::new(tools_only_snapshot(&body_json)));
             if ccextra_core::antigravity_uses_reasoning_replay(&route.upstream_model) {
                 ag_replay_key = cc_session.as_deref().map(|sess| {
                     crate::sse::antigravity_replay_cache::ag_replay_session_key(
@@ -1993,6 +2003,26 @@ mod tests {
 
     fn pinned(frames: Vec<Result<Bytes, std::io::Error>>) -> SseStreamPin {
         Box::pin(stream::iter(frames))
+    }
+
+    /// 快照仅保留 tools:响应侧回剥只读 tools,其余字段不进快照
+    #[test]
+    fn tools_only_snapshot_keeps_tools_and_drops_rest() {
+        let body = serde_json::json!({
+            "model": "m",
+            "messages": [{"role": "user", "content": "long history"}],
+            "tools": [{"name": "t", "input_schema": {"type": "object"}}],
+        });
+        let snapshot = tools_only_snapshot(&body);
+        assert_eq!(snapshot.get("tools"), body.get("tools"));
+        assert!(snapshot.get("messages").is_none());
+        assert!(snapshot.get("model").is_none());
+    }
+
+    #[test]
+    fn tools_only_snapshot_without_tools_is_empty_object() {
+        let body = serde_json::json!({"messages": []});
+        assert_eq!(tools_only_snapshot(&body), serde_json::json!({}));
     }
 
     /// 多个心跳后到达 error 帧:心跳全部跳过,仍被首帧错误检测识别,message 可提取。

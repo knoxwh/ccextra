@@ -117,7 +117,7 @@ where
 ///
 /// `tool_names`:short→original 工具名还原表(请求转换侧产出;stream 需 'static,
 /// 内部用 Arc 共享)。
-/// `original_claude_request`:Gemini/AG 转换前 Claude 请求快照,用于响应侧回剥占位 args。
+/// `original_claude_request`:Gemini/AG 转换前 Claude 请求 tools 快照,用于响应侧回剥占位 args。
 /// `inbound_model`:客户端入站 model 别名;仅 OpenAiResponses 用于预填 message_start。
 pub fn relay<S>(
     protocol: Protocol,

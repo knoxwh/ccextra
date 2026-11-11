@@ -60,12 +60,13 @@ pub fn convert_to_antigravity_with(
     }
 
     // 3. 将 Gemini 字段移到 request 中（除了 model）
-    if let Some(gemini_obj) = gemini_body.as_object() {
+    // gemini_body 此后不再使用,直接 move 键值,免全量深克隆
+    if let Value::Object(gemini_obj) = gemini_body {
         let mut request_obj = serde_json::Map::new();
 
         for (key, value) in gemini_obj {
             if key != "model" {
-                request_obj.insert(key.clone(), value.clone());
+                request_obj.insert(key, value);
             }
         }
 
