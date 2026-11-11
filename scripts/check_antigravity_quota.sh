@@ -10,8 +10,9 @@ DAILY_API_ENDPOINT="https://daily-cloudcode-pa.googleapis.com"
 SANDBOX_DAILY_API_ENDPOINT="https://daily-cloudcode-pa.sandbox.googleapis.com"
 OAUTH_TOKEN_URL="https://oauth2.googleapis.com/token"
 CONSTANTS_RS="${BASE_DIR}/crates/ccextra-server/src/antigravity/constants.rs"
-CLIENT_ID="$(sed -n 's/.*pub const CLIENT_ID: &str = "\([^"]*\)".*/\1/p' "${CONSTANTS_RS}" 2>/dev/null || true)"
-CLIENT_SECRET="$(sed -n 's/.*pub const CLIENT_SECRET: &str = "\([^"]*\)".*/\1/p' "${CONSTANTS_RS}" 2>/dev/null || true)"
+# rustfmt 可能把常量折成两行，按整文件匹配
+CLIENT_ID="$(perl -0ne 'print $1 if /pub const CLIENT_ID: &str =\s*"([^"]*)"/' "${CONSTANTS_RS}" 2>/dev/null || true)"
+CLIENT_SECRET="$(perl -0ne 'print $1 if /pub const CLIENT_SECRET: &str =\s*"([^"]*)"/' "${CONSTANTS_RS}" 2>/dev/null || true)"
 
 # 优先从 config.yaml 读取 user_agents.antigravity，未配置则回退 constants.rs
 CONFIG_UA="$(sed -n '/^[[:space:]]*user_agents:/,/^[[:space:]]*[a-zA-Z0-9_-]\+:/p' "${CONFIG_YAML}" 2>/dev/null | sed -n 's/^[[:space:]]*antigravity:[[:space:]]*["'\'']\{0,1\}\([^"'\'']*\)["'\'']\{0,1\}[[:space:]]*$/\1/p' | head -n 1 || true)"
@@ -105,17 +106,21 @@ refresh_token_if_needed() {
             new_exp="$(echo "$refresh_resp" | jq -r '.expires_in // 3599')"
             local tmp_file="${cred_file}.tmp.$$"
             local expired_str
-            expired_str="$(date -u +"%Y-%m-%dT%H:%M:%SZ")"
+            # expired 是到期时间（服务端优先读它），不是写入时间
+            expired_str="$(date -u -r $(( now_ms / 1000 + new_exp )) +"%Y-%m-%dT%H:%M:%SZ" 2>/dev/null \
+                || date -u -d "@$(( now_ms / 1000 + new_exp ))" +"%Y-%m-%dT%H:%M:%SZ")"
 
             jq --arg token "$new_token" \
                --argjson ts "$now_ms" \
                --argjson exp "$new_exp" \
                --arg exp_str "$expired_str" \
                '.access_token = $token | .timestamp = $ts | .expires_in = $exp | .expired = $exp_str' \
-               "$cred_file" > "$tmp_file" && mv "$tmp_file" "$cred_file"
+               "$cred_file" > "$tmp_file" && chmod 600 "$tmp_file" && mv "$tmp_file" "$cred_file"
             echo "$new_token"
             return
         fi
+        echo "⚠️  token 刷新失败: $(echo "$refresh_resp" | jq -r '"\(.error // "unknown"): \(.error_description // "")"' 2>/dev/null || echo "无响应")" >&2
+        return
     fi
 
     echo "$access_token"
