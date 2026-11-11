@@ -169,12 +169,25 @@ if [[ -n "$LATEST_CLAUDE_VER" ]]; then
     NEW_CLAUDE="claude-cli/${LATEST_CLAUDE_VER}"
 fi
 
+# Darwin 上检测本机 OS 版本与架构；取不到则保持原后缀/写死兜底
+MAC_OS_VER=""
+MAC_ARCH=""
+if [[ "$(uname -s 2>/dev/null || true)" == "Darwin" ]]; then
+    MAC_OS_VER="$(sw_vers -productVersion 2>/dev/null || true)"
+    MAC_ARCH="$(uname -m 2>/dev/null || true)"
+fi
+
 NEW_CODEX=""
 if [[ -n "$LATEST_CODEX_VER" ]]; then
     if [[ "$CURRENT_CODEX" =~ ^codex_cli_rs/[^[:space:]]+(.*)$ ]]; then
-        NEW_CODEX="codex_cli_rs/${LATEST_CODEX_VER}${BASH_REMATCH[1]}"
+        CODEX_SUFFIX="${BASH_REMATCH[1]}"
+        MAC_OS_RE='^(.*\(Mac OS )[^;)]+(;.*)$'
+        if [[ -n "$MAC_OS_VER" && "$CODEX_SUFFIX" =~ $MAC_OS_RE ]]; then
+            CODEX_SUFFIX="${BASH_REMATCH[1]}${MAC_OS_VER}${BASH_REMATCH[2]}"
+        fi
+        NEW_CODEX="codex_cli_rs/${LATEST_CODEX_VER}${CODEX_SUFFIX}"
     else
-        NEW_CODEX="codex_cli_rs/${LATEST_CODEX_VER} (Mac OS 27.0.1; arm64)"
+        NEW_CODEX="codex_cli_rs/${LATEST_CODEX_VER} (Mac OS ${MAC_OS_VER:-27.0.1}; ${MAC_ARCH:-arm64})"
     fi
 fi
 
