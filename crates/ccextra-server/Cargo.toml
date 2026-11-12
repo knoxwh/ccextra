@@ -36,6 +36,10 @@ fslock = "0.2"
 regex = "1"
 # 入站 body 超限识别(LengthLimitError → 413)
 http-body-util = "0.1"
+# antigravity.gohttp:经 Unix socket 向 ccextra-gohttp 发绝对形 HTTP/1.1(均已随 reqwest 入锁)
+hyper = { version = "1", features = ["client", "http1"] }
+hyper-util = { version = "0.1", features = ["tokio"] }
+libc = "0.2"
 
 [dev-dependencies]
 tower.workspace = true
@@ -45,3 +49,6 @@ yaml_serde = "0.10"
 tokio = { version = "1.35", features = ["test-util"] }
 # 坏凭证告警用例:捕获 tracing 输出
 tracing-subscriber.workspace = true
+# gohttp 真二进制 gzip SSE e2e:本地 TLS 上游 + gzip 编码(均已在锁内)
+tokio-rustls = "0.26"
+flate2 = "1"

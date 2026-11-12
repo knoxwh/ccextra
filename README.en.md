@@ -142,6 +142,7 @@ Full fields: [config.example.yaml](config.example.yaml). Common items:
 - Hot reload — watches `config.yaml` and the startup-pinned `models.json` (save-to-reload, 150ms debounce + content hash); `POST /reload` also works. Atomically publishes providers, payload, normalize, auth, proxy, UA, reasoning table, and refresh params; failed loads leave the snapshot unchanged; `logging.level` needs a restart
 - Background refresh uses the last successfully published static config; explicit reload prefers removals / disables / directory switches
 - `antigravity.connection-pool` — short connections by default; with `enabled: true`, keep the pool per idle / per-host caps
+- `antigravity.gohttp` — default false; when `true`, the AG data plane goes through `ccextra-gohttp` in the same directory (Go net/http, official TLS fingerprint) using the resolved proxy, and errors (no fallback) if the binary is missing. Build it yourself from [knoxwh/ccextra-gohttp](https://github.com/knoxwh/ccextra-gohttp) (`CGO_ENABLED=0 go build`) and place it next to ccextra (`build.sh` / `deploy.sh` do not build it); `connection-pool` has no effect while it is on
 
 </details>
 

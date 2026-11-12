@@ -69,6 +69,14 @@ impl Config {
     pub fn load(path: &str) -> Result<Self> {
         let content = fs::read_to_string(path)?;
         let mut config: Config = yaml_serde::from_str(&content)?;
+        // antigravity.gohttp sidecar socket 放配置文件旁 .cache(凭证缓存目录,已 gitignore)
+        if let Some(ag) = config.antigravity.as_mut() {
+            let base = std::path::Path::new(path)
+                .parent()
+                .filter(|p| !p.as_os_str().is_empty())
+                .unwrap_or(std::path::Path::new("."));
+            ag.gohttp_socket_dir = Some(base.join(".cache"));
+        }
 
         // secret_key 明文自动转 bcrypt,并回写配置文件(下次启动识别哈希不重复转)
         if let Some(secret) = &config.secret_key {

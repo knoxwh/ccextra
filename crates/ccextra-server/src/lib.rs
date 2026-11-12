@@ -4,6 +4,7 @@ pub mod antigravity;
 pub mod claude;
 pub mod claude_tls_fp;
 pub mod codex;
+pub mod gohttp;
 pub mod http;
 pub mod jwt;
 pub mod sse;

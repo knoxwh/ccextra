@@ -143,6 +143,7 @@ curl -H "Authorization: Bearer $ANTHROPIC_AUTH_TOKEN" http://127.0.0.1:8222/v1/m
 - 热重载 — 监视 `config.yaml` 与启动时钉死的 `models.json`（保存即重载，150ms debounce + 内容 hash）；亦可 `POST /reload`。原子发布 providers、payload、归一化、认证、代理、UA、reasoning 表与刷新参数；失败不改快照；`logging.level` 需重启
 - 后台刷新用最近成功发布的静态配置；显式 reload 优先应用删除 / 禁用 / 目录切换
 - `antigravity.connection-pool` — 默认短连接；`enabled: true` 后按 idle / per-host 上限保留池
+- `antigravity.gohttp` — 默认 false；`true` 时 AG 数据面经同目录 `ccextra-gohttp`（Go net/http，官方 TLS 指纹）转发，走已解析代理，找不到二进制即报错不回退。二进制来自 [knoxwh/ccextra-gohttp](https://github.com/knoxwh/ccextra-gohttp)，需自行 `CGO_ENABLED=0 go build` 后放到 ccextra 同目录（`build.sh` / `deploy.sh` 不编它）；打开后 `connection-pool` 不生效
 
 </details>
 

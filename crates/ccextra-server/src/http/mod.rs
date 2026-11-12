@@ -300,7 +300,10 @@ pub fn app(state: AppState) -> Router {
 }
 
 pub async fn serve(addr: &str, state: AppState) -> anyhow::Result<()> {
-    serve_with_shutdown(addr, state, shutdown_signal()).await
+    let result = serve_with_shutdown(addr, state, shutdown_signal()).await;
+    // antigravity.gohttp sidecar 由本进程拉起,退出前收掉
+    crate::gohttp::shutdown();
+    result
 }
 
 pub(crate) async fn serve_with_shutdown<F>(

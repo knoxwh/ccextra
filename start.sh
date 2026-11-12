@@ -57,9 +57,12 @@ listen_pids() {
     lsof -ti :8222 -sTCP:LISTEN 2>/dev/null || true
 }
 
+# 只匹配 ccextra 本体:裸 "$BIN" 前缀也会命中同目录 ccextra-gohttp
+BIN_RE="^${BIN}( |\$)"
+
 # 本仓库二进制的进程
 our_pids() {
-    pgrep -f "$BIN" 2>/dev/null || true
+    pgrep -f "$BIN_RE" 2>/dev/null || true
 }
 
 # 若 8222 被非本仓库二进制占用则失败
@@ -68,7 +71,7 @@ fail_if_foreign_listener() {
     for pid in $(listen_pids); do
         cmd=$(ps -p "$pid" -o command= 2>/dev/null || true)
         case "$cmd" in
-            "$BIN"*|"$BIN "*) ;;
+            "$BIN"|"$BIN "*) ;;
             *)
                 echo "端口 8222 已被其他进程占用 (PID: $pid, cmd: $cmd)，请先处理后再 start" >&2
                 exit 1

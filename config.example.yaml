@@ -49,6 +49,12 @@ secret_key: "sk-ccextra-xxx"
 # Antigravity 连接池(可选)。默认短连接:空闲连接响应结束即关闭,
 # 防止凭证轮换下 socket 堆积与陈旧连接错误;仅显式 enabled: true 才保留池。
 # antigravity:
+#   # 数据面经同目录 ccextra-gohttp(Go net/http,官方 TLS 指纹)转发;默认 false = reqwest。
+#   # 打开后 ccextra 自己拉起/收掉 sidecar(socket 在配置文件旁 .cache/),/reload 生效。
+#   # 找不到二进制即报错,不回退;走本次请求已解析的代理(http/https/socks5→socks5h,direct/none 直连)。
+#   # 仅切 AG 数据面,OAuth 刷新/模型列表仍走 reqwest(按代理配置)。
+#   # 打开后下面 connection-pool 不生效:池由 Go 默认 Transport 管(短连接默认、按凭证隔离都不适用)。
+#   gohttp: false
 #   connection-pool:
 #     enabled: false             # 是否启用连接池(默认 false = 短连接)
 #     idle-conn-timeout: "30s"   # 空闲连接存活时长(默认 30s,上限 210s)

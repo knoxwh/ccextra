@@ -16,6 +16,7 @@ models.json
 
 # 编译产物
 /ccextra
+/ccextra-gohttp
 
 # 运行时日志
 /logs/

@@ -9,6 +9,10 @@ LABEL="com.wanghao.ccextra"
 UID_NUM="$(id -u)"
 DOMAIN="gui/${UID_NUM}"
 SERVICE="${DOMAIN}/${LABEL}"
+# 只匹配 ccextra 本体:裸 "$BIN" 前缀也会命中同目录 ccextra-gohttp(sidecar 由下方孤儿段处理)
+BIN_RE="^${BIN}( |\$)"
+SIDECAR="ccextra-gohttp"
+SOCK_DIR="$SCRIPT_DIR/.cache"
 
 # 记录谁触发了 stop，方便下次对照 SIGTERM（写入 launchd 活跃日志）
 log_stop_caller() {
@@ -54,7 +58,7 @@ fi
 
 # 等待 launchd 子进程退出
 for _ in $(seq 1 20); do
-    if ! pgrep -f "$BIN" >/dev/null 2>&1 \
+    if ! pgrep -f "$BIN_RE" >/dev/null 2>&1 \
         && ! lsof -ti :8222 -sTCP:LISTEN >/dev/null 2>&1; then
         break
     fi
@@ -62,7 +66,7 @@ for _ in $(seq 1 20); do
 done
 
 # 孤儿：本仓库二进制
-for pid in $(pgrep -f "$BIN" 2>/dev/null || true); do
+for pid in $(pgrep -f "$BIN_RE" 2>/dev/null || true); do
     echo "Stopping orphan $BIN (PID: $pid)"
     kill "$pid" 2>/dev/null || true
 done
@@ -75,7 +79,7 @@ for pid in $(lsof -ti :8222 -sTCP:LISTEN 2>/dev/null || true); do
 done
 
 for _ in $(seq 1 10); do
-    if ! pgrep -f "$BIN" >/dev/null 2>&1 \
+    if ! pgrep -f "$BIN_RE" >/dev/null 2>&1 \
         && ! lsof -ti :8222 -sTCP:LISTEN >/dev/null 2>&1; then
         echo "ccextra stopped"
         break
@@ -84,12 +88,45 @@ for _ in $(seq 1 10); do
 done
 
 # 强杀残留
-if pgrep -f "$BIN" >/dev/null 2>&1; then
+if pgrep -f "$BIN_RE" >/dev/null 2>&1; then
     echo "Force killing $BIN"
-    pkill -9 -f "$BIN" 2>/dev/null || true
+    pkill -9 -f "$BIN_RE" 2>/dev/null || true
 fi
 for pid in $(lsof -ti :8222 -sTCP:LISTEN 2>/dev/null || true); do
     echo "Force killing process on port 8222 (PID: $pid)"
     kill -9 "$pid" 2>/dev/null || true
+done
+
+# 孤儿 sidecar:进程名精确为 ccextra-gohttp 且 PPID=1(父 ccextra 已死、被 launchd 收养)。
+# 父进程仍活着的(另一实例 / 测试)不动。先 SIGTERM(它自己删 socket),超时才 -9。
+orphan_sidecars() {
+    local pid ppid
+    for pid in $(pgrep -x -U "$UID_NUM" "$SIDECAR" 2>/dev/null || true); do
+        ppid=$(ps -o ppid= -p "$pid" 2>/dev/null | tr -d ' ' || true)
+        [ "$ppid" = "1" ] && echo "$pid"
+    done
+    return 0
+}
+for pid in $(orphan_sidecars); do
+    echo "Stopping orphan $SIDECAR (PID: $pid)"
+    kill "$pid" 2>/dev/null || true
+done
+for _ in $(seq 1 10); do
+    [ -z "$(orphan_sidecars)" ] && break
+    sleep 0.2
+done
+for pid in $(orphan_sidecars); do
+    echo "Force killing orphan $SIDECAR (PID: $pid)"
+    kill -9 "$pid" 2>/dev/null || true
+done
+# 残留 socket:文件名 ccextra-gohttp-<ccextra pid>-<seq>.sock,所属 ccextra 已不在才删
+for sock in "$SOCK_DIR/$SIDECAR"-*.sock; do
+    [ -S "$sock" ] || continue
+    owner=${sock##*/"$SIDECAR"-}
+    owner=${owner%%-*}
+    if [[ "$owner" =~ ^[0-9]+$ ]] && ! kill -0 "$owner" 2>/dev/null; then
+        echo "Removing stale socket $sock"
+        rm -f "$sock"
+    fi
 done
 echo "=== ccextra stopped ==="
