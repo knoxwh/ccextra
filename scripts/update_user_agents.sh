@@ -196,22 +196,11 @@ if [[ -n "$LATEST_GROK_VER" ]]; then
     NEW_GROK="${LATEST_GROK_VER}"
 fi
 
-# antigravity 版本 -> cl(changelist)。只收有出处的值：2.23.0/2.24.0/2.29.0 为 CPA 已核实，
-# 2.31.2 取自官方 language_server --stamp 实测。未知版本输出空(省略 cl)，不沿用旧版本的 cl。
-antigravity_cl() {
-    case "$1" in
-        2.23.0) echo "998057262" ;;
-        2.24.0) echo "1000335682" ;;
-        2.29.0) echo "1013060670" ;;
-        2.31.2) echo "1019359392" ;;
-    esac
-}
-
-# 整串按官方 language_server 格式重写(manifest 为 latest-arm64-mac，os_type/arch 固定)，不保留旧后缀
+# 整串按官方 language_server 格式重写(manifest 为 latest-arm64-mac，os_type/arch 固定)，不保留旧后缀；
+# 有意省略 cl(changelist)：manifest 不含 cl，采集需下载官方二进制，成本高、影响小
 NEW_ANTIGRAVITY=""
 if [[ -n "$LATEST_ANTIGRAVITY_VER" ]]; then
-    ANTIGRAVITY_CL="$(antigravity_cl "$LATEST_ANTIGRAVITY_VER")"
-    NEW_ANTIGRAVITY="antigravity/hub/${LATEST_ANTIGRAVITY_VER} (aidev_client; os_type=darwin; arch=arm64${ANTIGRAVITY_CL:+; cl=${ANTIGRAVITY_CL}})"
+    NEW_ANTIGRAVITY="antigravity/hub/${LATEST_ANTIGRAVITY_VER} (aidev_client; os_type=darwin; arch=arm64)"
 fi
 
 # 3. 对比展示

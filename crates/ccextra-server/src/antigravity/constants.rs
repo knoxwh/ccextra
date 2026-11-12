@@ -26,10 +26,10 @@ pub const API_VERSION: &str = "v1internal";
 /// 写死 hub 回退版本,不拉 updater manifest
 /// Cloud Code 拒绝 <2.23.0 客户端访问新模型,此版本必须 ≥2.23.0(对齐 CPA 8fb633c9;版本对齐 CPA f72f8bfd)
 /// 聊天 UA（user_agents.antigravity）与 fetch_models / login 缺省同源，避免版本分裂。
-/// 格式对齐官方 2.31.2 language_server 实测 UA（cl 取自其 --stamp）。
+/// 格式对齐官方 2.31.2 language_server 实测 UA，有意省略 cl（采集成本高、影响小）。
 macro_rules! antigravity_hub_ua {
     () => {
-        "antigravity/hub/2.31.2 (aidev_client; os_type=darwin; arch=arm64; cl=1019359392)"
+        "antigravity/hub/2.31.2 (aidev_client; os_type=darwin; arch=arm64)"
     };
 }
 pub const REQUEST_UA: &str = antigravity_hub_ua!();
@@ -143,7 +143,7 @@ mod tests {
 
     #[test]
     fn official_aidev_client_ua_format() {
-        let ua = "antigravity/hub/2.31.2 (aidev_client; os_type=darwin; arch=arm64; cl=1019359392)";
+        let ua = "antigravity/hub/2.31.2 (aidev_client; os_type=darwin; arch=arm64)";
         assert_eq!(REQUEST_UA, ua);
         assert_eq!(version_from_user_agent(ua), "2.31.2");
         assert_eq!(base_user_agent(ua), ua);
