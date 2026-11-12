@@ -182,10 +182,21 @@ pub fn convert_to_gemini_with_registry(
         match thinking_obj.get("type").and_then(|t| t.as_str()) {
             Some("enabled") => {
                 if let Some(budget) = thinking_obj.get("budget_tokens").and_then(|b| b.as_i64()) {
-                    generation_config.insert(
-                        "thinkingConfig".into(),
-                        serde_json::json!({"thinkingBudget": budget}),
-                    );
+                    // Gemini 4 不收 thinkingBudget(官方 400 INVALID_ARGUMENT):直连按预算
+                    // 映射 LOW/MEDIUM/HIGH(有意偏离 CPA 原样转发);Antigravity 未抓包核实,保持原样
+                    if flavor == SchemaFlavor::Gemini && is_gemini_4_model(upstream_model) {
+                        if let Some(level) = gemini_4_level_from_budget(budget) {
+                            generation_config.insert(
+                                "thinkingConfig".into(),
+                                serde_json::json!({"thinkingLevel": level}),
+                            );
+                        }
+                    } else {
+                        generation_config.insert(
+                            "thinkingConfig".into(),
+                            serde_json::json!({"thinkingBudget": budget}),
+                        );
+                    }
                 }
             }
             Some("adaptive") | Some("auto") => {
@@ -331,13 +342,33 @@ fn neutralize_claude_identity(text: &str) -> String {
 
 /// 对齐 CPA registry models.json gemini 节 thinking.max(仅 Gemini 直连目标)
 /// 未收录模型返回 None(兜底 thinkingLevel=high)
+/// Gemini 4 返回 None:官方不收 thinkingBudget(400),「开到最大」改由 HIGH 表达,
+/// 有意不跟 CPA 的 65535
 fn gemini_thinking_max_budget(model: &str) -> Option<i64> {
     Some(match model {
+        m if is_gemini_4_model(m) => return None,
         "gemini-2.5-flash" | "gemini-2.5-flash-lite" => 24576,
         // 2.5-pro 与 3.x 系列统一 32768
         m if m.starts_with("gemini-") => 32768,
         _ => return None,
     })
+}
+
+/// Gemini 4 系列(gemini-4-argon / gemini-4-carbon 等):只认 thinkingLevel
+fn is_gemini_4_model(model: &str) -> bool {
+    model.trim().to_ascii_lowercase().starts_with("gemini-4")
+}
+
+/// Gemini 4 预算 → thinkingLevel:不支持 MINIMAL,关闭/极小抬到 LOW,超高落到 HIGH;
+/// auto(-1)/非法值返回 None(不发 thinkingConfig,交上游默认)
+fn gemini_4_level_from_budget(budget: i64) -> Option<&'static str> {
+    use crate::thinking::Level;
+    match crate::thinking::budget_to_level(budget)? {
+        Level::None | Level::Minimal | Level::Low => Some("LOW"),
+        Level::Medium => Some("MEDIUM"),
+        Level::High | Level::XHigh | Level::Max => Some("HIGH"),
+        Level::Auto => None,
+    }
 }
 
 /// 对齐 CPA contentHasFunctionResponse:content turn 是否含 functionResponse part
@@ -839,6 +870,86 @@ IMPORTANT: Assist with authorized security testing.
         assert!(gemini["generationConfig"]["thinkingConfig"]
             .get("thinkingLevel")
             .is_none());
+    }
+
+    #[test]
+    fn test_convert_to_gemini_4_adaptive_and_max_use_high_level() {
+        // Gemini 4 不收 thinkingBudget:adaptive 无 effort / effort=max 走 HIGH 兜底
+        for model in ["gemini-4-argon", "gemini-4-carbon"] {
+            for effort in [None, Some("max")] {
+                let mut anthropic = json!({
+                    "model": "m", "max_tokens": 1000,
+                    "thinking": {"type": "adaptive"},
+                    "messages": [{"role": "user", "content": "hi"}]
+                });
+                if let Some(effort) = effort {
+                    anthropic["output_config"] = json!({"effort": effort});
+                }
+                let (gemini, _) = convert_to_gemini(&anthropic, model);
+                let cfg = &gemini["generationConfig"]["thinkingConfig"];
+                assert!(cfg.get("thinkingBudget").is_none(), "{model} {effort:?}");
+                assert_eq!(cfg["thinkingLevel"], "HIGH", "{model} {effort:?}");
+            }
+        }
+    }
+
+    #[test]
+    fn test_convert_to_gemini_4_enabled_budget_maps_to_level() {
+        // Gemini 直连 enabled+budget_tokens:Gemini 4 映射档位(无 MINIMAL),不发预算
+        for model in ["gemini-4-argon", "gemini-4-carbon"] {
+            for (budget, level) in [
+                (512, Some("LOW")),
+                (1024, Some("LOW")),
+                (4096, Some("MEDIUM")),
+                (24576, Some("HIGH")),
+                (31999, Some("HIGH")),
+                (128000, Some("HIGH")),
+                (-1, None),
+            ] {
+                let anthropic = json!({
+                    "model": "m", "max_tokens": 1000,
+                    "thinking": {"type": "enabled", "budget_tokens": budget},
+                    "messages": [{"role": "user", "content": "hi"}]
+                });
+                let (gemini, _) = convert_to_gemini(&anthropic, model);
+                let cfg = gemini["generationConfig"].get("thinkingConfig");
+                match level {
+                    Some(level) => {
+                        let cfg = cfg.expect("应有 thinkingConfig");
+                        assert!(cfg.get("thinkingBudget").is_none(), "{model} {budget}");
+                        assert_eq!(cfg["thinkingLevel"], level, "{model} {budget}");
+                    }
+                    None => assert!(cfg.is_none(), "{model} {budget}"),
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn test_convert_to_antigravity_gemini_4_thinking_unchanged() {
+        // Antigravity:adaptive 恒走小写 thinkingLevel;enabled 预算原样转发(未抓包,暂不改)
+        let adaptive = json!({
+            "model": "m", "max_tokens": 1000,
+            "thinking": {"type": "adaptive"},
+            "messages": [{"role": "user", "content": "hi"}]
+        });
+        let (gemini, _) =
+            convert_to_gemini_with(&adaptive, "gemini-4-argon-high", SchemaFlavor::Antigravity);
+        assert_eq!(
+            gemini["generationConfig"]["thinkingConfig"]["thinkingLevel"],
+            "high"
+        );
+        let enabled = json!({
+            "model": "m", "max_tokens": 1000,
+            "thinking": {"type": "enabled", "budget_tokens": 4096},
+            "messages": [{"role": "user", "content": "hi"}]
+        });
+        let (gemini, _) =
+            convert_to_gemini_with(&enabled, "gemini-4-argon-high", SchemaFlavor::Antigravity);
+        assert_eq!(
+            gemini["generationConfig"]["thinkingConfig"]["thinkingBudget"],
+            4096
+        );
     }
 
     #[test]
