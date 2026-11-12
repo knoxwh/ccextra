@@ -15,7 +15,7 @@ use super::gemini::{convert_to_gemini_with_registry, SchemaFlavor};
 ///   "model": "gemini-3.8-flash-medium",
 ///   "userAgent": "antigravity",
 ///   "requestType": "agent",
-///   "requestId": "agent-<hex>",
+///   "requestId": "agent/<cascade-uuid>/<unix-ms>/<trajectory-uuid>/<step>",
 ///   "request": {
 ///     "contents": [...],
 ///     "sessionId": "-<int64>"
@@ -44,12 +44,24 @@ pub fn convert_to_antigravity_with(
     let (gemini_body, short_to_original) =
         convert_to_gemini_with_registry(body, upstream_model, SchemaFlavor::Antigravity, registry);
 
+    // 对齐 CPA DerivedAntigravitySessionID:客户端显式 session 优先
+    // sha256("cli-proxy-api:antigravity:derived-session\0" + id) 转负数
+    let empty = serde_json::Map::new();
+    let gemini_obj_ref = gemini_body.as_object().unwrap_or(&empty);
+    let derived_session_id = if let Some(sid) = session_id.filter(|s| !s.trim().is_empty()) {
+        derived_antigravity_session_id(sid)
+    } else {
+        stable_session_id(gemini_obj_ref)
+    };
+    // 对齐官方 2.31.2 language_server requestId 形态;两个 UUID 由 sessionId 稳定派生
+    let request_id = official_request_id(&derived_session_id, user_turn_count(gemini_obj_ref));
+
     // 2. 包裹为 Antigravity 格式(对齐 CLIProxyAPI geminiToAntigravity)
     let mut antigravity = serde_json::json!({
         "model": upstream_model,
         "userAgent": "antigravity",
         "requestType": "agent",
-        "requestId": format!("agent-{}", random_hex_id()),
+        "requestId": request_id,
         "request": {}
     });
     // 对齐 CPA:project 为空时不写该键
@@ -110,14 +122,7 @@ pub fn convert_to_antigravity_with(
         // 对齐 CPA dc21a426:归一化 responseJsonSchema/response_json_schema → responseSchema
         normalize_generation_config_response_schema(&mut request_obj);
 
-        // 对齐 CPA DerivedAntigravitySessionID:客户端显式 session 优先
-        // sha256("cli-proxy-api:antigravity:derived-session\0" + id) 转负数
-        let session_id = if let Some(sid) = session_id.filter(|s| !s.trim().is_empty()) {
-            derived_antigravity_session_id(sid)
-        } else {
-            stable_session_id(&request_obj)
-        };
-        request_obj.insert("sessionId".to_string(), Value::String(session_id));
+        request_obj.insert("sessionId".to_string(), Value::String(derived_session_id));
 
         antigravity["request"] = Value::Object(request_obj);
     }
@@ -207,15 +212,59 @@ fn random_u64() -> u64 {
     u64::from_be_bytes(d[..8].try_into().unwrap())
 }
 
-fn random_hex_id() -> String {
+/// 官方 language_server 形态:`agent/<cascade>/<unix-ms>/<trajectory>/<step>`。
+/// cascade / trajectory 由 seed 经不同命名空间稳定派生(同 seed 同值,两者不同)。
+fn official_request_id(seed: &str, step: usize) -> String {
+    let millis = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map(|d| d.as_millis())
+        .unwrap_or(0);
     format!(
-        "{:08x}-{:04x}-{:04x}-{:04x}-{:012x}",
-        random_u64() as u32,
-        random_u64() as u16,
-        random_u64() as u16,
-        random_u64() as u16,
-        random_u64() & 0xFFFF_FFFF_FFFF
+        "agent/{}/{millis}/{}/{step}",
+        derived_uuid(b"ccextra:antigravity:cascade-id\0", seed),
+        derived_uuid(b"ccextra:antigravity:trajectory-id\0", seed),
     )
+}
+
+/// sha256(namespace + seed) 前 16 字节,置 v4 版本/变体位,格式化为 UUID
+fn derived_uuid(namespace: &[u8], seed: &str) -> String {
+    use sha2::Digest;
+    let mut h = sha2::Sha256::new();
+    h.update(namespace);
+    h.update(seed.as_bytes());
+    let d = h.finalize();
+    let mut b: [u8; 16] = d[..16].try_into().unwrap();
+    b[6] = (b[6] & 0x0F) | 0x40;
+    b[8] = (b[8] & 0x3F) | 0x80;
+    let hex: String = b.iter().map(|x| format!("{x:02x}")).collect();
+    format!(
+        "{}-{}-{}-{}-{}",
+        &hex[..8],
+        &hex[8..12],
+        &hex[12..16],
+        &hex[16..20],
+        &hex[20..]
+    )
+}
+
+/// 步数从简:含文本的 user 轮次数(工具结果轮不计),至少 1
+fn user_turn_count(request_obj: &serde_json::Map<String, Value>) -> usize {
+    let n = request_obj
+        .get("contents")
+        .and_then(|c| c.as_array())
+        .map(|contents| {
+            contents
+                .iter()
+                .filter(|c| c.get("role").and_then(|r| r.as_str()) == Some("user"))
+                .filter(|c| {
+                    c.get("parts")
+                        .and_then(|p| p.as_array())
+                        .is_some_and(|parts| parts.iter().any(|p| p.get("text").is_some()))
+                })
+                .count()
+        })
+        .unwrap_or(0);
+    n.max(1)
 }
 
 #[cfg(test)]
@@ -458,6 +507,79 @@ mod tests {
         assert!(sid1.starts_with('-'));
         let n: i64 = sid1.parse().expect("valid i64");
         assert!(n < 0);
+    }
+
+    /// 解析 `agent/<uuid>/<ms>/<uuid>/<step>`,返回 (cascade, ms, traj, step)
+    fn parse_request_id(id: &str) -> (String, u128, String, usize) {
+        fn is_uuid(s: &str) -> bool {
+            let groups: Vec<_> = s.split('-').collect();
+            groups.iter().map(|g| g.len()).collect::<Vec<_>>() == [8, 4, 4, 4, 12]
+                && groups.iter().all(|g| {
+                    g.chars()
+                        .all(|c| c.is_ascii_hexdigit() && !c.is_ascii_uppercase())
+                })
+        }
+        let parts: Vec<_> = id.split('/').collect();
+        assert_eq!(parts.len(), 5, "{id}");
+        assert_eq!(parts[0], "agent", "{id}");
+        assert!(is_uuid(parts[1]) && is_uuid(parts[3]), "{id}");
+        let step: usize = parts[4].parse().unwrap();
+        assert!(step >= 1, "{id}");
+        (
+            parts[1].to_string(),
+            parts[2].parse().unwrap(),
+            parts[3].to_string(),
+            step,
+        )
+    }
+
+    #[test]
+    fn test_request_id_official_shape_and_stable_per_session() {
+        let req1 = json!({
+            "messages": [{"role": "user", "content": "hello"}]
+        });
+        let req2 = json!({
+            "messages": [
+                {"role": "user", "content": "hello"},
+                {"role": "assistant", "content": "hi"},
+                {"role": "user", "content": "again"}
+            ]
+        });
+        let (out1, _) =
+            convert_to_antigravity_with(&req1, "gemini-2.5-pro", None, &[], Some("s-1"));
+        let (out2, _) =
+            convert_to_antigravity_with(&req2, "gemini-2.5-pro", None, &[], Some("s-1"));
+        let (out3, _) =
+            convert_to_antigravity_with(&req1, "gemini-2.5-pro", None, &[], Some("s-2"));
+        let (c1, ms1, t1, step1) = parse_request_id(out1["requestId"].as_str().unwrap());
+        let (c2, _, t2, step2) = parse_request_id(out2["requestId"].as_str().unwrap());
+        let (c3, _, t3, _) = parse_request_id(out3["requestId"].as_str().unwrap());
+        assert_eq!((c1.as_str(), t1.as_str()), (c2.as_str(), t2.as_str()));
+        assert_ne!(c1, t1);
+        assert_ne!(c1, c3);
+        assert_ne!(t1, t3);
+        assert_eq!(step1, 1);
+        assert_eq!(step2, 2);
+        assert!(ms1 > 1_700_000_000_000);
+        // 键顺序不变:requestId 仍在 request 之前
+        let keys: Vec<_> = out1.as_object().unwrap().keys().cloned().collect();
+        assert_eq!(
+            keys,
+            ["model", "userAgent", "requestType", "requestId", "request"]
+        );
+    }
+
+    #[test]
+    fn test_request_id_without_session_is_valid_shape() {
+        let (out, _) = convert_to_antigravity(&json!({"messages": []}), "gemini-2.5-pro", None);
+        let (_, _, _, step) = parse_request_id(out["requestId"].as_str().unwrap());
+        assert_eq!(step, 1);
+        let req = json!({"messages": [{"role": "user", "content": "same text"}]});
+        let (a, _) = convert_to_antigravity(&req, "gemini-2.5-pro", None);
+        let (b, _) = convert_to_antigravity(&req, "gemini-2.5-pro", None);
+        let (ca, _, ta, _) = parse_request_id(a["requestId"].as_str().unwrap());
+        let (cb, _, tb, _) = parse_request_id(b["requestId"].as_str().unwrap());
+        assert_eq!((ca, ta), (cb, tb));
     }
 
     #[test]
