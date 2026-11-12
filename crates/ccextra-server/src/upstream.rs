@@ -585,6 +585,8 @@ impl UpstreamClient {
                     .pool_max_idle_per_host(pool.max_idle_conns_per_host)
                     .pool_idle_timeout(pool.idle_conn_timeout);
             }
+            // 对齐官方 language_server(Go net/http):Accept-Encoding 只报 gzip,仍自动解压 gzip
+            builder = builder.no_brotli().no_zstd().no_deflate();
         }
         if proxy_key == "direct" {
             builder = builder.no_proxy();
@@ -2047,6 +2049,58 @@ mod tests {
                 None,
             )
             .await
+    }
+
+    /// 抓线:Antigravity client 出站 Accept-Encoding 只有 gzip;其余协议不变。
+    /// 注:reqwest 0.13.5 在 execute 时总会合并内置默认 `accept: */*`,无公开 API 去掉。
+    #[tokio::test]
+    async fn antigravity_wire_accept_encoding_gzip_only() {
+        use tokio::io::{AsyncReadExt, AsyncWriteExt};
+        async fn capture(protocol: Protocol) -> String {
+            let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+            let addr = listener.local_addr().unwrap();
+            let server = tokio::spawn(async move {
+                let (mut socket, _) = listener.accept().await.unwrap();
+                let mut buf = Vec::new();
+                let mut chunk = [0u8; 4096];
+                while !buf.windows(4).any(|w| w == b"\r\n\r\n") {
+                    let n = socket.read(&mut chunk).await.unwrap();
+                    if n == 0 {
+                        break;
+                    }
+                    buf.extend_from_slice(&chunk[..n]);
+                }
+                socket
+                    .write_all(
+                        b"HTTP/1.1 200 OK\r\ncontent-length: 2\r\nconnection: close\r\n\r\n{}",
+                    )
+                    .await
+                    .unwrap();
+                String::from_utf8_lossy(&buf).to_ascii_lowercase()
+            });
+            let client = UpstreamClient::new(Some("direct".into()));
+            let http = client.client_for("direct", protocol, false, "").unwrap();
+            let policy = if matches!(protocol, Protocol::Antigravity) {
+                AcceptScrubPolicy::LeaveClientDefault
+            } else {
+                AcceptScrubPolicy::ForceApplicationJson
+            };
+            send_with_timeout(
+                http.post(format!("http://{addr}/x"))
+                    .header(reqwest::header::CONTENT_TYPE, "application/json")
+                    .body("{}"),
+                policy,
+                std::time::Duration::from_secs(5),
+            )
+            .await
+            .unwrap();
+            server.await.unwrap()
+        }
+        let ag = capture(Protocol::Antigravity).await;
+        assert!(ag.contains("\r\naccept-encoding: gzip\r\n"), "{ag}");
+        let other = capture(Protocol::OpenAiChat).await;
+        assert!(other.contains("\r\naccept-encoding: "), "{other}");
+        assert!(!other.contains("\r\naccept-encoding: gzip\r\n"), "{other}");
     }
 
     #[tokio::test]
