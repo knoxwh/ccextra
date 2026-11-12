@@ -808,6 +808,15 @@ mod tests {
         assert_eq!(launches.load(Ordering::SeqCst), 2);
     }
 
+    /// 测试里手动拉起的 sidecar:panic 时也 SIGKILL 并回收,避免泄漏进程。
+    struct KillOnDrop(Child);
+    impl Drop for KillOnDrop {
+        fn drop(&mut self) {
+            let _ = self.0.kill();
+            let _ = self.0.wait();
+        }
+    }
+
     /// 自签证书(SAN localhost/127.0.0.1),经 SSL_CERT_FILE 只让测试 sidecar 信任(Go 1.27 在 macOS 也生效)
     fn test_cert(dir: &Path) -> (PathBuf, PathBuf) {
         let (cert, key) = (dir.join("cert.pem"), dir.join("key.pem"));
@@ -893,13 +902,15 @@ mod tests {
         });
 
         let sock = dir.path().join("s").join("gohttp.sock");
-        let mut child = Command::new(&bin)
-            .arg("-socket")
-            .arg(&sock)
-            .env("SSL_CERT_FILE", &cert)
-            .stdin(Stdio::null())
-            .spawn()
-            .unwrap();
+        let _child = KillOnDrop(
+            Command::new(&bin)
+                .arg("-socket")
+                .arg(&sock)
+                .env("SSL_CERT_FILE", &cert)
+                .stdin(Stdio::null())
+                .spawn()
+                .unwrap(),
+        );
         let client = UpstreamClient::new(Some("direct".into())).with_gohttp_lane(Arc::new(
             Lane::fixed_for_test(Ok(Arc::new(Sidecar::attach_for_test(sock)))),
         ));
@@ -920,14 +931,7 @@ mod tests {
                 None,
             )
             .await;
-        let resp = match resp {
-            Ok(r) => r,
-            Err(e) => {
-                child.kill().ok();
-                child.wait().ok();
-                panic!("{e}");
-            }
-        };
+        let resp = resp.unwrap();
         assert_eq!(resp.status, 200);
         assert!(
             resp.body.headers().get("content-encoding").is_none(),
@@ -954,7 +958,5 @@ mod tests {
         assert_eq!(got, b"data: 1\n\ndata: 2\n\n");
         let head = upstream.await.unwrap();
         assert!(head.contains("\r\naccept-encoding: gzip"), "{head}");
-        child.kill().unwrap();
-        child.wait().unwrap();
     }
 }
