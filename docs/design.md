@@ -37,7 +37,7 @@ ccextra 将 Anthropic Messages 入口接到不同上游协议，同时尽量保�
 1. 读取请求体（上限 10 MiB，超出返回 413）并校验 `x-api-key` 或 `Authorization: Bearer`。
 2. 由入站 `model` 解析 `(provider, protocol, upstream_model)`。
 3. 按协议执行转换前归一化。
-4. 转换成目标请求体，或在 Claude 路径只替换 `model`，再清洗非 Claude 模型的 system 并钳制其越档 effort。
+4. 转换成目标请求体，或在 Claude 路径只替换 `model`，再清洗非 Claude 模型的 system，并按 `models.json` 钳制已登记模型的越档 effort。
 5. OpenAI 路径执行转换后归一化；Gemini 和 Antigravity 跳过该步骤。
 6. 应用 `payload` 顶层参数覆盖，保留已有非空 `prompt_cache_key`。
 7. 为符合条件的 OpenAI 请求注入会话 cache key，必要时写诊断日志。
@@ -60,7 +60,7 @@ ccextra 将 Anthropic Messages 入口接到不同上游协议，同时尽量保�
 
 ### Claude
 
-`convert_passthrough` 只改 `model`，再对非 Claude 模型做两件事。一是 system 清洗（对齐 chat/responses/gemini）：顶层 `system` 与 `messages` 内 `role: system` 项剥掉计费归属指纹（逐请求变化，破坏上游缓存前缀；归属行与指令同块时只剥前导行、保留剩余指令，对齐 sub2api）、Claude 身份声明与 `<identity>`/`<rules>`/`# Output Style:` 等 Claude 触发段，保留白名单段与 `cache_control`，清空后移除该块或消息。二是越档 effort 钳制：命中 glob `*claude*` 的模型、`thinking.type: disabled` 或注册表未命中的请求跳过；写回优先顶层 `output_config.effort`，回退 `thinking.output_config.effort`，值不变不写回。条目设置 `force_effort` 时改写为该固定值（不钳制），跳过条件不变。`*claude*` 模型两项都跳过，保持逐字节直通。身份头按排除表透传，`anthropic-beta` 默认原样转发；订阅 OAuth（`sk-ant-oat*`）缺 `oauth-2025-04-20` 时补上，已有则不动。
+`convert_passthrough` 只改 `model`，再做两件事。一是对非 Claude 模型做 system 清洗（对齐 chat/responses/gemini）：顶层 `system` 与 `messages` 内 `role: system` 项剥掉计费归属指纹（逐请求变化，破坏上游缓存前缀；归属行与指令同块时只剥前导行、保留剩余指令，对齐 sub2api）、Claude 身份声明与 `<identity>`/`<rules>`/`# Output Style:` 等 Claude 触发段，保留白名单段与 `cache_control`，清空后移除该块或消息。二是越档 effort 钳制（Claude 模型同样生效）：`thinking.type: disabled`、无显式 effort 或注册表未命中的请求跳过；写回优先顶层 `output_config.effort`，回退 `thinking.output_config.effort`，值不变不写回。条目设置 `force_effort` 时改写为该固定值（不钳制），跳过条件不变。`*claude*` 模型跳过 system 清洗；未登记或 effort 不变时保持逐字节直通。身份头按排除表透传，`anthropic-beta` 默认原样转发；订阅 OAuth（`sk-ant-oat*`）缺 `oauth-2025-04-20` 时补上，已有则不动。
 
 ### OpenAI Chat
 

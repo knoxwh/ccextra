@@ -1,7 +1,7 @@
 // Claude 直通:只改 model 字段,其余字节原样保留
 //
-// 例外:非 Claude 模型的越档 effort 由 clamp_passthrough_effort 钳制
-// (百炼等上游对越档值直接 400,见函数文档)。
+// 例外:models.json 已登记模型的越档 effort 由 clamp_passthrough_effort 钳制
+// 或按 force_effort 改写(百炼等上游对越档值直接 400,见函数文档)。
 // serde_json 的 preserve_order feature 保证 Map 顺序,最小化字节变化。
 
 use super::Result;
@@ -207,10 +207,9 @@ fn sanitize_system_messages(body: &mut Value, upstream_model: &str) -> bool {
 /// 非 Claude 模型经 claude 协议接入百炼等上游时,平台档位宽于模型档位
 /// (`medium`/`xhigh` 发给只有 `low`/`high`/`max` 的模型会 400),
 /// 故按 models.json 注册表钳到最近档;条目设置 `force_effort` 时
-/// 改写为该固定值(不钳制)。
+/// 改写为该固定值(不钳制)。Claude 模型同样生效(如 fable 固定 xhigh)。
 ///
 /// 跳过条件:
-/// - 上游模型匹配 glob `*claude*`(大小写不敏感):Claude 模型不钳
 /// - `thinking.type: "disabled"`:上游关闭思考时不校验 effort
 /// - 注册表查不到该模型或表为空:`clamp_effort` 原值返回,自然不写回
 ///
@@ -222,10 +221,6 @@ pub fn clamp_passthrough_effort(
     upstream_model: &str,
     registry: &[ModelCapability],
 ) -> bool {
-    // glob `*claude*` 等价于小写包含判断
-    if upstream_model.to_ascii_lowercase().contains("claude") {
-        return false;
-    }
     if body
         .get("thinking")
         .and_then(|t| t.get("type"))
@@ -275,7 +270,7 @@ mod tests {
     use super::*;
     use serde_json::json;
 
-    /// glm-5.3 只支持 low/high/max(对齐 models.json);claude-opus-5 用于验证跳过
+    /// glm-5.3 只支持 low/high/max(对齐 models.json);claude-opus-5 用于验证 Claude 也钳
     fn registry() -> Vec<ModelCapability> {
         vec![
             ModelCapability {
@@ -421,17 +416,25 @@ mod tests {
         }
     }
 
-    /// glob `*claude*` 模型不钳制,匹配大小写不敏感
+    /// 已登记的 Claude 模型同样钳制;未登记的 Claude 模型原样透传
     #[test]
-    fn test_claude_model_skipped() {
-        for model in ["claude-opus-5", "US.Anthropic.CLAUDE-Sonnet-4"] {
-            let mut body = json!({"output_config": {"effort": "medium"}});
-            assert!(
-                !clamp_passthrough_effort(&mut body, model, &registry()),
-                "{model}"
-            );
-            assert_eq!(body["output_config"]["effort"], "medium", "{model}");
-        }
+    fn test_claude_model_clamped_when_registered() {
+        let mut body = json!({"output_config": {"effort": "medium"}});
+        assert!(clamp_passthrough_effort(
+            &mut body,
+            "claude-opus-5",
+            &registry()
+        ));
+        assert_eq!(body["output_config"]["effort"], "low");
+
+        let mut body = json!({"model": "x", "output_config": {"effort": "medium"}, "messages": []});
+        let before = serde_json::to_string(&body).unwrap();
+        assert!(!clamp_passthrough_effort(
+            &mut body,
+            "US.Anthropic.CLAUDE-Sonnet-4",
+            &registry()
+        ));
+        assert_eq!(serde_json::to_string(&body).unwrap(), before);
     }
 
     /// 注册表未命中 / 表为空:不钳
@@ -524,9 +527,9 @@ mod tests {
         assert_eq!(serde_json::to_string(&body).unwrap(), before);
     }
 
-    /// force_effort 跳过条件与 clamp 一致:claude 模型、disabled 不改写
+    /// force_effort 对 claude 模型同样生效;disabled 照旧不改写
     #[test]
-    fn test_force_effort_skips_claude_and_disabled() {
+    fn test_force_effort_applies_to_claude_skips_disabled() {
         let reg = vec![ModelCapability {
             id: "claude-opus-5".into(),
             reasoning_levels: vec!["low".into(), "high".into()],
@@ -534,8 +537,8 @@ mod tests {
             max_completion_tokens: None,
         }];
         let mut body = json!({"output_config": {"effort": "high"}});
-        assert!(!clamp_passthrough_effort(&mut body, "claude-opus-5", &reg));
-        assert_eq!(body["output_config"]["effort"], "high");
+        assert!(clamp_passthrough_effort(&mut body, "claude-opus-5", &reg));
+        assert_eq!(body["output_config"]["effort"], "low");
 
         let reg2 = vec![ModelCapability {
             id: "glm-5.3".into(),
@@ -547,6 +550,37 @@ mod tests {
             json!({"thinking": {"type": "disabled", "output_config": {"effort": "high"}}});
         assert!(!clamp_passthrough_effort(&mut body2, "glm-5.3", &reg2));
         assert_eq!(body2["thinking"]["output_config"]["effort"], "high");
+    }
+
+    /// claude-fable-5-2 固定 xhigh(对齐 models.json):Claude Code 发 max 改写为 xhigh
+    #[test]
+    fn test_force_effort_fable_max_to_xhigh() {
+        let reg = vec![ModelCapability {
+            id: "claude-fable-5-2".into(),
+            reasoning_levels: vec![
+                "low".into(),
+                "medium".into(),
+                "high".into(),
+                "xhigh".into(),
+                "max".into(),
+            ],
+            force_effort: Some("xhigh".into()),
+            max_completion_tokens: Some(128000),
+        }];
+        let mut body = json!({
+            "model": "claude-fable-5-2",
+            "max_tokens": 64000,
+            "thinking": {"type": "adaptive"},
+            "output_config": {"effort": "max"},
+            "messages": []
+        });
+        assert!(clamp_passthrough_effort(
+            &mut body,
+            "claude-fable-5-2",
+            &reg
+        ));
+        assert_eq!(body["output_config"]["effort"], "xhigh");
+        assert_eq!(body["max_tokens"], 64000);
     }
 
     #[test]
