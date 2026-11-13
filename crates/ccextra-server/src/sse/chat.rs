@@ -859,12 +859,13 @@ fn take_complete_events(pending: &mut BytesMut, chunk: Bytes) -> Option<Bytes> {
 }
 
 /// 直通终态跟踪:按解析出的完整 SSE 事件名(不按字节子串)记录
-/// message_start 与终态(message_stop / error),正文里出现同名字样不算。
+/// message_start、终态(message_stop / error)与是否见过非 ping 事件,正文里出现同名字样不算。
 #[derive(Default)]
 struct PassthroughTerminal {
     parser: SseParser,
     started: bool,
     terminal: bool,
+    seen_event: bool,
 }
 
 impl PassthroughTerminal {
@@ -873,16 +874,20 @@ impl PassthroughTerminal {
         self.apply(events);
     }
 
-    /// EOF:连同未完结尾部一起判断;见过 message_start 却无终态即为截断
+    /// EOF:连同未完结尾部一起判断;无终态时,见过 message_start 或
+    /// 零有效内容(空流、纯 ping 流)即为截断;其他非 Messages 事件流原样透传。
     fn truncated_at_eof(&mut self, tail: &[u8]) -> bool {
         let mut events = self.parser.push(tail);
         events.extend(self.parser.finish());
         self.apply(events);
-        self.started && !self.terminal
+        !self.terminal && (self.started || !self.seen_event)
     }
 
     fn apply(&mut self, events: Vec<super::parser::SseEvent>) {
         for event in events {
+            if event.event.as_deref() != Some("ping") {
+                self.seen_event = true;
+            }
             match event.event.as_deref() {
                 Some("message_start") => self.started = true,
                 Some("message_stop" | "error") => self.terminal = true,
@@ -1947,6 +1952,36 @@ mod tests {
             err.contains("upstream stream ended before message_stop"),
             "{err}"
         );
+    }
+
+    #[tokio::test]
+    async fn test_claude_passthrough_empty_stream_emits_error() {
+        // 空流:零字节
+        let out = collect_passthrough(passthrough_chunks(&[])).await;
+        assert_eq!(out.len(), 1, "{out:?}");
+        let err = String::from_utf8_lossy(&out[0]);
+        assert!(err.starts_with("event: error\n"), "{err}");
+        assert!(err.contains("\"type\":\"timeout_error\""), "{err}");
+        assert!(
+            err.contains("upstream stream ended before message_stop"),
+            "{err}"
+        );
+    }
+
+    #[tokio::test]
+    async fn test_claude_passthrough_ping_only_emits_error() {
+        // 只有 ping 无 message_start
+        let out = collect_passthrough(passthrough_chunks(&[
+            "event: ping\ndata: {\"type\":\"ping\"}\n\n",
+            "event: ping\ndata: {\"type\":\"ping\"}\n\n",
+        ]))
+        .await;
+        assert_eq!(out.len(), 3, "{out:?}");
+        assert_eq!(&out[0][..], b"event: ping\ndata: {\"type\":\"ping\"}\n\n");
+        assert_eq!(&out[1][..], b"event: ping\ndata: {\"type\":\"ping\"}\n\n");
+        let err = String::from_utf8_lossy(&out[2]);
+        assert!(err.starts_with("event: error\n"), "{err}");
+        assert!(err.contains("\"type\":\"timeout_error\""), "{err}");
     }
 
     #[tokio::test]
