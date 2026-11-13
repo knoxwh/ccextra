@@ -248,8 +248,9 @@ where
                     if relay.finished {
                         break;
                     }
-                    tracing::error!("Gemini 流读取错误: {}", e);
-                    yield Ok(emit::timeout_error_event(&format!("上游流中断: {}", e)));
+                    let cause = crate::sse::error_chain(&e);
+                    tracing::error!("Gemini 流读取错误: {}", cause);
+                    yield Ok(emit::timeout_error_event(&format!("上游流中断: {}", cause)));
                     relay.upstream_failed = true;
                     break;
                 }

@@ -159,10 +159,14 @@ pub(crate) fn spawn_at(bin: &Path, dir: &Path) -> anyhow::Result<Sidecar> {
         std::process::id(),
         SEQ.fetch_add(1, Ordering::Relaxed)
     ));
+    // stdin 接管道、写端留在 Child 里(不 take):ccextra 无论怎么退出(含 kill -9 /
+    // panic=abort)写端都随进程关闭,sidecar 读到 EOF 自行删 socket 退出,不留孤儿。
+    // 需要支持 -exit-on-stdin-eof 的 sidecar(与本版本一起部署)。
     let child = Command::new(bin)
         .arg("-socket")
         .arg(&socket)
-        .stdin(Stdio::null())
+        .arg("-exit-on-stdin-eof")
+        .stdin(Stdio::piped())
         .spawn()
         .map_err(|e| anyhow::anyhow!("antigravity.gohttp: 拉起 {} 失败: {e}", bin.display()))?;
     tracing::info!(pid = child.id(), socket = %socket.display(), "ccextra-gohttp 已拉起");
@@ -642,13 +646,7 @@ mod tests {
     /// 真二进制回环:拉起、socket 0600、经 socket 转发(目标拒连 → sidecar 502)、SIGTERM 收掉
     #[tokio::test]
     async fn gohttp_real_binary_lifecycle() {
-        let bin = Path::new(env!("CARGO_MANIFEST_DIR"))
-            .join("../..")
-            .join(BINARY_NAME);
-        if !bin.is_file() {
-            eprintln!("skip: {} 不存在", bin.display());
-            return;
-        }
+        let Some(bin) = real_bin() else { return };
         let dir = tempfile::tempdir().unwrap();
         let sidecar = Arc::new(spawn_at(&bin, &dir.path().join("c")).unwrap());
         let mut req = reqwest::Request::new(
@@ -686,16 +684,30 @@ mod tests {
         assert!(!socket.exists());
     }
 
+    /// 真二进制:stdin 写端关闭(等同 ccextra 被 kill -9 / abort)后 sidecar 自行退出并删 socket
+    #[tokio::test]
+    async fn gohttp_real_binary_exits_when_parent_pipe_closes() {
+        let Some(bin) = real_bin() else { return };
+        let dir = tempfile::tempdir().unwrap();
+        let sidecar = spawn_at(&bin, &dir.path().join("c")).unwrap();
+        drop(sidecar.connect().await.unwrap()); // 已在 listen
+        let mut child = KillOnDrop(sidecar.child.lock().unwrap().take().unwrap());
+        drop(child.0.stdin.take());
+        let deadline = std::time::Instant::now() + Duration::from_secs(5);
+        while child.0.try_wait().unwrap().is_none() {
+            assert!(
+                std::time::Instant::now() < deadline,
+                "stdin EOF 后 sidecar 未退出"
+            );
+            tokio::time::sleep(Duration::from_millis(20)).await;
+        }
+        assert!(!sidecar.socket.exists(), "sidecar 应自行删 socket");
+    }
+
     /// 真二进制:代理不可达 → sidecar 502,错误里不带代理凭证,也不偷偷直连
     #[tokio::test]
     async fn gohttp_real_binary_proxy_error_hides_credentials() {
-        let bin = Path::new(env!("CARGO_MANIFEST_DIR"))
-            .join("../..")
-            .join(BINARY_NAME);
-        if !bin.is_file() {
-            eprintln!("skip: {} 不存在", bin.display());
-            return;
-        }
+        let Some(bin) = real_bin() else { return };
         // 目标在本地监听:若 sidecar 绕过代理直连,这里会收到连接
         let target = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
         target.set_nonblocking(true).unwrap();
@@ -733,10 +745,15 @@ mod tests {
         assert!(target.accept().is_err(), "代理失败不得回退直连");
     }
 
+    /// 默认用仓库根(线上部署)的二进制;`CCEXTRA_GOHTTP_TEST_BIN` 可指向临时构建的新版
     fn real_bin() -> Option<PathBuf> {
-        let bin = Path::new(env!("CARGO_MANIFEST_DIR"))
-            .join("../..")
-            .join(BINARY_NAME);
+        let bin = std::env::var_os("CCEXTRA_GOHTTP_TEST_BIN")
+            .map(PathBuf::from)
+            .unwrap_or_else(|| {
+                Path::new(env!("CARGO_MANIFEST_DIR"))
+                    .join("../..")
+                    .join(BINARY_NAME)
+            });
         if bin.is_file() {
             Some(bin)
         } else {

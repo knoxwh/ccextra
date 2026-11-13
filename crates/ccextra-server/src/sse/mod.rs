@@ -48,6 +48,22 @@ const KEEPALIVE_FRAME: &str = ": keepalive\n\n";
 pub(crate) const STREAM_IDLE_TIMEOUT: Duration = Duration::from_secs(180);
 pub(crate) const STREAM_IDLE_MESSAGE: &str = "upstream stream idle timeout (180s)";
 
+/// 读流错误连同 source 链拼成一行(根因常在 source 里,如 "unexpected EOF during chunk size line")。
+/// 已出现在前文的环节跳过,避免包装层 Display 已含 source 时重复。
+pub(crate) fn error_chain(err: &(dyn std::error::Error + 'static)) -> String {
+    let mut msg = err.to_string();
+    let mut source = err.source();
+    while let Some(cause) = source {
+        let part = cause.to_string();
+        if !msg.contains(&part) {
+            msg.push_str(": ");
+            msg.push_str(&part);
+        }
+        source = cause.source();
+    }
+    msg
+}
+
 /// 等到下一上游 chunk;超时返回 Idle。
 pub(crate) async fn next_upstream_chunk<S>(
     stream: &mut Pin<Box<S>>,

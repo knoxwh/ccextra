@@ -858,9 +858,45 @@ fn take_complete_events(pending: &mut BytesMut, chunk: Bytes) -> Option<Bytes> {
     Some(pending.split_to(end).freeze())
 }
 
-/// Claude 直通:字节级转发,不解析。
+/// 直通终态跟踪:按解析出的完整 SSE 事件名(不按字节子串)记录
+/// message_start 与终态(message_stop / error),正文里出现同名字样不算。
+#[derive(Default)]
+struct PassthroughTerminal {
+    parser: SseParser,
+    started: bool,
+    terminal: bool,
+}
+
+impl PassthroughTerminal {
+    fn observe(&mut self, bytes: &[u8]) {
+        let events = self.parser.push(bytes);
+        self.apply(events);
+    }
+
+    /// EOF:连同未完结尾部一起判断;见过 message_start 却无终态即为截断
+    fn truncated_at_eof(&mut self, tail: &[u8]) -> bool {
+        let mut events = self.parser.push(tail);
+        events.extend(self.parser.finish());
+        self.apply(events);
+        self.started && !self.terminal
+    }
+
+    fn apply(&mut self, events: Vec<super::parser::SseEvent>) {
+        for event in events {
+            match event.event.as_deref() {
+                Some("message_start") => self.started = true,
+                Some("message_stop" | "error") => self.terminal = true,
+                _ => {}
+            }
+        }
+    }
+}
+
+/// Claude 直通:字节级转发,只解析事件名以识别终态。
 /// 只在完整事件边界放行(未完结尾部暂存),心跳/错误帧因此不会插进半截事件;
 /// EOF 原样冲刷剩余字节,读失败/空闲超时丢弃半截事件再发 error。
+/// 有意与 CPA 不同:干净 EOF 但见过 message_start 而无 message_stop/error 时,
+/// 同样丢弃半截尾部并补 error,不让截断的回合看起来像正常结束。
 pub fn relay_claude_passthrough<S>(stream: S) -> SseStreamPin
 where
     S: Stream<Item = Result<Bytes, std::io::Error>> + Send + 'static,
@@ -868,21 +904,32 @@ where
     Box::pin(stream! {
         let mut stream = Box::pin(stream);
         let mut pending = BytesMut::new();
+        let mut terminal = PassthroughTerminal::default();
         loop {
             match crate::sse::next_upstream_chunk(&mut stream).await {
                 Ok(Some(Ok(chunk))) => {
                     if let Some(events) = take_complete_events(&mut pending, chunk) {
+                        terminal.observe(&events);
                         yield Ok(events);
                     }
                 }
                 Ok(Some(Err(e))) => {
                     // 读失败发 timeout_error,避免下游只见 io::Error 断流
-                    yield Ok(crate::sse::emit::timeout_error_event(&format!("上游流中断: {e}")));
+                    let cause = crate::sse::error_chain(&e);
+                    yield Ok(crate::sse::emit::timeout_error_event(&format!("上游流中断: {cause}")));
                     return;
                 }
                 Ok(None) => {
-                    if !pending.is_empty() {
-                        yield Ok(pending.split().freeze());
+                    let tail = pending.split().freeze();
+                    if terminal.truncated_at_eof(&tail) {
+                        tracing::warn!("Claude 直通上游流在 message_stop 前结束");
+                        yield Ok(crate::sse::emit::timeout_error_event(
+                            "upstream stream ended before message_stop",
+                        ));
+                        return;
+                    }
+                    if !tail.is_empty() {
+                        yield Ok(tail);
                     }
                     return;
                 }
@@ -1878,6 +1925,81 @@ mod tests {
             "错误帧须起于事件边界: {err}"
         );
         assert!(!err.contains("half"), "半截事件不得拼入: {err}");
+    }
+
+    const START: &str = "event: message_start\ndata: {\"type\":\"message_start\"}\n\n";
+
+    #[tokio::test]
+    async fn test_claude_passthrough_eof_without_message_stop_emits_error() {
+        // 正文含 message_stop 字样、半截尾部:都不算终态;尾部丢弃,error 起于事件边界
+        let chunks = [
+            START,
+            "event: content_block_delta\ndata: {\"text\":\"event: message_stop\"}\n\n",
+            "event: content_block_delta\ndata: {\"half",
+        ];
+        let out = collect_passthrough(passthrough_chunks(&chunks)).await;
+        assert_eq!(out.len(), 3, "{out:?}");
+        assert_eq!(out[..2].concat(), chunks[..2].concat().into_bytes());
+        let err = String::from_utf8_lossy(&out[2]);
+        assert!(err.starts_with("event: error\n"), "{err}");
+        assert!(err.contains("\"type\":\"timeout_error\""), "{err}");
+        assert!(
+            err.contains("upstream stream ended before message_stop"),
+            "{err}"
+        );
+    }
+
+    #[tokio::test]
+    async fn test_claude_passthrough_terminal_events_add_nothing() {
+        let cases: [&[&'static str]; 3] = [
+            // message_stop 事件名跨 chunk 切分
+            &[
+                START,
+                "event: message_",
+                "stop\ndata: {\"type\":\"message_stop\"}\n\n",
+            ],
+            // 上游自己发了 error:不重复补
+            &[START, "event: error\ndata: {\"type\":\"error\"}\n\n"],
+            // message_stop 在未以空行结尾的尾部:照旧原样冲刷
+            &[
+                START,
+                "event: message_stop\ndata: {\"type\":\"message_stop\"}",
+            ],
+        ];
+        for chunks in cases {
+            let out = collect_passthrough(passthrough_chunks(chunks)).await;
+            assert_eq!(out.concat(), chunks.concat().into_bytes(), "{chunks:?}");
+        }
+    }
+
+    #[tokio::test]
+    async fn test_claude_passthrough_read_error_includes_source_chain() {
+        #[derive(Debug)]
+        struct Body(std::io::Error);
+        impl std::fmt::Display for Body {
+            fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+                f.write_str("error reading a body from connection")
+            }
+        }
+        impl std::error::Error for Body {
+            fn source(&self) -> Option<&(dyn std::error::Error + 'static)> {
+                Some(&self.0)
+            }
+        }
+        let root = std::io::Error::new(
+            std::io::ErrorKind::UnexpectedEof,
+            "unexpected EOF during chunk size line",
+        );
+        let mut items = passthrough_chunks(&[START]);
+        items.push(Err(std::io::Error::other(Body(root))));
+        let out = collect_passthrough(items).await;
+        let err = String::from_utf8_lossy(&out[1]);
+        assert!(
+            err.contains(
+                "上游流中断: error reading a body from connection: unexpected EOF during chunk size line"
+            ),
+            "{err}"
+        );
     }
 
     #[tokio::test(start_paused = true)]
