@@ -546,9 +546,9 @@ impl AgStreamReplayExtractor {
         cache: AgReplayCache,
         session_key: String,
         snapshot: AgReplaySnapshot,
-        request: Value,
+        request: &Value,
     ) -> Self {
-        let accumulator = AgReplayAccumulator::new_from_request(&request);
+        let accumulator = AgReplayAccumulator::new_from_request(request);
         Self {
             cache,
             session_key,
@@ -706,7 +706,7 @@ mod tests {
             cache.clone(),
             key.clone(),
             AgReplaySnapshot::default(),
-            request,
+            &request,
         );
         extractor.push(
             br#"data: {"response":{"candidates":[{"content":{"parts":[{"thoughtSignature":"sig-first-long-enough","functionCall":{"name":"Read","args":{"file_path":"/a"},"id":"id1"}}]}}]}}
@@ -736,7 +736,7 @@ mod tests {
             cache.clone(),
             key.clone(),
             AgReplaySnapshot::default(),
-            request,
+            &request,
         );
         let sig = "s".repeat(128);
         extractor.push(
@@ -777,7 +777,7 @@ mod tests {
                 cache.clone(),
                 key.clone(),
                 AgReplaySnapshot::default(),
-                request,
+                &request,
             );
             extractor.push(
                 br#"data: {"response":{"candidates":[{"content":{"parts":[{"thoughtSignature":"sig-drop-long-enough12","functionCall":{"name":"Read","args":{"p":"/a"},"id":"id1"}}]},"finishReason":"STOP"}]}}
@@ -1368,12 +1368,8 @@ mod tests {
         cache.replace_items(&key, vec![item("old")]);
         let (_, snapshot) = cache.load(&key);
         let request = json!({"contents": [{"role": "user", "parts": [{"text": "hi"}]}]});
-        let mut slow = AgStreamReplayExtractor::new(
-            cache.clone(),
-            key.clone(),
-            snapshot.clone(),
-            request.clone(),
-        );
+        let mut slow =
+            AgStreamReplayExtractor::new(cache.clone(), key.clone(), snapshot.clone(), &request);
         // 并发请求先提交
         cache.replace_items(&key, vec![item("newer")]);
         slow.push(
@@ -1397,7 +1393,7 @@ mod tests {
 
         // 快照仍当前 → 正常提交
         let (_, current) = cache.load(&key);
-        let mut fresh = AgStreamReplayExtractor::new(cache.clone(), key.clone(), current, request);
+        let mut fresh = AgStreamReplayExtractor::new(cache.clone(), key.clone(), current, &request);
         fresh.push(
             br#"data: {"response":{"candidates":[{"content":{"parts":[{"thoughtSignature":"sig-fresh-long-enough","functionCall":{"name":"Read","args":{"p":"/a"},"id":"id1"}}]},"finishReason":"STOP"}]}}
 

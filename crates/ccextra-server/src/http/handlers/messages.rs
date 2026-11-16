@@ -166,13 +166,8 @@ enum ReplayTap {
     None,
     /// (cache, key, request_fingerprint)
     Responses(crate::sse::replay_cache::ReplayCache, String, String),
-    /// (cache, key, 读账本快照, 外发 request):提交走 ReplaceIfUnchanged(snapshot)
-    Antigravity(
-        crate::sse::antigravity_replay_cache::AgReplayCache,
-        String,
-        crate::sse::antigravity_replay_cache::AgReplaySnapshot,
-        Value,
-    ),
+    /// 已按外发 request 构造的提取器(借用 request,不深拷贝):提交走 ReplaceIfUnchanged(snapshot)
+    Antigravity(Box<AgStreamReplayExtractor>),
     /// Kimi thinking:(cache, key, replay_applied)
     Kimi(
         crate::sse::kimi_thinking_replay_cache::KimiThinkingReplayCache,
@@ -227,10 +222,7 @@ where
             let mut extractor = StreamReplayExtractor::new(cache, key, request_fingerprint);
             Box::new(move |bytes| extractor.push(bytes))
         }
-        ReplayTap::Antigravity(cache, key, snapshot, request) => {
-            let mut extractor = AgStreamReplayExtractor::new(cache, key, snapshot, request);
-            Box::new(move |bytes| extractor.push(bytes))
-        }
+        ReplayTap::Antigravity(mut extractor) => Box::new(move |bytes| extractor.push(bytes)),
         ReplayTap::Kimi(cache, key, applied) => {
             let mut extractor = KimiStreamReplayExtractor::new(cache, key, applied);
             Box::new(move |bytes| extractor.push(bytes))
@@ -1961,16 +1953,13 @@ fn build_stream_relay(
     let replay_tap = if let Some((cache, key, fingerprint)) = prepared.replay_scope.clone() {
         ReplayTap::Responses(cache, key, fingerprint)
     } else if let Some((cache, key)) = prepared.ag_replay_scope.as_ref() {
-        ReplayTap::Antigravity(
+        let empty = Value::Object(Default::default());
+        ReplayTap::Antigravity(Box::new(AgStreamReplayExtractor::new(
             cache.clone(),
             key.clone(),
             prepared.ag_replay_snapshot.clone(),
-            prepared
-                .body_json
-                .get("request")
-                .cloned()
-                .unwrap_or_else(|| Value::Object(Default::default())),
-        )
+            prepared.body_json.get("request").unwrap_or(&empty),
+        )))
     } else if let Some((cache, key, applied)) = prepared.kimi_replay_scope.clone() {
         ReplayTap::Kimi(cache, key, applied)
     } else {
