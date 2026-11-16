@@ -17,10 +17,10 @@ base64.workspace = true
 tracing.workspace = true
 
 # cache_stabilization 与 session 依赖
-md-5 = "0.11"
-lru = "0.18"
-regex = "1"
+md-5.workspace = true
+lru.workspace = true
+regex.workspace = true
 http = "1"
 
 [dev-dependencies]
-yaml_serde = "0.10"
+yaml_serde.workspace = true

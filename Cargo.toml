@@ -58,12 +58,21 @@ bcrypt = "0.19"
 
 # Pattern matching (for payload model wildcards)
 globset = "0.4"
+regex = "1"
+
+# Cache & hash
+lru = "0.18"
+md-5 = "0.11"
 
 # CLI
 clap = { version = "4.4", features = ["derive"] }
 
 # Filesystem watch (config hot reload)
 notify = "7.0"
+
+# Time & test tempfiles
+time = "0.3"
+tempfile = "3"
 
 [profile.release]
 opt-level = 3          # 最大运行时优化
