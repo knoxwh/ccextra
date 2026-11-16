@@ -6,8 +6,9 @@ use axum::http::StatusCode;
 use bytes::Bytes;
 use futures::Stream;
 
-/// 入站请求 body 上限 10 MiB(超出返回 413)
-pub(crate) const INBOUND_BODY_LIMIT: usize = 10 * 1024 * 1024;
+/// 入站请求 body 上限 32 MiB(超出返回 413)。与 ccextra-gohttp maxBodyBytes 及
+/// Anthropic 云平台 Messages 上限一致;CPA 默认不限,第一方 API 为 128 MB。
+pub(crate) const INBOUND_BODY_LIMIT: usize = 32 * 1024 * 1024;
 /// 成功非流响应 body 上限:恰好上限可读,多 1 字节拒绝
 pub(crate) const SUCCESS_BODY_LIMIT: usize = 16 * 1024 * 1024;
 /// 上游错误 body 上限:超出停止读取并标记截断
