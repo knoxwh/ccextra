@@ -104,15 +104,16 @@ pub(crate) fn reload_published(result: &ReloadResult) -> bool {
     result.published
 }
 
-/// 监视侧提交契约：仅 `published` 时用磁盘指纹替换 `last_hash`；否则原样保留以便同内容重试。
+/// 监视侧提交契约：仅 `published` 时用热加载前的指纹 `applied_hash` 替换 `last_hash`；否则原样保留以便同内容重试。
+/// 对齐 CPA 1631875b：不得在热加载后重读磁盘，热加载期间落盘的新写入不能算已生效；
+/// 加载期间的回写（如 secret bcrypt）只多一次热加载。
 pub(crate) fn next_last_hash_after_reload(
     published: bool,
     last_hash: &str,
-    config_path: &Path,
-    models_path: &Path,
+    applied_hash: &str,
 ) -> String {
     if published {
-        content_fingerprint(config_path, models_path)
+        applied_hash.to_string()
     } else {
         last_hash.to_string()
     }
@@ -205,7 +206,7 @@ async fn run_config_watcher(
             ReloadDecision::SkipUnchanged => {
                 tracing::debug!("配置内容未变 (hash 命中)，跳过热重载");
             }
-            ReloadDecision::Reload { .. } => {
+            ReloadDecision::Reload { new_hash } => {
                 tracing::info!(
                     "检测到配置文件变更，开始热重载 ({}, {})",
                     config_path.display(),
@@ -233,9 +234,8 @@ async fn run_config_watcher(
                         false
                     }
                 };
-                // 仅快照真正发布成功才提交 hash；Config::load 可能 bcrypt 回写，重读吸收环
-                last_hash =
-                    next_last_hash_after_reload(published, &last_hash, &config_path, &models_path);
+                // 仅快照真正发布成功才提交热加载前的 hash（不重读磁盘，避免吞掉热加载期间的保存）
+                last_hash = next_last_hash_after_reload(published, &last_hash, &new_hash);
             }
         }
     }
@@ -448,8 +448,7 @@ mod tests {
         let kept = next_last_hash_after_reload(
             reload_published(&unpublished_providers_failed()),
             &last,
-            &cfg,
-            &models,
+            &bad_fp,
         );
         assert_eq!(kept, last);
         match decide_reload(&kept, &cfg, &models) {
@@ -464,12 +463,8 @@ mod tests {
         );
 
         // 发布：提交新指纹（同内容此后 Skip）
-        let committed = next_last_hash_after_reload(
-            reload_published(&published_result()),
-            &last,
-            &cfg,
-            &models,
-        );
+        let committed =
+            next_last_hash_after_reload(reload_published(&published_result()), &last, &bad_fp);
         assert_eq!(committed, bad_fp);
         assert_eq!(
             decide_reload(&committed, &cfg, &models),
@@ -477,30 +472,64 @@ mod tests {
         );
     }
 
-    /// secret 回写后指纹变化，成功发布后 commit 再 decide 应 Skip（吸收 bcrypt 环）
+    /// secret 加载期间 bcrypt 回写：只多一次热加载，第二次提交后 Skip（对齐 CPA）
     #[test]
-    fn hash_commit_via_helper_absorbs_rewrite() {
+    fn bcrypt_rewrite_costs_one_extra_reload() {
         let dir = tempdir().unwrap();
         let cfg = dir.path().join("config.yaml");
         let models = dir.path().join("models.json");
-        fs::write(&cfg, "secret_key: plain\n").unwrap();
+        fs::write(&cfg, "secret_key: old\n").unwrap();
         fs::write(&models, "[]\n").unwrap();
         let last = content_fingerprint(&cfg, &models);
+        fs::write(&cfg, "secret_key: plain\n").unwrap();
+        let ReloadDecision::Reload { new_hash: applied } = decide_reload(&last, &cfg, &models)
+        else {
+            panic!("expected Reload");
+        };
+        // Config::load 期间回写 bcrypt
         fs::write(&cfg, "secret_key: \"$2b$12$abcdef\"\n").unwrap();
-        match decide_reload(&last, &cfg, &models) {
-            ReloadDecision::Reload { .. } => {}
-            other => panic!("{other:?}"),
-        }
+        let committed =
+            next_last_hash_after_reload(reload_published(&published_result()), &last, &applied);
+        let ReloadDecision::Reload {
+            new_hash: rewritten,
+        } = decide_reload(&committed, &cfg, &models)
+        else {
+            panic!("回写应触发一次额外热加载");
+        };
         let committed = next_last_hash_after_reload(
             reload_published(&published_result()),
-            &last,
-            &cfg,
-            &models,
+            &committed,
+            &rewritten,
         );
-        assert_ne!(committed, last);
         assert_eq!(
             decide_reload(&committed, &cfg, &models),
             ReloadDecision::SkipUnchanged
         );
+    }
+
+    /// 回归：热加载期间（2-3s）的第二次保存必须得到 Reload，不能被提交的 hash 吞掉
+    #[test]
+    fn write_during_reload_is_not_skipped() {
+        let dir = tempdir().unwrap();
+        let cfg = dir.path().join("config.yaml");
+        let models = dir.path().join("models.json");
+        fs::write(&cfg, "v: 0\n").unwrap();
+        fs::write(&models, "[]\n").unwrap();
+        let last = content_fingerprint(&cfg, &models);
+        // 第一次保存 A
+        fs::write(&cfg, "v: A\n").unwrap();
+        let ReloadDecision::Reload { new_hash: applied } = decide_reload(&last, &cfg, &models)
+        else {
+            panic!("expected Reload");
+        };
+        // reload_now 已读到 A、尚未发布时第二次保存 B
+        fs::write(&cfg, "v: B\n").unwrap();
+        let last =
+            next_last_hash_after_reload(reload_published(&published_result()), &last, &applied);
+        // 排队的 B 事件：必须再热加载一次
+        assert!(matches!(
+            decide_reload(&last, &cfg, &models),
+            ReloadDecision::Reload { .. }
+        ));
     }
 }
