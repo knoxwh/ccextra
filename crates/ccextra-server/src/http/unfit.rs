@@ -441,10 +441,10 @@ mod tests {
     #[test]
     fn mark_does_not_duplicate_kinds() {
         let reg = UnfitRegistry::new();
-        let gen = reg.generation();
-        reg.mark("p", "m", UnfitKind::RefusesFormat, gen);
-        reg.mark("p", "m", UnfitKind::RefusesFormat, gen);
-        reg.mark("p", "m", UnfitKind::OffRefused, gen);
+        let generation = reg.generation();
+        reg.mark("p", "m", UnfitKind::RefusesFormat, generation);
+        reg.mark("p", "m", UnfitKind::RefusesFormat, generation);
+        reg.mark("p", "m", UnfitKind::OffRefused, generation);
         let state = reg.state.read().unwrap();
         assert_eq!(state.flags[&("p".into(), "m".into())].len(), 2);
     }
@@ -452,8 +452,8 @@ mod tests {
     #[test]
     fn clear_empties_registry() {
         let reg = UnfitRegistry::new();
-        let gen = reg.generation();
-        reg.mark("p", "m", UnfitKind::ToolChoiceRefused, gen);
+        let generation = reg.generation();
+        reg.mark("p", "m", UnfitKind::ToolChoiceRefused, generation);
         reg.clear();
         assert!(!reg.is_unfit("p", "m", UnfitKind::ToolChoiceRefused));
     }
@@ -473,8 +473,8 @@ mod tests {
 
     fn marked(kind: UnfitKind) -> UnfitRegistry {
         let reg = UnfitRegistry::new();
-        let gen = reg.generation();
-        reg.mark("p", "m", kind, gen);
+        let generation = reg.generation();
+        reg.mark("p", "m", kind, generation);
         reg
     }
 

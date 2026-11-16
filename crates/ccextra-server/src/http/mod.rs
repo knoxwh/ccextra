@@ -173,8 +173,8 @@ impl AppState {
     /// 请求侧请走本方法,勿单独调用 UnfitRegistry::generation。
     pub async fn snapshot_and_unfit_generation(&self) -> (Arc<ConfigSnapshot>, u64) {
         let guard = self.config.read().await;
-        let gen = unfit::global_registry().generation();
-        (Arc::clone(&*guard), gen)
+        let generation = unfit::global_registry().generation();
+        (Arc::clone(&*guard), generation)
     }
 }
 

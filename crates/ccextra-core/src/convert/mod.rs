@@ -112,12 +112,10 @@ pub fn strip_attribution_line(text: &str) -> &str {
         Some(end) => &trimmed[end..],
     };
     // 消费行尾分隔符(CRLF 算一个)
-    let rest = rest
-        .strip_prefix("\r\n")
+    rest.strip_prefix("\r\n")
         .or_else(|| rest.strip_prefix('\r'))
         .or_else(|| rest.strip_prefix('\n'))
-        .unwrap_or(rest);
-    rest
+        .unwrap_or(rest)
 }
 
 /// 是否为 Claude 官方固定身份声明句(对齐 Claude Code 2.1.289 zee: dk/bD/SD)
