@@ -30,7 +30,7 @@ lru.workspace = true
 md-5.workspace = true
 # 精确锁定:升级 wreq 会改变 Claude TLS 指纹(JA3/JA4);管不到传递依赖 btls/tokio-btls,勿整体 cargo update
 # 任何依赖更新后必跑 scripts/check_fingerprints.sh
-wreq = { version = "=0.16.1", default-features = true, features = ["json", "stream", "socks", "gzip", "brotli", "deflate", "zstd"] }
+wreq = { version = "=0.16.3", default-features = true, features = ["json", "stream", "socks", "gzip", "brotli", "deflate", "zstd"] }
 
 time = { workspace = true, features = ["formatting", "parsing", "std"] }
 getrandom = "0.4"

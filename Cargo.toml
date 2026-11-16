@@ -9,7 +9,7 @@ resolver = "2"
 [workspace.package]
 version = "2.0.0"
 edition = "2021"
-# 实际下限由 wreq 0.16.1(rust-version 1.98)决定
+# 实际下限由 wreq 0.16.3(rust-version 1.98)决定
 rust-version = "1.98"
 authors = ["wanghao"]
 license = "MIT"
@@ -61,7 +61,7 @@ globset = "0.4"
 regex = "1"
 
 # Cache & hash
-lru = "0.18"
+lru = "0.19"
 md-5 = "0.11"
 
 # CLI
