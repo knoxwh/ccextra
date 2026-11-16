@@ -194,9 +194,6 @@ fn shorten_if_needed(id: &str) -> String {
     use sha2::{Digest, Sha256};
     let digest = Sha256::digest(id.as_bytes());
     let suffix = format!("_{}", hex::encode(&digest[..8]));
-    let mut prefix_len = LIMIT.saturating_sub(suffix.len());
-    while prefix_len > 0 && !id.is_char_boundary(prefix_len) {
-        prefix_len -= 1;
-    }
+    let prefix_len = id.floor_char_boundary(LIMIT.saturating_sub(suffix.len()));
     format!("{}{}", &id[..prefix_len], suffix)
 }

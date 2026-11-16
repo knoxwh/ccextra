@@ -4,7 +4,7 @@
 // 保证同一请求内名字不重复。响应侧用反向映射还原原名。
 
 use std::collections::HashMap;
-use std::sync::OnceLock;
+use std::sync::LazyLock;
 
 use regex::Regex;
 
@@ -13,13 +13,10 @@ const NAME_LIMIT: usize = 64;
 
 /// 网关 MCP 工具 id `[mcp_]<server 词>-<hex 实例 id...>_<tool>`
 /// (对齐 CPA 08437a67 gatewayToolNamePattern)
-fn gateway_tool_name_pattern() -> &'static Regex {
-    static PATTERN: OnceLock<Regex> = OnceLock::new();
-    PATTERN.get_or_init(|| {
-        Regex::new(r"^(?:mcp_)?([a-z][a-z0-9-]*?)-[0-9a-f]{6,}(?:-[0-9a-f]+)*_(.+)$")
-            .expect("gateway tool name pattern")
-    })
-}
+static GATEWAY_TOOL_NAME_PATTERN: LazyLock<Regex> = LazyLock::new(|| {
+    Regex::new(r"^(?:mcp_)?([a-z][a-z0-9-]*?)-[0-9a-f]{6,}(?:-[0-9a-f]+)*_(.+)$")
+        .expect("gateway tool name pattern")
+});
 
 /// mcp__ 前缀工具名缩短:保留 mcp__ + 末段 __ 后的名字;仍超长且末段是网关
 /// MCP 工具 id 时剥掉中间 hex 实例 id,保留 server 词 + 工具名(对齐 CPA 08437a67,
@@ -35,7 +32,7 @@ pub fn shorten_name_if_needed(name: &str) -> String {
             let cand = format!("mcp__{tail}");
             if cand.len() <= NAME_LIMIT {
                 cand
-            } else if let Some(readable) = gateway_tool_name_pattern()
+            } else if let Some(readable) = GATEWAY_TOOL_NAME_PATTERN
                 .captures(tail)
                 .map(|c| format!("mcp__{}_{}", &c[1], &c[2]))
                 .filter(|r| r.len() <= NAME_LIMIT)
@@ -61,11 +58,7 @@ pub fn shorten_name_if_needed(name: &str) -> String {
 
 /// 截到 NAME_LIMIT 字节;落在多字节字符中间时回退到前一个字符边界(避免切片 panic)
 fn truncate_to_limit(s: &str) -> String {
-    let mut cut = NAME_LIMIT.min(s.len());
-    while !s.is_char_boundary(cut) {
-        cut -= 1;
-    }
-    s[..cut].to_string()
+    s[..s.floor_char_boundary(NAME_LIMIT)].to_string()
 }
 
 /// 候选名冲突时追加 `_N` 后缀直到唯一

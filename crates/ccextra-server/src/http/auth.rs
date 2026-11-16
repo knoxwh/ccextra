@@ -3,22 +3,22 @@ use axum::http::HeaderMap;
 use ccextra_core::secret::looks_like_bcrypt;
 use lru::LruCache;
 use std::num::NonZeroUsize;
-use std::sync::{Mutex as StdMutex, OnceLock};
+use std::sync::{LazyLock, Mutex as StdMutex};
 
 /// bcrypt 验证结果缓存:(expected hash, key) → 已验证,避免每请求一次 ~100ms 的 bcrypt verify。
 /// 键绑定 expected hash:reload 换 secret 后,旧 secret 的 true/false 结果不可命中
 /// (旧 true 不得让新 secret 错误接受 key,旧 false 不得错误拒绝合法 key)。
 /// 上限 1024 条,满时淘汰最久未访问条目;secret 可热重载,/reload 一律清空缓存。
-static AUTH_CACHE: OnceLock<StdMutex<LruCache<String, bool>>> = OnceLock::new();
+static AUTH_CACHE: LazyLock<StdMutex<LruCache<String, bool>>> = LazyLock::new(|| {
+    StdMutex::new(LruCache::new(
+        NonZeroUsize::new(AUTH_CACHE_CAPACITY).expect("缓存容量非零"),
+    ))
+});
 
 const AUTH_CACHE_CAPACITY: usize = 1024;
 
 pub fn auth_cache() -> &'static StdMutex<LruCache<String, bool>> {
-    AUTH_CACHE.get_or_init(|| {
-        StdMutex::new(LruCache::new(
-            NonZeroUsize::new(AUTH_CACHE_CAPACITY).expect("缓存容量非零"),
-        ))
-    })
+    &AUTH_CACHE
 }
 
 /// 缓存键:expected hash 与 key 以 NUL 拼接(两者均不可能含 NUL:bcrypt hash

@@ -2,7 +2,7 @@
 
 use serde_json::Value;
 use std::collections::{HashMap, HashSet};
-use std::sync::OnceLock;
+use std::sync::LazyLock;
 
 use regex::Regex;
 
@@ -326,14 +326,13 @@ pub fn convert_to_gemini_with_registry(
 
 /// 对齐 sub2api dd292e3b0:仅中和 system 块开头的 Claude 身份句，保留后续指令。
 fn neutralize_claude_identity(text: &str) -> String {
-    static OPENER: OnceLock<Regex> = OnceLock::new();
-    let opener = OPENER.get_or_init(|| {
+    static OPENER: LazyLock<Regex> = LazyLock::new(|| {
         Regex::new(
             r"(?i)^[ \t\r\n]*You are (?:a Claude agent, built on Anthropic'?s Claude Agent SDK|Claude Code, Anthropic'?s official CLI for Claude(?:, running within the Claude Agent SDK)?)\.?",
         )
         .unwrap()
     });
-    if let Some(matched) = opener.find(text) {
+    if let Some(matched) = OPENER.find(text) {
         format!("You are an AI agent.{}", &text[matched.end()..])
     } else {
         text.to_string()

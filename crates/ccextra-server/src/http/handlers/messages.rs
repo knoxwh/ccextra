@@ -260,7 +260,7 @@ fn is_sse_comment_frame(frame: &Bytes) -> bool {
 async fn next_business_frame(out: &mut SseStreamPin) -> Option<Result<Bytes, std::io::Error>> {
     loop {
         match out.next().await {
-            Some(Ok(frame)) if is_sse_comment_frame(&frame) => continue,
+            Some(Ok(frame)) if is_sse_comment_frame(&frame) => {}
             other => return other,
         }
     }

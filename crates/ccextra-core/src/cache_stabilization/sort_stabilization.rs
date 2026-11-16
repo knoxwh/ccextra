@@ -20,7 +20,7 @@
 
 use crate::cache_stabilization::drift_detector::ApiKind;
 use serde_json::Value;
-use std::sync::OnceLock;
+use std::sync::LazyLock;
 
 /// 编译好的内联（非锚定）技能块匹配器。捕获技能列表 `<system-reminder>`
 /// 块的头部 / 条目 / 结束标签，该块可出现在更大的系统提示中的任意位置。
@@ -28,34 +28,26 @@ use std::sync::OnceLock;
 /// 之前的版本将模式锚定到 `^...$`，只有当 *整个* 系统字符串恰好是一个技能块
 /// 时才能匹配。实际的 Claude Code 系统提示把该块嵌入在字符串中间（前面有
 /// 身份文本，后面有其他提醒），因此锚定模式永远无法匹配，排序成了静默空操作。
-static SKILLS_BLOCK: OnceLock<regex::Regex> = OnceLock::new();
+static SKILLS_BLOCK: LazyLock<regex::Regex> = LazyLock::new(|| {
+    regex::Regex::new(
+        r"(<system-reminder>\nThe following skills are available[^\n]*\n+)(- [\s\S]+?)(\n+</system-reminder>)",
+    )
+    .expect("valid")
+});
 
 /// 编译好的内联延迟工具块匹配器：捕获系统提示中任意位置的延迟工具
 /// `<system-reminder>` 块的头部 / 工具列表 / 结束标签。
-static DEFERRED_BLOCK: OnceLock<regex::Regex> = OnceLock::new();
-
-fn skills_regex() -> &'static regex::Regex {
-    SKILLS_BLOCK.get_or_init(|| {
-        regex::Regex::new(
-            r"(<system-reminder>\nThe following skills are available[^\n]*\n+)(- [\s\S]+?)(\n+</system-reminder>)",
-        )
-        .expect("valid")
-    })
-}
-
-fn deferred_regex() -> &'static regex::Regex {
-    DEFERRED_BLOCK.get_or_init(|| {
-        regex::Regex::new(
-            r"(<system-reminder>\nThe following deferred tools are now available[^\n]*\n)([\s\S]+?)(\n+</system-reminder>)",
-        )
-        .expect("valid")
-    })
-}
+static DEFERRED_BLOCK: LazyLock<regex::Regex> = LazyLock::new(|| {
+    regex::Regex::new(
+        r"(<system-reminder>\nThe following deferred tools are now available[^\n]*\n)([\s\S]+?)(\n+</system-reminder>)",
+    )
+    .expect("valid")
+});
 
 /// 对系统提示内的技能和延迟工具列表块进行确定性排序。返回被修改的块数量。
 pub fn stabilize_block_sort(body: &mut Value, kind: ApiKind) -> usize {
-    let skills_re = skills_regex();
-    let deferred_re = deferred_regex();
+    let skills_re = &*SKILLS_BLOCK;
+    let deferred_re = &*DEFERRED_BLOCK;
     let mut count = 0;
 
     match kind {

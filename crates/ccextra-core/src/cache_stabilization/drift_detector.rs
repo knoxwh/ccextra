@@ -227,8 +227,8 @@ pub fn is_ancillary_request(body: &Value, kind: ApiKind) -> bool {
     // "没有可用的 tools"，因此统一处理。
     let tools_empty = body
         .get("tools")
-        .map(|t| t.as_array().is_none() || t.as_array().is_some_and(|a| a.is_empty()))
-        .unwrap_or(true);
+        .and_then(Value::as_array)
+        .is_none_or(Vec::is_empty);
     let msg_count = non_system_message_count(body, kind);
     tools_empty && msg_count <= 1
 }
@@ -238,9 +238,8 @@ pub fn is_ancillary_request(body: &Value, kind: ApiKind) -> bool {
 /// `messages` 内没有 system 角色（其 system prompt 是顶层字段），
 /// 因此所有消息都计数。
 fn non_system_message_count(body: &Value, kind: ApiKind) -> usize {
-    let messages = match messages_array(body, kind) {
-        Some(arr) => arr,
-        None => return 0,
+    let Some(messages) = messages_array(body, kind) else {
+        return 0;
     };
     match kind {
         ApiKind::Anthropic => messages.len(),
@@ -263,9 +262,8 @@ fn extract_tools(body: &Value) -> Value {
 
 /// 提取前 [`EARLY_MESSAGES_WINDOW`] 个消息形态条目。
 fn extract_early_messages(body: &Value, kind: ApiKind) -> Value {
-    let messages = match messages_array(body, kind) {
-        Some(arr) => arr,
-        None => return Value::Null,
+    let Some(messages) = messages_array(body, kind) else {
+        return Value::Null;
     };
     let early: Vec<Value> = match kind {
         ApiKind::OpenAiChat => messages
@@ -467,9 +465,8 @@ fn early_message_item_hashes(messages: &Value) -> Vec<String> {
 /// 指纹按 (name, type, schema_hash) 排序，因此 tool 顺序变化不会导致哈希漂移。
 /// schema 键被递归排序以实现确定性哈希——即使 normalize 阶段尚未运行也自足。
 fn stable_tool_fingerprint_hash(tools: &Value) -> [u8; 32] {
-    let tools_arr = match tools.as_array() {
-        Some(arr) => arr,
-        None => return hash_value(&Value::Null),
+    let Some(tools_arr) = tools.as_array() else {
+        return hash_value(&Value::Null);
     };
 
     let mut fingerprints: Vec<Value> = tools_arr
@@ -568,9 +565,8 @@ fn stable_tool_fingerprint_hash(tools: &Value) -> [u8; 32] {
 /// tools[] description 软维指纹（按 name 排序后哈希 description 文本）。
 /// 默认关闭；开启后仅用于会话级 DEBUG，永不进入父级 WARN。
 fn tools_description_hash(tools: &Value) -> [u8; 32] {
-    let tools_arr = match tools.as_array() {
-        Some(arr) => arr,
-        None => return hash_value(&Value::Null),
+    let Some(tools_arr) = tools.as_array() else {
+        return hash_value(&Value::Null);
     };
     let mut pairs: Vec<(String, String)> = tools_arr
         .iter()

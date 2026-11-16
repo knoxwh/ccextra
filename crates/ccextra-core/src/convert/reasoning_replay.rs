@@ -466,7 +466,7 @@ pub fn build_replay_turn(completed: &Value, request_fingerprint: &str) -> Option
                     assistant_fingerprint = fp;
                 }
             }
-            _ => continue,
+            _ => {}
         }
     }
     if items.is_empty() {
@@ -837,7 +837,7 @@ fn filter_turn_items(
                 }
                 filtered.push(item);
             }
-            _ => continue,
+            _ => {}
         }
     }
     filtered

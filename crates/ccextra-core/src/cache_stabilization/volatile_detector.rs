@@ -584,10 +584,7 @@ fn truncate_sample(s: &str) -> String {
         return s.to_string();
     }
     // 找到 <= SAMPLE_TRUNCATE_BYTES 的最大字符边界。
-    let mut cut = SAMPLE_TRUNCATE_BYTES;
-    while cut > 0 && !s.is_char_boundary(cut) {
-        cut -= 1;
-    }
+    let cut = s.floor_char_boundary(SAMPLE_TRUNCATE_BYTES);
     let mut out = String::with_capacity(cut + 1);
     out.push_str(&s[..cut]);
     out.push('…');

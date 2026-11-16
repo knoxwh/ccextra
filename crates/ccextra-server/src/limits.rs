@@ -36,11 +36,7 @@ pub(crate) async fn read_inbound_body(body: axum::body::Body) -> Result<Bytes, A
 
 /// 截到至多 `max` 字节;落在多字节字符中间时回退到前一个字符边界
 pub(crate) fn truncate_at_char_boundary(s: &str, max: usize) -> &str {
-    let mut cut = max.min(s.len());
-    while !s.is_char_boundary(cut) {
-        cut -= 1;
-    }
-    &s[..cut]
+    &s[..s.floor_char_boundary(max)]
 }
 
 /// 有界读取结果:truncated 表示超过上限,已停止读取并保留前 limit 字节

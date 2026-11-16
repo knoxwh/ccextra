@@ -16,23 +16,19 @@
 
 use crate::cache_stabilization::drift_detector::ApiKind;
 use serde_json::{json, Value};
-use std::sync::OnceLock;
+use std::sync::LazyLock;
 
-static TRAILING_SMOOSH: OnceLock<regex::Regex> = OnceLock::new();
-
-fn smoosh_regex() -> &'static regex::Regex {
-    TRAILING_SMOOSH.get_or_init(|| {
-        // 注意:Rust 的 `regex` crate 不支持 look-around,因此简报中的
-        // `(?!</system-reminder>)` 负向前瞻改用惰性量词(`*?`)来表达,
-        // 它会在第一个 `</system-reminder>` 处停止,从而每次匹配恰好产生一个块。
-        // 简报中尾部的 `\s*$` 锚点则通过代码强制执行(见
-        // `split_anthropic_messages` 中的尾部检查),因此只有被揉合到内容
-        // *末尾* 的 reminder 才会被剥离。行为与简报在所有测试用例上的
-        // 预期语义一致。
-        regex::Regex::new(r"\n\n(<system-reminder>\n[\s\S]*?\n</system-reminder>)")
-            .expect("valid static regex")
-    })
-}
+// 注意:Rust 的 `regex` crate 不支持 look-around,因此简报中的
+// `(?!</system-reminder>)` 负向前瞻改用惰性量词(`*?`)来表达,
+// 它会在第一个 `</system-reminder>` 处停止,从而每次匹配恰好产生一个块。
+// 简报中尾部的 `\s*$` 锚点则通过代码强制执行(见
+// `split_anthropic_messages` 中的尾部检查),因此只有被揉合到内容
+// *末尾* 的 reminder 才会被剥离。行为与简报在所有测试用例上的
+// 预期语义一致。
+static TRAILING_SMOOSH: LazyLock<regex::Regex> = LazyLock::new(|| {
+    regex::Regex::new(r"\n\n(<system-reminder>\n[\s\S]*?\n</system-reminder>)")
+        .expect("valid static regex")
+});
 
 /// 从 `tool_result.content` 字符串中剥离被揉合的 `<system-reminder>` 块。
 /// 返回被剥离的块数。
@@ -45,7 +41,7 @@ pub fn split_smooshed_reminders(body: &mut Value, kind: ApiKind) -> usize {
 }
 
 fn split_anthropic_messages(body: &mut Value) -> usize {
-    let re = smoosh_regex();
+    let re = &*TRAILING_SMOOSH;
     let Some(Value::Array(messages)) = body.get_mut("messages") else {
         return 0;
     };

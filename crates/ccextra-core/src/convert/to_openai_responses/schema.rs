@@ -411,9 +411,8 @@ fn rational_number_key(raw: &str) -> String {
             .try_fold(value, |acc, _| acc.checked_mul(10))
             .unwrap_or(u128::MAX)
     };
-    let digits_val = match digits.parse::<u128>() {
-        Ok(v) => v,
-        Err(_) => return raw.to_string(),
+    let Ok(digits_val) = digits.parse::<u128>() else {
+        return raw.to_string();
     };
     let num = scaled(digits_val, num_shift);
     let den = scaled(1, den_shift);

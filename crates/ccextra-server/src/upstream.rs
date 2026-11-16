@@ -732,7 +732,7 @@ impl UpstreamClient {
 
     /// 测试入口:自行编码 body 后委托 [`Self::request_encoded`]
     #[cfg(test)]
-    #[allow(clippy::too_many_arguments)]
+    #[expect(clippy::too_many_arguments)]
     pub(crate) async fn request(
         &self,
         base_url: &str,
@@ -782,7 +782,7 @@ impl UpstreamClient {
     /// - `extra_headers`:Claude 直通为 [`crate::http::claude_passthrough_headers`] 最小透传头
     /// - `inbound_user_agent`:Claude 协议优先使用入站值,缺失时回退配置值
     /// - `query`:入站 URI query(不含 `?`);仅 Claude 直通接到 `/v1/messages`
-    #[allow(clippy::too_many_arguments)]
+    #[expect(clippy::too_many_arguments)]
     pub(crate) async fn request_encoded(
         &self,
         base_url: &str,
@@ -862,7 +862,7 @@ impl UpstreamClient {
         }
     }
 
-    #[allow(clippy::too_many_arguments)]
+    #[expect(clippy::too_many_arguments)]
     async fn request_once(
         &self,
         base_url: &str,
@@ -1040,7 +1040,7 @@ impl UpstreamClient {
     }
 
     /// Claude TLS fingerprint lane (wreq/BoringSSL):仅 Protocol::Claude messages 路径。
-    #[allow(clippy::too_many_arguments)]
+    #[expect(clippy::too_many_arguments)]
     async fn request_once_fp(
         &self,
         base_url: &str,

@@ -419,7 +419,7 @@ fn map_nonstream_finish_reason(finish_reason: &str, has_tool_call: bool) -> &'st
 }
 
 /// 组装 Anthropic messages 非流式响应(基础形状)
-#[allow(clippy::too_many_arguments)]
+#[expect(clippy::too_many_arguments)]
 fn build_message(
     source: &Value,
     content: Vec<Value>,

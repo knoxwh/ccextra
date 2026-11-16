@@ -32,26 +32,22 @@
 
 use crate::cache_stabilization::drift_detector::ApiKind;
 use serde_json::Value;
-use std::sync::OnceLock;
+use std::sync::LazyLock;
 
 /// cccf 的 `/\s+(<\/system-reminder>)\s*$/` 的编译形式。
 ///
 /// 组 1 捕获字面量 `</system-reminder>`；开头的 `\s+` 被替换为单个 `\n`，
 /// 尾部的 `\s*$` 被丢弃。
-static REMINDER_TRAILING: OnceLock<regex::Regex> = OnceLock::new();
-
-fn reminder_regex() -> &'static regex::Regex {
-    REMINDER_TRAILING.get_or_init(|| {
-        regex::Regex::new(r"\s+(</system-reminder>)\s*$").expect("valid static regex")
-    })
-}
+static REMINDER_TRAILING: LazyLock<regex::Regex> = LazyLock::new(|| {
+    regex::Regex::new(r"\s+(</system-reminder>)\s*$").expect("valid static regex")
+});
 
 /// 在 cache prefix 和历史消息中，对每个包含 `</system-reminder>` 的文本承载
 /// 内容块，规范化其尾部 `</system-reminder>` 周围的空白。返回被修改的块数量。
 ///
 /// 确定性且幂等：第二次执行是空操作（正则不再匹配已规范化的文本）。
 pub fn normalize_reminder_trailing_whitespace(body: &mut Value, kind: ApiKind) -> usize {
-    let re = reminder_regex();
+    let re = &*REMINDER_TRAILING;
     let mut count = 0;
 
     match kind {

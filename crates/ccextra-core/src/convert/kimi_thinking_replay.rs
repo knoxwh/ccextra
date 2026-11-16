@@ -155,7 +155,7 @@ fn non_thinking_parts(content: &Value) -> Option<Vec<Value>> {
             .unwrap_or("")
             .trim()
         {
-            "thinking" | "redacted_thinking" => continue,
+            "thinking" | "redacted_thinking" => {}
             "tool_use" => {
                 if !part
                     .get("id")

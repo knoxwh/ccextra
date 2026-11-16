@@ -8,7 +8,7 @@ use std::collections::HashMap;
 use std::fs::{self, OpenOptions};
 use std::io::Write;
 use std::path::{Path, PathBuf};
-use std::sync::{Arc, Mutex, OnceLock};
+use std::sync::{Arc, LazyLock, Mutex};
 
 #[cfg(unix)]
 use std::os::unix::fs::{OpenOptionsExt, PermissionsExt};
@@ -30,14 +30,12 @@ pub fn oauth_http_client(proxy_url: Option<&str>, label: &str) -> Result<reqwest
         .with_context(|| format!("build {label} http client"))
 }
 
-static PATH_LOCKS: OnceLock<Mutex<HashMap<PathBuf, Arc<Mutex<()>>>>> = OnceLock::new();
+static PATH_LOCKS: LazyLock<Mutex<HashMap<PathBuf, Arc<Mutex<()>>>>> =
+    LazyLock::new(|| Mutex::new(HashMap::new()));
 
 fn path_lock(path: &Path) -> Arc<Mutex<()>> {
     let key = path.canonicalize().unwrap_or_else(|_| path.to_path_buf());
-    let mut map = PATH_LOCKS
-        .get_or_init(|| Mutex::new(HashMap::new()))
-        .lock()
-        .unwrap_or_else(|p| p.into_inner());
+    let mut map = PATH_LOCKS.lock().unwrap_or_else(|p| p.into_inner());
     map.entry(key)
         .or_insert_with(|| Arc::new(Mutex::new(())))
         .clone()
@@ -140,14 +138,12 @@ pub(crate) fn sanitize_file_segment(value: &str) -> String {
 
 type RefreshLock = Arc<tokio::sync::Mutex<()>>;
 
-static REFRESH_LOCKS: OnceLock<tokio::sync::Mutex<HashMap<String, RefreshLock>>> = OnceLock::new();
+static REFRESH_LOCKS: LazyLock<tokio::sync::Mutex<HashMap<String, RefreshLock>>> =
+    LazyLock::new(|| tokio::sync::Mutex::new(HashMap::new()));
 
 /// 按 refresh_token 单飞的刷新锁(对齐 CPA conductor_refresh refreshLocks 按凭证串行刷新)
 pub(crate) async fn lock_for_refresh_token(refresh_token: &str) -> RefreshLock {
-    let mut map = REFRESH_LOCKS
-        .get_or_init(|| tokio::sync::Mutex::new(HashMap::new()))
-        .lock()
-        .await;
+    let mut map = REFRESH_LOCKS.lock().await;
     acquire_refresh_lock(&mut map, refresh_token)
 }
 
