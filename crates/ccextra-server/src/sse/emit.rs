@@ -3,7 +3,7 @@
 // 提取自 chat/responses/gemini 状态机的无状态帧构造器。
 
 use bytes::Bytes;
-use serde_json::{json, Value};
+use serde_json::{Value, json};
 use std::io::Write;
 
 /// 序列化一个 SSE 事件(Anthropic 格式)

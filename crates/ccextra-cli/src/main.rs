@@ -2,27 +2,28 @@ use anyhow::{Context, Result};
 use ccextra_core::cache_stabilization::drift_detector::DriftState;
 use ccextra_core::route::ProviderConfig;
 use ccextra_server::antigravity::{
+    LoginOptions as AntigravityLoginOptions,
     constants::{CALLBACK_PORT, REFRESH_SKEW_SECS},
     list as list_antigravity, resolve_auth_dir as resolve_antigravity_auth_dir,
-    run_login as run_antigravity_login, LoginOptions as AntigravityLoginOptions,
+    run_login as run_antigravity_login,
 };
 use ccextra_server::claude::{
-    list as list_claude, resolve_auth_dir as resolve_claude_auth_dir,
-    run_login as run_claude_login, ClaudeLoginOptions,
+    ClaudeLoginOptions, list as list_claude, resolve_auth_dir as resolve_claude_auth_dir,
+    run_login as run_claude_login,
 };
 use ccextra_server::codex::{
-    list as list_codex, resolve_auth_dir as resolve_codex_auth_dir, run_login as run_codex_login,
-    CodexLoginOptions,
+    CodexLoginOptions, list as list_codex, resolve_auth_dir as resolve_codex_auth_dir,
+    run_login as run_codex_login,
 };
 use ccextra_server::http::{
-    publish_refreshed_providers, AppState, ConfigSnapshot, ProviderRefreshConfig, ReloadData,
-    RuntimeConfig, UserAgentSet,
+    AppState, ConfigSnapshot, ProviderRefreshConfig, ReloadData, RuntimeConfig, UserAgentSet,
+    publish_refreshed_providers,
 };
 use ccextra_server::serve;
 use ccextra_server::upstream::UpstreamClient;
 use ccextra_server::xai::{
-    constants::REFRESH_SKEW_SECS as XAI_REFRESH_SKEW_SECS, list as list_xai,
-    resolve_auth_dir as resolve_xai_auth_dir, run_login as run_xai_login, XAILoginOptions,
+    XAILoginOptions, constants::REFRESH_SKEW_SECS as XAI_REFRESH_SKEW_SECS, list as list_xai,
+    resolve_auth_dir as resolve_xai_auth_dir, run_login as run_xai_login,
 };
 use clap::{Parser, Subcommand};
 use std::path::PathBuf;
@@ -31,7 +32,7 @@ use std::time::SystemTime;
 use time::UtcOffset;
 use tokio::sync::RwLock;
 use tracing_subscriber::{
-    fmt::time::OffsetTime, layer::SubscriberExt, util::SubscriberInitExt, EnvFilter,
+    EnvFilter, fmt::time::OffsetTime, layer::SubscriberExt, util::SubscriberInitExt,
 };
 
 mod config;
@@ -775,7 +776,9 @@ async fn reload_after_login(config_path: &str) {
     }
     .await;
     if let Err(error) = result {
-        eprintln!("凭证已保存，自动重载未完成: {error}。服务未启动时下次启动生效，否则请手动 POST /reload。");
+        eprintln!(
+            "凭证已保存，自动重载未完成: {error}。服务未启动时下次启动生效，否则请手动 POST /reload。"
+        );
     }
 }
 
@@ -1062,10 +1065,10 @@ fn build_user_agents(config: Option<&config::UserAgents>) -> UserAgentSet {
 #[cfg(test)]
 mod tests {
     use super::{
+        Arc, Config, ProviderConfig, RuntimeConfig, RwLock, UpstreamClient,
         antigravity_injection_loop, build_user_agents, load_refreshed_providers,
         load_thinking_registry, merge_all_providers, merge_providers, pin_auth_dir, pin_path,
-        provider_refresh_config, refresh_providers, startup_retry_delay, with_pinned_log_dir, Arc,
-        Config, ProviderConfig, RuntimeConfig, RwLock, UpstreamClient,
+        provider_refresh_config, refresh_providers, startup_retry_delay, with_pinned_log_dir,
     };
     use ccextra_core::route::{ModelConfig, Protocol};
     use ccextra_server::antigravity::resolve_auth_dir as resolve_antigravity_auth_dir;
@@ -1075,7 +1078,7 @@ mod tests {
 
     #[test]
     fn antigravity_ua_defaults_to_request_ua_constant() {
-        use ccextra_server::antigravity::constants::{onboard_ua, ONBOARD_UA, REQUEST_UA};
+        use ccextra_server::antigravity::constants::{ONBOARD_UA, REQUEST_UA, onboard_ua};
         assert_eq!(build_user_agents(None).antigravity.as_str(), REQUEST_UA);
         assert!(ONBOARD_UA.starts_with(REQUEST_UA));
         assert_eq!(
@@ -1217,11 +1220,13 @@ mod tests {
             snapshot.refresh.claude_auth_dir = Some(directory.path().join("claude"));
             snapshot.refresh.static_providers = vec![static_provider];
         }
-        assert!(refresh_providers(&state, |refresh, current| {
-            load_refreshed_providers(refresh, current)
-        })
-        .await
-        .unwrap());
+        assert!(
+            refresh_providers(&state, |refresh, current| {
+                load_refreshed_providers(refresh, current)
+            })
+            .await
+            .unwrap()
+        );
         let snapshot = state.read().await;
         assert_eq!(snapshot.providers.len(), 1);
         assert_eq!(snapshot.providers[0].name, "static");
@@ -1255,11 +1260,13 @@ mod tests {
             snapshot.refresh.proxy_url = Some("invalid-proxy".into());
         }
         let before = state.read().await.clone();
-        assert!(!refresh_providers(&state, |refresh, current| {
-            load_refreshed_providers(refresh, current)
-        })
-        .await
-        .unwrap());
+        assert!(
+            !refresh_providers(&state, |refresh, current| {
+                load_refreshed_providers(refresh, current)
+            })
+            .await
+            .unwrap()
+        );
         assert!(Arc::ptr_eq(&before, &*state.read().await));
     }
 

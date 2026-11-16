@@ -8,7 +8,7 @@
 //! Exit non-zero on mismatch.
 
 use ccextra_server::claude_tls_fp::{
-    build_fingerprint_client, PROFILE_ID, TARGET_JA3_HASH, TARGET_JA4,
+    PROFILE_ID, TARGET_JA3_HASH, TARGET_JA4, build_fingerprint_client,
 };
 
 #[tokio::main]

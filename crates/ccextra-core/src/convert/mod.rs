@@ -29,23 +29,23 @@ pub mod tool_sanitize;
 
 pub use antigravity::{convert_to_antigravity, convert_to_antigravity_with};
 pub use antigravity_reasoning_replay::{
-    claude_replay_system_lane, collect_ag_replay_from_response,
+    AgReplayAccumulator, AgReplayPrepareReport, AgReplayToolContext, MAX_BYTES_PER_ENTRY,
+    MAX_ITEMS_PER_ENTRY, claude_replay_system_lane, collect_ag_replay_from_response,
     is_antigravity_thought_signature_invalid, normalize_ag_replay_items,
-    prepare_ag_replay_request_with_tools, AgReplayAccumulator, AgReplayPrepareReport,
-    AgReplayToolContext, MAX_BYTES_PER_ENTRY, MAX_ITEMS_PER_ENTRY,
+    prepare_ag_replay_request_with_tools,
 };
 pub use antigravity_tools::{
     antigravity_tool_name_to_upstream, antigravity_upstream_tool_name_to_client,
 };
 pub use claude_tool_args::{
-    claude_tool_is_parameterless, clean_claude_tool_arguments, clean_claude_tool_arguments_raw,
-    ToolArgStreamState,
+    ToolArgStreamState, claude_tool_is_parameterless, clean_claude_tool_arguments,
+    clean_claude_tool_arguments_raw,
 };
 pub use fix_json::fix_json_quotes;
 pub use gemini::{convert_to_gemini, convert_to_gemini_with_registry};
 pub use gemini_response::{
-    convert_gemini_response, convert_gemini_stream_chunk, finalize_gemini_stream,
-    force_finalize_gemini_stream, GeminiStreamState,
+    GeminiStreamState, convert_gemini_response, convert_gemini_stream_chunk,
+    finalize_gemini_stream, force_finalize_gemini_stream,
 };
 pub use gemini_schema::{
     clean_json_schema_for_antigravity, clean_json_schema_for_antigravity_claude_tool,
@@ -53,21 +53,21 @@ pub use gemini_schema::{
     clean_nested_schema_for_antigravity_claude,
 };
 pub use kimi_thinking_replay::{
-    content_from_message_response, content_is_replayable, is_kimi_thinking_replay_model,
-    kimi_thinking_replay_model_family, normalize_cached_content, restore_kimi_thinking_replay,
-    KimiThinkingReplayStreamAccumulator,
+    KimiThinkingReplayStreamAccumulator, content_from_message_response, content_is_replayable,
+    is_kimi_thinking_replay_model, kimi_thinking_replay_model_family, normalize_cached_content,
+    restore_kimi_thinking_replay,
 };
 pub use passthrough::{clamp_passthrough_effort, convert_passthrough, sanitize_passthrough_prompt};
 pub use reasoning_replay::{
-    append_replay_turn, build_replay_turn, compute_input_prefix_fingerprint,
-    input_prefix_fingerprint, insert_replay_turns, REPLAY_TURN_TYPE,
+    REPLAY_TURN_TYPE, append_replay_turn, build_replay_turn, compute_input_prefix_fingerprint,
+    input_prefix_fingerprint, insert_replay_turns,
 };
 pub use shorten::build_reverse_map;
 pub use shorten::build_short_name_map;
 pub use signature::{
-    format_claude_signature_value, is_codex_commentary_signature_marker,
-    is_valid_gpt_reasoning_signature, is_valid_grok_encrypted_content, model_group,
-    restore_codex_commentary_markers, CODEX_COMMENTARY_SIGNATURE_MARKER,
+    CODEX_COMMENTARY_SIGNATURE_MARKER, format_claude_signature_value,
+    is_codex_commentary_signature_marker, is_valid_gpt_reasoning_signature,
+    is_valid_grok_encrypted_content, model_group, restore_codex_commentary_markers,
 };
 pub use to_openai_chat::{
     convert_to_openai_chat, convert_to_openai_chat_with, sanitize_openai_chat_after_payload,
@@ -89,8 +89,7 @@ pub const CLAUDE_AGENT_SDK_IDENTITY: &str =
     "You are a Claude agent, built on Anthropic's Claude Agent SDK.";
 pub const CLAUDE_CODE_CLI_IDENTITY: &str =
     "You are Claude Code, Anthropic's official CLI for Claude.";
-pub const CLAUDE_CODE_SDK_CLI_IDENTITY: &str =
-    "You are Claude Code, Anthropic's official CLI for Claude, running within the Claude Agent SDK.";
+pub const CLAUDE_CODE_SDK_CLI_IDENTITY: &str = "You are Claude Code, Anthropic's official CLI for Claude, running within the Claude Agent SDK.";
 
 /// 是否为 Claude Code 计费归属文本(前导空白后以前缀开头)
 pub fn is_attribution_text(text: &str) -> bool {
@@ -439,9 +438,11 @@ mod tests {
         )
         .unwrap();
         let out = normalize_object_schema_properties(schema);
-        assert!(out["properties"]["file_paths"]["items"]
-            .get("pattern")
-            .is_none());
+        assert!(
+            out["properties"]["file_paths"]["items"]
+                .get("pattern")
+                .is_none()
+        );
         assert_eq!(out["properties"]["file_paths"]["items"]["minLength"], 1);
         assert_eq!(out["properties"]["asset_id"]["pattern"], "^[0-9a-f]{32}$");
         assert_eq!(out["properties"]["hex_nul"]["pattern"], "^[^\\x00]*$");

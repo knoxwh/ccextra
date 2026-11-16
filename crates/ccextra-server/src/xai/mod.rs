@@ -9,8 +9,8 @@ pub mod provider;
 pub mod refresh;
 pub mod store;
 
-pub use credential::{credential_file_name, parse_jwt_identity, XAICredential};
-pub use login::{run_login, XAILoginOptions};
+pub use credential::{XAICredential, credential_file_name, parse_jwt_identity};
+pub use login::{XAILoginOptions, run_login};
 pub use models::default_grok_models;
 pub use provider::load_xai_providers;
 pub use refresh::{ensure_credential_fresh, refresh_if_needed};

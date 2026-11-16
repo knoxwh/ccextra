@@ -5,8 +5,8 @@
 //! value = 完整 assistant `content` 数组（带 signature 的 thinking + tool_use）。
 
 use ccextra_core::convert::{
-    content_from_message_response, content_is_replayable, normalize_cached_content,
-    restore_kimi_thinking_replay, KimiThinkingReplayStreamAccumulator,
+    KimiThinkingReplayStreamAccumulator, content_from_message_response, content_is_replayable,
+    normalize_cached_content, restore_kimi_thinking_replay,
 };
 use serde_json::Value;
 use std::time::Duration;

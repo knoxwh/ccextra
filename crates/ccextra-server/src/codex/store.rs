@@ -1,6 +1,6 @@
 // Codex 凭证持久化 (对齐原子写 + CPA 文件锁精神)
 
-use super::credential::{credential_file_name, CodexCredential};
+use super::credential::{CodexCredential, credential_file_name};
 use anyhow::{Context, Result};
 use std::fs;
 use std::path::{Path, PathBuf};

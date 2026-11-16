@@ -1,12 +1,12 @@
 // Gemini SSE 流 → Anthropic SSE 转换
 
+use super::SseStreamPin;
 use super::emit;
 use super::parser::{SseEvent, SseParser};
-use super::SseStreamPin;
 use bytes::{BufMut, Bytes, BytesMut};
 use ccextra_core::convert::{
-    convert_gemini_stream_chunk, finalize_gemini_stream, force_finalize_gemini_stream,
-    GeminiStreamState,
+    GeminiStreamState, convert_gemini_stream_chunk, finalize_gemini_stream,
+    force_finalize_gemini_stream,
 };
 use futures::Stream;
 use std::collections::HashMap;
@@ -308,8 +308,8 @@ where
 #[cfg(test)]
 mod tests {
     use super::*;
-    use futures::stream;
     use futures::StreamExt;
+    use futures::stream;
 
     async fn collect_output<S>(stream: S) -> String
     where

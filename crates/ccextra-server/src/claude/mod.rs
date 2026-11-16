@@ -9,8 +9,8 @@ pub mod provider;
 pub mod refresh;
 pub mod store;
 
-pub use credential::{credential_file_name, is_claude_oauth_token, ClaudeCredential};
-pub use login::{run_login, ClaudeLoginOptions};
+pub use credential::{ClaudeCredential, credential_file_name, is_claude_oauth_token};
+pub use login::{ClaudeLoginOptions, run_login};
 pub use models::default_claude_models;
 pub use provider::load_claude_providers;
 pub use refresh::{ensure_credential_fresh, refresh_if_needed};

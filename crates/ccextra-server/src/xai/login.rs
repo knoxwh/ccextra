@@ -1,6 +1,6 @@
 // xAI Device Code 登录流程与交互
 
-use super::credential::{parse_jwt_identity, XAICredential};
+use super::credential::{XAICredential, parse_jwt_identity};
 use super::oauth::{http_client, poll_for_token, start_device_flow};
 use super::store;
 use crate::oauth_common::open_browser;

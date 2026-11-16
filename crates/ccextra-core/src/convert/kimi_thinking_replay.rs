@@ -10,7 +10,7 @@
 //!
 //! 纯函数，无 IO；server 层持有缓存。
 
-use serde_json::{json, Map, Value};
+use serde_json::{Map, Value, json};
 use std::collections::BTreeMap;
 
 /// 单条 content 数组字节上限（对齐 CPA KimiThinkingReplayCacheMaxBytesPerEntry）
@@ -171,11 +171,7 @@ fn non_thinking_parts(content: &Value) -> Option<Vec<Value>> {
             _ => parts.push(canonicalize_value(part)),
         }
     }
-    if has_tool_use {
-        Some(parts)
-    } else {
-        None
-    }
+    if has_tool_use { Some(parts) } else { None }
 }
 
 fn canonicalize_value(v: &Value) -> Value {

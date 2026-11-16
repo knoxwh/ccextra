@@ -632,10 +632,12 @@ mod tests {
         assert_eq!(msgs[0]["role"], "developer");
         let parts = msgs[0]["content"].as_array().unwrap();
         assert_eq!(parts[0]["text"], "base");
-        assert!(parts[1]["text"]
-            .as_str()
-            .unwrap()
-            .contains("IMPORTANT: Respond with valid JSON"));
+        assert!(
+            parts[1]["text"]
+                .as_str()
+                .unwrap()
+                .contains("IMPORTANT: Respond with valid JSON")
+        );
     }
 
     /// Gemini/AG 无注入字段:schema 探测得到但注入失败,不得置 adapted,
@@ -741,10 +743,12 @@ mod tests {
             Protocol::OpenAiResponses
         ));
         assert!(body.get("text").is_none());
-        assert!(body["instructions"]
-            .as_str()
-            .unwrap()
-            .contains("IMPORTANT: Respond with valid JSON"));
+        assert!(
+            body["instructions"]
+                .as_str()
+                .unwrap()
+                .contains("IMPORTANT: Respond with valid JSON")
+        );
     }
 
     /// 首发预降级幂等:第二次不得再改 body / 报 adapted。

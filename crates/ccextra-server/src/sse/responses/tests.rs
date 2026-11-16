@@ -3,7 +3,7 @@ use super::state_machine::*;
 use super::*;
 use crate::sse::parser::SseEvent;
 use bytes::Bytes;
-use serde_json::{json, Value};
+use serde_json::{Value, json};
 use std::collections::HashMap;
 use std::sync::Arc;
 
@@ -51,12 +51,14 @@ fn test_responses_text_stream() {
     let out2 = r.process(&ev(
         r#"{"type":"response.output_text.delta","delta":"hello"}"#,
     ));
-    assert!(out2
-        .iter()
-        .any(|b| b.starts_with(b"event: content_block_start")));
-    assert!(out2
-        .iter()
-        .any(|b| b.starts_with(b"event: content_block_delta")));
+    assert!(
+        out2.iter()
+            .any(|b| b.starts_with(b"event: content_block_start"))
+    );
+    assert!(
+        out2.iter()
+            .any(|b| b.starts_with(b"event: content_block_delta"))
+    );
 }
 
 #[test]
@@ -975,10 +977,12 @@ fn test_empty_incomplete_becomes_error() {
         v["error"]["type"], "api_error",
         "空 incomplete 维持 api_error(CPA 502),不得改成 timeout_error"
     );
-    assert!(v["error"]["message"]
-        .as_str()
-        .unwrap()
-        .contains("incomplete empty response"));
+    assert!(
+        v["error"]["message"]
+            .as_str()
+            .unwrap()
+            .contains("incomplete empty response")
+    );
 }
 
 #[test]
@@ -1112,7 +1116,7 @@ fn test_golden_sse_typical_flows_byte_invariance() {
         let fc_stream = s(&out);
         assert_eq!(
             fc_stream,
-concat!(
+            concat!(
                 "event: message_start\ndata: {\"type\":\"message_start\",\"message\":{\"id\":\"resp_3\",\"type\":\"message\",\"role\":\"assistant\",\"model\":\"gpt-5\",\"content\":[],\"stop_reason\":null,\"stop_sequence\":null,\"usage\":{\"input_tokens\":1,\"output_tokens\":0,\"cache_read_input_tokens\":0,\"cache_creation_input_tokens\":0}}}\n\n",
                 "event: content_block_start\ndata: {\"type\":\"content_block_start\",\"index\":0,\"content_block\":{\"type\":\"tool_use\",\"id\":\"c1\",\"name\":\"tool_a\"}}\n\n",
                 "event: content_block_delta\ndata: {\"type\":\"content_block_delta\",\"index\":0,\"delta\":{\"type\":\"input_json_delta\",\"partial_json\":\"\"}}\n\n",

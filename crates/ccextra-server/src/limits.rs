@@ -89,7 +89,7 @@ where
                 return Ok(BoundedBody {
                     bytes: Bytes::from(buf),
                     truncated: false,
-                })
+                });
             }
             Ok(Some(Err(e))) => return Err(BodyReadError::Transport(e)),
             Ok(Some(Ok(chunk))) => {

@@ -3,7 +3,7 @@
 // 各模块保留自身的凭证结构、文件命名与扫描规则。
 // (写回语义对齐 CPA sdk/auth/filestore.go:原子写、目录 0700、文件 0600)
 
-use anyhow::{anyhow, Context, Result};
+use anyhow::{Context, Result, anyhow};
 use std::collections::HashMap;
 use std::fs::{self, OpenOptions};
 use std::io::Write;
@@ -261,9 +261,11 @@ mod tests {
         ];
         for (url, pkce) in urls {
             let query = url.split_once('?').unwrap().1;
-            assert!(query
-                .split('&')
-                .any(|p| p == format!("code_challenge={}", pkce.code_challenge)));
+            assert!(
+                query
+                    .split('&')
+                    .any(|p| p == format!("code_challenge={}", pkce.code_challenge))
+            );
             assert!(query.split('&').any(|p| p == "code_challenge_method=S256"));
             assert!(!query.split('&').any(|p| p.starts_with("code_verifier=")));
         }

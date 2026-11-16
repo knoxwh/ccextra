@@ -1,5 +1,5 @@
 use crate::claude::constants::OAUTH_BETA;
-use axum::http::{header, HeaderMap, HeaderName, HeaderValue};
+use axum::http::{HeaderMap, HeaderName, HeaderValue, header};
 
 /// Claude Code / CPA 对齐的 Accept-Encoding(`protocol: claude` 直通)。
 ///

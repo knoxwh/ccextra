@@ -5,7 +5,7 @@ use super::constants::{REFRESH_MAX_RETRIES, REFRESH_SKEW_SECS};
 use super::credential::ClaudeCredential;
 use super::{oauth, store};
 use crate::oauth_common::lock_for_refresh_token;
-use anyhow::{anyhow, Result};
+use anyhow::{Result, anyhow};
 use std::path::Path;
 
 /// 检查并刷新凭证(如果需要);仅对明确可重试 HTTP 错误退避重试

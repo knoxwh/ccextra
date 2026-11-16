@@ -1,12 +1,12 @@
 // project_id:loadCodeAssist,空则 daily onboardUser 轮询
 
 use super::constants::{
-    onboard_ua, version_from_user_agent, API_VERSION, DAILY_API_ENDPOINT, GOOG_API_CLIENT,
-    REQUEST_UA,
+    API_VERSION, DAILY_API_ENDPOINT, GOOG_API_CLIENT, REQUEST_UA, onboard_ua,
+    version_from_user_agent,
 };
-use anyhow::{anyhow, Context, Result};
+use anyhow::{Context, Result, anyhow};
 use reqwest::Client;
-use serde_json::{json, Value};
+use serde_json::{Value, json};
 use std::time::Duration;
 
 const ONBOARD_ATTEMPTS: u32 = 5;
@@ -230,7 +230,7 @@ mod tests {
     async fn project_and_onboard_body_limits() {
         use crate::{
             limits::SUCCESS_BODY_LIMIT,
-            test_support::{padded_json, TestServer},
+            test_support::{TestServer, padded_json},
         };
         use axum::http::StatusCode;
         let client = crate::antigravity::oauth::http_client(Some("direct")).unwrap();

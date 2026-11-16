@@ -1,11 +1,11 @@
 use axum::{
+    Json,
     http::StatusCode,
     response::{IntoResponse, Response},
-    Json,
 };
 use ccextra_core::convert::ConvertError;
 use ccextra_core::route::RouteError;
-use serde_json::{json, Value};
+use serde_json::{Value, json};
 
 #[derive(Debug)]
 pub struct AppError {
@@ -267,10 +267,12 @@ mod tests {
         let v = body_json(resp).await;
         assert_eq!(v["type"], "error");
         assert_eq!(v["error"]["type"], "timeout_error");
-        assert!(v["error"]["message"]
-            .as_str()
-            .unwrap()
-            .contains("上游请求超时"));
+        assert!(
+            v["error"]["message"]
+                .as_str()
+                .unwrap()
+                .contains("上游请求超时")
+        );
     }
 
     #[tokio::test]

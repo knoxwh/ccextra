@@ -3,7 +3,7 @@
 //! 不做握手、不联网。btls / wreq 升级导致 Hello 漂移时这里会红。
 
 use ccextra_server::claude_tls_fp::{
-    build_fingerprint_client, ja3_hash, TARGET_JA3_HASH, TARGET_JA4,
+    TARGET_JA3_HASH, TARGET_JA4, build_fingerprint_client, ja3_hash,
 };
 use sha2::{Digest, Sha256};
 use tokio::io::AsyncReadExt;

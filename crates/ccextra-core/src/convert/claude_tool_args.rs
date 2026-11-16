@@ -4,7 +4,7 @@
 //! 按原始 Claude tools 声明回剥。本模块为 original-only 路径(不对齐
 //! CleanClaudeToolArgumentsWithTranslated)。
 
-use serde_json::{json, Value};
+use serde_json::{Value, json};
 use std::collections::{HashMap, HashSet};
 
 /// 对齐 CPA CanonicalToolName:去首尾空白、剥前导 `_`、小写。
@@ -555,11 +555,7 @@ fn resolve_array_items<'a>(
     if let Some(direct) = schema.get("items") {
         collect(direct);
     }
-    if deterministic {
-        Some(items)
-    } else {
-        None
-    }
+    if deterministic { Some(items) } else { None }
 }
 
 fn clean_array(args: &mut Value, schemas: &[&Value], root: &Value, path: &[String]) {
@@ -1065,9 +1061,11 @@ mod tests {
         });
         let mut state = ToolArgStreamState::default();
         state.begin_tool("echo", Some(&orig));
-        assert!(state
-            .clean_emitted_args("{}", "echo", Some(&orig))
-            .is_none());
+        assert!(
+            state
+                .clean_emitted_args("{}", "echo", Some(&orig))
+                .is_none()
+        );
         assert!(state.current_tool_pending_empty);
         let real = state
             .clean_emitted_args(r#"{"user":"v"}"#, "echo", Some(&orig))
@@ -1082,9 +1080,11 @@ mod tests {
             .clean_emitted_args(r#"{"user":"v"}"#, "echo", Some(&orig))
             .unwrap();
         assert_eq!(first, r#"{"user":"v"}"#);
-        assert!(state2
-            .clean_emitted_args("{}", "echo", Some(&orig))
-            .is_none());
+        assert!(
+            state2
+                .clean_emitted_args("{}", "echo", Some(&orig))
+                .is_none()
+        );
         assert!(state2.flush_pending_empty().is_none());
     }
 
@@ -1095,9 +1095,11 @@ mod tests {
         });
         let mut state = ToolArgStreamState::default();
         state.begin_tool("echo", Some(&orig));
-        assert!(state
-            .clean_emitted_args("{}", "echo", Some(&orig))
-            .is_none());
+        assert!(
+            state
+                .clean_emitted_args("{}", "echo", Some(&orig))
+                .is_none()
+        );
         assert_eq!(state.flush_pending_empty().as_deref(), Some("{}"));
         assert!(state.flush_pending_empty().is_none());
     }

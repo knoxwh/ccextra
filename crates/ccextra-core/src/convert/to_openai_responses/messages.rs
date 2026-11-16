@@ -1,4 +1,4 @@
-use serde_json::{json, Value};
+use serde_json::{Value, json};
 
 /// tool_result content → responses output 与图片 parts 元组(对齐 convertToolResultOutput)。
 /// function_call_output.output 只接受文本,内嵌 image 抽出为元组第二项,

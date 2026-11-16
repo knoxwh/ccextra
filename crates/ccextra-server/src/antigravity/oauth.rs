@@ -4,7 +4,7 @@ use super::constants::{
     AUTH_ENDPOINT, CALLBACK_PORT, CLIENT_ID, CLIENT_SECRET, SCOPES, TOKEN_ENDPOINT,
     TOKEN_REFRESH_UA, USERINFO_ENDPOINT,
 };
-use anyhow::{anyhow, Context, Result};
+use anyhow::{Context, Result, anyhow};
 use reqwest::Client;
 use serde::Deserialize;
 
@@ -197,7 +197,7 @@ pub async fn refresh_token(client: &Client, refresh: &str) -> Result<TokenRespon
                 status: None,
                 message: format!("request failed: {}", error_chain(&e)),
                 retryable: transport_error_retryable(&e),
-            })
+            });
         }
     };
     let status = resp.status();
@@ -217,7 +217,7 @@ pub async fn refresh_token(client: &Client, refresh: &str) -> Result<TokenRespon
                 status: None,
                 message: format!("read response: {e}"),
                 retryable: false,
-            })
+            });
         }
     };
     let token: TokenResponse = match serde_json::from_slice(&bytes) {
@@ -227,7 +227,7 @@ pub async fn refresh_token(client: &Client, refresh: &str) -> Result<TokenRespon
                 status: None,
                 message: format!("parse response: {e}"),
                 retryable: false,
-            })
+            });
         }
     };
     if token.access_token.trim().is_empty() {
@@ -403,7 +403,7 @@ mod tests {
     async fn userinfo_body_limits() {
         use crate::{
             limits::SUCCESS_BODY_LIMIT,
-            test_support::{padded_json, TestServer},
+            test_support::{TestServer, padded_json},
         };
         use axum::http::StatusCode;
         let client = http_client(Some("direct")).unwrap();
@@ -430,8 +430,8 @@ mod tests {
     #[tokio::test]
     async fn oauth_clients_timeout_covers_body_read() {
         use crate::{
-            limits::{read_success_body, BodyReadError},
-            test_support::{stalled_body, TestServer},
+            limits::{BodyReadError, read_success_body},
+            test_support::{TestServer, stalled_body},
         };
         use std::time::Duration;
         let server =

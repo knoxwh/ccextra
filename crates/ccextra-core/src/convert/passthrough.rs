@@ -6,7 +6,7 @@
 
 use super::Result;
 use crate::convert::signature::restore_codex_commentary_markers;
-use crate::thinking::{clamp_effort, ModelCapability};
+use crate::thinking::{ModelCapability, clamp_effort};
 use serde_json::Value;
 
 /// Claude 直通转换:改 model,并对 Claude 5.5 降级强制 tool_choice

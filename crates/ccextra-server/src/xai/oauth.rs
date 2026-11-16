@@ -1,7 +1,7 @@
 // xAI OAuth Discovery, Device Code 与 Token 交换/刷新 (对齐 CLIProxyAPI internal/auth/xai/xai.go)
 
 use super::constants::{CLIENT_ID, DEVICE_CODE_GRANT_TYPE, DISCOVERY_URL, SCOPE};
-use anyhow::{anyhow, Context, Result};
+use anyhow::{Context, Result, anyhow};
 use reqwest::Client;
 use serde::Deserialize;
 use std::time::Duration;
@@ -277,7 +277,7 @@ pub async fn refresh_token(
                     status: None,
                     message: format!("discovery failed: {e}"),
                     retryable: false,
-                })
+                });
             }
         }
     } else {
@@ -302,7 +302,7 @@ pub async fn refresh_token(
                 status: None,
                 message: format!("request failed: {e}"),
                 retryable: false,
-            })
+            });
         }
     };
 
@@ -323,7 +323,7 @@ pub async fn refresh_token(
                 status: None,
                 message: format!("read response: {e}"),
                 retryable: false,
-            })
+            });
         }
     };
     let data: TokenData = match serde_json::from_slice(&bytes) {
@@ -333,7 +333,7 @@ pub async fn refresh_token(
                 status: None,
                 message: format!("parse response: {e}"),
                 retryable: false,
-            })
+            });
         }
     };
     if data.access_token.trim().is_empty() {
@@ -369,7 +369,7 @@ mod tests {
 
     #[tokio::test]
     async fn poll_body_limits_and_classification() {
-        use crate::test_support::{padded_json, TestServer};
+        use crate::test_support::{TestServer, padded_json};
         use axum::http::StatusCode;
         for (status, json, len, expected) in [
             (StatusCode::OK, r#"{"access_token":"at"}"#, 0, ""),
@@ -420,7 +420,7 @@ mod tests {
     async fn refresh_and_device_body_limits() {
         use crate::{
             limits::SUCCESS_BODY_LIMIT,
-            test_support::{padded_json, TestServer},
+            test_support::{TestServer, padded_json},
         };
         use axum::http::StatusCode;
         let json =
@@ -467,7 +467,7 @@ mod tests {
     async fn discover_body_limits() {
         use crate::{
             limits::SUCCESS_BODY_LIMIT,
-            test_support::{padded_json, TestServer},
+            test_support::{TestServer, padded_json},
         };
         use axum::http::StatusCode;
         let json = r#"{"device_authorization_endpoint":"https://auth.x.ai/oauth2/device/code","token_endpoint":"https://auth.x.ai/oauth2/token"}"#;

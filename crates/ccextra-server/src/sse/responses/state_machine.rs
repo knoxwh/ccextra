@@ -1,5 +1,5 @@
 use bytes::Bytes;
-use serde_json::{json, Value};
+use serde_json::{Value, json};
 use std::collections::{HashMap, HashSet};
 use std::sync::Arc;
 
@@ -465,11 +465,7 @@ impl ResponsesRelay {
                     .collect::<Vec<_>>()
             })?;
         let out = self.absorb_doom_loop_triggers(&triggers);
-        if out.is_empty() {
-            None
-        } else {
-            Some(out)
-        }
+        if out.is_empty() { None } else { Some(out) }
     }
 
     /// 吸收触发器集:去重、解析、置信判定;置信返回中断帧

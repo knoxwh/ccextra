@@ -3,8 +3,8 @@
 use crate::oauth_common::sanitize_file_segment;
 use serde::{Deserialize, Serialize};
 use std::time::{Duration, SystemTime};
-use time::format_description::well_known::Rfc3339;
 use time::OffsetDateTime;
+use time::format_description::well_known::Rfc3339;
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct XAICredential {

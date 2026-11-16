@@ -1,15 +1,15 @@
 // Codex PKCE + 本地回调登录流程 (对齐 CPA sdk/auth/codex.go 主路径)
 
 use super::constants::{CALLBACK_PATH, DEFAULT_CALLBACK_PORT};
-use super::credential::{parse_jwt_identity, CodexCredential};
+use super::credential::{CodexCredential, parse_jwt_identity};
 use super::oauth::{build_auth_url, exchange_code, generate_pkce_codes, http_client};
 use super::store;
 use crate::oauth_common::{open_browser, random_state};
-use anyhow::{anyhow, Context, Result};
+use anyhow::{Context, Result, anyhow};
+use axum::Router;
 use axum::extract::Query;
 use axum::response::Html;
 use axum::routing::get;
-use axum::Router;
 use serde::Deserialize;
 use std::net::SocketAddr;
 use std::path::PathBuf;

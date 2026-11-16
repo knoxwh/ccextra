@@ -18,9 +18,9 @@ use bytes::{Bytes, BytesMut};
 use futures::Stream;
 use serde_json::Value;
 
+use super::SseStreamPin;
 use super::emit;
 use super::parser::SseParser;
-use super::SseStreamPin;
 use ccextra_core::convert::fix_json_quotes;
 
 /// active block 类型
@@ -1142,21 +1142,24 @@ mod tests {
         let out1 = r.process(&ev1);
         // 首 chunk 应发 message_start + content_block_start + content_block_delta
         assert!(out1.iter().any(|b| b.starts_with(b"event: message_start")));
-        assert!(out1
-            .iter()
-            .any(|b| b.starts_with(b"event: content_block_start")));
-        assert!(out1
-            .iter()
-            .any(|b| b.starts_with(b"event: content_block_delta")));
+        assert!(
+            out1.iter()
+                .any(|b| b.starts_with(b"event: content_block_start"))
+        );
+        assert!(
+            out1.iter()
+                .any(|b| b.starts_with(b"event: content_block_delta"))
+        );
 
         let out2 = process_then_done(
             &mut r,
             r#"{"id":"1","choices":[{"delta":{"content":"there"},"finish_reason":"stop"}],"usage":{"prompt_tokens":10,"completion_tokens":5}}"#,
         );
         // [DONE] 后应发 content_block_stop + message_delta + message_stop
-        assert!(out2
-            .iter()
-            .any(|b| b.starts_with(b"event: content_block_stop")));
+        assert!(
+            out2.iter()
+                .any(|b| b.starts_with(b"event: content_block_stop"))
+        );
         assert!(out2.iter().any(|b| b.starts_with(b"event: message_delta")));
         assert!(out2.iter().any(|b| b.starts_with(b"event: message_stop")));
     }
@@ -1171,9 +1174,10 @@ mod tests {
             event: Some("c".into()),
             data: r#"{"choices":[{"delta":{"tool_calls":[{"index":0,"id":"call_1","function":{"name":"get_weather","arguments":""}}]}}]}"#.into(),
         });
-        assert!(out1
-            .iter()
-            .all(|b| !b.starts_with(b"event: content_block_start")));
+        assert!(
+            out1.iter()
+                .all(|b| !b.starts_with(b"event: content_block_start"))
+        );
         // tool 开启期间到达 text → 必须缓冲,不发 delta/stop
         let out2 = r.process(&super::super::parser::SseEvent {
             event: Some("c".into()),
@@ -1211,9 +1215,11 @@ mod tests {
         });
         // 会发 message_start,但工具 start 帧延迟到 finish 才发
         assert!(out1.iter().any(|b| b.starts_with(b"event: message_start")));
-        assert!(!out1
-            .iter()
-            .any(|b| b.starts_with(b"event: content_block_start")));
+        assert!(
+            !out1
+                .iter()
+                .any(|b| b.starts_with(b"event: content_block_start"))
+        );
 
         // chunk2: arguments 增量(累积,不在流中逐段发)
         let out2 = r.process(&super::super::parser::SseEvent {
@@ -1227,12 +1233,14 @@ mod tests {
             &mut r,
             r#"{"choices":[{"delta":{},"finish_reason":"tool_calls"}],"usage":{"prompt_tokens":10,"completion_tokens":5}}"#,
         );
-        assert!(out3
-            .iter()
-            .any(|b| b.starts_with(b"event: content_block_stop")));
-        assert!(out3
-            .iter()
-            .any(|b| b.starts_with(b"event: content_block_delta")));
+        assert!(
+            out3.iter()
+                .any(|b| b.starts_with(b"event: content_block_stop"))
+        );
+        assert!(
+            out3.iter()
+                .any(|b| b.starts_with(b"event: content_block_delta"))
+        );
         assert!(out3.iter().any(|b| b.starts_with(b"event: message_delta")));
     }
 
@@ -1421,9 +1429,10 @@ mod tests {
             event: Some("c".into()),
             data: r#"{"id":"1","choices":[{"delta":{"reasoning_content":"thinking A"}}]}"#.into(),
         });
-        assert!(out1
-            .iter()
-            .any(|b| String::from_utf8_lossy(b).contains("thinking A")));
+        assert!(
+            out1.iter()
+                .any(|b| String::from_utf8_lossy(b).contains("thinking A"))
+        );
 
         // 重复发同样的 reasoning(去重)
         let out2 = r.process(&super::super::parser::SseEvent {
@@ -1437,9 +1446,10 @@ mod tests {
             event: Some("c".into()),
             data: r#"{"choices":[{"delta":{"reasoning_content":"thinking B"}}]}"#.into(),
         });
-        assert!(out3
-            .iter()
-            .any(|b| String::from_utf8_lossy(b).contains("thinking B")));
+        assert!(
+            out3.iter()
+                .any(|b| String::from_utf8_lossy(b).contains("thinking B"))
+        );
     }
 
     #[test]
@@ -2072,10 +2082,11 @@ mod tests {
             business,
             b"event: a\ndata: 1\n\nevent: b\ndata: 2\n\n".to_vec()
         );
-        assert!(out
-            .iter()
-            .filter(|f| &f[..] != keepalive)
-            .all(|f| f.ends_with(b"\n\n")));
+        assert!(
+            out.iter()
+                .filter(|f| &f[..] != keepalive)
+                .all(|f| f.ends_with(b"\n\n"))
+        );
     }
 
     #[test]

@@ -1,7 +1,7 @@
 // Antigravity 模型列表获取
 use super::constants::{API_ENDPOINT, DAILY_API_ENDPOINT, SANDBOX_DAILY_API_ENDPOINT};
 use super::oauth;
-use anyhow::{anyhow, Result};
+use anyhow::{Result, anyhow};
 use ccextra_core::route::ModelConfig;
 use serde_json::Value;
 
@@ -214,7 +214,7 @@ mod tests {
         assert!(!names.contains(&"gemini-3.5-flash-extra-low"));
     }
 
-    use crate::test_support::{padded_json, TestServer};
+    use crate::test_support::{TestServer, padded_json};
     use axum::http::StatusCode;
 
     async fn spawn_ok_models_server() -> TestServer {

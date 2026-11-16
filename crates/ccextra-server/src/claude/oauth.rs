@@ -5,8 +5,8 @@ use super::constants::{
     AUTH_SCOPE, AUTH_URL, CLIENT_ID, PROFILE_URL, REDIRECT_URI, REFRESH_TOKEN_URL, TOKEN_URL,
 };
 use crate::oauth_common::urlencode;
-pub use crate::oauth_common::{generate_pkce_codes, PkceCodes};
-use anyhow::{anyhow, Context, Result};
+pub use crate::oauth_common::{PkceCodes, generate_pkce_codes};
+use anyhow::{Context, Result, anyhow};
 use reqwest::Client;
 use serde::{Deserialize, Serialize};
 
@@ -209,7 +209,7 @@ pub async fn refresh_token(client: &Client, refresh: &str) -> Result<TokenData, 
                 status: None,
                 message: format!("request failed: {e}"),
                 retryable: false,
-            })
+            });
         }
     };
     let status = resp.status();
@@ -230,7 +230,7 @@ pub async fn refresh_token(client: &Client, refresh: &str) -> Result<TokenData, 
                 status: None,
                 message: format!("read response: {e}"),
                 retryable: false,
-            })
+            });
         }
     };
     let mut data: TokenData = match serde_json::from_slice(&bytes) {
@@ -240,7 +240,7 @@ pub async fn refresh_token(client: &Client, refresh: &str) -> Result<TokenData, 
                 status: None,
                 message: format!("parse response: {e}"),
                 retryable: false,
-            })
+            });
         }
     };
     if data.access_token.trim().is_empty() {

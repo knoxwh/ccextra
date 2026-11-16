@@ -7,7 +7,7 @@
 //! - 兜底：找不回原生 id → 合成 id；首个 functionCall 补哨兵；回放破坏配对 → 退回原始请求
 //! - 累积：从响应 `candidates[0].content.parts` 收集可回放项；仅 terminal（有 finishReason）才可提交
 
-use serde_json::{json, Value};
+use serde_json::{Value, json};
 use sha2::{Digest, Sha256};
 use std::collections::HashMap;
 
@@ -93,11 +93,7 @@ pub fn normalize_ag_replay_items(items: &[Value]) -> Option<Vec<Value>> {
         }
         out.push(normalized);
     }
-    if out.is_empty() {
-        None
-    } else {
-        Some(out)
-    }
+    if out.is_empty() { None } else { Some(out) }
 }
 
 fn normalize_thought_signature_item(item: &Value) -> Option<Value> {
@@ -2355,16 +2351,20 @@ mod tests {
 
     #[test]
     fn normalize_rejects_short_and_bypass_signature() {
-        assert!(normalize_ag_replay_item(&json!({
-            "type": "thought_signature",
-            "thoughtSignature": "short"
-        }))
-        .is_none());
-        assert!(normalize_ag_replay_item(&json!({
-            "type": "thought_signature",
-            "thoughtSignature": GEMINI_SKIP_THOUGHT_SIGNATURE_VALIDATOR
-        }))
-        .is_none());
+        assert!(
+            normalize_ag_replay_item(&json!({
+                "type": "thought_signature",
+                "thoughtSignature": "short"
+            }))
+            .is_none()
+        );
+        assert!(
+            normalize_ag_replay_item(&json!({
+                "type": "thought_signature",
+                "thoughtSignature": GEMINI_SKIP_THOUGHT_SIGNATURE_VALIDATOR
+            }))
+            .is_none()
+        );
         let ok = normalize_ag_replay_item(&json!({
             "type": "thought_signature",
             "thoughtSignature": "native-signature-ok-16",
@@ -2465,9 +2465,11 @@ mod tests {
             ]
         });
         assert!(!apply_ag_replay_items(&mut request, &items));
-        assert!(request["contents"][1]["parts"][0]
-            .get("thoughtSignature")
-            .is_none());
+        assert!(
+            request["contents"][1]["parts"][0]
+                .get("thoughtSignature")
+                .is_none()
+        );
     }
 
     #[test]
@@ -2674,9 +2676,11 @@ mod tests {
         let mut dup = dup_call_request(2);
         assert!(!apply_ag_replay_items(&mut dup, &items));
         for pi in 0..2 {
-            assert!(dup["contents"][1]["parts"][pi]
-                .get("thoughtSignature")
-                .is_none());
+            assert!(
+                dup["contents"][1]["parts"][pi]
+                    .get("thoughtSignature")
+                    .is_none()
+            );
         }
 
         let mut single = dup_call_request(1);
@@ -2702,9 +2706,11 @@ mod tests {
         })];
         let mut dup = dup_call_request(2);
         assert!(apply_ag_replay_items(&mut dup, &items));
-        assert!(dup["contents"][1]["parts"][0]
-            .get("thoughtSignature")
-            .is_none());
+        assert!(
+            dup["contents"][1]["parts"][0]
+                .get("thoughtSignature")
+                .is_none()
+        );
         assert_eq!(
             dup["contents"][1]["parts"][1]["thoughtSignature"],
             "sig-first-long-enough"
@@ -2938,9 +2944,11 @@ mod tests {
             req["contents"][1]["parts"][0]["thoughtSignature"],
             GEMINI_SKIP_THOUGHT_SIGNATURE_VALIDATOR
         );
-        assert!(req["contents"][1]["parts"][1]
-            .get("thoughtSignature")
-            .is_none());
+        assert!(
+            req["contents"][1]["parts"][1]
+                .get("thoughtSignature")
+                .is_none()
+        );
         assert!(gemini_function_call_pairing_valid(&req));
 
         // 账本有条目但对不上（args 被客户端改过）→ 同样降级，不把签名挂到改过的 call
@@ -2950,10 +2958,12 @@ mod tests {
         let report = prepare_ag_replay_request(&mut edited, Some(&items));
         assert_eq!(report.degraded, 2);
         let part = &edited["contents"][1]["parts"][0];
-        assert!(part["functionCall"]["id"]
-            .as_str()
-            .unwrap()
-            .starts_with("call_"));
+        assert!(
+            part["functionCall"]["id"]
+                .as_str()
+                .unwrap()
+                .starts_with("call_")
+        );
         assert_ne!(part["thoughtSignature"], SIG_A);
         assert_eq!(
             edited["contents"][1]["parts"][1]["functionCall"]["id"],
@@ -3097,9 +3107,11 @@ mod tests {
         // system 改了：位置猜 + 旧式 call 不写；targetHash 文本与稳定 id call 照写
         let mut drifted = history("sys edited");
         assert!(apply_ag_replay_items(&mut drifted, &items));
-        assert!(drifted["contents"][1]["parts"][0]
-            .get("thoughtSignature")
-            .is_none());
+        assert!(
+            drifted["contents"][1]["parts"][0]
+                .get("thoughtSignature")
+                .is_none()
+        );
         assert_eq!(
             drifted["contents"][1]["parts"][1]["thoughtSignature"],
             GEMINI_SKIP_THOUGHT_SIGNATURE_VALIDATOR
@@ -3191,13 +3203,17 @@ mod tests {
             req["contents"][0]["parts"][1]["thoughtSignature"],
             GEMINI_SKIP_THOUGHT_SIGNATURE_VALIDATOR
         );
-        assert!(req["contents"][0]["parts"][2]
-            .get("thoughtSignature")
-            .is_none());
+        assert!(
+            req["contents"][0]["parts"][2]
+                .get("thoughtSignature")
+                .is_none()
+        );
         assert_eq!(req["contents"][1]["parts"][0]["thoughtSignature"], SIG_A);
-        assert!(req["contents"][2]["parts"][0]
-            .get("thoughtSignature")
-            .is_none());
+        assert!(
+            req["contents"][2]["parts"][0]
+                .get("thoughtSignature")
+                .is_none()
+        );
     }
 
     #[test]
@@ -3712,9 +3728,11 @@ mod tests {
         assert_eq!(parts[0]["thoughtSignature"], SIG_A);
         assert_eq!(parts[1]["functionCall"]["id"], "native-b");
         assert!(parts[1].get("thoughtSignature").is_none());
-        assert!(parts[1]["extra_content"]["google"]
-            .get("thought_signature")
-            .is_none());
+        assert!(
+            parts[1]["extra_content"]["google"]
+                .get("thought_signature")
+                .is_none()
+        );
     }
 
     /// 对齐 CPA eligibility filter :812-821 / 批量 sameNativeCall :613-616：id 与 args 已是原生
@@ -3785,9 +3803,11 @@ mod tests {
             GEMINI_SKIP_THOUGHT_SIGNATURE_VALIDATOR
         );
         assert!(parts[3].get("thoughtSignature").is_none());
-        assert!(req["contents"][2]["parts"][0]
-            .get("thoughtSignature")
-            .is_none());
+        assert!(
+            req["contents"][2]["parts"][0]
+                .get("thoughtSignature")
+                .is_none()
+        );
         // sanitize 补的哨兵不计入 repair（repair 只看 sanitize 之后仍无签名的首 call）
         assert_eq!(report.repaired, 0);
     }
@@ -4203,9 +4223,11 @@ mod tests {
             {"functionCall": {"id": "e1", "name": "Read", "args": {}}}
         ]})];
         assert!(apply_signature_at(&mut contents, 0, 1, sig));
-        assert!(contents[0]["parts"][0]["extra_content"]["google"]
-            .get("thought_signature")
-            .is_none());
+        assert!(
+            contents[0]["parts"][0]["extra_content"]["google"]
+                .get("thought_signature")
+                .is_none()
+        );
         assert_eq!(contents[0]["parts"][1]["thoughtSignature"], sig);
     }
 

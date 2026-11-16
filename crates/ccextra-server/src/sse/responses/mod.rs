@@ -25,8 +25,8 @@ use futures::Stream;
 use std::collections::HashMap;
 use std::sync::Arc;
 
-use super::parser::SseParser;
 use super::SseStreamPin;
+use super::parser::SseParser;
 use state_machine::ResponsesRelay;
 
 // Re-exports for server crate (including non_stream.rs)

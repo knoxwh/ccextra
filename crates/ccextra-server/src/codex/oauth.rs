@@ -3,8 +3,8 @@
 
 use super::constants::{AUTH_SCOPE, AUTH_URL, CLIENT_ID, REFRESH_SCOPE, TOKEN_URL};
 use crate::oauth_common::urlencode;
-pub use crate::oauth_common::{generate_pkce_codes, PkceCodes};
-use anyhow::{anyhow, Context, Result};
+pub use crate::oauth_common::{PkceCodes, generate_pkce_codes};
+use anyhow::{Context, Result, anyhow};
 use reqwest::Client;
 use serde::Deserialize;
 

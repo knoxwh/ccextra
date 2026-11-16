@@ -2,10 +2,10 @@ use crate::http::auth::auth_cache;
 use crate::http::error::AppError;
 use crate::http::{AppState, RuntimeConfig};
 use crate::upstream::UpstreamClient;
-use axum::extract::State;
 use axum::Json;
+use axum::extract::State;
 use ccextra_core::route::{
-    validate_provider_proxies, validate_providers, Protocol, ProviderConfig,
+    Protocol, ProviderConfig, validate_provider_proxies, validate_providers,
 };
 use serde::{Deserialize, Serialize};
 

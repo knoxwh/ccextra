@@ -119,8 +119,10 @@ fn test_grok_adapter_block_contains_key_constraints() {
 
 #[test]
 fn test_gpt_codex_adapter_block_contains_key_constraints() {
-    assert!(GPT_CODEX_ADAPTER_BLOCK
-        .starts_with("You are running as a coding agent inside Claude Code CLI"));
+    assert!(
+        GPT_CODEX_ADAPTER_BLOCK
+            .starts_with("You are running as a coding agent inside Claude Code CLI")
+    );
     assert!(GPT_CODEX_ADAPTER_BLOCK.contains("tools declared in this request"));
     assert!(GPT_CODEX_ADAPTER_BLOCK.contains("Always respond in Simplified Chinese"));
     assert!(GPT_CODEX_ADAPTER_BLOCK.contains("Read / Edit / Write"));
@@ -139,8 +141,10 @@ fn test_gpt_codex_adapter_block_contains_key_constraints() {
 
 #[test]
 fn test_gpt6_astra_adapter_block_contains_key_constraints() {
-    assert!(GPT_6_ASTRA_ADAPTER_BLOCK
-        .starts_with("You are running as a coding agent inside Claude Code CLI"));
+    assert!(
+        GPT_6_ASTRA_ADAPTER_BLOCK
+            .starts_with("You are running as a coding agent inside Claude Code CLI")
+    );
     assert!(GPT_6_ASTRA_ADAPTER_BLOCK.contains("Share one workspace with the user"));
     assert!(GPT_6_ASTRA_ADAPTER_BLOCK.contains("keep working until their intended goal"));
     assert!(!GPT_6_ASTRA_ADAPTER_BLOCK.contains("Codex"));
@@ -1925,9 +1929,11 @@ fn test_web_search_blocked_domains_mapping() {
     });
     convert_to_openai_responses(&mut body, "grok-4.6").unwrap();
     assert_eq!(body["tools"][0]["filters"]["allowed_domains"][0], "x.com");
-    assert!(body["tools"][0]["filters"]
-        .get("excluded_domains")
-        .is_none());
+    assert!(
+        body["tools"][0]["filters"]
+            .get("excluded_domains")
+            .is_none()
+    );
 }
 
 #[test]
@@ -1942,10 +1948,12 @@ fn test_system_role_message_reminder() {
     convert_to_openai_responses(&mut body, "test-model").unwrap();
     assert_eq!(body["input"][0]["type"], "message");
     assert_eq!(body["input"][0]["role"], "user");
-    assert!(body["input"][0]["content"][0]["text"]
-        .as_str()
-        .unwrap()
-        .contains("<system-reminder>"));
+    assert!(
+        body["input"][0]["content"][0]["text"]
+            .as_str()
+            .unwrap()
+            .contains("<system-reminder>")
+    );
 }
 
 #[test]
@@ -2332,10 +2340,12 @@ fn test_responses_tool_pairing_across_system_message() {
     assert_eq!(input[3]["call_id"], "t2");
     assert_eq!(input[4]["type"], "message");
     assert_eq!(input[4]["role"], "user");
-    assert!(input[4]["content"][0]["text"]
-        .as_str()
-        .unwrap()
-        .contains("<system-reminder>"));
+    assert!(
+        input[4]["content"][0]["text"]
+            .as_str()
+            .unwrap()
+            .contains("<system-reminder>")
+    );
     assert_eq!(input[5]["type"], "message");
     assert_eq!(input[5]["role"], "user");
     assert_eq!(input[5]["content"][0]["text"], "next instruction");
@@ -2639,10 +2649,12 @@ fn test_tool_addition_emits_additional_tools_in_place() {
         .unwrap();
     // reminder 文本保留在 additional_tools 之前
     assert_eq!(input[pos - 1]["role"], "user");
-    assert!(input[pos - 1]["content"][0]["text"]
-        .as_str()
-        .unwrap()
-        .contains("Handback is now available."));
+    assert!(
+        input[pos - 1]["content"][0]["text"]
+            .as_str()
+            .unwrap()
+            .contains("Handback is now available.")
+    );
     assert_eq!(input[pos]["role"], "developer");
     let tools = input[pos]["tools"].as_array().unwrap();
     assert_eq!(tools.len(), 1);

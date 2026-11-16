@@ -2,10 +2,10 @@ use super::*;
 use crate::http::handlers::messages::*;
 use crate::http::handlers::models::*;
 use crate::upstream::UpstreamClient;
-use axum::body::{to_bytes, Body};
-use axum::http::{header, HeaderMap, Request, StatusCode};
+use axum::body::{Body, to_bytes};
+use axum::http::{HeaderMap, Request, StatusCode, header};
 use ccextra_core::route::{Protocol, ProviderConfig};
-use serde_json::{json, Value};
+use serde_json::{Value, json};
 use std::sync::atomic::Ordering;
 use std::sync::{Arc, Mutex as StdMutex};
 use tokio::sync::RwLock;
@@ -354,10 +354,12 @@ models:
     assert_eq!(status, StatusCode::BAD_GATEWAY);
     let v: Value = serde_json::from_slice(&response_body).unwrap();
     assert_eq!(v["type"], "error");
-    assert!(v["error"]["message"]
-        .as_str()
-        .unwrap()
-        .contains("upstream boom"));
+    assert!(
+        v["error"]["message"]
+            .as_str()
+            .unwrap()
+            .contains("upstream boom")
+    );
 }
 
 /// 多 URL 回退后的首帧重试必须打当前生效的 base_url,不倒退回已失败的 [0]。
@@ -987,10 +989,12 @@ async fn test_missing_model_field() {
     let body_json: Value = serde_json::from_slice(&body).unwrap();
     assert_eq!(body_json["type"], "error");
     assert_eq!(body_json["error"]["type"], "invalid_request_error");
-    assert!(body_json["error"]["message"]
-        .as_str()
-        .unwrap()
-        .contains("缺少 model 字段"));
+    assert!(
+        body_json["error"]["message"]
+            .as_str()
+            .unwrap()
+            .contains("缺少 model 字段")
+    );
 }
 
 #[tokio::test]
@@ -1009,10 +1013,12 @@ async fn test_invalid_json() {
     let body_json: Value = serde_json::from_slice(&body).unwrap();
     assert_eq!(body_json["type"], "error");
     assert_eq!(body_json["error"]["type"], "invalid_request_error");
-    assert!(body_json["error"]["message"]
-        .as_str()
-        .unwrap()
-        .contains("JSON 解析失败"));
+    assert!(
+        body_json["error"]["message"]
+            .as_str()
+            .unwrap()
+            .contains("JSON 解析失败")
+    );
 }
 
 #[tokio::test]
@@ -1035,27 +1041,31 @@ async fn test_model_not_found() {
     let body_json: Value = serde_json::from_slice(&body).unwrap();
     assert_eq!(body_json["type"], "error");
     assert_eq!(body_json["error"]["type"], "not_found_error");
-    assert!(body_json["error"]["message"]
-        .as_str()
-        .unwrap()
-        .contains("未找到"));
+    assert!(
+        body_json["error"]["message"]
+            .as_str()
+            .unwrap()
+            .contains("未找到")
+    );
 }
 
 #[test]
 fn test_payload_override_wildcard() {
     let mut body = json!({"model": "glm-5.1", "max_tokens": 1024});
-    let rules = vec![PayloadRule {
-        models: vec!["*glm*".into()],
-        protocol: Some(Protocol::OpenAiChat),
-        params: {
-            let mut map = serde_json::Map::new();
-            map.insert("max_tokens".into(), json!(32000));
-            map.insert("temperature".into(), json!(0.1));
-            map
-        },
-        matchers: vec![],
-    }
-    .compiled()];
+    let rules = vec![
+        PayloadRule {
+            models: vec!["*glm*".into()],
+            protocol: Some(Protocol::OpenAiChat),
+            params: {
+                let mut map = serde_json::Map::new();
+                map.insert("max_tokens".into(), json!(32000));
+                map.insert("temperature".into(), json!(0.1));
+                map
+            },
+            matchers: vec![],
+        }
+        .compiled(),
+    ];
     apply_payload_overrides(&mut body, "glm-5.1", Protocol::OpenAiChat, &rules);
     assert_eq!(body["max_tokens"], 32000);
     assert_eq!(body["temperature"], 0.1);
@@ -1065,17 +1075,19 @@ fn test_payload_override_wildcard() {
 fn test_payload_override_protocol_gate() {
     // 规则限定 openai_chat,claude 直通不应注入
     let mut body = json!({"model": "glm-5.1", "max_tokens": 1024});
-    let rules = vec![PayloadRule {
-        models: vec!["*glm*".into()],
-        protocol: Some(Protocol::OpenAiChat),
-        params: {
-            let mut map = serde_json::Map::new();
-            map.insert("tool_stream".into(), json!(true));
-            map
-        },
-        matchers: vec![],
-    }
-    .compiled()];
+    let rules = vec![
+        PayloadRule {
+            models: vec!["*glm*".into()],
+            protocol: Some(Protocol::OpenAiChat),
+            params: {
+                let mut map = serde_json::Map::new();
+                map.insert("tool_stream".into(), json!(true));
+                map
+            },
+            matchers: vec![],
+        }
+        .compiled(),
+    ];
     apply_payload_overrides(&mut body, "glm-5.1", Protocol::Claude, &rules);
     assert!(body.get("tool_stream").is_none());
     assert_eq!(body["max_tokens"], 1024);
@@ -1085,17 +1097,19 @@ fn test_payload_override_protocol_gate() {
 fn test_payload_override_claude_requires_explicit_protocol() {
     // 无 protocol 字段的规则作用于 claude 直通:默认不注入
     let mut body = json!({"model": "evol-opus-5", "max_tokens": 1024});
-    let rules = vec![PayloadRule {
-        models: vec!["*evol*".into()],
-        protocol: None,
-        params: {
-            let mut map = serde_json::Map::new();
-            map.insert("max_tokens".into(), json!(32000));
-            map
-        },
-        matchers: vec![],
-    }
-    .compiled()];
+    let rules = vec![
+        PayloadRule {
+            models: vec!["*evol*".into()],
+            protocol: None,
+            params: {
+                let mut map = serde_json::Map::new();
+                map.insert("max_tokens".into(), json!(32000));
+                map
+            },
+            matchers: vec![],
+        }
+        .compiled(),
+    ];
     apply_payload_overrides(&mut body, "evol-opus-5", Protocol::Claude, &rules);
     assert_eq!(
         body["max_tokens"], 1024,
@@ -1103,17 +1117,19 @@ fn test_payload_override_claude_requires_explicit_protocol() {
     );
 
     // 显式声明 protocol: claude → 注入
-    let rules2 = vec![PayloadRule {
-        models: vec!["*evol*".into()],
-        protocol: Some(Protocol::Claude),
-        params: {
-            let mut map = serde_json::Map::new();
-            map.insert("max_tokens".into(), json!(32000));
-            map
-        },
-        matchers: vec![],
-    }
-    .compiled()];
+    let rules2 = vec![
+        PayloadRule {
+            models: vec!["*evol*".into()],
+            protocol: Some(Protocol::Claude),
+            params: {
+                let mut map = serde_json::Map::new();
+                map.insert("max_tokens".into(), json!(32000));
+                map
+            },
+            matchers: vec![],
+        }
+        .compiled(),
+    ];
     apply_payload_overrides(&mut body, "evol-opus-5", Protocol::Claude, &rules2);
     assert_eq!(body["max_tokens"], 32000, "显式 claude 协议应注入");
 }
@@ -1121,17 +1137,19 @@ fn test_payload_override_claude_requires_explicit_protocol() {
 #[test]
 fn test_payload_override_no_match() {
     let mut body = json!({"model": "claude-opus", "max_tokens": 1024});
-    let rules = vec![PayloadRule {
-        models: vec!["*glm*".into()],
-        protocol: None,
-        params: {
-            let mut map = serde_json::Map::new();
-            map.insert("max_tokens".into(), json!(32000));
-            map
-        },
-        matchers: vec![],
-    }
-    .compiled()];
+    let rules = vec![
+        PayloadRule {
+            models: vec!["*glm*".into()],
+            protocol: None,
+            params: {
+                let mut map = serde_json::Map::new();
+                map.insert("max_tokens".into(), json!(32000));
+                map
+            },
+            matchers: vec![],
+        }
+        .compiled(),
+    ];
     apply_payload_overrides(&mut body, "claude-opus", Protocol::OpenAiChat, &rules);
     assert_eq!(body["max_tokens"], 1024);
 }
@@ -1139,17 +1157,19 @@ fn test_payload_override_no_match() {
 #[test]
 fn test_payload_override_star_matches_all() {
     let mut body = json!({"model": "any-model"});
-    let rules = vec![PayloadRule {
-        models: vec!["*".into()],
-        protocol: None,
-        params: {
-            let mut map = serde_json::Map::new();
-            map.insert("temperature".into(), json!(0.5));
-            map
-        },
-        matchers: vec![],
-    }
-    .compiled()];
+    let rules = vec![
+        PayloadRule {
+            models: vec!["*".into()],
+            protocol: None,
+            params: {
+                let mut map = serde_json::Map::new();
+                map.insert("temperature".into(), json!(0.5));
+                map
+            },
+            matchers: vec![],
+        }
+        .compiled(),
+    ];
     apply_payload_overrides(&mut body, "any-model", Protocol::OpenAiChat, &rules);
     assert_eq!(body["temperature"], 0.5);
 }
@@ -2250,7 +2270,7 @@ async fn test_count_tokens_missing_model_returns_400() {
 async fn non_stream_body_limits_and_passthrough() {
     use crate::{
         limits::SUCCESS_BODY_LIMIT,
-        test_support::{padded_json, TestServer},
+        test_support::{TestServer, padded_json},
     };
     for path in ["/v1/messages", "/v1/messages/count_tokens"] {
         for (status, len) in [
@@ -2298,10 +2318,12 @@ async fn non_stream_body_limits_and_passthrough() {
                     }
                 );
                 if !status.is_success() {
-                    assert!(error["error"]["message"]
-                        .as_str()
-                        .unwrap()
-                        .contains("已截断"));
+                    assert!(
+                        error["error"]["message"]
+                            .as_str()
+                            .unwrap()
+                            .contains("已截断")
+                    );
                 }
             }
         }
@@ -2873,10 +2895,12 @@ async fn test_upstream_all_base_urls_5xx_returns_last_error() {
     );
     let v: Value = serde_json::from_slice(&bytes).unwrap();
     assert_eq!(v["type"], "error");
-    assert!(v["error"]["message"]
-        .as_str()
-        .unwrap()
-        .contains("last down"));
+    assert!(
+        v["error"]["message"]
+            .as_str()
+            .unwrap()
+            .contains("last down")
+    );
 }
 
 /// 空 base_url 列表:prepare 阶段拒绝,返回 anthropic error 而非 panic。
@@ -3215,9 +3239,11 @@ async fn test_responses_payload_tier_is_serialized_before_input() {
     assert_eq!(response.status(), StatusCode::OK);
     let raw = captured.raw_body.lock().unwrap().clone().unwrap();
     // GPT adapter 路径省略空 instructions;路由字段仍须先于 input 序列化
-    assert!(std::str::from_utf8(&raw)
-        .unwrap()
-        .starts_with(r#"{"model":"gpt-5","stream":false,"service_tier":"priority""#));
+    assert!(
+        std::str::from_utf8(&raw)
+            .unwrap()
+            .starts_with(r#"{"model":"gpt-5","stream":false,"service_tier":"priority""#)
+    );
     assert_eq!(captured.body()["service_tier"], "priority");
 }
 

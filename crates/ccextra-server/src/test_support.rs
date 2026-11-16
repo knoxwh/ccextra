@@ -1,4 +1,4 @@
-use axum::{body::Body, http::StatusCode, Router};
+use axum::{Router, body::Body, http::StatusCode};
 use bytes::Bytes;
 
 pub(crate) struct TestServer {

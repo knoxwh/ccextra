@@ -1,12 +1,12 @@
 use axum::{
     body::Body,
     extract::State,
-    http::{header, HeaderMap},
+    http::{HeaderMap, header},
     response::Response,
 };
 use bytes::Bytes;
 use ccextra_core::cache_stabilization::{
-    maybe_observe_request_drift_with, observe_cache_usage, DriftApiKind, DriftObserveOptions,
+    DriftApiKind, DriftObserveOptions, maybe_observe_request_drift_with, observe_cache_usage,
 };
 use ccextra_core::convert::{
     clamp_passthrough_effort, convert_passthrough, convert_to_antigravity_with,
@@ -17,31 +17,31 @@ use ccextra_core::convert::{
     trim_encrypted_reasoning_items,
 };
 use ccextra_core::normalize::{
-    normalize_anthropic_full, normalize_anthropic_pretransform, normalize_target_post, TargetShape,
+    TargetShape, normalize_anthropic_full, normalize_anthropic_pretransform, normalize_target_post,
 };
 use ccextra_core::prompt_cache::inject_prompt_cache_key;
-use ccextra_core::route::{resolve_route, Protocol};
+use ccextra_core::route::{Protocol, resolve_route};
 use ccextra_core::session::{
     extract_claude_code_agent_id, extract_claude_code_session, extract_claude_code_thread,
 };
 use futures::StreamExt;
-use serde_json::{json, Value};
+use serde_json::{Value, json};
 use std::collections::HashMap;
-use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::Arc;
+use std::sync::atomic::{AtomicU64, Ordering};
 
 use crate::http::auth::check_secret;
 use crate::http::claude_relay::{
     claude_inbound_user_agent, claude_passthrough_headers, ensure_oauth_beta,
 };
-use crate::http::error::{to_anthropic_error, AppError};
+use crate::http::error::{AppError, to_anthropic_error};
 use crate::http::retry::{parse_google_retry_delay, parse_retry_after, retry_after_header_secs};
 use crate::http::{AppState, PayloadRule};
+use crate::sse::SseStreamPin;
 use crate::sse::antigravity_replay_cache::AgStreamReplayExtractor;
 use crate::sse::kimi_thinking_replay_cache::KimiStreamReplayExtractor;
 use crate::sse::replay_cache::StreamReplayExtractor;
-use crate::sse::SseStreamPin;
-use crate::upstream::{is_gpt_model, is_grok_model, UpstreamResponse};
+use crate::upstream::{UpstreamResponse, is_gpt_model, is_grok_model};
 
 /// 诊断日志请求序号:与毫秒时间戳组合,避免并发请求覆盖同一文件。
 static UPSTREAM_LOG_SEQUENCE: AtomicU64 = AtomicU64::new(0);
@@ -2156,16 +2156,20 @@ mod tests {
         // 本测仅钉住门禁谓词的上界:400 命中、401 不命中。
         // 钉住 deliver 那行赋值需 OAuth 刷新 + 两跳 mock 上游,留给集成测。
         let retry = axum::http::StatusCode::BAD_REQUEST;
-        assert!(crate::http::unfit::detect_unfit_from_error(
-            retry.as_u16(),
-            r#"{"error":{"message":"unsupported response_format"}}"#
-        )
-        .is_some());
-        assert!(crate::http::unfit::detect_unfit_from_error(
-            axum::http::StatusCode::UNAUTHORIZED.as_u16(),
-            r#"{"error":{"message":"unsupported response_format"}}"#
-        )
-        .is_none());
+        assert!(
+            crate::http::unfit::detect_unfit_from_error(
+                retry.as_u16(),
+                r#"{"error":{"message":"unsupported response_format"}}"#
+            )
+            .is_some()
+        );
+        assert!(
+            crate::http::unfit::detect_unfit_from_error(
+                axum::http::StatusCode::UNAUTHORIZED.as_u16(),
+                r#"{"error":{"message":"unsupported response_format"}}"#
+            )
+            .is_none()
+        );
     }
 
     /// Codex 401 helper:无 chatgpt-account-id → 插入后须 reencode 为 zstd。

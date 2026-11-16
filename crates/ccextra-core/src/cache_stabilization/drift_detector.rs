@@ -1319,9 +1319,10 @@ mod tests {
         let body = anthropic_body("sys", json!([]), vec!["hi"]);
         let id = derive_session_key(&headers, &body, ApiKind::Anthropic);
         assert_eq!(id.parent, "tklite:codex:opaque-session-key");
-        assert!(id
-            .conversation
-            .starts_with("tklite:codex:opaque-session-key:conv:"));
+        assert!(
+            id.conversation
+                .starts_with("tklite:codex:opaque-session-key:conv:")
+        );
     }
 
     #[test]
@@ -1333,9 +1334,10 @@ mod tests {
         let body = anthropic_body("sys", json!([]), vec!["hi"]);
         let id = derive_session_key(&headers, &body, ApiKind::Anthropic);
         assert_eq!(id.parent, "claude-code:cc-sess-0123");
-        assert!(id
-            .conversation
-            .starts_with("claude-code:cc-sess-0123:conv:"));
+        assert!(
+            id.conversation
+                .starts_with("claude-code:cc-sess-0123:conv:")
+        );
     }
 
     #[test]
@@ -2294,12 +2296,14 @@ mod tests {
             maybe_observe_request_drift(true, &state, &headers, &body2, ApiKind::Anthropic);
         assert!(parent.is_some());
         assert!(is_stable_parent_bucket(parent.as_deref().unwrap()));
-        assert!(state
-            .cache
-            .lock()
-            .unwrap()
-            .2
-            .contains(parent.as_ref().unwrap()));
+        assert!(
+            state
+                .cache
+                .lock()
+                .unwrap()
+                .2
+                .contains(parent.as_ref().unwrap())
+        );
     }
 
     #[test]

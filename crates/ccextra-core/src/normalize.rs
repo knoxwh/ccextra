@@ -21,8 +21,8 @@ use crate::cache_stabilization::tool_def_normalize::{
 };
 use crate::cache_stabilization::tool_input_normalize::normalize_tool_use_inputs;
 use crate::cache_stabilization::volatile_detector::{
-    detect_volatile_content, emit_volatile_warnings, normalize_client_dateline,
-    ApiKind as VolatileApiKind,
+    ApiKind as VolatileApiKind, detect_volatile_content, emit_volatile_warnings,
+    normalize_client_dateline,
 };
 use crate::route::Protocol;
 
@@ -484,7 +484,7 @@ mod tests {
 
     #[test]
     fn test_target_post_detects_volatile_in_chat_system() {
-        use crate::cache_stabilization::volatile_detector::{detect_volatile_content, ApiKind};
+        use crate::cache_stabilization::volatile_detector::{ApiKind, detect_volatile_content};
         let mut body = json!({
             "model": "test",
             "messages": [

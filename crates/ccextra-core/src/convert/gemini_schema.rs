@@ -13,7 +13,7 @@
 // unsupported 关键字含 contentMediaType/contentEncoding(CPA a43026d7 / #6699)、
 // readOnly/writeOnly(CPA 154d5144 / #6778)
 
-use serde_json::{json, Map, Value};
+use serde_json::{Map, Value, json};
 
 /// 清洗选项(对齐 CPA jsonSchemaCleanOptions,仅保留入口用到的字段)
 #[derive(Clone, Copy, Default)]
@@ -2410,10 +2410,12 @@ mod tests {
         });
         let out = clean_json_schema_for_gemini(&schema);
         assert_eq!(out["properties"]["a"]["type"], "string");
-        assert!(out["properties"]["a"]["description"]
-            .as_str()
-            .unwrap()
-            .contains("(nullable)"));
+        assert!(
+            out["properties"]["a"]["description"]
+                .as_str()
+                .unwrap()
+                .contains("(nullable)")
+        );
         assert!(out.get("required").is_none());
     }
 
@@ -2423,10 +2425,12 @@ mod tests {
         let out = clean_json_schema_for_antigravity(&schema);
         assert_eq!(out["type"], "string");
         assert!(out.get("enum").is_none());
-        assert!(out["description"]
-            .as_str()
-            .unwrap()
-            .contains("Allowed: read"));
+        assert!(
+            out["description"]
+                .as_str()
+                .unwrap()
+                .contains("Allowed: read")
+        );
     }
 
     #[test]
@@ -2479,10 +2483,11 @@ mod tests {
         let schema = json!({"type": "object", "properties": {}, "title": "T"});
         let out = clean_json_schema_for_antigravity_tool(&schema, false);
         assert!(out.get("required").is_none(), "{out}");
-        assert!(out
-            .get("properties")
-            .and_then(|p| p.get("reason"))
-            .is_none());
+        assert!(
+            out.get("properties")
+                .and_then(|p| p.get("reason"))
+                .is_none()
+        );
         assert!(out.get("title").is_none(), "{out}");
         let nested = clean_nested_schema_for_antigravity_tool(
             &json!({"type": "object", "properties": {"flag": {"type": "string"}}}),
@@ -2497,10 +2502,12 @@ mod tests {
         let schema = json!({"type": "string", "enum": ["a", "b"]});
         let out = clean_json_schema_for_antigravity(&schema);
         assert!(out.get("enum").is_none());
-        assert!(out["description"]
-            .as_str()
-            .unwrap()
-            .contains("Allowed: a, b"));
+        assert!(
+            out["description"]
+                .as_str()
+                .unwrap()
+                .contains("Allowed: a, b")
+        );
         // antigravity 不强制 type=string 重写(类型本就 string)
         assert_eq!(out["type"], "string");
     }
@@ -3451,8 +3458,8 @@ mod tests {
         ] {
             let out1 = clean(&input_union);
             assert_eq!(
-                out1["properties"]["requestBody"]["properties"]["delivery"]["properties"]
-                    ["endpoint"]["type"],
+                out1["properties"]["requestBody"]["properties"]["delivery"]["properties"]["endpoint"]
+                    ["type"],
                 "object"
             );
             assert!(

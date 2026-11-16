@@ -8,11 +8,11 @@ use super::oauth::{
 use super::project::fetch_project_id;
 use super::store;
 use crate::oauth_common::{open_browser, random_state};
-use anyhow::{anyhow, Context, Result};
+use anyhow::{Context, Result, anyhow};
+use axum::Router;
 use axum::extract::Query;
 use axum::response::Html;
 use axum::routing::get;
-use axum::Router;
 use reqwest::Client;
 use serde::Deserialize;
 use std::net::SocketAddr;

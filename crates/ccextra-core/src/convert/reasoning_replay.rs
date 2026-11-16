@@ -11,7 +11,7 @@
 // input[](call_id/assistant 指纹定位)。缓存状态由 server 层持有,
 // 本模块只做纯函数。
 
-use serde_json::{json, Value};
+use serde_json::{Value, json};
 use sha2::{Digest, Sha256};
 
 /// 计算 input 数组前缀指纹(对齐 CPA codexReplayInputPrefixFingerprint)。
@@ -112,11 +112,7 @@ fn message_parts(content: &Value) -> Option<Vec<(String, String)>> {
         };
         parts.push((ptype.to_string(), value));
     }
-    if parts.is_empty() {
-        None
-    } else {
-        Some(parts)
-    }
+    if parts.is_empty() { None } else { Some(parts) }
 }
 
 /// 过滤缓存项中 input 已覆盖的部分(对齐 filterXAIReasoningReplayItemsForInput):
@@ -992,9 +988,11 @@ mod tests {
         // grok:带文本的明文保留
         let filtered = filter_turn_items(body["input"].as_array().unwrap(), items.clone(), true);
         assert_eq!(filtered.len(), 2);
-        assert!(filtered
-            .iter()
-            .any(|i| i["type"] == "reasoning" && i["summary"][0]["text"] == "think"));
+        assert!(
+            filtered
+                .iter()
+                .any(|i| i["type"] == "reasoning" && i["summary"][0]["text"] == "think")
+        );
         assert!(filtered.iter().any(|i| i["encrypted_content"] == "gAAA"));
     }
 
@@ -1013,18 +1011,22 @@ mod tests {
         // 非 grok:明文 reasoning 丢弃,无可回放项 → 不注入
         let mut plain = body.clone();
         assert!(!insert_replay_turns(&mut plain, turn.clone(), false));
-        assert!(plain["input"]
-            .as_array()
-            .unwrap()
-            .iter()
-            .all(|i| i["type"] != "reasoning"));
+        assert!(
+            plain["input"]
+                .as_array()
+                .unwrap()
+                .iter()
+                .all(|i| i["type"] != "reasoning")
+        );
         // grok:明文 reasoning 保留并注入
         assert!(insert_replay_turns(&mut body, turn, true));
-        assert!(body["input"]
-            .as_array()
-            .unwrap()
-            .iter()
-            .any(|i| i["type"] == "reasoning" && i["summary"][0]["text"] == "think"));
+        assert!(
+            body["input"]
+                .as_array()
+                .unwrap()
+                .iter()
+                .any(|i| i["type"] == "reasoning" && i["summary"][0]["text"] == "think")
+        );
     }
 
     #[test]
@@ -1222,10 +1224,12 @@ mod tests {
         // call_ids 收集
         assert_eq!(turn[0]["call_ids"], json!(["c1"]));
         // assistant_fingerprint 非空
-        assert!(!turn[0]["assistant_fingerprint"]
-            .as_str()
-            .unwrap()
-            .is_empty());
+        assert!(
+            !turn[0]["assistant_fingerprint"]
+                .as_str()
+                .unwrap()
+                .is_empty()
+        );
         // request_fingerprint 透传
         assert_eq!(turn[0]["request_fingerprint"], "reqfp");
         // items 原样保留(不归一化,对齐 CPA cacheCodexReasoningReplayFromCompleted)

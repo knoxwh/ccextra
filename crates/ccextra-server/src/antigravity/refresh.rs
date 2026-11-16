@@ -2,7 +2,7 @@ use super::constants::{REFRESH_MAX_RETRIES, REFRESH_SKEW_SECS};
 use super::credential::AntigravityCredential;
 use super::{oauth, project, store};
 use crate::oauth_common::lock_for_refresh_token;
-use anyhow::{anyhow, Result};
+use anyhow::{Result, anyhow};
 use std::path::Path;
 
 /// 检查并刷新凭证(如果需要);仅对可重试错误(HTTP 5xx / 连接建立失败)退避重试

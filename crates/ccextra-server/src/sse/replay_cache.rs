@@ -372,7 +372,7 @@ mod tests {
         ]}});
         cache.store_from_completed("sess-1", &round1, "");
         cache.store_from_completed("sess-1", &round1, ""); // 同轮重复(重试场景)
-                                                           // marker id 相同,不重复累积
+        // marker id 相同,不重复累积
         let mut body = json!({"input": [
             {"type": "message", "role": "user", "content": "q"}
         ]});

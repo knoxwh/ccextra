@@ -1,4 +1,4 @@
-use serde_json::{json, Value};
+use serde_json::{Value, json};
 
 /// web_search_call 的 query(对齐 codexWebSearchQuery:item/root 多路径)
 pub(crate) fn web_search_query(root: &Value, item: &Value) -> String {

@@ -475,8 +475,7 @@ mod tests {
 
     #[test]
     fn deferred_block_embedded_is_sorted() {
-        let text =
-            "identity\n\n<system-reminder>\nThe following deferred tools are now available:\nread_file\nwrite_file\nbash\n</system-reminder>\n\ntrailing";
+        let text = "identity\n\n<system-reminder>\nThe following deferred tools are now available:\nread_file\nwrite_file\nbash\n</system-reminder>\n\ntrailing";
         let mut body = json!({
             "system": text,
             "messages": []

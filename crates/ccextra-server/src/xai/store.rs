@@ -1,6 +1,6 @@
 // xAI 凭证持久化 (对齐 codex/store 原子写 + path 锁)
 
-use super::credential::{credential_file_name, XAICredential};
+use super::credential::{XAICredential, credential_file_name};
 use anyhow::{Context, Result};
 use std::fs;
 use std::path::{Path, PathBuf};

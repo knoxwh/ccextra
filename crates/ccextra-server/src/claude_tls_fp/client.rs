@@ -6,8 +6,8 @@
 
 use std::borrow::Cow;
 
-use wreq::tls::{AlpnProtocol, ExtensionType, KeyShare, TlsOptions, TlsVersion};
 use wreq::Client;
+use wreq::tls::{AlpnProtocol, ExtensionType, KeyShare, TlsOptions, TlsVersion};
 
 /// Build a wreq client for the Claude Bun fingerprint lane.
 pub fn build_fingerprint_client(proxy_key: &str, no_redirect: bool) -> anyhow::Result<Client> {

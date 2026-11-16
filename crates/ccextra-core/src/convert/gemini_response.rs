@@ -1,11 +1,11 @@
 // Gemini 响应 → Anthropic 格式转换
 
-use serde_json::{json, Value};
+use serde_json::{Value, json};
 use std::collections::HashMap;
 use std::sync::atomic::{AtomicU64, Ordering};
 
 use super::antigravity_tools::antigravity_upstream_tool_name_to_client;
-use super::claude_tool_args::{clean_claude_tool_arguments, ToolArgStreamState};
+use super::claude_tool_args::{ToolArgStreamState, clean_claude_tool_arguments};
 use super::signature::{format_claude_signature_value, model_group};
 use super::tool_id::{claude_tool_id_for, gemini_claude_tool_use_id};
 
@@ -919,7 +919,7 @@ mod tests {
         assert_eq!(content.len(), 1);
         assert_eq!(content[0]["type"], "tool_use");
         assert_eq!(content[0]["name"], "Read"); // 还原了原名
-                                                // 对齐 CPA:id 自生成 {name}-{counter},不透传上游 id
+        // 对齐 CPA:id 自生成 {name}-{counter},不透传上游 id
         let id = content[0]["id"].as_str().unwrap();
         assert!(id.starts_with("Rd-"), "id={}", id);
         assert_eq!(content[0]["input"]["path"], "/file.txt");
@@ -1484,15 +1484,22 @@ mod tests {
             })
             .expect("carrier thinking start");
         assert_eq!(carrier_start["content_block"]["thinking"], "");
-        assert!(events
-            .iter()
-            .any(|e| e["delta"]["type"] == "signature_delta"));
-        assert!(events
-            .iter()
-            .any(|e| e["delta"]["type"] == "text_delta" && e["delta"]["text"] == "visible answer"));
-        assert!(events
-            .iter()
-            .all(|e| e["delta"]["type"] != "thinking_delta"));
+        assert!(
+            events
+                .iter()
+                .any(|e| e["delta"]["type"] == "signature_delta")
+        );
+        assert!(
+            events
+                .iter()
+                .any(|e| e["delta"]["type"] == "text_delta"
+                    && e["delta"]["text"] == "visible answer")
+        );
+        assert!(
+            events
+                .iter()
+                .all(|e| e["delta"]["type"] != "thinking_delta")
+        );
         assert_eq!(state.response_type, ResponseType::Content);
     }
 
@@ -1510,9 +1517,11 @@ mod tests {
         assert!(events.iter().any(
             |e| e["type"] == "content_block_start" && e["content_block"]["type"] == "thinking"
         ));
-        assert!(events
-            .iter()
-            .any(|e| e["delta"]["type"] == "signature_delta"));
+        assert!(
+            events
+                .iter()
+                .any(|e| e["delta"]["type"] == "signature_delta")
+        );
         assert!(events.iter().any(|e| e["type"] == "content_block_stop"));
         assert_eq!(state.response_type, ResponseType::None);
         assert!(state.has_content);
@@ -1529,12 +1538,17 @@ mod tests {
         });
         let mut state = GeminiStreamState::default();
         let events = convert_gemini_stream_chunk(&chunk, &mut state, &HashMap::new(), None, None);
-        assert!(events
-            .iter()
-            .any(|e| e["delta"]["type"] == "thinking_delta" && e["delta"]["thinking"] == "reason"));
-        assert!(events
-            .iter()
-            .any(|e| e["delta"]["type"] == "signature_delta"));
+        assert!(
+            events
+                .iter()
+                .any(|e| e["delta"]["type"] == "thinking_delta"
+                    && e["delta"]["thinking"] == "reason")
+        );
+        assert!(
+            events
+                .iter()
+                .any(|e| e["delta"]["type"] == "signature_delta")
+        );
         assert_eq!(state.response_type, ResponseType::Thinking);
     }
 

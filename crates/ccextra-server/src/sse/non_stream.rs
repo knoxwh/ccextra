@@ -7,7 +7,7 @@
 //
 // claude 直通协议上游返回的已是 Anthropic 形状,不经过本模块。
 
-use serde_json::{json, Value};
+use serde_json::{Value, json};
 use std::collections::HashMap;
 
 use super::chat::map_finish_reason;
@@ -15,8 +15,8 @@ use super::responses::{
     codex_stop_reason, map_stop_reason, sanitize_tool_id, stop_sequence, web_search_result_content,
 };
 use ccextra_core::convert::{
-    fix_json_quotes, is_valid_gpt_reasoning_signature, is_valid_grok_encrypted_content,
-    CODEX_COMMENTARY_SIGNATURE_MARKER,
+    CODEX_COMMENTARY_SIGNATURE_MARKER, fix_json_quotes, is_valid_gpt_reasoning_signature,
+    is_valid_grok_encrypted_content,
 };
 use ccextra_core::doom_loop::{is_confident, parse_trigger};
 
@@ -125,8 +125,10 @@ pub fn responses_to_anthropic(
                         let mut block = json!({"type": block_type, block_type: text});
                         if is_redacted {
                             if !valid_signature.is_empty() {
-                                block["redacted_thinking_data"] = json!(valid_signature
-                                    .trim_start_matches(CLAUDE_RESPONSES_REDACTED_THINKING_PREFIX));
+                                block["redacted_thinking_data"] =
+                                    json!(valid_signature.trim_start_matches(
+                                        CLAUDE_RESPONSES_REDACTED_THINKING_PREFIX
+                                    ));
                             }
                         } else {
                             // thinking 块必须包含 signature 字段（对齐 sub2api 412718edf）
@@ -733,13 +735,15 @@ mod tests {
         let out = responses_to_anthropic(&body, None).unwrap();
         assert_eq!(out["content"][0]["type"], "thinking");
         assert_eq!(out["content"][0]["thinking"], "think step step two");
-        assert_eq!(out["content"][0]["signature"], "gAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA");
+        assert_eq!(
+            out["content"][0]["signature"],
+            "gAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA"
+        );
     }
 
     #[test]
     fn test_responses_nonstream_grok_encrypted_content_signature() {
-        const GROK_CIPHER: &str =
-            "5+C3No7B0G0P2dR5lSbMvwrctRb+B3vLAJ5/VYemHZNuaDbKv8IfNb+4Gyd125rfZtRtG4+iqYjT5uWOZbE44A";
+        const GROK_CIPHER: &str = "5+C3No7B0G0P2dR5lSbMvwrctRb+B3vLAJ5/VYemHZNuaDbKv8IfNb+4Gyd125rfZtRtG4+iqYjT5uWOZbE44A";
         let body = json!({
             "type": "response.completed",
             "response": {
@@ -775,10 +779,12 @@ mod tests {
         let out = responses_to_anthropic(&body, None).unwrap();
         assert_eq!(out["type"], "error");
         assert_eq!(out["error"]["type"], "api_error");
-        assert!(out["error"]["message"]
-            .as_str()
-            .unwrap()
-            .contains("doom loop"));
+        assert!(
+            out["error"]["message"]
+                .as_str()
+                .unwrap()
+                .contains("doom loop")
+        );
     }
 
     #[test]

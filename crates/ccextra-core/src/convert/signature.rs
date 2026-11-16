@@ -4,8 +4,8 @@
 // gpt(Fernet)、kimi(固定长度)、grok(无信封高熵)五族。
 // 只做传输形状校验,不证明可解密性。
 
-use base64::engine::general_purpose::{STANDARD, STANDARD_NO_PAD, URL_SAFE, URL_SAFE_NO_PAD};
 use base64::Engine;
+use base64::engine::general_purpose::{STANDARD, STANDARD_NO_PAD, URL_SAFE, URL_SAFE_NO_PAD};
 
 /// Claude/Gemini/GPT/Kimi 签名长度上限(对齐 MaxClaudeThinkingSignatureLen 等)
 const MAX_SIGNATURE_LEN: usize = 32 * 1024 * 1024;
@@ -1436,8 +1436,8 @@ pub fn sanitize_gemini_request_thought_signatures(contents: &mut [serde_json::Va
 /// 各转换层测试共用,避免手写假签名被严格校验拒掉。
 #[cfg(test)]
 pub(crate) mod fixtures {
-    use base64::engine::general_purpose::STANDARD;
     use base64::Engine;
+    use base64::engine::general_purpose::STANDARD;
 
     /// Gemini 3 field2{field1{payload}} 信封(对齐 CPA testGemini3ThoughtSignature)
     pub(crate) fn gemini_native_signature(payload: &[u8]) -> String {
@@ -1832,9 +1832,11 @@ mod tests {
             out[0]["parts"][0]["thoughtSignature"],
             GEMINI_SKIP_THOUGHT_SIGNATURE_VALIDATOR
         );
-        assert!(out[0]["parts"][0]["functionCall"]
-            .get("thoughtSignature")
-            .is_none());
+        assert!(
+            out[0]["parts"][0]["functionCall"]
+                .get("thoughtSignature")
+                .is_none()
+        );
     }
 
     #[test]
@@ -1846,9 +1848,11 @@ mod tests {
             {"role": "model", "parts": [{"text": "hidden", "thought": true}]}
         ]));
         assert!(out[0]["parts"][0].get("thoughtSignature").is_none());
-        assert!(out[0]["parts"][0]["functionResponse"]
-            .get("thoughtSignature")
-            .is_none());
+        assert!(
+            out[0]["parts"][0]["functionResponse"]
+                .get("thoughtSignature")
+                .is_none()
+        );
         assert!(out[1]["parts"][0].get("thoughtSignature").is_none());
         assert!(out[2]["parts"][0].get("thoughtSignature").is_none());
     }

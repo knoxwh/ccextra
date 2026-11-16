@@ -28,14 +28,14 @@ pub mod schema;
 #[cfg(test)]
 mod tests;
 
-use serde_json::{json, Value};
+use serde_json::{Value, json};
 use std::collections::{HashMap, HashSet};
 
+use crate::convert::Result;
 use crate::convert::shorten::{build_short_name_map, shorten_name_if_needed};
 use crate::convert::signature::is_codex_commentary_signature_marker;
 use crate::convert::system_reminder_text;
 use crate::convert::tool_id::shorten_call_id;
-use crate::convert::Result;
 
 pub use instructions::{
     is_gpt_upstream, strip_claude_system_for_chat, strip_claude_system_for_gemini,

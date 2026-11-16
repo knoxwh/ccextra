@@ -44,9 +44,9 @@ pub mod tool_input_normalize;
 pub mod volatile_detector;
 
 pub use drift_detector::{
-    compute_structural_hash, derive_session_key, is_stable_parent_bucket,
-    maybe_observe_request_drift, maybe_observe_request_drift_with, observe_cache_usage,
-    observe_drift, ApiKind as DriftApiKind, DriftObserveOptions, DriftState,
+    ApiKind as DriftApiKind, DriftObserveOptions, DriftState, compute_structural_hash,
+    derive_session_key, is_stable_parent_bucket, maybe_observe_request_drift,
+    maybe_observe_request_drift_with, observe_cache_usage, observe_drift,
 };
 pub use reminder_rstrip::normalize_reminder_trailing_whitespace;
 pub use smoosh_split::split_smooshed_reminders;

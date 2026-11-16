@@ -1,13 +1,13 @@
 // Anthropic messages → Gemini contents 转换(对齐 CLIProxyAPI convertClaudeRequestToGemini)
 
-use serde_json::{json, Value};
+use serde_json::{Value, json};
 use std::collections::HashMap;
 
 use super::antigravity_tools::antigravity_tool_name_to_upstream;
 use super::signature::{
+    GEMINI_SKIP_THOUGHT_SIGNATURE_VALIDATOR, SignatureProvider,
     is_codex_commentary_signature_marker, resolve_thinking_signature,
-    resolve_tool_use_thought_signature, signature_provider_from_model_name, SignatureProvider,
-    GEMINI_SKIP_THOUGHT_SIGNATURE_VALIDATOR,
+    resolve_tool_use_thought_signature, signature_provider_from_model_name,
 };
 use super::tool_id::tool_name_from_claude_tool_use_id;
 use super::tool_sanitize::sanitize_function_name;
@@ -1261,10 +1261,12 @@ mod tests {
         assert_eq!(contents[1]["role"], "user");
         let parts = contents[1]["parts"].as_array().unwrap();
         assert_eq!(parts.len(), 3);
-        assert!(parts[0]["text"]
-            .as_str()
-            .unwrap()
-            .contains("<system-reminder>"));
+        assert!(
+            parts[0]["text"]
+                .as_str()
+                .unwrap()
+                .contains("<system-reminder>")
+        );
         assert_eq!(parts[1]["text"], "continue");
         assert_eq!(parts[2]["functionResponse"]["id"], "Read-1");
     }

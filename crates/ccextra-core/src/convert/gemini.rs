@@ -811,9 +811,11 @@ IMPORTANT: Assist with authorized security testing.
             gemini["generationConfig"]["thinkingConfig"]["thinkingBudget"],
             512
         );
-        assert!(gemini["generationConfig"]["thinkingConfig"]
-            .get("type")
-            .is_none());
+        assert!(
+            gemini["generationConfig"]["thinkingConfig"]
+                .get("type")
+                .is_none()
+        );
     }
 
     #[test]
@@ -866,9 +868,11 @@ IMPORTANT: Assist with authorized security testing.
             gemini["generationConfig"]["thinkingConfig"]["thinkingBudget"],
             32768
         );
-        assert!(gemini["generationConfig"]["thinkingConfig"]
-            .get("thinkingLevel")
-            .is_none());
+        assert!(
+            gemini["generationConfig"]["thinkingConfig"]
+                .get("thinkingLevel")
+                .is_none()
+        );
     }
 
     #[test]
@@ -1175,9 +1179,11 @@ IMPORTANT: Assist with authorized security testing.
             gemini["generationConfig"]["thinkingConfig"]["thinkingLevel"],
             "high"
         );
-        assert!(gemini["generationConfig"]["thinkingConfig"]
-            .get("thinkingBudget")
-            .is_none());
+        assert!(
+            gemini["generationConfig"]["thinkingConfig"]
+                .get("thinkingBudget")
+                .is_none()
+        );
     }
 
     #[test]
@@ -1309,9 +1315,11 @@ IMPORTANT: Assist with authorized security testing.
 
         // strict 不外泄进 functionDeclarations
         let (g, _) = convert_to_gemini(&strict_base(json!({"type": "auto"})), "m");
-        assert!(g["tools"][0]["functionDeclarations"][0]
-            .get("strict")
-            .is_none());
+        assert!(
+            g["tools"][0]["functionDeclarations"][0]
+                .get("strict")
+                .is_none()
+        );
     }
 
     #[test]

@@ -8,8 +8,8 @@ pub mod session_tokens;
 pub mod unfit;
 
 use axum::{
-    routing::{get, post},
     Router,
+    routing::{get, post},
 };
 use ccextra_core::cache_stabilization::drift_detector::DriftState;
 use ccextra_core::route::{Protocol, ProviderConfig};
@@ -27,10 +27,10 @@ use handlers::reload::handle_reload;
 
 pub use auth::{check_secret, extract_key, verify_cached};
 pub use claude_relay::{
-    claude_inbound_user_agent, claude_passthrough_headers, ensure_claude_accept_encoding,
-    ensure_oauth_beta, is_claude_passthrough_header_excluded, CLAUDE_ACCEPT_ENCODING,
+    CLAUDE_ACCEPT_ENCODING, claude_inbound_user_agent, claude_passthrough_headers,
+    ensure_claude_accept_encoding, ensure_oauth_beta, is_claude_passthrough_header_excluded,
 };
-pub use error::{extract_upstream_error, to_anthropic_error, AppError};
+pub use error::{AppError, extract_upstream_error, to_anthropic_error};
 pub use retry::parse_retry_after;
 
 /// 配置重载闭包类型

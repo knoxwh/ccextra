@@ -4,9 +4,9 @@
 //! key 由 [`ag_replay_session_key`] 统一构造，value = 规范化的 AG replay items 账本。
 
 use ccextra_core::convert::{
+    AgReplayAccumulator, AgReplayPrepareReport, AgReplayToolContext,
     collect_ag_replay_from_response, normalize_ag_replay_items,
-    prepare_ag_replay_request_with_tools, AgReplayAccumulator, AgReplayPrepareReport,
-    AgReplayToolContext,
+    prepare_ag_replay_request_with_tools,
 };
 use serde_json::Value;
 use std::collections::HashMap;
@@ -1008,11 +1008,13 @@ mod tests {
             AgReplayApplyOutcome::Miss
         );
         let mut no_session = make();
-        assert!(prepare_antigravity_body_without_ledger(
-            &mut no_session,
-            AgReplayToolContext::default()
-        )
-        .is_none());
+        assert!(
+            prepare_antigravity_body_without_ledger(
+                &mut no_session,
+                AgReplayToolContext::default()
+            )
+            .is_none()
+        );
         for body in [&miss, &no_session] {
             let id = body["request"]["contents"][1]["parts"][0]["functionCall"]["id"]
                 .as_str()
@@ -1289,9 +1291,11 @@ mod tests {
         let key = "gemini-flash:claude:untouched:agent:main";
         let (_, snapshot) = cache.load(key);
         cache.inner.lock().unwrap().evict_oldest(1);
-        assert!(cache
-            .get_items("gemini-flash:claude:older:agent:main")
-            .is_none());
+        assert!(
+            cache
+                .get_items("gemini-flash:claude:older:agent:main")
+                .is_none()
+        );
         assert_eq!(
             cache.replace_if_unchanged(key, &snapshot, vec![item("first")]),
             Some(true)

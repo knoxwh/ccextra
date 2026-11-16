@@ -4,7 +4,7 @@
 use serde_json::Value;
 use std::collections::HashMap;
 
-use super::gemini::{convert_to_gemini_with_registry, SchemaFlavor};
+use super::gemini::{SchemaFlavor, convert_to_gemini_with_registry};
 
 /// 转换 Anthropic 请求体为 Antigravity 格式
 ///
@@ -313,9 +313,11 @@ mod tests {
     fn test_non_claude_no_validated_and_max_output_deleted() {
         let (out, _) = convert_to_antigravity(&base_body(), "gemini-3-flash", None);
         assert!(out["request"].get("toolConfig").is_none());
-        assert!(out["request"]["generationConfig"]
-            .get("maxOutputTokens")
-            .is_none());
+        assert!(
+            out["request"]["generationConfig"]
+                .get("maxOutputTokens")
+                .is_none()
+        );
     }
 
     #[test]
@@ -358,10 +360,12 @@ mod tests {
         let parts = out["request"]["contents"][1]["parts"].as_array().unwrap();
         assert_eq!(parts.len(), 2);
         assert_eq!(parts[0]["thought"], true);
-        assert!(parts[0]["thoughtSignature"]
-            .as_str()
-            .unwrap()
-            .starts_with('R'));
+        assert!(
+            parts[0]["thoughtSignature"]
+                .as_str()
+                .unwrap()
+                .starts_with('R')
+        );
         assert_eq!(parts[1]["text"], "answer");
     }
 

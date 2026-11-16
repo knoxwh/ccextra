@@ -138,12 +138,14 @@ mod tests {
         // 后缀形态 _<12hex>
         let suffixed = if a.len() > b.len() { &a } else { &b };
         assert!(suffixed.len() == "my_tool".len() + 13 || suffixed.len() == 64);
-        assert!(suffixed
-            .rsplit('_')
-            .next()
-            .unwrap()
-            .chars()
-            .all(|c| c.is_ascii_hexdigit()));
+        assert!(
+            suffixed
+                .rsplit('_')
+                .next()
+                .unwrap()
+                .chars()
+                .all(|c| c.is_ascii_hexdigit())
+        );
     }
 
     #[test]

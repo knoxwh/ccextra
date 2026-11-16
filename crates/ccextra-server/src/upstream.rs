@@ -1084,7 +1084,7 @@ impl UpstreamClient {
 /// - `Accept`:缺省或 `*/*` → `application/json`;多值保留首个。
 /// - 多值 `User-Agent`:保留首个。
 fn scrub_outbound_request_headers_wreq(req: &mut wreq::Request) {
-    use wreq::header::{HeaderValue, ACCEPT, CONTENT_TYPE, USER_AGENT};
+    use wreq::header::{ACCEPT, CONTENT_TYPE, HeaderValue, USER_AGENT};
 
     if req.headers().contains_key(CONTENT_TYPE) {
         // 有意规范为裸 application/json(丢 charset 等),与显式声明一致
@@ -1153,7 +1153,7 @@ pub(crate) enum AcceptScrubPolicy {
 ///     (Antigravity;CPA chat 不设 Accept;reqwest 随后仍可能补 `*/*`)。
 /// - 多值 `Accept` / `User-Agent`:保留首个,去掉叠出来的重复项。
 fn scrub_outbound_request_headers(req: &mut reqwest::Request, accept_policy: AcceptScrubPolicy) {
-    use reqwest::header::{HeaderValue, ACCEPT, CONTENT_TYPE, USER_AGENT};
+    use reqwest::header::{ACCEPT, CONTENT_TYPE, HeaderValue, USER_AGENT};
 
     if req.headers().contains_key(CONTENT_TYPE) {
         // 有意规范为裸 application/json(丢 charset 等),与显式声明一致
@@ -1472,13 +1472,15 @@ mod tests {
     #[test]
     fn test_grok_cli_headers_chat_gpt_empty() {
         assert!(grok_cli_headers(Protocol::OpenAiChat, "gpt-4", Some("sess"), "1.0.5").is_empty());
-        assert!(grok_cli_headers(
-            Protocol::OpenAiResponses,
-            "gpt-5.6-terra",
-            Some("sess"),
-            "1.0.5"
-        )
-        .is_empty());
+        assert!(
+            grok_cli_headers(
+                Protocol::OpenAiResponses,
+                "gpt-5.6-terra",
+                Some("sess"),
+                "1.0.5"
+            )
+            .is_empty()
+        );
         assert!(grok_cli_headers(Protocol::Claude, "grok-4.6", Some("sess"), "1.0.5").is_empty());
         assert!(grok_cli_headers(Protocol::Gemini, "grok-4.6", Some("sess"), "1.0.5").is_empty());
     }

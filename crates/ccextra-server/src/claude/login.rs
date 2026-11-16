@@ -1,17 +1,17 @@
 // Claude PKCE + 本地回调登录流程 (对齐 CPA sdk/auth/claude.go)
 
 use super::constants::{CALLBACK_PATH, DEFAULT_CALLBACK_PORT, REDIRECT_URI};
-use super::credential::{generate_device_id, ClaudeCredential};
+use super::credential::{ClaudeCredential, generate_device_id};
 use super::oauth::{
     build_auth_url, exchange_code, fetch_profile, generate_pkce_codes, http_client,
 };
 use super::store;
 use crate::oauth_common::{open_browser, random_state};
-use anyhow::{anyhow, Context, Result};
+use anyhow::{Context, Result, anyhow};
+use axum::Router;
 use axum::extract::Query;
 use axum::response::Html;
 use axum::routing::get;
-use axum::Router;
 use serde::Deserialize;
 use std::net::SocketAddr;
 use std::path::PathBuf;

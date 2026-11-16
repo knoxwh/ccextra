@@ -15,7 +15,7 @@
 //! - 仅针对 Anthropic walker;OpenAI 分支返回 0。
 
 use crate::cache_stabilization::drift_detector::ApiKind;
-use serde_json::{json, Value};
+use serde_json::{Value, json};
 use std::sync::LazyLock;
 
 // 注意:Rust 的 `regex` crate 不支持 look-around,因此简报中的

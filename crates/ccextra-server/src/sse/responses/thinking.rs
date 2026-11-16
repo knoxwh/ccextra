@@ -4,8 +4,8 @@ use serde_json::Value;
 use crate::sse::emit;
 use ccextra_core::convert::CODEX_COMMENTARY_SIGNATURE_MARKER;
 
-use super::state_machine::ResponsesRelay;
 use super::CLAUDE_RESPONSES_REDACTED_THINKING_PREFIX;
+use super::state_machine::ResponsesRelay;
 
 impl ResponsesRelay {
     pub(crate) fn start_thinking(&mut self) -> Vec<Bytes> {

@@ -15,7 +15,7 @@
 
 use std::collections::{HashMap, HashSet};
 
-use serde_json::{json, Value};
+use serde_json::{Value, json};
 
 use super::signature::is_codex_commentary_signature_marker;
 use super::{ConvertError, Result};
@@ -2060,14 +2060,18 @@ IMPORTANT: Assist with authorized security testing.
         assert_eq!(msgs[1]["role"], "user");
         // system reminder 也走 convert_message 归一化为数组
         assert_eq!(msgs[1]["content"][0]["type"], "text");
-        assert!(msgs[1]["content"][0]["text"]
-            .as_str()
-            .unwrap()
-            .contains("<system-reminder>"));
-        assert!(msgs[1]["content"][0]["text"]
-            .as_str()
-            .unwrap()
-            .contains("Token usage"));
+        assert!(
+            msgs[1]["content"][0]["text"]
+                .as_str()
+                .unwrap()
+                .contains("<system-reminder>")
+        );
+        assert!(
+            msgs[1]["content"][0]["text"]
+                .as_str()
+                .unwrap()
+                .contains("Token usage")
+        );
     }
 
     #[test]
@@ -2412,10 +2416,12 @@ IMPORTANT: Assist with authorized security testing.
         assert_eq!(msgs[2]["role"], "tool");
         assert_eq!(msgs[2]["tool_call_id"], "t2");
         assert_eq!(msgs[3]["role"], "user");
-        assert!(msgs[3]["content"][0]["text"]
-            .as_str()
-            .unwrap()
-            .contains("<system-reminder>"));
+        assert!(
+            msgs[3]["content"][0]["text"]
+                .as_str()
+                .unwrap()
+                .contains("<system-reminder>")
+        );
         assert_eq!(msgs[4]["role"], "user");
         assert_eq!(msgs[4]["content"][0]["text"], "next instruction");
     }
@@ -2691,9 +2697,11 @@ IMPORTANT: Assist with authorized security testing.
         assert_eq!(body["tool_choice"]["function"]["name"], "Late");
         // reminder 文本保留
         let msgs = body["messages"].as_array().unwrap();
-        assert!(msgs.iter().any(|m| m["content"][0]["text"]
-            .as_str()
-            .is_some_and(|t| t.contains("tools changed"))));
+        assert!(msgs.iter().any(|m| {
+            m["content"][0]["text"]
+                .as_str()
+                .is_some_and(|t| t.contains("tools changed"))
+        }));
     }
 
     #[test]

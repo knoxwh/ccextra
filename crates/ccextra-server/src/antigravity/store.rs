@@ -1,7 +1,7 @@
 // 凭证目录读写:根目录用项目 `.cache/antigravity`
 
 use super::constants::DEFAULT_AUTH_DIR;
-use super::credential::{credential_file_name, AntigravityCredential};
+use super::credential::{AntigravityCredential, credential_file_name};
 use anyhow::{Context, Result};
 use std::fs;
 use std::path::{Path, PathBuf};

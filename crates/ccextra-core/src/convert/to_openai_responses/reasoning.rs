@@ -1,9 +1,9 @@
-use serde_json::{json, Value};
+use serde_json::{Value, json};
 
 use super::instructions::is_grok_upstream;
 use crate::convert::signature::{
-    compatible_signature_for_provider_block, is_valid_gpt_reasoning_signature,
-    is_valid_grok_encrypted_content, SignatureBlockKind, SignatureProvider,
+    SignatureBlockKind, SignatureProvider, compatible_signature_for_provider_block,
+    is_valid_gpt_reasoning_signature, is_valid_grok_encrypted_content,
 };
 
 /// thinking signature → 可回放给目标上游的 reasoning.encrypted_content
