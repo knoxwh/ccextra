@@ -39,7 +39,12 @@ pub async fn reload_now(state: &AppState) -> Result<ReloadResult, AppError> {
         Err(e) => return Err(AppError::new(anyhow::anyhow!("配置文件读取失败: {e}"))),
     };
     if data.antigravity_load_failed {
-        carry_over_antigravity(&mut data.providers, &state.config.read().await.providers);
+        let current = state.config.read().await.clone();
+        carry_over_antigravity(
+            &mut data.providers,
+            &current.providers,
+            data.proxy_url.as_deref(),
+        );
     }
 
     // 2. 验证 providers 与生效代理(失败记录但尝试继续构建 runtime;不发布,保留旧配置)
@@ -107,24 +112,42 @@ pub async fn reload_now(state: &AppState) -> Result<ReloadResult, AppError> {
     Ok(result)
 }
 
-/// AG 拉取失败时沿用当前快照的 Antigravity providers(对齐 CPA 失败保旧);
-/// alias 已被新 providers 占用的模型丢弃(同 merge_providers 语义)。
-fn carry_over_antigravity(providers: &mut Vec<ProviderConfig>, current: &[ProviderConfig]) {
+/// AG 拉取失败时沿用当前快照中动态注入的 Antigravity providers(对齐 CPA 失败保旧)。
+/// - 只取带 `credential_path` 的注入项;静态配置的 antigravity provider 已在新配置里,不重复沿用
+/// - 追加在末尾、alias 已被占用的模型丢弃:与正常加载 AG 最后合并(merge_providers)一致
+/// - proxy_url 换成新配置的全局代理(注入时同源写入,见 antigravity::provider)
+///
+/// 返回沿用的 provider 数。
+fn carry_over_antigravity(
+    providers: &mut Vec<ProviderConfig>,
+    current: &[ProviderConfig],
+    proxy_url: Option<&str>,
+) -> usize {
     let mut seen: std::collections::HashSet<String> = providers
         .iter()
         .flat_map(|p| p.models.iter().map(|m| m.alias.clone()))
         .collect();
     let mut carried = 0usize;
-    for p in current
-        .iter()
-        .filter(|p| p.protocol == Protocol::Antigravity)
-    {
+    for p in current.iter().filter(|p| is_injected_antigravity(p)) {
         let mut p = p.clone();
+        p.proxy_url = proxy_url.map(str::to_string);
         p.models.retain(|m| seen.insert(m.alias.clone()));
         providers.push(p);
         carried += 1;
     }
-    tracing::warn!(carried, "Antigravity 拉取失败,沿用当前快照的 AG providers");
+    if carried > 0 {
+        tracing::warn!(carried, "Antigravity 拉取失败,沿用当前快照的 AG providers");
+    } else {
+        tracing::info!("Antigravity 拉取失败,当前快照无已注入的 AG providers 可沿用");
+    }
+    carried
+}
+
+fn is_injected_antigravity(p: &ProviderConfig) -> bool {
+    p.protocol == Protocol::Antigravity
+        && p.metadata
+            .as_ref()
+            .is_some_and(|m| m.contains_key("credential_path"))
 }
 
 /// HTTP `POST /reload`：委托 [`reload_now`]。
@@ -141,5 +164,96 @@ fn build_runtime_config(data: &crate::http::ReloadData) -> RuntimeConfig {
         upstream: UpstreamClient::with_ant_pool(data.proxy_url.clone(), data.antigravity.as_ref()),
         user_agents: data.user_agents.clone(),
         thinking_registry: data.thinking_registry.clone(),
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use ccextra_core::route::ModelConfig;
+
+    fn model(alias: &str) -> ModelConfig {
+        ModelConfig {
+            name: alias.into(),
+            alias: alias.into(),
+            max_input_tokens: None,
+            max_tokens: None,
+        }
+    }
+
+    fn provider(name: &str, protocol: Protocol, aliases: &[&str]) -> ProviderConfig {
+        ProviderConfig::new(
+            name.into(),
+            protocol,
+            vec!["https://example.invalid".into()],
+            "fixture-key".into(),
+            Some("http://old-proxy.invalid:8080".into()),
+            false,
+            aliases.iter().map(|a| model(a)).collect(),
+        )
+    }
+
+    fn injected_ag(name: &str, aliases: &[&str]) -> ProviderConfig {
+        provider(name, Protocol::Antigravity, aliases).with_metadata(
+            [("credential_path".to_string(), format!("/tmp/{name}.json"))]
+                .into_iter()
+                .collect(),
+        )
+    }
+
+    /// 沿用的 AG 用新配置的全局代理,不带旧 proxy_url
+    #[test]
+    fn carried_antigravity_uses_new_proxy_url() {
+        let mut providers = vec![];
+        let current = vec![injected_ag("ag-1", &["g1"])];
+        assert_eq!(
+            carry_over_antigravity(&mut providers, &current, Some("direct")),
+            1
+        );
+        assert_eq!(providers[0].proxy_url.as_deref(), Some("direct"));
+    }
+
+    /// alias 冲突时新加载的 providers 优先,与正常加载 AG 最后合并一致
+    #[test]
+    fn carried_antigravity_loses_alias_conflict_like_normal_merge() {
+        let mut providers = vec![provider("claude-sub", Protocol::Claude, &["shared"])];
+        let current = vec![injected_ag("ag-1", &["shared", "g1"])];
+        carry_over_antigravity(&mut providers, &current, Some("direct"));
+        assert_eq!(providers.len(), 2);
+        assert_eq!(providers[0].models[0].alias, "shared");
+        let aliases: Vec<_> = providers[1]
+            .models
+            .iter()
+            .map(|m| m.alias.as_str())
+            .collect();
+        assert_eq!(aliases, vec!["g1"]);
+    }
+
+    /// 静态配置的 antigravity provider 不沿用(新配置自带;删掉的不能复活)
+    #[test]
+    fn static_antigravity_is_not_carried() {
+        let mut providers = vec![];
+        let current = vec![
+            provider("static-ag", Protocol::Antigravity, &["s1"]),
+            injected_ag("ag-1", &["g1"]),
+        ];
+        assert_eq!(
+            carry_over_antigravity(&mut providers, &current, Some("direct")),
+            1
+        );
+        assert_eq!(providers[0].name, "ag-1");
+    }
+
+    /// 当前快照没有已注入的 AG:不改 providers,返回 0(不打 WARN)
+    #[test]
+    fn nothing_carried_without_injected_antigravity() {
+        let mut providers = vec![provider("claude-sub", Protocol::Claude, &["c1"])];
+        let current = vec![provider("claude-old", Protocol::Claude, &["c0"])];
+        assert_eq!(
+            carry_over_antigravity(&mut providers, &current, Some("direct")),
+            0
+        );
+        assert_eq!(providers.len(), 1);
+        assert_eq!(providers[0].name, "claude-sub");
     }
 }

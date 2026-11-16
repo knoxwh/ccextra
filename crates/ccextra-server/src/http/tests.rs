@@ -1631,7 +1631,9 @@ async fn state_with_ag_provider() -> AppState {
   protocol: antigravity
   base_url: "https://ag.example.com"
   key: ya29.test
-  proxy_url: "direct"
+  proxy_url: "http://old-proxy.invalid:8080"
+  metadata:
+    credential_path: /tmp/antigravity-test.json
   models:
     - name: gemini-4-pro
       alias: gemini-4-pro
@@ -1670,6 +1672,11 @@ async fn test_reload_keeps_ag_providers_when_ag_load_failed() {
         .collect();
     assert_eq!(ag.len(), 1, "拉取失败应保留旧 AG provider");
     assert_eq!(ag[0].models[0].alias, "gemini-4-pro");
+    assert_eq!(
+        ag[0].proxy_url.as_deref(),
+        Some("direct"),
+        "沿用时换成新全局代理"
+    );
     assert!(
         snapshot.providers.iter().all(|p| p.name != "test-claude"),
         "非 AG providers 仍按新配置替换"

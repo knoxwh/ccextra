@@ -323,10 +323,13 @@ async fn main() -> Result<()> {
                 cfg.server.proxy_url.as_deref(),
             )
             .await;
-            let mut providers = merge_providers(cfg.providers, antigravity_providers);
-            providers = merge_providers(providers, xai_providers);
-            providers = merge_providers(providers, codex_providers);
-            providers = merge_providers(providers, claude_providers);
+            let providers = merge_all_providers(
+                cfg.providers,
+                xai_providers,
+                codex_providers,
+                claude_providers,
+                antigravity_providers,
+            );
 
             let user_agents = build_user_agents(cfg.user_agents.as_ref());
             let thinking_registry = load_thinking_registry(&config_path, cfg.models_file.as_deref())?;
@@ -609,11 +612,29 @@ async fn load_refreshed_providers(
         }
         AntigravityLoad::Loaded(providers) => providers,
     };
-    let set = merge_providers(refresh.static_providers, xai);
+    Some(merge_all_providers(
+        refresh.static_providers,
+        xai,
+        codex,
+        claude,
+        injected,
+    ))
+}
+
+/// reload 与后台刷新共用的合并顺序:static → xai → codex → claude → antigravity,
+/// alias 冲突先合并者优先。AG 放最后与启动(AG 后台注入)一致;
+/// reload 拉取失败沿用的 AG 也追加在末尾(见 reload::carry_over_antigravity)。
+fn merge_all_providers(
+    static_providers: Vec<ProviderConfig>,
+    xai: Vec<ProviderConfig>,
+    codex: Vec<ProviderConfig>,
+    claude: Vec<ProviderConfig>,
+    antigravity: Vec<ProviderConfig>,
+) -> Vec<ProviderConfig> {
+    let set = merge_providers(static_providers, xai);
     let set = merge_providers(set, codex);
     let set = merge_providers(set, claude);
-    let set = merge_providers(set, injected);
-    Some(set)
+    merge_providers(set, antigravity)
 }
 
 async fn refresh_providers<F, Fut>(
@@ -1042,9 +1063,9 @@ fn build_user_agents(config: Option<&config::UserAgents>) -> UserAgentSet {
 mod tests {
     use super::{
         antigravity_injection_loop, build_user_agents, load_refreshed_providers,
-        load_thinking_registry, merge_providers, pin_auth_dir, pin_path, provider_refresh_config,
-        refresh_providers, startup_retry_delay, with_pinned_log_dir, Arc, Config, ProviderConfig,
-        RuntimeConfig, RwLock, UpstreamClient,
+        load_thinking_registry, merge_all_providers, merge_providers, pin_auth_dir, pin_path,
+        provider_refresh_config, refresh_providers, startup_retry_delay, with_pinned_log_dir, Arc,
+        Config, ProviderConfig, RuntimeConfig, RwLock, UpstreamClient,
     };
     use ccextra_core::route::{ModelConfig, Protocol};
     use ccextra_server::antigravity::resolve_auth_dir as resolve_antigravity_auth_dir;
@@ -1377,6 +1398,28 @@ xai_auth_dir: new-xai
             false,
             models,
         )
+    }
+
+    #[test]
+    fn merge_all_providers_puts_antigravity_last() {
+        let mut ag = provider("ag", vec![model("g", "shared"), model("g2", "ag-only")]);
+        ag.protocol = Protocol::Antigravity;
+        let merged = merge_all_providers(
+            vec![],
+            vec![],
+            vec![],
+            vec![provider("claude-sub", vec![model("c", "shared")])],
+            vec![ag],
+        );
+        let names: Vec<_> = merged.iter().map(|p| p.name.as_str()).collect();
+        assert_eq!(names, vec!["claude-sub", "ag"]);
+        assert_eq!(merged[0].models[0].alias, "shared");
+        let ag_aliases: Vec<_> = merged[1].models.iter().map(|m| m.alias.as_str()).collect();
+        assert_eq!(
+            ag_aliases,
+            vec!["ag-only"],
+            "alias 冲突时 AG 让位,与沿用路径一致"
+        );
     }
 
     #[test]
