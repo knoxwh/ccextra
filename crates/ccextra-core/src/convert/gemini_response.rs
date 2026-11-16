@@ -76,6 +76,8 @@ pub struct GeminiStreamState {
     pub has_content: bool,
     /// 是否见过工具调用
     pub saw_tool_call: bool,
+    /// 是否见过可见输出:非空白文本或非空 functionCall,thinking 不算(对齐 CPA cf07c78a HasVisibleOutput)
+    pub has_visible_output: bool,
     /// 最终事件是否已发(对齐 CPA HasFinalEvents,防重复 finalize)
     pub final_events_sent: bool,
     /// 已发 MALFORMED api_error(对齐 CPA 7f2f17d7;SSE 层据此跳过 message_stop)
@@ -195,7 +197,10 @@ pub fn convert_gemini_stream_chunk(
     {
         for part in parts {
             let text_result = part.get("text");
-            let function_call_result = part.get("functionCall");
+            // 对齐 CPA cf07c78a:非续传的空 functionCall 跳过(视为无 FC,签名走签名-only 分支)
+            let function_call_result = part.get("functionCall").filter(|fc| {
+                is_function_call_continuation(state, fc) || is_non_empty_function_call(fc)
+            });
             let thought_signature = part
                 .get("thoughtSignature")
                 .or_else(|| part.get("thought_signature"))
@@ -276,6 +281,9 @@ pub fn convert_gemini_stream_chunk(
             // 工具调用
             if let Some(function_call) = function_call_result {
                 state.saw_tool_call = true;
+                if is_non_empty_function_call(function_call) {
+                    state.has_visible_output = true;
+                }
                 let upstream_tool_name = function_call
                     .get("name")
                     .and_then(|n| n.as_str())
@@ -385,6 +393,9 @@ pub fn convert_gemini_stream_chunk(
                 if has_thought_signature {
                     append_carrier_thinking_block(&mut events, state, &signature_value);
                 }
+                if !text.trim().is_empty() {
+                    state.has_visible_output = true;
+                }
 
                 if state.response_type == ResponseType::Content {
                     events.push(json!({
@@ -488,9 +499,52 @@ fn cache_chunk_metadata(chunk: &Value, state: &mut GeminiStreamState) {
 pub const GEMINI_MALFORMED_FUNCTION_CALL_ERROR_MESSAGE: &str =
     "Gemini response finished with MALFORMED_FUNCTION_CALL";
 
-/// 无有效 tool_call 时的 MALFORMED → Claude api_error(对齐 CPA isGeminiMalformedFunctionCall)。
-pub(crate) fn is_gemini_malformed_function_call(finish_reason: &str, saw_tool_call: bool) -> bool {
-    finish_reason == "MALFORMED_FUNCTION_CALL" && !saw_tool_call
+/// 无可见输出时的 MALFORMED → Claude api_error(对齐 CPA cf07c78a isGeminiMalformedFunctionCall:
+/// 忽略大小写与首尾空白;可见输出 = 非空白文本或非空 functionCall)。
+pub(crate) fn is_gemini_malformed_function_call(
+    finish_reason: &str,
+    has_visible_output: bool,
+) -> bool {
+    finish_reason
+        .trim()
+        .eq_ignore_ascii_case("MALFORMED_FUNCTION_CALL")
+        && !has_visible_output
+}
+
+/// 非空 functionCall:name/id 非空白,或 args 为非空对象,或 partialArgs 为非空数组
+/// (对齐 CPA cf07c78a isGeminiNonEmptyFunctionCall)。
+fn is_non_empty_function_call(fc: &Value) -> bool {
+    let Some(obj) = fc.as_object() else {
+        return false;
+    };
+    let non_blank = |key: &str| {
+        obj.get(key)
+            .and_then(|v| v.as_str())
+            .is_some_and(|s| !s.trim().is_empty())
+    };
+    if non_blank("name") || non_blank("id") {
+        return true;
+    }
+    if ["partialArgs", "partial_args"].iter().any(|key| {
+        obj.get(*key)
+            .and_then(|v| v.as_array())
+            .is_some_and(|a| !a.is_empty())
+    }) {
+        return true;
+    }
+    obj.get("args")
+        .and_then(|v| v.as_object())
+        .is_some_and(|m| !m.is_empty())
+}
+
+/// 流式续传块:当前在 tool 块内且 name 为空(与续传分支判定一致)。
+fn is_function_call_continuation(state: &GeminiStreamState, fc: &Value) -> bool {
+    state.response_type == ResponseType::Function
+        && fc
+            .get("name")
+            .and_then(|n| n.as_str())
+            .unwrap_or("")
+            .is_empty()
 }
 
 /// 对齐 CPA geminiMalformedFunctionCallErrorPayload。
@@ -545,7 +599,7 @@ fn append_final_events(state: &mut GeminiStreamState, events: &mut Vec<Value>) {
     if state.final_events_sent || !state.has_content {
         return;
     }
-    if is_gemini_malformed_function_call(&state.finish_reason, state.saw_tool_call) {
+    if is_gemini_malformed_function_call(&state.finish_reason, state.has_visible_output) {
         append_malformed_api_error(state, events);
         return;
     }
@@ -576,7 +630,7 @@ pub fn finalize_gemini_stream(chunk: &Value, state: &mut GeminiStreamState) -> V
         return events;
     }
     if state.has_finish
-        && is_gemini_malformed_function_call(&state.finish_reason, state.saw_tool_call)
+        && is_gemini_malformed_function_call(&state.finish_reason, state.has_visible_output)
     {
         append_malformed_api_error(state, &mut events);
         return events;
@@ -594,7 +648,7 @@ pub fn force_finalize_gemini_stream(state: &mut GeminiStreamState) -> Vec<Value>
     if state.final_events_sent {
         return Vec::new();
     }
-    if is_gemini_malformed_function_call(&state.finish_reason, state.saw_tool_call) {
+    if is_gemini_malformed_function_call(&state.finish_reason, state.has_visible_output) {
         let mut events = Vec::new();
         append_malformed_api_error(state, &mut events);
         return events;
@@ -647,6 +701,7 @@ pub fn convert_gemini_response(
     }
 
     let mut saw_tool_call = false;
+    let mut has_visible_output = false;
     if let Some(candidate) = response
         .get("candidates")
         .and_then(|c| c.as_array())
@@ -680,13 +735,21 @@ pub fn convert_gemini_response(
                         block["signature"] = json!(sig);
                         content_blocks.push(block);
                     } else {
+                        if !text.trim().is_empty() {
+                            has_visible_output = true;
+                        }
                         content_blocks.push(json!({"type": "text", "text": text}));
                     }
                 }
 
                 // 工具调用:id 见 claude_tool_use_id(不直接透传上游 id),name 还原原名
-                if let Some(function_call) = part.get("functionCall") {
+                // 对齐 CPA cf07c78a:空 functionCall 跳过(非流无 carrier,签名随之丢弃)
+                if let Some(function_call) = part
+                    .get("functionCall")
+                    .filter(|fc| is_non_empty_function_call(fc))
+                {
                     saw_tool_call = true;
+                    has_visible_output = true;
                     let upstream_name = function_call
                         .get("name")
                         .and_then(|n| n.as_str())
@@ -748,8 +811,8 @@ pub fn convert_gemini_response(
             .and_then(|f| f.as_str())
             .filter(|reason| !reason.is_empty())
             .unwrap_or("STOP");
-        // 对齐 CPA 7f2f17d7:无 tool_call 的 MALFORMED → api_error(可重试)
-        if is_gemini_malformed_function_call(finish_reason, saw_tool_call) {
+        // 对齐 CPA 7f2f17d7/cf07c78a:无可见输出的 MALFORMED → api_error(可重试)
+        if is_gemini_malformed_function_call(finish_reason, has_visible_output) {
             return gemini_malformed_function_call_error();
         }
         anthropic["stop_reason"] = json!(resolve_gemini_claude_stop_reason(
@@ -1772,5 +1835,216 @@ mod tests {
                 assert!(ids[0].starts_with("Read-"), "{model:?} {ids:?}");
             }
         }
+    }
+
+    // ---- 对齐 CPA cf07c78a:MALFORMED 判定改「无可见输出」+ 空 functionCall 跳过 ----
+
+    fn run_stream(chunks: &[Value]) -> (Vec<Value>, GeminiStreamState) {
+        let mut state = GeminiStreamState::default();
+        let mut events = Vec::new();
+        for chunk in chunks {
+            events.extend(convert_gemini_stream_chunk(
+                chunk,
+                &mut state,
+                &HashMap::new(),
+                None,
+                None,
+            ));
+            events.extend(finalize_gemini_stream(chunk, &mut state));
+        }
+        (events, state)
+    }
+
+    fn malformed_terminal_chunk() -> Value {
+        json!({
+            "candidates": [{
+                "content": {"role": "model", "parts": []},
+                "finishReason": "MALFORMED_FUNCTION_CALL"
+            }],
+            "usageMetadata": {"promptTokenCount": 10, "candidatesTokenCount": 5}
+        })
+    }
+
+    fn has_api_error(events: &[Value]) -> bool {
+        events
+            .iter()
+            .any(|e| e["type"] == "error" && e["error"]["type"] == "api_error")
+    }
+
+    fn has_tool_use_start(events: &[Value]) -> bool {
+        events
+            .iter()
+            .any(|e| e["type"] == "content_block_start" && e["content_block"]["type"] == "tool_use")
+    }
+
+    #[test]
+    fn test_stream_malformed_after_visible_text_ends_normally() {
+        let text =
+            json!({"candidates": [{"content": {"role": "model", "parts": [{"text": "hi"}]}}]});
+        let (events, state) = run_stream(&[text, malformed_terminal_chunk()]);
+        assert!(state.has_visible_output);
+        assert!(!state.api_error_emitted);
+        assert!(!has_api_error(&events), "{events:?}");
+        let delta = events
+            .iter()
+            .find(|e| e["type"] == "message_delta")
+            .expect("message_delta");
+        assert_eq!(delta["delta"]["stop_reason"], "end_turn");
+    }
+
+    #[test]
+    fn test_stream_malformed_after_whitespace_text_emits_api_error() {
+        let text =
+            json!({"candidates": [{"content": {"role": "model", "parts": [{"text": "  \n"}]}}]});
+        let (events, state) = run_stream(&[text, malformed_terminal_chunk()]);
+        assert!(!state.has_visible_output);
+        assert!(state.api_error_emitted);
+        assert!(has_api_error(&events), "{events:?}");
+        assert!(events.iter().all(|e| e["type"] != "message_delta"));
+    }
+
+    #[test]
+    fn test_stream_malformed_after_thinking_only_emits_api_error() {
+        let thinking = json!({"candidates": [{"content": {"role": "model", "parts": [
+            {"text": "plan", "thought": true}
+        ]}}]});
+        let (events, state) = run_stream(&[thinking, malformed_terminal_chunk()]);
+        assert!(!state.has_visible_output);
+        assert!(state.api_error_emitted);
+        let n = events.len();
+        assert_eq!(events[n - 2]["type"], "content_block_stop", "{events:?}");
+        assert_eq!(events[n - 1]["type"], "error", "{events:?}");
+        assert!(events.iter().all(|e| e["type"] != "message_delta"));
+    }
+
+    #[test]
+    fn test_stream_empty_function_call_skipped_then_malformed_errors() {
+        let empty_fc = json!({"candidates": [{"content": {"role": "model", "parts": [
+            {"functionCall": {}}
+        ]}}]});
+        let (events, state) = run_stream(&[empty_fc, malformed_terminal_chunk()]);
+        assert!(!state.saw_tool_call);
+        assert!(!state.has_visible_output);
+        assert!(!has_tool_use_start(&events), "{events:?}");
+        assert!(has_api_error(&events), "{events:?}");
+    }
+
+    #[test]
+    fn test_stream_signed_empty_function_call_emits_carrier_not_tool_use() {
+        let empty_fc = json!({"candidates": [{"content": {"role": "model", "parts": [
+            {"thoughtSignature": "sig-empty-fc", "functionCall": {"args": {}}}
+        ]}}]});
+        let (events, state) = run_stream(&[empty_fc, malformed_terminal_chunk()]);
+        assert!(!state.saw_tool_call);
+        assert!(!has_tool_use_start(&events), "{events:?}");
+        assert!(
+            events
+                .iter()
+                .any(|e| e["type"] == "content_block_start"
+                    && e["content_block"]["type"] == "thinking"),
+            "{events:?}"
+        );
+        assert!(
+            events
+                .iter()
+                .any(|e| e["delta"]["type"] == "signature_delta"
+                    && e["delta"]["signature"] == "sig-empty-fc"),
+            "{events:?}"
+        );
+        assert!(has_api_error(&events), "{events:?}");
+    }
+
+    #[test]
+    fn test_malformed_finish_reason_case_insensitive() {
+        assert!(is_gemini_malformed_function_call(
+            " malformed_function_call ",
+            false
+        ));
+        assert!(!is_gemini_malformed_function_call(
+            "malformed_function_call",
+            true
+        ));
+        let gemini = json!({
+            "candidates": [{
+                "content": {"role": "model", "parts": []},
+                "finishReason": "malformed_function_call"
+            }]
+        });
+        let out = convert_gemini_response(&gemini, &HashMap::new(), None, None);
+        assert_eq!(out["type"], "error");
+        assert_eq!(out["error"]["type"], "api_error");
+    }
+
+    #[test]
+    fn test_convert_gemini_response_malformed_with_text_keeps_message() {
+        let gemini = json!({
+            "candidates": [{
+                "content": {"role": "model", "parts": [{"text": "partial answer"}]},
+                "finishReason": "MALFORMED_FUNCTION_CALL"
+            }]
+        });
+        let out = convert_gemini_response(&gemini, &HashMap::new(), None, None);
+        assert_eq!(out["type"], "message", "{out}");
+        assert_eq!(out["stop_reason"], "end_turn");
+        assert_eq!(out["content"][0]["text"], "partial answer");
+    }
+
+    #[test]
+    fn test_convert_gemini_response_malformed_whitespace_text_returns_api_error() {
+        let gemini = json!({
+            "candidates": [{
+                "content": {"role": "model", "parts": [{"text": " \n "}]},
+                "finishReason": "MALFORMED_FUNCTION_CALL"
+            }]
+        });
+        let out = convert_gemini_response(&gemini, &HashMap::new(), None, None);
+        assert_eq!(out["type"], "error", "{out}");
+    }
+
+    #[test]
+    fn test_convert_gemini_response_malformed_thinking_only_returns_api_error() {
+        let gemini = json!({
+            "candidates": [{
+                "content": {"role": "model", "parts": [{"text": "plan", "thought": true}]},
+                "finishReason": "MALFORMED_FUNCTION_CALL"
+            }]
+        });
+        let out = convert_gemini_response(&gemini, &HashMap::new(), None, None);
+        assert_eq!(out["type"], "error", "{out}");
+        assert_eq!(out["error"]["type"], "api_error");
+    }
+
+    #[test]
+    fn test_convert_gemini_response_empty_function_call_malformed_returns_api_error() {
+        let gemini = json!({
+            "candidates": [{
+                "content": {"role": "model", "parts": [
+                    {"thoughtSignature": "sig-empty-fc", "functionCall": {"args": {}}}
+                ]},
+                "finishReason": "MALFORMED_FUNCTION_CALL"
+            }]
+        });
+        let out = convert_gemini_response(&gemini, &HashMap::new(), None, None);
+        assert_eq!(out["type"], "error", "{out}");
+        assert_eq!(out["error"]["type"], "api_error");
+    }
+
+    #[test]
+    fn test_convert_gemini_response_empty_function_call_skipped_with_text() {
+        let gemini = json!({
+            "candidates": [{
+                "content": {"role": "model", "parts": [
+                    {"functionCall": {}},
+                    {"text": "ok"}
+                ]},
+                "finishReason": "STOP"
+            }]
+        });
+        let out = convert_gemini_response(&gemini, &HashMap::new(), None, None);
+        assert_eq!(out["type"], "message", "{out}");
+        assert_eq!(out["stop_reason"], "end_turn");
+        let content = out["content"].as_array().expect("content");
+        assert_eq!(content.len(), 1, "{out}");
+        assert_eq!(content[0]["type"], "text");
     }
 }

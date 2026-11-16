@@ -449,4 +449,16 @@ mod tests {
             "{output}"
         );
     }
+
+    #[tokio::test]
+    async fn test_malformed_after_visible_text_finishes_with_message_stop() {
+        // 对齐 CPA cf07c78a:已有可见文本时 MALFORMED 不报错,正常收尾
+        let output = collect_output(stream::iter(vec![Ok(Bytes::from(
+            "data: {\"candidates\":[{\"content\":{\"role\":\"model\",\"parts\":[{\"text\":\"hi\"}]}}],\"modelVersion\":\"m\"}\n\ndata: {\"candidates\":[{\"content\":{\"role\":\"model\",\"parts\":[]},\"finishReason\":\"MALFORMED_FUNCTION_CALL\"}],\"usageMetadata\":{\"promptTokenCount\":3,\"candidatesTokenCount\":1}}\n\ndata: [DONE]\n\n",
+        ))]))
+        .await;
+        assert!(!output.contains("event: error"), "{output}");
+        assert!(output.contains("\"stop_reason\":\"end_turn\""), "{output}");
+        assert!(output.contains("event: message_stop"), "{output}");
+    }
 }
