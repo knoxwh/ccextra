@@ -4,7 +4,9 @@ use crate::http::{AppState, RuntimeConfig};
 use crate::upstream::UpstreamClient;
 use axum::extract::State;
 use axum::Json;
-use ccextra_core::route::{validate_provider_proxies, validate_providers};
+use ccextra_core::route::{
+    validate_provider_proxies, validate_providers, Protocol, ProviderConfig,
+};
 use serde::{Deserialize, Serialize};
 
 /// 热重载结果:收集所有成功与失败项(对齐 magpie syncProjects 错误收集模式)
@@ -32,10 +34,13 @@ pub async fn reload_now(state: &AppState) -> Result<ReloadResult, AppError> {
     let mut result = ReloadResult::default();
 
     // 1. 读取配置文件(失败则快速失败，无法继续)
-    let data = match (state.reload)().await {
+    let mut data = match (state.reload)().await {
         Ok(d) => d,
         Err(e) => return Err(AppError::new(anyhow::anyhow!("配置文件读取失败: {e}"))),
     };
+    if data.antigravity_load_failed {
+        carry_over_antigravity(&mut data.providers, &state.config.read().await.providers);
+    }
 
     // 2. 验证 providers 与生效代理(失败记录但尝试继续构建 runtime;不发布,保留旧配置)
     let providers_valid = match validate_providers(&data.providers)
@@ -100,6 +105,26 @@ pub async fn reload_now(state: &AppState) -> Result<ReloadResult, AppError> {
         result.failed.len()
     );
     Ok(result)
+}
+
+/// AG 拉取失败时沿用当前快照的 Antigravity providers(对齐 CPA 失败保旧);
+/// alias 已被新 providers 占用的模型丢弃(同 merge_providers 语义)。
+fn carry_over_antigravity(providers: &mut Vec<ProviderConfig>, current: &[ProviderConfig]) {
+    let mut seen: std::collections::HashSet<String> = providers
+        .iter()
+        .flat_map(|p| p.models.iter().map(|m| m.alias.clone()))
+        .collect();
+    let mut carried = 0usize;
+    for p in current
+        .iter()
+        .filter(|p| p.protocol == Protocol::Antigravity)
+    {
+        let mut p = p.clone();
+        p.models.retain(|m| seen.insert(m.alias.clone()));
+        providers.push(p);
+        carried += 1;
+    }
+    tracing::warn!(carried, "Antigravity 拉取失败,沿用当前快照的 AG providers");
 }
 
 /// HTTP `POST /reload`：委托 [`reload_now`]。

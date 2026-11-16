@@ -1346,6 +1346,7 @@ fn reload_returning_secret(secret: Option<String>) -> ReloadFn {
             Ok(ReloadData {
                 refresh: ProviderRefreshConfig::default(),
                 providers: vec![],
+                antigravity_load_failed: false,
                 payload_rules: vec![],
                 normalize: NormalizeConfig {
                     enabled: false,
@@ -1416,6 +1417,7 @@ async fn test_reload_applies_normalize_and_proxy() {
             Ok(ReloadData {
                 refresh: ProviderRefreshConfig::default(),
                 providers: vec![],
+                antigravity_load_failed: false,
                 payload_rules: vec![],
                 normalize: NormalizeConfig {
                     enabled: true,
@@ -1468,6 +1470,7 @@ async fn test_reload_rejects_invalid_proxy_keeps_old() {
             Ok(ReloadData {
                 refresh: ProviderRefreshConfig::default(),
                 providers: vec![],
+                antigravity_load_failed: false,
                 payload_rules: vec![],
                 normalize: NormalizeConfig {
                     enabled: false,
@@ -1553,6 +1556,7 @@ async fn test_reload_rejects_oauth_credentials_without_proxy() {
                     ..Default::default()
                 },
                 providers: vec![],
+                antigravity_load_failed: false,
                 payload_rules: vec![],
                 normalize: NormalizeConfig {
                     enabled: true,
@@ -1587,6 +1591,108 @@ async fn test_reload_rejects_oauth_credentials_without_proxy() {
     assert_eq!(json["published"], false, "{json}");
     assert!(json["failed"].to_string().contains("未配置代理"), "{json}");
     assert_eq!(config.read().await.version, version, "旧快照保留");
+}
+
+/// reload 闭包:新 providers 为空(AG 未产出),`antigravity_load_failed` 区分拉取失败与没凭证。
+fn reload_with_ag_load_failed(failed: bool) -> ReloadFn {
+    Arc::new(move || {
+        Box::pin(async move {
+            Ok(ReloadData {
+                refresh: ProviderRefreshConfig::default(),
+                providers: vec![],
+                antigravity_load_failed: failed,
+                payload_rules: vec![],
+                normalize: NormalizeConfig {
+                    enabled: false,
+                    drift_detector: false,
+                    drift_tools_description: false,
+                },
+                logging: LoggingConfig {
+                    level: "info".into(),
+                    request_body: false,
+                    log_dir: None,
+                },
+                secret: None,
+                proxy_url: Some("direct".into()),
+                antigravity: None,
+                user_agents: test_user_agents(),
+                thinking_registry: Arc::new(vec![]),
+            })
+        })
+    })
+}
+
+/// 当前快照追加一个 AG provider(模拟后台注入已就绪)
+async fn state_with_ag_provider() -> AppState {
+    let state = mock_state();
+    let ag: Vec<ProviderConfig> = yaml_serde::from_str(
+        r#"
+- name: antigravity-test
+  protocol: antigravity
+  base_url: "https://ag.example.com"
+  key: ya29.test
+  proxy_url: "direct"
+  models:
+    - name: gemini-4-pro
+      alias: gemini-4-pro
+"#,
+    )
+    .unwrap();
+    {
+        let mut guard = state.config.write().await;
+        let mut providers = guard.providers.clone();
+        providers.extend(ag);
+        *guard = Arc::new(ConfigSnapshot {
+            version: guard.version,
+            providers,
+            payload_rules: vec![],
+            runtime: guard.runtime.clone(),
+            refresh: ProviderRefreshConfig::default(),
+        });
+    }
+    state
+}
+
+/// AG 有凭证但拉取全失败:reload 沿用当前快照的 AG providers,不置空 AG 路由
+#[tokio::test]
+async fn test_reload_keeps_ag_providers_when_ag_load_failed() {
+    let mut state = state_with_ag_provider().await;
+    state.reload = reload_with_ag_load_failed(true);
+    let result = crate::http::handlers::reload::reload_now(&state)
+        .await
+        .unwrap_or_else(|e| panic!("{}", e.err));
+    assert!(result.published);
+    let snapshot = state.config.read().await;
+    let ag: Vec<_> = snapshot
+        .providers
+        .iter()
+        .filter(|p| p.protocol == Protocol::Antigravity)
+        .collect();
+    assert_eq!(ag.len(), 1, "拉取失败应保留旧 AG provider");
+    assert_eq!(ag[0].models[0].alias, "gemini-4-pro");
+    assert!(
+        snapshot.providers.iter().all(|p| p.name != "test-claude"),
+        "非 AG providers 仍按新配置替换"
+    );
+}
+
+/// AG 没凭证(NoCredentials):reload 照常移除 AG providers
+#[tokio::test]
+async fn test_reload_drops_ag_providers_when_no_credentials() {
+    let mut state = state_with_ag_provider().await;
+    state.reload = reload_with_ag_load_failed(false);
+    let result = crate::http::handlers::reload::reload_now(&state)
+        .await
+        .unwrap_or_else(|e| panic!("{}", e.err));
+    assert!(result.published);
+    let snapshot = state.config.read().await;
+    assert!(
+        snapshot
+            .providers
+            .iter()
+            .all(|p| p.protocol != Protocol::Antigravity),
+        "没凭证应移除 AG provider"
+    );
 }
 
 /// 上游等待释放信号时 reload 必须完成,不能依赖固定延迟制造并发窗口。

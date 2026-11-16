@@ -298,8 +298,11 @@ async fn main() -> Result<()> {
                 cfg.antigravity_models.as_deref().unwrap_or(&[]),
                 Some(reload_ua.antigravity.as_str()),
             )
-            .await
-            .into_providers();
+            .await;
+            // 拉取失败(有凭证但全失败)交 reload_now 沿用当前快照的 AG;没凭证照常移除
+            let antigravity_load_failed =
+                matches!(&antigravity_providers, ccextra_server::antigravity::AntigravityLoad::Loaded(p) if p.is_empty());
+            let antigravity_providers = antigravity_providers.into_providers();
 
             let xai_auth_dir = pin_auth_dir(&config_path, cfg.xai_auth_dir.as_deref(), resolve_xai_auth_dir);
             let xai_providers = ccextra_server::xai::load_xai_providers(
@@ -330,6 +333,7 @@ async fn main() -> Result<()> {
 
             Ok(ReloadData {
                 providers,
+                antigravity_load_failed,
                 payload_rules: cfg.payload.unwrap_or_default(),
                 normalize: cfg.normalize,
                 logging: with_pinned_log_dir(cfg.logging, &config_path),

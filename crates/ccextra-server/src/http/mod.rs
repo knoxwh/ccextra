@@ -67,6 +67,8 @@ pub struct UserAgentSet {
 pub struct ReloadData {
     pub refresh: ProviderRefreshConfig,
     pub providers: Vec<ProviderConfig>,
+    /// Antigravity 有凭证但拉取全失败:reload 沿用当前快照的 AG providers(对齐 CPA 失败保旧)
+    pub antigravity_load_failed: bool,
     pub payload_rules: Vec<PayloadRule>,
     pub normalize: NormalizeConfig,
     pub logging: LoggingConfig,
