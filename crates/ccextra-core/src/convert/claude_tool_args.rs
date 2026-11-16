@@ -246,16 +246,14 @@ fn analyze_object_schema_depth(
                     append_unique_schema(info.properties.entry(key.clone()).or_default(), value);
                 }
             }
-            if let Some(Value::String(ref_)) = schema.get("$ref") {
-                if !visited_refs.contains(ref_) {
-                    if let Some(target) = resolve_local_ref(root, ref_) {
-                        visited_refs.insert(ref_.clone());
-                        let resolved =
-                            analyze_object_schema_depth(target, root, depth + 1, visited_refs);
-                        visited_refs.remove(ref_);
-                        merge_info(&mut info, resolved);
-                    }
-                }
+            if let Some(Value::String(ref_)) = schema.get("$ref")
+                && !visited_refs.contains(ref_)
+                && let Some(target) = resolve_local_ref(root, ref_)
+            {
+                visited_refs.insert(ref_.clone());
+                let resolved = analyze_object_schema_depth(target, root, depth + 1, visited_refs);
+                visited_refs.remove(ref_);
+                merge_info(&mut info, resolved);
             }
             if let Some(Value::Array(all_of)) = schema.get("allOf") {
                 for branch in all_of {
@@ -755,12 +753,11 @@ fn clean_object(
         }
     }
 
-    if path.is_empty() {
-        if let Some(obj) = args.as_object() {
-            if obj.is_empty() {
-                *args = json!({});
-            }
-        }
+    if path.is_empty()
+        && let Some(obj) = args.as_object()
+        && obj.is_empty()
+    {
+        *args = json!({});
     }
 }
 

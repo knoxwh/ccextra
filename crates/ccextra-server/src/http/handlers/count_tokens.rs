@@ -131,26 +131,27 @@ pub async fn handle_count_tokens(
             }
 
             // 401:强制刷新后重试一次
-            if status.as_u16() == 401 && auth_attempt == 0 {
-                if let Some(ref path) = claude_oauth {
-                    let rejected = attempt_key.clone();
-                    match crate::claude::ensure_credential_fresh(
-                        std::path::Path::new(path),
-                        proxy_url.as_deref(),
-                        Some(&rejected),
-                    )
-                    .await
-                    {
-                        Ok(fresh) => {
-                            tracing::info!("Claude count_tokens 401,凭证已刷新,重试一次");
-                            attempt_key = fresh.access_token;
-                            continue;
-                        }
-                        Err(e) => {
-                            return Err(AppError::unauthorized(format!(
-                                "Claude count_tokens 401 后刷新失败,拒绝使用旧 token: {e}"
-                            )));
-                        }
+            if status.as_u16() == 401
+                && auth_attempt == 0
+                && let Some(ref path) = claude_oauth
+            {
+                let rejected = attempt_key.clone();
+                match crate::claude::ensure_credential_fresh(
+                    std::path::Path::new(path),
+                    proxy_url.as_deref(),
+                    Some(&rejected),
+                )
+                .await
+                {
+                    Ok(fresh) => {
+                        tracing::info!("Claude count_tokens 401,凭证已刷新,重试一次");
+                        attempt_key = fresh.access_token;
+                        continue;
+                    }
+                    Err(e) => {
+                        return Err(AppError::unauthorized(format!(
+                            "Claude count_tokens 401 后刷新失败,拒绝使用旧 token: {e}"
+                        )));
                     }
                 }
             }

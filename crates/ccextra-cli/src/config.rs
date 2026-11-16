@@ -79,12 +79,13 @@ impl Config {
         }
 
         // secret_key 明文自动转 bcrypt,并回写配置文件(下次启动识别哈希不重复转)
-        if let Some(secret) = &config.secret_key {
-            if !secret.is_empty() && !looks_like_bcrypt(secret) {
-                let hashed = bcrypt::hash(secret, bcrypt::DEFAULT_COST)?;
-                config.secret_key = Some(hashed.clone());
-                persist_secret(path, &content, &hashed)?;
-            }
+        if let Some(secret) = &config.secret_key
+            && !secret.is_empty()
+            && !looks_like_bcrypt(secret)
+        {
+            let hashed = bcrypt::hash(secret, bcrypt::DEFAULT_COST)?;
+            config.secret_key = Some(hashed.clone());
+            persist_secret(path, &content, &hashed)?;
         }
         if let Some(ref mut rules) = config.payload {
             PayloadRule::compile_all(rules)

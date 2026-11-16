@@ -113,10 +113,10 @@ fn normalize_thought_signature_item(item: &Value) -> Option<Value> {
     let mut out = json!({"type": "thought_signature", "thoughtSignature": sig});
     copy_optional_number(item, &mut out, "contentIndex");
     copy_optional_number(item, &mut out, "partIndex");
-    if let Some(kind) = item.get("targetKind").and_then(|v| v.as_str()) {
-        if kind == "text" || kind == "thought" {
-            out["targetKind"] = json!(kind);
-        }
+    if let Some(kind) = item.get("targetKind").and_then(|v| v.as_str())
+        && (kind == "text" || kind == "thought")
+    {
+        out["targetKind"] = json!(kind);
     }
     if let Some(hash) = item
         .get("targetHash")
@@ -153,27 +153,27 @@ fn normalize_function_call_part_item(item: &Value) -> Option<Value> {
         .trim()
         .to_string();
     let mut args = item.get("args").cloned();
-    if name.is_empty() || args.is_none() {
-        if let Some(fc) = item.get("functionCall") {
-            if call_id.is_empty() {
-                call_id = fc
-                    .get("id")
-                    .and_then(|v| v.as_str())
-                    .unwrap_or("")
-                    .trim()
-                    .to_string();
-            }
-            if name.is_empty() {
-                name = fc
-                    .get("name")
-                    .and_then(|v| v.as_str())
-                    .unwrap_or("")
-                    .trim()
-                    .to_string();
-            }
-            if args.is_none() {
-                args = fc.get("args").cloned();
-            }
+    if (name.is_empty() || args.is_none())
+        && let Some(fc) = item.get("functionCall")
+    {
+        if call_id.is_empty() {
+            call_id = fc
+                .get("id")
+                .and_then(|v| v.as_str())
+                .unwrap_or("")
+                .trim()
+                .to_string();
+        }
+        if name.is_empty() {
+            name = fc
+                .get("name")
+                .and_then(|v| v.as_str())
+                .unwrap_or("")
+                .trim()
+                .to_string();
+        }
+        if args.is_none() {
+            args = fc.get("args").cloned();
         }
     }
     let args = args?;
@@ -436,14 +436,12 @@ fn locate_thought_signature_part(
         } else {
             if let Some(candidate) = item.get("partIndex").and_then(|v| v.as_u64()) {
                 let candidate = candidate as usize;
-                if candidate < parts.len() {
-                    if let Some((kind, fingerprint)) = part_fingerprint(&parts[candidate]) {
-                        if fingerprint == target_hash
-                            && (target_kind.is_empty() || kind == target_kind)
-                        {
-                            part_index = Some(candidate);
-                        }
-                    }
+                if candidate < parts.len()
+                    && let Some((kind, fingerprint)) = part_fingerprint(&parts[candidate])
+                    && fingerprint == target_hash
+                    && (target_kind.is_empty() || kind == target_kind)
+                {
+                    part_index = Some(candidate);
                 }
             }
             if part_index.is_none() {
@@ -678,12 +676,12 @@ impl FunctionCallIndex {
         if old_id == new_id {
             return;
         }
-        if !old_id.is_empty() {
-            if let Some(vec) = self.positions.get_mut(old_id) {
-                vec.retain(|&(c, p)| !(c == ci && p == pi));
-                if vec.is_empty() {
-                    self.positions.remove(old_id);
-                }
+        if !old_id.is_empty()
+            && let Some(vec) = self.positions.get_mut(old_id)
+        {
+            vec.retain(|&(c, p)| !(c == ci && p == pi));
+            if vec.is_empty() {
+                self.positions.remove(old_id);
             }
         }
         if !new_id.is_empty() {
@@ -833,10 +831,10 @@ fn part_mut(contents: &mut [Value], ci: usize, pi: usize) -> Option<&mut Value> 
 }
 
 fn set_part_thought_signature(part: &mut Value, signature: &str) -> bool {
-    if let Some(existing) = part_thought_signature(part) {
-        if has_native_thought_signature(existing) {
-            return false;
-        }
+    if let Some(existing) = part_thought_signature(part)
+        && has_native_thought_signature(existing)
+    {
+        return false;
     }
     if let Some(obj) = part.as_object_mut() {
         obj.insert("thoughtSignature".into(), json!(signature));
@@ -976,11 +974,11 @@ fn restore_native_function_call(
     native_call["args"] = args;
 
     let mut first_changed: Option<usize> = None;
-    if canonical_json(&native_call) != current_canonical {
-        if let Some(part) = part_mut(contents, ci, pi) {
-            part["functionCall"] = native_call;
-            first_changed = Some(ci);
-        }
+    if canonical_json(&native_call) != current_canonical
+        && let Some(part) = part_mut(contents, ci, pi)
+    {
+        part["functionCall"] = native_call;
+        first_changed = Some(ci);
     }
     let signed = overwrite_signature_at(contents, ci, pi, &signature);
     if !current_id.is_empty() && !native_id.is_empty() && current_id != native_id {
@@ -1354,17 +1352,16 @@ pub fn degrade_unresolved_tool_provenance_ids(request: &mut Value) -> usize {
                 if part_thought_signature(part)
                     .map(has_native_thought_signature)
                     .unwrap_or(false)
+                    && let Some(obj) = part.as_object_mut()
                 {
-                    if let Some(obj) = part.as_object_mut() {
-                        obj.remove("thought_signature");
-                        if first {
-                            obj.insert(
-                                "thoughtSignature".into(),
-                                json!(GEMINI_SKIP_THOUGHT_SIGNATURE_VALIDATOR),
-                            );
-                        } else {
-                            obj.remove("thoughtSignature");
-                        }
+                    obj.remove("thought_signature");
+                    if first {
+                        obj.insert(
+                            "thoughtSignature".into(),
+                            json!(GEMINI_SKIP_THOUGHT_SIGNATURE_VALIDATOR),
+                        );
+                    } else {
+                        obj.remove("thoughtSignature");
                     }
                 }
                 count += 1;
@@ -1412,14 +1409,12 @@ pub fn repair_unsigned_first_function_calls(request: &mut Value) -> usize {
                 .pointer("/extra_content/google/thought_signature")
                 .and_then(|v| v.as_str())
                 .is_some_and(|s| !s.trim().is_empty());
-        if !has_signature {
-            if let Some(obj) = part.as_object_mut() {
-                obj.insert(
-                    "thoughtSignature".into(),
-                    json!(GEMINI_SKIP_THOUGHT_SIGNATURE_VALIDATOR),
-                );
-                repaired += 1;
-            }
+        if !has_signature && let Some(obj) = part.as_object_mut() {
+            obj.insert(
+                "thoughtSignature".into(),
+                json!(GEMINI_SKIP_THOUGHT_SIGNATURE_VALIDATOR),
+            );
+            repaired += 1;
         }
     }
     repaired
@@ -1555,10 +1550,10 @@ fn repair_function_response_names(contents: &mut [Value]) {
             if id.is_empty() || (!name.is_empty() && name != "unknown") {
                 continue;
             }
-            if let Some(real) = call_id_to_name.get(id).cloned() {
-                if fr.is_object() {
-                    fr["name"] = json!(real);
-                }
+            if let Some(real) = call_id_to_name.get(id).cloned()
+                && fr.is_object()
+            {
+                fr["name"] = json!(real);
             }
         }
     }
@@ -1648,17 +1643,14 @@ pub fn normalize_function_response_roles(request: &mut Value) {
                 !has_other_part && content.get("role").and_then(|r| r.as_str()) != Some("model");
             (new_order, set_model_role)
         };
-        if let Some(order) = new_order {
-            if let Some(parts) = content.get_mut("parts").and_then(|p| p.as_array_mut()) {
-                let mut old: Vec<Option<Value>> =
-                    std::mem::take(parts).into_iter().map(Some).collect();
-                *parts = order.into_iter().filter_map(|i| old[i].take()).collect();
-            }
+        if let Some(order) = new_order
+            && let Some(parts) = content.get_mut("parts").and_then(|p| p.as_array_mut())
+        {
+            let mut old: Vec<Option<Value>> = std::mem::take(parts).into_iter().map(Some).collect();
+            *parts = order.into_iter().filter_map(|i| old[i].take()).collect();
         }
-        if set_model_role {
-            if let Some(obj) = content.as_object_mut() {
-                obj.insert("role".into(), json!("model"));
-            }
+        if set_model_role && let Some(obj) = content.as_object_mut() {
+            obj.insert("role".into(), json!("model"));
         }
     }
 }
@@ -2273,16 +2265,16 @@ impl AgReplayAccumulator {
 }
 
 fn pending_model_content_index(contents: &[Value]) -> (usize, usize) {
-    if let Some(last) = contents.last() {
-        if is_model_role(last) {
-            let parts = last
-                .get("parts")
-                .and_then(|v| v.as_array())
-                .map(Vec::as_slice)
-                .unwrap_or_default();
-            if !parts.iter().any(|p| p.get("functionResponse").is_some()) {
-                return (contents.len() - 1, parts.len());
-            }
+    if let Some(last) = contents.last()
+        && is_model_role(last)
+    {
+        let parts = last
+            .get("parts")
+            .and_then(|v| v.as_array())
+            .map(Vec::as_slice)
+            .unwrap_or_default();
+        if !parts.iter().any(|p| p.get("functionResponse").is_some()) {
+            return (contents.len() - 1, parts.len());
         }
     }
     (contents.len(), 0)

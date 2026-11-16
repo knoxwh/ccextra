@@ -65,10 +65,10 @@ pub fn convert_to_antigravity_with(
         "request": {}
     });
     // 对齐 CPA:project 为空时不写该键
-    if let Some(pid) = project_id {
-        if !pid.is_empty() {
-            antigravity["project"] = Value::String(pid.to_string());
-        }
+    if let Some(pid) = project_id
+        && !pid.is_empty()
+    {
+        antigravity["project"] = Value::String(pid.to_string());
     }
 
     // 3. 将 Gemini 字段移到 request 中（除了 model）
@@ -102,21 +102,19 @@ pub fn convert_to_antigravity_with(
         }
 
         // 对齐 CPA executor:maxOutputTokens 按 registry max_completion_tokens 封顶
-        if let Some(cap) = crate::thinking::max_completion_tokens(upstream_model, registry) {
-            if let Some(Value::Object(gc)) = request_obj.get_mut("generationConfig") {
-                if let Some(v) = gc.get("maxOutputTokens").and_then(|v| v.as_i64()) {
-                    if v > cap {
-                        gc.insert("maxOutputTokens".to_string(), Value::from(cap));
-                    }
-                }
-            }
+        if let Some(cap) = crate::thinking::max_completion_tokens(upstream_model, registry)
+            && let Some(Value::Object(gc)) = request_obj.get_mut("generationConfig")
+            && let Some(v) = gc.get("maxOutputTokens").and_then(|v| v.as_i64())
+            && v > cap
+        {
+            gc.insert("maxOutputTokens".to_string(), Value::from(cap));
         }
 
         // 对齐 CLIProxyAPI:非 claude 模型删除 maxOutputTokens(上游自管理)
-        if !upstream_model.contains("claude") {
-            if let Some(Value::Object(gc)) = request_obj.get_mut("generationConfig") {
-                gc.remove("maxOutputTokens");
-            }
+        if !upstream_model.contains("claude")
+            && let Some(Value::Object(gc)) = request_obj.get_mut("generationConfig")
+        {
+            gc.remove("maxOutputTokens");
         }
 
         // 对齐 CPA dc21a426:归一化 responseJsonSchema/response_json_schema → responseSchema

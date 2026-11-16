@@ -157,10 +157,10 @@ async fn start_callback(
                     } else {
                         "<h1>Login failed</h1><p>Please check the CLI output.</p>"
                     };
-                    if let Ok(mut slot) = tx.lock() {
-                        if let Some(sender) = slot.take() {
-                            let _ = sender.send(q);
-                        }
+                    if let Ok(mut slot) = tx.lock()
+                        && let Some(sender) = slot.take()
+                    {
+                        let _ = sender.send(q);
                     }
                     Html(html)
                 }

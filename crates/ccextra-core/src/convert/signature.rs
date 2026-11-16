@@ -659,12 +659,12 @@ fn inspect_cais_channel_block(
         Ok(())
     })?;
     // 对齐 CPA 75ce6352:v≥4 签名字节可回退 Container Field 5
-    if !have_signature_bytes && envelope_version >= 4 {
-        if let Some(bytes) = container_signature_bytes {
-            if !bytes.is_empty() {
-                have_signature_bytes = true;
-            }
-        }
+    if !have_signature_bytes
+        && envelope_version >= 4
+        && let Some(bytes) = container_signature_bytes
+        && !bytes.is_empty()
+    {
+        have_signature_bytes = true;
     }
     if !have_channel_id {
         return Err(

@@ -82,10 +82,10 @@ fn sort_anthropic_system(
         Value::Array(blocks) => {
             let mut n = 0;
             for block in blocks.iter_mut() {
-                if block.get("type").and_then(|t| t.as_str()) == Some("text") {
-                    if let Some(Value::String(text)) = block.get_mut("text") {
-                        n += sort_system_text(text, skills_re, deferred_re);
-                    }
+                if block.get("type").and_then(|t| t.as_str()) == Some("text")
+                    && let Some(Value::String(text)) = block.get_mut("text")
+                {
+                    n += sort_system_text(text, skills_re, deferred_re);
                 }
             }
             n
@@ -126,10 +126,8 @@ fn sort_openai_system_messages(
                         Some("input_text") | Some("output_text") => responses_parts,
                         _ => false,
                     };
-                    if is_text {
-                        if let Some(Value::String(text)) = part.get_mut("text") {
-                            n += sort_system_text(text, skills_re, deferred_re);
-                        }
+                    if is_text && let Some(Value::String(text)) = part.get_mut("text") {
+                        n += sort_system_text(text, skills_re, deferred_re);
                     }
                 }
             }

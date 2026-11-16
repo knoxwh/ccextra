@@ -125,10 +125,10 @@ impl StreamReplayExtractor {
                 }
             }
             output.extend(self.items_fallback.iter().cloned());
-            if let Some(obj) = completed.as_object_mut() {
-                if let Some(response) = obj.get_mut("response").and_then(|v| v.as_object_mut()) {
-                    response.insert("output".to_string(), Value::Array(output));
-                }
+            if let Some(obj) = completed.as_object_mut()
+                && let Some(response) = obj.get_mut("response").and_then(|v| v.as_object_mut())
+            {
+                response.insert("output".to_string(), Value::Array(output));
             }
         }
         self.merge_streamed_reasoning_summaries(&mut completed);

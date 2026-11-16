@@ -93,10 +93,10 @@ pub(crate) fn apply_payload_overrides(
         if matches!(protocol, Protocol::Claude) && rule.protocol.is_none() {
             continue;
         }
-        if let Some(p) = rule.protocol {
-            if p != protocol {
-                continue;
-            }
+        if let Some(p) = rule.protocol
+            && p != protocol
+        {
+            continue;
         }
         let matched = rule.matches_model(model);
         if matched {
@@ -444,32 +444,32 @@ pub(crate) async fn prepare_message_request(
             }
             // Kimi thinking 回放：Claude Code 会剥掉非 Anthropic 签名的 thinking，
             // 在第三方 Claude-compatible（Moonshot 等）多轮工具续接前补回。
-            if is_kimi_thinking_replay_model(&route.upstream_model) {
-                if let Some(sess) = cc_session.as_deref() {
-                    let family = kimi_thinking_replay_model_family(&route.upstream_model);
-                    let key = format!("{family}:{sess}");
-                    use crate::sse::kimi_thinking_replay_cache::KimiReplayApplyOutcome;
-                    match state
-                        .kimi_thinking_replay_cache
-                        .apply_to_claude_body(&key, &mut body_json)
-                    {
-                        KimiReplayApplyOutcome::Applied => {
-                            kimi_replay_applied = true;
-                            tracing::debug!(
-                                session = %sess,
-                                family = %family,
-                                "kimi thinking replay 已注入"
-                            );
-                        }
-                        KimiReplayApplyOutcome::Unchanged => {
-                            tracing::debug!(
-                                session = %sess,
-                                family = %family,
-                                "kimi thinking replay 账本未改写"
-                            );
-                        }
-                        KimiReplayApplyOutcome::Miss => {}
+            if is_kimi_thinking_replay_model(&route.upstream_model)
+                && let Some(sess) = cc_session.as_deref()
+            {
+                let family = kimi_thinking_replay_model_family(&route.upstream_model);
+                let key = format!("{family}:{sess}");
+                use crate::sse::kimi_thinking_replay_cache::KimiReplayApplyOutcome;
+                match state
+                    .kimi_thinking_replay_cache
+                    .apply_to_claude_body(&key, &mut body_json)
+                {
+                    KimiReplayApplyOutcome::Applied => {
+                        kimi_replay_applied = true;
+                        tracing::debug!(
+                            session = %sess,
+                            family = %family,
+                            "kimi thinking replay 已注入"
+                        );
                     }
+                    KimiReplayApplyOutcome::Unchanged => {
+                        tracing::debug!(
+                            session = %sess,
+                            family = %family,
+                            "kimi thinking replay 账本未改写"
+                        );
+                    }
+                    KimiReplayApplyOutcome::Miss => {}
                 }
             }
             // drift 仅观测：sanitize/effort 之后，避免计费指纹造成假 system 漂移
@@ -602,10 +602,9 @@ pub(crate) async fn prepare_message_request(
     if matches!(
         route.protocol,
         Protocol::OpenAiChat | Protocol::OpenAiResponses
-    ) {
-        if let Some(key) = inbound_prompt_cache_key {
-            body_json["prompt_cache_key"] = Value::String(key);
-        }
+    ) && let Some(key) = inbound_prompt_cache_key
+    {
+        body_json["prompt_cache_key"] = Value::String(key);
     }
 
     // 5. payload 参数覆盖
@@ -995,17 +994,18 @@ fn strip_upstream_unsupported_fields(
     // Grok Responses:对齐 CPA xai_executor 明确 DeleteBytes 的字段;
     // 保留 temperature/top_p/max_output_tokens(CPA preserveXAIResponsesOutputControls /
     // 原生 ModelEntry 可带采样)。须在 payload_overrides 之后。
-    if matches!(protocol, Protocol::OpenAiResponses) && is_grok_model(outbound_model) {
-        if let Some(obj) = body_json.as_object_mut() {
-            for key in [
-                "previous_response_id",
-                "prompt_cache_retention",
-                "safety_identifier",
-                "stream_options",
-                "stop",
-            ] {
-                obj.remove(key);
-            }
+    if matches!(protocol, Protocol::OpenAiResponses)
+        && is_grok_model(outbound_model)
+        && let Some(obj) = body_json.as_object_mut()
+    {
+        for key in [
+            "previous_response_id",
+            "prompt_cache_retention",
+            "safety_identifier",
+            "stream_options",
+            "stop",
+        ] {
+            obj.remove(key);
         }
     }
 
@@ -1442,16 +1442,17 @@ pub(crate) async fn deliver_response(
         }
 
         // Kimi：注入后仍 400/422 → 清账本（对齐 CPA shouldClearKimiThinkingReplayAfterError）
-        if !retried_ok && !final_truncated && (status.as_u16() == 400 || status.as_u16() == 422) {
-            if let Some((cache, key, applied)) = prepared.kimi_replay_scope.as_ref() {
-                if *applied {
-                    tracing::warn!(
-                        protocol = ?prepared.route.protocol,
-                        "kimi thinking replay 注入后上游 400/422,清空账本"
-                    );
-                    cache.invalidate(key);
-                }
-            }
+        if !retried_ok
+            && !final_truncated
+            && (status.as_u16() == 400 || status.as_u16() == 422)
+            && let Some((cache, key, applied)) = prepared.kimi_replay_scope.as_ref()
+            && *applied
+        {
+            tracing::warn!(
+                protocol = ?prepared.route.protocol,
+                "kimi thinking replay 注入后上游 400/422,清空账本"
+            );
+            cache.invalidate(key);
         }
 
         if !retried_ok
@@ -1526,26 +1527,26 @@ pub(crate) async fn deliver_response(
             None => None,
         };
         // 对齐 CPA 7f2f17d7:转换层产出的 Claude api_error(如 MALFORMED)抬 502 供客户端重试
-        if let Some(out) = converted.as_ref() {
-            if out.get("type").and_then(|t| t.as_str()) == Some("error") {
-                let msg = out
-                    .pointer("/error/message")
-                    .and_then(|m| m.as_str())
-                    .unwrap_or("upstream translated api_error")
-                    .to_string();
-                let payload = serde_json::to_vec(out).unwrap_or_else(|_| {
-                    serde_json::to_vec(&serde_json::json!({
-                        "type": "error",
-                        "error": {"type": "api_error", "message": msg}
-                    }))
-                    .unwrap_or_default()
-                });
-                return Response::builder()
-                    .status(axum::http::StatusCode::BAD_GATEWAY)
-                    .header(header::CONTENT_TYPE, "application/json")
-                    .body(Body::from(payload))
-                    .map_err(|e| AppError::new(anyhow::anyhow!("构造响应失败: {e}")));
-            }
+        if let Some(out) = converted.as_ref()
+            && out.get("type").and_then(|t| t.as_str()) == Some("error")
+        {
+            let msg = out
+                .pointer("/error/message")
+                .and_then(|m| m.as_str())
+                .unwrap_or("upstream translated api_error")
+                .to_string();
+            let payload = serde_json::to_vec(out).unwrap_or_else(|_| {
+                serde_json::to_vec(&serde_json::json!({
+                    "type": "error",
+                    "error": {"type": "api_error", "message": msg}
+                }))
+                .unwrap_or_default()
+            });
+            return Response::builder()
+                .status(axum::http::StatusCode::BAD_GATEWAY)
+                .header(header::CONTENT_TYPE, "application/json")
+                .body(Body::from(payload))
+                .map_err(|e| AppError::new(anyhow::anyhow!("构造响应失败: {e}")));
         }
         // 非 Claude 协议必须转换:converted 为 None 表示转换层无输出(非法 JSON、
         // 缺 choices/response 等形状问题),不得原样透传上游字节(客户端收到非 Anthropic
@@ -1773,25 +1774,23 @@ pub async fn handle_messages(
 
 /// 非流成功旁路:Responses/AG/Kimi replay 落账与 drift cache usage 观测(只读响应)。
 fn observe_non_stream_success(prepared: &PreparedMessageRequest, v: &Value) {
-    if let Some((cache, key, fingerprint)) = prepared.replay_scope.as_ref() {
-        if matches!(prepared.route.protocol, Protocol::OpenAiResponses)
-            && v.get("object").and_then(|o| o.as_str()) == Some("response")
-        {
-            let wrapped = json!({"response": v});
-            cache.store_from_completed(key, &wrapped, fingerprint);
-        }
+    if let Some((cache, key, fingerprint)) = prepared.replay_scope.as_ref()
+        && matches!(prepared.route.protocol, Protocol::OpenAiResponses)
+        && v.get("object").and_then(|o| o.as_str()) == Some("response")
+    {
+        let wrapped = json!({"response": v});
+        cache.store_from_completed(key, &wrapped, fingerprint);
     }
-    if let Some((cache, key)) = prepared.ag_replay_scope.as_ref() {
-        if matches!(prepared.route.protocol, Protocol::Antigravity) {
-            if let Some(request) = prepared.body_json.get("request") {
-                cache.store_from_response(key, &prepared.ag_replay_snapshot, request, v);
-            }
-        }
+    if let Some((cache, key)) = prepared.ag_replay_scope.as_ref()
+        && matches!(prepared.route.protocol, Protocol::Antigravity)
+        && let Some(request) = prepared.body_json.get("request")
+    {
+        cache.store_from_response(key, &prepared.ag_replay_snapshot, request, v);
     }
-    if let Some((cache, key, _)) = prepared.kimi_replay_scope.as_ref() {
-        if matches!(prepared.route.protocol, Protocol::Claude) {
-            cache.store_from_message_response(key, v);
-        }
+    if let Some((cache, key, _)) = prepared.kimi_replay_scope.as_ref()
+        && matches!(prepared.route.protocol, Protocol::Claude)
+    {
+        cache.store_from_message_response(key, v);
     }
     if let Some((drift, parent)) = prepared.drift_usage_scope.as_ref() {
         let (cache_read, cache_creation) = match prepared.route.protocol {
@@ -1850,14 +1849,14 @@ fn record_non_stream_input_tokens(state: &AppState, prepared: &PreparedMessageRe
             }
             Protocol::Claude => None,
         };
-        if let Some(tokens) = input_tokens {
-            if tokens > 0 {
-                let _ = state
-                    .last_input_tokens
-                    .lock()
-                    .ok()
-                    .map(|mut cache| cache.insert(sid.to_string(), tokens as usize));
-            }
+        if let Some(tokens) = input_tokens
+            && tokens > 0
+        {
+            let _ = state
+                .last_input_tokens
+                .lock()
+                .ok()
+                .map(|mut cache| cache.insert(sid.to_string(), tokens as usize));
         }
     }
 }

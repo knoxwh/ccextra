@@ -217,10 +217,10 @@ pub fn normalize_object_schema_properties(schema: serde_json::Value) -> serde_js
             }
             // 对齐 CPA e56abd56:剥离含 \p{...}/\P{...} 的 pattern
             // (Python re 编译报 bad escape \p,上游 schema 校验失败)
-            if let Some(Value::String(p)) = map.get("pattern") {
-                if has_unsupported_unicode_property_escape(p) {
-                    map.shift_remove("pattern");
-                }
+            if let Some(Value::String(p)) = map.get("pattern")
+                && has_unsupported_unicode_property_escape(p)
+            {
+                map.shift_remove("pattern");
             }
             // 对齐 CPA 37ce368c:patternProperties 正则键含 \p{...} 时整键删除
             if let Some(Value::Object(pat_props)) = map.get_mut("patternProperties") {

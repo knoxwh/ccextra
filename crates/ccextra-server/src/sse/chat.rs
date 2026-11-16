@@ -130,17 +130,16 @@ impl ChatRelay {
         }
 
         // 身份 + usage(任意 chunk 缓存)
-        if !self.started {
-            if let Some(id) = root.get("id").and_then(|v| v.as_str()) {
-                if !id.is_empty() {
-                    self.id = id.to_string();
-                }
-            }
+        if !self.started
+            && let Some(id) = root.get("id").and_then(|v| v.as_str())
+            && !id.is_empty()
+        {
+            self.id = id.to_string();
         }
-        if let Some(model) = root.get("model").and_then(|v| v.as_str()) {
-            if !model.is_empty() {
-                self.model = model.to_string();
-            }
+        if let Some(model) = root.get("model").and_then(|v| v.as_str())
+            && !model.is_empty()
+        {
+            self.model = model.to_string();
         }
         // usage 双路径提取(对齐 Moonshot):优先顶层 usage,回退 choices[0].usage
         let mut has_usage = false;
@@ -185,33 +184,32 @@ impl ChatRelay {
         }
 
         // tool_calls (对齐 CPA 6c6473f8:忽略空数组,防止错误停止 reasoning)
-        if let Some(tool_calls) = delta.get("tool_calls").and_then(|v| v.as_array()) {
-            if !tool_calls.is_empty() {
-                frames.extend(self.collect_tool_calls(tool_calls));
-            }
+        if let Some(tool_calls) = delta.get("tool_calls").and_then(|v| v.as_array())
+            && !tool_calls.is_empty()
+        {
+            frames.extend(self.collect_tool_calls(tool_calls));
         }
 
         // finish_reason
         if let Some(fr) = root
             .pointer("/choices/0/finish_reason")
             .and_then(|v| v.as_str())
+            && !fr.is_empty()
         {
-            if !fr.is_empty() {
-                // 对齐 CPA 772c63c8 effectiveOpenAIFinishReason:
-                // length/content_filter 优先于 tool 判定;累积 args 截断或
-                // 非法 JSON 时降级 length(→max_tokens),不发非法 tool_use
-                self.finish_reason = if fr == "length" || fr == "content_filter" {
-                    fr.to_string()
-                } else if self.saw_tool_call && self.has_valid_tool_call_arguments() {
-                    "tool_calls".to_string()
-                } else if self.saw_tool_call {
-                    "length".to_string()
-                } else if fr == "tool_calls" {
-                    "stop".to_string()
-                } else {
-                    fr.to_string()
-                };
-            }
+            // 对齐 CPA 772c63c8 effectiveOpenAIFinishReason:
+            // length/content_filter 优先于 tool 判定;累积 args 截断或
+            // 非法 JSON 时降级 length(→max_tokens),不发非法 tool_use
+            self.finish_reason = if fr == "length" || fr == "content_filter" {
+                fr.to_string()
+            } else if self.saw_tool_call && self.has_valid_tool_call_arguments() {
+                "tool_calls".to_string()
+            } else if self.saw_tool_call {
+                "length".to_string()
+            } else if fr == "tool_calls" {
+                "stop".to_string()
+            } else {
+                fr.to_string()
+            };
         }
 
         // finish+usage 同帧不 finalize(等尾帧 usage-only / [DONE] / EOF)
@@ -369,10 +367,10 @@ impl ChatRelay {
     /// 确保 active block 与目标类型一致;不一致则 close 当前再开
     fn ensure_block(&mut self, block_type: BlockType) -> Vec<Bytes> {
         let mut frames = self.ensure_started();
-        if let Some((active, _)) = self.active_block {
-            if active == block_type {
-                return frames;
-            }
+        if let Some((active, _)) = self.active_block
+            && active == block_type
+        {
+            return frames;
         }
         self.close_active_block(&mut frames);
         let index = self.next_block_index;
@@ -442,18 +440,19 @@ impl ChatRelay {
                 });
 
                 // 仅在 start 未发射时接受非空 string id(对齐 CPA c449529e)
-                if let Some(ref id) = incoming_id {
-                    if !call.start_emitted {
-                        call.id = id.clone();
-                    }
+                if let Some(ref id) = incoming_id
+                    && !call.start_emitted
+                {
+                    call.id = id.clone();
                 }
 
                 if let Some(function) = tc.get("function") {
                     // name 同 id:仅在 start 未发射时接受非空值(对齐 CPA)
-                    if let Some(name) = function.get("name").and_then(|v| v.as_str()) {
-                        if !name.is_empty() && !call.start_emitted {
-                            call.name = name.to_string();
-                        }
+                    if let Some(name) = function.get("name").and_then(|v| v.as_str())
+                        && !name.is_empty()
+                        && !call.start_emitted
+                    {
+                        call.name = name.to_string();
                     }
                     if let Some(args) = function.get("arguments") {
                         match args {
@@ -591,11 +590,11 @@ impl ChatRelay {
 
     /// 缓冲交错内容(对齐 InterleavedContentChunks:同类型尾部合并)
     fn buffer_interleaved(&mut self, block_type: BlockType, text: &str) {
-        if let Some((bt, buf)) = self.interleaved.last_mut() {
-            if *bt == block_type {
-                buf.push_str(text);
-                return;
-            }
+        if let Some((bt, buf)) = self.interleaved.last_mut()
+            && *bt == block_type
+        {
+            buf.push_str(text);
+            return;
         }
         self.interleaved.push((block_type, text.to_string()));
     }
@@ -781,10 +780,10 @@ fn collect_reasoning_value(node: &Value, out: &mut Vec<String>) {
             }
         }
         Value::Object(obj) => {
-            if let Some(Value::String(s)) = obj.get("text") {
-                if !s.is_empty() {
-                    out.push(s.clone());
-                }
+            if let Some(Value::String(s)) = obj.get("text")
+                && !s.is_empty()
+            {
+                out.push(s.clone());
             }
         }
         _ => {}
@@ -1036,19 +1035,19 @@ mod tests {
             if block.starts_with("content_block_start") {
                 if let Some(data) = block.split_once("data: ").map(|(_, rest)| rest) {
                     let json = data.split("\n\n").next().unwrap_or(data).trim();
-                    if let Ok(v) = serde_json::from_str::<Value>(json) {
-                        if v["content_block"]["type"] == "tool_use" {
-                            starts.push(v);
-                        }
+                    if let Ok(v) = serde_json::from_str::<Value>(json)
+                        && v["content_block"]["type"] == "tool_use"
+                    {
+                        starts.push(v);
                     }
                 }
             } else if block.starts_with("content_block_delta") {
                 if let Some(data) = block.split_once("data: ").map(|(_, rest)| rest) {
                     let json = data.split("\n\n").next().unwrap_or(data).trim();
-                    if let Ok(v) = serde_json::from_str::<Value>(json) {
-                        if v["delta"]["type"] == "input_json_delta" {
-                            deltas.push(v);
-                        }
+                    if let Ok(v) = serde_json::from_str::<Value>(json)
+                        && v["delta"]["type"] == "input_json_delta"
+                    {
+                        deltas.push(v);
                     }
                 }
             } else if block.starts_with("content_block_stop") {
@@ -1261,19 +1260,19 @@ mod tests {
             if block.starts_with("content_block_start") {
                 if let Some(data) = block.split_once("data: ").map(|(_, rest)| rest) {
                     let json = data.split("\n\n").next().unwrap_or(data).trim();
-                    if let Ok(v) = serde_json::from_str::<Value>(json) {
-                        if v["content_block"]["type"] == "tool_use" {
-                            starts.push(v);
-                        }
+                    if let Ok(v) = serde_json::from_str::<Value>(json)
+                        && v["content_block"]["type"] == "tool_use"
+                    {
+                        starts.push(v);
                     }
                 }
             } else if block.starts_with("content_block_delta") {
                 if let Some(data) = block.split_once("data: ").map(|(_, rest)| rest) {
                     let json = data.split("\n\n").next().unwrap_or(data).trim();
-                    if let Ok(v) = serde_json::from_str::<Value>(json) {
-                        if v["delta"]["type"] == "input_json_delta" {
-                            deltas.push(v);
-                        }
+                    if let Ok(v) = serde_json::from_str::<Value>(json)
+                        && v["delta"]["type"] == "input_json_delta"
+                    {
+                        deltas.push(v);
                     }
                 }
             } else if block.starts_with("content_block_stop") {
@@ -2113,23 +2112,24 @@ mod tests {
             if block.starts_with("content_block_start") {
                 if let Some(data) = block.split_once("data: ").map(|(_, rest)| rest) {
                     let json = data.split("\n\n").next().unwrap_or(data).trim();
-                    if let Ok(v) = serde_json::from_str::<Value>(json) {
-                        if let Some(t) = v["content_block"]["type"].as_str() {
-                            block_starts.push(t.to_string());
-                        }
+                    if let Ok(v) = serde_json::from_str::<Value>(json)
+                        && let Some(t) = v["content_block"]["type"].as_str()
+                    {
+                        block_starts.push(t.to_string());
                     }
                 }
-            } else if block.starts_with("content_block_delta") {
-                if let Some(data) = block.split_once("data: ").map(|(_, rest)| rest) {
-                    let json = data.split("\n\n").next().unwrap_or(data).trim();
-                    if let Ok(v) = serde_json::from_str::<Value>(json) {
-                        match v["delta"]["type"].as_str() {
-                            Some("thinking_delta") => thinking_deltas
-                                .push(v["delta"]["thinking"].as_str().unwrap_or("").to_string()),
-                            Some("text_delta") => text_deltas
-                                .push(v["delta"]["text"].as_str().unwrap_or("").to_string()),
-                            _ => {}
+            } else if block.starts_with("content_block_delta")
+                && let Some(data) = block.split_once("data: ").map(|(_, rest)| rest)
+            {
+                let json = data.split("\n\n").next().unwrap_or(data).trim();
+                if let Ok(v) = serde_json::from_str::<Value>(json) {
+                    match v["delta"]["type"].as_str() {
+                        Some("thinking_delta") => thinking_deltas
+                            .push(v["delta"]["thinking"].as_str().unwrap_or("").to_string()),
+                        Some("text_delta") => {
+                            text_deltas.push(v["delta"]["text"].as_str().unwrap_or("").to_string())
                         }
+                        _ => {}
                     }
                 }
             }
@@ -2167,17 +2167,18 @@ mod tests {
         let mut thinking_deltas = Vec::new();
         let mut text_deltas = Vec::new();
         for block in s.split("event: ") {
-            if block.starts_with("content_block_delta") {
-                if let Some(data) = block.split_once("data: ").map(|(_, rest)| rest) {
-                    let json = data.split("\n\n").next().unwrap_or(data).trim();
-                    if let Ok(v) = serde_json::from_str::<Value>(json) {
-                        match v["delta"]["type"].as_str() {
-                            Some("thinking_delta") => thinking_deltas
-                                .push(v["delta"]["thinking"].as_str().unwrap_or("").to_string()),
-                            Some("text_delta") => text_deltas
-                                .push(v["delta"]["text"].as_str().unwrap_or("").to_string()),
-                            _ => {}
+            if block.starts_with("content_block_delta")
+                && let Some(data) = block.split_once("data: ").map(|(_, rest)| rest)
+            {
+                let json = data.split("\n\n").next().unwrap_or(data).trim();
+                if let Ok(v) = serde_json::from_str::<Value>(json) {
+                    match v["delta"]["type"].as_str() {
+                        Some("thinking_delta") => thinking_deltas
+                            .push(v["delta"]["thinking"].as_str().unwrap_or("").to_string()),
+                        Some("text_delta") => {
+                            text_deltas.push(v["delta"]["text"].as_str().unwrap_or("").to_string())
                         }
+                        _ => {}
                     }
                 }
             }

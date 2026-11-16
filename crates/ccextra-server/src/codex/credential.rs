@@ -65,25 +65,25 @@ impl CodexCredential {
         expires_in: i64,
     ) {
         self.access_token = access_token;
-        if let Some(r) = refresh_token {
-            if !r.trim().is_empty() {
-                self.refresh_token = r;
-            }
+        if let Some(r) = refresh_token
+            && !r.trim().is_empty()
+        {
+            self.refresh_token = r;
         }
-        if let Some(id) = id_token {
-            if !id.trim().is_empty() {
-                let (email, account_id, plan_type) = parse_jwt_identity(&id);
-                if !email.is_empty() {
-                    self.email = email;
-                }
-                if !account_id.is_empty() {
-                    self.account_id = account_id;
-                }
-                if !plan_type.is_empty() {
-                    self.plan_type = plan_type;
-                }
-                self.id_token = id;
+        if let Some(id) = id_token
+            && !id.trim().is_empty()
+        {
+            let (email, account_id, plan_type) = parse_jwt_identity(&id);
+            if !email.is_empty() {
+                self.email = email;
             }
+            if !account_id.is_empty() {
+                self.account_id = account_id;
+            }
+            if !plan_type.is_empty() {
+                self.plan_type = plan_type;
+            }
+            self.id_token = id;
         }
         let now = OffsetDateTime::now_utc();
         self.last_refresh = now.format(&Rfc3339).unwrap_or_default();

@@ -59,11 +59,9 @@ pub async fn verify_cached(key: &str, expected: &str) -> bool {
     .await
     .unwrap_or(false);
 
-    if !skip_store {
-        if let Ok(mut cache) = auth_cache().lock() {
-            // 回填时若已有条目(并发 miss),以本次结果覆盖;负结果仍缓存(与既有语义一致)
-            cache.put(ck, ok);
-        }
+    if !skip_store && let Ok(mut cache) = auth_cache().lock() {
+        // 回填时若已有条目(并发 miss),以本次结果覆盖;负结果仍缓存(与既有语义一致)
+        cache.put(ck, ok);
     }
     ok
 }
@@ -105,19 +103,18 @@ pub async fn check_secret(headers: &HeaderMap, secret: &Option<String>) -> Resul
 /// 从请求头提取 key:x-api-key 优先,其次 Authorization: Bearer
 /// scheme 大小写不敏感(RFC 6750),容忍任意空白
 pub fn extract_key(headers: &HeaderMap) -> &str {
-    if let Some(v) = headers.get("x-api-key").and_then(|v| v.to_str().ok()) {
-        if !v.is_empty() {
-            return v;
-        }
+    if let Some(v) = headers.get("x-api-key").and_then(|v| v.to_str().ok())
+        && !v.is_empty()
+    {
+        return v;
     }
-    if let Some(v) = headers.get("authorization").and_then(|v| v.to_str().ok()) {
-        if let Some((scheme, token)) = v.split_once(char::is_whitespace) {
-            if scheme.eq_ignore_ascii_case("bearer") {
-                let token = token.trim();
-                if !token.is_empty() {
-                    return token;
-                }
-            }
+    if let Some(v) = headers.get("authorization").and_then(|v| v.to_str().ok())
+        && let Some((scheme, token)) = v.split_once(char::is_whitespace)
+        && scheme.eq_ignore_ascii_case("bearer")
+    {
+        let token = token.trim();
+        if !token.is_empty() {
+            return token;
         }
     }
     ""

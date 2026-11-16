@@ -52,13 +52,13 @@ pub fn parse_trigger(label: &str) -> DoomLoopSignal {
     }
 
     // tail_repetition:{threshold}
-    if let Some(threshold_str) = type_part.strip_prefix("tail_repetition:") {
-        if let Ok(threshold) = threshold_str.parse::<u32>() {
-            return DoomLoopSignal {
-                kind: DoomLoopSignalKind::TailRepetition(threshold),
-                channel,
-            };
-        }
+    if let Some(threshold_str) = type_part.strip_prefix("tail_repetition:")
+        && let Ok(threshold) = threshold_str.parse::<u32>()
+    {
+        return DoomLoopSignal {
+            kind: DoomLoopSignalKind::TailRepetition(threshold),
+            channel,
+        };
     }
 
     // exact_repetition:{sequence_tokens}x{repeat_count}

@@ -168,14 +168,13 @@ pub fn resolve_effort_from_body(body: &serde_json::Value) -> Option<&'static str
     }
 
     // enabled 同时提供两种形状时,legacy budget 优先;无效 budget 继续走顶层 effort。
-    if thinking_type == Some("enabled") {
-        if let Some(e) = thinking
+    if thinking_type == Some("enabled")
+        && let Some(e) = thinking
             .and_then(|t| t.get("budget_tokens"))
             .and_then(|v| v.as_i64())
             .and_then(budget_to_level)
-        {
-            return Some(e.as_str());
-        }
+    {
+        return Some(e.as_str());
     }
 
     // Claude Code 2.1+:effort 在请求顶层 output_config

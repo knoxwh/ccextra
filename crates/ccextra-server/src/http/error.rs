@@ -218,27 +218,27 @@ pub fn extract_upstream_error(body: &[u8]) -> (String, String) {
         .to_string();
     let msg = v.get("message").cloned();
     // message 可能是嵌套 JSON 字符串,真实错误对象藏在里面
-    if let Some(Value::String(s)) = &msg {
-        if let Ok(inner) = serde_json::from_str::<Value>(s) {
-            if let Some(err) = inner.get("error") {
-                let t = err
-                    .get("type")
-                    .and_then(|x| x.as_str())
-                    .unwrap_or("")
-                    .to_string();
-                let m = err
-                    .get("message")
-                    .and_then(|x| x.as_str())
-                    .unwrap_or("")
-                    .to_string();
-                if !t.is_empty() || !m.is_empty() {
-                    return (if t.is_empty() { code } else { t }, m);
-                }
+    if let Some(Value::String(s)) = &msg
+        && let Ok(inner) = serde_json::from_str::<Value>(s)
+    {
+        if let Some(err) = inner.get("error") {
+            let t = err
+                .get("type")
+                .and_then(|x| x.as_str())
+                .unwrap_or("")
+                .to_string();
+            let m = err
+                .get("message")
+                .and_then(|x| x.as_str())
+                .unwrap_or("")
+                .to_string();
+            if !t.is_empty() || !m.is_empty() {
+                return (if t.is_empty() { code } else { t }, m);
             }
-            // 二次解析的对象里没有 error,直接取其 message(若有)
-            if let Some(m) = inner.get("message").and_then(|x| x.as_str()) {
-                return (code, m.to_string());
-            }
+        }
+        // 二次解析的对象里没有 error,直接取其 message(若有)
+        if let Some(m) = inner.get("message").and_then(|x| x.as_str()) {
+            return (code, m.to_string());
         }
     }
     match msg {

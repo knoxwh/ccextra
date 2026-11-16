@@ -33,8 +33,8 @@ where
         futures::pin_mut!(stream);
         loop {
             let chunk = stream.next().await;
-            if active {
-                if let Some((cache, session)) = scope.as_ref() {
+            if active
+                && let Some((cache, session)) = scope.as_ref() {
                     let events = match &chunk {
                         Some(Ok(bytes)) => parser.push(bytes),
                         None => parser.finish(),
@@ -60,14 +60,12 @@ where
                         }.and_then(serde_json::Value::as_u64)
                             .and_then(|tokens| usize::try_from(tokens).ok())
                             .filter(|tokens| *tokens > 0);
-                        if let Some(tokens) = tokens {
-                            if let Ok(mut cache) = cache.lock() {
+                        if let Some(tokens) = tokens
+                            && let Ok(mut cache) = cache.lock() {
                                 cache.insert(session.clone(), tokens);
                             }
-                        }
                     }
                 }
-            }
             match chunk {
                 Some(chunk) => yield chunk,
                 None => break,
@@ -100,8 +98,8 @@ where
         futures::pin_mut!(stream);
         loop {
             let chunk = stream.next().await;
-            if !done {
-                if let Some((drift, parent)) = scope.as_ref() {
+            if !done
+                && let Some((drift, parent)) = scope.as_ref() {
                     let events = match &chunk {
                         Some(Ok(bytes)) => parser.push(bytes),
                         None => parser.finish(),
@@ -124,7 +122,6 @@ where
                         }
                     }
                 }
-            }
             match chunk {
                 Some(chunk) => yield chunk,
                 None => break,
@@ -215,15 +212,14 @@ impl SessionTokenCache {
         let sequence = self.next_sequence;
         self.next_sequence = self.next_sequence.wrapping_add(1);
         self.entries.insert(session, (tokens, written_at, sequence));
-        if self.entries.len() > CAPACITY {
-            if let Some(oldest) = self
+        if self.entries.len() > CAPACITY
+            && let Some(oldest) = self
                 .entries
                 .iter()
                 .min_by_key(|(_, (_, _, sequence))| *sequence)
                 .map(|(session, _)| session.clone())
-            {
-                self.entries.remove(&oldest);
-            }
+        {
+            self.entries.remove(&oldest);
         }
     }
 

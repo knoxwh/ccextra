@@ -35,11 +35,13 @@ pub(crate) fn gpt_compatible_signature(
 
 /// 移除 reasoning 项的孤儿 id(encrypted_content 已无且 store 非 true 时)
 pub(crate) fn remove_reasoning_id_if_orphan(item: &mut Value, store_true: bool) -> bool {
-    if !store_true && item.get("encrypted_content").is_none() && item.get("id").is_some() {
-        if let Some(obj) = item.as_object_mut() {
-            obj.remove("id");
-            return true;
-        }
+    if !store_true
+        && item.get("encrypted_content").is_none()
+        && item.get("id").is_some()
+        && let Some(obj) = item.as_object_mut()
+    {
+        obj.remove("id");
+        return true;
     }
     false
 }

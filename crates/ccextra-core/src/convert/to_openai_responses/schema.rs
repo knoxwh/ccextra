@@ -100,10 +100,10 @@ fn strip_dialect_keywords_from_schema(v: &mut Value) {
             }
 
             // 对齐 CPA e56abd56:Python re 编译失败的 pattern 直接删
-            if let Some(Value::String(p)) = map.get("pattern") {
-                if has_unsupported_unicode_property_escape(p) {
-                    map.shift_remove("pattern");
-                }
+            if let Some(Value::String(p)) = map.get("pattern")
+                && has_unsupported_unicode_property_escape(p)
+            {
+                map.shift_remove("pattern");
             }
 
             // 对齐 CPA 57d005fe:Codex 拒绝超出 int64 的 integer numeric bounds → HTTP 500
@@ -487,10 +487,10 @@ pub(crate) fn codex_schema_misses_required(schema: &Value) -> bool {
     }
 
     for &keyword in SCHEMA_VALUE_KEYWORDS {
-        if let Some(child) = map.get(keyword) {
-            if codex_schema_misses_required(child) {
-                return true;
-            }
+        if let Some(child) = map.get(keyword)
+            && codex_schema_misses_required(child)
+        {
+            return true;
         }
     }
 

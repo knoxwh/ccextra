@@ -17,10 +17,10 @@ pub fn extract_project(data: &Value) -> String {
         match data.get(key) {
             Some(Value::String(s)) if !s.trim().is_empty() => return s.trim().to_string(),
             Some(Value::Object(obj)) => {
-                if let Some(Value::String(id)) = obj.get("id") {
-                    if !id.trim().is_empty() {
-                        return id.trim().to_string();
-                    }
+                if let Some(Value::String(id)) = obj.get("id")
+                    && !id.trim().is_empty()
+                {
+                    return id.trim().to_string();
                 }
             }
             _ => {}
@@ -36,10 +36,10 @@ pub fn default_tier_id(load: &Value) -> String {
             if !is_default {
                 continue;
             }
-            if let Some(id) = tier.get("id").and_then(Value::as_str) {
-                if !id.trim().is_empty() {
-                    return id.trim().to_string();
-                }
+            if let Some(id) = tier.get("id").and_then(Value::as_str)
+                && !id.trim().is_empty()
+            {
+                return id.trim().to_string();
             }
         }
     }

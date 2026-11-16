@@ -164,16 +164,16 @@ pub fn adapt_request_for_unfit(
     if registry.is_unfit(provider, model, UnfitKind::RefusesFormat) {
         // 先探测再注入:注入失败(协议无对应字段 / body 缺 messages)时
         // 不得剥掉 format,否则 body 被改却不会重试
-        if let Some((schema, slot)) = response_format_schema(body) {
-            if inject_schema_instruction(body, &schema, protocol) {
-                strip_response_format_slot(body, slot);
-                adapted = true;
-                tracing::debug!(
-                    provider,
-                    model,
-                    "unfit: response_format → system instruction"
-                );
-            }
+        if let Some((schema, slot)) = response_format_schema(body)
+            && inject_schema_instruction(body, &schema, protocol)
+        {
+            strip_response_format_slot(body, slot);
+            adapted = true;
+            tracing::debug!(
+                provider,
+                model,
+                "unfit: response_format → system instruction"
+            );
         }
     }
 
@@ -239,10 +239,8 @@ fn strip_response_format_slot(body: &mut serde_json::Value, slot: &str) {
                 } else {
                     false
                 };
-            if text_empty {
-                if let Some(obj) = body.as_object_mut() {
-                    obj.remove("text");
-                }
+            if text_empty && let Some(obj) = body.as_object_mut() {
+                obj.remove("text");
             }
         }
         _ => {
@@ -330,36 +328,36 @@ fn inject_schema_instruction(
 fn force_reasoning_effort(body: &mut serde_json::Value, effort: &str, protocol: Protocol) -> bool {
     match protocol {
         Protocol::Claude => {
-            if let Some(config) = body.pointer_mut("/thinking/output_config/effort") {
-                if config.as_str() == Some("off") {
-                    *config = serde_json::json!(effort);
-                    return true;
-                }
+            if let Some(config) = body.pointer_mut("/thinking/output_config/effort")
+                && config.as_str() == Some("off")
+            {
+                *config = serde_json::json!(effort);
+                return true;
             }
             false
         }
         Protocol::OpenAiChat => {
-            if let Some(re) = body.get_mut("reasoning_effort") {
-                if matches!(re.as_str(), Some("off") | Some("none")) {
-                    *re = serde_json::json!(effort);
-                    return true;
-                }
+            if let Some(re) = body.get_mut("reasoning_effort")
+                && matches!(re.as_str(), Some("off") | Some("none"))
+            {
+                *re = serde_json::json!(effort);
+                return true;
             }
             // Kimi: thinking.effort
-            if let Some(te) = body.pointer_mut("/thinking/effort") {
-                if matches!(te.as_str(), Some("off") | Some("none")) {
-                    *te = serde_json::json!(effort);
-                    return true;
-                }
+            if let Some(te) = body.pointer_mut("/thinking/effort")
+                && matches!(te.as_str(), Some("off") | Some("none"))
+            {
+                *te = serde_json::json!(effort);
+                return true;
             }
             false
         }
         Protocol::OpenAiResponses => {
-            if let Some(e) = body.pointer_mut("/reasoning/effort") {
-                if matches!(e.as_str(), Some("off") | Some("none")) {
-                    *e = serde_json::json!(effort);
-                    return true;
-                }
+            if let Some(e) = body.pointer_mut("/reasoning/effort")
+                && matches!(e.as_str(), Some("off") | Some("none"))
+            {
+                *e = serde_json::json!(effort);
+                return true;
             }
             false
         }
@@ -370,11 +368,11 @@ fn force_reasoning_effort(body: &mut serde_json::Value, effort: &str, protocol: 
 fn downgrade_tool_choice(body: &mut serde_json::Value, protocol: Protocol) -> bool {
     match protocol {
         Protocol::Claude => {
-            if let Some(choice) = body.get_mut("tool_choice") {
-                if choice.get("type").and_then(|t| t.as_str()) != Some("auto") {
-                    *choice = serde_json::json!({"type": "auto"});
-                    return true;
-                }
+            if let Some(choice) = body.get_mut("tool_choice")
+                && choice.get("type").and_then(|t| t.as_str()) != Some("auto")
+            {
+                *choice = serde_json::json!({"type": "auto"});
+                return true;
             }
             false
         }
@@ -403,14 +401,13 @@ fn remove_reasoning_config(body: &mut serde_json::Value, protocol: Protocol) -> 
             {
                 removed = true;
             }
-            if let Some(config) = body.pointer_mut("/output_config") {
-                if config
+            if let Some(config) = body.pointer_mut("/output_config")
+                && config
                     .as_object_mut()
                     .and_then(|m| m.remove("effort"))
                     .is_some()
-                {
-                    removed = true;
-                }
+            {
+                removed = true;
             }
             removed
         }

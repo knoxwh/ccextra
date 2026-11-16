@@ -27,10 +27,10 @@ pub fn antigravity_tool_name_to_upstream(name: &str) -> String {
 /// 从上游工具名还原客户端名称。仅当前缀为 `external_` 且基础名为冲突工具时才剥离前缀,
 /// 其余名称原样返回。
 pub fn antigravity_upstream_tool_name_to_client(name: &str) -> String {
-    if let Some(base) = name.strip_prefix(EXTERNAL_TOOL_PREFIX) {
-        if is_colliding_tool(base) {
-            return base.to_string();
-        }
+    if let Some(base) = name.strip_prefix(EXTERNAL_TOOL_PREFIX)
+        && is_colliding_tool(base)
+    {
+        return base.to_string();
     }
     name.to_string()
 }

@@ -119,24 +119,23 @@ pub fn convert_to_openai_responses_with(
         for tool in tools {
             let tool_type = tool.get("type").and_then(|v| v.as_str()).unwrap_or("");
             if super::is_web_search_tool_type(tool_type) {
-                if let Some(n) = tool.get("name").and_then(|v| v.as_str()) {
-                    if !n.is_empty() {
-                        web_search_names.insert(n.to_string());
-                    }
+                if let Some(n) = tool.get("name").and_then(|v| v.as_str())
+                    && !n.is_empty()
+                {
+                    web_search_names.insert(n.to_string());
                 }
                 continue;
             }
-            if tool_type == "custom" {
-                if let Some(n) = tool.get("name").and_then(|v| v.as_str()) {
-                    if !n.is_empty() {
-                        custom_tool_names.insert(n.to_string());
-                    }
-                }
+            if tool_type == "custom"
+                && let Some(n) = tool.get("name").and_then(|v| v.as_str())
+                && !n.is_empty()
+            {
+                custom_tool_names.insert(n.to_string());
             }
-            if let Some(n) = tool.get("name").and_then(|v| v.as_str()) {
-                if !n.is_empty() {
-                    names.push(n.to_string());
-                }
+            if let Some(n) = tool.get("name").and_then(|v| v.as_str())
+                && !n.is_empty()
+            {
+                names.push(n.to_string());
             }
         }
         tool_name_map = build_short_name_map(&names);
@@ -309,12 +308,10 @@ pub fn convert_to_openai_responses_with(
         .get("tools")
         .and_then(|v| v.as_array())
         .is_some_and(|a| !a.is_empty());
-    if !has_tools {
-        if let Some(obj) = openai.as_object_mut() {
-            obj.remove("tools");
-            obj.remove("tool_choice");
-            obj.remove("parallel_tool_calls");
-        }
+    if !has_tools && let Some(obj) = openai.as_object_mut() {
+        obj.remove("tools");
+        obj.remove("tool_choice");
+        obj.remove("parallel_tool_calls");
     }
 
     // 反向映射 short→original,响应侧还原工具名
@@ -352,10 +349,10 @@ fn promote_additional_tools(openai: &mut Value) {
         .map(str::to_string)
         .collect();
     for tool in promoted {
-        if let Some(name) = tool.get("name").and_then(|v| v.as_str()) {
-            if !seen.insert(name.to_string()) {
-                continue;
-            }
+        if let Some(name) = tool.get("name").and_then(|v| v.as_str())
+            && !seen.insert(name.to_string())
+        {
+            continue;
         }
         tools.push(tool);
     }
@@ -485,16 +482,16 @@ fn convert_messages_to_input(
                         let sig = part.get("signature").and_then(|v| v.as_str());
                         // 对齐 CPA 531721bf:commentary marker → phase:commentary message
                         if matches!(sig, Some(s) if is_codex_commentary_signature_marker(s)) {
-                            if let Some(t) = part.get("thinking").and_then(|v| v.as_str()) {
-                                if !t.is_empty() {
-                                    flush_message(&mut content_items, &mut out_items);
-                                    out_items.push(json!({
-                                        "type": "message",
-                                        "role": "assistant",
-                                        "phase": "commentary",
-                                        "content": [{"type": "output_text", "text": t}],
-                                    }));
-                                }
+                            if let Some(t) = part.get("thinking").and_then(|v| v.as_str())
+                                && !t.is_empty()
+                            {
+                                flush_message(&mut content_items, &mut out_items);
+                                out_items.push(json!({
+                                    "type": "message",
+                                    "role": "assistant",
+                                    "phase": "commentary",
+                                    "content": [{"type": "output_text", "text": t}],
+                                }));
                             }
                         } else if matches!(sig, Some(s) if !s.trim().is_empty()) {
                             if let Some(good) = gpt_compatible_signature(sig, upstream_model) {
@@ -511,16 +508,14 @@ fn convert_messages_to_input(
                             }
                         } else if !is_gpt_upstream(upstream_model)
                             && !upstream_model.to_ascii_lowercase().contains("grok")
+                            && let Some(t) = part.get("thinking").and_then(|v| v.as_str())
+                            && !t.trim().is_empty()
                         {
-                            if let Some(t) = part.get("thinking").and_then(|v| v.as_str()) {
-                                if !t.trim().is_empty() {
-                                    flush_message(&mut content_items, &mut out_items);
-                                    out_items.push(json!({
-                                        "type": "reasoning",
-                                        "content": t
-                                    }));
-                                }
-                            }
+                            flush_message(&mut content_items, &mut out_items);
+                            out_items.push(json!({
+                                "type": "reasoning",
+                                "content": t
+                            }));
                         }
                     }
                 }
@@ -675,10 +670,10 @@ fn convert_one_tool(
             };
             ws["filters"] = json!({key: domains});
         }
-        if let Some(loc) = tool.get("user_location") {
-            if loc.is_object() {
-                ws["user_location"] = loc.clone();
-            }
+        if let Some(loc) = tool.get("user_location")
+            && loc.is_object()
+        {
+            ws["user_location"] = loc.clone();
         }
         return (ws, true);
     }
@@ -717,10 +712,10 @@ fn convert_one_tool(
         obj.remove("input_schema");
         obj.remove("cache_control");
         obj.remove("defer_loading");
-        if let Some(p) = obj.get_mut("parameters") {
-            if let Some(po) = p.as_object_mut() {
-                po.remove("$schema");
-            }
+        if let Some(p) = obj.get_mut("parameters")
+            && let Some(po) = p.as_object_mut()
+        {
+            po.remove("$schema");
         }
     }
     if t.get("strict") != Some(&json!(false)) {

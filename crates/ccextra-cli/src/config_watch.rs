@@ -44,10 +44,10 @@ fn path_eq(a: &Path, b: &Path) -> bool {
     if a == b {
         return true;
     }
-    if let (Ok(ca), Ok(cb)) = (a.canonicalize(), b.canonicalize()) {
-        if ca == cb {
-            return true;
-        }
+    if let (Ok(ca), Ok(cb)) = (a.canonicalize(), b.canonicalize())
+        && ca == cb
+    {
+        return true;
     }
     match (a.file_name(), b.file_name(), a.parent(), b.parent()) {
         (Some(an), Some(bn), Some(ap), Some(bp)) if an == bn => {

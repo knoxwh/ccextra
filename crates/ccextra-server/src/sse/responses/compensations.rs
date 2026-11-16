@@ -25,10 +25,10 @@ pub(crate) fn extract_output_text(content: Option<&Value>) -> String {
     let mut text = String::new();
     if let Some(parts) = content.and_then(|v| v.as_array()) {
         for part in parts {
-            if part.get("type").and_then(|v| v.as_str()) == Some("output_text") {
-                if let Some(t) = part.get("text").and_then(|v| v.as_str()) {
-                    text.push_str(t);
-                }
+            if part.get("type").and_then(|v| v.as_str()) == Some("output_text")
+                && let Some(t) = part.get("text").and_then(|v| v.as_str())
+            {
+                text.push_str(t);
             }
         }
     }
@@ -118,21 +118,20 @@ pub(crate) fn stream_error_frame(root: &Value) -> Bytes {
 /// stop_reason 提取(对齐 codexStopReason):
 /// stop_reason > incomplete_details.reason > stop_sequence 推断
 pub fn codex_stop_reason(r: &Value) -> String {
-    if let Some(sr) = r.get("stop_reason").and_then(|v| v.as_str()) {
-        if !sr.is_empty() {
-            if sr == "stop" && stop_sequence(r).is_some() {
-                return "stop_sequence".to_string();
-            }
-            return sr.to_string();
+    if let Some(sr) = r.get("stop_reason").and_then(|v| v.as_str())
+        && !sr.is_empty()
+    {
+        if sr == "stop" && stop_sequence(r).is_some() {
+            return "stop_sequence".to_string();
         }
+        return sr.to_string();
     }
     if let Some(reason) = r
         .pointer("/incomplete_details/reason")
         .and_then(|v| v.as_str())
+        && !reason.is_empty()
     {
-        if !reason.is_empty() {
-            return reason.to_string();
-        }
+        return reason.to_string();
     }
     if stop_sequence(r).is_some() {
         return "stop_sequence".to_string();

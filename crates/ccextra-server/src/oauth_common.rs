@@ -103,10 +103,10 @@ pub(crate) fn write_credential_file(path: &Path, data: &[u8], tmp_prefix: &str) 
 pub(crate) fn resolve_auth_dir(dir: Option<&str>, default: &str) -> PathBuf {
     match dir {
         Some(d) if !d.trim().is_empty() => {
-            if let Some(rest) = d.strip_prefix("~/") {
-                if let Some(home) = home_dir() {
-                    return home.join(rest);
-                }
+            if let Some(rest) = d.strip_prefix("~/")
+                && let Some(home) = home_dir()
+            {
+                return home.join(rest);
             }
             PathBuf::from(d)
         }

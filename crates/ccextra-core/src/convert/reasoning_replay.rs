@@ -148,15 +148,13 @@ fn filter_replay_items(body: &Value, items: Vec<Value>) -> Vec<Value> {
         if matches!(
             item_type,
             "function_call_output" | "custom_tool_call_output"
-        ) {
-            if let Some(call_id) = item
-                .get("call_id")
-                .and_then(|v| v.as_str())
-                .filter(|c| !c.trim().is_empty())
-            {
-                for candidate in comparable_call_ids(call_id) {
-                    existing_outputs.insert(candidate);
-                }
+        ) && let Some(call_id) = item
+            .get("call_id")
+            .and_then(|v| v.as_str())
+            .filter(|c| !c.trim().is_empty())
+        {
+            for candidate in comparable_call_ids(call_id) {
+                existing_outputs.insert(candidate);
             }
         }
         for key in tool_call_keys(item) {
@@ -170,10 +168,10 @@ fn filter_replay_items(body: &Value, items: Vec<Value>) -> Vec<Value> {
         match item_type {
             "reasoning" => {
                 let enc = item.get("encrypted_content").and_then(|v| v.as_str());
-                if let Some(enc) = enc.filter(|e| !e.is_empty()) {
-                    if input_has_encrypted_content(input_items, enc) {
-                        continue;
-                    }
+                if let Some(enc) = enc.filter(|e| !e.is_empty())
+                    && input_has_encrypted_content(input_items, enc)
+                {
+                    continue;
                 }
             }
             "message" => {
@@ -724,15 +722,15 @@ fn turn_anchor_index(
 /// 对齐 grok-build conversation/responses.rs:Reasoning 项带
 /// summary/content 时原样回放进 input,仅 encrypted-only 无文本项视为空。
 fn reasoning_has_text(item: &Value) -> bool {
-    if let Some(arr) = item.get("summary").and_then(|v| v.as_array()) {
-        if arr.iter().any(|sp| {
+    if let Some(arr) = item.get("summary").and_then(|v| v.as_array())
+        && arr.iter().any(|sp| {
             sp.get("text")
                 .and_then(|v| v.as_str())
                 .map(|s| !s.is_empty())
                 .unwrap_or(false)
-        }) {
-            return true;
-        }
+        })
+    {
+        return true;
     }
     if let Some(s) = item.get("content").and_then(|v| v.as_str()) {
         return !s.is_empty();

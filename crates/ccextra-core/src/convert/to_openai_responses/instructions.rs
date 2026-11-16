@@ -333,12 +333,12 @@ pub(crate) fn system_to_instructions_text(system: &Value, upstream_model: &str) 
         }
         Value::Array(blocks) => {
             for b in blocks {
-                if b.get("type").and_then(|v| v.as_str()) == Some("text") {
-                    if let Some(t) = b.get("text").and_then(|v| v.as_str()) {
-                        let trimmed = strip_attribution_line(t).trim();
-                        if !is_ignorable_system_text(trimmed, upstream_model) {
-                            texts.push(trimmed.to_string());
-                        }
+                if b.get("type").and_then(|v| v.as_str()) == Some("text")
+                    && let Some(t) = b.get("text").and_then(|v| v.as_str())
+                {
+                    let trimmed = strip_attribution_line(t).trim();
+                    if !is_ignorable_system_text(trimmed, upstream_model) {
+                        texts.push(trimmed.to_string());
                     }
                 }
             }

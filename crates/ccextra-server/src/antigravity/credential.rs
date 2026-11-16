@@ -79,10 +79,10 @@ impl AntigravityCredential {
     pub fn apply_tokens(&mut self, access: String, refresh: Option<String>, expires_in: i64) {
         let now = SystemTime::now();
         self.access_token = access;
-        if let Some(token) = refresh {
-            if !token.trim().is_empty() {
-                self.refresh_token = token;
-            }
+        if let Some(token) = refresh
+            && !token.trim().is_empty()
+        {
+            self.refresh_token = token;
         }
         self.expires_in = expires_in;
         self.timestamp = now

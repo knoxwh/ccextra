@@ -176,15 +176,15 @@ impl ResponsesRelay {
     ) {
         let call = &mut self.function_call_queue[idx];
         if let Some(i) = item {
-            if let Some(cid) = i.get("call_id").and_then(|v| v.as_str()) {
-                if !cid.is_empty() {
-                    call.call_id = cid.to_string();
-                }
+            if let Some(cid) = i.get("call_id").and_then(|v| v.as_str())
+                && !cid.is_empty()
+            {
+                call.call_id = cid.to_string();
             }
-            if let Some(n) = i.get("name").and_then(|v| v.as_str()) {
-                if !n.is_empty() {
-                    call.name = n.to_string();
-                }
+            if let Some(n) = i.get("name").and_then(|v| v.as_str())
+                && !n.is_empty()
+            {
+                call.name = n.to_string();
             }
         }
         let keys = self.call_keys(root, item);

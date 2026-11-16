@@ -79,22 +79,22 @@ impl XAICredential {
         expires_in: i64,
     ) {
         self.access_token = access_token;
-        if let Some(r) = refresh_token {
-            if !r.trim().is_empty() {
-                self.refresh_token = r;
-            }
+        if let Some(r) = refresh_token
+            && !r.trim().is_empty()
+        {
+            self.refresh_token = r;
         }
-        if let Some(id) = id_token {
-            if !id.trim().is_empty() {
-                let (email, sub) = parse_jwt_identity(&id);
-                if !email.is_empty() {
-                    self.email = email;
-                }
-                if !sub.is_empty() {
-                    self.sub = sub;
-                }
-                self.id_token = id;
+        if let Some(id) = id_token
+            && !id.trim().is_empty()
+        {
+            let (email, sub) = parse_jwt_identity(&id);
+            if !email.is_empty() {
+                self.email = email;
             }
+            if !sub.is_empty() {
+                self.sub = sub;
+            }
+            self.id_token = id;
         }
         self.expires_in = expires_in;
         let now = OffsetDateTime::now_utc();

@@ -191,16 +191,16 @@ pub fn normalize_tool_definitions_responses(body: &mut Value) -> NormalizationAp
 
         // 注意:responses_tool_sort_key / responses_tool_schema_hash 依赖上方
         // sort_responses_tool_schema_keys 已将各工具 schema 原地排序,调用顺序不可颠倒。
-        if let Some(tools) = walker.tools_mut() {
-            if !any_tool_has_cache_control(tools) {
-                let keys: Vec<String> = tools.iter().map(responses_tool_sort_key).collect();
-                let changed = keys.windows(2).any(|pair| pair[0] > pair[1]);
-                if changed {
-                    tools.sort_by_cached_key(responses_tool_sort_key);
-                    tracing::debug!("OpenAI Responses tools sorted deterministically (E1)");
-                }
-                applied.e1_tool_sort = changed;
+        if let Some(tools) = walker.tools_mut()
+            && !any_tool_has_cache_control(tools)
+        {
+            let keys: Vec<String> = tools.iter().map(responses_tool_sort_key).collect();
+            let changed = keys.windows(2).any(|pair| pair[0] > pair[1]);
+            if changed {
+                tools.sort_by_cached_key(responses_tool_sort_key);
+                tracing::debug!("OpenAI Responses tools sorted deterministically (E1)");
             }
+            applied.e1_tool_sort = changed;
         }
     }
 

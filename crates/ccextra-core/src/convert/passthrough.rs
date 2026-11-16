@@ -99,19 +99,17 @@ fn sanitize_system_field(body: &mut Value, upstream_model: &str) -> bool {
             let mut kept: Vec<Value> = Vec::with_capacity(blocks.len());
             for mut block in blocks {
                 let is_text = block.get("type").and_then(|t| t.as_str()) == Some("text");
-                if is_text {
-                    if let Some(text) = block.get("text").and_then(|t| t.as_str()) {
-                        match sanitize_system_text(text, upstream_model) {
-                            Some(cleaned) => {
-                                if cleaned != text {
-                                    block["text"] = Value::String(cleaned);
-                                    changed = true;
-                                }
-                            }
-                            None => {
+                if is_text && let Some(text) = block.get("text").and_then(|t| t.as_str()) {
+                    match sanitize_system_text(text, upstream_model) {
+                        Some(cleaned) => {
+                            if cleaned != text {
+                                block["text"] = Value::String(cleaned);
                                 changed = true;
-                                continue;
                             }
+                        }
+                        None => {
+                            changed = true;
+                            continue;
                         }
                     }
                 }
@@ -168,19 +166,19 @@ fn sanitize_system_messages(body: &mut Value, upstream_model: &str) -> bool {
             Some(Value::Array(items)) => {
                 let mut item_kept: Vec<Value> = Vec::with_capacity(items.len());
                 for mut item in items {
-                    if item.get("type").and_then(|t| t.as_str()) == Some("text") {
-                        if let Some(text) = item.get("text").and_then(|t| t.as_str()) {
-                            match sanitize_system_text(text, upstream_model) {
-                                Some(cleaned) => {
-                                    if cleaned != text {
-                                        item["text"] = Value::String(cleaned);
-                                        changed = true;
-                                    }
-                                }
-                                None => {
+                    if item.get("type").and_then(|t| t.as_str()) == Some("text")
+                        && let Some(text) = item.get("text").and_then(|t| t.as_str())
+                    {
+                        match sanitize_system_text(text, upstream_model) {
+                            Some(cleaned) => {
+                                if cleaned != text {
+                                    item["text"] = Value::String(cleaned);
                                     changed = true;
-                                    continue;
                                 }
+                            }
+                            None => {
+                                changed = true;
+                                continue;
                             }
                         }
                     }

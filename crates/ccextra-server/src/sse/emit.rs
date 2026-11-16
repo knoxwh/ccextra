@@ -166,10 +166,10 @@ pub fn content_block_start_web_search_result(
         "index": index,
         "content_block": {"type": "web_search_tool_result", "tool_use_id": tool_use_id, "content": []}
     });
-    if let Value::Array(arr) = content {
-        if !arr.is_empty() {
-            start["content_block"]["content"] = content.clone();
-        }
+    if let Value::Array(arr) = content
+        && !arr.is_empty()
+    {
+        start["content_block"]["content"] = content.clone();
     }
     sse("content_block_start", &start)
 }

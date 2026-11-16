@@ -246,11 +246,10 @@ fn merge_adjacent_gemini_user_contents(contents: Vec<Value>) -> Vec<Value> {
                 && role == "user"
                 && !content_has_gemini_function_response(last)
                 && !content_has_gemini_function_response(&content)
+                && let Some(last_parts) = last.get_mut("parts").and_then(|p| p.as_array_mut())
             {
-                if let Some(last_parts) = last.get_mut("parts").and_then(|p| p.as_array_mut()) {
-                    last_parts.extend(parts.iter().cloned());
-                    continue;
-                }
+                last_parts.extend(parts.iter().cloned());
+                continue;
             }
         }
         merged.push(content);
@@ -277,16 +276,17 @@ fn merge_adjacent_gemini_contents(contents: Vec<Value>) -> Vec<Value> {
 
         if let Some(last) = merged.last_mut() {
             let last_role = last.get("role").and_then(|r| r.as_str()).unwrap_or("");
-            if last_role == "user" && role == "user" {
-                if let (Some(last_parts), Some(cur_parts)) = (
+            if last_role == "user"
+                && role == "user"
+                && let (Some(last_parts), Some(cur_parts)) = (
                     last.get_mut("parts").and_then(|p| p.as_array_mut()),
                     content.get("parts").and_then(|p| p.as_array()),
-                ) {
-                    last_parts.extend(cur_parts.iter().cloned());
-                    // 对齐 CPA 4fde97f4:合并后重排 user parts,text 在 functionResponse 前
-                    reorder_gemini_user_parts(last_parts);
-                    continue;
-                }
+                )
+            {
+                last_parts.extend(cur_parts.iter().cloned());
+                // 对齐 CPA 4fde97f4:合并后重排 user parts,text 在 functionResponse 前
+                reorder_gemini_user_parts(last_parts);
+                continue;
             }
         }
         merged.push(content);
@@ -444,10 +444,10 @@ fn append_block_parts(
     match block_type {
         "text" => {
             // 空文本 part 跳过(对齐 CPA:规避 Gemini required oneof field 'data' 报错)
-            if let Some(text) = block.get("text").and_then(|t| t.as_str()) {
-                if !text.is_empty() {
-                    parts.push(json!({ "text": text }));
-                }
+            if let Some(text) = block.get("text").and_then(|t| t.as_str())
+                && !text.is_empty()
+            {
+                parts.push(json!({ "text": text }));
             }
         }
         // thinking 块默认丢弃(Gemini 非 compat 路径);Antigravity 按目标族解析签名
@@ -522,10 +522,10 @@ fn append_block_parts(
                 "args": input
             });
             // 对齐 CPA 6a26e92a:Antigravity 冲突工具名加 external_ 前缀
-            if antigravity {
-                if let Some(name_str) = function_call.get("name").and_then(|n| n.as_str()) {
-                    function_call["name"] = json!(antigravity_tool_name_to_upstream(name_str));
-                }
+            if antigravity
+                && let Some(name_str) = function_call.get("name").and_then(|n| n.as_str())
+            {
+                function_call["name"] = json!(antigravity_tool_name_to_upstream(name_str));
             }
             if !tool_use_id.is_empty() {
                 function_call["id"] = json!(sanitize_gemini_tool_id(tool_use_id, antigravity));

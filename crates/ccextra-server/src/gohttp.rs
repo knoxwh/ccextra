@@ -48,10 +48,10 @@ pub struct Sidecar {
 /// 找不到二进制时返回明确错误(调用方不得回退 reqwest)。
 pub(crate) fn acquire(socket_dir: Option<&Path>) -> anyhow::Result<Arc<Sidecar>> {
     let mut current = CURRENT.lock().unwrap_or_else(|p| p.into_inner());
-    if let Some(s) = current.upgrade() {
-        if s.is_running() {
-            return Ok(s);
-        }
+    if let Some(s) = current.upgrade()
+        && s.is_running()
+    {
+        return Ok(s);
     }
     let exe = std::env::current_exe()
         .map_err(|e| anyhow::anyhow!("antigravity.gohttp: 无法定位当前可执行文件: {e}"))?;

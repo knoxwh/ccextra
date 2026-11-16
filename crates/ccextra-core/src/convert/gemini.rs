@@ -592,15 +592,15 @@ fn is_terminal_tool(name: &str) -> bool {
 
 /// 从 schema properties/required 移除 description 字段(对齐 CPA f051442)
 fn strip_description_param(schema: &mut Value) {
-    if let Some(props) = schema.pointer_mut("/properties") {
-        if let Some(obj) = props.as_object_mut() {
-            obj.remove("description");
-        }
+    if let Some(props) = schema.pointer_mut("/properties")
+        && let Some(obj) = props.as_object_mut()
+    {
+        obj.remove("description");
     }
-    if let Some(required) = schema.pointer_mut("/required") {
-        if let Some(arr) = required.as_array_mut() {
-            arr.retain(|v| v.as_str() != Some("description"));
-        }
+    if let Some(required) = schema.pointer_mut("/required")
+        && let Some(arr) = required.as_array_mut()
+    {
+        arr.retain(|v| v.as_str() != Some("description"));
     }
 }
 

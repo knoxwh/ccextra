@@ -3,15 +3,15 @@ use serde_json::{Value, json};
 /// web_search_call 的 query(对齐 codexWebSearchQuery:item/root 多路径)
 pub(crate) fn web_search_query(root: &Value, item: &Value) -> String {
     for path in ["/action/query", "/query", "/input/query"] {
-        if let Some(v) = item.pointer(path).and_then(|v| v.as_str()) {
-            if !v.trim().is_empty() {
-                return v.trim().to_string();
-            }
+        if let Some(v) = item.pointer(path).and_then(|v| v.as_str())
+            && !v.trim().is_empty()
+        {
+            return v.trim().to_string();
         }
-        if let Some(v) = root.pointer(path).and_then(|v| v.as_str()) {
-            if !v.trim().is_empty() {
-                return v.trim().to_string();
-            }
+        if let Some(v) = root.pointer(path).and_then(|v| v.as_str())
+            && !v.trim().is_empty()
+        {
+            return v.trim().to_string();
         }
     }
     String::new()

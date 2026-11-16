@@ -28,10 +28,10 @@ pub fn claude_code_prompt_cache_key(session_id: &str) -> Option<String> {
 /// session_id 必须在转换前提取(转换后 metadata 被丢弃),由调用方传入。
 pub fn inject_prompt_cache_key(body: &mut Value, session_id: Option<&str>) -> bool {
     // 已有非空 key 不覆盖(入站/原始/转换后任一存在即保留)
-    if let Some(existing) = body.get("prompt_cache_key").and_then(|v| v.as_str()) {
-        if !existing.trim().is_empty() {
-            return false;
-        }
+    if let Some(existing) = body.get("prompt_cache_key").and_then(|v| v.as_str())
+        && !existing.trim().is_empty()
+    {
+        return false;
     }
     let Some(session_id) = session_id else {
         return false;

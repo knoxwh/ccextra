@@ -78,10 +78,10 @@ pub fn responses_to_anthropic(
                     if let Some(summary) = item.get("summary").and_then(|v| v.as_array()) {
                         for part in summary {
                             if part.get("type").and_then(|t| t.as_str()) == Some("summary_text") {
-                                if let Some(t) = part.get("text").and_then(|v| v.as_str()) {
-                                    if !t.is_empty() {
-                                        text.push_str(t);
-                                    }
+                                if let Some(t) = part.get("text").and_then(|v| v.as_str())
+                                    && !t.is_empty()
+                                {
+                                    text.push_str(t);
                                 }
                                 break; // 首个 summary_text 后 break
                             }
@@ -90,12 +90,11 @@ pub fn responses_to_anthropic(
                     // content:遍历全部 reasoning_text,直接累加
                     if let Some(content_arr) = item.get("content").and_then(|v| v.as_array()) {
                         for part in content_arr {
-                            if part.get("type").and_then(|t| t.as_str()) == Some("reasoning_text") {
-                                if let Some(t) = part.get("text").and_then(|v| v.as_str()) {
-                                    if !t.is_empty() {
-                                        text.push_str(t);
-                                    }
-                                }
+                            if part.get("type").and_then(|t| t.as_str()) == Some("reasoning_text")
+                                && let Some(t) = part.get("text").and_then(|v| v.as_str())
+                                && !t.is_empty()
+                            {
+                                text.push_str(t);
                             }
                         }
                     }
@@ -531,10 +530,10 @@ fn collect_part_thinking_fragments(node: &Value, out: &mut Vec<String>) {
             }
         }
         Value::Object(obj) => {
-            if let Some(Value::String(s)) = obj.get("text") {
-                if !s.is_empty() {
-                    out.push(s.clone());
-                }
+            if let Some(Value::String(s)) = obj.get("text")
+                && !s.is_empty()
+            {
+                out.push(s.clone());
             }
         }
         _ => {}

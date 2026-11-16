@@ -48,17 +48,17 @@ fn session_id_from_user_id(user_id: &str) -> Option<String> {
             return Some(suffix.to_string());
         }
     }
-    if user_id.starts_with('{') {
-        if let Ok(v) = serde_json::from_str::<Value>(user_id) {
-            let sid = v
-                .get("session_id")
-                .and_then(|s| s.as_str())
-                .unwrap_or("")
-                .trim()
-                .to_string();
-            if !sid.is_empty() {
-                return Some(sid);
-            }
+    if user_id.starts_with('{')
+        && let Ok(v) = serde_json::from_str::<Value>(user_id)
+    {
+        let sid = v
+            .get("session_id")
+            .and_then(|s| s.as_str())
+            .unwrap_or("")
+            .trim()
+            .to_string();
+        if !sid.is_empty() {
+            return Some(sid);
         }
     }
     None

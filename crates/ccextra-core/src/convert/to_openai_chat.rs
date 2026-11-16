@@ -76,15 +76,15 @@ pub fn convert_to_openai_chat_with(
     if capabilities.supports_temperature {
         if let Some(val) = body.get("temperature") {
             openai.insert("temperature".into(), val.clone());
-        } else if capabilities.supports_top_p {
-            if let Some(val) = body.get("top_p") {
-                openai.insert("top_p".into(), val.clone());
-            }
-        }
-    } else if capabilities.supports_top_p {
-        if let Some(val) = body.get("top_p") {
+        } else if capabilities.supports_top_p
+            && let Some(val) = body.get("top_p")
+        {
             openai.insert("top_p".into(), val.clone());
         }
+    } else if capabilities.supports_top_p
+        && let Some(val) = body.get("top_p")
+    {
+        openai.insert("top_p".into(), val.clone());
     }
     // stop_sequences → stop(单元素发字符串,一致)
     if let Some(seqs) = body.get("stop_sequences").and_then(|v| v.as_array()) {
@@ -277,12 +277,11 @@ pub fn convert_to_openai_chat_with(
     }
 
     // tool_choice 映射(仅当有存活工具时处理,对齐 sub2api 请求侧入口判断)
-    if !declared_tools.is_empty() {
-        if let Some(tc) = body.get("tool_choice") {
-            if let Some(choice) = convert_tool_choice(tc, &declared_tools) {
-                openai.insert("tool_choice".into(), choice);
-            }
-        }
+    if !declared_tools.is_empty()
+        && let Some(tc) = body.get("tool_choice")
+        && let Some(choice) = convert_tool_choice(tc, &declared_tools)
+    {
+        openai.insert("tool_choice".into(), choice);
     }
 
     // disable_parallel_tool_use → parallel_tool_calls: false
@@ -473,10 +472,8 @@ fn normalize_openai_chat_max_tokens(
         return;
     }
     if use_max_completion_tokens {
-        if has_max_tokens {
-            if let Some(val) = openai.remove("max_tokens") {
-                openai.insert("max_completion_tokens".into(), val);
-            }
+        if has_max_tokens && let Some(val) = openai.remove("max_tokens") {
+            openai.insert("max_completion_tokens".into(), val);
         }
     } else if has_mct {
         if has_max_tokens {
@@ -730,17 +727,17 @@ fn convert_message_parts(
                 let sig = part.get("signature").and_then(|v| v.as_str()).unwrap_or("");
                 // 对齐 CPA 531721bf 跨格式:commentary → 纯 text,不进 reasoning_content
                 if is_codex_commentary_signature_marker(sig) {
-                    if let Some(t) = part.get("thinking").and_then(|v| v.as_str()) {
-                        if !t.is_empty() {
-                            content_items.push(json!({"type": "text", "text": t}));
-                        }
+                    if let Some(t) = part.get("thinking").and_then(|v| v.as_str())
+                        && !t.is_empty()
+                    {
+                        content_items.push(json!({"type": "text", "text": t}));
                     }
-                } else if role == "assistant" && should_map_thinking_to_reasoning(part) {
-                    if let Some(t) = part.get("thinking").and_then(|v| v.as_str()) {
-                        if !t.trim().is_empty() {
-                            reasoning_parts.push(t.to_string());
-                        }
-                    }
+                } else if role == "assistant"
+                    && should_map_thinking_to_reasoning(part)
+                    && let Some(t) = part.get("thinking").and_then(|v| v.as_str())
+                    && !t.trim().is_empty()
+                {
+                    reasoning_parts.push(t.to_string());
                 }
             }
             "redacted_thinking" => { /* 显式忽略 */ }
@@ -865,10 +862,10 @@ fn convert_tool_result_content(content: &Value) -> (Value, Vec<Value>) {
                 match p.get("type").and_then(|t| t.as_str()) {
                     // 对齐 sub2api b.Text != "":仅精确空串滤除
                     Some("text") => {
-                        if let Some(t) = p.get("text").and_then(|v| v.as_str()) {
-                            if !t.is_empty() {
-                                texts.push(t);
-                            }
+                        if let Some(t) = p.get("text").and_then(|v| v.as_str())
+                            && !t.is_empty()
+                        {
+                            texts.push(t);
                         }
                     }
                     Some("image") => {
@@ -887,13 +884,13 @@ fn convert_tool_result_content(content: &Value) -> (Value, Vec<Value>) {
             }
         }
         Value::Object(_) => {
-            if content.get("type").and_then(|t| t.as_str()) == Some("image") {
-                if let Some(url) = image_to_url(content) {
-                    return (
-                        Value::String("(no output)".to_string()),
-                        vec![json!({"type": "image_url", "image_url": {"url": url}})],
-                    );
-                }
+            if content.get("type").and_then(|t| t.as_str()) == Some("image")
+                && let Some(url) = image_to_url(content)
+            {
+                return (
+                    Value::String("(no output)".to_string()),
+                    vec![json!({"type": "image_url", "image_url": {"url": url}})],
+                );
             }
             match content.get("text").and_then(|v| v.as_str()) {
                 Some(t) if !t.trim().is_empty() => (Value::String(t.to_string()), Vec::new()),

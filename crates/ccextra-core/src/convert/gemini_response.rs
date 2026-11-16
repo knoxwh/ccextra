@@ -358,21 +358,21 @@ pub fn convert_gemini_stream_chunk(
                     }
                 }));
 
-                if let Some(args) = function_call.get("args") {
-                    if let Some(partial) = state.tool_args.clean_emitted_args(
+                if let Some(args) = function_call.get("args")
+                    && let Some(partial) = state.tool_args.clean_emitted_args(
                         &args.to_string(),
                         client_tool_name,
                         original_request,
-                    ) {
-                        events.push(json!({
-                            "type": "content_block_delta",
-                            "index": state.response_index,
-                            "delta": {
-                                "type": "input_json_delta",
-                                "partial_json": partial
-                            }
-                        }));
-                    }
+                    )
+                {
+                    events.push(json!({
+                        "type": "content_block_delta",
+                        "index": state.response_index,
+                        "delta": {
+                            "type": "input_json_delta",
+                            "partial_json": partial
+                        }
+                    }));
                 }
 
                 state.response_type = ResponseType::Function;
@@ -437,17 +437,17 @@ pub fn convert_gemini_stream_chunk(
     }
 
     // 对齐 CPA e1fb2521:见 finishReason 即冲刷延迟空 input
-    if state.has_finish {
-        if let Some(partial) = state.tool_args.flush_pending_empty() {
-            events.push(json!({
-                "type": "content_block_delta",
-                "index": state.response_index,
-                "delta": {
-                    "type": "input_json_delta",
-                    "partial_json": partial
-                }
-            }));
-        }
+    if state.has_finish
+        && let Some(partial) = state.tool_args.flush_pending_empty()
+    {
+        events.push(json!({
+            "type": "content_block_delta",
+            "index": state.response_index,
+            "delta": {
+                "type": "input_json_delta",
+                "partial_json": partial
+            }
+        }));
     }
 
     events

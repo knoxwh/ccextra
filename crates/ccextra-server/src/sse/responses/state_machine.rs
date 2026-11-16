@@ -116,10 +116,10 @@ impl ResponsesRelay {
 
     /// 工具名还原:short → original(对齐 resolveCodexClaudeToolUseName)
     pub(crate) fn resolve_tool_name(&self, name: &str) -> String {
-        if let Some(rev) = &self.tool_names {
-            if let Some(orig) = rev.get(name) {
-                return orig.clone();
-            }
+        if let Some(rev) = &self.tool_names
+            && let Some(orig) = rev.get(name)
+        {
+            return orig.clone();
         }
         name.to_string()
     }
@@ -161,10 +161,10 @@ impl ResponsesRelay {
             "response.failed" => {
                 self.finished = true;
                 let mut failed_root = root.clone();
-                if failed_root.get("error").is_none() {
-                    if let Some(err) = failed_root.pointer("/response/error") {
-                        failed_root["error"] = err.clone();
-                    }
+                if failed_root.get("error").is_none()
+                    && let Some(err) = failed_root.pointer("/response/error")
+                {
+                    failed_root["error"] = err.clone();
                 }
                 vec![stream_error_frame(&failed_root)]
             }
@@ -327,16 +327,13 @@ impl ResponsesRelay {
                             self.update_function_call_identity(i, item, Some(&root));
                             self.function_call_queue[i].is_custom = is_custom;
                             // custom 工具 input 可能是字符串,包成 {"input": str} 回放
-                            if is_custom {
-                                if let Some(input) =
+                            if is_custom
+                                && let Some(input) =
                                     item.and_then(|i| i.get("input")).and_then(|v| v.as_str())
-                                {
-                                    if !input.is_empty() {
-                                        self.function_call_queue[i].arguments = input.to_string();
-                                        self.function_call_queue[i].has_received_arguments_delta =
-                                            true;
-                                    }
-                                }
+                                && !input.is_empty()
+                            {
+                                self.function_call_queue[i].arguments = input.to_string();
+                                self.function_call_queue[i].has_received_arguments_delta = true;
                             }
                             if !self.function_call_queue[i].name.is_empty() {
                                 self.function_call_queue[i].emit_initial_empty_delta = true;
@@ -623,15 +620,15 @@ impl ResponsesRelay {
 
     fn update_identity(&mut self, response: Option<&Value>) {
         if let Some(r) = response {
-            if let Some(id) = r.get("id").and_then(|v| v.as_str()) {
-                if !id.is_empty() {
-                    self.id = id.to_string();
-                }
+            if let Some(id) = r.get("id").and_then(|v| v.as_str())
+                && !id.is_empty()
+            {
+                self.id = id.to_string();
             }
-            if let Some(model) = r.get("model").and_then(|v| v.as_str()) {
-                if !model.is_empty() {
-                    self.model = model.to_string();
-                }
+            if let Some(model) = r.get("model").and_then(|v| v.as_str())
+                && !model.is_empty()
+            {
+                self.model = model.to_string();
             }
         }
     }
@@ -772,15 +769,15 @@ impl ResponsesRelay {
     /// web_search_call 的 id 提取(对齐 codexWebSearchToolUseID:item/root 多路径 + last 兜底)
     fn web_search_tool_use_id(&mut self, root: &Value, item: &Value) -> String {
         for path in ["id", "output_item_id", "call_id", "item_id"] {
-            if let Some(v) = item.get(path).and_then(|v| v.as_str()) {
-                if !v.trim().is_empty() {
-                    return v.trim().to_string();
-                }
+            if let Some(v) = item.get(path).and_then(|v| v.as_str())
+                && !v.trim().is_empty()
+            {
+                return v.trim().to_string();
             }
-            if let Some(v) = root.get(path).and_then(|v| v.as_str()) {
-                if !v.trim().is_empty() {
-                    return v.trim().to_string();
-                }
+            if let Some(v) = root.get(path).and_then(|v| v.as_str())
+                && !v.trim().is_empty()
+            {
+                return v.trim().to_string();
             }
         }
         if !self.last_web_search_tool_use_id.is_empty() {

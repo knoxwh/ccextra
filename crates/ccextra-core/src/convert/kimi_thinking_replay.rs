@@ -41,10 +41,11 @@ pub fn kimi_thinking_replay_model_family(model: &str) -> String {
 fn strip_thinking_and_context_suffix(model: &str) -> String {
     let mut s = model.trim().to_string();
     // Claude Code effort / thinking 后缀：`model(high)` / `model(1024)`
-    if let Some(open) = s.rfind('(') {
-        if s.ends_with(')') && open > 0 {
-            s = s[..open].to_string();
-        }
+    if let Some(open) = s.rfind('(')
+        && s.ends_with(')')
+        && open > 0
+    {
+        s = s[..open].to_string();
     }
     let lower = s.to_ascii_lowercase();
     if let Some(stripped) = lower.strip_suffix("[1m]") {
@@ -386,11 +387,11 @@ impl KimiThinkingReplayStreamAccumulator {
                     .get("partial_json")
                     .and_then(|v| v.as_str())
                     .unwrap_or("");
-                if self.reserve_bytes(suffix.len()) {
-                    if let Some(block) = self.blocks.get_mut(&index) {
-                        block.input.push_str(suffix);
-                        block.has_input_delta = true;
-                    }
+                if self.reserve_bytes(suffix.len())
+                    && let Some(block) = self.blocks.get_mut(&index)
+                {
+                    block.input.push_str(suffix);
+                    block.has_input_delta = true;
                 }
             }
             _ => self.abandon(),

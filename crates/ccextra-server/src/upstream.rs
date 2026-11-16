@@ -267,11 +267,11 @@ fn grok_cli_headers(
         ),
         ("x-grok-model-override", upstream_model.to_string()),
     ];
-    if let Some(sid) = session_id {
-        if !sid.trim().is_empty() {
-            // 原样发出;trim 只判断空,不改值
-            headers.push(("x-grok-conv-id", sid.to_string()));
-        }
+    if let Some(sid) = session_id
+        && !sid.trim().is_empty()
+    {
+        // 原样发出;trim 只判断空,不改值
+        headers.push(("x-grok-conv-id", sid.to_string()));
     }
     if matches!(protocol, Protocol::OpenAiResponses) {
         headers.push(("x-grok-doom-loop-check", "1024".to_string()));
@@ -1222,12 +1222,12 @@ fn is_stale_connection(err: &anyhow::Error) -> bool {
     };
     // wreq 提供显式 connection-reset 标志时,即使 Display 不含 "reset" 也按 stale 处理
     // (仍受 connect/timeout 优先否决约束)。
-    if !is_connect && !is_timeout {
-        if let Some(e) = err.downcast_ref::<wreq::Error>() {
-            if e.is_connection_reset() {
-                return true;
-            }
-        }
+    if !is_connect
+        && !is_timeout
+        && let Some(e) = err.downcast_ref::<wreq::Error>()
+        && e.is_connection_reset()
+    {
+        return true;
     }
     stale_by_classification(is_connect, is_timeout, err)
 }

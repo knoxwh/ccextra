@@ -322,15 +322,13 @@ fn inline_local_refs_for_clean(schema: &Value) -> Value {
     if !contains_ref(schema) {
         return schema.clone();
     }
-    if let Value::Object(root_map) = schema {
-        if root_map.len() == 1 {
-            if let Some(inner) = root_map.get("schema") {
-                if inner.is_object() {
-                    let resolved = resolve_schema_root(inner, &mut RefResolveState::new(), true);
-                    return Value::Object(Map::from_iter([("schema".to_string(), resolved)]));
-                }
-            }
-        }
+    if let Value::Object(root_map) = schema
+        && root_map.len() == 1
+        && let Some(inner) = root_map.get("schema")
+        && inner.is_object()
+    {
+        let resolved = resolve_schema_root(inner, &mut RefResolveState::new(), true);
+        return Value::Object(Map::from_iter([("schema".to_string(), resolved)]));
     }
     inline_local_refs_rooted(schema, true).expect("contains_ref 已在函数入口确认")
 }
@@ -403,51 +401,42 @@ fn resolve_schema_root(root: &Value, state: &mut RefResolveState, for_clean: boo
     }
 
     // 根级 $ref 展开后兄弟关键字覆盖目标(对齐 resolveLocalRefs)
-    if let Some(Value::String(ref_)) = root_map.get("$ref") {
-        if let Some(ptr) = ref_.strip_prefix("#/") {
-            if let Some(target) = resolve_json_pointer(root, ptr) {
-                let size = target_expansion_size(target, for_clean);
-                if size <= state.budget {
-                    state.budget -= size;
-                    let mut active = vec![ref_.clone()];
-                    let resolved_target =
-                        resolve_local_refs(root, target, &mut active, state, false, for_clean);
-                    if let Value::Object(target_map) = resolved_target {
-                        let mut merged = Map::with_capacity(target_map.len() + out.len());
-                        for k in sorted_keys(&target_map) {
-                            merged.insert(k.clone(), target_map[&k].clone());
-                        }
-                        for k in sorted_keys(&out) {
-                            if k != "$ref" {
-                                merged.insert(k.clone(), out[&k].clone());
-                            }
-                        }
-                        out = merged;
-                    } else {
-                        out = resolve_ref_fallback(
-                            root,
-                            &out,
-                            target,
-                            ref_,
-                            &mut Vec::new(),
-                            state,
-                            for_clean,
-                        );
-                    }
-                } else {
-                    out = resolve_ref_fallback(
-                        root,
-                        &out,
-                        target,
-                        ref_,
-                        &mut Vec::new(),
-                        state,
-                        for_clean,
-                    );
+    if let Some(Value::String(ref_)) = root_map.get("$ref")
+        && let Some(ptr) = ref_.strip_prefix("#/")
+        && let Some(target) = resolve_json_pointer(root, ptr)
+    {
+        let size = target_expansion_size(target, for_clean);
+        if size <= state.budget {
+            state.budget -= size;
+            let mut active = vec![ref_.clone()];
+            let resolved_target =
+                resolve_local_refs(root, target, &mut active, state, false, for_clean);
+            if let Value::Object(target_map) = resolved_target {
+                let mut merged = Map::with_capacity(target_map.len() + out.len());
+                for k in sorted_keys(&target_map) {
+                    merged.insert(k.clone(), target_map[&k].clone());
                 }
-                out.shift_remove("$ref");
+                for k in sorted_keys(&out) {
+                    if k != "$ref" {
+                        merged.insert(k.clone(), out[&k].clone());
+                    }
+                }
+                out = merged;
+            } else {
+                out = resolve_ref_fallback(
+                    root,
+                    &out,
+                    target,
+                    ref_,
+                    &mut Vec::new(),
+                    state,
+                    for_clean,
+                );
             }
+        } else {
+            out = resolve_ref_fallback(root, &out, target, ref_, &mut Vec::new(), state, for_clean);
         }
+        out.shift_remove("$ref");
     }
 
     if !for_clean {
@@ -585,52 +574,48 @@ fn resolve_local_refs(
                 .collect(),
         ),
         Value::Object(map) => {
-            if !in_name_map {
-                if let Some(Value::String(ref_)) = map.get("$ref") {
-                    if let Some(ptr) = ref_.strip_prefix("#/") {
-                        if let Some(target) = resolve_json_pointer(root, ptr) {
-                            if active.contains(ref_) {
-                                return Value::Object(resolve_ref_fallback(
-                                    root, map, target, ref_, active, state, for_clean,
-                                ));
-                            }
-                            let size = target_expansion_size(target, for_clean);
-                            if size > state.budget {
-                                return Value::Object(resolve_ref_fallback(
-                                    root, map, target, ref_, active, state, for_clean,
-                                ));
-                            }
-                            state.budget -= size;
-                            active.push(ref_.clone());
-                            let resolved_target =
-                                resolve_local_refs(root, target, active, state, false, for_clean);
-                            active.pop();
-                            if let Value::Object(target_map) = resolved_target {
-                                let mut out = Map::with_capacity(target_map.len() + map.len());
-                                for key in sorted_keys(&target_map) {
-                                    if for_clean && (key == "$defs" || key == "definitions") {
-                                        continue;
-                                    }
-                                    out.insert(key.clone(), target_map[&key].clone());
-                                }
-                                for key in sorted_keys(map) {
-                                    if key == "$ref" {
-                                        continue;
-                                    }
-                                    if for_clean && (key == "$defs" || key == "definitions") {
-                                        continue;
-                                    }
-                                    out.insert(
-                                        key.clone(),
-                                        resolve_schema_entry(
-                                            root, &key, &map[&key], active, state, for_clean,
-                                        ),
-                                    );
-                                }
-                                return Value::Object(out);
-                            }
+            if !in_name_map
+                && let Some(Value::String(ref_)) = map.get("$ref")
+                && let Some(ptr) = ref_.strip_prefix("#/")
+                && let Some(target) = resolve_json_pointer(root, ptr)
+            {
+                if active.contains(ref_) {
+                    return Value::Object(resolve_ref_fallback(
+                        root, map, target, ref_, active, state, for_clean,
+                    ));
+                }
+                let size = target_expansion_size(target, for_clean);
+                if size > state.budget {
+                    return Value::Object(resolve_ref_fallback(
+                        root, map, target, ref_, active, state, for_clean,
+                    ));
+                }
+                state.budget -= size;
+                active.push(ref_.clone());
+                let resolved_target =
+                    resolve_local_refs(root, target, active, state, false, for_clean);
+                active.pop();
+                if let Value::Object(target_map) = resolved_target {
+                    let mut out = Map::with_capacity(target_map.len() + map.len());
+                    for key in sorted_keys(&target_map) {
+                        if for_clean && (key == "$defs" || key == "definitions") {
+                            continue;
                         }
+                        out.insert(key.clone(), target_map[&key].clone());
                     }
+                    for key in sorted_keys(map) {
+                        if key == "$ref" {
+                            continue;
+                        }
+                        if for_clean && (key == "$defs" || key == "definitions") {
+                            continue;
+                        }
+                        out.insert(
+                            key.clone(),
+                            resolve_schema_entry(root, &key, &map[&key], active, state, for_clean),
+                        );
+                    }
+                    return Value::Object(out);
                 }
             }
 
@@ -662,22 +647,20 @@ fn resolve_ref_fallback(
 ) -> Map<String, Value> {
     let mut out = cyclic_ref_fallback(node, target, ref_);
     // 退化拷贝的目标 description 计入预算;超限只留短 hint
-    if let Value::Object(target_map) = target {
-        if let Some(Value::String(description)) = target_map.get("description") {
-            if !description.is_empty()
-                && description.len() <= MAX_FALLBACK_DESCRIPTION_BYTES
-                && !node.contains_key("description")
-            {
-                let cost = json_string_encoded_size(description);
-                if cost > state.budget {
-                    out.insert(
-                        "description".to_string(),
-                        Value::String(format!("See: {}", ref_name(ref_))),
-                    );
-                } else {
-                    state.budget -= cost;
-                }
-            }
+    if let Value::Object(target_map) = target
+        && let Some(Value::String(description)) = target_map.get("description")
+        && !description.is_empty()
+        && description.len() <= MAX_FALLBACK_DESCRIPTION_BYTES
+        && !node.contains_key("description")
+    {
+        let cost = json_string_encoded_size(description);
+        if cost > state.budget {
+            out.insert(
+                "description".to_string(),
+                Value::String(format!("See: {}", ref_name(ref_))),
+            );
+        } else {
+            state.budget -= cost;
         }
     }
     for key in sorted_keys(node) {
@@ -708,17 +691,17 @@ fn resolve_schema_entry(
     if is_literal_value_keyword(key) {
         return item.clone();
     }
-    if is_name_map_keyword(key) {
-        if let Value::Object(name_map) = item {
-            let mut out = Map::with_capacity(name_map.len());
-            for name in sorted_keys(name_map) {
-                out.insert(
-                    name.clone(),
-                    resolve_local_refs(root, &name_map[&name], active, state, false, for_clean),
-                );
-            }
-            return Value::Object(out);
+    if is_name_map_keyword(key)
+        && let Value::Object(name_map) = item
+    {
+        let mut out = Map::with_capacity(name_map.len());
+        for name in sorted_keys(name_map) {
+            out.insert(
+                name.clone(),
+                resolve_local_refs(root, &name_map[&name], active, state, false, for_clean),
+            );
         }
+        return Value::Object(out);
     }
     resolve_local_refs(root, item, active, state, false, for_clean)
 }
@@ -750,12 +733,11 @@ fn cyclic_ref_fallback(
     if let Value::Object(t) = target {
         for key in ["type", "nullable", "description"] {
             if let Some(v) = t.get(key) {
-                if key == "description" {
-                    if let Value::String(d) = v {
-                        if d.len() > MAX_FALLBACK_DESCRIPTION_BYTES {
-                            continue;
-                        }
-                    }
+                if key == "description"
+                    && let Value::String(d) = v
+                    && d.len() > MAX_FALLBACK_DESCRIPTION_BYTES
+                {
+                    continue;
                 }
                 out.insert(key.to_string(), v.clone());
             }
@@ -1094,17 +1076,12 @@ fn flatten_any_of_one_of_at(
                 if is_literal_value_keyword(&key) && !is_property_definition(path) {
                     continue;
                 }
-                if let Some(child) = map.get_mut(&key) {
-                    if matches!(child, Value::Object(_) | Value::Array(_)) {
-                        path.push(key);
-                        flatten_any_of_one_of_at(
-                            child,
-                            path,
-                            preserve_one_of,
-                            flatten_multi_branch,
-                        );
-                        path.pop();
-                    }
+                if let Some(child) = map.get_mut(&key)
+                    && matches!(child, Value::Object(_) | Value::Array(_))
+                {
+                    path.push(key);
+                    flatten_any_of_one_of_at(child, path, preserve_one_of, flatten_multi_branch);
+                    path.pop();
                 }
             }
             if !is_property_definition(path) {
@@ -1209,12 +1186,12 @@ fn partition_union_branches(
                 has_null = true;
             }
             Value::Object(_) if is_required_only_union_branch(item) => {
-                if let Some(props) = parent_props {
-                    if let Some(materialized) = materialize_required_only_branch(item, props) {
-                        non_null.push(materialized);
-                        has_filtered = true;
-                        continue;
-                    }
+                if let Some(props) = parent_props
+                    && let Some(materialized) = materialize_required_only_branch(item, props)
+                {
+                    non_null.push(materialized);
+                    has_filtered = true;
+                    continue;
                 }
                 has_filtered = true;
             }
@@ -1539,12 +1516,12 @@ fn sanitize_array_items(schema: &mut Value, add_missing: bool) {
                 Value::Array(arr) => key.parse::<usize>().ok().and_then(|i| arr.get_mut(i)),
                 _ => None,
             };
-            if let Some(child) = child {
-                if matches!(child, Value::Object(_) | Value::Array(_)) {
-                    path.push(key);
-                    visit(child, path, add_missing);
-                    path.pop();
-                }
+            if let Some(child) = child
+                && matches!(child, Value::Object(_) | Value::Array(_))
+            {
+                path.push(key);
+                visit(child, path, add_missing);
+                path.pop();
             }
         }
         let Value::Object(map) = value else {
@@ -1596,12 +1573,12 @@ fn sanitize_object_properties(schema: &mut Value) {
                 Value::Array(arr) => key.parse::<usize>().ok().and_then(|i| arr.get_mut(i)),
                 _ => None,
             };
-            if let Some(child) = child {
-                if matches!(child, Value::Object(_) | Value::Array(_)) {
-                    path.push(key);
-                    visit(child, path);
-                    path.pop();
-                }
+            if let Some(child) = child
+                && matches!(child, Value::Object(_) | Value::Array(_))
+            {
+                path.push(key);
+                visit(child, path);
+                path.pop();
             }
         }
         let Value::Object(map) = value else {
@@ -1930,10 +1907,10 @@ fn is_api_request_document(m: &Map<String, Value>) -> bool {
     {
         return true;
     }
-    if let Some(Value::Object(req)) = m.get("request") {
-        if is_api_request_document(req) {
-            return true;
-        }
+    if let Some(Value::Object(req)) = m.get("request")
+        && is_api_request_document(req)
+    {
+        return true;
     }
     false
 }
@@ -1998,28 +1975,26 @@ fn repair_schema_node(
     }
 
     // 2. 递归修复 properties(仅当 Step 1 未处理时)
-    if !skip_step2 {
-        if let Some(Value::Object(props_val)) = clone.get("properties").cloned() {
-            // 对齐 CPA e1e3a811:含 properties 但无 type 时显式置 type="object"
-            if !clone.contains_key("type") {
-                clone.insert("type".to_string(), Value::String("object".to_string()));
-                modified = true;
-            }
-            let (repaired, promoted, props_mod) =
-                repair_property_map(props_val, add_missing_array_items);
-            clone.insert("properties".to_string(), Value::Object(repaired));
-            if props_mod {
-                modified = true;
-            }
-            if !promoted.is_empty() {
-                let existing = extract_string_array(clone.get("required"));
-                let merged = merge_string_slices(&existing, &promoted);
-                clone.insert(
-                    "required".to_string(),
-                    Value::Array(merged.into_iter().map(Value::String).collect()),
-                );
-                modified = true;
-            }
+    if !skip_step2 && let Some(Value::Object(props_val)) = clone.get("properties").cloned() {
+        // 对齐 CPA e1e3a811:含 properties 但无 type 时显式置 type="object"
+        if !clone.contains_key("type") {
+            clone.insert("type".to_string(), Value::String("object".to_string()));
+            modified = true;
+        }
+        let (repaired, promoted, props_mod) =
+            repair_property_map(props_val, add_missing_array_items);
+        clone.insert("properties".to_string(), Value::Object(repaired));
+        if props_mod {
+            modified = true;
+        }
+        if !promoted.is_empty() {
+            let existing = extract_string_array(clone.get("required"));
+            let merged = merge_string_slices(&existing, &promoted);
+            clone.insert(
+                "required".to_string(),
+                Value::Array(merged.into_iter().map(Value::String).collect()),
+            );
+            modified = true;
         }
     }
 

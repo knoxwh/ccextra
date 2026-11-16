@@ -89,10 +89,10 @@ pub async fn ensure_credential_fresh(
     proxy_url: Option<&str>,
     rejected_token: Option<&str>,
 ) -> Result<ClaudeCredential> {
-    if let Ok(cred) = store::load(path) {
-        if usable(&cred, rejected_token) {
-            return Ok(cred);
-        }
+    if let Ok(cred) = store::load(path)
+        && usable(&cred, rejected_token)
+    {
+        return Ok(cred);
     }
 
     let prelim = store::load(path)?;

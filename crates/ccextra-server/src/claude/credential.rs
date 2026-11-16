@@ -73,10 +73,10 @@ impl ClaudeCredential {
         expires_in: i64,
     ) {
         self.access_token = access_token;
-        if let Some(r) = refresh_token {
-            if !r.trim().is_empty() {
-                self.refresh_token = r;
-            }
+        if let Some(r) = refresh_token
+            && !r.trim().is_empty()
+        {
+            self.refresh_token = r;
         }
         let now = OffsetDateTime::now_utc();
         self.last_refresh = now.format(&Rfc3339).unwrap_or_default();

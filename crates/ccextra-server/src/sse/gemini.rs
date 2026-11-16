@@ -99,22 +99,21 @@ fn process_gemini_events(
         let mut chunk = match chunk.get("response") {
             Some(inner) => {
                 let mut inner = inner.clone();
-                if inner.get("usageMetadata").is_none() {
-                    if let Some(usage) = chunk
+                if inner.get("usageMetadata").is_none()
+                    && let Some(usage) = chunk
                         .get("usageMetadata")
                         .or_else(|| chunk.get("cpaUsageMetadata"))
-                    {
-                        inner["usageMetadata"] = usage.clone();
-                    }
+                {
+                    inner["usageMetadata"] = usage.clone();
                 }
                 inner
             }
             None => chunk,
         };
-        if chunk.get("usageMetadata").is_none() {
-            if let Some(usage) = chunk.get("cpaUsageMetadata").cloned() {
-                chunk["usageMetadata"] = usage;
-            }
+        if chunk.get("usageMetadata").is_none()
+            && let Some(usage) = chunk.get("cpaUsageMetadata").cloned()
+        {
+            chunk["usageMetadata"] = usage;
         }
 
         // 空信封、空 candidates 不算已开始响应;usage 对象可单独作为有效 payload。

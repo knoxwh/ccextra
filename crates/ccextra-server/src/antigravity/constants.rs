@@ -53,12 +53,12 @@ pub fn base_user_agent(user_agent: &str) -> String {
         return REQUEST_UA.to_string();
     }
     let lower = user_agent.to_ascii_lowercase();
-    if is_antigravity_family_ua(&lower) {
-        if let Some(idx) = lower.find(" google-api-nodejs-client/") {
-            let trimmed = user_agent[..idx].trim();
-            if !trimmed.is_empty() {
-                return trimmed.to_string();
-            }
+    if is_antigravity_family_ua(&lower)
+        && let Some(idx) = lower.find(" google-api-nodejs-client/")
+    {
+        let trimmed = user_agent[..idx].trim();
+        if !trimmed.is_empty() {
+            return trimmed.to_string();
         }
     }
     user_agent.to_string()
