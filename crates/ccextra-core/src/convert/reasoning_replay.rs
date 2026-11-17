@@ -974,7 +974,7 @@ mod tests {
         assert_eq!(filtered.len(), 1);
         assert_eq!(filtered[0]["encrypted_content"], "gAAA");
         // grok:带文本的明文保留
-        let filtered = filter_turn_items(body["input"].as_array().unwrap(), items.clone(), true);
+        let filtered = filter_turn_items(body["input"].as_array().unwrap(), items, true);
         assert_eq!(filtered.len(), 2);
         assert!(
             filtered

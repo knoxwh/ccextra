@@ -2959,7 +2959,7 @@ mod tests {
     fn context_fingerprint_is_stable_and_sensitive() {
         let a = base_request();
         let mut fa = ContextFingerprints::new(&a);
-        let mut fb = ContextFingerprints::new(&a.clone());
+        let mut fb = ContextFingerprints::new(&a);
         let ca = a["contents"].as_array().unwrap().clone();
         assert_eq!(fa.at(&ca, 1), fb.at(&ca, 1));
         assert!(!fa.at(&ca, 0).is_empty());
@@ -3015,7 +3015,7 @@ mod tests {
             ContextFingerprints::new(&r1).at(&c1, c1.len()),
             ContextFingerprints::new(&r2).at(&c2, c2.len())
         );
-        let mut other = claude.clone();
+        let mut other = claude;
         other["tools"][0]["input_schema"]["properties"]["q"] = json!({"type": "string"});
         let r3 = convert(&other);
         let c3 = r3["contents"].as_array().unwrap().clone();
@@ -3120,7 +3120,7 @@ mod tests {
         let base = base_request();
         let items = first_turn_items(&base);
         let sa = stable("native-a", "/a");
-        let mut req = base.clone();
+        let mut req = base;
         req["contents"].as_array_mut().unwrap().extend([
             json!({"role": "model", "parts": [
                 {"functionCall": {"id": sa, "name": "Read", "args": {"p": "/a"}}},
@@ -3375,7 +3375,7 @@ mod tests {
         ]}, "finishReason": "STOP"}]}}));
         let items = acc.take_commit_items().unwrap();
         let sid = gemini_claude_tool_use_id("native-x", "Bash", Some(&native_args));
-        let mut req = base.clone();
+        let mut req = base;
         req["contents"].as_array_mut().unwrap().extend([
             json!({"role": "model", "parts": [{"thoughtSignature": GEMINI_SKIP_THOUGHT_SIGNATURE_VALIDATOR,
                 "functionCall": {"id": sid, "name": "Bash", "args": client_args}}]}),
@@ -3466,7 +3466,7 @@ mod tests {
             json!({"type": "function_call_part", "call_id": "native-s", "name": "Read",
             "args": raw, "thoughtSignature": SIG_A, "contentIndex": 1, "partIndex": 0, "targetOccurrence": 0}),
         ];
-        let mut req = base.clone();
+        let mut req = base;
         req["contents"].as_array_mut().unwrap().extend([
             json!({"role": "model", "parts": [{"functionCall": {"id": sid, "name": "Read", "args": {"p": "/s"}}}]}),
             json!({"role": "user", "parts": [{"functionResponse": {"id": sid, "name": "Read", "response": {}}}]}),
@@ -3938,7 +3938,7 @@ mod tests {
         let base = base_request();
         let items = first_turn_items(&base);
         let (sa, sb) = (stable("native-a", "/a"), stable("native-b", "/b"));
-        let mut req = base.clone();
+        let mut req = base;
         req["contents"]
             .as_array_mut()
             .unwrap()
@@ -3974,7 +3974,7 @@ mod tests {
         let base = base_request();
         let items = first_turn_items(&base);
         let (sa, sb) = (stable("native-a", "/a"), stable("native-b", "/b"));
-        let mut req = base.clone();
+        let mut req = base;
         let contents = req["contents"].as_array_mut().unwrap();
         contents.push(json!({"role": "model", "parts": [{"text": "ok"}]}));
         contents.push(orphan_fr_content(&sa, &sb));
@@ -4000,7 +4000,7 @@ mod tests {
         let base = base_request();
         let items = first_turn_items(&base);
         let (sa, sb) = (stable("native-a", "/a"), stable("native-b", "/b"));
-        let mut req = base.clone();
+        let mut req = base;
         req["contents"]
             .as_array_mut()
             .unwrap()
@@ -4111,7 +4111,7 @@ mod tests {
         let base = base_request();
         let items = first_turn_items(&base);
         let (sa, sb) = (stable("native-a", "/a"), stable("native-b", "/b"));
-        let mut req = base.clone();
+        let mut req = base;
         let contents = req["contents"].as_array_mut().unwrap();
         contents.push(json!({"role": "user", "parts": [
             {"functionResponse": {"id": sa, "name": "Read", "response": {"result": "a"}}}

@@ -93,7 +93,7 @@ fn fingerprint(hs: &[u8]) -> (String, String, String) {
             .collect::<Vec<_>>()
             .join(",")
     };
-    let mut cs = c.clone();
+    let mut cs = c;
     cs.sort();
     let mut es: Vec<u16> = e.iter().copied().filter(|x| *x != 0 && *x != 16).collect();
     es.sort();

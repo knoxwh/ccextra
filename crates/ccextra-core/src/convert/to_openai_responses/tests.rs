@@ -266,8 +266,8 @@ fn test_tool_name_shortened_with_unique_suffix() {
         "model": "test",
         "messages": [],
         "tools": [
-            {"name": a.clone(), "description": "d", "input_schema": {"type": "object"}},
-            {"name": b.clone(), "description": "d", "input_schema": {"type": "object"}},
+            {"name": a, "description": "d", "input_schema": {"type": "object"}},
+            {"name": b, "description": "d", "input_schema": {"type": "object"}},
             {"name": "short_tool", "description": "d", "input_schema": {"type": "object"}}
         ]
     });
@@ -289,10 +289,10 @@ fn test_tool_use_name_uses_short_name() {
         "model": "test",
         "messages": [
             {"role": "assistant", "content": [
-                {"type": "tool_use", "id": "t1", "name": long.clone(), "input": {}}
+                {"type": "tool_use", "id": "t1", "name": long, "input": {}}
             ]}
         ],
-        "tools": [{"name": long.clone(), "input_schema": {"type": "object"}}]
+        "tools": [{"name": long, "input_schema": {"type": "object"}}]
     });
     let rev = convert_to_openai_responses(&mut body, "test-model").unwrap();
     let short = body["tools"][0]["name"].as_str().unwrap();
@@ -1717,7 +1717,7 @@ fn test_pure_const_union_guards() {
 
     // 同时带 oneOf 与 anyOf:不动
     let both = json!({"properties": {"kind": {
-        "oneOf": branches.clone(),
+        "oneOf": branches,
         "anyOf": branches
     }}});
     let mut params = both;
@@ -2177,7 +2177,7 @@ fn test_long_call_id_shortened() {
         "model": "test",
         "messages": [
             {"role": "assistant", "content": [
-                {"type": "tool_use", "id": long_id.clone(), "name": "f", "input": {}}
+                {"type": "tool_use", "id": long_id, "name": "f", "input": {}}
             ]}
         ]
     });

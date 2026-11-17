@@ -606,7 +606,7 @@ mod tests {
     #[test]
     fn test_claude_55_tool_choice_auto_none_untouched() {
         for tc in [json!({"type": "auto"}), json!({"type": "none"})] {
-            let mut body = json!({"model": "a", "tool_choice": tc.clone(), "messages": []});
+            let mut body = json!({"model": "a", "tool_choice": tc, "messages": []});
             convert_passthrough(&mut body, "claude-sonnet-5-5").unwrap();
             assert_eq!(body["tool_choice"], tc);
         }

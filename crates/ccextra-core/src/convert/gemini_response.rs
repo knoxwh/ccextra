@@ -1816,7 +1816,7 @@ mod tests {
         let expected = gemini_claude_tool_use_id("native-1", "Read", Some(&fc["args"]));
         for ids in [
             stream_tool_use_ids(Some("gemini-3-flash"), fc.clone()),
-            nonstream_tool_use_ids(Some("gemini-3-flash"), fc.clone()),
+            nonstream_tool_use_ids(Some("gemini-3-flash"), fc),
         ] {
             assert_eq!(ids, vec![expected.clone()]);
         }

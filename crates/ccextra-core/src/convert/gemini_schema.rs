@@ -1327,7 +1327,7 @@ fn process_union_keywords(
             .unwrap_or("")
             .to_string();
 
-        let mut candidate_items = arr.clone();
+        let mut candidate_items = arr;
         if has_filtered || non_null_items.len() >= 2 {
             candidate_items.clone_from(&non_null_items);
             if has_null {
@@ -4290,7 +4290,7 @@ mod tests {
         let property_ref = json!({
             "type": "object",
             "properties": {"person": {"$ref": "#/$defs/Person"}},
-            "$defs": {"Person": person.clone()}
+            "$defs": {"Person": person}
         });
         let root_ref = json!({
             "$ref": "#/$defs/Person",

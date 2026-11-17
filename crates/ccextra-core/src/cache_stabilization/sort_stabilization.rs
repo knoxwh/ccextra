@@ -370,7 +370,7 @@ mod tests {
                 json!({"instructions": "", "input": [{"type": "message", "role": "developer", "content": [
                     {"type": "output_text", "text": unsorted}]}]}),
                 "/input/0/content/0/text",
-                sorted.clone(),
+                sorted,
             ),
         ] {
             assert_eq!(stabilize_block_sort(&mut body, kind), 1, "{name}");

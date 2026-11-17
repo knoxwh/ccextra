@@ -566,7 +566,7 @@ pub fn convert_tool_definitions(
         }
 
         gemini_tools.push(gemini_tool);
-        short_to_original.insert(short_name.clone(), original_name.to_string());
+        short_to_original.insert(short_name, original_name.to_string());
     }
 
     (gemini_tools, short_to_original)
@@ -837,7 +837,7 @@ IMPORTANT: Assist with authorized security testing.
             "HIGH"
         );
         // 显式 effort 透传
-        let mut with_effort = anthropic.clone();
+        let mut with_effort = anthropic;
         with_effort["output_config"] = json!({"effort": "LOW"});
         let (gemini, _) = convert_to_gemini(&with_effort, "gemini-2.5-pro");
         assert_eq!(
@@ -1509,9 +1509,9 @@ IMPORTANT: Assist with authorized security testing.
         let common = vec![
             json!({"role": "user", "parts": [{"text": "q"}]}),
             json!({"role": "model", "parts": [{"text": "a"}]}),
-            thought_only.clone(),
+            thought_only,
         ];
-        let (mut a, mut g) = (common.clone(), common.clone());
+        let (mut a, mut g) = (common.clone(), common);
         ensure_antigravity_gemini_boundary_user_content(&mut a);
         ensure_gemini_boundary_user_content(&mut g);
         assert_eq!(a, g);

@@ -1411,7 +1411,7 @@ pub fn sanitize_gemini_request_thought_signatures(contents: &mut [serde_json::Va
                 && decision.action == SignatureAction::Preserve
                 && !is_gemini_thought_signature_bypass(&signature_payload_without_prefix(&raw))
             {
-                decision.normalized.clone()
+                decision.normalized
             } else {
                 String::new()
             };
