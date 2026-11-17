@@ -55,11 +55,8 @@ pub(crate) fn normalize_tool_parameters(schema: &Value) -> Value {
             let Some(Value::Array(arr)) = s.get(*k) else {
                 return true;
             };
-            arr.iter().all(|b| {
-                b.get("type")
-                    .map(branch_schema_type_is_object_only)
-                    .unwrap_or(false)
-            })
+            arr.iter()
+                .all(|b| b.get("type").is_some_and(branch_schema_type_is_object_only))
         });
         if !object_only {
             return json!({"type": "object", "properties": {}, "additionalProperties": true});
@@ -323,15 +320,12 @@ pub(crate) fn simplify_pure_const_unions(params: &mut Value) {
         let obj = prop.as_object_mut().unwrap();
         if let Some(existing) = obj.get("enum") {
             // 已有 enum:仅当与 union 语义一致时删冗余 union
-            let identical = existing
-                .as_array()
-                .map(|arr| {
-                    arr.len() == semantic_keys.len()
-                        && arr
-                            .iter()
-                            .all(|v| semantic_keys.contains(&canonical_json_value_key(v)))
-                })
-                .unwrap_or(false);
+            let identical = existing.as_array().is_some_and(|arr| {
+                arr.len() == semantic_keys.len()
+                    && arr
+                        .iter()
+                        .all(|v| semantic_keys.contains(&canonical_json_value_key(v)))
+            });
             if identical {
                 obj.remove(union_name);
             }
@@ -437,8 +431,7 @@ fn branch_schema_type_is_object_only(t: &Value) -> bool {
             !arr.is_empty()
                 && arr.iter().all(|item| {
                     item.as_str()
-                        .map(|s| s.eq_ignore_ascii_case("object"))
-                        .unwrap_or(false)
+                        .is_some_and(|s| s.eq_ignore_ascii_case("object"))
                 })
         }
         _ => false,

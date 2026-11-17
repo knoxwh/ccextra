@@ -155,7 +155,7 @@ pub fn resolve_effort_from_body(body: &serde_json::Value) -> Option<&'static str
         .and_then(|v| v.as_str());
 
     // adaptive/auto 使用顶层 effort;budget_tokens 仅属于 enabled legacy 形状。
-    if matches!(thinking_type, Some("adaptive") | Some("auto")) {
+    if matches!(thinking_type, Some("adaptive" | "auto")) {
         if let Some(e) = body
             .get("output_config")
             .and_then(|o| o.get("effort"))

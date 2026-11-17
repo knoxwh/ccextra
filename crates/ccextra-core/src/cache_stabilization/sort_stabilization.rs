@@ -110,7 +110,7 @@ fn sort_openai_system_messages(
     for msg in messages.iter_mut() {
         let is_system = matches!(
             msg.get("role").and_then(|r| r.as_str()),
-            Some("system") | Some("developer")
+            Some("system" | "developer")
         );
         if !is_system {
             continue;
@@ -123,7 +123,7 @@ fn sort_openai_system_messages(
                 for part in parts.iter_mut() {
                     let is_text = match part.get("type").and_then(|t| t.as_str()) {
                         Some("text") => true,
-                        Some("input_text") | Some("output_text") => responses_parts,
+                        Some("input_text" | "output_text") => responses_parts,
                         _ => false,
                     };
                     if is_text && let Some(Value::String(text)) = part.get_mut("text") {
@@ -156,19 +156,16 @@ fn sort_system_text(s: &mut String, skills_re: &regex::Regex, deferred_re: &rege
 fn sort_skills_block(s: &mut String, re: &regex::Regex) -> usize {
     let mut n = 0;
     let replaced = re.replace_all(s, |caps: &regex::Captures| {
-        let header = caps.get(1).map(|m| m.as_str()).unwrap_or("");
-        let entries_text = caps.get(2).map(|m| m.as_str()).unwrap_or("");
-        let footer = caps.get(3).map(|m| m.as_str()).unwrap_or("");
+        let header = caps.get(1).map_or("", |m| m.as_str());
+        let entries_text = caps.get(2).map_or("", |m| m.as_str());
+        let footer = caps.get(3).map_or("", |m| m.as_str());
 
         let entries = split_on_newline_dash(entries_text);
         let mut sorted: Vec<&str> = entries.clone();
         sorted.sort_unstable();
         if entries == sorted {
             // 已排序：原样返回原始文本，使替换成为逐字节的空操作。
-            return caps
-                .get(0)
-                .map(|m| m.as_str().to_string())
-                .unwrap_or_default();
+            return caps.get(0).map_or_default(|m| m.as_str().to_string());
         }
         n += 1;
         format!("{}{}{}", header, sorted.join("\n"), footer)
@@ -183,9 +180,9 @@ fn sort_skills_block(s: &mut String, re: &regex::Regex) -> usize {
 fn sort_deferred_block(s: &mut String, re: &regex::Regex) -> usize {
     let mut n = 0;
     let replaced = re.replace_all(s, |caps: &regex::Captures| {
-        let header = caps.get(1).map(|m| m.as_str()).unwrap_or("");
-        let tools_list = caps.get(2).map(|m| m.as_str()).unwrap_or("");
-        let footer = caps.get(3).map(|m| m.as_str()).unwrap_or("");
+        let header = caps.get(1).map_or("", |m| m.as_str());
+        let tools_list = caps.get(2).map_or("", |m| m.as_str());
+        let footer = caps.get(3).map_or("", |m| m.as_str());
 
         let mut tools: Vec<&str> = tools_list
             .split('\n')
@@ -195,10 +192,7 @@ fn sort_deferred_block(s: &mut String, re: &regex::Regex) -> usize {
         let original = tools.clone();
         tools.sort_unstable();
         if tools == original {
-            return caps
-                .get(0)
-                .map(|m| m.as_str().to_string())
-                .unwrap_or_default();
+            return caps.get(0).map_or_default(|m| m.as_str().to_string());
         }
         n += 1;
         format!("{}{}{}", header, tools.join("\n"), footer)

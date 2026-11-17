@@ -201,8 +201,7 @@ fn random_u64() -> u64 {
     let mut h = sha2::Sha256::new();
     let now = std::time::SystemTime::now()
         .duration_since(std::time::UNIX_EPOCH)
-        .map(|d| d.as_nanos())
-        .unwrap_or(0);
+        .map_or(0, |d| d.as_nanos());
     h.update(now.to_be_bytes());
     h.update(std::process::id().to_be_bytes());
     h.update(std::thread::current().name().unwrap_or("").as_bytes());
@@ -215,8 +214,7 @@ fn random_u64() -> u64 {
 fn official_request_id(seed: &str, step: usize) -> String {
     let millis = std::time::SystemTime::now()
         .duration_since(std::time::UNIX_EPOCH)
-        .map(|d| d.as_millis())
-        .unwrap_or(0);
+        .map_or(0, |d| d.as_millis());
     format!(
         "agent/{}/{millis}/{}/{step}",
         derived_uuid(b"ccextra:antigravity:cascade-id\0", seed),
@@ -250,7 +248,7 @@ fn user_turn_count(request_obj: &serde_json::Map<String, Value>) -> usize {
     let n = request_obj
         .get("contents")
         .and_then(|c| c.as_array())
-        .map(|contents| {
+        .map_or(0, |contents| {
             contents
                 .iter()
                 .filter(|c| c.get("role").and_then(|r| r.as_str()) == Some("user"))
@@ -260,8 +258,7 @@ fn user_turn_count(request_obj: &serde_json::Map<String, Value>) -> usize {
                         .is_some_and(|parts| parts.iter().any(|p| p.get("text").is_some()))
                 })
                 .count()
-        })
-        .unwrap_or(0);
+        });
     n.max(1)
 }
 

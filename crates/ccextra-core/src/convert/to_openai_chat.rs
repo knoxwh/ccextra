@@ -421,8 +421,7 @@ fn normalize_kimi_temperature(openai: &mut serde_json::Map<String, Value>) {
         .get("thinking")
         .and_then(|t| t.get("type"))
         .and_then(|v| v.as_str())
-        .map(|t| t.eq_ignore_ascii_case("disabled"))
-        .unwrap_or(false);
+        .is_some_and(|t| t.eq_ignore_ascii_case("disabled"));
     let keep = if disabled { temp == 0.6 } else { temp == 1.0 };
     if !keep {
         openai.remove("temperature");

@@ -149,8 +149,7 @@ fn extract_system(body: &Value, kind: ApiKind) -> Value {
                 arr.iter().find(|m| {
                     m.get("role")
                         .and_then(|r| r.as_str())
-                        .map(is_openai_system_role)
-                        .unwrap_or(false)
+                        .is_some_and(is_openai_system_role)
                 })
             })
             .and_then(|m| m.get("content").cloned())
@@ -185,8 +184,7 @@ fn first_responses_system_content(body: &Value, key: &str) -> Option<Value> {
             arr.iter().find(|item| {
                 item.get("role")
                     .and_then(Value::as_str)
-                    .map(is_openai_system_role)
-                    .unwrap_or(false)
+                    .is_some_and(is_openai_system_role)
             })
         })
         .and_then(|item| item.get("content").cloned())
@@ -248,8 +246,7 @@ fn non_system_message_count(body: &Value, kind: ApiKind) -> usize {
             .filter(|m| {
                 m.get("role")
                     .and_then(Value::as_str)
-                    .map(|s| !is_openai_system_role(s))
-                    .unwrap_or(true)
+                    .is_none_or(|s| !is_openai_system_role(s))
             })
             .count(),
     }
@@ -271,8 +268,7 @@ fn extract_early_messages(body: &Value, kind: ApiKind) -> Value {
             .filter(|m| {
                 m.get("role")
                     .and_then(Value::as_str)
-                    .map(|s| !is_openai_system_role(s))
-                    .unwrap_or(true)
+                    .is_none_or(|s| !is_openai_system_role(s))
             })
             .take(EARLY_MESSAGES_WINDOW)
             .cloned()
@@ -282,8 +278,7 @@ fn extract_early_messages(body: &Value, kind: ApiKind) -> Value {
             .filter(|m| {
                 m.get("role")
                     .and_then(Value::as_str)
-                    .map(|s| !is_openai_system_role(s))
-                    .unwrap_or(true)
+                    .is_none_or(|s| !is_openai_system_role(s))
             })
             .take(EARLY_MESSAGES_WINDOW)
             .cloned()
@@ -315,8 +310,7 @@ fn first_conversation_message(body: &Value, kind: ApiKind) -> Option<Value> {
             .find(|m| {
                 m.get("role")
                     .and_then(Value::as_str)
-                    .map(|r| !is_openai_system_role(r))
-                    .unwrap_or(false)
+                    .is_some_and(|r| !is_openai_system_role(r))
             })
             .cloned(),
     }
@@ -440,15 +434,12 @@ fn hash_value_canonical_keys(mut value: Value) -> [u8; 32] {
 /// 每个摘要只保留前 12 个十六进制字符（6 字节），以最小化 LRU 内存，
 /// 同时仍为位置级漂移识别提供足够的碰撞抵抗力。
 fn early_message_item_hashes(messages: &Value) -> Vec<String> {
-    messages
-        .as_array()
-        .map(|items| {
-            items
-                .iter()
-                .map(|v| hex_prefix(&hash_value(v), 6))
-                .collect()
-        })
-        .unwrap_or_default()
+    messages.as_array().map_or_default(|items| {
+        items
+            .iter()
+            .map(|v| hex_prefix(&hash_value(v), 6))
+            .collect()
+    })
 }
 
 /// tools 数组的稳定指纹哈希。
@@ -705,13 +696,12 @@ fn unix_ms_now() -> u64 {
     use std::time::{SystemTime, UNIX_EPOCH};
     SystemTime::now()
         .duration_since(UNIX_EPOCH)
-        .map(|d| d.as_millis() as u64)
-        .unwrap_or(0)
+        .map_or(0, |d| d.as_millis() as u64)
 }
 
 impl std::fmt::Debug for DriftState {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        let len = self.cache.lock().map(|c| c.0.len()).unwrap_or(0);
+        let len = self.cache.lock().map_or(0, |c| c.0.len());
         f.debug_struct("DriftState").field("len", &len).finish()
     }
 }
@@ -1030,7 +1020,7 @@ pub fn derive_session_key(headers: &HeaderMap, body: &Value, kind: ApiKind) -> S
     let parent = derive_parent_bucket(headers, body);
     let discriminator = conversation_discriminator(body, kind);
     SessionIdentity {
-        conversation: format!("{}:conv:{}", parent, discriminator),
+        conversation: format!("{parent}:conv:{discriminator}"),
         parent,
     }
 }
@@ -1043,7 +1033,7 @@ pub fn is_stable_parent_bucket(parent: &str) -> bool {
 /// 父级 bucket 派生（头 + body.metadata.user_id）。
 fn derive_parent_bucket(headers: &HeaderMap, body: &Value) -> String {
     if let Some(session_id) = crate::session::extract_claude_code_session(headers, body) {
-        return format!("claude-code:{}", session_id);
+        return format!("claude-code:{session_id}");
     }
 
     if let Some(session_key) = headers
@@ -1052,7 +1042,7 @@ fn derive_parent_bucket(headers: &HeaderMap, body: &Value) -> String {
         .map(str::trim)
         .filter(|v| !v.is_empty())
     {
-        return format!("tklite:{}", session_key);
+        return format!("tklite:{session_key}");
     }
 
     if let Some(request_id) = headers.get("x-request-id").and_then(|v| v.to_str().ok()) {
@@ -1194,7 +1184,7 @@ mod tests {
     fn identity(conv: &str) -> SessionIdentity {
         SessionIdentity {
             parent: "test-parent".to_string(),
-            conversation: format!("test-parent:conv:{}", conv),
+            conversation: format!("test-parent:conv:{conv}"),
         }
     }
 
@@ -1520,7 +1510,7 @@ mod tests {
         );
         assert_eq!(
             masked,
-            format!("a{}b{}c", REMINDER_PLACEHOLDER, REMINDER_PLACEHOLDER)
+            format!("a{REMINDER_PLACEHOLDER}b{REMINDER_PLACEHOLDER}c")
         );
     }
 
@@ -1897,8 +1887,7 @@ mod tests {
                 prefix
                     .chars()
                     .all(|c| c.is_ascii_digit() || matches!(c, 'a'..='f')),
-                "prefix must be lowercase hex: {}",
-                prefix
+                "prefix must be lowercase hex: {prefix}"
             );
         }
 
@@ -1914,8 +1903,7 @@ mod tests {
                 prefix
                     .chars()
                     .all(|c| c.is_ascii_digit() || matches!(c, 'a'..='f')),
-                "prefix must be lowercase hex: {}",
-                prefix
+                "prefix must be lowercase hex: {prefix}"
             );
         }
 

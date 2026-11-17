@@ -171,7 +171,7 @@ pub(crate) async fn read_success_body_or_anthropic(
     match read_body_bounded_upstream(resp, SUCCESS_BODY_LIMIT).await {
         Ok(body) if body.truncated => Err(AppError::with_status(
             StatusCode::BAD_GATEWAY,
-            format!("上游响应超过大小上限: limit={}", SUCCESS_BODY_LIMIT),
+            format!("上游响应超过大小上限: limit={SUCCESS_BODY_LIMIT}"),
         )),
         Ok(body) => Ok(body.bytes),
         Err(BodyReadError::Idle) => Err(AppError::with_status(

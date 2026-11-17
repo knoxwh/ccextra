@@ -105,7 +105,7 @@ mod tests {
             auth_kind: "oauth".to_string(),
             access_token: "test_access".to_string(),
             refresh_token: "test_refresh".to_string(),
-            id_token: "".to_string(),
+            id_token: String::new(),
             token_type: "Bearer".to_string(),
             expires_in: 3600,
             expired: "2026-01-01T00:00:00Z".to_string(),
@@ -127,7 +127,7 @@ mod tests {
         let list_res = list(dir.path()).unwrap();
         assert_eq!(list_res.len(), 1);
 
-        cred.email = "".to_string();
+        cred.email = String::new();
         cred.sub = "sub_only".to_string();
         let path2 = save(dir.path(), &cred).unwrap();
         assert_eq!(path2.file_name().unwrap(), "xai-sub_only.json");

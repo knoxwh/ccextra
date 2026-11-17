@@ -18,7 +18,7 @@ fn is_colliding_tool(name: &str) -> bool {
 /// 冲突名加 `external_` 前缀,非冲突名原样返回。
 pub fn antigravity_tool_name_to_upstream(name: &str) -> String {
     if is_colliding_tool(name) {
-        format!("{}{}", EXTERNAL_TOOL_PREFIX, name)
+        format!("{EXTERNAL_TOOL_PREFIX}{name}")
     } else {
         name.to_string()
     }

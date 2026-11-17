@@ -925,16 +925,14 @@ fn test_normal_thinking_signature_not_affected() {
     let buf2 = out2.concat();
     let s2 = String::from_utf8_lossy(&buf2);
 
-    let combined = format!("{}{}", s1, s2);
+    let combined = format!("{s1}{s2}");
     assert!(
         combined.contains("\"type\":\"thinking\""),
-        "普通签名应发 thinking 块,实际: {}",
-        combined
+        "普通签名应发 thinking 块,实际: {combined}"
     );
     assert!(
         combined.contains("signature_delta"),
-        "应发 signature_delta,实际: {}",
-        combined
+        "应发 signature_delta,实际: {combined}"
     );
     assert!(combined.contains("gAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA"));
     assert!(

@@ -439,12 +439,11 @@ impl ResponsesRelay {
         let triggers = root
             .pointer("/doom_loop_check/triggers")
             .and_then(|v| v.as_array())
-            .map(|arr| {
+            .map_or_default(|arr| {
                 arr.iter()
                     .filter_map(|t| t.as_str().map(String::from))
                     .collect::<Vec<_>>()
-            })
-            .unwrap_or_default();
+            });
         self.absorb_doom_loop_triggers(&triggers)
     }
 
@@ -815,11 +814,10 @@ impl ResponsesRelay {
         // 映射为 cache_creation_input_tokens,对齐 CPA 893abbab)
         let (input_tokens, output_tokens, cached, cache_write, thinking_tokens) = response
             .and_then(|r| r.get("usage"))
-            .map(extract_usage_responses)
-            .unwrap_or((0, 0, 0, 0, -1));
+            .map_or((0, 0, 0, 0, -1), extract_usage_responses);
 
         let stop_seq = response.and_then(stop_sequence);
-        let raw_reason = response.map(codex_stop_reason).unwrap_or_default();
+        let raw_reason = response.map_or_default(codex_stop_reason);
         let stop_reason = map_stop_reason(&raw_reason, self.has_emitted_tool_use);
 
         out.push(emit::message_delta(

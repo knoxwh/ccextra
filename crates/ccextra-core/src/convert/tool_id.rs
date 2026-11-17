@@ -28,8 +28,7 @@ pub fn sanitize_claude_tool_id(id: &str) -> String {
     if cleaned.is_empty() {
         let nanos = std::time::SystemTime::now()
             .duration_since(std::time::UNIX_EPOCH)
-            .map(|d| d.as_nanos())
-            .unwrap_or(0);
+            .map_or(0, |d| d.as_nanos());
         return format!(
             "toolu_{}_{}",
             nanos,
@@ -41,7 +40,7 @@ pub fn sanitize_claude_tool_id(id: &str) -> String {
 
 /// 生成 Claude 侧 tool_use id:`{name}-{counter}`(对齐 CPA 流/非流响应侧)
 pub fn claude_tool_id_for(name: &str, counter: u64) -> String {
-    sanitize_claude_tool_id(&format!("{}-{}", name, counter))
+    sanitize_claude_tool_id(&format!("{name}-{counter}"))
 }
 
 /// 从 tool_use_id 反解工具名(对齐 CPA toolNameFromClaudeToolUseID):

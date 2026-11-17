@@ -199,7 +199,7 @@ pub fn convert_to_gemini_with_registry(
                     }
                 }
             }
-            Some("adaptive") | Some("auto") => {
+            Some("adaptive" | "auto") => {
                 // 对齐 CPA:effort 显式给则透传 thinkingLevel;否则按目标模型
                 // thinking.max 发 thinkingBudget,查不到再兜底 "high"。
                 // Antigravity 无预算表,走 thinkingLevel,并按注册表钳到模型档位
@@ -267,12 +267,11 @@ pub fn convert_to_gemini_with_registry(
         && body
             .get("tools")
             .and_then(|t| t.as_array())
-            .map(|tools| {
+            .is_some_and(|tools| {
                 tools
                     .iter()
                     .any(|t| t.get("strict") == Some(&Value::Bool(true)))
-            })
-            .unwrap_or(false);
+            });
     let tool_choice = body.get("tool_choice").filter(|tc| !tc.is_null());
     if let Some(tool_choice) = tool_choice {
         let (choice_type, choice_name) = match tool_choice {

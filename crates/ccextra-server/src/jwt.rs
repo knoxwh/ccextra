@@ -110,7 +110,7 @@ mod tests {
         let payload = r#"{"azp":"test-client"}"#;
         let encoded = engine.encode(payload.as_bytes());
         // 手动添加 padding（模拟非标准 token）
-        let with_padding = format!("header.{}==.sig", encoded);
+        let with_padding = format!("header.{encoded}==.sig");
         assert_eq!(extract_client_id(&with_padding), Some("test-client".into()));
     }
 }

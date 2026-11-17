@@ -145,8 +145,7 @@ pub fn credential_file_name(email: &str, account_id: &str) -> String {
     }
     let ms = SystemTime::now()
         .duration_since(SystemTime::UNIX_EPOCH)
-        .map(|d| d.as_millis())
-        .unwrap_or(0);
+        .map_or(0, |d| d.as_millis());
     format!("codex-{ms}.json")
 }
 
@@ -168,7 +167,7 @@ mod tests {
         let payload = r#"{"email":"test@example.com","https://api.openai.com/auth":{"chatgpt_account_id":"acct-123","chatgpt_plan_type":"pro"}}"#;
         use base64::Engine;
         let encoded = base64::engine::general_purpose::URL_SAFE_NO_PAD.encode(payload.as_bytes());
-        let token = format!("header.{}.sig", encoded);
+        let token = format!("header.{encoded}.sig");
         let (email, account_id, plan_type) = parse_jwt_identity(&token);
         assert_eq!(email, "test@example.com");
         assert_eq!(account_id, "acct-123");

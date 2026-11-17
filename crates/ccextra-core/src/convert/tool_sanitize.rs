@@ -80,15 +80,15 @@ pub fn sanitized_function_name_map(names: &[&str]) -> HashMap<String, String> {
 /// base 截到 64-13=51 字符,撞车则 attempt+1
 fn disambiguate(base: &str, original: &str, used: &HashSet<String>) -> String {
     for attempt in 0u32.. {
-        let digest = Sha256::digest(format!("{}\x00{}", original, attempt).as_bytes());
+        let digest = Sha256::digest(format!("{original}\x00{attempt}").as_bytes());
         let mut suffix = String::with_capacity(13);
         suffix.push('_');
         for b in &digest[..6] {
-            suffix.push_str(&format!("{:02x}", b));
+            suffix.push_str(&format!("{b:02x}"));
         }
         let max_prefix = 64 - suffix.len();
         let prefix: String = base.chars().take(max_prefix).collect();
-        let candidate = format!("{}{}", prefix, suffix);
+        let candidate = format!("{prefix}{suffix}");
         if !used.contains(&candidate) {
             return candidate;
         }

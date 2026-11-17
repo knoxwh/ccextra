@@ -443,7 +443,7 @@ impl ChatRelay {
                 if let Some(ref id) = incoming_id
                     && !call.start_emitted
                 {
-                    call.id = id.clone();
+                    call.id.clone_from(id);
                 }
 
                 if let Some(function) = tc.get("function") {
@@ -480,11 +480,7 @@ impl ChatRelay {
 
     /// 分配 tool_use 的 block index(帧在 flush 时发)
     fn emit_tool_use_start(&mut self, openai_index: usize, frames: &mut Vec<Bytes>) {
-        let started = self
-            .tool_calls
-            .get(&openai_index)
-            .map(|c| c.started)
-            .unwrap_or(true);
+        let started = self.tool_calls.get(&openai_index).is_none_or(|c| c.started);
         if started {
             return;
         }
@@ -672,7 +668,7 @@ impl ChatRelay {
                             frames.extend(self.emit_content_delta(BlockType::Text, text));
                         }
                         Value::Object(_) => match part.get("type").and_then(|v| v.as_str()) {
-                            Some("thinking") | Some("reasoning") => {
+                            Some("thinking" | "reasoning") => {
                                 let text = extract_content_part_thinking_text(part);
                                 if !text.is_empty() && self.thinking_distinct(&text) {
                                     frames.extend(

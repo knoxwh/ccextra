@@ -42,7 +42,7 @@ pub(crate) async fn fetch_models_from(
     let ua = user_agent.unwrap_or(super::constants::REQUEST_UA);
 
     for base_url in base_urls {
-        let url = format!("{}{}", base_url, ANTIGRAVITY_MODELS_PATH);
+        let url = format!("{base_url}{ANTIGRAVITY_MODELS_PATH}");
 
         // 构造请求体
         let body = if let Some(pid) = project_id {
@@ -55,7 +55,7 @@ pub(crate) async fn fetch_models_from(
             let resp = client
                 .post(&url)
                 .header("Content-Type", "application/json")
-                .header("Authorization", format!("Bearer {}", access_token))
+                .header("Authorization", format!("Bearer {access_token}"))
                 .header("User-Agent", ua)
                 .json(&body)
                 .send()

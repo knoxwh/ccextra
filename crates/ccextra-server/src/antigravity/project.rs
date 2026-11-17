@@ -174,10 +174,7 @@ pub(crate) async fn onboard_user_at(
         }
         let data: Value = serde_json::from_slice(&body.bytes).context("decode onboardUser")?;
         if data.get("done").and_then(Value::as_bool) == Some(true) {
-            let project = data
-                .get("response")
-                .map(extract_project)
-                .unwrap_or_default();
+            let project = data.get("response").map_or_default(extract_project);
             if project.is_empty() {
                 return Err(anyhow!("no project_id in onboardUser response"));
             }

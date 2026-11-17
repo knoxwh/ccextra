@@ -44,7 +44,7 @@ pub fn web_search_result_content(root: &Value, item: &Value) -> Vec<Value> {
             .trim()
             .to_string();
         if title.is_empty() {
-            title = url.clone();
+            title.clone_from(&url);
         }
         out.push(json!({
             "type": "web_search_result",

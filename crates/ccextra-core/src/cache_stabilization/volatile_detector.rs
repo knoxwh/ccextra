@@ -1185,12 +1185,11 @@ mod tests {
                 "messages": [],
             });
             let count = normalize_client_dateline(&mut body, ApiKind::Anthropic);
-            assert_eq!(count, 1, "{} variant should be rewritten", name);
+            assert_eq!(count, 1, "{name} variant should be rewritten");
             assert_eq!(
                 body.get("system").unwrap().as_str().unwrap(),
                 "Today's date is 2026-07-01.",
-                "{} should become ASCII apostrophe",
-                name
+                "{name} should become ASCII apostrophe"
             );
         }
     }

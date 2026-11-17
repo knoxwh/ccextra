@@ -677,7 +677,7 @@ where
     F: Fn(ProviderRefreshConfig, Vec<ProviderConfig>) -> Fut,
     Fut: std::future::Future<Output = Option<Vec<ProviderConfig>>>,
 {
-    const REFRESH_INTERVAL: std::time::Duration = std::time::Duration::from_secs(3 * 3600);
+    const REFRESH_INTERVAL: std::time::Duration = std::time::Duration::from_hours(3);
 
     let mut ready = false;
     let mut retry_attempt: u32 = 0;
@@ -1190,7 +1190,7 @@ mod tests {
                 })
             }
         }));
-        tokio::time::sleep(std::time::Duration::from_secs(4 * 3600)).await;
+        tokio::time::sleep(std::time::Duration::from_hours(4)).await;
         task.abort();
         // 0 → +30s → +60s → +120s 成功 → 之后回到 3h 周期
         assert_eq!(*calls.lock().unwrap(), vec![0, 30, 90, 210, 210 + 3 * 3600]);

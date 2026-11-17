@@ -183,7 +183,7 @@ pub(crate) fn unwrap_custom_tool_input(input: Option<&Value>) -> String {
                     other => other.to_string(),
                 }
             } else {
-                input.map(|v| v.to_string()).unwrap_or_default()
+                input.map_or_default(|v| v.to_string())
             }
         }
         Some(Value::String(s)) => s.clone(),

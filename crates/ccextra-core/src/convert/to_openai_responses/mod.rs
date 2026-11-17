@@ -70,8 +70,7 @@ pub fn convert_to_openai_responses_with(
     // 其余上游将白名单直入 instructions。
     let system = body
         .get("system")
-        .map(|system| system_to_instructions_text(system, upstream_model))
-        .unwrap_or_default();
+        .map_or_default(|system| system_to_instructions_text(system, upstream_model));
     let needs_adapter = needs_adapter_block(upstream_model);
     let cleaned_system = strip_claude_system_for_gpt(&system);
     let instructions = if needs_adapter {

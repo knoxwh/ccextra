@@ -154,9 +154,9 @@ async fn finish_login(
     } else {
         "claude-user".to_string()
     };
-    println!("✅ Claude 订阅登录成功: {}", display_id);
+    println!("✅ Claude 订阅登录成功: {display_id}");
     if !organization_name.is_empty() {
-        println!("组织: {}", organization_name);
+        println!("组织: {organization_name}");
     }
     println!("📁 凭证已保存至: {}", path.display());
     Ok(path)

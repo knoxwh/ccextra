@@ -286,7 +286,7 @@ fn inject_schema_instruction(
             let sys_pos = msgs.iter().position(|m| {
                 matches!(
                     m.get("role").and_then(|r| r.as_str()),
-                    Some("system") | Some("developer")
+                    Some("system" | "developer")
                 )
             });
             match sys_pos {
@@ -338,14 +338,14 @@ fn force_reasoning_effort(body: &mut serde_json::Value, effort: &str, protocol: 
         }
         Protocol::OpenAiChat => {
             if let Some(re) = body.get_mut("reasoning_effort")
-                && matches!(re.as_str(), Some("off") | Some("none"))
+                && matches!(re.as_str(), Some("off" | "none"))
             {
                 *re = serde_json::json!(effort);
                 return true;
             }
             // Kimi: thinking.effort
             if let Some(te) = body.pointer_mut("/thinking/effort")
-                && matches!(te.as_str(), Some("off") | Some("none"))
+                && matches!(te.as_str(), Some("off" | "none"))
             {
                 *te = serde_json::json!(effort);
                 return true;
@@ -354,7 +354,7 @@ fn force_reasoning_effort(body: &mut serde_json::Value, effort: &str, protocol: 
         }
         Protocol::OpenAiResponses => {
             if let Some(e) = body.pointer_mut("/reasoning/effort")
-                && matches!(e.as_str(), Some("off") | Some("none"))
+                && matches!(e.as_str(), Some("off" | "none"))
             {
                 *e = serde_json::json!(effort);
                 return true;

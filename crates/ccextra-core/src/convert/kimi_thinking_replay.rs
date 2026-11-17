@@ -324,7 +324,7 @@ impl KimiThinkingReplayStreamAccumulator {
             self.abandon();
             return;
         }
-        let raw_len = serde_json::to_vec(block).map(|v| v.len()).unwrap_or(0);
+        let raw_len = serde_json::to_vec(block).map_or(0, |v| v.len());
         if !self.reserve_bytes(raw_len) {
             return;
         }
@@ -400,15 +400,11 @@ impl KimiThinkingReplayStreamAccumulator {
 
     fn append_field(&mut self, index: i64, path: &str, suffix: &str, kind: FieldKind) {
         // Initialize from raw once
-        let need_init = self
-            .blocks
-            .get(&index)
-            .map(|b| match kind {
-                FieldKind::Text => !b.text_initialized,
-                FieldKind::Thinking => !b.thinking_initialized,
-                FieldKind::Signature => !b.signature_initialized,
-            })
-            .unwrap_or(true);
+        let need_init = self.blocks.get(&index).is_none_or(|b| match kind {
+            FieldKind::Text => !b.text_initialized,
+            FieldKind::Thinking => !b.thinking_initialized,
+            FieldKind::Signature => !b.signature_initialized,
+        });
         if need_init {
             let initial = self
                 .blocks
@@ -516,7 +512,7 @@ impl KimiThinkingReplayStreamAccumulator {
             parts.push(raw);
         }
         let content = Value::Array(parts);
-        let raw_len = serde_json::to_vec(&content).map(|v| v.len()).unwrap_or(0);
+        let raw_len = serde_json::to_vec(&content).map_or(0, |v| v.len());
         if raw_len > MAX_BYTES_PER_ENTRY {
             self.abandon();
             return None;

@@ -2,7 +2,7 @@ use std::collections::HashMap;
 use std::time::{Duration, Instant};
 
 const CAPACITY: usize = 512;
-const TTL: Duration = Duration::from_secs(30 * 60);
+const TTL: Duration = Duration::from_mins(30);
 
 type Entry = (usize, Instant, u64);
 

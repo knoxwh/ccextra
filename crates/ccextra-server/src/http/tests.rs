@@ -250,14 +250,13 @@ async fn test_openai_responses_retries_empty_stream_before_output() {
         r#"
 name: test-responses
 protocol: openai_responses
-base_url: "http://{}"
+base_url: "http://{upstream_addr}"
 key: sk-test
 proxy_url: "direct"
 models:
   - name: gpt-5
     alias: test-responses
-"#,
-        upstream_addr
+"#
     );
     let provider: ProviderConfig = yaml_serde::from_str(&provider_yaml).unwrap();
     Arc::make_mut(&mut *state.config.write().await)
@@ -316,14 +315,13 @@ async fn test_openai_responses_first_frame_error_returns_502() {
         r#"
 name: test-first-frame-error
 protocol: openai_responses
-base_url: "http://{}"
+base_url: "http://{upstream_addr}"
 key: sk-test
 proxy_url: "direct"
 models:
   - name: gpt-5
     alias: test-first-frame-error
-"#,
-        upstream_addr
+"#
     );
     let provider: ProviderConfig = yaml_serde::from_str(&provider_yaml).unwrap();
     Arc::make_mut(&mut *state.config.write().await)
@@ -416,8 +414,7 @@ async fn test_first_frame_retry_uses_active_base_url() {
 
     let state = mock_state();
     let provider: ProviderConfig = yaml_serde::from_str(&format!(
-        "name: test-active-url\nprotocol: openai_responses\nbase_url: [http://{}, http://{}]\nkey: sk-test\nproxy_url: direct\nmodels:\n  - name: gpt-5\n    alias: test-active-url\n",
-        bad_addr, good_addr
+        "name: test-active-url\nprotocol: openai_responses\nbase_url: [http://{bad_addr}, http://{good_addr}]\nkey: sk-test\nproxy_url: direct\nmodels:\n  - name: gpt-5\n    alias: test-active-url\n"
     ))
     .unwrap();
     Arc::make_mut(&mut *state.config.write().await)
@@ -490,7 +487,7 @@ async fn test_claude_passthrough_clamps_effort_before_upstream() {
         r#"
 - name: test-bailian
   protocol: claude
-  base_url: "http://{}"
+  base_url: "http://{upstream_addr}"
   key: sk-test
   proxy_url: "direct"
   models:
@@ -498,8 +495,7 @@ async fn test_claude_passthrough_clamps_effort_before_upstream() {
       alias: test-glm
     - name: claude-opus-5
       alias: test-claude-local
-"#,
-        upstream_addr
+"#
     );
     let providers: Vec<ProviderConfig> = yaml_serde::from_str(&providers_yaml).unwrap();
     Arc::make_mut(&mut *state.config.write().await)
@@ -593,13 +589,12 @@ async fn test_openai_responses_sanitizes_invalid_encrypted_content_before_reques
                 let has_enc = parsed
                     .get("input")
                     .and_then(|v| v.as_array())
-                    .map(|items| {
+                    .is_some_and(|items| {
                         items.iter().any(|item| {
                             item.get("type").and_then(|t| t.as_str()) == Some("reasoning")
                                 && item.get("encrypted_content").is_some()
                         })
-                    })
-                    .unwrap_or(false);
+                    });
                 if has_enc {
                     saw_encrypted.store(true, Ordering::SeqCst);
                     (
@@ -648,14 +643,13 @@ async fn test_openai_responses_sanitizes_invalid_encrypted_content_before_reques
         r#"
 name: test-responses-trim
 protocol: openai_responses
-base_url: "http://{}"
+base_url: "http://{upstream_addr}"
 key: sk-test
 proxy_url: "direct"
 models:
   - name: gpt-5
     alias: test-responses-trim
-"#,
-        upstream_addr
+"#
     );
     let provider: ProviderConfig = yaml_serde::from_str(&provider_yaml).unwrap();
     Arc::make_mut(&mut *state.config.write().await)
@@ -743,8 +737,7 @@ async fn test_openai_responses_retries_valid_encrypted_content_after_upstream_re
 
     let state = mock_state();
     let provider: ProviderConfig = yaml_serde::from_str(&format!(
-            "name: test-responses-retry\nprotocol: openai_responses\nbase_url: http://{}\nkey: sk-test\nproxy_url: direct\nmodels:\n  - name: gpt-5\n    alias: test-responses-retry\n",
-            upstream_addr
+            "name: test-responses-retry\nprotocol: openai_responses\nbase_url: http://{upstream_addr}\nkey: sk-test\nproxy_url: direct\nmodels:\n  - name: gpt-5\n    alias: test-responses-retry\n"
         ))
         .unwrap();
     Arc::make_mut(&mut *state.config.write().await)
@@ -819,8 +812,7 @@ async fn test_openai_responses_retries_on_422_invalid_encrypted_content() {
 
     let state = mock_state();
     let provider: ProviderConfig = yaml_serde::from_str(&format!(
-            "name: test-422-retry\nprotocol: openai_responses\nbase_url: http://{}\nkey: sk-test\nproxy_url: direct\nmodels:\n  - name: gpt-5\n    alias: test-422-retry\n",
-            upstream_addr
+            "name: test-422-retry\nprotocol: openai_responses\nbase_url: http://{upstream_addr}\nkey: sk-test\nproxy_url: direct\nmodels:\n  - name: gpt-5\n    alias: test-422-retry\n"
         ))
         .unwrap();
     Arc::make_mut(&mut *state.config.write().await)
@@ -894,14 +886,13 @@ async fn test_gpt_responses_strips_execute_only_payload_fields() {
         r#"
 name: test-responses-final
 protocol: openai_responses
-base_url: "http://{}"
+base_url: "http://{upstream_addr}"
 key: sk-test
 proxy_url: "direct"
 models:
   - name: gpt-5
     alias: test-responses-final
-"#,
-        upstream_addr
+"#
     ))
     .unwrap();
     Arc::make_mut(&mut *state.config.write().await)
@@ -2215,8 +2206,7 @@ async fn test_count_tokens_empty_base_url_rejected() {
     assert_eq!(v["type"], "error");
     assert!(
         v["error"]["message"].as_str().unwrap().contains("base_url"),
-        "got {}",
-        v
+        "got {v}"
     );
 }
 
@@ -2259,8 +2249,7 @@ async fn test_count_tokens_missing_model_returns_400() {
     assert_eq!(v["type"], "error");
     assert!(
         v["error"]["message"].as_str().unwrap().contains("model"),
-        "got {}",
-        v
+        "got {v}"
     );
 }
 
@@ -2817,8 +2806,7 @@ async fn test_upstream_429_fails_fast_passes_retry_after() {
 
     let state = mock_state();
     let provider: ProviderConfig = yaml_serde::from_str(&format!(
-            "name: test-429\nprotocol: openai_chat\nbase_url: http://{}\nkey: sk-test\nproxy_url: direct\nmodels:\n  - name: gpt-4\n    alias: test-429\n",
-            upstream_addr
+            "name: test-429\nprotocol: openai_chat\nbase_url: http://{upstream_addr}\nkey: sk-test\nproxy_url: direct\nmodels:\n  - name: gpt-4\n    alias: test-429\n"
         ))
         .unwrap();
     Arc::make_mut(&mut *state.config.write().await)
@@ -2946,8 +2934,7 @@ async fn test_non_claude_200_invalid_json_returns_502() {
             .as_str()
             .unwrap()
             .contains("响应无法转换为 Anthropic 形状"),
-        "got {}",
-        v
+        "got {v}"
     );
 }
 

@@ -62,8 +62,7 @@ impl StreamReplayExtractor {
             match event_type {
                 // 上游真实事件名带 response. 前缀(见 sse/responses/state_machine.rs 的
                 // event_type 判别,data.type 同为全名)
-                Some("response.reasoning_text.delta")
-                | Some("response.reasoning_summary_text.delta") => {
+                Some("response.reasoning_text.delta" | "response.reasoning_summary_text.delta") => {
                     self.collect_reasoning_delta(&value);
                 }
                 Some("response.output_item.done") => {
@@ -113,8 +112,7 @@ impl StreamReplayExtractor {
         let has_output = completed
             .pointer("/response/output")
             .and_then(|v| v.as_array())
-            .map(|arr| !arr.is_empty())
-            .unwrap_or(false);
+            .is_some_and(|arr| !arr.is_empty());
         if !has_output && !(self.items_by_index.is_empty() && self.items_fallback.is_empty()) {
             let mut indexes: Vec<i64> = self.items_by_index.keys().copied().collect();
             indexes.sort_unstable();
@@ -208,15 +206,13 @@ impl StreamReplayExtractor {
 fn reasoning_item_has_text(item: &Value) -> bool {
     item.get("summary")
         .and_then(|v| v.as_array())
-        .map(|arr| {
+        .is_some_and(|arr| {
             arr.iter().any(|sp| {
                 sp.get("text")
                     .and_then(|t| t.as_str())
-                    .map(|s| !s.is_empty())
-                    .unwrap_or(false)
+                    .is_some_and(|s| !s.is_empty())
             })
         })
-        .unwrap_or(false)
 }
 
 /// replay 缓存(会话 → 累积的 replay 项)
@@ -254,7 +250,7 @@ impl ReplayCache {
             return;
         };
         self.inner.upsert(session_key, |existing| {
-            append_replay_turn(existing.map(Vec::as_slice).unwrap_or_default(), &turn)
+            append_replay_turn(existing.map_or_default(Vec::as_slice), &turn)
         });
     }
 
@@ -595,7 +591,7 @@ mod tests {
         };
         // 填满 200 个 session
         for i in 0..200 {
-            cache.store_from_completed(&format!("sess-{}", i), &completed(&format!("g{}", i)), "");
+            cache.store_from_completed(&format!("sess-{i}"), &completed(&format!("g{i}")), "");
             std::thread::sleep(Duration::from_micros(100));
         }
 

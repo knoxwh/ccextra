@@ -1036,9 +1036,8 @@ fn dump_upstream_request(
         .unwrap_or_else(|| "nosess".into());
     let ts = std::time::SystemTime::now()
         .duration_since(std::time::UNIX_EPOCH)
-        .map(|d| d.as_millis() as u64)
-        .unwrap_or(0);
-    let proto = format!("{:?}", protocol).to_lowercase();
+        .map_or(0, |d| d.as_millis() as u64);
+    let proto = format!("{protocol:?}").to_lowercase();
     let request_seq = if log_request_body {
         UPSTREAM_LOG_SEQUENCE.fetch_add(1, Ordering::Relaxed)
     } else {

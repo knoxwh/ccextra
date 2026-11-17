@@ -91,7 +91,7 @@ pub fn sanitize_gpt_reasoning_items(body: &mut Value) -> bool {
             let promoted: Vec<Value> = if reasoning_summary_is_empty(item.get("summary")) {
                 item.get("content")
                     .and_then(|v| v.as_array())
-                    .map(|parts| {
+                    .map_or_default(|parts| {
                         parts
                             .iter()
                             .filter(|p| {
@@ -102,7 +102,6 @@ pub fn sanitize_gpt_reasoning_items(body: &mut Value) -> bool {
                             .map(|t| json!({"type": "summary_text", "text": t}))
                             .collect()
                     })
-                    .unwrap_or_default()
             } else {
                 Vec::new()
             };

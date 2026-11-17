@@ -245,16 +245,14 @@ fn is_model_role(content: &Value) -> bool {
     content
         .get("role")
         .and_then(|v| v.as_str())
-        .map(|r| r.trim().eq_ignore_ascii_case("model"))
-        .unwrap_or(false)
+        .is_some_and(|r| r.trim().eq_ignore_ascii_case("model"))
 }
 
 fn content_parts(content: &Value) -> &[Value] {
     content
         .get("parts")
         .and_then(|v| v.as_array())
-        .map(Vec::as_slice)
-        .unwrap_or_default()
+        .map_or_default(Vec::as_slice)
 }
 
 fn str_field<'a>(v: &'a Value, key: &str) -> &'a str {
@@ -855,15 +853,12 @@ fn apply_signature_at(contents: &mut [Value], ci: usize, pi: usize, signature: &
         .map(content_parts)
         .and_then(|parts| parts.get(pi))
         .and_then(part_thought_signature)
-        .map(has_native_thought_signature)
-        .unwrap_or(false);
+        .is_some_and(has_native_thought_signature);
     if already_native {
         return false;
     }
     remove_thought_signature_from_other_parts(contents, ci, signature, pi);
-    part_mut(contents, ci, pi)
-        .map(|part| set_part_thought_signature(part, signature))
-        .unwrap_or(false)
+    part_mut(contents, ci, pi).is_some_and(|part| set_part_thought_signature(part, signature))
 }
 
 /// 身份回写分支的签名写法（对齐 CPA restoreAntigravityNativeFunctionCallReplay :2114-2118）：
@@ -1208,14 +1203,12 @@ fn restore_with_index(
     item: &Value,
     allow_legacy: bool,
 ) -> FunctionCallReplay {
-    let before_id = function_call_at(contents, ci, pi)
-        .map(|fc| str_field(fc, "id").to_string())
-        .unwrap_or_default();
+    let before_id =
+        function_call_at(contents, ci, pi).map_or_default(|fc| str_field(fc, "id").to_string());
     let replay = restore_native_function_call(contents, ci, pi, item, allow_legacy);
     if matches!(replay, FunctionCallReplay::Identity(_)) {
-        let after_id = function_call_at(contents, ci, pi)
-            .map(|fc| str_field(fc, "id").to_string())
-            .unwrap_or_default();
+        let after_id =
+            function_call_at(contents, ci, pi).map_or_default(|fc| str_field(fc, "id").to_string());
         index.rewrite_id(ci, pi, &before_id, &after_id);
     }
     replay
@@ -1349,9 +1342,7 @@ pub fn degrade_unresolved_tool_provenance_ids(request: &mut Value) -> usize {
                     continue;
                 };
                 fc_obj.insert("id".into(), json!(synthetic_tool_call_id(&id)));
-                if part_thought_signature(part)
-                    .map(has_native_thought_signature)
-                    .unwrap_or(false)
+                if part_thought_signature(part).is_some_and(has_native_thought_signature)
                     && let Some(obj) = part.as_object_mut()
                 {
                     obj.remove("thought_signature");
@@ -1743,8 +1734,7 @@ fn request_has_tool_provenance_id(request: &Value) -> bool {
             content_parts(content).iter().any(|part| {
                 ["functionCall", "functionResponse"].iter().any(|k| {
                     part.get(*k)
-                        .map(|v| is_gemini_claude_tool_use_id(str_field(v, "id")))
-                        .unwrap_or(false)
+                        .is_some_and(|v| is_gemini_claude_tool_use_id(str_field(v, "id")))
                 })
             })
         })
@@ -1960,8 +1950,7 @@ impl AgReplayAccumulator {
         if first
             .get("finishReason")
             .and_then(|v| v.as_str())
-            .map(|s| !s.trim().is_empty())
-            .unwrap_or(false)
+            .is_some_and(|s| !s.trim().is_empty())
         {
             self.terminal = true;
         }
@@ -2105,7 +2094,7 @@ impl AgReplayAccumulator {
                 }
                 self.visible_text.push_str(text);
             }
-            self.last_response_kind = target_kind.clone();
+            self.last_response_kind.clone_from(&target_kind);
         }
 
         if !signature.is_empty() && !self.seen_signatures.contains(&signature) {
@@ -2271,8 +2260,7 @@ fn pending_model_content_index(contents: &[Value]) -> (usize, usize) {
         let parts = last
             .get("parts")
             .and_then(|v| v.as_array())
-            .map(Vec::as_slice)
-            .unwrap_or_default();
+            .map_or_default(Vec::as_slice);
         if !parts.iter().any(|p| p.get("functionResponse").is_some()) {
             return (contents.len() - 1, parts.len());
         }

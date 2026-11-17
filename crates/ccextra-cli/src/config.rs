@@ -103,8 +103,7 @@ fn persist_secret(path: &str, content: &str, hashed: &str) -> Result<()> {
         let indent_len = line
             .char_indices()
             .find(|(_, c)| !c.is_whitespace())
-            .map(|(i, _)| i)
-            .unwrap_or(line.len());
+            .map_or(line.len(), |(i, _)| i);
         if line[indent_len..].starts_with("secret_key:") {
             let indent = &line[..indent_len];
             let comment = find_trailing_comment(&line[indent_len..]);
@@ -127,9 +126,7 @@ fn persist_secret(path: &str, content: &str, hashed: &str) -> Result<()> {
         #[cfg(unix)]
         {
             use std::os::unix::fs::{OpenOptionsExt, PermissionsExt};
-            let mode = fs::metadata(path)
-                .map(|m| m.permissions().mode() & 0o777)
-                .unwrap_or(0o600);
+            let mode = fs::metadata(path).map_or(0o600, |m| m.permissions().mode() & 0o777);
             options.mode(mode);
         }
         let mut file = options.open(&tmp)?;

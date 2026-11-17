@@ -183,7 +183,7 @@ mod tests {
     #[test]
     fn go_duration_subset() {
         assert_eq!(parse_go_duration("0"), Some(Duration::ZERO));
-        assert_eq!(parse_go_duration("1.5h"), Some(Duration::from_secs(5400)));
+        assert_eq!(parse_go_duration("1.5h"), Some(Duration::from_mins(90)));
         assert_eq!(parse_go_duration("250ms"), Some(Duration::from_millis(250)));
         assert_eq!(parse_go_duration("2us"), Some(Duration::from_micros(2)));
         assert_eq!(parse_go_duration("-1s"), None);

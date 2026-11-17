@@ -185,6 +185,6 @@ pub async fn handle_count_tokens(
     Response::builder()
         .status(StatusCode::OK)
         .header(header::CONTENT_TYPE, "application/json")
-        .body(Body::from(format!(r#"{{"input_tokens":{}}}"#, tokens)))
+        .body(Body::from(format!(r#"{{"input_tokens":{tokens}}}"#)))
         .map_err(|e| AppError::new(anyhow::anyhow!("构造响应失败: {e}")))
 }

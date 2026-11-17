@@ -150,8 +150,7 @@ pub fn credential_file_name(email: &str, sub: &str) -> String {
     }
     let ms = SystemTime::now()
         .duration_since(SystemTime::UNIX_EPOCH)
-        .map(|d| d.as_millis())
-        .unwrap_or(0);
+        .map_or(0, |d| d.as_millis());
     format!("xai-{ms}.json")
 }
 
@@ -170,7 +169,7 @@ mod tests {
         let payload = r#"{"email":"test@example.com","sub":"user-123"}"#;
         use base64::Engine;
         let encoded = base64::engine::general_purpose::URL_SAFE_NO_PAD.encode(payload.as_bytes());
-        let token = format!("header.{}.sig", encoded);
+        let token = format!("header.{encoded}.sig");
         let (email, sub) = parse_jwt_identity(&token);
         assert_eq!(email, "test@example.com");
         assert_eq!(sub, "user-123");

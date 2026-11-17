@@ -35,7 +35,7 @@ fn normalize_claude_55_tool_choice(body: &mut Value, upstream_model: &str) -> bo
         return false;
     };
     match obj.get("type").and_then(|t| t.as_str()) {
-        Some("any") | Some("tool") => {
+        Some("any" | "tool") => {
             obj.insert("type".into(), Value::String("auto".into()));
             obj.remove("name");
             true

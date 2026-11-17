@@ -40,7 +40,7 @@ pub async fn run_login(opts: XAILoginOptions) -> Result<PathBuf> {
 
     println!("==================================================================");
     println!("🔑 xAI 用户验证代码 (User Code): {}", device.user_code);
-    println!("🔗 验证页面 URL: {}", verify_url);
+    println!("🔗 验证页面 URL: {verify_url}");
     println!("==================================================================");
 
     if !opts.no_browser {
@@ -111,7 +111,7 @@ pub async fn run_login(opts: XAILoginOptions) -> Result<PathBuf> {
         "xai-user".to_string()
     };
 
-    println!("✅ xAI 登录成功: {}", display_id);
+    println!("✅ xAI 登录成功: {display_id}");
     println!("📁 凭证已保存至: {}", path.display());
 
     Ok(path)

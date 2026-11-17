@@ -11,8 +11,7 @@ use crate::oauth_common;
 fn home_dir() -> PathBuf {
     std::env::var_os("HOME")
         .or_else(|| std::env::var_os("USERPROFILE"))
-        .map(PathBuf::from)
-        .unwrap_or_else(|| PathBuf::from("."))
+        .map_or_else(|| PathBuf::from("."), PathBuf::from)
 }
 
 /// 默认 `.cache/antigravity`(相对路径,由 CLI 钉到配置文件所在目录)
@@ -22,7 +21,7 @@ pub fn default_auth_dir() -> PathBuf {
 
 /// 空 → `.cache/antigravity`;单独 `~` → $HOME;其余展开 `~` 或原样
 pub fn resolve_auth_dir(raw: Option<&str>) -> PathBuf {
-    let s = raw.map(str::trim).unwrap_or("");
+    let s = raw.map_or("", str::trim);
     if s.is_empty() {
         return PathBuf::from(DEFAULT_AUTH_DIR);
     }

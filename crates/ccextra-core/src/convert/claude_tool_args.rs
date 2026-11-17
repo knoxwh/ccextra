@@ -589,9 +589,9 @@ fn clean_array(args: &mut Value, schemas: &[&Value], root: &Value, path: &[Strin
         let mut child_path = path.to_vec();
         child_path.push(index.to_string());
         let child = get_path(args, &child_path);
-        if child.map(|c| c.is_object()).unwrap_or(false) {
+        if child.is_some_and(|c| c.is_object()) {
             clean_object(args, &item_refs, root, &child_path, false);
-        } else if child.map(|c| c.is_array()).unwrap_or(false) {
+        } else if child.is_some_and(|c| c.is_array()) {
             clean_array(args, &item_refs, root, &child_path);
         }
     }
@@ -680,7 +680,7 @@ fn clean_object(
         && !originals_any_branch_allows_dynamic(schemas, root)
         && !originals_any_candidate_accepts_implicitly(schemas, root, &current)
     {
-        let empty = current.as_object().map(|m| m.is_empty()).unwrap_or(true);
+        let empty = current.as_object().is_none_or(|m| m.is_empty());
         if empty {
             return;
         }
@@ -828,9 +828,8 @@ pub struct ToolArgStreamState {
 impl ToolArgStreamState {
     pub fn begin_tool(&mut self, tool_name: &str, original_request: Option<&Value>) {
         self.current_tool_name = tool_name.to_string();
-        self.current_tool_is_parameterless = original_request
-            .map(|orig| claude_tool_is_parameterless(tool_name, orig))
-            .unwrap_or(false);
+        self.current_tool_is_parameterless =
+            original_request.is_some_and(|orig| claude_tool_is_parameterless(tool_name, orig));
         self.current_tool_input_emitted = false;
         self.current_tool_pending_empty = false;
     }

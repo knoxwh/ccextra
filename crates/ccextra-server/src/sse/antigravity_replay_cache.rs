@@ -398,7 +398,7 @@ impl AgReplayCache {
         if entry.deleted || entry.items.is_empty() {
             return (None, snapshot);
         }
-        snapshot.items = entry.items.clone();
+        snapshot.items.clone_from(&entry.items);
         (Some(entry.items.clone()), snapshot)
     }
 

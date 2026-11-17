@@ -279,12 +279,12 @@ fn merge_hint(existing: &str, hint: &str) -> String {
         return hint.to_string();
     }
     if existing == hint
-        || existing.starts_with(&format!("{} (", hint))
-        || existing.contains(&format!("({})", hint))
+        || existing.starts_with(&format!("{hint} ("))
+        || existing.contains(&format!("({hint})"))
     {
         return existing.to_string();
     }
-    format!("{} ({})", existing, hint)
+    format!("{existing} ({hint})")
 }
 
 /// 向对象 description 追加提示
@@ -783,7 +783,7 @@ fn convert_refs_to_hints(schema: &mut Value, preserve_siblings: bool) {
             let hint = if existing.is_empty() {
                 hint
             } else {
-                format!("{} ({})", existing, hint)
+                format!("{existing} ({hint})")
             };
             *map = Map::from_iter([
                 ("type".to_string(), json!("object")),
@@ -872,8 +872,7 @@ fn add_enum_hints(schema: &mut Value) {
             .iter()
             .map(|item| {
                 item.as_str()
-                    .map(|s| s.to_string())
-                    .unwrap_or_else(|| value_display_string(item))
+                    .map_or_else(|| value_display_string(item), |s| s.to_string())
             })
             .collect();
         append_hint(map, &format!("Allowed: {}", vals.join(", ")));
@@ -896,7 +895,7 @@ fn drop_ignored_enums_to_hints(schema: &mut Value, opts: CleanOptions) {
                 .as_str()
                 .map(|s| s.to_string())
                 .unwrap_or_else(|| value_display_string(&arr[0]));
-            append_hint(map, &format!("Allowed: {}", v));
+            append_hint(map, &format!("Allowed: {v}"));
         }
         map.shift_remove("enum");
     });
@@ -958,7 +957,7 @@ fn move_not_to_description(schema: &mut Value) {
             return;
         }
         if let Some(val) = map.get("not") {
-            append_hint(map, &format!("not: {}", val));
+            append_hint(map, &format!("not: {val}"));
         }
     });
 }
@@ -1217,7 +1216,7 @@ fn merge_parent_description_into(selected: &mut Map<String, Value>, parent_desc:
     } else if child_desc == parent_desc {
         child_desc
     } else {
-        format!("{} ({})", parent_desc, child_desc)
+        format!("{parent_desc} ({child_desc})")
     };
     selected.insert("description".into(), Value::String(merged));
 }
@@ -1330,7 +1329,7 @@ fn process_union_keywords(
 
         let mut candidate_items = arr.clone();
         if has_filtered || non_null_items.len() >= 2 {
-            candidate_items = non_null_items.clone();
+            candidate_items.clone_from(&non_null_items);
             if has_null {
                 candidate_items.push(json!({"type": "null"}));
             }
@@ -1723,11 +1722,7 @@ fn remove_placeholder_fields(schema: &mut Value) {
         }
         if let Some(Value::Array(req)) = map.get("required") {
             let mut req = req.clone();
-            req.retain(|r| {
-                r.as_str()
-                    .map(|s| !removed.iter().any(|x| x == s))
-                    .unwrap_or(true)
-            });
+            req.retain(|r| r.as_str().is_none_or(|s| !removed.iter().any(|x| x == s)));
             if req.is_empty() {
                 map.shift_remove("required");
             } else {
@@ -1756,7 +1751,7 @@ fn cleanup_required_fields(schema: &mut Value) {
         };
         let valid: Vec<Value> = req
             .iter()
-            .filter(|r| r.as_str().map(|s| props.contains_key(s)).unwrap_or(false))
+            .filter(|r| r.as_str().is_some_and(|s| props.contains_key(s)))
             .cloned()
             .collect();
         if valid.len() != req.len() {
@@ -2290,7 +2285,7 @@ mod tests {
         assert_eq!(out["type"], "string");
         assert_eq!(out["enum"], json!(["1", "2", "3"]));
         let desc = out["description"].as_str().unwrap();
-        assert!(desc.contains("Allowed: 1, 2, 3"), "desc={}", desc);
+        assert!(desc.contains("Allowed: 1, 2, 3"), "desc={desc}");
     }
 
     #[test]
@@ -4426,8 +4421,7 @@ mod tests {
                 && example
                     .get("required")
                     .and_then(|r| r.as_array())
-                    .map(|a| !a.iter().any(|v| v == "_"))
-                    .unwrap_or(true),
+                    .is_none_or(|a| !a.iter().any(|v| v == "_")),
             "placeholder injected into example literal: {out}"
         );
         // example 对象本身若被当 schema 清洗,还会被塞 properties.reason;二者都不应出现
@@ -4482,8 +4476,7 @@ mod tests {
             choice
                 .get("required")
                 .and_then(|r| r.as_array())
-                .map(|a| !a.iter().any(|v| v == "_"))
-                .unwrap_or(true),
+                .is_none_or(|a| !a.iter().any(|v| v == "_")),
             "union 节点不应注入 required:[_]: {out}"
         );
         // 原有 reason 属性保留;不得被占位 reason-only properties 整表替换

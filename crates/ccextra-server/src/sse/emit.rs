@@ -283,7 +283,7 @@ mod tests {
                     "delta": {"type": "text_delta", "text": case}
                 }),
             );
-            assert_eq!(actual, expected, "case {} failed", case);
+            assert_eq!(actual, expected, "case {case} failed");
         }
 
         let thinking_actual = content_block_delta_thinking(0, "thought \n \"quotes\"");

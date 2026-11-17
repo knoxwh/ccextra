@@ -56,7 +56,7 @@ fn tool_call_keys(item: &Value) -> Vec<String> {
     let call_id = item.get("call_id").and_then(|v| v.as_str()).unwrap_or("");
     comparable_call_ids(call_id)
         .into_iter()
-        .map(|c| format!("{}:{}", item_type, c))
+        .map(|c| format!("{item_type}:{c}"))
         .collect()
 }
 
@@ -184,15 +184,14 @@ fn filter_replay_items(body: &Value, items: Vec<Value>) -> Vec<Value> {
                 if keys.is_empty() || keys.iter().any(|k| existing_calls.contains(k)) {
                     continue;
                 }
-                let has_matching_output = item
-                    .get("call_id")
-                    .and_then(|v| v.as_str())
-                    .map(|c| {
-                        comparable_call_ids(c)
-                            .iter()
-                            .any(|candidate| existing_outputs.contains(candidate))
-                    })
-                    .unwrap_or(false);
+                let has_matching_output =
+                    item.get("call_id")
+                        .and_then(|v| v.as_str())
+                        .is_some_and(|c| {
+                            comparable_call_ids(c)
+                                .iter()
+                                .any(|candidate| existing_outputs.contains(candidate))
+                        });
                 if !has_matching_output {
                     continue;
                 }
@@ -249,8 +248,7 @@ fn replay_insert_index(input_items: &[Value], replay_items: &[Value]) -> usize {
             let call_id = item
                 .get("call_id")
                 .and_then(|v| v.as_str())
-                .map(|c| c.trim())
-                .unwrap_or("");
+                .map_or("", |c| c.trim());
             if call_id.is_empty()
                 || comparable_call_ids(call_id)
                     .iter()
@@ -266,8 +264,7 @@ fn replay_insert_index(input_items: &[Value], replay_items: &[Value]) -> usize {
         let role = item
             .get("role")
             .and_then(|v| v.as_str())
-            .map(|r| r.trim().to_ascii_lowercase())
-            .unwrap_or_default();
+            .map_or_default(|r| r.trim().to_ascii_lowercase());
         if role == "assistant" && (item_type.is_empty() || item_type == "message") {
             return index;
         }
@@ -279,8 +276,7 @@ fn replay_insert_index(input_items: &[Value], replay_items: &[Value]) -> usize {
         let role = item
             .get("role")
             .and_then(|v| v.as_str())
-            .map(|r| r.trim().to_ascii_lowercase())
-            .unwrap_or_default();
+            .map_or_default(|r| r.trim().to_ascii_lowercase());
         let is_message = role.is_empty() || item_type.is_empty() || item_type == "message";
         if !(is_message && (role == "developer" || role == "system")) {
             return index;
@@ -338,8 +334,7 @@ fn align_replay_call_ids(input_items: &[Value], replay_items: Vec<Value>) -> Vec
             let call_id = item
                 .get("call_id")
                 .and_then(|v| v.as_str())
-                .map(|c| c.trim().to_string())
-                .unwrap_or_default();
+                .map_or_default(|c| c.trim().to_string());
             let mut output_call_id = None;
             for candidate in comparable_call_ids(&call_id) {
                 if let Some(v) = outputs.get(&candidate) {
@@ -468,9 +463,9 @@ pub fn build_replay_turn(completed: &Value, request_fingerprint: &str) -> Option
     }
     let mut hasher = Sha256::new();
     hasher.update(request_fingerprint.as_bytes());
-    hasher.update(format!("\u{0}assistant\u{0}{}", assistant_fingerprint).as_bytes());
+    hasher.update(format!("\u{0}assistant\u{0}{assistant_fingerprint}").as_bytes());
     for call_id in &call_ids {
-        hasher.update(format!("\u{0}call\u{0}{}", call_id).as_bytes());
+        hasher.update(format!("\u{0}call\u{0}{call_id}").as_bytes());
     }
     for item in &items {
         hasher.update(b"\0item\0");
@@ -534,7 +529,7 @@ fn trim_replay_items(mut items: Vec<Value>) -> Vec<Value> {
         let mut turn_starts = vec![0usize];
         let mut total_bytes: usize = 0;
         for (index, item) in items.iter().enumerate() {
-            total_bytes += serde_json::to_vec(item).map(|v| v.len()).unwrap_or(0);
+            total_bytes += serde_json::to_vec(item).map_or(0, |v| v.len());
             if index > 0 && is_marker(item) {
                 turn_starts.push(index);
             }
@@ -591,14 +586,13 @@ fn split_replay_turns(items: &[Value]) -> Vec<ReplayTurn> {
                 call_ids: item
                     .get("call_ids")
                     .and_then(|v| v.as_array())
-                    .map(|arr| {
+                    .map_or_default(|arr| {
                         arr.iter()
                             .filter_map(|v| v.as_str())
                             .map(|s| s.trim().to_string())
                             .filter(|s| !s.is_empty())
                             .collect()
-                    })
-                    .unwrap_or_default(),
+                    }),
                 items: Vec::new(),
             };
             continue;
@@ -726,8 +720,7 @@ fn reasoning_has_text(item: &Value) -> bool {
         && arr.iter().any(|sp| {
             sp.get("text")
                 .and_then(|v| v.as_str())
-                .map(|s| !s.is_empty())
-                .unwrap_or(false)
+                .is_some_and(|s| !s.is_empty())
         })
     {
         return true;
@@ -739,8 +732,7 @@ fn reasoning_has_text(item: &Value) -> bool {
         return arr.iter().any(|c| {
             c.get("text")
                 .and_then(|v| v.as_str())
-                .map(|s| !s.is_empty())
-                .unwrap_or(false)
+                .is_some_and(|s| !s.is_empty())
         });
     }
     false
@@ -794,8 +786,7 @@ fn filter_turn_items(
                 let enc = item
                     .get("encrypted_content")
                     .and_then(|v| v.as_str())
-                    .map(|s| s.trim())
-                    .unwrap_or("");
+                    .map_or("", |s| s.trim());
                 if enc.is_empty() {
                     // 无加密信封:grok 明文回放开关放行带文本的项,
                     // 否则丢弃(对齐 to_openai_responses/reasoning.rs 决策)
@@ -817,12 +808,11 @@ fn filter_turn_items(
                 let has_output = item
                     .get("call_id")
                     .and_then(|v| v.as_str())
-                    .map(|c| {
+                    .is_some_and(|c| {
                         comparable_call_ids(c)
                             .iter()
                             .any(|id| existing_outputs.contains(id))
-                    })
-                    .unwrap_or(false);
+                    });
                 if !has_output {
                     continue;
                 }

@@ -58,8 +58,7 @@ impl AntigravityCredential {
         let now = SystemTime::now();
         let timestamp = now
             .duration_since(UNIX_EPOCH)
-            .map(|d| d.as_millis() as i64)
-            .unwrap_or(0);
+            .map_or(0, |d| d.as_millis() as i64);
         let expired = rfc3339_from_now(now, expires_in);
         Self {
             kind: "antigravity".into(),
@@ -87,8 +86,7 @@ impl AntigravityCredential {
         self.expires_in = expires_in;
         self.timestamp = now
             .duration_since(UNIX_EPOCH)
-            .map(|d| d.as_millis() as i64)
-            .unwrap_or(0);
+            .map_or(0, |d| d.as_millis() as i64);
         self.expired = rfc3339_from_now(now, expires_in);
         self.kind = "antigravity".into();
     }

@@ -131,9 +131,9 @@ async fn finish_login(
     } else {
         "codex-user".to_string()
     };
-    println!("✅ Codex 登录成功: {}", display_id);
+    println!("✅ Codex 登录成功: {display_id}");
     if !plan_type.is_empty() {
-        println!("订阅档位: {}", plan_type);
+        println!("订阅档位: {plan_type}");
     }
     println!("📁 凭证已保存至: {}", path.display());
     Ok(path)

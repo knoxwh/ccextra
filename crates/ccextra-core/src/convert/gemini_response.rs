@@ -209,7 +209,7 @@ pub fn convert_gemini_stream_chunk(
             let has_thought_signature = !thought_signature.is_empty();
             let signature_value = outbound_signature(signature_model, thought_signature);
             let text_str = text_result.and_then(|t| t.as_str());
-            let text_empty = text_str.map(|t| t.is_empty()).unwrap_or(true);
+            let text_empty = text_str.is_none_or(|t| t.is_empty());
             let is_thought = part
                 .get("thought")
                 .and_then(|t| t.as_bool())
@@ -730,8 +730,7 @@ pub fn convert_gemini_response(
                             .or_else(|| part.get("thought_signature"))
                             .and_then(|s| s.as_str())
                             .filter(|s| !s.is_empty())
-                            .map(|s| outbound_signature(signature_model, s))
-                            .unwrap_or_default();
+                            .map_or_default(|s| outbound_signature(signature_model, s));
                         block["signature"] = json!(sig);
                         content_blocks.push(block);
                     } else {
@@ -921,7 +920,7 @@ mod tests {
         assert_eq!(content[0]["name"], "Read"); // 还原了原名
         // 对齐 CPA:id 自生成 {name}-{counter},不透传上游 id
         let id = content[0]["id"].as_str().unwrap();
-        assert!(id.starts_with("Rd-"), "id={}", id);
+        assert!(id.starts_with("Rd-"), "id={id}");
         assert_eq!(content[0]["input"]["path"], "/file.txt");
         // 有工具调用时 stop_reason 一律 tool_use(即使 finishReason=STOP)
         assert_eq!(anthropic["stop_reason"], "tool_use");

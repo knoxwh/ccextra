@@ -72,7 +72,7 @@ pub(crate) fn function_call_start(call_id: &str, name: &str, index: i64) -> Byte
 /// custom 工具 input(字符串)→ tool_use.input 的 JSON 文本(包成 {"input": str})
 pub(crate) fn custom_input_json(input: &str) -> String {
     let escaped = serde_json::to_string(input).unwrap_or_else(|_| "\"\"".to_string());
-    format!(r#"{{"input":{}}}"#, escaped)
+    format!(r#"{{"input":{escaped}}}"#)
 }
 
 /// input_json_delta(对齐 appendCodexFunctionCallArgumentDelta)
@@ -104,7 +104,7 @@ impl ResponsesRelay {
         };
         if let Some(r) = root {
             if let Some(oi) = r.get("output_index") {
-                push(format!("output:{}", oi), &mut keys);
+                push(format!("output:{oi}"), &mut keys);
             }
             if let Some(ci) = r.get("call_id").and_then(|v| v.as_str()) {
                 push(format!("call:{ci}"), &mut keys);
@@ -288,7 +288,7 @@ impl ResponsesRelay {
                 let is_custom = item_type == "custom_tool_call";
                 let mut keys = self.call_keys(None, Some(item));
                 if let Some(oi) = item.get("output_index") {
-                    push_key(&mut keys, format!("output:{}", oi));
+                    push_key(&mut keys, format!("output:{oi}"));
                 }
                 push_key(&mut keys, format!("output:{i}"));
                 let idx = match self.function_call_for_keys(&keys) {

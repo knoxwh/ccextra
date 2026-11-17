@@ -237,8 +237,7 @@ pub fn responses_to_anthropic(
     // (对齐 extractResponsesUsage / CPA 893abbab)
     let (input_tokens, output_tokens, cached, cache_write, thinking_tokens) = response
         .get("usage")
-        .map(super::extract_usage_responses)
-        .unwrap_or((0, 0, 0, 0, -1));
+        .map_or((0, 0, 0, 0, -1), super::extract_usage_responses);
 
     let stop_reason = map_stop_reason(&codex_stop_reason(response), has_tool_use);
     let stop_seq = stop_sequence(response);
@@ -382,8 +381,7 @@ pub fn openai_chat_to_anthropic(body: &Value) -> Option<Value> {
     // usage:prompt_tokens/completion_tokens(+ cache_write,对齐 CPA extractOpenAIUsage)
     let (input_tokens, output_tokens, cached, cache_write) = body
         .get("usage")
-        .map(super::extract_usage_chat)
-        .unwrap_or((0, 0, 0, 0));
+        .map_or((0, 0, 0, 0), super::extract_usage_chat);
 
     // reasoning-only 空回合兜底(对齐流式 finalize 与 sub2api
     // chatMessageToAnthropicBlocks:text=="" 且无 tool_calls 时 text=reasoning),
@@ -439,7 +437,7 @@ fn build_message(
         "model": source.get("model").and_then(|v| v.as_str()).unwrap_or(""),
         "content": content,
         "stop_reason": stop_reason,
-        "stop_sequence": stop_sequence.map(Value::String).unwrap_or(Value::Null),
+        "stop_sequence": stop_sequence.map_or(Value::Null, Value::String),
         "usage": {"input_tokens": input_tokens, "output_tokens": output_tokens}
     });
     if cached > 0 {

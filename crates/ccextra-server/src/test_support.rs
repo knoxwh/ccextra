@@ -104,8 +104,7 @@ impl CapturedUpstream {
     pub fn record_uri(&self, uri: &axum::http::Uri) {
         let pq = uri
             .path_and_query()
-            .map(|pq| pq.as_str().to_string())
-            .unwrap_or_else(|| uri.path().to_string());
+            .map_or_else(|| uri.path().to_string(), |pq| pq.as_str().to_string());
         *self.path_and_query.lock().unwrap() = Some(pq);
     }
 
@@ -126,14 +125,13 @@ impl CapturedUpstream {
             .lock()
             .unwrap()
             .as_ref()
-            .map(|headers| {
+            .map_or_default(|headers| {
                 headers
                     .get_all(name)
                     .iter()
                     .filter_map(|value| value.to_str().ok().map(str::to_string))
                     .collect()
             })
-            .unwrap_or_default()
     }
 
     pub fn has_header(&self, name: &str) -> bool {
@@ -141,8 +139,7 @@ impl CapturedUpstream {
             .lock()
             .unwrap()
             .as_ref()
-            .map(|h| h.contains_key(name))
-            .unwrap_or(false)
+            .is_some_and(|h| h.contains_key(name))
     }
 
     pub fn body(&self) -> serde_json::Value {

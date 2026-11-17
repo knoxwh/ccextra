@@ -16,8 +16,7 @@ pub(crate) fn is_meaningful_output_delta(root: &Value, event_type: &str) -> bool
     }
     root.get("delta")
         .and_then(|v| v.as_str())
-        .map(|s| !s.trim().is_empty())
-        .unwrap_or(false)
+        .is_some_and(|s| !s.trim().is_empty())
 }
 
 /// message item content 数组里的 output_text 拼接(文本兜底共用)
@@ -104,10 +103,10 @@ pub(crate) fn stream_error_frame(root: &Value) -> Bytes {
             .to_string();
     }
     if message.is_empty() {
-        message = code.clone();
+        message.clone_from(&code);
     }
     if message.is_empty() {
-        message = err_type.clone();
+        message.clone_from(&err_type);
     }
     if code == "cyber_policy" || err_type == "invalid_request" {
         err_type = "invalid_request_error".to_string();
