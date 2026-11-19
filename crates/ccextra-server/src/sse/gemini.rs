@@ -95,6 +95,28 @@ fn process_gemini_events(
             }
         };
 
+        // 无 `event: error` 的 `data: {"error":{...}}` 帧:转 Anthropic error 收尾,不再按正常结束
+        // (对齐 CPA antigravity stream:error.code 不在 400..=599 按 502)
+        if let Some(code) = chunk.get("error").filter(|e| e.is_object()).map(|e| {
+            e.get("code")
+                .and_then(serde_json::Value::as_u64)
+                .and_then(|c| u16::try_from(c).ok())
+                .filter(|c| (400..=599).contains(c))
+                .unwrap_or(502)
+        }) {
+            let status = axum::http::StatusCode::from_u16(code)
+                .unwrap_or(axum::http::StatusCode::BAD_GATEWAY);
+            let body = crate::http::error::to_anthropic_error(event.data.as_bytes(), status);
+            let mut buf = BytesMut::new();
+            buf.put(b"event: error\ndata: " as &[u8]);
+            buf.put(body.as_slice());
+            buf.put(b"\n\n" as &[u8]);
+            output.push(buf.freeze());
+            relay.upstream_failed = true;
+            relay.finished = true;
+            continue;
+        }
+
         // Antigravity 信封解包;usageMetadata 可能在信封根或 cpaUsageMetadata。
         let mut chunk = match chunk.get("response") {
             Some(inner) => {
@@ -460,6 +482,47 @@ mod tests {
         assert!(output.contains("UNEXPECTED_TOOL_CALL"), "{output}");
         assert!(!output.contains("event: message_stop"), "{output}");
         assert!(!output.contains("\"stop_reason\":\"end_turn\""), "{output}");
+    }
+
+    #[tokio::test]
+    async fn test_data_error_frame_before_start_emits_upstream_message() {
+        // 无 event: error 的 data 错误帧:保留上游原因与状态映射,不再报 "ended before response start"
+        let output = collect_antigravity_output(stream::iter(vec![Ok(Bytes::from(
+            "data: {\"error\":{\"code\":429,\"message\":\"Resource has been exhausted\",\"status\":\"RESOURCE_EXHAUSTED\"}}\n\n",
+        ))]))
+        .await;
+        assert!(output.starts_with("event: error\n"), "{output}");
+        assert!(output.contains("\"type\":\"rate_limit_error\""), "{output}");
+        assert!(output.contains("Resource has been exhausted"), "{output}");
+        assert!(!output.contains("ended before response start"), "{output}");
+        assert!(!output.contains("event: message_start"), "{output}");
+        assert_eq!(output.matches("event: error").count(), 1, "{output}");
+    }
+
+    #[tokio::test]
+    async fn test_data_error_frame_after_content_stops_without_message_stop() {
+        // 对齐 CPA stream.go:流中错误帧终止流;不得补 end_turn / message_stop 伪装完整
+        let output = collect_output(stream::iter(vec![Ok(Bytes::from(
+            "data: {\"candidates\":[{\"content\":{\"role\":\"model\",\"parts\":[{\"text\":\"hi\"}]}}]}\n\ndata: {\"error\":{\"code\":503,\"message\":\"The model is overloaded.\",\"status\":\"UNAVAILABLE\"}}\n\ndata: {\"candidates\":[{\"content\":{\"role\":\"model\",\"parts\":[{\"text\":\"late\"}]},\"finishReason\":\"STOP\"}]}\n\n",
+        ))]))
+        .await;
+        assert!(output.contains("event: message_start"), "{output}");
+        assert!(output.contains("event: error"), "{output}");
+        assert!(output.contains("\"type\":\"api_error\""), "{output}");
+        assert!(output.contains("The model is overloaded."), "{output}");
+        assert!(!output.contains("late"), "{output}");
+        assert!(!output.contains("event: message_stop"), "{output}");
+        assert!(!output.contains("\"stop_reason\":\"end_turn\""), "{output}");
+    }
+
+    #[tokio::test]
+    async fn test_data_error_frame_invalid_code_maps_502() {
+        let output = collect_output(stream::iter(vec![Ok(Bytes::from(
+            "data: {\"error\":{\"code\":200,\"message\":\"weird\"}}\n\n",
+        ))]))
+        .await;
+        assert!(output.contains("\"type\":\"api_error\""), "{output}");
+        assert!(output.contains("weird"), "{output}");
     }
 
     #[tokio::test]
