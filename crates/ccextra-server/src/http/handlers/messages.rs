@@ -161,6 +161,38 @@ fn should_clear_ag_replay_on_error(protocol: Protocol, status: u16, body: &[u8])
         && is_antigravity_thought_signature_invalid(body)
 }
 
+/// AG 403 是否为封号(对齐 CPA parseAntigravityTOSViolation:`error.code == 403`、
+/// `error.status == PERMISSION_DENIED`、`error.details[]` 含 ErrorInfo `reason == TOS_VIOLATION`,
+/// 后两者忽略大小写与首尾空白)。命中返回申诉链接,按 CPA redactTOSAppealURL 截掉 `?` / `#`
+/// 之后的部分(防签名 / 跟踪参数进日志);无链接为空串。
+fn antigravity_tos_violation_appeal_url(body: &[u8]) -> Option<String> {
+    let v: Value = serde_json::from_slice(body).ok()?;
+    let err = v.get("error")?;
+    if err.get("code").and_then(Value::as_i64) != Some(403)
+        || !err
+            .get("status")
+            .and_then(Value::as_str)
+            .is_some_and(|s| s.trim().eq_ignore_ascii_case("PERMISSION_DENIED"))
+    {
+        return None;
+    }
+    err.get("details")?.as_array()?.iter().find_map(|d| {
+        let is_tos = d.get("@type").and_then(Value::as_str)
+            == Some("type.googleapis.com/google.rpc.ErrorInfo")
+            && d.get("reason")
+                .and_then(Value::as_str)
+                .is_some_and(|r| r.trim().eq_ignore_ascii_case("TOS_VIOLATION"));
+        is_tos.then(|| {
+            let url = d
+                .pointer("/metadata/appeal_url")
+                .and_then(Value::as_str)
+                .unwrap_or("")
+                .trim();
+            url.split(['?', '#']).next().unwrap_or("").to_string()
+        })
+    })
+}
+
 /// 流式响应旁路提取 replay 的作用域;按协议互斥(Responses / Antigravity / Kimi)
 enum ReplayTap {
     None,
@@ -1485,6 +1517,19 @@ pub(crate) async fn deliver_response(
             }
         }
 
+        // AG 封号:只打告警,不改凭证状态(provider 名含邮箱,不入日志)
+        if !retried_ok
+            && !final_truncated
+            && final_status.as_u16() == 403
+            && matches!(prepared.route.protocol, Protocol::Antigravity)
+            && let Some(appeal_url) = antigravity_tos_violation_appeal_url(&final_bytes)
+        {
+            tracing::warn!(
+                appeal_url = %appeal_url,
+                "Antigravity 上游 403 TOS_VIOLATION,账号疑似被封,需申诉后恢复"
+            );
+        }
+
         if !retried_ok {
             return build_upstream_error_response(
                 prepared.route.protocol,
@@ -2109,6 +2154,57 @@ mod tests {
             crate::http::access_log::access_line(None, 401, 3, 3),
             "access status=401 first_byte_ms=3 total_ms=3"
         );
+    }
+
+    /// AG 封号识别对齐 CPA parseAntigravityTOSViolation;申诉链接按 redactTOSAppealURL 脱敏。
+    #[test]
+    fn ag_tos_violation_detect_and_redact() {
+        let body = br#"{"error":{"code":403,"status":"PERMISSION_DENIED","message":"banned","details":[
+            {"@type":"type.googleapis.com/google.rpc.ErrorInfo","reason":"TOS_VIOLATION",
+             "metadata":{"appeal_url":" https://example.com/appeal?sig=abc#frag ","appeal_url_link_text":"Appeal"}}]}}"#;
+        assert_eq!(
+            antigravity_tos_violation_appeal_url(body).as_deref(),
+            Some("https://example.com/appeal")
+        );
+        // 大小写 / 空白归一;无 metadata → 空串
+        let no_url = br#"{"error":{"code":403,"status":" permission_denied ","details":[
+            {"@type":"type.googleapis.com/google.rpc.ErrorInfo","reason":"tos_violation"}]}}"#;
+        assert_eq!(
+            antigravity_tos_violation_appeal_url(no_url).as_deref(),
+            Some("")
+        );
+    }
+
+    #[test]
+    fn ag_tos_violation_rejects_other_errors() {
+        for body in [
+            // 普通 403
+            br#"{"error":{"code":403,"status":"PERMISSION_DENIED","details":[
+                {"@type":"type.googleapis.com/google.rpc.ErrorInfo","reason":"ACCESS_TOKEN_SCOPE_INSUFFICIENT"}]}}"#
+                .as_slice(),
+            // 429 配额(reason 偶然同名也不算)
+            br#"{"error":{"code":429,"status":"RESOURCE_EXHAUSTED","details":[
+                {"@type":"type.googleapis.com/google.rpc.ErrorInfo","reason":"TOS_VIOLATION"}]}}"#
+                .as_slice(),
+            // status 不对
+            br#"{"error":{"code":403,"status":"FORBIDDEN","details":[
+                {"@type":"type.googleapis.com/google.rpc.ErrorInfo","reason":"TOS_VIOLATION"}]}}"#
+                .as_slice(),
+            // @type 不是 ErrorInfo
+            br#"{"error":{"code":403,"status":"PERMISSION_DENIED","details":[
+                {"@type":"type.googleapis.com/google.rpc.Help","reason":"TOS_VIOLATION"}]}}"#
+                .as_slice(),
+            // 无 details / 非 JSON
+            br#"{"error":{"code":403,"status":"PERMISSION_DENIED"}}"#.as_slice(),
+            b"forbidden".as_slice(),
+        ] {
+            assert_eq!(
+                antigravity_tos_violation_appeal_url(body),
+                None,
+                "{}",
+                String::from_utf8_lossy(body)
+            );
+        }
     }
 
     /// AG 账本清理门禁对齐 CPA：仅 400；422 / 401 / 其它协议不清；含 "signature" 即命中。
