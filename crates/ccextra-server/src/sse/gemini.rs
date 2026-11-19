@@ -450,6 +450,19 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn test_unexpected_tool_call_emits_sse_api_error() {
+        // 对齐 CPA cf07c78a:零输出 UNEXPECTED_TOOL_CALL 同 MALFORMED 走 api_error
+        let output = collect_antigravity_output(stream::iter(vec![Ok(Bytes::from(
+            "data: {\"response\":{\"candidates\":[{\"content\":{\"role\":\"model\",\"parts\":[]},\"finishReason\":\"UNEXPECTED_TOOL_CALL\"}],\"modelVersion\":\"m\"}}\n\ndata: [DONE]\n\n",
+        ))]))
+        .await;
+        assert!(output.contains("event: error"), "{output}");
+        assert!(output.contains("UNEXPECTED_TOOL_CALL"), "{output}");
+        assert!(!output.contains("event: message_stop"), "{output}");
+        assert!(!output.contains("\"stop_reason\":\"end_turn\""), "{output}");
+    }
+
+    #[tokio::test]
     async fn test_malformed_after_visible_text_finishes_with_message_stop() {
         // 对齐 CPA cf07c78a:已有可见文本时 MALFORMED 不报错,正常收尾
         let output = collect_output(stream::iter(vec![Ok(Bytes::from(
