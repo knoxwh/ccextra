@@ -6,20 +6,26 @@ use ccextra_core::route::ModelConfig;
 pub fn default_codex_models() -> Vec<ModelConfig> {
     vec![
         ModelConfig {
-            name: "gpt-5.6-terra".to_string(),
-            alias: "gpt-5.6-terra".to_string(),
+            name: "gpt-6.1-sol".to_string(),
+            alias: "gpt-6.1-sol".to_string(),
             max_input_tokens: None,
             max_tokens: None,
         },
         ModelConfig {
-            name: "gpt-5.6-sol".to_string(),
-            alias: "gpt-5.6-sol".to_string(),
+            name: "gpt-6.1-terra".to_string(),
+            alias: "gpt-6.1-terra".to_string(),
             max_input_tokens: None,
             max_tokens: None,
         },
         ModelConfig {
-            name: "gpt-6-astra".to_string(),
-            alias: "gpt-6-astra".to_string(),
+            name: "gpt-6.2-sol".to_string(),
+            alias: "gpt-6.2-sol".to_string(),
+            max_input_tokens: None,
+            max_tokens: None,
+        },
+        ModelConfig {
+            name: "gpt-6.2-astra".to_string(),
+            alias: "gpt-6.2-astra".to_string(),
             max_input_tokens: None,
             max_tokens: None,
         },
