@@ -64,7 +64,7 @@ flowchart LR
 
 让 Claude Code 用自己的订阅登录经 ccextra 访问 Anthropic。ccextra 不保存、不刷新任何订阅凭证，只把客户端的 `Authorization` 原样转给 `api.anthropic.com`。
 
-- **建议独立实例**：单独起一个监听 `127.0.0.1:8223` 的实例，不设 `secret_key`、不设 `payload`，只放这一个 provider（注释示例见 [config.example.yaml](config.example.yaml)）；在主实例 `config.yaml` 设 `official_instance: on` 后由 `./service.sh` 统一启停。设了 `secret_key` 的实例先做入口认证，`sk-ant-` 开头的 key 一律 401。
+- **建议独立实例**：单独起一个监听 `127.0.0.1:8223` 的实例，不设 `secret_key`、不设 `payload`，只放这一个 provider（模板见 [scripts/official/config.yaml.example](scripts/official/config.yaml.example)）；在主实例 `config.yaml` 设 `official_instance: on` 后由 `./service.sh` 自动建目录并统一启停。设了 `secret_key` 的实例先做入口认证，`sk-ant-` 开头的 key 一律 401。
 - **Claude Code 端**：只设 `ANTHROPIC_BASE_URL=http://127.0.0.1:8223`，不要设 `ANTHROPIC_AUTH_TOKEN`、`ANTHROPIC_API_KEY` 或 `apiKeyHelper`；否则发出的就不是订阅登录的 `Authorization`。缺 `Authorization`（含空值、全空白）本地返回 401，`x-api-key` 不转发。
 - **配置约束**（启动与 `/reload` 校验）：`key` 必须留空；`base_url` 只能是单个 `https://api.anthropic.com`（端口为空或 443，不含 path / query / fragment / userinfo）；不得设 `metadata`；每个模型 `alias == name`，不改写 `model`。
 - **`claude-*` 通配**：仅 `anthropic_official` 可用，每个 provider 至多一条，须以 `claude-` 开头且只有末尾一个 `*`。精确条目优先；未登记的 `claude-…` 快照名命中通配并原样转发；`claude-`、`claude-*`、`claude-**` 返回 404；`/v1/models` 不列出通配条目。
@@ -136,7 +136,7 @@ curl -H "Authorization: Bearer $ANTHROPIC_AUTH_TOKEN" http://127.0.0.1:8222/v1/m
 
 后台（macOS）：`build.sh` / `deploy.sh`（均 `cargo build --release --locked`，按已提交的 `Cargo.lock` 构建，保证指纹车道依赖可复现）/ `start.sh` / `stop.sh` / `restart.sh` 经 LaunchAgent `com.wanghao.ccextra` 管理根目录 `./ccextra`（关终端不杀进程；首次 `scripts/macos/install-launchagent.sh`，或直接 `./start.sh` 会安装 plist）。`logs/ccextra.launchd.log`（stdout/stderr 同文件）仅在 Agent 未加载、即将 bootstrap 时按日合并滚动（append 进 `ccextra.launchd.YYYY-MM-DD.log`，不写时间戳碎片）。热重载：保存 `config.yaml` / 启动时的 `models.json` 即生效（150ms debounce），亦可 `POST /reload`。
 
-统一入口 `./service.sh start|stop|restart|status`：始终管理 8222（内部调用 `start.sh` / `stop.sh`）；按 `config.yaml` 顶层 `official_instance`（只读这一行）决定官方透传实例：`on` 时安装并拉起 LaunchAgent `com.wanghao.ccextra-official`（`../ccextra-official/ccextra --config ../ccextra-official/config.yaml`，监听 8223，日志在该目录 `logs/`，PID 写 `ccextra.pid`；plist 留在 `~/Library/LaunchAgents`，登录时自启、崩溃由 KeepAlive 重拉），`off` 时 bootout 并移除该 plist，确保 8223 未运行。`stop` 两个都停（开关为 on 时保留 plist）。目录可用 `CCEXTRA_OFFICIAL_DIR` 覆盖。`deploy.sh` 构建后先 `stop.sh` 停 8222，再 `service.sh start`（8223 已在跑则不动）。
+统一入口 `./service.sh start|stop|restart|status|official-init`：始终管理 8222（内部调用 `start.sh` / `stop.sh`）；按 `config.yaml` 顶层 `official_instance`（只读这一行）决定官方透传实例：`on` 时先 `official-init`，再安装并拉起 LaunchAgent `com.wanghao.ccextra-official`（`../ccextra-official/ccextra --config ../ccextra-official/config.yaml`，监听 8223，日志在该目录 `logs/`，PID 写 `ccextra.pid`；plist 留在 `~/Library/LaunchAgents`，登录时自启、崩溃由 KeepAlive 重拉），`off` 时 bootout 并移除该 plist，确保 8223 未运行。`stop` 两个都停（开关为 on 时保留 plist）。`../ccextra-official`（可用 `CCEXTRA_OFFICIAL_DIR` 覆盖）是纯运行目录，删掉可重建：`official-init`（不看开关、不启动）补建目录与 `logs/`，二进制与仓库根 `./ccextra` 不同就原子替换（8223 在跑则 kickstart，保证与 8222 同版本），`config.yaml` 缺失时由 [scripts/official/config.yaml.example](scripts/official/config.yaml.example) 生成（0600，`proxy_url` 取主实例 `server.proxy_url`，已存在不覆盖）。模板、A1 自检与启用步骤见 [scripts/official/](scripts/official/README.md)。`deploy.sh` 构建后先 `stop.sh` 停 8222，再 `service.sh start`（8223 已在跑则不动）。
 
 ## 配置要点
 

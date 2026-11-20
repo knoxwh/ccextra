@@ -1,11 +1,14 @@
 #!/bin/bash
 set -euo pipefail
 
-# 统一入口: ./service.sh start|stop|restart|status
+# 统一入口: ./service.sh start|stop|restart|status|official-init
 # - 始终管理 8222 主实例(复用 start.sh / stop.sh,LaunchAgent com.wanghao.ccextra)
 # - 按 config.yaml 顶层 official_instance(on/off,只读这一行)管理 8223 官方透传实例:
-#   on  → 安装 plist 并 bootstrap LaunchAgent com.wanghao.ccextra-official(登录自启、KeepAlive)
+#   on  → official-init(补齐运行目录、同步二进制)后安装 plist 并 bootstrap
+#         LaunchAgent com.wanghao.ccextra-official(登录自启、KeepAlive)
 #   off → bootout 并移除该 plist,确保 8223 未运行
+# - official-init:不看开关,只准备 $CCEXTRA_OFFICIAL_DIR(纯运行目录,可删后重建):
+#   logs/、仓库根 ./ccextra 的副本、由 scripts/official/config.yaml.example 生成的 config.yaml
 
 SCRIPT_DIR="$(cd "$(dirname "$0")" && pwd)"
 CONFIG="$SCRIPT_DIR/config.yaml"
@@ -21,6 +24,9 @@ OFFICIAL_PORT=8223
 OFFICIAL_LABEL="com.wanghao.ccextra-official"
 OFFICIAL_SERVICE="${DOMAIN}/${OFFICIAL_LABEL}"
 OFFICIAL_SRC="$SCRIPT_DIR/scripts/macos/${OFFICIAL_LABEL}.plist"
+OFFICIAL_TEMPLATE="$SCRIPT_DIR/scripts/official/config.yaml.example"
+MAIN_BIN="$SCRIPT_DIR/ccextra"
+OFFICIAL_BIN_UPDATED=no
 OFFICIAL_DST="${HOME}/Library/LaunchAgents/${OFFICIAL_LABEL}.plist"
 # 匹配 launchd 拉起的绝对路径与手工 ./ccextra 两种命令行
 OFFICIAL_RE="ccextra --config ${OFFICIAL_CONFIG}( |\$)"
@@ -44,6 +50,51 @@ official_switch() {
             return 1
             ;;
     esac
+}
+
+# 主实例 server.proxy_url 的值(只读 server 段这一行,不输出);找不到返回非 0
+main_proxy_url() {
+    local val
+    val=$(awk '/^server:/{f=1;next} f&&/^[^[:space:]#]/{f=0} f&&/^[[:space:]]+proxy_url:/{print;exit}' "$CONFIG" 2>/dev/null || true)
+    val=$(printf '%s' "$val" | sed -E 's/^[[:space:]]*proxy_url:[[:space:]]*//; s/[[:space:]]+#.*$//; s/[[:space:]]+$//')
+    val=${val#\"}; val=${val%\"}; val=${val#\'}; val=${val%\'}
+    [ -n "$val" ] || return 1
+    printf '%s' "$val"
+}
+
+# 准备 8223 运行目录:logs/、二进制(与仓库根 ./ccextra 不同则原子替换)、config.yaml(缺失才生成,0600)
+official_init() {
+    local tmp proxy
+    if [ ! -x "$MAIN_BIN" ]; then
+        echo "错误: 未找到 $MAIN_BIN,请先 build.sh / deploy.sh" >&2
+        return 1
+    fi
+    mkdir -p "$OFFICIAL_DIR/logs"
+    if ! cmp -s "$MAIN_BIN" "$OFFICIAL_BIN"; then
+        # 先复制到同目录临时文件再 rename:运行中的旧进程不受影响(不能原地覆盖正在执行的二进制)
+        tmp="$OFFICIAL_BIN.tmp.$$"
+        cp "$MAIN_BIN" "$tmp"
+        chmod 755 "$tmp"
+        mv -f "$tmp" "$OFFICIAL_BIN"
+        OFFICIAL_BIN_UPDATED=yes
+        echo "official binary synced from $MAIN_BIN"
+    fi
+    if [ ! -f "$OFFICIAL_CONFIG" ]; then
+        if [ ! -f "$OFFICIAL_TEMPLATE" ]; then
+            echo "错误: 找不到配置模板 $OFFICIAL_TEMPLATE" >&2
+            return 1
+        fi
+        if ! proxy=$(main_proxy_url); then
+            echo "错误: $CONFIG 中没有 server.proxy_url,无法生成 $OFFICIAL_CONFIG" >&2
+            return 1
+        fi
+        tmp="$OFFICIAL_CONFIG.tmp.$$"
+        (umask 077 && PROXY="$proxy" awk '{ i = index($0, "@PROXY_URL@"); if (i > 0) $0 = substr($0, 1, i - 1) ENVIRON["PROXY"] substr($0, i + 11); print }' "$OFFICIAL_TEMPLATE" > "$tmp")
+        chmod 600 "$tmp"
+        mv "$tmp" "$OFFICIAL_CONFIG"
+        echo "generated: $OFFICIAL_CONFIG (0600, proxy_url 取自主实例 server.proxy_url)"
+    fi
+    echo "official dir ready: $OFFICIAL_DIR"
 }
 
 official_health_ok() {
@@ -110,10 +161,7 @@ official_stop() {
 
 official_start() {
     local pid
-    if [ ! -x "$OFFICIAL_BIN" ] || [ ! -f "$OFFICIAL_CONFIG" ]; then
-        echo "错误: 缺少 $OFFICIAL_BIN 或 $OFFICIAL_CONFIG" >&2
-        return 1
-    fi
+    official_init
     if [ ! -f "$OFFICIAL_SRC" ]; then
         echo "错误: 找不到 plist 模板 $OFFICIAL_SRC" >&2
         return 1
@@ -121,7 +169,7 @@ official_start() {
     mkdir -p "${HOME}/Library/LaunchAgents" "$OFFICIAL_DIR/logs"
     sed "s|@DIR@|${OFFICIAL_DIR}|g" "$OFFICIAL_SRC" > "$OFFICIAL_DST"
 
-    if official_loaded && official_health_ok; then
+    if official_loaded && official_health_ok && [ "$OFFICIAL_BIN_UPDATED" = no ]; then
         echo "official instance already running via LaunchAgent $OFFICIAL_LABEL"
     else
         official_fail_if_foreign_listener
@@ -195,6 +243,9 @@ case "${1:-}" in
         if [ "$sw" = on ]; then official_stop no; fi
         apply_switch
         ;;
+    official-init)
+        official_init
+        ;;
     status)
         sw=$(official_switch 2>/dev/null || echo invalid)
         echo "official_instance: $sw"
@@ -207,7 +258,7 @@ case "${1:-}" in
         fi
         ;;
     *)
-        echo "用法: $0 start|stop|restart|status" >&2
+        echo "用法: $0 start|stop|restart|status|official-init" >&2
         exit 1
         ;;
 esac
