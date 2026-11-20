@@ -231,10 +231,17 @@ async fn main() -> Result<()> {
 
     // 构建应用状态
     let config_path = cli.config.clone();
+    let startup_official_instance = config.official_instance;
     let reload = Arc::new(move || -> std::pin::Pin<Box<dyn std::future::Future<Output = anyhow::Result<ReloadData>> + Send>> {
         let config_path = config_path.clone();
         Box::pin(async move {
             let cfg = Config::load(&config_path)?;
+            if cfg.official_instance != startup_official_instance {
+                tracing::info!(
+                    "official_instance 已改为 {}:本进程不受影响,执行 ./service.sh restart 生效",
+                    if cfg.official_instance { "on" } else { "off" }
+                );
+            }
             let refresh = provider_refresh_config(&config_path, &cfg);
 
             // 重载时重新解析 auth_dir 并加载动态 providers

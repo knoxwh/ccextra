@@ -39,6 +39,35 @@ pub struct Config {
     /// reasoning 级别注册表路径(可选);相对配置文件解析,默认同目录 `models.json`
     #[serde(default)]
     pub models_file: Option<String>,
+    /// 官方订阅透传独立实例(8223)开关:on/off(也接受 bool),缺省 off。
+    /// 仅 service.sh 读取以决定是否管理该实例;不改变本进程任何行为,/reload 不生效
+    #[serde(default, deserialize_with = "de_on_off")]
+    pub official_instance: bool,
+}
+
+/// `official_instance` 取值:`on`/`off` 或 bool;其他值(含空值)报错
+fn de_on_off<'de, D>(d: D) -> std::result::Result<bool, D::Error>
+where
+    D: serde::Deserializer<'de>,
+{
+    struct OnOff;
+    impl serde::de::Visitor<'_> for OnOff {
+        type Value = bool;
+        fn expecting(&self, f: &mut std::fmt::Formatter) -> std::fmt::Result {
+            f.write_str("on 或 off(也接受 true/false)")
+        }
+        fn visit_bool<E: serde::de::Error>(self, v: bool) -> std::result::Result<bool, E> {
+            Ok(v)
+        }
+        fn visit_str<E: serde::de::Error>(self, v: &str) -> std::result::Result<bool, E> {
+            match v {
+                "on" => Ok(true),
+                "off" => Ok(false),
+                _ => Err(E::invalid_value(serde::de::Unexpected::Str(v), &self)),
+            }
+        }
+    }
+    d.deserialize_any(OnOff)
 }
 
 #[derive(Debug, Deserialize, Clone)]
@@ -632,5 +661,52 @@ logging:
             err.to_string().contains("sk-ant-"),
             "unexpected error: {err}"
         );
+    }
+
+    #[test]
+    fn test_official_instance_switch() {
+        let base = r#"
+server:
+  host: "127.0.0.1"
+  port: 8222
+providers: []
+normalize:
+  enabled: false
+  drift_detector: false
+logging:
+  level: info
+  request_body: false
+"#;
+        let load = |extra: &str| {
+            let mut file = NamedTempFile::new().unwrap();
+            file.write_all(format!("{base}{extra}").as_bytes()).unwrap();
+            Config::load(file.path().to_str().unwrap())
+        };
+        assert!(!load("").unwrap().official_instance, "缺省应为 off");
+        assert!(load("official_instance: on\n").unwrap().official_instance);
+        assert!(!load("official_instance: off\n").unwrap().official_instance);
+        assert!(
+            !load("official_instance: off  # 注释\n")
+                .unwrap()
+                .official_instance
+        );
+        assert!(
+            load("official_instance: \"on\"\n")
+                .unwrap()
+                .official_instance
+        );
+        assert!(load("official_instance: true\n").unwrap().official_instance);
+        assert!(
+            !load("official_instance: false\n")
+                .unwrap()
+                .official_instance
+        );
+        for bad in ["yes", "ON", "1", "\"\"", ""] {
+            let err = load(&format!("official_instance: {bad}\n")).unwrap_err();
+            assert!(
+                err.to_string().contains("on 或 off"),
+                "{bad:?} 应报错: {err}"
+            );
+        }
     }
 }

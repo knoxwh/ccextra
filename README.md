@@ -64,7 +64,7 @@ flowchart LR
 
 让 Claude Code 用自己的订阅登录经 ccextra 访问 Anthropic。ccextra 不保存、不刷新任何订阅凭证，只把客户端的 `Authorization` 原样转给 `api.anthropic.com`。
 
-- **建议独立实例**：单独起一个监听 `127.0.0.1:8223` 的实例，不设 `secret_key`、不设 `payload`，只放这一个 provider（注释示例见 [config.example.yaml](config.example.yaml)）。设了 `secret_key` 的实例先做入口认证，`sk-ant-` 开头的 key 一律 401。
+- **建议独立实例**：单独起一个监听 `127.0.0.1:8223` 的实例，不设 `secret_key`、不设 `payload`，只放这一个 provider（注释示例见 [config.example.yaml](config.example.yaml)）；在主实例 `config.yaml` 设 `official_instance: on` 后由 `./service.sh` 统一启停。设了 `secret_key` 的实例先做入口认证，`sk-ant-` 开头的 key 一律 401。
 - **Claude Code 端**：只设 `ANTHROPIC_BASE_URL=http://127.0.0.1:8223`，不要设 `ANTHROPIC_AUTH_TOKEN`、`ANTHROPIC_API_KEY` 或 `apiKeyHelper`；否则发出的就不是订阅登录的 `Authorization`。缺 `Authorization`（含空值、全空白）本地返回 401，`x-api-key` 不转发。
 - **配置约束**（启动与 `/reload` 校验）：`key` 必须留空；`base_url` 只能是单个 `https://api.anthropic.com`（端口为空或 443，不含 path / query / fragment / userinfo）；不得设 `metadata`；每个模型 `alias == name`，不改写 `model`。
 - **`claude-*` 通配**：仅 `anthropic_official` 可用，每个 provider 至多一条，须以 `claude-` 开头且只有末尾一个 `*`。精确条目优先；未登记的 `claude-…` 快照名命中通配并原样转发；`claude-`、`claude-*`、`claude-**` 返回 404；`/v1/models` 不列出通配条目。
@@ -136,6 +136,8 @@ curl -H "Authorization: Bearer $ANTHROPIC_AUTH_TOKEN" http://127.0.0.1:8222/v1/m
 
 后台（macOS）：`build.sh` / `deploy.sh`（均 `cargo build --release --locked`，按已提交的 `Cargo.lock` 构建，保证指纹车道依赖可复现）/ `start.sh` / `stop.sh` / `restart.sh` 经 LaunchAgent `com.wanghao.ccextra` 管理根目录 `./ccextra`（关终端不杀进程；首次 `scripts/macos/install-launchagent.sh`，或直接 `./start.sh` 会安装 plist）。`logs/ccextra.launchd.log`（stdout/stderr 同文件）仅在 Agent 未加载、即将 bootstrap 时按日合并滚动（append 进 `ccextra.launchd.YYYY-MM-DD.log`，不写时间戳碎片）。热重载：保存 `config.yaml` / 启动时的 `models.json` 即生效（150ms debounce），亦可 `POST /reload`。
 
+统一入口 `./service.sh start|stop|restart|status`：始终管理 8222（内部调用 `start.sh` / `stop.sh`）；按 `config.yaml` 顶层 `official_instance`（只读这一行）决定官方透传实例：`on` 时安装并拉起 LaunchAgent `com.wanghao.ccextra-official`（`../ccextra-official/ccextra --config ../ccextra-official/config.yaml`，监听 8223，日志在该目录 `logs/`，PID 写 `ccextra.pid`；plist 留在 `~/Library/LaunchAgents`，登录时自启、崩溃由 KeepAlive 重拉），`off` 时 bootout 并移除该 plist，确保 8223 未运行。`stop` 两个都停（开关为 on 时保留 plist）。目录可用 `CCEXTRA_OFFICIAL_DIR` 覆盖。`deploy.sh` 构建后先 `stop.sh` 停 8222，再 `service.sh start`（8223 已在跑则不动）。
+
 ## 配置要点
 
 完整字段见 [config.example.yaml](config.example.yaml)。常用项：
@@ -149,6 +151,7 @@ curl -H "Authorization: Bearer $ANTHROPIC_AUTH_TOKEN" http://127.0.0.1:8222/v1/m
 | `payload` | 按模型 glob 覆盖顶层参数，可用 `protocol` 限定 |
 | `prompt_cache_key` | 仅 OpenAI 路径；取 Claude Code 会话 ID，不覆盖已有非空值 |
 | `models_file` | reasoning 表（默认旁路 `models.json`，可从 [models.json.example](models.json.example) 复制） |
+| `official_instance` | `on` / `off`（缺省 `off`，也接受 `true`/`false`，其他值启动报错）；仅 `service.sh` 读取，决定是否同时管理 8223 官方透传实例；不影响本进程，`/reload` 不生效（只打 INFO 提示），改后 `./service.sh restart` |
 | `antigravity_models` | 模型白名单（glob / 精确名）；缺省全量 |
 | `*_auth_dir` | OAuth 凭证目录；默认配置旁 `.cache/<provider>` |
 

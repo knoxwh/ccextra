@@ -64,7 +64,7 @@ Inbound is always Anthropic-shaped; outbound is restored to Anthropic responses.
 
 Lets Claude Code reach Anthropic through ccextra with its own subscription login. ccextra stores and refreshes no subscription credential; it forwards the client's `Authorization` verbatim to `api.anthropic.com`.
 
-- **Use a standalone instance**: run a separate instance on `127.0.0.1:8223` with no `secret_key` and no `payload`, holding only this provider (commented example in [config.example.yaml](config.example.yaml)). An instance with `secret_key` authenticates first and rejects any key starting with `sk-ant-` with 401.
+- **Use a standalone instance**: run a separate instance on `127.0.0.1:8223` with no `secret_key` and no `payload`, holding only this provider (commented example in [config.example.yaml](config.example.yaml)); set `official_instance: on` in the main instance's `config.yaml` and `./service.sh` starts/stops it together. An instance with `secret_key` authenticates first and rejects any key starting with `sk-ant-` with 401.
 - **Claude Code side**: set only `ANTHROPIC_BASE_URL=http://127.0.0.1:8223`; do not set `ANTHROPIC_AUTH_TOKEN`, `ANTHROPIC_API_KEY`, or `apiKeyHelper`, otherwise the `Authorization` sent is not the subscription login. A missing `Authorization` (including empty or all-whitespace) gets a local 401; `x-api-key` is not forwarded.
 - **Config rules** (checked at startup and `/reload`): `key` must be empty; `base_url` must be a single `https://api.anthropic.com` (port empty or 443, no path / query / fragment / userinfo); no `metadata`; every model has `alias == name`, so `model` is never rewritten.
 - **`claude-*` wildcard**: `anthropic_official` only, at most one per provider, must start with `claude-` and have a single trailing `*`. Exact entries win; unlisted `claude-…` snapshot names hit the wildcard and are forwarded verbatim; `claude-`, `claude-*`, `claude-**` return 404; `/v1/models` does not list wildcard entries.
@@ -136,6 +136,8 @@ curl -H "Authorization: Bearer $ANTHROPIC_AUTH_TOKEN" http://127.0.0.1:8222/v1/m
 
 Daemon helpers (macOS): `build.sh` / `deploy.sh` / `start.sh` / `stop.sh` / `restart.sh` manage `./ccextra` via LaunchAgent `com.wanghao.ccextra` (survives quitting the terminal; first run `scripts/macos/install-launchagent.sh`, or `./start.sh` installs the plist). `logs/ccextra.launchd.log` (stdout+stderr) merges/appends into `ccextra.launchd.YYYY-MM-DD.log` only when the Agent is unloaded and about to bootstrap (no timestamped fragments). Hot reload: saving `config.yaml` / startup `models.json` applies (150ms debounce); `POST /reload` still works.
 
+Unified entry `./service.sh start|stop|restart|status`: always manages 8222 (calls `start.sh` / `stop.sh`); the top-level `official_instance` in `config.yaml` (only that line is read) decides the official passthrough instance: `on` installs and starts LaunchAgent `com.wanghao.ccextra-official` (`../ccextra-official/ccextra --config ../ccextra-official/config.yaml` on 8223, logs in that directory's `logs/`, PID in `ccextra.pid`; the plist stays in `~/Library/LaunchAgents`, so it starts at login and KeepAlive restarts it on crash); `off` boots it out and removes that plist so 8223 is not running. `stop` stops both (keeps the plist when the switch is on). Override the directory with `CCEXTRA_OFFICIAL_DIR`. `deploy.sh` builds, stops 8222 via `stop.sh`, then runs `service.sh start` (a running 8223 is left alone).
+
 ## Configuration highlights
 
 Full fields: [config.example.yaml](config.example.yaml). Common items:
@@ -149,6 +151,7 @@ Full fields: [config.example.yaml](config.example.yaml). Common items:
 | `payload` | Glob overrides for top-level params; optional `protocol` scope |
 | `prompt_cache_key` | OpenAI paths only; takes Claude Code session ID; does not overwrite a non-empty value |
 | `models_file` | Reasoning table (default sibling `models.json`; copy from [models.json.example](models.json.example)) |
+| `official_instance` | `on` / `off` (default `off`; `true`/`false` also accepted, anything else fails startup); read only by `service.sh` to decide whether to also manage the 8223 official passthrough instance; no effect on this process, `/reload` does not apply it (INFO hint only); run `./service.sh restart` after changing |
 | `antigravity_models` | Model whitelist (glob / exact); default = all |
 | `*_auth_dir` | OAuth credential dirs; default `.cache/<provider>` next to config |
 

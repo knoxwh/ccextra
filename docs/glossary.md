@@ -9,6 +9,7 @@
 | Anthropic Messages | ccextra 的入站与出口形状，主端点为 `/v1/messages`。 |
 | `claude` | 上游 Anthropic Messages 协议。 |
 | `anthropic_official` | 官方 Anthropic 订阅透传：把客户端 `Authorization` 与请求原始字节原样转给 `https://api.anthropic.com`，上游状态、头、错误体与 SSE 原样回传；要求 `key` 为空、`alias == name`，不转换、不重试、不刷新凭证。 |
+| `official_instance` | 主实例 `config.yaml` 顶层开关（`on`/`off`，缺省 off）。只由 `service.sh` 读取，决定是否同时管理 8223 官方透传独立实例；不改变主进程行为。 |
 | `openai_chat` | OpenAI Chat Completions 协议，端点为 `/chat/completions`。 |
 | `openai_responses` | OpenAI Responses 协议，端点为 `/responses`。 |
 | `gemini` | Google Gemini GenerateContent 协议。 |

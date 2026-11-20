@@ -42,6 +42,11 @@ secret_key: "sk-ccextra-xxx"
 # 缺文件 = 不钳制 effort;/reload 会重读。示例见仓库根 models.json。
 # models_file: "models.json"
 
+# 官方订阅透传独立实例(127.0.0.1:8223,目录 ../ccextra-official)开关:on/off,缺省 off(也接受 true/false)。
+# 仅 service.sh 读取:on 时 start/restart 同时拉起该实例(LaunchAgent com.wanghao.ccextra-official,登录时随开关自启),
+# off 时确保它停止并移除其 plist。不改变本进程任何行为,/reload 不生效;改后执行 ./service.sh restart。
+official_instance: off
+
 # Antigravity 连接池(可选)。默认短连接:空闲连接响应结束即关闭,
 # 防止凭证轮换下 socket 堆积与陈旧连接错误;仅显式 enabled: true 才保留池。
 # antigravity:

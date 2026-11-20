@@ -36,8 +36,9 @@ cp "$SCRIPT_DIR/target/release/ccextra" "$SCRIPT_DIR/ccextra"
 echo "ccextra → $SCRIPT_DIR/ccextra"
 
 # 编完必起：即使原先没在跑，也拉起来，避免「只停不起 / 已死后 deploy 不启」
+# service.sh start = start.sh + 按 official_instance 开关处理 8223（已在跑则不动）
 echo "=== Starting service ==="
-if ! "$SCRIPT_DIR/start.sh"; then
+if ! "$SCRIPT_DIR/service.sh" start; then
     echo "错误: deploy 后 start 失败，请检查 logs/ccextra.launchd.log 与端口 8222" >&2
     exit 1
 fi
