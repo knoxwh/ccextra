@@ -89,7 +89,7 @@ OpenAI Chat 或 Responses 的 provider 级缓存桶标识。来自 Claude Code �
 ## 运行时术语
 
 **UpstreamClient**
-双栈发送器：默认车道按 (proxy, antigravity, no_redirect, credential scope) 缓存 `reqwest::Client`；`protocol: claude` 走 Claude TLS fingerprint lane（wreq/BoringSSL），按 (proxy, no_redirect) 缓存进 `fp_clients`。它选择协议端点、认证、User-Agent、Grok 会话头和流式头。Responses 序列化时先发顶层 `model`、`stream` 和已有 `service_tier`，供网关在大 input 到达前路由；其余键序与值不变。
+分池发送器：默认车道按 (proxy, antigravity, no_redirect, credential scope) 缓存 `reqwest::Client`；`protocol: claude` 走 Claude TLS fingerprint lane（wreq/BoringSSL），按 (proxy, no_redirect) 缓存进 `fp_clients`；`protocol: anthropic_official` 走独立 `official_clients` 池（普通 `reqwest + rustls`、按代理键缓存、禁重定向、无总超时）。它选择协议端点、认证、User-Agent、Grok 会话头和流式头。Responses 序列化时先发顶层 `model`、`stream` 和已有 `service_tier`，供网关在大 input 到达前路由；其余键序与值不变。
 
 **Grok CLI 身份**
 Grok Chat/Responses 请求使用 `x-grok-client-identifier: grok-pager`、`x-grok-client-mode: interactive` 与 `grok-pager/{version} grok-shell/{version} ({os}; {arch})`。版本默认 `1.0.46`，可由 `user_agents.grok_version` 覆盖；`x-authenticateresponse: authenticate-response` 仅官方 `cli-chat-proxy.grok.com` 添加，不用于普通 API 或其他模型/协议。
@@ -107,7 +107,7 @@ messages 路径不做本地退避：429/5xx（含 52x）与网络错误在同轮
 将 OpenAI 或 Gemini 风格 SSE 转成 Anthropic `message_start`、content block、delta 和终态事件的状态机。终态后忽略后续上游事件。
 
 **keepalive**
-流式输出空闲 10 秒后发送的 `: keepalive\n\n` SSE 注释，防止中间网络层关闭空闲连接。上游流本身另有 180s chunk idle（当前服务设置）；超时发 Anthropic error，不是心跳。首帧预读阶段跳过心跳帧，不当作首帧成功。
+流式输出空闲 10 秒后发送的 `: keepalive\n\n` SSE 注释，防止中间网络层关闭空闲连接。上游流本身另有 180s chunk idle（当前服务设置）；超时发 Anthropic error，不是心跳。首帧预读阶段跳过心跳帧，不当作首帧成功。`anthropic_official` 例外：响应字节原样回传，不插心跳、不设 180s 空闲超时。
 
 **reasoning replay**
 Responses 上游不保留完整会话时，服务端按模型和会话保存兼容 reasoning 回合，并在下一请求锚定插入。仅可安全回放的内容会进入请求。
@@ -141,7 +141,7 @@ Gemini 函数调用模式。Antigravity Claude 模型强制使用；Gemini 直�
 包含 providers、payload、运行时配置和后台刷新参数的不可变 `Arc`。请求入口一次获取，发布只在短暂写锁内替换。后台 Antigravity 空结果保留整个 provider 集合；显式 reload 优先应用删除、禁用及目录切换，不从旧快照恢复动态 provider。
 
 **诊断落盘**
-`logging.request_body: true` 时保存最终出站请求，便于检查缓存和转换问题；敏感入站认证头会脱敏。
+`logging.request_body: true` 时保存最终出站请求，便于检查缓存和转换问题；敏感入站认证头会脱敏；`anthropic_official` 路径不生效。
 
 **fail-open**
 归一化不能安全处理某项数据时，优先保留可发送的原始语义，而非因缓存优化阻断请求。

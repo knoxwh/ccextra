@@ -91,6 +91,7 @@ cargo build --release
 server:
   host: "127.0.0.1"
   port: 8222
+  proxy_url: "direct"
 
 providers:
   - name: upstream
@@ -151,7 +152,7 @@ curl -H "Authorization: Bearer $ANTHROPIC_AUTH_TOKEN" http://127.0.0.1:8222/v1/m
 | `payload` | 按模型 glob 覆盖顶层参数，可用 `protocol` 限定 |
 | `prompt_cache_key` | 仅 OpenAI 路径；取 Claude Code 会话 ID，不覆盖已有非空值 |
 | `models_file` | reasoning 表（默认旁路 `models.json`，可从 [models.json.example](models.json.example) 复制） |
-| `official_instance` | `on` / `off`（缺省 `off`，也接受 `true`/`false`，其他值启动报错）；仅 `service.sh` 读取，决定是否同时管理 8223 官方透传实例；不影响本进程，`/reload` 不生效（只打 INFO 提示），改后 `./service.sh restart` |
+| `official_instance` | `on` / `off`（缺省 `off`，也接受 `true`/`false`，其他值启动报错）；仅 `service.sh` 读取，决定是否同时管理 8223 官方透传实例；不影响本进程，`/reload` 不生效（变化时打一次 INFO 提示），改后 `./service.sh start`（不中断 8222）或 `restart` |
 | `antigravity_models` | 模型白名单（glob / 精确名）；缺省全量 |
 | `*_auth_dir` | OAuth 凭证目录；默认配置旁 `.cache/<provider>` |
 

@@ -91,6 +91,7 @@ Copy [config.example.yaml](config.example.yaml) to `config.yaml`, or start from 
 server:
   host: "127.0.0.1"
   port: 8222
+  proxy_url: "direct"
 
 providers:
   - name: upstream
@@ -151,7 +152,7 @@ Full fields: [config.example.yaml](config.example.yaml). Common items:
 | `payload` | Glob overrides for top-level params; optional `protocol` scope |
 | `prompt_cache_key` | OpenAI paths only; takes Claude Code session ID; does not overwrite a non-empty value |
 | `models_file` | Reasoning table (default sibling `models.json`; copy from [models.json.example](models.json.example)) |
-| `official_instance` | `on` / `off` (default `off`; `true`/`false` also accepted, anything else fails startup); read only by `service.sh` to decide whether to also manage the 8223 official passthrough instance; no effect on this process, `/reload` does not apply it (INFO hint only); run `./service.sh restart` after changing |
+| `official_instance` | `on` / `off` (default `off`; `true`/`false` also accepted, anything else fails startup); read only by `service.sh` to decide whether to also manage the 8223 official passthrough instance; no effect on this process, `/reload` does not apply it (logs one INFO hint per change); run `./service.sh start` (keeps 8222 running) or `restart` after changing |
 | `antigravity_models` | Model whitelist (glob / exact); default = all |
 | `*_auth_dir` | OAuth credential dirs; default `.cache/<provider>` next to config |
 
@@ -160,6 +161,7 @@ Full fields: [config.example.yaml](config.example.yaml). Common items:
 
 - `user_agents` — override Claude / Codex / Grok / Antigravity identifiers
 - `logging.request_body` — write diagnostic requests under `logs/` next to the config file (not cwd)
+- Access log — one `INFO` `access …` line per `/v1/messages` request (`model` / `provider` / `protocol` / `upstream_model` / `stream` / `status` / `first_byte_ms` / `total_ms`; streaming 2xx logs total duration on stream end or client disconnect), with no headers, body, or keys
 - Hot reload — watches `config.yaml` and the startup-pinned `models.json` (save-to-reload, 150ms debounce + content hash); `POST /reload` also works. Atomically publishes providers, payload, normalize, auth, proxy, UA, reasoning table, and refresh params; failed loads leave the snapshot unchanged; `logging.level` needs a restart
 - Background refresh uses the last successfully published static config; explicit reload prefers removals / disables / directory switches
 - `antigravity.connection-pool` — short connections by default; with `enabled: true`, keep the pool per idle / per-host caps
