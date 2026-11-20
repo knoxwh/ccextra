@@ -1,11 +1,14 @@
 # A1 mock: 只记录头名/存在性/布尔值，绝不记录 Authorization、x-api-key 的值
-import json, sys, time
+import json, os, sys, threading, time
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 
 LOG = sys.argv[2]
 PORT = int(sys.argv[1])
+READY_TOKEN = os.environ.get("A1_READY_TOKEN", "a1-mock-ready").encode()
+LOG_LOCK = threading.Lock()
 
-def record(h, method):
+
+def record(h, method, path):
     names = sorted({k.lower() for k in h.keys()})
     auth = h.get("authorization") or ""
     beta = h.get("anthropic-beta") or ""
@@ -13,7 +16,7 @@ def record(h, method):
     entry = {
         "t": time.strftime("%H:%M:%S"),
         "method": method,
-        "path": h.path if False else None,
+        "path": path,
         "header_names": names,
         "authorization_present": bool(auth.strip()),
         "authorization_is_bearer": auth.lower().startswith("bearer "),
@@ -25,17 +28,45 @@ def record(h, method):
     }
     return entry
 
+
 class H(BaseHTTPRequestHandler):
     def log_message(self, *a):
         pass
 
     def _log(self, method):
-        e = record(self.headers, method)
-        e["path"] = self.path.split("?")[0]
-        with open(LOG, "a") as f:
-            f.write(json.dumps(e, ensure_ascii=False) + "\n")
+        e = record(self.headers, method, self.path.split("?")[0])
+        with LOG_LOCK:
+            with open(LOG, "a") as f:
+                f.write(json.dumps(e, ensure_ascii=False) + "\n")
+
+    def _read_body(self):
+        te = (self.headers.get("transfer-encoding") or "").lower()
+        if "chunked" in te:
+            chunks = []
+            while True:
+                line = self.rfile.readline()
+                if not line:
+                    break
+                size = int(line.split(b";", 1)[0].strip(), 16)
+                if size == 0:
+                    while self.rfile.readline() not in (b"\r\n", b"\n", b""):
+                        pass
+                    break
+                chunks.append(self.rfile.read(size))
+                self.rfile.read(2)
+            return b"".join(chunks)
+        n = int(self.headers.get("content-length") or 0)
+        return self.rfile.read(n) if n else b""
 
     def do_GET(self):
+        if self.path == "/__a1_ready":
+            body = READY_TOKEN
+            self.send_response(200)
+            self.send_header("content-type", "text/plain")
+            self.send_header("content-length", str(len(body)))
+            self.end_headers()
+            self.wfile.write(body)
+            return
         self._log("GET")
         body = b'{"data":[],"has_more":false}'
         self.send_response(200)
@@ -50,8 +81,7 @@ class H(BaseHTTPRequestHandler):
         self.end_headers()
 
     def do_POST(self):
-        n = int(self.headers.get("content-length") or 0)
-        raw = self.rfile.read(n) if n else b""
+        raw = self._read_body()
         self._log("POST")
         try:
             req = json.loads(raw or b"{}")

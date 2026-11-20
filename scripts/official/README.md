@@ -13,10 +13,10 @@
 
 | 文件 | 说明 |
 | --- | --- |
-| `ccextra` | 仓库根 `./ccextra` 的副本;每次 `official-init`(含开关 on 时的 start/restart、deploy)与仓库根不同就原子替换,8223 在跑则 kickstart 重启 |
+| `ccextra` | 仓库根 `./ccextra` 的副本;`official-init` 在二进制不同时原子替换(不启停进程);开关 on 时 `start` / `deploy` 同步后对运行中的 8223 执行 kickstart 重启(plist 变化时先 bootout 再 bootstrap),`restart` 则是先停再同步并重新 bootstrap |
 | `config.yaml` | 由模板生成,0600;已存在不覆盖(手工改动保留) |
 | `ccextra.pid` | 启动后写入,停止时删除 |
-| `logs/ccextra.launchd.log` | LaunchAgent `com.wanghao.ccextra-official` 的 stdout/stderr |
+| `logs/ccextra.launchd.log` | LaunchAgent `com.wanghao.ccextra-official` 的 stdout/stderr(bootstrap 时按日合并滚动并清理旧日日志) |
 
 ## 启停
 
@@ -57,7 +57,7 @@ cd ~/tools/ccextra
    ```bash
    ~/tools/ccextra/scripts/official/a1_check.sh
    ```
-   期望最后一行 `A1: PASS`(`/v1/messages` 带 Bearer `Authorization`、无 `x-api-key`)。FAIL 时先看 `claude auth status`,并确认当前 shell 没有导出 `ANTHROPIC_AUTH_TOKEN` / `ANTHROPIC_API_KEY`。
+   期望最后一行 `A1: PASS`(`/v1/messages` 带 `sk-ant-oat` 前缀的 Bearer `Authorization`、无 `x-api-key`)。FAIL 时先看 `claude auth status`,并确认当前 shell 及当前目录 `.claude/settings*.json` 没有注入 `ANTHROPIC_AUTH_TOKEN` / `ANTHROPIC_API_KEY` / `apiKeyHelper`。
 6. **确认登录方式**:新开 `claude`,输入 `/status`,确认 Login method 为 Claude 账号(claude.ai 订阅)、用量正常;再问一句并跑一次工具调用,在 `~/tools/ccextra-official/logs/ccextra.launchd.log` 里应看到 `access … provider=anthropic-official … status=200` 和 `official messages response … request_id=…`。
 
 ## 回退

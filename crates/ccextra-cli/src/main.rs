@@ -231,14 +231,20 @@ async fn main() -> Result<()> {
 
     // 构建应用状态
     let config_path = cli.config.clone();
-    let startup_official_instance = config.official_instance;
+    let last_official_instance =
+        Arc::new(std::sync::atomic::AtomicBool::new(config.official_instance));
     let reload = Arc::new(move || -> std::pin::Pin<Box<dyn std::future::Future<Output = anyhow::Result<ReloadData>> + Send>> {
         let config_path = config_path.clone();
+        let last_official_instance = Arc::clone(&last_official_instance);
         Box::pin(async move {
             let cfg = Config::load(&config_path)?;
-            if cfg.official_instance != startup_official_instance {
+            let prev = last_official_instance.swap(
+                cfg.official_instance,
+                std::sync::atomic::Ordering::Relaxed,
+            );
+            if cfg.official_instance != prev {
                 tracing::info!(
-                    "official_instance 已改为 {}:本进程不受影响,执行 ./service.sh restart 生效",
+                    "official_instance 已改为 {}:本进程不受影响,执行 ./service.sh start(不中断 8222)或 ./service.sh restart 生效",
                     if cfg.official_instance { "on" } else { "off" }
                 );
             }

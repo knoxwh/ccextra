@@ -11,12 +11,21 @@ set -euo pipefail
 #   logs/、仓库根 ./ccextra 的副本、由 scripts/official/config.yaml.example 生成的 config.yaml
 
 SCRIPT_DIR="$(cd "$(dirname "$0")" && pwd)"
+SCRIPT_REAL="$(cd "$SCRIPT_DIR" && pwd -P)"
 CONFIG="$SCRIPT_DIR/config.yaml"
 UID_NUM="$(id -u)"
 DOMAIN="gui/${UID_NUM}"
 MAIN_SERVICE="${DOMAIN}/com.wanghao.ccextra"
 
 OFFICIAL_DIR="${CCEXTRA_OFFICIAL_DIR:-$(dirname "$SCRIPT_DIR")/ccextra-official}"
+[ "$OFFICIAL_DIR" != "/" ] && OFFICIAL_DIR="${OFFICIAL_DIR%/}"
+if [ -d "$OFFICIAL_DIR" ]; then
+    OFFICIAL_REAL="$(cd "$OFFICIAL_DIR" && pwd -P)"
+    if [ "$OFFICIAL_REAL" = "$SCRIPT_REAL" ]; then
+        echo "错误: CCEXTRA_OFFICIAL_DIR 不能指向仓库目录 ($SCRIPT_DIR)" >&2
+        exit 1
+    fi
+fi
 OFFICIAL_BIN="$OFFICIAL_DIR/ccextra"
 OFFICIAL_CONFIG="$OFFICIAL_DIR/config.yaml"
 OFFICIAL_PID_FILE="$OFFICIAL_DIR/ccextra.pid"
@@ -28,8 +37,9 @@ OFFICIAL_TEMPLATE="$SCRIPT_DIR/scripts/official/config.yaml.example"
 MAIN_BIN="$SCRIPT_DIR/ccextra"
 OFFICIAL_BIN_UPDATED=no
 OFFICIAL_DST="${HOME}/Library/LaunchAgents/${OFFICIAL_LABEL}.plist"
-# 匹配 launchd 拉起的绝对路径与手工 ./ccextra 两种命令行
-OFFICIAL_RE="ccextra --config ${OFFICIAL_CONFIG}( |\$)"
+# 匹配 launchd 拉起的绝对路径与手工 ./ccextra 两种命令行(转义路径正则元字符)
+OFFICIAL_CONFIG_RE=$(printf '%s' "$OFFICIAL_CONFIG" | sed 's/[.[\\*^$+?(){}|]/\\&/g')
+OFFICIAL_RE="ccextra --config ${OFFICIAL_CONFIG_RE}( |\$)"
 
 # 只解析 official_instance 一行(不输出 config.yaml 其他内容);缺省 off
 official_switch() {
@@ -41,12 +51,13 @@ official_switch() {
     fi
     val=${line#official_instance:}
     val=${val%%#*}
-    val=$(printf '%s' "$val" | tr -d " \t\"'")
+    # 剥离 \r 与首尾空白(不动值内部空白/引号,对齐 Rust de_on_off)
+    val=$(printf '%s' "$val" | tr -d '\r' | sed -E 's/^[[:space:]]+//; s/[[:space:]]+$//')
     case "$val" in
-        on|true) echo on ;;
-        off|false) echo off ;;
+        on|'"on"'|"'on'"|true|True|TRUE) echo on ;;
+        off|'"off"'|"'off'"|false|False|FALSE) echo off ;;
         *)
-            echo "错误: $CONFIG 中 official_instance 只接受 on/off" >&2
+            echo "错误: $CONFIG 中 official_instance 只接受 on/off (或 true/false)" >&2
             return 1
             ;;
     esac
@@ -56,7 +67,7 @@ official_switch() {
 main_proxy_url() {
     local val
     val=$(awk '/^server:/{f=1;next} f&&/^[^[:space:]#]/{f=0} f&&/^[[:space:]]+proxy_url:/{print;exit}' "$CONFIG" 2>/dev/null || true)
-    val=$(printf '%s' "$val" | sed -E 's/^[[:space:]]*proxy_url:[[:space:]]*//; s/[[:space:]]+#.*$//; s/[[:space:]]+$//')
+    val=$(printf '%s' "$val" | tr -d '\r' | sed -E 's/^[[:space:]]*proxy_url:[[:space:]]*//; s/[[:space:]]+#.*$//; s/[[:space:]]+$//')
     val=${val#\"}; val=${val%\"}; val=${val#\'}; val=${val%\'}
     [ -n "$val" ] || return 1
     printf '%s' "$val"
@@ -73,9 +84,10 @@ official_init() {
     if ! cmp -s "$MAIN_BIN" "$OFFICIAL_BIN"; then
         # 先复制到同目录临时文件再 rename:运行中的旧进程不受影响(不能原地覆盖正在执行的二进制)
         tmp="$OFFICIAL_BIN.tmp.$$"
-        cp "$MAIN_BIN" "$tmp"
-        chmod 755 "$tmp"
-        mv -f "$tmp" "$OFFICIAL_BIN"
+        if ! cp "$MAIN_BIN" "$tmp" || ! chmod 755 "$tmp" || ! mv -f "$tmp" "$OFFICIAL_BIN"; then
+            rm -f "$tmp"
+            return 1
+        fi
         OFFICIAL_BIN_UPDATED=yes
         echo "official binary synced from $MAIN_BIN"
     fi
@@ -89,9 +101,12 @@ official_init() {
             return 1
         fi
         tmp="$OFFICIAL_CONFIG.tmp.$$"
-        (umask 077 && PROXY="$proxy" awk '{ i = index($0, "@PROXY_URL@"); if (i > 0) $0 = substr($0, 1, i - 1) ENVIRON["PROXY"] substr($0, i + 11); print }' "$OFFICIAL_TEMPLATE" > "$tmp")
-        chmod 600 "$tmp"
-        mv "$tmp" "$OFFICIAL_CONFIG"
+        if ! (umask 077 && PROXY="$proxy" awk '{ i = index($0, "@PROXY_URL@"); if (i > 0) $0 = substr($0, 1, i - 1) ENVIRON["PROXY"] substr($0, i + 11); print }' "$OFFICIAL_TEMPLATE" > "$tmp") \
+            || ! chmod 600 "$tmp" \
+            || ! mv -f "$tmp" "$OFFICIAL_CONFIG"; then
+            rm -f "$tmp"
+            return 1
+        fi
         echo "generated: $OFFICIAL_CONFIG (0600, proxy_url 取自主实例 server.proxy_url)"
     fi
     echo "official dir ready: $OFFICIAL_DIR"
@@ -105,8 +120,33 @@ official_listen_pids() {
     lsof -ti ":${OFFICIAL_PORT}" -sTCP:LISTEN 2>/dev/null || true
 }
 
+# 判断监听 8223 的 PID 是否属于本官方实例(含运行目录下相对路径手工启动的 ./ccextra --config config.yaml)
+is_official_listener_pid() {
+    local pid="$1" cmd cwd dir_real
+    cmd=$(ps -p "$pid" -o command= 2>/dev/null || true)
+    if printf '%s\n' "$cmd" | grep -Eq "$OFFICIAL_RE"; then
+        return 0
+    fi
+    if printf '%s\n' "$cmd" | grep -Eq '(^|/)ccextra( |$)' && [ -d "$OFFICIAL_DIR" ]; then
+        dir_real=$(cd "$OFFICIAL_DIR" 2>/dev/null && pwd -P || printf '%s' "$OFFICIAL_DIR")
+        cwd=$(lsof -a -p "$pid" -d cwd -Fn 2>/dev/null | sed -n 's/^n//p' | head -1 || true)
+        if [ -n "$cwd" ] && { [ "$cwd" = "$OFFICIAL_DIR" ] || [ "$cwd" = "$dir_real" ]; }; then
+            return 0
+        fi
+    fi
+    return 1
+}
+
 official_pids() {
-    pgrep -f "$OFFICIAL_RE" 2>/dev/null || true
+    local pid
+    {
+        pgrep -f "$OFFICIAL_RE" 2>/dev/null || true
+        for pid in $(official_listen_pids); do
+            if is_official_listener_pid "$pid"; then
+                echo "$pid"
+            fi
+        done
+    } | awk 'NF && !seen[$0]++'
 }
 
 official_loaded() {
@@ -114,10 +154,9 @@ official_loaded() {
 }
 
 official_fail_if_foreign_listener() {
-    local pid cmd
+    local pid
     for pid in $(official_listen_pids); do
-        cmd=$(ps -p "$pid" -o command= 2>/dev/null || true)
-        if ! printf '%s\n' "$cmd" | grep -Eq "$OFFICIAL_RE"; then
+        if ! is_official_listener_pid "$pid"; then
             echo "错误: 端口 ${OFFICIAL_PORT} 已被其他进程占用 (PID: $pid)，请先处理" >&2
             return 1
         fi
@@ -159,15 +198,61 @@ official_stop() {
     echo "official instance stopped (${OFFICIAL_PORT})"
 }
 
+# 仅在即将 bootstrap(Agent 未加载)时按日合并滚动 launchd 日志并清理旧日日志(对齐 start.sh)
+rotate_official_logs() {
+    local log_dir="$OFFICIAL_DIR/logs" today src dest f base
+    today=$(date +%Y-%m-%d)
+    mkdir -p "$log_dir"
+    find "$log_dir" -maxdepth 1 -name '*.log' | while read -r f; do
+        base=$(basename "$f")
+        [ "$base" = "ccextra.launchd.log" ] && continue
+        if [[ "$base" =~ \.([0-9]{4}-[0-9]{2}-[0-9]{2})(\.[0-9]+)?\.log$ ]] \
+            && [ "${BASH_REMATCH[1]}" != "$today" ]; then
+            echo "Removing old official log: $f"
+            rm -f "$f"
+        fi
+    done
+    src="$log_dir/ccextra.launchd.log"
+    dest="$log_dir/ccextra.launchd.${today}.log"
+    if [ -f "$src" ]; then
+        if [ ! -s "$src" ]; then
+            rm -f "$src"
+        elif [ -e "$dest" ]; then
+            echo "Appending official launchd log -> $(basename "$dest")"
+            cat "$src" >> "$dest"
+            rm -f "$src"
+        else
+            echo "Rotating official launchd log -> $(basename "$dest")"
+            mv "$src" "$dest"
+        fi
+    fi
+}
+
 official_start() {
-    local pid
+    local pid tmp_plist plist_changed=no
     official_init
     if [ ! -f "$OFFICIAL_SRC" ]; then
         echo "错误: 找不到 plist 模板 $OFFICIAL_SRC" >&2
         return 1
     fi
     mkdir -p "${HOME}/Library/LaunchAgents" "$OFFICIAL_DIR/logs"
-    sed "s|@DIR@|${OFFICIAL_DIR}|g" "$OFFICIAL_SRC" > "$OFFICIAL_DST"
+    tmp_plist="$OFFICIAL_DST.tmp.$$"
+    if ! DIR="$OFFICIAL_DIR" awk '{ while ((i = index($0, "@DIR@")) > 0) $0 = substr($0, 1, i - 1) ENVIRON["DIR"] substr($0, i + 5); print }' "$OFFICIAL_SRC" > "$tmp_plist"; then
+        rm -f "$tmp_plist"
+        return 1
+    fi
+    if ! cmp -s "$tmp_plist" "$OFFICIAL_DST"; then
+        mv -f "$tmp_plist" "$OFFICIAL_DST"
+        plist_changed=yes
+    else
+        rm -f "$tmp_plist"
+    fi
+
+    # plist 有变化时 launchd 不会通过 kickstart 重载定义,必须先 bootout 再 bootstrap
+    if [ "$plist_changed" = yes ] && official_loaded; then
+        echo "official plist changed, reloading $OFFICIAL_SERVICE"
+        official_stop no
+    fi
 
     if official_loaded && official_health_ok && [ "$OFFICIAL_BIN_UPDATED" = no ]; then
         echo "official instance already running via LaunchAgent $OFFICIAL_LABEL"
@@ -187,6 +272,7 @@ official_start() {
                 sleep 0.25
             done
             official_fail_if_foreign_listener
+            rotate_official_logs
             echo "bootstrap $DOMAIN <- $OFFICIAL_DST"
             launchctl bootstrap "$DOMAIN" "$OFFICIAL_DST"
         fi
