@@ -1,4 +1,5 @@
 //! Claude 指纹车道回环回归：真实 `build_fingerprint_client` 发出的 ClientHello
+//!（`protocol: claude` 与官方透传 `anthropic_official` 共用此构建）
 //! 必须算出 `TARGET_JA3_HASH` / `TARGET_JA4`。只读第一个 ClientHello 就断开，
 //! 不做握手、不联网。btls / wreq 升级导致 Hello 漂移时这里会红。
 
@@ -131,15 +132,15 @@ async fn read_client_hello(sock: &mut tokio::net::TcpStream) -> Vec<u8> {
     }
 }
 
-#[tokio::test]
-async fn claude_lane_client_hello_matches_target() {
+/// `no_redirect`:`protocol: claude` 用 false,官方透传 `official_client_for` 用 true;两者 Hello 须一致。
+async fn assert_client_hello_matches_target(no_redirect: bool) {
     let ln = TcpListener::bind("127.0.0.1:0").await.unwrap();
     let port = ln.local_addr().unwrap().port();
     let capture = tokio::spawn(async move {
         let (mut sock, _) = ln.accept().await.unwrap();
         read_client_hello(&mut sock).await // drop 即断开，客户端握手失败属预期
     });
-    let client = build_fingerprint_client("direct", false).unwrap();
+    let client = build_fingerprint_client("direct", no_redirect).unwrap();
     // 用主机名而不是 IP：要带 SNI，JA4 前缀才是 d
     let _ = tokio::time::timeout(
         std::time::Duration::from_secs(10),
@@ -153,4 +154,14 @@ async fn claude_lane_client_hello_matches_target() {
     let (ja3, ja4, ja4_r) = fingerprint(&hs);
     assert_eq!(ja4, TARGET_JA4, "JA4 drift; ja4_r={ja4_r}");
     assert_eq!(ja3_hash(&ja3), TARGET_JA3_HASH, "JA3 drift; ja3={ja3}");
+}
+
+#[tokio::test]
+async fn claude_lane_client_hello_matches_target() {
+    assert_client_hello_matches_target(false).await;
+}
+
+#[tokio::test]
+async fn official_passthrough_client_hello_matches_target() {
+    assert_client_hello_matches_target(true).await;
 }

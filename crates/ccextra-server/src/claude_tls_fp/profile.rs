@@ -80,8 +80,9 @@ pub fn ja3_hash(ja3: &str) -> String {
 
 /// Whether this outbound hop should use the Claude Bun fingerprint TLS lane.
 ///
-/// Always on for config `protocol: claude` (official Anthropic and third-party
-/// Claude-compatible hosts). Other protocols stay on reqwest + rustls.
+/// Always on for config `protocol: claude` (static API and third-party
+/// Claude-compatible hosts). `protocol: anthropic_official` reuses `build_fingerprint_client`
+/// directly in its own pool; other protocols stay on reqwest + rustls.
 pub fn should_use_fingerprint_lane(protocol_is_claude: bool) -> bool {
     protocol_is_claude
 }

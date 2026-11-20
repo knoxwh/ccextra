@@ -30,7 +30,7 @@ Claude Code sends Anthropic Messages requests; ccextra picks an upstream by mode
 | **Request stabilization** | Normalize tools, schemas, and history to cut incidental cross-turn drift (hit rate still depends on the upstream) |
 | **Capability adaptation** | Message / tool / image conversion; `models.json` clamps reasoning levels |
 | **OAuth providers** | Antigravity, xAI Grok, Codex — credential load, refresh, dynamic models |
-| **Claude fingerprint lane** | `protocol: claude` defaults to wreq/BoringSSL (Bun-aligned TLS + HTTP/1.1) |
+| **Claude fingerprint lane** | `protocol: claude` and `anthropic_official` default to wreq/BoringSSL (Bun-aligned TLS + HTTP/1.1) |
 | **Hot reload** | Saving `config.yaml` / `models.json` or `POST /reload` publishes atomically; in-flight requests keep the old snapshot |
 
 ## Architecture
@@ -68,7 +68,8 @@ Lets Claude Code reach Anthropic through ccextra with its own subscription login
 - **Claude Code side**: set only `ANTHROPIC_BASE_URL=http://127.0.0.1:8223`; do not set `ANTHROPIC_AUTH_TOKEN`, `ANTHROPIC_API_KEY`, or `apiKeyHelper`, otherwise the `Authorization` sent is not the subscription login. A missing `Authorization` (including empty or all-whitespace) gets a local 401; `x-api-key` is not forwarded.
 - **Config rules** (checked at startup and `/reload`): `key` must be empty; `base_url` must be a single `https://api.anthropic.com` (port empty or 443, no path / query / fragment / userinfo); no `metadata`; every model has `alias == name`, so `model` is never rewritten.
 - **`claude-*` wildcard**: `anthropic_official` only, at most one per provider, must start with `claude-` and have a single trailing `*`. Exact entries win; unlisted `claude-…` snapshot names hit the wildcard and are forwarded verbatim; `claude-`, `claude-*`, `claude-**` return 404; `/v1/models` does not list wildcard entries.
-- **Verbatim forwarding**: the request body is forwarded as raw bytes (no normalize, payload override, effort clamp, or system sanitizing); request headers are forwarded as-is except hop-by-hop, `host`, `content-length`, `x-api-key`, `x-ccextra-key`, `accept-encoding` (`Content-Type` defaults to `application/json` when missing); no beta is appended and no User-Agent is filled in; `Accept-Encoding` is negotiated and decoded by ccextra itself.
+- **Verbatim forwarding**: the request body is forwarded as raw bytes (no normalize, payload override, effort clamp, or system sanitizing); request headers are forwarded as-is (including `Accept-Encoding`) except hop-by-hop, `host`, `content-length`, `x-api-key`, `x-ccextra-key` (`Content-Type` defaults to `application/json` when missing); no beta is appended and no User-Agent is filled in; a missing `Accept-Encoding` is filled by wreq itself, and responses are decoded by ccextra.
+- **Outbound TLS**: built the same way as the `protocol: claude` fingerprint lane (wreq/BoringSSL, Bun ClientHello, HTTP/1.1 only) in a separate connection pool, so the TLS layer matches a direct Claude Code connection.
 - **Verbatim response**: upstream status, response headers (minus hop-by-hop and `set-cookie`), error bodies, and SSE bytes are returned as-is: no `: keepalive`, no rebuilt errors, no synthetic `timeout_error` / `message_stop`, no 180s idle timeout.
 - **No retries**: redirects are not followed; no stale / 400 / 401 retry, no credential refresh, no `base_url` rotation. Local errors: connect failure 502; response-header wait timeout 408 (streaming 60s, non-streaming 600s, count_tokens 60s); when the instance has an official provider, a non-`identity` inbound `Content-Encoding` gets 415 before the body is read.
 - `count_tokens` is passed through the same way; `logging.request_body` does not apply to the official path.

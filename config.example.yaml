@@ -29,7 +29,7 @@ secret_key: "sk-ccextra-xxx"
 # codex_auth_dir: ".cache/codex"
 
 # 凡 config protocol: claude 出站默认走 Bun TLS 指纹车道(wreq/BoringSSL,
-# 对齐 Claude Code / Bun peet JA3/JA4 + HTTP/1.1;官方与第三方 Claude 兼容站均适用)。
+# 对齐 Claude Code / Bun peet JA3/JA4 + HTTP/1.1);anthropic_official 也在独立池复用同一 TLS 构建。
 # 验收: cargo run -p ccextra-server --example peet_fp
 # 说明: crates/ccextra-server/src/claude_tls_fp/STATUS.md
 
@@ -124,7 +124,7 @@ providers:
   # 官方 Anthropic 订阅透传(anthropic_official)。建议放进独立实例(如 port: 8223)的配置单独使用:
   # 该实例不设 secret_key、不设 payload;Claude Code 只设 ANTHROPIC_BASE_URL=http://127.0.0.1:8223,
   # 不设 ANTHROPIC_AUTH_TOKEN / ANTHROPIC_API_KEY / apiKeyHelper,由订阅登录的 Authorization 原样转发。
-  # 请求字节、请求头(除 hop-by-hop/host/content-length/x-api-key/x-ccextra-key/accept-encoding)、
+  # 请求字节、请求头(除 hop-by-hop/host/content-length/x-api-key/x-ccextra-key,含 accept-encoding)、
   # 上游状态/头/错误体/SSE 均原样透传;不插 keepalive、不重建错误、不重试、不刷新凭证。
   # 校验:key 必须留空;base_url 只能是单个 https://api.anthropic.com(端口空或 443,无 path/query/fragment/userinfo);
   # 不得设 metadata;每个模型 alias 必须等于 name(不改写 model)。

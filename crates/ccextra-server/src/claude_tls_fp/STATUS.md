@@ -35,7 +35,9 @@ Fingerprint lane uses **wreq 0.16 + BoringSSL (`btls`)** with a hand-tuned `TlsO
 spec from the sampler peet JSON (cipher list, curves, sigalgs, key shares, extension
 order, GREASE off, OCSP + SCT on, ALPN `http/1.1` only).
 
-Non-Claude protocols and `protocol: anthropic_official` stay on **reqwest + rustls**. Lane is always on for every
+Non-Claude protocols stay on **reqwest + rustls**. `protocol: anthropic_official` reuses the same
+`build_fingerprint_client` (no-redirect) in its own `official_clients` pool, without the lane's UA/header
+scrub or stale retry. Lane is always on for every
 config `protocol: claude` provider (static API / third-party Claude-compatible;
 no config flag).
 
@@ -60,6 +62,7 @@ Claude Code upgrades (see that tool's README / `sample.sh`).
 ## HTTP Accept-Encoding (L7)
 
 Claude passthrough keeps inbound `Accept-Encoding`, or fills `gzip, deflate, br, zstd`
-(CLI/CPA). Both the wreq fingerprint lane and default reqwest client enable
+(CLI/CPA). `anthropic_official` also forwards inbound `Accept-Encoding` verbatim but fills
+nothing (when absent, wreq's decoder sends `zstd,gzip,deflate,br`). Both the wreq fingerprint lane and default reqwest client enable
 gzip/brotli/deflate/zstd auto-decompress so SSE/JSON stay readable.
 

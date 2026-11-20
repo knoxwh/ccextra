@@ -2,7 +2,8 @@
 //!
 //! Matches Claude Code 2.1.316 / Bun 1.4.4 local ClientHello sample (JA3/JA4 + HTTP/1.1);
 //! the 2.1.318 sample is identical; 2.1.319 / 2.1.321 embed the same Bun 1.4.4 (not re-sampled).
-//! Default (non-Claude) protocols keep reqwest+rustls; all `protocol: claude` use this lane.
+//! Default (non-Claude) protocols keep reqwest+rustls; all `protocol: claude` use this lane,
+//! and `protocol: anthropic_official` reuses this builder (no-redirect) for its own pool.
 
 use std::borrow::Cow;
 

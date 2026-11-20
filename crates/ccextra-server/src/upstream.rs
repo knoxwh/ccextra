@@ -1,7 +1,8 @@
 // 上游请求客户端 (双栈:默认 reqwest + Claude TLS fingerprint lane wreq/BoringSSL)
 //
 // 支持代理:全局 proxy 兜底 + 每 provider 覆盖。
-// reqwest 按 (proxy, ant, no_redirect, scope) 缓存;指纹车道按 (proxy, no_redirect) 进 fp_clients。
+// reqwest 按 (proxy, ant, no_redirect, scope) 缓存;指纹车道按 (proxy, no_redirect) 进 fp_clients;
+// 官方透传用同一指纹构建、按代理键进 official_clients。
 
 use std::collections::HashMap;
 use std::sync::Mutex;
@@ -500,8 +501,8 @@ pub struct UpstreamClient {
     clients: std::sync::Arc<Mutex<HashMap<ClientCacheKey, Client>>>,
     /// Claude protocol 指纹车道(wreq/BoringSSL),与 rustls 池隔离
     fp_clients: std::sync::Arc<Mutex<HashMap<FpClientCacheKey, wreq::Client>>>,
-    /// 官方 Anthropic 透传独立池(reqwest + rustls,禁重定向,与 clients/fp_clients 隔离)
-    official_clients: std::sync::Arc<Mutex<HashMap<String, Client>>>,
+    /// 官方 Anthropic 透传独立池(Claude 指纹车道 wreq/BoringSSL,禁重定向,与 clients/fp_clients 隔离)
+    official_clients: std::sync::Arc<Mutex<HashMap<String, wreq::Client>>>,
     /// Antigravity 连接池设置(短连接默认,对齐 CPA antigravity.executor)
     ant_pool: AntigravityPoolSettings,
     /// `antigravity.gohttp` 打开时的 sidecar;拉起失败 / 已崩溃则请求时重拉一次,仍失败原样报出(不回退)
@@ -663,9 +664,9 @@ impl UpstreamClient {
         Ok(client)
     }
 
-    /// 官方 Anthropic 透传独立 client(普通 reqwest + rustls,禁重定向,不碰 clients/fp_clients)。
-    /// 保活与建连参数复制自本文件 `client_for`(L586-603),防长思考期间死连接挂死。
-    pub(crate) fn official_client_for(&self, proxy_key: &str) -> anyhow::Result<Client> {
+    /// 官方 Anthropic 透传独立 client:与 `protocol: claude` 同一指纹构建(Bun ClientHello、
+    /// 仅 HTTP/1.1),固定禁重定向;单独缓存,不碰 clients/fp_clients。
+    pub(crate) fn official_client_for(&self, proxy_key: &str) -> anyhow::Result<wreq::Client> {
         let mut clients = self
             .official_clients
             .lock()
@@ -673,26 +674,7 @@ impl UpstreamClient {
         if let Some(c) = clients.get(proxy_key) {
             return Ok(c.clone());
         }
-        let mut builder = Client::builder()
-            .pool_max_idle_per_host(4)
-            .pool_idle_timeout(POOL_IDLE_TIMEOUT)
-            .connect_timeout(CONNECT_TIMEOUT)
-            .tcp_keepalive(TCP_KEEPALIVE)
-            .tcp_nodelay(true)
-            .http2_keep_alive_interval(std::time::Duration::from_secs(15))
-            .http2_keep_alive_timeout(std::time::Duration::from_secs(5))
-            .http2_keep_alive_while_idle(true)
-            .redirect(reqwest::redirect::Policy::none());
-        if proxy_key == "direct" {
-            builder = builder.no_proxy();
-        } else {
-            let proxy = reqwest::Proxy::all(proxy_key)
-                .map_err(|e| anyhow::anyhow!("解析官方上游代理失败: {e}"))?;
-            builder = builder.proxy(proxy);
-        }
-        let client = builder
-            .build()
-            .map_err(|e| anyhow::anyhow!("构建官方上游 HTTP client 失败: {e}"))?;
+        let client = crate::claude_tls_fp::build_fingerprint_client(proxy_key, true)?;
         clients.insert(proxy_key.to_string(), client.clone());
         Ok(client)
     }

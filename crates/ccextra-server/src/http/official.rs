@@ -3,7 +3,7 @@
 //! 隔离于通用转换/中转路径,确保红线 R1-R7 可单文件审计:
 //! - 不落盘/缓存/记录任何订阅凭证与请求体
 //! - 不改写请求体字节、不改写 model、不追加 beta、不调用 scrub_*
-//! - 走普通 reqwest + rustls 独立池,禁重定向,不做 stale/400 重试
+//! - 走 Claude 指纹车道(wreq/BoringSSL,HTTP/1.1)独立池,禁重定向,不做 stale/400 重试
 //! - 响应状态码、非 hop-by-hop 头、错误体与 SSE 字节流原样回传,不加 180s 空闲超时
 
 use crate::http::{ConfigSnapshot, error::AppError};
@@ -157,8 +157,9 @@ fn has_valid_authorization(headers: &HeaderMap) -> bool {
 }
 
 /// 构造官方出站请求头:
-/// - 原样透传 `Authorization`、`anthropic-*`、`x-stainless-*`、`x-app`、`x-claude-code-*`、`User-Agent`、`Accept`、`Content-Type` 等
-/// - 剔除 `host`、`content-length`、静/动态 hop-by-hop、`x-api-key`、`x-ccextra-key`、`accept-encoding`
+/// - 原样透传 `Authorization`、`anthropic-*`、`x-stainless-*`、`x-app`、`x-claude-code-*`、`User-Agent`、`Accept`、`Accept-Encoding`、`Content-Type` 等
+/// - 剔除 `host`、`content-length`、静/动态 hop-by-hop、`x-api-key`、`x-ccextra-key`
+/// - 缺 `Accept-Encoding` 时本函数不补(wreq 解压层会自报 `zstd,gzip,deflate,br`);响应仍由 wreq 按 `Content-Encoding` 透明解压
 /// - 不追加 beta、不写默认 UA、不写 `Accept`、不调用 `scrub_*`
 pub(crate) fn official_request_headers(inbound: &HeaderMap) -> HeaderMap {
     let conn_names = connection_header_names(inbound);
@@ -169,7 +170,7 @@ pub(crate) fn official_request_headers(inbound: &HeaderMap) -> HeaderMap {
             || conn_names.iter().any(|c| c == &lower)
             || matches!(
                 lower.as_str(),
-                "host" | "content-length" | "x-api-key" | "x-ccextra-key" | "accept-encoding"
+                "host" | "content-length" | "x-api-key" | "x-ccextra-key"
             )
         {
             continue;

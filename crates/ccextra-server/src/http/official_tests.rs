@@ -164,7 +164,7 @@ fn default_official_state(base_url: String) -> AppState {
     )
 }
 
-/// 测试 1、2、3、4、5:头透传、不补 beta、原始 body 逐字节、UA 缺失不发/存在原样、剔除 key 头与 AE 协商
+/// 测试 1、2、3、4、5:头透传、不补 beta、原始 body 逐字节、UA 缺失不发/存在原样、剔除 key 头、AE 原样转发/缺省由 wreq 自报
 #[tokio::test]
 async fn test_01_to_05_headers_raw_body_ua_and_ae() {
     let (base, cap) = spawn_capture_mock(StatusCode::OK, vec![], br#"{"ok":true}"#).await;
@@ -233,13 +233,16 @@ async fn test_01_to_05_headers_raw_body_ua_and_ae() {
     // 断言 5
     assert!(items[0].headers.get("x-api-key").is_none());
     assert!(items[0].headers.get("x-ccextra-key").is_none());
-    let ae = items[0]
-        .headers
-        .get("accept-encoding")
-        .expect("reqwest 应自动协商 accept-encoding")
-        .to_str()
-        .unwrap();
-    assert_ne!(ae, CLAUDE_ACCEPT_ENCODING);
+    // 入站 AE(CC 金样)原样转发
+    assert_eq!(
+        items[0].headers.get("accept-encoding").unwrap(),
+        CLAUDE_ACCEPT_ENCODING
+    );
+    // 入站缺 AE:ccextra 不补,由 wreq(tower-http 解压层)自报缺省值
+    assert_eq!(
+        items[1].headers.get("accept-encoding").unwrap(),
+        "zstd,gzip,deflate,br"
+    );
     // 断言 2
     assert_eq!(
         items[1].headers.get("anthropic-beta").unwrap(),
@@ -387,7 +390,7 @@ async fn test_09_redirect_302_not_followed() {
     assert_eq!(cap.lock().unwrap().len(), 1);
 }
 
-/// 测试 10:count_tokens 满足 1-9(透传、不补 beta、原始体、无 UA、剔 key/AE、本地 401、响应头/错误体、302 不跟)且不触碰 fp 池
+/// 测试 10:count_tokens 满足 1-9(透传、不补 beta、原始体、无 UA、剔 key 与 AE 原样、本地 401、响应头/错误体、302 不跟)且不触碰 fp 池
 #[tokio::test]
 async fn test_10_count_tokens_passthrough_and_zero_fp_clients() {
     let raw_resp: &'static [u8] = br#"{"input_tokens":123,"extra":"keep"}"#;
@@ -429,6 +432,7 @@ async fn test_10_count_tokens_passthrough_and_zero_fp_clients() {
         .header("anthropic-version", "2023-06-01")
         .header("x-api-key", "strip-me")
         .header("x-ccextra-key", "strip-me-2")
+        .header("accept-encoding", CLAUDE_ACCEPT_ENCODING)
         .body(Body::from(Bytes::from_static(raw_body)))
         .unwrap();
     let resp = app(state.clone()).oneshot(req).await.unwrap();
@@ -464,7 +468,7 @@ async fn test_10_count_tokens_passthrough_and_zero_fp_clients() {
         assert!(items[0].headers.get("user-agent").is_none());
         assert!(items[0].headers.get("x-api-key").is_none());
         assert!(items[0].headers.get("x-ccextra-key").is_none());
-        assert_ne!(
+        assert_eq!(
             items[0].headers.get("accept-encoding").unwrap(),
             CLAUDE_ACCEPT_ENCODING
         );
@@ -841,7 +845,7 @@ async fn test_17_hop_by_hop_both_directions_and_subset_invariant() {
     }
 }
 
-/// 测试 18:上游 gzip 响应透明解压并移除 content-encoding;未知编码 foo 原样保留字节与头
+/// 测试 18:上游 gzip 响应透明解压并移除 content-encoding(入站带 AE 与缺 AE 均如此);未知编码 foo 原样保留字节与头
 #[tokio::test]
 async fn test_18_response_gzip_decompressed_and_unknown_encoding_preserved() {
     let plain = b"event: message_start\ndata: {\"ok\":true}\n\n";
@@ -880,20 +884,30 @@ async fn test_18_response_gzip_decompressed_and_unknown_encoding_preserved() {
     let base = spawn_mock(router).await;
     let state = default_official_state(base);
 
-    // gzip 响应:解压且无 content-encoding
-    let req_gz = Request::builder()
-        .method("POST")
-        .uri("/v1/messages")
-        .header("authorization", "Bearer test-oat")
-        .body(Body::from(r#"{"model":"claude-opus-5-5","stream":true}"#))
-        .unwrap();
-    let resp_gz = app(state.clone()).oneshot(req_gz).await.unwrap();
-    assert_eq!(resp_gz.status(), StatusCode::OK);
-    assert!(resp_gz.headers().get("content-encoding").is_none());
-    let out_gz = axum::body::to_bytes(resp_gz.into_body(), usize::MAX)
-        .await
-        .unwrap();
-    assert_eq!(out_gz.as_ref(), plain);
+    // gzip 响应:解压且无 content-encoding;入站 AE 由客户端带入(原样转发)时 wreq 仍解压
+    for inbound_ae in [None, Some(CLAUDE_ACCEPT_ENCODING)] {
+        let mut req_gz = Request::builder()
+            .method("POST")
+            .uri("/v1/messages")
+            .header("authorization", "Bearer test-oat");
+        if let Some(ae) = inbound_ae {
+            req_gz = req_gz.header("accept-encoding", ae);
+        }
+        let req_gz = req_gz
+            .body(Body::from(r#"{"model":"claude-opus-5-5","stream":true}"#))
+            .unwrap();
+        let resp_gz = app(state.clone()).oneshot(req_gz).await.unwrap();
+        assert_eq!(resp_gz.status(), StatusCode::OK);
+        assert!(
+            resp_gz.headers().get("content-encoding").is_none(),
+            "inbound AE {inbound_ae:?}"
+        );
+        assert!(resp_gz.headers().get("content-length").is_none());
+        let out_gz = axum::body::to_bytes(resp_gz.into_body(), usize::MAX)
+            .await
+            .unwrap();
+        assert_eq!(out_gz.as_ref(), plain, "inbound AE {inbound_ae:?}");
+    }
 
     // 未知编码 foo:保留头与原始字节
     let req_unk = Request::builder()
@@ -1117,7 +1131,7 @@ async fn test_26_base_url_trailing_slash_join_no_double_slash() {
     assert_eq!(items[1].path_and_query, "/v1/messages?beta=true");
 }
 
-/// 测试 27:Accept 与 Content-Type 原样透传;缺 Accept 至多为 reqwest 默认 */*,绝不强写 application/json
+/// 测试 27:Accept 与 Content-Type 原样透传;缺 Accept 原样不发(不补 */*,也不强写 application/json)
 #[tokio::test]
 async fn test_27_accept_and_content_type_verbatim_without_scrub() {
     let (base, cap) = spawn_capture_mock(StatusCode::OK, vec![], b"{}").await;
@@ -1155,10 +1169,8 @@ async fn test_27_accept_and_content_type_verbatim_without_scrub() {
         "application/json; charset=utf-8"
     );
     let accept2 = items[1].headers.get("accept").and_then(|v| v.to_str().ok());
-    assert!(
-        matches!(accept2, None | Some("*/*")),
-        "缺 Accept 时不得强写 application/json,实际: {accept2:?}"
-    );
+    // wreq 无默认头:缺 Accept 时原样不发(不补 */*,也不强写 application/json)
+    assert_eq!(accept2, None, "缺 Accept 时不得补写,实际: {accept2:?}");
     assert_eq!(
         items[1].headers.get("content-type").unwrap(),
         "application/json"
@@ -1373,4 +1385,88 @@ async fn test_30_non_claude_exact_official_model_not_sanitized() {
     let resp = app(state).oneshot(req).await.unwrap();
     assert_eq!(resp.status(), StatusCode::OK);
     assert_eq!(cap.lock().unwrap()[0].body.as_ref(), raw_body);
+}
+
+/// 读第一个 TLS 记录里的 ClientHello,抽出 (cipher suites, 扩展类型序列, ALPN 列表原始字节)。
+/// 指纹车道关闭了 GREASE 与扩展乱序,同一构建两次连接这三项应逐字节相同。
+async fn capture_client_hello_shape(ln: TcpListener) -> (Vec<u8>, Vec<u16>, Vec<u8>) {
+    let (mut sock, _) = ln.accept().await.unwrap();
+    let mut raw = Vec::new();
+    let mut buf = [0u8; 16384];
+    loop {
+        let n = sock.read(&mut buf).await.unwrap();
+        assert!(n > 0, "peer closed before full ClientHello record");
+        raw.extend_from_slice(&buf[..n]);
+        if raw.len() >= 5 && raw.len() >= 5 + u16::from_be_bytes([raw[3], raw[4]]) as usize {
+            break;
+        }
+    }
+    assert_eq!(raw[0], 0x16, "not a TLS handshake record");
+    let b = &raw[5 + 4..]; // 记录头 + 握手头
+    let u16_at = |i: usize| u16::from_be_bytes([b[i], b[i + 1]]) as usize;
+    let mut q = 34;
+    q += 1 + b[q] as usize; // session id
+    let n = u16_at(q);
+    let ciphers = b[q + 2..q + 2 + n].to_vec();
+    q += 2 + n;
+    q += 1 + b[q] as usize; // compression
+    let end = q + 2 + u16_at(q);
+    q += 2;
+    let (mut exts, mut alpn) = (Vec::new(), Vec::new());
+    while q + 4 <= end {
+        let t = u16_at(q) as u16;
+        let l = u16_at(q + 2);
+        if t == 16 {
+            alpn = b[q + 4..q + 4 + l].to_vec();
+        }
+        exts.push(t);
+        q += 4 + l;
+    }
+    (ciphers, exts, alpn)
+}
+
+/// 测试 31:官方透传出站 ClientHello 与 Claude 指纹车道构建一致(Bun 套件/扩展顺序,ALPN 仅 http/1.1),
+/// 且只进 official_clients、不碰 fp_clients
+#[tokio::test]
+async fn test_31_official_uses_claude_fingerprint_client_hello() {
+    let ln = TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let port = ln.local_addr().unwrap().port();
+    let cap = tokio::spawn(capture_client_hello_shape(ln));
+    // 用主机名带 SNI;握手被 mock 读完 Hello 后断开,官方路径本地映射 502
+    let state = default_official_state(format!("https://localhost:{port}"));
+    let req = Request::builder()
+        .method("POST")
+        .uri("/v1/messages")
+        .header("authorization", "Bearer test-oat")
+        .body(Body::from(r#"{"model":"claude-opus-5-5","messages":[]}"#))
+        .unwrap();
+    let resp = app(state.clone()).oneshot(req).await.unwrap();
+    assert_eq!(resp.status(), StatusCode::BAD_GATEWAY);
+    let official = tokio::time::timeout(Duration::from_secs(10), cap)
+        .await
+        .expect("no ClientHello from official path")
+        .unwrap();
+
+    let ln = TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let port = ln.local_addr().unwrap().port();
+    let cap = tokio::spawn(capture_client_hello_shape(ln));
+    let fp = crate::claude_tls_fp::build_fingerprint_client("direct", false).unwrap();
+    let _ = tokio::time::timeout(
+        Duration::from_secs(10),
+        fp.get(format!("https://localhost:{port}/")).send(),
+    )
+    .await;
+    let lane = tokio::time::timeout(Duration::from_secs(10), cap)
+        .await
+        .expect("no ClientHello from fingerprint lane")
+        .unwrap();
+
+    assert_eq!(
+        official, lane,
+        "官方透传 ClientHello 应与 Claude 指纹车道一致"
+    );
+    assert_eq!(official.2, b"\x00\x09\x08http/1.1", "ALPN 只报 http/1.1");
+    let upstream = state.config.read().await.runtime.upstream.clone();
+    assert_eq!(upstream.official_client_count(), 1);
+    assert_eq!(upstream.fp_client_count(), 0);
 }

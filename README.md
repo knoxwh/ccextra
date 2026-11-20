@@ -30,7 +30,7 @@ Claude Code 发来 Anthropic Messages 请求；ccextra 按模型别名选上游�
 | **请求稳定化** | 归一化工具、schema、历史，降低无意义跨轮差异（命中率仍看上游） |
 | **能力适配** | 消息 / 工具 / 图片转换；`models.json` 钳制 reasoning 档位 |
 | **OAuth 接入** | Antigravity、xAI Grok、Codex — 凭证加载、刷新、动态模型 |
-| **Claude 指纹车道** | `protocol: claude` 默认走 wreq/BoringSSL（Bun 对齐 TLS + HTTP/1.1） |
+| **Claude 指纹车道** | `protocol: claude` 与 `anthropic_official` 默认走 wreq/BoringSSL（Bun 对齐 TLS + HTTP/1.1） |
 | **热重载** | 保存 `config.yaml` / `models.json` 或 `POST /reload` 原子发布；进行中的请求继续用旧快照 |
 
 ## 架构
@@ -68,7 +68,8 @@ flowchart LR
 - **Claude Code 端**：只设 `ANTHROPIC_BASE_URL=http://127.0.0.1:8223`，不要设 `ANTHROPIC_AUTH_TOKEN`、`ANTHROPIC_API_KEY` 或 `apiKeyHelper`；否则发出的就不是订阅登录的 `Authorization`。缺 `Authorization`（含空值、全空白）本地返回 401，`x-api-key` 不转发。
 - **配置约束**（启动与 `/reload` 校验）：`key` 必须留空；`base_url` 只能是单个 `https://api.anthropic.com`（端口为空或 443，不含 path / query / fragment / userinfo）；不得设 `metadata`；每个模型 `alias == name`，不改写 `model`。
 - **`claude-*` 通配**：仅 `anthropic_official` 可用，每个 provider 至多一条，须以 `claude-` 开头且只有末尾一个 `*`。精确条目优先；未登记的 `claude-…` 快照名命中通配并原样转发；`claude-`、`claude-*`、`claude-**` 返回 404；`/v1/models` 不列出通配条目。
-- **原样转发**：请求 body 按原始字节转发（不归一化、不 payload 覆盖、不钳制 effort、不清洗 system）；请求头除 hop-by-hop、`host`、`content-length`、`x-api-key`、`x-ccextra-key`、`accept-encoding` 外原样转发（缺 `Content-Type` 时补 `application/json`），不追加 beta、不补 User-Agent；`Accept-Encoding` 由 ccextra 自行协商并解压。
+- **原样转发**：请求 body 按原始字节转发（不归一化、不 payload 覆盖、不钳制 effort、不清洗 system）；请求头除 hop-by-hop、`host`、`content-length`、`x-api-key`、`x-ccextra-key` 外原样转发（含 `Accept-Encoding`；缺 `Content-Type` 时补 `application/json`），不追加 beta、不补 User-Agent；缺 `Accept-Encoding` 时由 wreq 自报，响应由 ccextra 透明解压。
+- **出站 TLS**：与 `protocol: claude` 同用 Claude 指纹车道构建（wreq/BoringSSL，Bun ClientHello，仅 HTTP/1.1），独立连接池，TLS 层与真实 Claude Code 直连一致。
 - **响应原样回传**：上游状态码、响应头（去掉 hop-by-hop 与 `set-cookie`）、错误体与 SSE 字节原样回传：不插 `: keepalive`、不重建错误、不补 `timeout_error` / `message_stop`、不加 180s 空闲超时。
 - **不重试**：不跟随重定向，不做 stale / 400 / 401 重试，不刷新凭证，不轮转 `base_url`。本地错误：连接失败 502；等响应头超时 408（流式 60s、非流 600s、count_tokens 60s）；实例含官方 provider 时，入站非 `identity` 的 `Content-Encoding` 在读 body 前返回 415。
 - `count_tokens` 同样原样透传；`logging.request_body` 对官方路径不生效。
