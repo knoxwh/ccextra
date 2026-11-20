@@ -191,7 +191,6 @@ curl -H "Authorization: Bearer $ANTHROPIC_AUTH_TOKEN" http://127.0.0.1:8222/v1/m
 配额 / 模型目录：
 
 ```bash
-./scripts/check_antigravity_quota.sh
 ./scripts/check_grok_quota.sh
 ./scripts/check_codex_quota.sh
 ```

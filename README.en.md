@@ -190,7 +190,6 @@ Pipeline: auth → route → normalize → protocol convert → payload override
 Quota / model catalog:
 
 ```bash
-./scripts/check_antigravity_quota.sh
 ./scripts/check_grok_quota.sh
 ./scripts/check_codex_quota.sh
 ```
