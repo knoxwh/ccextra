@@ -86,12 +86,16 @@ pub(crate) fn normalize_tool_parameters(schema: &Value) -> Value {
 
 /// 递归删除 $schema/$id dialect 关键字(对齐 CPA 7fac6b15 stripDialectKeywordsFromSchema),
 /// 剥离含 \p{...}/\P{...} 的 pattern(对齐 CPA e56abd56),
-/// 以及超出 int64 的 numeric bounds(对齐 CPA 57d005fe)
+/// 超出 int64 的 numeric bounds(对齐 CPA 57d005fe),
+/// 以及 schema 级 uniqueItems(对齐 CPA 6faa8d20;properties 下名为 uniqueItems 的字段保留)
 fn strip_dialect_keywords_from_schema(v: &mut Value) {
     match v {
         Value::Object(map) => {
             map.remove("$schema");
             map.remove("$id");
+            // 对齐 CPA 6faa8d20:Codex 不接受 uniqueItems;只在 schema 节点删,
+            // properties 等映射的键按 subschema 递归,同名属性不受影响
+            map.shift_remove("uniqueItems");
             if map.get("required").is_some_and(Value::is_null) {
                 map.shift_remove("required");
             }

@@ -2385,6 +2385,59 @@ fn test_strip_dialect_keywords_from_tool_schema() {
 }
 
 #[test]
+fn test_strips_unique_items_from_tool_schema() {
+    // 对齐 CPA 6faa8d20 TestNormalizeCodexToolSchemasDoc_StripsUniqueItems
+    let mut body = json!({
+        "model": "test",
+        "messages": [{"role": "user", "content": "hi"}],
+        "tools": [{
+            "name": "t",
+            "input_schema": {
+                "type": "object",
+                "uniqueItems": true,
+                "properties": {
+                    "options": {"type": "array", "items": {"type": "string"}, "uniqueItems": true},
+                    "nested": {
+                        "type": "array",
+                        "uniqueItems": false,
+                        "items": {"type": "array", "items": {"type": "string"}, "uniqueItems": true}
+                    },
+                    "union": {"anyOf": [
+                        {"type": "array", "items": {"type": "string"}, "uniqueItems": true},
+                        {"type": "null"}
+                    ]},
+                    "uniqueItems": {"type": "boolean", "description": "literal property"},
+                    "user_data": {
+                        "type": "object",
+                        "default": {"uniqueItems": true},
+                        "enum": [{"uniqueItems": true}]
+                    }
+                },
+                "additionalProperties": {"type": "array", "items": {"type": "string"}, "uniqueItems": true},
+                "$defs": {"tags": {"type": "array", "items": {"type": "string"}, "uniqueItems": true}}
+            }
+        }]
+    });
+    convert_to_openai_responses(&mut body, "test-model").unwrap();
+    let p = &body["tools"][0]["parameters"];
+    assert!(p.get("uniqueItems").is_none());
+    let props = &p["properties"];
+    assert!(props["options"].get("uniqueItems").is_none());
+    assert_eq!(props["options"]["items"]["type"], "string");
+    assert!(props["nested"].get("uniqueItems").is_none());
+    assert!(props["nested"]["items"].get("uniqueItems").is_none());
+    assert!(props["union"]["anyOf"][0].get("uniqueItems").is_none());
+    assert!(p["additionalProperties"].get("uniqueItems").is_none());
+    if let Some(defs) = p.get("$defs") {
+        assert!(defs["tags"].get("uniqueItems").is_none());
+    }
+    // 字面 properties.uniqueItems 与实例数据保留
+    assert_eq!(props["uniqueItems"]["type"], "boolean");
+    assert_eq!(props["user_data"]["default"]["uniqueItems"], true);
+    assert_eq!(props["user_data"]["enum"][0]["uniqueItems"], true);
+}
+
+#[test]
 fn test_tool_schema_union_type_array_keeps_properties() {
     // 对齐 CPA 7fac6b15:type 数组 ["object","null"] 保留,仅补 properties
     let mut body = json!({
