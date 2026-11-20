@@ -320,8 +320,12 @@ fn inject_schema_instruction(
             }
             true
         }
-        // Gemini/AG: 无 responseMimeType 路径,不注入
+        // Gemini/AG: 无 responseMimeType 路径,不注入;官方透传禁止改写
         Protocol::Gemini | Protocol::Antigravity => false,
+        Protocol::AnthropicOfficial => {
+            tracing::error!("AnthropicOfficial 不应进入 unfit inject_schema_instruction");
+            false
+        }
     }
 }
 
@@ -362,6 +366,10 @@ fn force_reasoning_effort(body: &mut serde_json::Value, effort: &str, protocol: 
             false
         }
         Protocol::Gemini | Protocol::Antigravity => false,
+        Protocol::AnthropicOfficial => {
+            tracing::error!("AnthropicOfficial 不应进入 unfit force_reasoning_effort");
+            false
+        }
     }
 }
 
@@ -387,6 +395,10 @@ fn downgrade_tool_choice(body: &mut serde_json::Value, protocol: Protocol) -> bo
             false
         }
         Protocol::Gemini | Protocol::Antigravity => false,
+        Protocol::AnthropicOfficial => {
+            tracing::error!("AnthropicOfficial 不应进入 unfit downgrade_tool_choice");
+            false
+        }
     }
 }
 
@@ -428,6 +440,10 @@ fn remove_reasoning_config(body: &mut serde_json::Value, protocol: Protocol) -> 
             .and_then(|m| m.remove("reasoning"))
             .is_some(),
         Protocol::Gemini | Protocol::Antigravity => false,
+        Protocol::AnthropicOfficial => {
+            tracing::error!("AnthropicOfficial 不应进入 unfit remove_reasoning_config");
+            false
+        }
     }
 }
 

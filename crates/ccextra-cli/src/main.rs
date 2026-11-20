@@ -7,10 +7,6 @@ use ccextra_server::antigravity::{
     list as list_antigravity, resolve_auth_dir as resolve_antigravity_auth_dir,
     run_login as run_antigravity_login,
 };
-use ccextra_server::claude::{
-    ClaudeLoginOptions, list as list_claude, resolve_auth_dir as resolve_claude_auth_dir,
-    run_login as run_claude_login,
-};
 use ccextra_server::codex::{
     CodexLoginOptions, list as list_codex, resolve_auth_dir as resolve_codex_auth_dir,
     run_login as run_codex_login,
@@ -110,26 +106,6 @@ enum Commands {
         #[arg(long)]
         auth_dir: Option<String>,
     },
-    /// 浏览器 PKCE 登录 Claude 订阅 (Anthropic OAuth) 并写入凭证
-    #[command(name = "claude-login")]
-    ClaudeLogin {
-        /// 凭证目录,默认配置文件旁 .cache/claude
-        #[arg(long)]
-        auth_dir: Option<String>,
-        /// 不自动打开浏览器,只打印 URL
-        #[arg(long)]
-        no_browser: bool,
-        /// 本地回调端口,默认 54545(须与 Anthropic 注册 RedirectURI 一致)
-        #[arg(long)]
-        callback_port: Option<u16>,
-    },
-    /// 列出已保存的 Claude 订阅凭证(不打印 token)
-    #[command(name = "claude-status")]
-    ClaudeStatus {
-        /// 凭证目录,默认配置文件旁 .cache/claude
-        #[arg(long)]
-        auth_dir: Option<String>,
-    },
 }
 
 #[tokio::main]
@@ -164,16 +140,6 @@ async fn main() -> Result<()> {
         }
         Some(Commands::CodexStatus { auth_dir }) => {
             return cmd_codex_status(&cli.config, auth_dir);
-        }
-        Some(Commands::ClaudeLogin {
-            auth_dir,
-            no_browser,
-            callback_port,
-        }) => {
-            return cmd_claude_login(&cli.config, auth_dir, no_browser, callback_port).await;
-        }
-        Some(Commands::ClaudeStatus { auth_dir }) => {
-            return cmd_claude_status(&cli.config, auth_dir);
         }
         None => {}
     }
@@ -240,24 +206,6 @@ async fn main() -> Result<()> {
         tracing::info!("动态加载 {} 个 Codex providers", codex_providers.len());
     }
 
-    // 动态加载 Claude 订阅 providers
-    let claude_auth_dir = pin_auth_dir(
-        &cli.config,
-        config.claude_auth_dir.as_deref(),
-        resolve_claude_auth_dir,
-    );
-    let claude_providers = ccextra_server::claude::load_claude_providers(
-        &claude_auth_dir,
-        config.server.proxy_url.as_deref(),
-    )
-    .await;
-    if !claude_providers.is_empty() {
-        tracing::info!(
-            "动态加载 {} 个 Claude 订阅 providers",
-            claude_providers.len()
-        );
-    }
-
     // Antigravity 不在 listen 前同步 fetch_models（对齐 CPA：已知数据先行、
     // asyncProbe / StartModelsUpdater 后台注入；HTTP 30s timeout 不得堵 bind）。
     // 凭证扫描 + 模型列表由下方 run_antigravity_injection 启动即拉一次。
@@ -273,7 +221,6 @@ async fn main() -> Result<()> {
     let mut all_providers = merge_providers(config.providers.clone(), Vec::new());
     all_providers = merge_providers(all_providers, xai_providers);
     all_providers = merge_providers(all_providers, codex_providers);
-    all_providers = merge_providers(all_providers, claude_providers);
 
     // 合并后复查:merge_providers 已按 alias 去重,这里只兜底告警,
     // 不再让后台拉取的动态 provider 决定服务能否启动
@@ -318,17 +265,10 @@ async fn main() -> Result<()> {
                 cfg.server.proxy_url.as_deref(),
             )
             .await;
-            let claude_auth_dir = pin_auth_dir(&config_path, cfg.claude_auth_dir.as_deref(), resolve_claude_auth_dir);
-            let claude_providers = ccextra_server::claude::load_claude_providers(
-                &claude_auth_dir,
-                cfg.server.proxy_url.as_deref(),
-            )
-            .await;
             let providers = merge_all_providers(
                 cfg.providers,
                 xai_providers,
                 codex_providers,
-                claude_providers,
                 antigravity_providers,
             );
 
@@ -463,15 +403,6 @@ fn codex_auth_dir_from(config_path: &str, override_dir: Option<String>) -> PathB
     pin_auth_dir(config_path, raw.as_deref(), resolve_codex_auth_dir)
 }
 
-fn claude_auth_dir_from(config_path: &str, override_dir: Option<String>) -> PathBuf {
-    let raw = if let Some(dir) = override_dir {
-        Some(dir)
-    } else {
-        load_optional_config(config_path).and_then(|cfg| cfg.claude_auth_dir)
-    };
-    pin_auth_dir(config_path, raw.as_deref(), resolve_claude_auth_dir)
-}
-
 /// 读用户 models.json。缺文件 = 空表不钳;解析失败则启动/reload 报错。
 fn load_thinking_registry(
     config_path: &str,
@@ -558,11 +489,6 @@ fn provider_refresh_config(config_path: &str, config: &Config) -> ProviderRefres
             config.codex_auth_dir.as_deref(),
             resolve_codex_auth_dir,
         )),
-        claude_auth_dir: Some(pin_auth_dir(
-            config_path,
-            config.claude_auth_dir.as_deref(),
-            resolve_claude_auth_dir,
-        )),
         antigravity_models: config.antigravity_models.clone(),
         antigravity_user_agent: Some(
             build_user_agents(config.user_agents.as_ref())
@@ -592,11 +518,6 @@ async fn load_refreshed_providers(
     } else {
         Vec::new()
     };
-    let claude = if let Some(dir) = refresh.claude_auth_dir.as_ref() {
-        ccextra_server::claude::load_claude_providers(dir, refresh.proxy_url.as_deref()).await
-    } else {
-        Vec::new()
-    };
     use ccextra_server::antigravity::AntigravityLoad;
     let injected = match ccextra_server::antigravity::load_antigravity_providers(
         auth_dir,
@@ -617,24 +538,21 @@ async fn load_refreshed_providers(
         refresh.static_providers,
         xai,
         codex,
-        claude,
         injected,
     ))
 }
 
-/// reload 与后台刷新共用的合并顺序:static → xai → codex → claude → antigravity,
+/// reload 与后台刷新共用的合并顺序:static → xai → codex → antigravity,
 /// alias 冲突先合并者优先。AG 放最后与启动(AG 后台注入)一致;
 /// reload 拉取失败沿用的 AG 也追加在末尾(见 reload::carry_over_antigravity)。
 fn merge_all_providers(
     static_providers: Vec<ProviderConfig>,
     xai: Vec<ProviderConfig>,
     codex: Vec<ProviderConfig>,
-    claude: Vec<ProviderConfig>,
     antigravity: Vec<ProviderConfig>,
 ) -> Vec<ProviderConfig> {
     let set = merge_providers(static_providers, xai);
     let set = merge_providers(set, codex);
-    let set = merge_providers(set, claude);
     merge_providers(set, antigravity)
 }
 
@@ -970,66 +888,6 @@ fn cmd_codex_status(config_path: &str, auth_dir: Option<String>) -> Result<()> {
     Ok(())
 }
 
-async fn cmd_claude_login(
-    config_path: &str,
-    auth_dir: Option<String>,
-    no_browser: bool,
-    callback_port: Option<u16>,
-) -> Result<()> {
-    let cfg = load_login_config(config_path)?;
-    let proxy_url = cfg.server.proxy_url.clone();
-    let opts = ClaudeLoginOptions {
-        auth_dir: claude_auth_dir_from(config_path, auth_dir),
-        no_browser,
-        callback_port: callback_port
-            .unwrap_or(ccextra_server::claude::constants::DEFAULT_CALLBACK_PORT),
-        proxy_url,
-    };
-    run_claude_login(opts).await?;
-    reload_after_login(config_path).await;
-    Ok(())
-}
-
-fn cmd_claude_status(config_path: &str, auth_dir: Option<String>) -> Result<()> {
-    let dir = claude_auth_dir_from(config_path, auth_dir);
-    let now = SystemTime::now();
-    let entries = list_claude(&dir)?;
-    if entries.is_empty() {
-        println!("无 Claude 订阅凭证: {}", dir.display());
-        return Ok(());
-    }
-    println!("auth_dir: {}", dir.display());
-    for (path, cred) in entries {
-        let status = if cred.disabled {
-            "disabled"
-        } else if cred.is_fresh(now, ccextra_server::claude::constants::REFRESH_SKEW_SECS) {
-            "fresh"
-        } else {
-            "stale"
-        };
-        let email = if cred.email.is_empty() {
-            "-"
-        } else {
-            cred.email.as_str()
-        };
-        let account = if cred.account_uuid.is_empty() {
-            "-"
-        } else {
-            cred.account_uuid.as_str()
-        };
-        println!(
-            "{}  email={email}  account={account}  {status}  expired={}",
-            path.file_name().unwrap_or_default().to_string_lossy(),
-            if cred.expired.is_empty() {
-                "-"
-            } else {
-                cred.expired.as_str()
-            }
-        );
-    }
-    Ok(())
-}
-
 /// 构建 UserAgentSet(从配置或使用默认值)
 fn build_user_agents(config: Option<&config::UserAgents>) -> UserAgentSet {
     const DEFAULT_CLAUDE_CLI: &str = "claude-cli/2.1.319";
@@ -1217,7 +1075,6 @@ mod tests {
             snapshot.refresh.auth_dir = Some(directory.path().join("antigravity"));
             snapshot.refresh.xai_auth_dir = Some(directory.path().join("xai"));
             snapshot.refresh.codex_auth_dir = Some(directory.path().join("codex"));
-            snapshot.refresh.claude_auth_dir = Some(directory.path().join("claude"));
             snapshot.refresh.static_providers = vec![static_provider];
         }
         assert!(
@@ -1256,7 +1113,6 @@ mod tests {
             snapshot.refresh.auth_dir = Some(ag_dir);
             snapshot.refresh.xai_auth_dir = Some(directory.path().join("xai"));
             snapshot.refresh.codex_auth_dir = Some(directory.path().join("codex"));
-            snapshot.refresh.claude_auth_dir = Some(directory.path().join("claude"));
             snapshot.refresh.proxy_url = Some("invalid-proxy".into());
         }
         let before = state.read().await.clone();
@@ -1414,12 +1270,11 @@ xai_auth_dir: new-xai
         let merged = merge_all_providers(
             vec![],
             vec![],
-            vec![],
-            vec![provider("claude-sub", vec![model("c", "shared")])],
+            vec![provider("codex-sub", vec![model("c", "shared")])],
             vec![ag],
         );
         let names: Vec<_> = merged.iter().map(|p| p.name.as_str()).collect();
-        assert_eq!(names, vec!["claude-sub", "ag"]);
+        assert_eq!(names, vec!["codex-sub", "ag"]);
         assert_eq!(merged[0].models[0].alias, "shared");
         let ag_aliases: Vec<_> = merged[1].models.iter().map(|m| m.alias.as_str()).collect();
         assert_eq!(

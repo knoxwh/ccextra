@@ -31,9 +31,7 @@ use std::sync::Arc;
 use std::sync::atomic::{AtomicU64, Ordering};
 
 use crate::http::auth::check_secret;
-use crate::http::claude_relay::{
-    claude_inbound_user_agent, claude_passthrough_headers, ensure_oauth_beta,
-};
+use crate::http::claude_relay::{claude_inbound_user_agent, claude_passthrough_headers};
 use crate::http::error::{AppError, to_anthropic_error};
 use crate::http::retry::{parse_google_retry_delay, parse_retry_after, retry_after_header_secs};
 use crate::http::{AppState, PayloadRule};
@@ -89,6 +87,9 @@ pub(crate) fn apply_payload_overrides(
     protocol: Protocol,
     rules: &[PayloadRule],
 ) {
+    if matches!(protocol, Protocol::AnthropicOfficial) {
+        return;
+    }
     for rule in rules {
         if matches!(protocol, Protocol::Claude) && rule.protocol.is_none() {
             continue;
@@ -321,7 +322,6 @@ fn prepend_sse_frame(first: Result<Bytes, std::io::Error>, rest: SseStreamPin) -
 #[derive(Debug, Clone)]
 pub(crate) enum OAuthRefreshTarget {
     Antigravity { path: String },
-    Claude { path: String },
     Codex { path: String },
     Xai { path: String },
 }
@@ -415,9 +415,10 @@ pub(crate) async fn prepare_message_request(
     let route = resolve_route(&model, providers)?;
     let payload_rules = &config_snapshot.payload_rules;
 
-    // 3. 归一化第一遍(按协议:claude 直通全量 / 其他转换前精简)
+    // 3. 归一化第一遍(按协议:claude 直通全量 / 官方透传跳过 / 其他转换前精简)
     if normalize_enabled {
         match route.protocol {
+            Protocol::AnthropicOfficial => {}
             Protocol::Claude => {
                 let counts = normalize_anthropic_full(&mut body_json, request_id);
                 tracing::debug!(?counts, "normalize_anthropic_full");
@@ -442,7 +443,11 @@ pub(crate) async fn prepare_message_request(
         .filter(|s| !s.trim().is_empty())
         .map(str::to_string);
 
-    let estimated_input_tokens = if !is_stream || matches!(route.protocol, Protocol::Claude) {
+    let estimated_input_tokens = if !is_stream
+        || matches!(
+            route.protocol,
+            Protocol::Claude | Protocol::AnthropicOfficial
+        ) {
         None
     } else {
         cc_session
@@ -460,6 +465,12 @@ pub(crate) async fn prepare_message_request(
     let mut ag_replay_snapshot = crate::sse::antigravity_replay_cache::AgReplaySnapshot::default();
 
     match route.protocol {
+        Protocol::AnthropicOfficial => {
+            tracing::error!("AnthropicOfficial 不应进入 prepare_message_request");
+            return Err(AppError::new(anyhow::anyhow!(
+                "内部错误: 官方透传请求误入通用转换路径"
+            )));
+        }
         Protocol::Claude => {
             convert_passthrough(&mut body_json, &route.upstream_model)?;
             if sanitize_passthrough_prompt(&mut body_json, &route.upstream_model) {
@@ -657,7 +668,6 @@ pub(crate) async fn prepare_message_request(
         antigravity_refresh,
         xai_refresh,
         codex_refresh,
-        claude_refresh,
     ) = {
         let provider = route
             .provider_config(providers)
@@ -681,7 +691,6 @@ pub(crate) async fn prepare_message_request(
         };
         let xai_refresh = credential_path("xai");
         let codex_refresh = credential_path("codex");
-        let claude_refresh = credential_path("claude");
         (
             provider.base_urls().to_vec(),
             provider.key.clone(),
@@ -691,7 +700,6 @@ pub(crate) async fn prepare_message_request(
             antigravity_refresh,
             xai_refresh,
             codex_refresh,
-            claude_refresh,
         )
     };
     // 空 base_url 列表会让轮转循环与内部重试越界,提前拒绝
@@ -708,7 +716,6 @@ pub(crate) async fn prepare_message_request(
             antigravity: antigravity_refresh,
             xai: xai_refresh,
             codex: codex_refresh,
-            claude: claude_refresh,
         },
         upstream_proxy.as_deref(),
         &mut upstream_key,
@@ -759,11 +766,7 @@ pub(crate) async fn prepare_message_request(
     };
     let extra_headers = if matches!(route.protocol, Protocol::Claude) {
         // 原生 Claude 直通:最小透传(保留 UA/Stainless);转换路径不走这里
-        let mut map = claude_passthrough_headers(headers);
-        if crate::claude::is_claude_oauth_token(&upstream_key) {
-            ensure_oauth_beta(&mut map);
-        }
-        map
+        claude_passthrough_headers(headers)
     } else if let Some(account_id) = codex_account_id.as_deref() {
         // Codex 订阅身份头 (对齐 CPA: 仅 OAuth 账号发,API key provider 无 metadata 不发)
         let mut map = HeaderMap::new();
@@ -875,7 +878,6 @@ struct OAuthRefreshPaths {
     antigravity: Option<String>,
     xai: Option<String>,
     codex: Option<String>,
-    claude: Option<String>,
 }
 
 /// OAuth 订阅:运行时 token 校验与自动刷新;失败硬失败,不得继续打旧 token。
@@ -953,26 +955,6 @@ async fn ensure_oauth_credentials_fresh(
             Err(e) => {
                 return Err(AppError::unauthorized(format!(
                     "Codex 凭证刷新失败,拒绝使用旧 token: {e}"
-                )));
-            }
-        }
-    }
-
-    if let Some(path) = paths.claude {
-        match crate::claude::ensure_credential_fresh(
-            std::path::Path::new(&path),
-            upstream_proxy,
-            None,
-        )
-        .await
-        {
-            Ok(fresh_cred) => {
-                *upstream_key = fresh_cred.access_token;
-                oauth_refresh = Some(OAuthRefreshTarget::Claude { path });
-            }
-            Err(e) => {
-                return Err(AppError::unauthorized(format!(
-                    "Claude 凭证刷新失败,拒绝使用旧 token: {e}"
                 )));
             }
         }
@@ -1717,19 +1699,6 @@ impl PreparedMessageRequest {
                 self.reencode_body().await?;
                 Ok(true)
             }
-            OAuthRefreshTarget::Claude { path } => {
-                let fresh = crate::claude::ensure_credential_fresh(
-                    std::path::Path::new(&path),
-                    proxy,
-                    Some(&rejected),
-                )
-                .await
-                .map_err(|e| {
-                    AppError::unauthorized(format!("Claude 401 后刷新失败,拒绝使用旧 token: {e}"))
-                })?;
-                self.upstream_key = fresh.access_token;
-                Ok(true)
-            }
             OAuthRefreshTarget::Codex { path } => {
                 let fresh = crate::codex::ensure_credential_fresh(
                     std::path::Path::new(&path),
@@ -1775,7 +1744,36 @@ pub async fn handle_messages(
         // prepare 中途 await 期间 reload 增代后,旧快照请求的 mark 必被丢弃。
         let (effective_snapshot, unfit_generation) = state.snapshot_and_unfit_generation().await;
         check_secret(&headers, &effective_snapshot.runtime.secret).await?;
+        let official_enabled = effective_snapshot
+            .providers
+            .iter()
+            .any(|p| p.protocol == Protocol::AnthropicOfficial);
+        if official_enabled {
+            crate::http::official::reject_compressed_inbound(&headers)?;
+        }
         let bytes = crate::limits::read_inbound_body(body).await?;
+
+        if official_enabled
+            && let Some(probe) = crate::http::official::probe_inbound_body(&bytes)
+            && let Ok(route) = resolve_route(&probe.model, &effective_snapshot.providers)
+            && route.protocol == Protocol::AnthropicOfficial
+        {
+            fields = Some(crate::http::access_log::AccessFields::for_official(
+                probe.model.clone(),
+                route.provider.clone(),
+                route.upstream_model.clone(),
+                probe.stream,
+            ));
+            return crate::http::official::relay_messages(
+                &effective_snapshot,
+                &route,
+                &headers,
+                uri.query(),
+                bytes,
+                probe.stream,
+            )
+            .await;
+        }
 
         let mut prepared = prepare_message_request(
             &state,
@@ -1891,7 +1889,7 @@ fn record_non_stream_input_tokens(state: &AppState, prepared: &PreparedMessageRe
                     .pointer("/usageMetadata/promptTokenCount")
                     .and_then(|t| t.as_i64())
             }
-            Protocol::Claude => None,
+            Protocol::Claude | Protocol::AnthropicOfficial => None,
         };
         if let Some(tokens) = input_tokens
             && tokens > 0
@@ -1909,6 +1907,10 @@ fn record_non_stream_input_tokens(state: &AppState, prepared: &PreparedMessageRe
 fn convert_non_stream_success(prepared: &PreparedMessageRequest, v: &Value) -> Option<Value> {
     match prepared.route.protocol {
         Protocol::Claude => None,
+        Protocol::AnthropicOfficial => {
+            tracing::error!("AnthropicOfficial 不应进入 convert_non_stream_success");
+            None
+        }
         Protocol::OpenAiChat => crate::sse::non_stream::openai_chat_to_anthropic(v),
         Protocol::OpenAiResponses => {
             crate::sse::non_stream::responses_to_anthropic(v, prepared.tool_names.as_deref())

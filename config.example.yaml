@@ -15,6 +15,7 @@ user_agents:
 
 # 入口 secret key(可选)。配置后 /v1/messages、/v1/messages/count_tokens 与
 # /v1/models 需 x-api-key 匹配;/health 与 /reload 不认证。
+# 注意:明文 secret_key 不得以 sk-ant- 开头(该前缀保留给 Anthropic 凭证)。
 # Claude Code 用 ANTHROPIC_AUTH_TOKEN 或环境变量注入该 key。
 secret_key: "sk-ccextra-xxx"
 
@@ -26,11 +27,6 @@ secret_key: "sk-ccextra-xxx"
 
 # Codex 凭证目录(可选)。默认配置文件旁 .cache/codex。
 # codex_auth_dir: ".cache/codex"
-
-# Claude 订阅 (Anthropic OAuth) 凭证目录(可选)。默认配置文件旁 .cache/claude。
-# 登录: ./ccextra claude-login → 启动时自动扫描并注入 protocol: claude provider
-# (base_url=https://api.anthropic.com, key=access_token)。与静态 API/中转共用直通管线。
-# claude_auth_dir: ".cache/claude"
 
 # 凡 config protocol: claude 出站默认走 Bun TLS 指纹车道(wreq/BoringSSL,
 # 对齐 Claude Code / Bun peet JA3/JA4 + HTTP/1.1;官方与第三方 Claude 兼容站均适用)。
@@ -61,6 +57,8 @@ secret_key: "sk-ccextra-xxx"
 #     max-idle-conns-per-host: 2 # 每凭证每 host 最大空闲连接数(默认 2,上限 100)
 
 # Provider 定义
+# 校验:非 anthropic_official provider 的 key 必填且不能为空白;
+# model 的 alias/name 含 * 的通配条目只限 anthropic_official,且须为 claude-* 形式(见下方注释示例)。
 providers:
   - name: xxx1
     protocol: claude
@@ -108,7 +106,7 @@ providers:
   #   base_url:
   #     - "https://daily-cloudcode-pa.googleapis.com"
   #     - "https://cloudcode-pa.googleapis.com"
-  #   key: ""
+  #   key: "ya29.xxx"
   #   models:
   #     - name: gemini-3.7-flash-high
   #       alias: gemini-3.7-flash-high
@@ -116,6 +114,25 @@ providers:
   # xAI Grok (OAuth)。无需手配:启动时自动扫描上方 xai_auth_dir,
   # 为每份有效凭证注入一个 xai provider(OpenAI Responses 协议)。
   # 凭证获取: ./ccextra xai-login → 写入 .cache/xai
+
+  # 官方 Anthropic 订阅透传(anthropic_official)。建议放进独立实例(如 port: 8223)的配置单独使用:
+  # 该实例不设 secret_key、不设 payload;Claude Code 只设 ANTHROPIC_BASE_URL=http://127.0.0.1:8223,
+  # 不设 ANTHROPIC_AUTH_TOKEN / ANTHROPIC_API_KEY / apiKeyHelper,由订阅登录的 Authorization 原样转发。
+  # 请求字节、请求头(除 hop-by-hop/host/content-length/x-api-key/x-ccextra-key/accept-encoding)、
+  # 上游状态/头/错误体/SSE 均原样透传;不插 keepalive、不重建错误、不重试、不刷新凭证。
+  # 校验:key 必须留空;base_url 只能是单个 https://api.anthropic.com(端口空或 443,无 path/query/fragment/userinfo);
+  # 不得设 metadata;每个模型 alias 必须等于 name(不改写 model)。
+  # 通配只限 anthropic_official:每个 provider 至多一条,须以 claude- 开头且只有末尾一个 *;
+  # 精确条目优先,/v1/models 不列通配条目。
+  # - name: anthropic-official
+  #   protocol: anthropic_official
+  #   base_url: https://api.anthropic.com
+  #   proxy_url: "direct"
+  #   models:
+  #     - name: claude-opus-5-5
+  #       alias: claude-opus-5-5
+  #     - name: "claude-*"
+  #       alias: "claude-*"
 
 # Payload 参数覆盖(按模型名模式匹配;protocol 限定生效目标协议)
 # openai_chat 出站会在 payload 后再守卫:kimi 非法 temperature 剥掉;

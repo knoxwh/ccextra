@@ -65,6 +65,7 @@ impl IntoResponse for AppError {
             StatusCode::BAD_REQUEST => "invalid_request_error",
             StatusCode::UNAUTHORIZED => "authentication_error",
             StatusCode::NOT_FOUND => "not_found_error",
+            StatusCode::UNSUPPORTED_MEDIA_TYPE => "invalid_request_error",
             StatusCode::UNPROCESSABLE_ENTITY => "invalid_request_error",
             // 对齐 CPA claudeErrorTypeFromStatus:408/504 → timeout_error
             StatusCode::REQUEST_TIMEOUT | StatusCode::GATEWAY_TIMEOUT => "timeout_error",
@@ -85,8 +86,15 @@ impl From<RouteError> for AppError {
     fn from(err: RouteError) -> Self {
         match err {
             RouteError::ModelNotFound(_) => Self::not_found(err.to_string()),
-            RouteError::AliasConflict(_) => Self::new(err),
-            RouteError::EmptyBaseUrl(_) | RouteError::InvalidProxy(..) => Self::new(err),
+            RouteError::AliasConflict(_)
+            | RouteError::EmptyBaseUrl(_)
+            | RouteError::EmptyKey(_)
+            | RouteError::OfficialNonEmptyKey(_)
+            | RouteError::InvalidOfficialBaseUrl(..)
+            | RouteError::OfficialMetadataNotAllowed(_)
+            | RouteError::OfficialAliasMismatch(..)
+            | RouteError::InvalidWildcardModel(..)
+            | RouteError::InvalidProxy(..) => Self::new(err),
         }
     }
 }

@@ -29,7 +29,7 @@ Claude Code sends Anthropic Messages requests; ccextra picks an upstream by mode
 | **Route by model** | Claude, OpenAI, Gemini, and Antigravity share one port; `alias` stays separate from upstream `name` |
 | **Request stabilization** | Normalize tools, schemas, and history to cut incidental cross-turn drift (hit rate still depends on the upstream) |
 | **Capability adaptation** | Message / tool / image conversion; `models.json` clamps reasoning levels |
-| **OAuth providers** | Antigravity, xAI Grok, Codex, Claude subscription — credential load, refresh, dynamic models |
+| **OAuth providers** | Antigravity, xAI Grok, Codex — credential load, refresh, dynamic models |
 | **Claude fingerprint lane** | `protocol: claude` defaults to wreq/BoringSSL (Bun-aligned TLS + HTTP/1.1) |
 | **Hot reload** | Saving `config.yaml` / `models.json` or `POST /reload` publishes atomically; in-flight requests keep the old snapshot |
 
@@ -55,8 +55,25 @@ Inbound is always Anthropic-shaped; outbound is restored to Anthropic responses.
 | `openai_responses` | Responses | `instructions` + `input`; reasoning replay, search-domain filtering |
 | `gemini` | Gemini GenerateContent | Content blocks, tool results, schema |
 | `antigravity` | Cloud Code Assist | Gemini wrapper; tool names and output caps; short connections by default |
+| `anthropic_official` | Anthropic Messages (official subscription) | Verbatim passthrough of client `Authorization` and request bytes; `alias == name`; no conversion, no rebuilt errors, no keepalive; `https://api.anthropic.com` only |
 
-> **OAuth synthesis**: xAI / Codex → `openai_responses`; Claude subscription → `claude` (same passthrough as static API). Codex auto-attaches `Chatgpt-Account-Id` and zstd request bodies (CLI-aligned).
+> **OAuth synthesis**: xAI / Codex → `openai_responses`. Codex auto-attaches `Chatgpt-Account-Id` and zstd request bodies (CLI-aligned).
+
+<details>
+<summary>Official Anthropic subscription passthrough (<code>anthropic_official</code>)</summary>
+
+Lets Claude Code reach Anthropic through ccextra with its own subscription login. ccextra stores and refreshes no subscription credential; it forwards the client's `Authorization` verbatim to `api.anthropic.com`.
+
+- **Use a standalone instance**: run a separate instance on `127.0.0.1:8223` with no `secret_key` and no `payload`, holding only this provider (commented example in [config.example.yaml](config.example.yaml)). An instance with `secret_key` authenticates first and rejects any key starting with `sk-ant-` with 401.
+- **Claude Code side**: set only `ANTHROPIC_BASE_URL=http://127.0.0.1:8223`; do not set `ANTHROPIC_AUTH_TOKEN`, `ANTHROPIC_API_KEY`, or `apiKeyHelper`, otherwise the `Authorization` sent is not the subscription login. A missing `Authorization` (including empty or all-whitespace) gets a local 401; `x-api-key` is not forwarded.
+- **Config rules** (checked at startup and `/reload`): `key` must be empty; `base_url` must be a single `https://api.anthropic.com` (port empty or 443, no path / query / fragment / userinfo); no `metadata`; every model has `alias == name`, so `model` is never rewritten.
+- **`claude-*` wildcard**: `anthropic_official` only, at most one per provider, must start with `claude-` and have a single trailing `*`. Exact entries win; unlisted `claude-…` snapshot names hit the wildcard and are forwarded verbatim; `claude-`, `claude-*`, `claude-**` return 404; `/v1/models` does not list wildcard entries.
+- **Verbatim forwarding**: the request body is forwarded as raw bytes (no normalize, payload override, effort clamp, or system sanitizing); request headers are forwarded as-is except hop-by-hop, `host`, `content-length`, `x-api-key`, `x-ccextra-key`, `accept-encoding` (`Content-Type` defaults to `application/json` when missing); no beta is appended and no User-Agent is filled in; `Accept-Encoding` is negotiated and decoded by ccextra itself.
+- **Verbatim response**: upstream status, response headers (minus hop-by-hop and `set-cookie`), error bodies, and SSE bytes are returned as-is: no `: keepalive`, no rebuilt errors, no synthetic `timeout_error` / `message_stop`, no 180s idle timeout.
+- **No retries**: redirects are not followed; no stale / 400 / 401 retry, no credential refresh, no `base_url` rotation. Local errors: connect failure 502; response-header wait timeout 408 (streaming 60s, non-streaming 600s, count_tokens 60s); when the instance has an official provider, a non-`identity` inbound `Content-Encoding` gets 415 before the body is read.
+- `count_tokens` is passed through the same way; `logging.request_body` does not apply to the official path.
+
+</details>
 
 ## Quick start
 
@@ -125,9 +142,10 @@ Full fields: [config.example.yaml](config.example.yaml). Common items:
 
 | Item | Notes |
 | :--- | :--- |
-| `models[].alias` | Inbound model name; must be unique across providers and must not collide with another model's `name`; `base_url` may be a fallback array |
+| `models[].alias` | Inbound model name; must be unique across providers and must not collide with another model's `name`; `base_url` may be a fallback array; `anthropic_official` requires `alias == name` |
+| provider `key` | Required and non-blank for non-`anthropic_official` providers; must be empty for `anthropic_official` |
 | `server.proxy_url` / provider `proxy_url` | Provider overrides server; one is required, `"direct"`/`"none"` = no proxy, `socks5` is rewritten to `socks5h`; missing / empty / invalid values fail startup and reload |
-| `secret_key` | Entry auth; bcrypt-written on load; requests use `x-api-key` or `Bearer` |
+| `secret_key` | Entry auth; bcrypt-written on load; requests use `x-api-key` or `Bearer`; plaintext must not start with `sk-ant-` |
 | `payload` | Glob overrides for top-level params; optional `protocol` scope |
 | `prompt_cache_key` | OpenAI paths only; takes Claude Code session ID; does not overwrite a non-empty value |
 | `models_file` | Reasoning table (default sibling `models.json`; copy from [models.json.example](models.json.example)) |
@@ -151,7 +169,7 @@ Full fields: [config.example.yaml](config.example.yaml). Common items:
 | Endpoint | Auth | Role |
 | :--- | :---: | :--- |
 | `POST /v1/messages` | \* | Anthropic Messages → JSON / SSE |
-| `POST /v1/messages/count_tokens` | \* | Claude forwards upstream count; others read session records, miss → 0 |
+| `POST /v1/messages/count_tokens` | \* | Claude forwards upstream count; `anthropic_official` passes through verbatim; others read session records, miss → 0 |
 | `GET /v1/models` | \* | Anthropic-format model list |
 | `GET /health` | — | Returns `ok` (does not probe upstream) |
 | Save config / `POST /reload` | — | Validate and publish new config (file watch and HTTP share one path) |
@@ -161,13 +179,13 @@ Full fields: [config.example.yaml](config.example.yaml). Common items:
 <details>
 <summary>Request pipeline and boundaries</summary>
 
-Pipeline: auth → route → normalize → protocol convert → payload override → upstream.
+Pipeline: auth → route → normalize → protocol convert → payload override → upstream. `anthropic_official` is forwarded verbatim right after routing and skips the rest.
 
 - **Compatibility**: OpenAI strips `required: null`; Chat maps schema-position `true`→`{}`; Gemini/AG fills `type: object`; blockage codes map to `refusal`; AG neutralizes Claude Code identity sentences and sanitizes non-standard session headers
-- **Streaming**: Claude body passthrough; others convert to Anthropic SSE; 10s `: keepalive`
+- **Streaming**: Claude body passthrough; others convert to Anthropic SSE; 10s `: keepalive` (`anthropic_official` bytes are verbatim, no keepalive)
 - **Retries**: same-round multi-`base_url` rotation on 429/5xx/network errors; exhaust → fail fast and pass through `Retry-After` (filled from the body RetryInfo for Antigravity 429s without the header); streaming first-frame error retries once internally
 - **Read limits**: success body 16 MiB, error 256 KiB, idle 180s; OAuth / project / model reads 30s total timeout
-- **Claude headers**: keep permitted identity headers; `anthropic-beta` passthrough by default; append `oauth-2025-04-20` for `sk-ant-oat*` when missing
+- **Claude headers**: keep permitted identity headers; `anthropic-beta` passthrough by default
 
 </details>
 
@@ -177,7 +195,6 @@ Pipeline: auth → route → normalize → protocol convert → payload override
 ./ccextra antigravity-login && ./ccextra antigravity-status
 ./ccextra xai-login         && ./ccextra xai-status
 ./ccextra codex-login       && ./ccextra codex-status
-./ccextra claude-login      && ./ccextra claude-status
 ```
 
 | Provider | Default credential dir | Refresh window | Notes |
@@ -185,7 +202,6 @@ Pipeline: auth → route → normalize → protocol convert → payload override
 | Antigravity | `.cache/antigravity` | 5 minutes early | Model catalog ~3h background refresh |
 | xAI Grok | `.cache/xai` | 5 minutes early | Injected on startup scan |
 | Codex | `.cache/codex` | 24 hours early | PKCE; callback port default 1455 |
-| Claude subscription | `.cache/claude` | 4 hours early | PKCE; callback fixed `localhost:54545`; no cloaking / UA rewrite |
 
 Quota / model catalog:
 
@@ -199,19 +215,6 @@ Successful login auto `POST /reload` against `--config` `host`/`port` (failure i
 ```bash
 curl -X POST http://127.0.0.1:8222/reload
 ```
-
-<details>
-<summary>Claude subscription notes</summary>
-
-**Claude subscription** — single-machine, Claude Code CLI clients only:
-
-- `./ccextra claude-login` → injects `protocol: claude` (`base_url=https://api.anthropic.com`)
-- Outbound reuses Messages passthrough and cache normalization; refresh retries only on 5xx
-- Same shape as static Claude API / proxy — swap `base_url` + key
-
-More in [design.md](docs/design.md).
-
-</details>
 
 ## Development
 

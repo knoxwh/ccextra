@@ -19,14 +19,18 @@ where
 {
     use ccextra_core::route::Protocol;
     use futures::StreamExt;
-    // Claude 协议不提取 input tokens(下方 match 恒 None),整体跳过解析;
+    // Claude 与官方透传不提取 input tokens(下方 match 恒 None),整体跳过解析;
     // scope 缺失同样零成本透传。
-    let active = scope.is_some() && !matches!(protocol, Protocol::Claude);
+    let active =
+        scope.is_some() && !matches!(protocol, Protocol::Claude | Protocol::AnthropicOfficial);
     // 预过滤关键词按协议选:Gemini/AG 的 cpaUsageMetadata 是大写 Usage,
     // 小写 "usage" 会漏帧;其四条取值路径均含 promptTokenCount。
     let usage_keyword = match protocol {
         Protocol::Gemini | Protocol::Antigravity => "promptTokenCount",
-        _ => "usage",
+        Protocol::Claude
+        | Protocol::AnthropicOfficial
+        | Protocol::OpenAiChat
+        | Protocol::OpenAiResponses => "usage",
     };
     let mut parser = crate::sse::parser::SseParser::new();
     async_stream::stream! {
@@ -56,7 +60,7 @@ where
                                 .or_else(|| value.pointer("/response/cpaUsageMetadata/promptTokenCount"))
                                 .or_else(|| value.pointer("/usageMetadata/promptTokenCount"))
                                 .or_else(|| value.pointer("/cpaUsageMetadata/promptTokenCount")),
-                            Protocol::Claude => None,
+                            Protocol::Claude | Protocol::AnthropicOfficial => None,
                         }.and_then(serde_json::Value::as_u64)
                             .and_then(|tokens| usize::try_from(tokens).ok())
                             .filter(|tokens| *tokens > 0);
@@ -187,6 +191,10 @@ fn extract_cache_usage_tokens(
             Some((cache_read, cache_creation))
         }
         Protocol::Gemini | Protocol::Antigravity => None,
+        Protocol::AnthropicOfficial => {
+            tracing::error!("AnthropicOfficial 不应进入 extract_cache_usage_tokens");
+            None
+        }
     }
 }
 

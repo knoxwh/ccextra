@@ -86,6 +86,12 @@ pub async fn check_secret(headers: &HeaderMap, secret: &Option<String>) -> Resul
         return Ok(());
     };
     let got = extract_key(headers);
+    // Anthropic 订阅/官方凭证前缀直接 401:绝不查/写 AUTH_CACHE,也不跑 bcrypt(R1)
+    if got.starts_with("sk-ant-") {
+        return Err(AppError::unauthorized(
+            "x-api-key 或 Authorization 缺失/不匹配",
+        ));
+    }
     let ok = if looks_like_bcrypt(expected) {
         verify_cached(got, expected).await
     } else {

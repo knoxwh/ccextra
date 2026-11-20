@@ -14,6 +14,10 @@ pub fn build_models_list(providers: &[ProviderConfig]) -> Value {
     let mut data = Vec::new();
     for provider in providers {
         for model in &provider.models {
+            // 跳过通配条目(如官方 provider 的 claude-*),避免暴露假模型 id
+            if model.alias.contains('*') {
+                continue;
+            }
             data.push(serde_json::json!({
                 "id": model.alias,
                 "object": "model",

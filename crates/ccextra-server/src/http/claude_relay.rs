@@ -1,5 +1,4 @@
-use crate::claude::constants::OAUTH_BETA;
-use axum::http::{HeaderMap, HeaderName, HeaderValue, header};
+use axum::http::{HeaderMap, HeaderValue, header};
 
 /// Claude Code / CPA 对齐的 Accept-Encoding(`protocol: claude` 直通)。
 ///
@@ -82,105 +81,10 @@ pub fn claude_inbound_user_agent(headers: &HeaderMap) -> Option<&str> {
         .filter(|value| !value.is_empty())
 }
 
-/// 订阅 OAuth (`sk-ant-oat*`) 出站时:入站 anthropic-beta 缺 oauth beta 则追加。
-/// 多个同名头按出现顺序合并为一个逗号列表再追加;各项 trim、丢空项(对齐 CPA
-/// normalizedClaudeBetaHeader 读取 `Values("Anthropic-Beta")` 全量后逐项规整);已含则不动。
-pub fn ensure_oauth_beta(headers: &mut HeaderMap) {
-    let beta_name = HeaderName::from_static("anthropic-beta");
-    let mut betas: Vec<&str> = headers
-        .get_all(&beta_name)
-        .iter()
-        .filter_map(|value| value.to_str().ok())
-        .flat_map(|value| value.split(','))
-        .map(str::trim)
-        .filter(|beta| !beta.is_empty())
-        .collect();
-    if betas
-        .iter()
-        .any(|beta| beta.eq_ignore_ascii_case(OAUTH_BETA))
-    {
-        return;
-    }
-    betas.push(OAUTH_BETA);
-    // insert 覆盖全部同名旧值
-    if let Ok(value) = HeaderValue::from_str(&betas.join(",")) {
-        headers.insert(beta_name, value);
-    }
-}
-
 #[cfg(test)]
 mod tests {
     use super::*;
-
-    #[test]
-    fn test_ensure_oauth_beta_appends_when_missing() {
-        let mut map = HeaderMap::new();
-        map.insert(
-            HeaderName::from_static("anthropic-beta"),
-            HeaderValue::from_static("claude-code-20250219"),
-        );
-        ensure_oauth_beta(&mut map);
-        let got = map.get("anthropic-beta").unwrap().to_str().unwrap();
-        assert_eq!(got, "claude-code-20250219,oauth-2025-04-20");
-    }
-
-    #[test]
-    fn test_ensure_oauth_beta_noop_when_present() {
-        let mut map = HeaderMap::new();
-        map.insert(
-            HeaderName::from_static("anthropic-beta"),
-            HeaderValue::from_static("claude-code-20250219,oauth-2025-04-20"),
-        );
-        ensure_oauth_beta(&mut map);
-        let got = map.get("anthropic-beta").unwrap().to_str().unwrap();
-        assert_eq!(got, "claude-code-20250219,oauth-2025-04-20");
-    }
-
-    #[test]
-    fn test_ensure_oauth_beta_merges_multiple_headers() {
-        let mut map = HeaderMap::new();
-        let name = HeaderName::from_static("anthropic-beta");
-        map.append(&name, HeaderValue::from_static("claude-code-20250219"));
-        map.append(&name, HeaderValue::from_static("context-1m-2025-08-07"));
-        ensure_oauth_beta(&mut map);
-        let all: Vec<_> = map.get_all(&name).iter().collect();
-        assert_eq!(all.len(), 1);
-        assert_eq!(
-            all[0].to_str().unwrap(),
-            "claude-code-20250219,context-1m-2025-08-07,oauth-2025-04-20"
-        );
-
-        // 第二个头已含 oauth beta:不动
-        let mut map = HeaderMap::new();
-        map.append(&name, HeaderValue::from_static("claude-code-20250219"));
-        map.append(&name, HeaderValue::from_static("oauth-2025-04-20"));
-        ensure_oauth_beta(&mut map);
-        assert_eq!(map.get_all(&name).iter().count(), 2);
-    }
-
-    #[test]
-    fn test_ensure_oauth_beta_normalizes_spaces_and_empty_items() {
-        let mut map = HeaderMap::new();
-        let name = HeaderName::from_static("anthropic-beta");
-        map.append(&name, HeaderValue::from_static(" claude-code-20250219 , ,"));
-        map.append(&name, HeaderValue::from_static(""));
-        map.append(&name, HeaderValue::from_static("context-1m-2025-08-07"));
-        ensure_oauth_beta(&mut map);
-        let all: Vec<_> = map.get_all(&name).iter().collect();
-        assert_eq!(all.len(), 1);
-        assert_eq!(
-            all[0].to_str().unwrap(),
-            "claude-code-20250219,context-1m-2025-08-07,oauth-2025-04-20"
-        );
-    }
-
-    #[test]
-    fn test_ensure_oauth_beta_inserts_when_absent() {
-        let mut map = HeaderMap::new();
-        ensure_oauth_beta(&mut map);
-        let got = map.get("anthropic-beta").unwrap().to_str().unwrap();
-        assert_eq!(got, "oauth-2025-04-20");
-    }
+    use axum::http::HeaderName;
 
     #[test]
     fn test_passthrough_keeps_ua_stainless_and_ae() {

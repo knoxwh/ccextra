@@ -1,7 +1,6 @@
 // ccextra-server: HTTP 入口 + 上游客户端 + SSE 转换
 
 pub mod antigravity;
-pub mod claude;
 pub mod claude_tls_fp;
 pub mod codex;
 pub mod gohttp;

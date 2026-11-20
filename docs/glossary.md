@@ -8,6 +8,7 @@
 | --- | --- |
 | Anthropic Messages | ccextra 的入站与出口形状，主端点为 `/v1/messages`。 |
 | `claude` | 上游 Anthropic Messages 协议。 |
+| `anthropic_official` | 官方 Anthropic 订阅透传：把客户端 `Authorization` 与请求原始字节原样转给 `https://api.anthropic.com`，上游状态、头、错误体与 SSE 原样回传；要求 `key` 为空、`alias == name`，不转换、不重试、不刷新凭证。 |
 | `openai_chat` | OpenAI Chat Completions 协议，端点为 `/chat/completions`。 |
 | `openai_responses` | OpenAI Responses 协议，端点为 `/responses`。 |
 | `gemini` | Google Gemini GenerateContent 协议。 |
@@ -16,7 +17,7 @@
 | 非流响应 | `stream` 为 `false` 或缺失时的单个 JSON 响应。 |
 | 会话输入用量缓存 | 按 session 保存上游真实输入 token 数，供下一轮流首和 count_tokens 使用。Chat/Responses/Gemini/Antigravity 的原始 SSE 正数输入用量也会写回；缺失或零值不覆盖旧值，占位值不写回。记录写入后 30 分钟过期，最多 512 条。 |
 
-xAI Grok 与 Codex 不是独立 protocol。它们使用 OAuth 凭证动态创建 `openai_responses` provider。Claude 订阅 OAuth 动态创建 `protocol: claude` provider（与静态 API/中转同形）。
+xAI Grok 与 Codex 不是独立 protocol。它们使用 OAuth 凭证动态创建 `openai_responses` provider。
 
 ## 路由与配置
 
@@ -25,6 +26,9 @@ xAI Grok 与 Codex 不是独立 protocol。它们使用 OAuth 凭证动态创建
 
 **model alias**
 客户端发送的模型名。路由先按 alias 匹配，再按真实上游模型名匹配。alias 全局唯一（跨 provider 与同 provider 内）；可等于其他模型的 `name`（自身 alias==name 亦允许），入站优先命中 alias。静态配置冲突 → 启动/`/reload` 失败；动态注入冲突 → 丢弃该动态模型。
+
+**通配条目**
+`anthropic_official` provider 中 alias 与 name 相同、以 `claude-` 开头且只有末尾一个 `*` 的模型条目（如 `claude-*`），每个 provider 至多一条。只在精确匹配（alias、name）全部未命中后参与路由；入站名去掉前缀后须非空且不含 `*`，上游模型名即入站原值。`/v1/models` 不列出；其他协议配置通配条目会校验失败。
 
 **upstream model**
 实际写入上游请求 `model` 的名称，可与 alias 不同。
@@ -42,7 +46,7 @@ xAI Grok 与 Codex 不是独立 protocol。它们使用 OAuth 凭证动态创建
 `server.proxy_url` 是默认值；provider `proxy_url` 优先。生效代理必须显式配置：`direct`/`none` 表示直连，`http`/`https`/`socks5h` URL 原样使用，`socks5` 改写为 `socks5h`；缺失、空值或其他值为配置错误，不回落环境代理。OAuth 动态 provider 沿用全局代理，有启用凭证时全局代理必填。
 
 **入口认证**
-`secret_key` 启用后，Anthropic API 端点要求 `x-api-key` 或 `Authorization: Bearer`。明文配置会转 bcrypt 并回写。
+`secret_key` 启用后，Anthropic API 端点要求 `x-api-key` 或 `Authorization: Bearer`。明文配置会转 bcrypt 并回写；明文不得以 `sk-ant-` 开头，认证时以 `sk-ant-` 开头的 key 直接 401。
 
 ## 请求转换
 
@@ -123,7 +127,7 @@ Gemini 函数调用模式。Antigravity Claude 模型强制使用；Gemini 直�
 将 Anthropic `input_schema` 转成 Gemini 或 Antigravity 可接受 JSON Schema 的递归过程。它内联本地引用、移除不支持关键字、归一化布尔 `true` 子 schema、处理 enum 和 required，并为不同目标采用不同规则；Gemini 直连保留 `additionalProperties` 与标准约束，Antigravity 搬入 description 提示。声明 `items` 但缺 `type` 的节点补 `type: array`；`type` 显式不是 `array` 时去掉 `items`。OpenAI Chat/Responses 转换另会删除 schema 节点中的 `required: null`，保留实例数据中的同名字段。Chat 将 schema 位置的 `true` 转为空对象，保留 `false`、布尔 `additionalProperties` 与 `default`/`enum` 实例数据。
 
 **OAuth 动态 provider**
-由保存的 Antigravity、xAI、Codex 或 Claude 凭证生成的运行时 provider。Antigravity 后台刷新模型；xAI、Codex 与 Claude 在启动和重载时扫描、刷新凭证。Codex 请求携带 `Chatgpt-Account-Id` 订阅身份头；Claude 订阅注入 `protocol: claude`（与静态 API/中转同形，OAuth 缺 beta 时补 `oauth-2025-04-20`）。
+由保存的 Antigravity、xAI 或 Codex 凭证生成的运行时 provider。Antigravity 后台刷新模型；xAI 与 Codex 在启动和重载时扫描、刷新凭证。Codex 请求携带 `Chatgpt-Account-Id` 订阅身份头。
 
 
 **热重载**

@@ -3,6 +3,7 @@ pub mod auth;
 pub mod claude_relay;
 pub mod error;
 pub mod handlers;
+pub(crate) mod official;
 pub mod retry;
 pub mod session_tokens;
 pub mod unfit;
@@ -28,7 +29,7 @@ use handlers::reload::handle_reload;
 pub use auth::{check_secret, extract_key, verify_cached};
 pub use claude_relay::{
     CLAUDE_ACCEPT_ENCODING, claude_inbound_user_agent, claude_passthrough_headers,
-    ensure_claude_accept_encoding, ensure_oauth_beta, is_claude_passthrough_header_excluded,
+    ensure_claude_accept_encoding, is_claude_passthrough_header_excluded,
 };
 pub use error::{AppError, extract_upstream_error, to_anthropic_error};
 pub use retry::parse_retry_after;
@@ -87,7 +88,6 @@ pub struct ProviderRefreshConfig {
     pub auth_dir: Option<std::path::PathBuf>,
     pub xai_auth_dir: Option<std::path::PathBuf>,
     pub codex_auth_dir: Option<std::path::PathBuf>,
-    pub claude_auth_dir: Option<std::path::PathBuf>,
     /// Antigravity 模型白名单;空 = 全量
     pub antigravity_models: Option<Vec<String>>,
     /// Antigravity hub UA（与 user_agents.antigravity / REQUEST_UA 同源）
@@ -97,7 +97,7 @@ pub struct ProviderRefreshConfig {
 }
 
 impl ProviderRefreshConfig {
-    /// OAuth 动态 provider(Antigravity/xAI/Codex/Claude)沿用 `server.proxy_url`:
+    /// OAuth 动态 provider(Antigravity/xAI/Codex)沿用 `server.proxy_url`:
     /// 任一凭证目录有启用中的凭证时全局代理必须有效。启动与 `/reload` 在加载凭证前静态校验,
     /// 否则 token 刷新失败只会逐个 warn 跳过凭证,配置错误被吞掉。
     pub fn validate_oauth_proxy(&self) -> anyhow::Result<()> {
@@ -122,11 +122,6 @@ impl ProviderRefreshConfig {
                 .count())
         }) + enabled(&self.codex_auth_dir, &|d| {
             Ok(crate::codex::list(d)?
-                .iter()
-                .filter(|(_, c)| !c.disabled)
-                .count())
-        }) + enabled(&self.claude_auth_dir, &|d| {
-            Ok(crate::claude::list(d)?
                 .iter()
                 .filter(|(_, c)| !c.disabled)
                 .count())

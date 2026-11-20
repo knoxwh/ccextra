@@ -159,7 +159,7 @@ fn acquire_refresh_lock(
         .clone()
 }
 
-/// Claude/Codex 共用的 PKCE 校验对(对齐 CPA:96 随机字节 base64url 无填充)。
+/// Codex PKCE 校验对(对齐 CPA:96 随机字节 base64url 无填充)。
 pub struct PkceCodes {
     pub code_verifier: String,
     pub code_challenge: String,
@@ -245,30 +245,17 @@ mod tests {
 
     #[test]
     fn pkce_public_paths_share_type_and_auth_url_contract() {
-        let claude: crate::claude::oauth::PkceCodes =
-            crate::codex::oauth::generate_pkce_codes().unwrap();
         let codex: crate::codex::oauth::PkceCodes =
-            crate::claude::oauth::generate_pkce_codes().unwrap();
-        let urls = [
-            (
-                crate::claude::oauth::build_auth_url("state", &claude),
-                &claude,
-            ),
-            (
-                crate::codex::oauth::build_auth_url("state", "http://localhost/callback", &codex),
-                &codex,
-            ),
-        ];
-        for (url, pkce) in urls {
-            let query = url.split_once('?').unwrap().1;
-            assert!(
-                query
-                    .split('&')
-                    .any(|p| p == format!("code_challenge={}", pkce.code_challenge))
-            );
-            assert!(query.split('&').any(|p| p == "code_challenge_method=S256"));
-            assert!(!query.split('&').any(|p| p.starts_with("code_verifier=")));
-        }
+            crate::codex::oauth::generate_pkce_codes().unwrap();
+        let url = crate::codex::oauth::build_auth_url("state", "http://localhost/callback", &codex);
+        let query = url.split_once('?').unwrap().1;
+        assert!(
+            query
+                .split('&')
+                .any(|p| p == format!("code_challenge={}", codex.code_challenge))
+        );
+        assert!(query.split('&').any(|p| p == "code_challenge_method=S256"));
+        assert!(!query.split('&').any(|p| p.starts_with("code_verifier=")));
     }
 
     #[test]

@@ -150,6 +150,14 @@ where
     // 空闲心跳在分派后统一注入:所有转换路径(含 claude 直通)共享
     let inner: SseStreamPin = match protocol {
         Protocol::Claude => chat::relay_claude_passthrough(stream),
+        Protocol::AnthropicOfficial => {
+            tracing::error!("AnthropicOfficial 不应进入通用 SSE relay");
+            return Box::pin(futures::stream::once(async {
+                Err(io::Error::other(
+                    "internal error: AnthropicOfficial reached generic SSE relay",
+                ))
+            }));
+        }
         Protocol::OpenAiChat => {
             chat::relay_openai_chat_to_anthropic(stream, estimated_input_tokens)
         }

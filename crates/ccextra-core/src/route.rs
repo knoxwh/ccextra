@@ -7,6 +7,8 @@ use thiserror::Error;
 #[serde(rename_all = "snake_case")]
 pub enum Protocol {
     Claude,
+    /// 官方 Anthropic 订阅透传(原始字节转发、透传客户端 Authorization,仅 api.anthropic.com)
+    AnthropicOfficial,
     #[serde(rename = "openai_chat")]
     OpenAiChat,
     #[serde(rename = "openai_responses")]
@@ -47,6 +49,24 @@ pub enum RouteError {
     #[error("provider {0} 未配置 base_url")]
     EmptyBaseUrl(String),
 
+    #[error("provider {0} 未配置 key")]
+    EmptyKey(String),
+
+    #[error("官方 provider {0} 不得配置 key(订阅认证由客户端 Authorization 透传)")]
+    OfficialNonEmptyKey(String),
+
+    #[error("官方 provider {0} base_url 无效: {1}")]
+    InvalidOfficialBaseUrl(String, String),
+
+    #[error("官方 provider {0} 不得配置 metadata")]
+    OfficialMetadataNotAllowed(String),
+
+    #[error("官方 provider {0} 模型 alias({1}) 必须等于 name({2})")]
+    OfficialAliasMismatch(String, String, String),
+
+    #[error("provider {0} 通配模型条目无效: {1}")]
+    InvalidWildcardModel(String, String),
+
     #[error("{0} 代理配置错误: {1}")]
     InvalidProxy(String, crate::proxy::ProxyError),
 }
@@ -60,6 +80,7 @@ pub struct ProviderConfig {
         serialize_with = "serialize_base_url"
     )]
     base_url: Vec<String>,
+    #[serde(default)]
     pub key: String,
     /// 覆盖全局代理;`direct`/`none` = 直连,缺省 = 用全局(全局也缺省为配置错误,见 [`crate::proxy`])
     #[serde(default)]
@@ -157,19 +178,31 @@ pub struct ModelConfig {
     pub max_tokens: Option<u64>,
 }
 
+fn is_wildcard_model(model: &ModelConfig) -> bool {
+    model.alias.ends_with('*') || model.name.ends_with('*')
+}
+
 /// 路由决策:从入站 model 解析到 (provider, protocol, upstream_model)
 ///
 /// 启动时由 [`validate_providers`] 保证 alias 全局唯一。
 /// provider name 允许重复;alias 可等于其他模型的 name(自身 alias==name 也允许)。
+/// 精确阶段跳过通配条目;精确全部未命中时,再对 `AnthropicOfficial` 尝试前缀通配。
 pub fn resolve_route(
     inbound_model: &str,
     providers: &[ProviderConfig],
 ) -> Result<RouteDecision, RouteError> {
     // alias 优先(Claude Code 主对话发别名);name 兜底(部分内部门如
-    // count_tokens 发上游裸名)
-    find_route(providers, |m| m.alias == inbound_model)
-        .or_else(|| find_route(providers, |m| m.name == inbound_model))
-        .ok_or_else(|| RouteError::ModelNotFound(inbound_model.to_string()))
+    // count_tokens 发上游裸名);两者均跳过通配条目
+    find_route(providers, |m| {
+        !is_wildcard_model(m) && m.alias == inbound_model
+    })
+    .or_else(|| {
+        find_route(providers, |m| {
+            !is_wildcard_model(m) && m.name == inbound_model
+        })
+    })
+    .or_else(|| find_official_wildcard_route(providers, inbound_model))
+    .ok_or_else(|| RouteError::ModelNotFound(inbound_model.to_string()))
 }
 
 fn find_route(
@@ -190,7 +223,71 @@ fn find_route(
         })
 }
 
-/// 启动时验证配置:检查 alias 全局唯一(跨 provider 与同 provider 内)与空 base_url
+fn find_official_wildcard_route(
+    providers: &[ProviderConfig],
+    inbound_model: &str,
+) -> Option<RouteDecision> {
+    providers
+        .iter()
+        .enumerate()
+        .filter(|(_, p)| p.protocol == Protocol::AnthropicOfficial)
+        .find_map(|(provider_index, provider)| {
+            provider.models.iter().find_map(|m| {
+                let prefix = m.alias.strip_suffix('*')?;
+                if !prefix.starts_with("claude-") || prefix.contains('*') {
+                    return None;
+                }
+                let rest = inbound_model.strip_prefix(prefix)?;
+                if rest.is_empty() || rest.contains('*') {
+                    return None;
+                }
+                Some(RouteDecision {
+                    provider: provider.name.clone(),
+                    provider_index,
+                    protocol: provider.protocol,
+                    // 原始字节直转:上游模型名即入站原值
+                    upstream_model: inbound_model.to_string(),
+                })
+            })
+        })
+}
+
+fn validate_official_base_url(provider_name: &str, urls: &[String]) -> Result<(), RouteError> {
+    let invalid =
+        |reason: &str| RouteError::InvalidOfficialBaseUrl(provider_name.to_string(), reason.into());
+    if urls.len() != 1 {
+        return Err(invalid("必须且只能配置单个 base_url"));
+    }
+    let raw = &urls[0];
+    if raw.contains('@') || raw.contains('?') || raw.contains('#') {
+        return Err(invalid("不得包含 userinfo(@)、query(?) 或 fragment(#)"));
+    }
+    let uri: http::Uri = raw.parse().map_err(|_| invalid("URL 解析失败"))?;
+    if !uri
+        .scheme_str()
+        .is_some_and(|s| s.eq_ignore_ascii_case("https"))
+    {
+        return Err(invalid("scheme 必须为 https"));
+    }
+    let Some(authority) = uri.authority() else {
+        return Err(invalid("缺少 host"));
+    };
+    let auth_str = authority.as_str();
+    if !(auth_str.eq_ignore_ascii_case("api.anthropic.com")
+        || auth_str.eq_ignore_ascii_case("api.anthropic.com:443"))
+    {
+        return Err(invalid("仅允许 https://api.anthropic.com(端口为空或 443)"));
+    }
+    if uri.query().is_some() {
+        return Err(invalid("不得包含 query"));
+    }
+    if !matches!(uri.path(), "" | "/") {
+        return Err(invalid("path 必须为空或 /"));
+    }
+    Ok(())
+}
+
+/// 启动与重载配置校验:alias 全局唯一、base_url、key、官方透传红线与通配约束
 pub fn validate_providers(providers: &[ProviderConfig]) -> Result<(), RouteError> {
     let mut aliases: std::collections::HashSet<&str> = std::collections::HashSet::new();
 
@@ -199,9 +296,67 @@ pub fn validate_providers(providers: &[ProviderConfig]) -> Result<(), RouteError
         if provider.base_urls().is_empty() {
             return Err(RouteError::EmptyBaseUrl(provider.name.clone()));
         }
-        for model in &provider.models {
-            if !aliases.insert(model.alias.as_str()) {
-                return Err(RouteError::AliasConflict(model.alias.clone()));
+        if provider.protocol == Protocol::AnthropicOfficial {
+            if !provider.key.is_empty() {
+                return Err(RouteError::OfficialNonEmptyKey(provider.name.clone()));
+            }
+            validate_official_base_url(&provider.name, provider.base_urls())?;
+            if provider.metadata.is_some() {
+                return Err(RouteError::OfficialMetadataNotAllowed(
+                    provider.name.clone(),
+                ));
+            }
+            let mut wildcard_count = 0usize;
+            for model in &provider.models {
+                if !aliases.insert(model.alias.as_str()) {
+                    return Err(RouteError::AliasConflict(model.alias.clone()));
+                }
+                if model.alias != model.name {
+                    return Err(RouteError::OfficialAliasMismatch(
+                        provider.name.clone(),
+                        model.alias.clone(),
+                        model.name.clone(),
+                    ));
+                }
+                if model.alias.contains('*') {
+                    let Some(prefix) = model.alias.strip_suffix('*') else {
+                        return Err(RouteError::InvalidWildcardModel(
+                            provider.name.clone(),
+                            format!("{} 仅允许末尾单个 *", model.alias),
+                        ));
+                    };
+                    if !prefix.starts_with("claude-") || prefix.contains('*') {
+                        return Err(RouteError::InvalidWildcardModel(
+                            provider.name.clone(),
+                            format!("{} 必须为 claude-* 单星前缀", model.alias),
+                        ));
+                    }
+                    wildcard_count += 1;
+                    if wildcard_count > 1 {
+                        return Err(RouteError::InvalidWildcardModel(
+                            provider.name.clone(),
+                            "每个官方 provider 最多允许一条通配条目".into(),
+                        ));
+                    }
+                }
+            }
+        } else {
+            if provider.key.trim().is_empty() {
+                return Err(RouteError::EmptyKey(provider.name.clone()));
+            }
+            for model in &provider.models {
+                if !aliases.insert(model.alias.as_str()) {
+                    return Err(RouteError::AliasConflict(model.alias.clone()));
+                }
+                if model.alias.contains('*') || model.name.contains('*') {
+                    return Err(RouteError::InvalidWildcardModel(
+                        provider.name.clone(),
+                        format!(
+                            "仅 anthropic_official 允许通配条目(alias={}, name={})",
+                            model.alias, model.name
+                        ),
+                    ));
+                }
             }
         }
     }
@@ -524,5 +679,251 @@ models:
 "#;
         let providers: Vec<ProviderConfig> = yaml_serde::from_str(yaml).unwrap();
         validate_providers(&providers).unwrap();
+    }
+
+    fn official_provider(
+        base_urls: Vec<&str>,
+        key: &str,
+        models: &[(&str, &str)],
+    ) -> ProviderConfig {
+        ProviderConfig::new(
+            "anthropic-official".into(),
+            Protocol::AnthropicOfficial,
+            base_urls.into_iter().map(String::from).collect(),
+            key.into(),
+            Some("direct".into()),
+            false,
+            models
+                .iter()
+                .map(|(n, a)| ModelConfig {
+                    name: (*n).into(),
+                    alias: (*a).into(),
+                    ..Default::default()
+                })
+                .collect(),
+        )
+    }
+
+    #[test]
+    fn test_official_protocol_serde_and_key_default() {
+        let yaml = r#"
+- name: anthropic-official
+  protocol: anthropic_official
+  base_url: "https://api.anthropic.com"
+  models:
+    - name: claude-opus-5-5
+      alias: claude-opus-5-5
+    - name: "claude-*"
+      alias: "claude-*"
+"#;
+        let providers: Vec<ProviderConfig> = yaml_serde::from_str(yaml).unwrap();
+        assert_eq!(providers[0].protocol, Protocol::AnthropicOfficial);
+        assert!(providers[0].key.is_empty());
+        validate_providers(&providers).unwrap();
+    }
+
+    #[test]
+    fn test_official_validation_rules() {
+        // 允许变体:无末尾斜杠、带 /、大小写 host、显式 :443
+        for ok_url in [
+            "https://api.anthropic.com",
+            "https://api.anthropic.com/",
+            "https://API.ANTHROPIC.COM",
+            "https://api.anthropic.com:443",
+            "https://api.anthropic.com:443/",
+        ] {
+            let p = official_provider(vec![ok_url], "", &[("claude-opus-5-5", "claude-opus-5-5")]);
+            validate_providers(&[p]).unwrap_or_else(|e| panic!("应通过 {ok_url}: {e}"));
+        }
+
+        // 拒绝各类非法 base_url
+        for bad_url in [
+            "https://api.anthropic.com@evil.example",
+            "https://api.anthropic.com:8443",
+            "https://api.anthropic.com/v1",
+            "http://api.anthropic.com",
+            "https://api.anthropic.com?x=1",
+            "https://api.anthropic.com#x",
+            "https://api.anthropic.com//",
+            "https://evil.anthropic.com",
+        ] {
+            let p = official_provider(vec![bad_url], "", &[("claude-opus-5-5", "claude-opus-5-5")]);
+            assert!(
+                matches!(
+                    validate_providers(&[p]),
+                    Err(RouteError::InvalidOfficialBaseUrl(..))
+                ),
+                "应拒绝 {bad_url}"
+            );
+        }
+
+        // 多 URL 拒绝
+        let multi = official_provider(
+            vec!["https://api.anthropic.com", "https://api.anthropic.com"],
+            "",
+            &[("claude-opus-5-5", "claude-opus-5-5")],
+        );
+        assert!(matches!(
+            validate_providers(&[multi]),
+            Err(RouteError::InvalidOfficialBaseUrl(..))
+        ));
+
+        // 官方非空 key(含空白)拒绝
+        for bad_key in ["sk-ant-1", " "] {
+            let p = official_provider(
+                vec!["https://api.anthropic.com"],
+                bad_key,
+                &[("claude-opus-5-5", "claude-opus-5-5")],
+            );
+            assert!(matches!(
+                validate_providers(&[p]),
+                Err(RouteError::OfficialNonEmptyKey(_))
+            ));
+        }
+
+        // 官方 metadata 拒绝
+        let with_meta = official_provider(
+            vec!["https://api.anthropic.com"],
+            "",
+            &[("claude-opus-5-5", "claude-opus-5-5")],
+        )
+        .with_metadata([("k".into(), "v".into())].into_iter().collect());
+        assert!(matches!(
+            validate_providers(&[with_meta]),
+            Err(RouteError::OfficialMetadataNotAllowed(_))
+        ));
+
+        // 官方 alias != name 拒绝
+        let mismatch = official_provider(
+            vec!["https://api.anthropic.com"],
+            "",
+            &[("claude-opus-5-5", "my-opus")],
+        );
+        assert!(matches!(
+            validate_providers(&[mismatch]),
+            Err(RouteError::OfficialAliasMismatch(..))
+        ));
+    }
+
+    #[test]
+    fn test_non_official_empty_key_and_wildcard_rejected() {
+        for bad_key in ["", "   "] {
+            let p = ProviderConfig::new(
+                "relay".into(),
+                Protocol::Claude,
+                vec!["https://example.com".into()],
+                bad_key.into(),
+                Some("direct".into()),
+                false,
+                vec![ModelConfig {
+                    name: "claude-opus-5-5".into(),
+                    alias: "claude-opus-5-5".into(),
+                    ..Default::default()
+                }],
+            );
+            assert!(matches!(
+                validate_providers(&[p]),
+                Err(RouteError::EmptyKey(_))
+            ));
+        }
+
+        let relay_wc = ProviderConfig::new(
+            "relay".into(),
+            Protocol::Claude,
+            vec!["https://example.com".into()],
+            "sk-relay".into(),
+            Some("direct".into()),
+            false,
+            vec![ModelConfig {
+                name: "claude-*".into(),
+                alias: "claude-*".into(),
+                ..Default::default()
+            }],
+        );
+        assert!(matches!(
+            validate_providers(&[relay_wc]),
+            Err(RouteError::InvalidWildcardModel(..))
+        ));
+    }
+
+    #[test]
+    fn test_official_wildcard_validation_and_routing() {
+        // 合法通配 + 精确条目
+        let ok = official_provider(
+            vec!["https://api.anthropic.com"],
+            "",
+            &[
+                ("claude-opus-5-5", "claude-opus-5-5"),
+                ("claude-*", "claude-*"),
+            ],
+        );
+        validate_providers(std::slice::from_ref(&ok)).unwrap();
+
+        // 两个通配条目被拒
+        let two = official_provider(
+            vec!["https://api.anthropic.com"],
+            "",
+            &[("claude-opus-*", "claude-opus-*"), ("claude-*", "claude-*")],
+        );
+        assert!(matches!(
+            validate_providers(&[two]),
+            Err(RouteError::InvalidWildcardModel(..))
+        ));
+
+        // 非法通配模式被拒
+        for bad in ["claude-*-*", "claude-**", "*", "gpt-*", "claude-*x"] {
+            let p = official_provider(vec!["https://api.anthropic.com"], "", &[(bad, bad)]);
+            assert!(
+                matches!(
+                    validate_providers(&[p]),
+                    Err(RouteError::InvalidWildcardModel(..))
+                ),
+                "应拒绝非法通配 {bad}"
+            );
+        }
+
+        // 路由:精确优先、快照通配、边界拒绝
+        let relay = ProviderConfig::new(
+            "relay".into(),
+            Protocol::Claude,
+            vec!["https://relay.example".into()],
+            "sk-relay".into(),
+            Some("direct".into()),
+            false,
+            vec![ModelConfig {
+                name: "claude-exact-relay".into(),
+                alias: "claude-exact-relay".into(),
+                ..Default::default()
+            }],
+        );
+        let providers = vec![ok, relay];
+
+        let snap = resolve_route("claude-haiku-4-5-20251001", &providers).unwrap();
+        assert_eq!(snap.protocol, Protocol::AnthropicOfficial);
+        assert_eq!(snap.upstream_model, "claude-haiku-4-5-20251001");
+
+        let exact_other = resolve_route("claude-exact-relay", &providers).unwrap();
+        assert_eq!(exact_other.protocol, Protocol::Claude);
+        assert_eq!(exact_other.provider, "relay");
+
+        let future_snap = resolve_route("claude-sonnet-9-9-20300101", &providers).unwrap();
+        assert_eq!(future_snap.protocol, Protocol::AnthropicOfficial);
+        assert_eq!(future_snap.upstream_model, "claude-sonnet-9-9-20300101");
+
+        for miss in [
+            "gpt-x",
+            "claude-*",
+            "claude-",
+            "claude-**",
+            "claude-foo*bar",
+        ] {
+            assert!(
+                matches!(
+                    resolve_route(miss, &providers),
+                    Err(RouteError::ModelNotFound(_))
+                ),
+                "应未命中 {miss}"
+            );
+        }
     }
 }

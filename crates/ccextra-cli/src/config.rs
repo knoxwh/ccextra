@@ -27,9 +27,6 @@ pub struct Config {
     /// Codex 凭证目录(可选);默认配置文件旁 `.cache/codex`
     #[serde(default)]
     pub codex_auth_dir: Option<String>,
-    /// Claude 订阅凭证目录(可选);默认配置文件旁 `.cache/claude`
-    #[serde(default)]
-    pub claude_auth_dir: Option<String>,
     /// Antigravity 连接池配置(可选);默认短连接
     #[serde(default)]
     pub antigravity: Option<AntigravityConfig>,
@@ -83,6 +80,11 @@ impl Config {
             && !secret.is_empty()
             && !looks_like_bcrypt(secret)
         {
+            if secret.starts_with("sk-ant-") {
+                anyhow::bail!(
+                    "secret_key 不得以 sk-ant- 开头(该前缀保留给 Anthropic 凭证,会被认证层直接拒绝)"
+                );
+            }
             let hashed = bcrypt::hash(secret, bcrypt::DEFAULT_COST)?;
             config.secret_key = Some(hashed.clone());
             persist_secret(path, &content, &hashed)?;
@@ -559,6 +561,76 @@ logging:
         assert!(
             msg.contains("无效 payload 模型模式"),
             "unexpected error: {msg}"
+        );
+    }
+
+    #[test]
+    fn test_official_standalone_minimal_config_loads_and_requires_normalize_and_logging() {
+        let yaml = r#"
+server:
+  host: "127.0.0.1"
+  port: 8223
+  proxy_url: "direct"
+normalize:
+  enabled: false
+  drift_detector: false
+logging:
+  level: info
+  request_body: false
+providers:
+  - name: anthropic-official
+    protocol: anthropic_official
+    base_url: https://api.anthropic.com
+    models:
+      - name: claude-opus-5-5
+        alias: claude-opus-5-5
+      - name: "claude-*"
+        alias: "claude-*"
+"#;
+        let mut file = NamedTempFile::new().unwrap();
+        file.write_all(yaml.as_bytes()).unwrap();
+        let cfg = Config::load(file.path().to_str().unwrap()).unwrap();
+        assert!(cfg.secret_key.is_none());
+        assert_eq!(cfg.providers.len(), 1);
+        assert!(cfg.providers[0].key.is_empty());
+        ccextra_core::route::validate_providers(&cfg.providers).unwrap();
+
+        // 缺少 normalize 仍解析失败
+        let no_normalize = r#"
+server:
+  host: "127.0.0.1"
+  port: 8223
+logging:
+  level: info
+  request_body: false
+providers: []
+"#;
+        let mut f2 = NamedTempFile::new().unwrap();
+        f2.write_all(no_normalize.as_bytes()).unwrap();
+        assert!(Config::load(f2.path().to_str().unwrap()).is_err());
+    }
+
+    #[test]
+    fn test_secret_key_rejects_sk_ant_prefix_plaintext() {
+        let yaml = r#"
+server:
+  host: "127.0.0.1"
+  port: 8222
+secret_key: "sk-ant-oat01-forbidden"
+providers: []
+normalize:
+  enabled: false
+  drift_detector: false
+logging:
+  level: info
+  request_body: false
+"#;
+        let mut file = NamedTempFile::new().unwrap();
+        file.write_all(yaml.as_bytes()).unwrap();
+        let err = Config::load(file.path().to_str().unwrap()).unwrap_err();
+        assert!(
+            err.to_string().contains("sk-ant-"),
+            "unexpected error: {err}"
         );
     }
 }

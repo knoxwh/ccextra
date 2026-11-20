@@ -13,8 +13,8 @@ ccextra 将 Anthropic Messages 入口接到不同上游协议，同时尽量保�
 - `ccextra-server`：HTTP、上游请求、SSE、OAuth provider 运行时注入和响应状态机。
   - `http/`：请求处理与路由装配（`handlers/`、`auth`、`retry`、`claude_relay`、`error`、`unfit`、`session_tokens`、`access_log`）。
   - `sse/`：响应流状态机（含 `responses/` 专用子模块：`state_machine`、`function_call`、`thinking`、`compensations`、`web_search`）。
-  - `antigravity/`、`claude/`、`codex/`、`xai/`：四类 OAuth 订阅，各含 `credential`/`store`/`oauth`/`refresh`/`login`/`provider`/`models`；共用的凭证写回、刷新锁与登录辅助在 `oauth_common`。
-  - `claude_tls_fp/`：`protocol: claude` 出站（含 Claude 订阅与静态 API / 中转）的 TLS 指纹客户端（对齐 Claude Code / Bun 基线，仅 HTTP/1.1）。
+  - `antigravity/`、`codex/`、`xai/`：三类 OAuth 订阅，各含 `credential`/`store`/`oauth`/`refresh`/`login`/`provider`/`models`；共用的凭证写回、刷新锁与登录辅助在 `oauth_common`。
+  - `claude_tls_fp/`：`protocol: claude` 出站（静态 API / 中转）的 TLS 指纹客户端（对齐 Claude Code / Bun 基线，仅 HTTP/1.1）。
   - `upstream`：上游 HTTP 客户端（URL 轮转、请求体编码/压缩、协议头）。
 - `ccextra-cli`：命令行、YAML 配置加载、日志初始化和进程启动。用户 `models.json` 在此读取。
 
@@ -25,8 +25,8 @@ ccextra 将 Anthropic Messages 入口接到不同上游协议，同时尽量保�
 | 端点 | 行为 |
 | --- | --- |
 | `POST /v1/messages` | 认证、路由、转换并返回 Anthropic 响应。 |
-| `POST /v1/messages/count_tokens` | Claude 路径转发精确请求；其他路径返回该会话上轮响应记录的输入 token 数，未命中返回 0。Chat/Responses/Gemini/Antigravity 从原始 SSE 提取正数输入用量并写回会话缓存；不记录转换后的占位值，缺字段或零值保留旧值。 |
-| `GET /v1/models` | 汇总 provider alias，返回 Anthropic 模型清单。 |
+| `POST /v1/messages/count_tokens` | Claude 路径转发精确请求；`anthropic_official` 原样透传（见“官方订阅透传”）；其他路径返回该会话上轮响应记录的输入 token 数，未命中返回 0。Chat/Responses/Gemini/Antigravity 从原始 SSE 提取正数输入用量并写回会话缓存；不记录转换后的占位值，缺字段或零值保留旧值。 |
+| `GET /v1/models` | 汇总 provider alias，返回 Anthropic 模型清单；alias 含 `*` 的通配条目不列出。 |
 | `GET /health` | 固定返回 `ok`。 |
 | 保存 `config.yaml` / `models.json` 或 `POST /reload` | 重新读取运行时配置（文件监视与 HTTP 共用发布路径）。 |
 
@@ -44,11 +44,40 @@ ccextra 将 Anthropic Messages 入口接到不同上游协议，同时尽量保�
 8. 选择 URL、代理、认证头和 User-Agent，发送上游请求并处理重试。
 9. 直通或转换流式 SSE；非流响应也恢复为 Anthropic 形状。
 
+配置含 `anthropic_official` provider 时，认证后、读 body 前先做 415 检查，读 body 后用轻量探针取 `model` 并路由；命中官方即原样转发，跳过 3-9 步，见“官方订阅透传”。
+
 ## 路由与配置
 
-`alias` 优先匹配；上游真实模型名是回退匹配，便于 `count_tokens` 等辅助请求。重复 alias（跨 provider 或同 provider 内）在启动或重载校验时失败；provider `name` 可重复，路由结果携带命中 provider 的下标，不按名二次查找。`base_url` 支持列表：messages 路径遇网络错误、429 或 5xx（含 Cloudflare 52x）在同轮内立即切换后续地址，耗尽后快速失败，不做本地退避（退避交客户端，`Retry-After` 透传）；OAuth/token refresh 的 5xx 可重试退避（Claude / Antigravity / Codex / xAI）属于凭证层，不参与 messages URL 轮转。provider 代理优先于全局代理；生效代理必须显式配置（对齐 CPA `proxyutil.Parse` 的报错语义）：仅 `direct`/`none`（忽略大小写与首尾空白）表示直连，`http`/`https`/`socks5h` 原样使用，`socks5` 改写为 `socks5h`（reqwest/wreq 的 `socks5` 在本地解析 DNS），缺失、空值或其他值均为配置错误，启动失败、`/reload` 失败并保留旧快照；任何路径都不读取环境变量或系统代理。Antigravity/xAI/Codex/Claude 动态 provider 沿用 `server.proxy_url`：任一凭证目录有启用凭证时，启动与 `/reload` 在加载凭证前先校验全局代理，避免 token 刷新失败被逐个告警跳过。OAuth 登录/刷新命令同样使用配置的代理，配置读取失败或代理缺失时明确报错。
+`alias` 优先匹配；上游真实模型名是回退匹配，便于 `count_tokens` 等辅助请求。重复 alias（跨 provider 或同 provider 内）在启动或重载校验时失败；provider `name` 可重复，路由结果携带命中 provider 的下标，不按名二次查找。`base_url` 支持列表：messages 路径遇网络错误、429 或 5xx（含 Cloudflare 52x）在同轮内立即切换后续地址，耗尽后快速失败，不做本地退避（退避交客户端，`Retry-After` 透传）；OAuth/token refresh 的 5xx 可重试退避（Antigravity / Codex / xAI）属于凭证层，不参与 messages URL 轮转。provider 代理优先于全局代理；生效代理必须显式配置（对齐 CPA `proxyutil.Parse` 的报错语义）：仅 `direct`/`none`（忽略大小写与首尾空白）表示直连，`http`/`https`/`socks5h` 原样使用，`socks5` 改写为 `socks5h`（reqwest/wreq 的 `socks5` 在本地解析 DNS），缺失、空值或其他值均为配置错误，启动失败、`/reload` 失败并保留旧快照；任何路径都不读取环境变量或系统代理。Antigravity/xAI/Codex 动态 provider 沿用 `server.proxy_url`：任一凭证目录有启用凭证时，启动与 `/reload` 在加载凭证前先校验全局代理，避免 token 刷新失败被逐个告警跳过。OAuth 登录/刷新命令同样使用配置的代理，配置读取失败或代理缺失时明确报错。
 
 配置重载替换 providers、payload、normalize、认证、全局 HTTP client、User-Agent 和 reasoning 注册表。`logging.level` 在启动时创建 `EnvFilter`，因此不能热改。
+
+非 `anthropic_official` provider 的 `key` 必填且不能为空白；model 的 alias / name 含 `*` 的通配条目只允许出现在 `anthropic_official` provider 中，规则见下节。
+
+## 官方订阅透传（`anthropic_official`）
+
+`Protocol::AnthropicOfficial` 让 Claude Code 用自己的订阅登录经 ccextra 访问 Anthropic，转发逻辑集中在 `http/official.rs`。ccextra 不保存、不刷新任何订阅凭证，只把客户端 `Authorization` 原样转给 `api.anthropic.com`。建议放在独立实例（如 `127.0.0.1:8223`，不设 `secret_key`、不设 `payload`）里单独使用；Claude Code 端只设 `ANTHROPIC_BASE_URL`，不设 `ANTHROPIC_AUTH_TOKEN` / `ANTHROPIC_API_KEY` / `apiKeyHelper`。
+
+**早期分发与入口顺序**（`handle_messages` 与 `handle_count_tokens` 相同）：
+
+1. `check_secret`：设了 `secret_key` 时执行；取到的 key 以 `sk-ant-` 开头直接 401，不查不写认证缓存、不跑 bcrypt。未设 `secret_key` 时不校验。
+2. `official_enabled`：快照中存在 `anthropic_official` provider 才执行第 3 步 415、第 5 步探针与第 6 步的官方分支；第 4 步 `read_inbound_body` 始终执行。无官方 provider 时与原有路径完全相同。
+3. 415：读 body 前检查入站 `Content-Encoding`，任一值不是 UTF-8，或按 `,` 拆分去空白后有非 `identity`（忽略大小写）项，返回 415 `invalid_request_error`。该检查作用于实例内全部请求（含发往其他 provider 的）。
+4. `read_inbound_body`（32 MiB 上限）。
+5. 探针：手写 `serde::de::Visitor` 只取顶层 `model` 与 `stream`（重复键后者覆盖，其余键 `IgnoredAny` 跳过，不建整棵 `Value` 树）；`model` 须为字符串，`stream` 缺失、`null` 或非布尔视为 `false`，与 `serde_json::from_slice::<Value>` 的取值一致。
+6. `resolve_route` 命中 `AnthropicOfficial` 才转入 `official::relay_messages` / `official::relay_count_tokens`；探针失败或路由未命中官方时，带已读 body 回落原有路径，由原有解析给出错误（count_tokens 的非 JSON body 维持原有 500）。messages 写访问日志（`protocol=AnthropicOfficial`），count_tokens 不接访问日志、只用 tracing 记状态、`request-id` 与耗时。
+
+**路由与校验**：精确阶段（先 alias、再 name）跳过通配条目；全部未命中后才对 `anthropic_official` provider 尝试通配：去掉末尾 `*` 得到前缀，入站名去掉前缀后须非空且不含 `*`，上游模型名即入站原值。`validate_providers`（启动与 `/reload`）要求官方 provider：`key` 为空；`base_url` 只有一个，原串不含 `@`/`?`/`#`，scheme 为 https，authority 为 `api.anthropic.com`（可带 `:443`，忽略大小写），path 为空或 `/`；不设 `metadata`；每个模型 `alias == name`（因此从不改写 `model`）；通配条目每个 provider 至多一条，须以 `claude-` 开头且只有末尾一个 `*`。其他协议配置通配条目、或 `key` 为空/全空白，均校验失败。`/v1/models` 跳过 alias 含 `*` 的条目。
+
+**请求转发**：URL 为 `base_url` 去掉末尾 `/` 后拼入站路径（`/v1/messages` 或 `/v1/messages/count_tokens`）与原 query；body 为入站原始字节，不做 normalize、dateline、drift、payload 覆盖、effort 钳制或 `force_effort`、unfit、`tool_choice` 降级、system 清洗或 `model` 改写。请求头剔除静态 hop-by-hop 表（`connection`、`keep-alive`、`proxy-connection`、`proxy-authenticate`、`proxy-authorization`、`te`、`trailer`、`transfer-encoding`、`upgrade`、`http2-settings`，请求与响应共用）、入站 `Connection` 声明的头、`host`、`content-length`、`x-api-key`、`x-ccextra-key`、`accept-encoding`；其余原样（含 `Authorization`、`anthropic-*`、User-Agent、`Accept`、`Content-Type`），缺 `Content-Type` 时补 `application/json`，不追加 beta、不补 UA、不调用 `scrub_outbound_request_headers*`。剔除后没有非空白 `Authorization` 时本地返回 401 `authentication_error`，不发上游。`Accept-Encoding` 由 reqwest 自行协商并解压；入站无 `Accept` 时由 reqwest 默认补 `*/*`。
+
+**响应**：上游状态码原样；响应头剔除同一张 hop-by-hop 表、上游 `Connection` 声明的头与 `set-cookie`，其余（含 `anthropic-ratelimit-unified-*`、`request-id`、`x-should-retry`、`retry-after`）原样；`content-length` / `content-encoding` 不主动剔除（reqwest 解压时自行移除，未知编码保留）。body 以 `Body::from_stream` 原样回传：不经 `to_anthropic_error`、10s `: keepalive`、Claude relay 或 180s 空闲超时；上游中途断流直接结束连接，不补 `timeout_error` / `message_stop`。
+
+**错误映射**：连接、DNS、TLS、代理或客户端构建失败返回 502 `api_error`；等响应头超过上限返回 408 `timeout_error`（messages 按 `header_wait`：流式 `SEND_TIMEOUT` 60s、非流 600s；count_tokens 用 `SEND_TIMEOUT` 60s）。
+
+**独立 client 池**：`UpstreamClient::official_client_for` 按代理键缓存，与 `clients`、`fp_clients` 隔离；普通 reqwest + rustls，`redirect(Policy::none())`，建连参数照抄 `client_for`（每 host 空闲 4、池空闲 45s、建连 10s、TCP keepalive 30s、`tcp_nodelay`、HTTP/2 ping 15s / 5s 且空闲时也 ping），没有 `Client::timeout`。代理取 provider `proxy_url`，缺省用全局。
+
+**不重试、不刷新**：不做 `base_url` 轮转（只允许一个 URL）、stale 丢池重发、400/401 重试、首帧重试或凭证刷新，不调用 `drop_pooled_client` / `request_once`（两处对官方变体只有防御分支）。不走 Claude TLS 指纹车道。`logging.request_body` 对官方路径不生效，任何日志都不记 `Authorization`。`count_tokens` 同样遵守以上全部规则。
 
 ## 缓存稳定化
 
@@ -60,7 +89,7 @@ ccextra 将 Anthropic Messages 入口接到不同上游协议，同时尽量保�
 
 ### Claude
 
-`convert_passthrough` 只改 `model`，再做两件事。一是对非 Claude 模型做 system 清洗（对齐 chat/responses/gemini）：顶层 `system` 与 `messages` 内 `role: system` 项剥掉计费归属指纹（逐请求变化，破坏上游缓存前缀；归属行与指令同块时只剥前导行、保留剩余指令，对齐 sub2api）、Claude 身份声明与 `<identity>`/`<rules>`/`# Output Style:` 等 Claude 触发段，保留白名单段与 `cache_control`，清空后移除该块或消息。二是越档 effort 钳制（Claude 模型同样生效）：`thinking.type: disabled`、无显式 effort 或注册表未命中的请求跳过；写回优先顶层 `output_config.effort`，回退 `thinking.output_config.effort`，值不变不写回。条目设置 `force_effort` 时改写为该固定值（不钳制），跳过条件不变。`*claude*` 模型跳过 system 清洗；未登记或 effort 不变时保持逐字节直通。身份头按排除表透传，`anthropic-beta` 默认原样转发；订阅 OAuth（`sk-ant-oat*`）缺 `oauth-2025-04-20` 时补上，已有则不动。
+`convert_passthrough` 只改 `model`，再做两件事。一是对非 Claude 模型做 system 清洗（对齐 chat/responses/gemini）：顶层 `system` 与 `messages` 内 `role: system` 项剥掉计费归属指纹（逐请求变化，破坏上游缓存前缀；归属行与指令同块时只剥前导行、保留剩余指令，对齐 sub2api）、Claude 身份声明与 `<identity>`/`<rules>`/`# Output Style:` 等 Claude 触发段，保留白名单段与 `cache_control`，清空后移除该块或消息。二是越档 effort 钳制（Claude 模型同样生效）：`thinking.type: disabled`、无显式 effort 或注册表未命中的请求跳过；写回优先顶层 `output_config.effort`，回退 `thinking.output_config.effort`，值不变不写回。条目设置 `force_effort` 时改写为该固定值（不钳制），跳过条件不变。`*claude*` 模型跳过 system 清洗；未登记或 effort 不变时保持逐字节直通。身份头按排除表透传，`anthropic-beta` 原样转发。
 
 ### OpenAI Chat
 
@@ -108,7 +137,7 @@ messages 路径不做本地退避重试：429、5xx（含 Cloudflare 52x）与�
 
 Claude 响应字节直通，只在完整事件边界（`\n\n` / `\r\n\r\n`，含跨 chunk 分隔符）放行：EOF 原样冲刷剩余字节，读失败或空闲超时丢弃半截事件再发 `error`，因此心跳与错误帧不会插进半截事件。OpenAI Chat、OpenAI Responses、Gemini 和 Antigravity 分别由状态机转换为 Anthropic SSE。状态机维护 content block、thinking、工具调用、usage（含 `output_tokens_details.reasoning_tokens`）和终态，避免上游事件交错破坏 Anthropic 事件顺序。Chat 状态机在工具块未关闭前缓存交错文本与思考并在 finalize 时按序输出。Responses 上游未输出 `output_text.delta` 时从 `response.completed` 恢复 terminal 文本；0 token 的 `response.incomplete` 会直接抛出错误。Gemini 保持活跃思考块跨空文本片段不中断。
 
-OpenAI 首帧预读跳过 `: keepalive` 心跳帧，只认业务帧（心跳帧会骗过错误检测、提前提交 200 丧失重试窗口）；首帧 error 内部重试一次，仍失败返回 502 Anthropic error，不提交 200。已输出首帧后的错误、未满足终态的 EOF、空 Gemini 风格流、读取错误和上游 180s chunk idle 产生结构化 Anthropic error，而不是裸断开。终态事件（含 `message_stop`）完整下发后立即结束流并关闭上游连接，不等上游 EOF（上游在 keep-alive/HTTP2 复用连接上可能拖延关流）。每条流式路径统一包裹 10 秒空闲心跳 `: keepalive\n\n`。非流 Claude 直通；其他路径转换为 Anthropic JSON，无法转换时保留上游原始 body。
+OpenAI 首帧预读跳过 `: keepalive` 心跳帧，只认业务帧（心跳帧会骗过错误检测、提前提交 200 丧失重试窗口）；首帧 error 内部重试一次，仍失败返回 502 Anthropic error，不提交 200。已输出首帧后的错误、未满足终态的 EOF、空 Gemini 风格流、读取错误和上游 180s chunk idle 产生结构化 Anthropic error，而不是裸断开。终态事件（含 `message_stop`）完整下发后立即结束流并关闭上游连接，不等上游 EOF（上游在 keep-alive/HTTP2 复用连接上可能拖延关流）。每条流式路径统一包裹 10 秒空闲心跳 `: keepalive\n\n`（`anthropic_official` 除外，其响应字节原样回传）。非流 Claude 直通；其他路径转换为 Anthropic JSON，无法转换时保留上游原始 body。
 
 ## 会话、缓存与 reasoning
 
@@ -130,9 +159,9 @@ Antigravity（gemini/flash/agent，不含 claude）使用**独立的** thoughtSi
 
 ## OAuth provider
 
-Antigravity、xAI、Codex、Claude 登录命令均在凭证保存成功后调用共享的自动重载逻辑，按当前配置的监听地址发送 `POST /reload`；通配 IPv4/IPv6 地址转回环地址，不走代理、不跟随重定向，连接超时 2 秒、总超时 30 秒。仅 2xx 报告重载成功；配置读取、连接或 HTTP 错误只提示，不改变登录成功结果。服务未启动时下次启动加载；`--auth-dir` 不修改服务配置，需与服务扫描目录一致。
+Antigravity、xAI、Codex 登录命令均在凭证保存成功后调用共享的自动重载逻辑，按当前配置的监听地址发送 `POST /reload`；通配 IPv4/IPv6 地址转回环地址，不走代理、不跟随重定向，连接超时 2 秒、总超时 30 秒。仅 2xx 报告重载成功；配置读取、连接或 HTTP 错误只提示，不改变登录成功结果。服务未启动时下次启动加载；`--auth-dir` 不修改服务配置，需与服务扫描目录一致。
 
-`antigravity-login` 使用浏览器回调登录并保存凭证。运行时后台读取有效凭证、提前 300 秒刷新 token（对齐 CPA 5 分钟安全窗口）、拉取模型并注入 provider；首次加载不阻塞监听。AG 未配置凭证（目录缺失/无凭证/全禁用或全空 token）属正常空结果，其它动态 provider 照常发布并就绪；有凭证但刷新、project 发现或模型拉取全部失败（含所有 provider 模型列表为空）时保留现有路由，未就绪前按 30s 起翻倍退避重试（封顶 5 分钟），就绪后每 3 小时刷新。四家 OAuth 的后台刷新与请求刷新共用按 refresh_token 的单飞锁（double-check 重读落盘凭证），轮换型 refresh token 不会被双消费；坏凭证文件跳过并告警。token 刷新仅 HTTP 5xx 与连接建立失败可重试，失败日志带完整错误链。上游统一锁定单 daily 节点（`daily-cloudcode-pa.googleapis.com`），禁止跨集群回退以防破坏上游前缀缓存。
+`antigravity-login` 使用浏览器回调登录并保存凭证。运行时后台读取有效凭证、提前 300 秒刷新 token（对齐 CPA 5 分钟安全窗口）、拉取模型并注入 provider；首次加载不阻塞监听。AG 未配置凭证（目录缺失/无凭证/全禁用或全空 token）属正常空结果，其它动态 provider 照常发布并就绪；有凭证但刷新、project 发现或模型拉取全部失败（含所有 provider 模型列表为空）时保留现有路由，未就绪前按 30s 起翻倍退避重试（封顶 5 分钟），就绪后每 3 小时刷新。三家 OAuth 的后台刷新与请求刷新共用按 refresh_token 的单飞锁（double-check 重读落盘凭证），轮换型 refresh token 不会被双消费；坏凭证文件跳过并告警。token 刷新仅 HTTP 5xx 与连接建立失败可重试，失败日志带完整错误链。上游统一锁定单 daily 节点（`daily-cloudcode-pa.googleapis.com`），禁止跨集群回退以防破坏上游前缀缓存。
 
 Antigravity 上游默认短连接：空闲连接在响应结束后立即关闭，防止凭证轮换下 socket 堆积与陈旧连接错误。`antigravity.connection-pool` 显式启用连接池（`idle-conn-timeout` 默认 30s、上限 210s，不超过 Google Frontend 240s keep-alive 截止；`max-idle-conns-per-host` 默认 2、上限 100），其余协议共享全局客户端不受影响。出站优先协商 HTTP/2（谈不上再走 HTTP/1.1）。Gemini 与 Antigravity 均不发送 `x-vscode-sessionid`（现 CPA / 官方路径已无此硬编码头）；其它自定义非标头同样清洗，保持同构规避 Google WAF。
 
@@ -142,8 +171,7 @@ Antigravity 上游默认短连接：空闲连接在响应结束后立即关闭�
 
 `codex-login` 使用 PKCE 浏览器授权（本地回调端口默认 1455）。凭证保存 `chatgpt_account_id` 与 `chatgpt_plan_type`（取自 ID token 的 `https://api.openai.com/auth` claim）。启动和配置重载扫描 Codex 凭证，token 提前 24 小时刷新（失败重试 3 次，`refresh_token_reused` 不重试），并为每份有效凭证注入一个 Responses provider，上游为 `https://chatgpt.com/backend-api/codex/responses`。请求时自动携带 `Chatgpt-Account-Id` 订阅身份头与 `X-Codex-Routing-Hint: model=<解析后模型>[;tier=<service_tier>]`（对齐 codex CLI `build_routing_hint_header`，hint 在压缩前从最终 body 构造，入站同名头可覆盖），并对请求体做 zstd 压缩（level 3，对齐 codex CLI `enable_request_compression` 默认行为；压缩在序列化后执行一次，退避重试共享压缩字节）；静态 API key provider 无该 metadata 不发头也不压缩。`codex_auth_dir` 相对配置文件目录解析。
 
-`claude-login` 使用 PKCE 浏览器授权（本地回调端口默认 54545，RedirectURI 固定 `http://localhost:54545/callback`）。凭证保存 access/refresh、email、account/org UUID 与单个 device id。启动和配置重载扫描 `claude_auth_dir`（默认配置文件旁 `.cache/claude`），token 提前 4 小时刷新（仅 HTTP 5xx 可重试，传输/解码错误不盲重放 refresh），并为每份有效凭证注入一个 `protocol: claude` provider（`base_url: https://api.anthropic.com`，key=access_token）。出站走现有 Claude 直通与缓存归一化；OAuth token 缺 `oauth-2025-04-20` 时补 beta（多个 `anthropic-beta` 头先按顺序合并为一个列表再追加，对齐 CPA）。不做 cloaking / 假 user_id / 改 UA。OAuth 订阅（Claude / Antigravity / Codex / xAI）预请求刷新失败时硬失败，拒绝继续打旧 token；上游 401 时强制刷新被拒 access_token 后重试一次，刷新仍失败则返回 `authentication_error`。四类 OAuth 凭证的运行时刷新与回写都使用启动/重载扫描到的凭证文件实际路径（文件名不要求是 `<provider>-<email>.json`，email/账号 id 为空也可用；对齐 CPA `FileTokenStore` 的 path 属性），登录新建凭证仍按规范文件名保存。四类凭证写回均为原子写（目录 0700、文件 0600），持进程内路径锁与跨进程 `<文件>.lock` 文件锁（Antigravity 亦同）；运行时刷新按 refresh_token 串行，refresh_token 轮换后旧锁在下次取锁时清理。
-
+OAuth 订阅（Antigravity / Codex / xAI）预请求刷新失败时硬失败，拒绝继续打旧 token；上游 401 时强制刷新被拒 access_token 后重试一次，刷新仍失败则返回 `authentication_error`。三类 OAuth 凭证的运行时刷新与回写都使用启动/重载扫描到的凭证文件实际路径（文件名不要求是 `<provider>-<email>.json`，email/账号 id 为空也可用；对齐 CPA `FileTokenStore` 的 path 属性），登录新建凭证仍按规范文件名保存。三类凭证写回均为原子写（目录 0700、文件 0600），持进程内路径锁与跨进程 `<文件>.lock` 文件锁（Antigravity 亦同）；运行时刷新按 refresh_token 串行，refresh_token 轮换后旧锁在下次取锁时清理。
 
 ## 并发、安全与诊断
 
@@ -151,11 +179,11 @@ providers、payload、运行时配置及后台刷新参数保存在统一不可�
 
 并发 `/reload` 按取得专用互斥锁的顺序串行执行完整加载、校验和发布；不按网络完成顺序覆盖。只有成功发布推进版本并在响应里置 `published=true`，加载或校验失败保留整个旧快照及版本（`published=false`）。加载期间不持有配置写锁，请求读取和后台刷新不被配置 IO 阻塞。成功 reload 仍清空认证缓存，并沿用每次重建 UpstreamClient 的行为；本批不加入客户端复用优化，避免沿用旧代理或旧 Antigravity 连接策略。`logging.level` 仍仅启动生效。
 
-后台每轮从当前快照复制版本、静态 providers、Antigravity/xAI/Codex/Claude 凭证目录和全局代理，再无锁执行凭证及模型读取。静态配置和刷新参数只在启动或成功 reload 时更新；后台不再重读未发布的磁盘配置。最终集合先校验，再在同一写锁内比较版本并发布；版本变化则丢弃旧轮次。集合未变化时不替换快照、不推进版本。后台只更新 providers，保留同版本的 payload、runtime 和刷新输入。
+后台每轮从当前快照复制版本、静态 providers、Antigravity/xAI/Codex 凭证目录和全局代理，再无锁执行凭证及模型读取。静态配置和刷新参数只在启动或成功 reload 时更新；后台不再重读未发布的磁盘配置。最终集合先校验，再在同一写锁内比较版本并发布；版本变化则丢弃旧轮次。集合未变化时不替换快照、不推进版本。后台只更新 providers，保留同版本的 payload、runtime 和刷新输入。
 
 后台 Antigravity 返回空集合时，沿用整个 provider 集合保旧策略，本轮 xAI 结果也不发布。显式 reload 优先应用新配置：移除的静态 provider、切换目录或禁用凭证不从旧快照补回；动态加载器沿用既有跳过不可用凭证的语义，可能返回部分或空集合。该集合通过校验后随 reload 整体发布。之后的后台只扫描新目录，旧轮次不能恢复被移除的 provider。凭证刷新等磁盘副作用不属于配置快照事务。
 
-`secret_key` 明文会写回 bcrypt；验证结果缓存以 (bcrypt hash, key) 为键，换 secret 后旧结果不可命中，最多 1024 项，满时淘汰最久未访问条目（不再整体清空），重载时清空。`logging.request_body` 将最终出站请求的诊断数据写入**配置文件旁的 `logs/`**（启动与 `/reload` 时 pin，不跟进程 cwd）；敏感入站头会脱敏。`/v1/messages` 每请求输出一行 INFO 访问日志（`http/access_log.rs`：model、provider、protocol、upstream_model、stream、status、首字节与总耗时；流式 2xx 在 body 流结束或客户端断开时记总耗时），只取路由元数据，不含 header、body 与 key。归一化只在能够安全处理时改变 body，避免优化本身阻断请求；转换失败由 HTTP 层返回 Anthropic error。
+`secret_key` 明文会写回 bcrypt，明文以 `sk-ant-` 开头时 `Config::load` 拒绝；认证时 key 以 `sk-ant-` 开头直接 401，不查不写验证缓存；验证结果缓存以 (bcrypt hash, key) 为键，换 secret 后旧结果不可命中，最多 1024 项，满时淘汰最久未访问条目（不再整体清空），重载时清空。`logging.request_body` 将最终出站请求的诊断数据写入**配置文件旁的 `logs/`**（启动与 `/reload` 时 pin，不跟进程 cwd）；敏感入站头会脱敏。`/v1/messages` 每请求输出一行 INFO 访问日志（`http/access_log.rs`：model、provider、protocol、upstream_model、stream、status、首字节与总耗时；流式 2xx 在 body 流结束或客户端断开时记总耗时），只取路由元数据，不含 header、body 与 key。归一化只在能够安全处理时改变 body，避免优化本身阻断请求；转换失败由 HTTP 层返回 Anthropic error。
 
 ## 有意保留（相对对照实现）
 

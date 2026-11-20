@@ -29,6 +29,21 @@ impl AccessFields {
             stream: prepared.is_stream,
         }
     }
+
+    pub(crate) fn for_official(
+        model: impl Into<Arc<str>>,
+        provider: impl Into<String>,
+        upstream_model: impl Into<String>,
+        stream: bool,
+    ) -> Self {
+        Self {
+            model: model.into(),
+            provider: provider.into(),
+            protocol: Protocol::AnthropicOfficial,
+            upstream_model: upstream_model.into(),
+            stream,
+        }
+    }
 }
 
 /// 单行内容;`fields` 为 None 表示路由前即失败(认证、读 body、解析等)。

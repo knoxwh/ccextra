@@ -26,10 +26,10 @@ pub(crate) const SEND_TIMEOUT: Duration = Duration::from_secs(60);
 pub(crate) const SEND_TIMEOUT: Duration = Duration::from_secs(3);
 /// 非流式 send() 上限:上游生成完才回响应头,60s 会截断长生成并触发 URL 回退重发。
 /// 600s 对齐 sub2api `gateway.response_header_timeout` 默认与 Anthropic SDK 10 分钟。
-const NON_STREAM_SEND_TIMEOUT: Duration = Duration::from_secs(600);
+pub(crate) const NON_STREAM_SEND_TIMEOUT: Duration = Duration::from_secs(600);
 
 /// 按是否流式选等响应头上限(见 [`SEND_TIMEOUT`] / [`NON_STREAM_SEND_TIMEOUT`])
-fn header_wait(is_stream: bool) -> Duration {
+pub(crate) fn header_wait(is_stream: bool) -> Duration {
     if is_stream {
         SEND_TIMEOUT
     } else {
@@ -191,6 +191,10 @@ pub(crate) async fn encode_request_body(
 fn endpoint_path(protocol: Protocol, is_stream: bool) -> String {
     match protocol {
         Protocol::Claude => "/v1/messages".to_string(),
+        Protocol::AnthropicOfficial => {
+            tracing::error!("AnthropicOfficial 不应进入通用 endpoint_path");
+            "/v1/messages".to_string()
+        }
         Protocol::OpenAiChat => "/chat/completions".to_string(),
         Protocol::OpenAiResponses => "/responses".to_string(),
         Protocol::Gemini => {
@@ -301,6 +305,11 @@ fn user_agent(
     user_agents: &crate::http::UserAgentSet,
     inbound_user_agent: Option<&str>,
 ) -> String {
+    if matches!(protocol, Protocol::AnthropicOfficial) {
+        debug_assert!(false, "AnthropicOfficial 不应调用 user_agent");
+        tracing::error!("AnthropicOfficial 不应调用 user_agent");
+        return String::new();
+    }
     if matches!(protocol, Protocol::Claude) {
         if let Some(value) = inbound_user_agent.filter(|value| !value.is_empty()) {
             return value.to_string();
@@ -491,6 +500,8 @@ pub struct UpstreamClient {
     clients: std::sync::Arc<Mutex<HashMap<ClientCacheKey, Client>>>,
     /// Claude protocol 指纹车道(wreq/BoringSSL),与 rustls 池隔离
     fp_clients: std::sync::Arc<Mutex<HashMap<FpClientCacheKey, wreq::Client>>>,
+    /// 官方 Anthropic 透传独立池(reqwest + rustls,禁重定向,与 clients/fp_clients 隔离)
+    official_clients: std::sync::Arc<Mutex<HashMap<String, Client>>>,
     /// Antigravity 连接池设置(短连接默认,对齐 CPA antigravity.executor)
     ant_pool: AntigravityPoolSettings,
     /// `antigravity.gohttp` 打开时的 sidecar;拉起失败 / 已崩溃则请求时重拉一次,仍失败原样报出(不回退)
@@ -512,6 +523,7 @@ impl UpstreamClient {
             global_proxy,
             clients: std::sync::Arc::new(Mutex::new(HashMap::new())),
             fp_clients: std::sync::Arc::new(Mutex::new(HashMap::new())),
+            official_clients: std::sync::Arc::new(Mutex::new(HashMap::new())),
             ant_pool: AntigravityPoolSettings::resolve(ant_cfg),
             gohttp: ant_cfg.filter(|c| c.gohttp).map(|c| {
                 std::sync::Arc::new(crate::gohttp::Lane::new(c.gohttp_socket_dir.as_deref()))
@@ -651,6 +663,56 @@ impl UpstreamClient {
         Ok(client)
     }
 
+    /// 官方 Anthropic 透传独立 client(普通 reqwest + rustls,禁重定向,不碰 clients/fp_clients)。
+    /// 保活与建连参数复制自本文件 `client_for`(L586-603),防长思考期间死连接挂死。
+    pub(crate) fn official_client_for(&self, proxy_key: &str) -> anyhow::Result<Client> {
+        let mut clients = self
+            .official_clients
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
+        if let Some(c) = clients.get(proxy_key) {
+            return Ok(c.clone());
+        }
+        let mut builder = Client::builder()
+            .pool_max_idle_per_host(4)
+            .pool_idle_timeout(POOL_IDLE_TIMEOUT)
+            .connect_timeout(CONNECT_TIMEOUT)
+            .tcp_keepalive(TCP_KEEPALIVE)
+            .tcp_nodelay(true)
+            .http2_keep_alive_interval(std::time::Duration::from_secs(15))
+            .http2_keep_alive_timeout(std::time::Duration::from_secs(5))
+            .http2_keep_alive_while_idle(true)
+            .redirect(reqwest::redirect::Policy::none());
+        if proxy_key == "direct" {
+            builder = builder.no_proxy();
+        } else {
+            let proxy = reqwest::Proxy::all(proxy_key)
+                .map_err(|e| anyhow::anyhow!("解析官方上游代理失败: {e}"))?;
+            builder = builder.proxy(proxy);
+        }
+        let client = builder
+            .build()
+            .map_err(|e| anyhow::anyhow!("构建官方上游 HTTP client 失败: {e}"))?;
+        clients.insert(proxy_key.to_string(), client.clone());
+        Ok(client)
+    }
+
+    #[cfg(test)]
+    pub(crate) fn fp_client_count(&self) -> usize {
+        self.fp_clients
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner())
+            .len()
+    }
+
+    #[cfg(test)]
+    pub(crate) fn official_client_count(&self) -> usize {
+        self.official_clients
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner())
+            .len()
+    }
+
     /// Claude 指纹车道 POST JSON;stale 时丢缓存 Client 再建一次。
     /// count_tokens 等不走通用 `request()` 的 Claude 出口复用同款语义。
     pub(crate) async fn send_fp_json_with_stale_retry(
@@ -702,6 +764,11 @@ impl UpstreamClient {
         api_key: &str,
         pool_refresh_token: Option<&str>,
     ) {
+        // 官方路径不走 stale 重试与通用连接池丢弃(见 H3/G2)
+        if matches!(protocol, Protocol::AnthropicOfficial) {
+            tracing::error!("AnthropicOfficial 不应调用 drop_pooled_client");
+            return;
+        }
         // 代理无效时请求本身已失败,无缓存 Client 可丢
         let Ok(proxy_key) = self.resolve_proxy(provider_proxy) else {
             return;
@@ -883,6 +950,10 @@ impl UpstreamClient {
     ) -> anyhow::Result<UpstreamResponse> {
         #[cfg(test)]
         self.attempts.lock().unwrap().push(base_url.to_owned());
+        if matches!(protocol, Protocol::AnthropicOfficial) {
+            tracing::error!("AnthropicOfficial 不应进入通用 request_once");
+            anyhow::bail!("内部错误: AnthropicOfficial 不应进入通用 request_once");
+        }
         let proxy_key = self.resolve_proxy(provider_proxy)?;
         // gohttp 开关只切 Antigravity 数据面;已解析代理(http/https/socks5h)随请求交给 sidecar
         let gohttp = match (&self.gohttp, protocol) {
