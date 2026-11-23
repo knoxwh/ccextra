@@ -228,32 +228,9 @@ pub async fn poll_for_token(client: &Client, device: &DeviceCodeResponse) -> Res
 }
 
 /// 刷新结果错误分类:仅明确 HTTP 5xx 可重试;其余(含传输/解码/discovery)不盲重放
-#[derive(Debug)]
-pub struct RefreshError {
-    pub status: Option<u16>,
-    pub message: String,
-    pub retryable: bool,
-}
+pub use crate::oauth_common::{RefreshError, refresh_status_retryable};
 
-impl std::fmt::Display for RefreshError {
-    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        match self.status {
-            Some(s) => write!(
-                f,
-                "xai token refresh failed with status {s}: {}",
-                self.message
-            ),
-            None => write!(f, "xai token refresh failed: {}", self.message),
-        }
-    }
-}
-
-impl std::error::Error for RefreshError {}
-
-/// 仅明确 HTTP 5xx 可重试(对齐 Claude oauth::RefreshError)
-pub fn refresh_status_retryable(status: u16) -> bool {
-    status >= 500
-}
+const REFRESH_LABEL: &str = "xai";
 
 /// 刷新 token;失败不自动重试——由 refresh.rs 按 retryable 决定
 pub async fn refresh_token(
@@ -263,21 +240,19 @@ pub async fn refresh_token(
 ) -> Result<TokenData, RefreshError> {
     let refresh = refresh.trim();
     if refresh.is_empty() {
-        return Err(RefreshError {
-            status: None,
-            message: "missing refresh token".into(),
-            retryable: false,
-        });
+        return Err(RefreshError::non_retryable(
+            REFRESH_LABEL,
+            "missing refresh token",
+        ));
     }
     let endpoint = if token_endpoint.trim().is_empty() {
         match discover(client).await {
             Ok(disco) => disco.token_endpoint,
             Err(e) => {
-                return Err(RefreshError {
-                    status: None,
-                    message: format!("discovery failed: {e}"),
-                    retryable: false,
-                });
+                return Err(RefreshError::non_retryable(
+                    REFRESH_LABEL,
+                    format!("discovery failed: {e}"),
+                ));
             }
         }
     } else {
@@ -298,50 +273,41 @@ pub async fn refresh_token(
     {
         Ok(r) => r,
         Err(e) => {
-            return Err(RefreshError {
-                status: None,
-                message: format!("request failed: {e}"),
-                retryable: false,
-            });
+            return Err(RefreshError::non_retryable(
+                REFRESH_LABEL,
+                format!("request failed: {e}"),
+            ));
         }
     };
 
     let status = resp.status();
     if !status.is_success() {
         let body = crate::limits::read_error_text(resp).await;
-        let code = status.as_u16();
-        return Err(RefreshError {
-            status: Some(code),
-            message: body,
-            retryable: refresh_status_retryable(code),
-        });
+        return Err(RefreshError::http(REFRESH_LABEL, status.as_u16(), body));
     }
     let bytes = match crate::limits::read_success_body(resp).await {
         Ok(b) => b,
         Err(e) => {
-            return Err(RefreshError {
-                status: None,
-                message: format!("read response: {e}"),
-                retryable: false,
-            });
+            return Err(RefreshError::non_retryable(
+                REFRESH_LABEL,
+                format!("read response: {e}"),
+            ));
         }
     };
     let data: TokenData = match serde_json::from_slice(&bytes) {
         Ok(d) => d,
         Err(e) => {
-            return Err(RefreshError {
-                status: None,
-                message: format!("parse response: {e}"),
-                retryable: false,
-            });
+            return Err(RefreshError::non_retryable(
+                REFRESH_LABEL,
+                format!("parse response: {e}"),
+            ));
         }
     };
     if data.access_token.trim().is_empty() {
-        return Err(RefreshError {
-            status: None,
-            message: "empty access token in response".into(),
-            retryable: false,
-        });
+        return Err(RefreshError::non_retryable(
+            REFRESH_LABEL,
+            "empty access token in response",
+        ));
     }
     Ok(data)
 }

@@ -3,7 +3,7 @@
 use super::constants::{REFRESH_MAX_RETRIES, REFRESH_SKEW_SECS};
 use super::credential::XAICredential;
 use super::{oauth, store};
-use crate::oauth_common::lock_for_refresh_token;
+use crate::oauth_common::{lock_for_refresh_token, refresh_lock_key, run_blocking};
 use anyhow::{Result, anyhow};
 use std::path::Path;
 
@@ -61,14 +61,10 @@ pub async fn refresh_if_needed(
             }
         }
     }
-    Err(anyhow!(
-        "{}",
-        last_err.unwrap_or_else(|| oauth::RefreshError {
-            status: None,
-            message: "xai token refresh failed".into(),
-            retryable: false,
-        })
-    ))
+    Err(match last_err {
+        Some(e) => anyhow!("{e}"),
+        None => anyhow!("xai token refresh failed"),
+    })
 }
 
 fn usable(cred: &XAICredential, rejected_token: Option<&str>) -> bool {
@@ -84,22 +80,25 @@ pub async fn ensure_credential_fresh(
     proxy_url: Option<&str>,
     rejected_token: Option<&str>,
 ) -> Result<XAICredential> {
-    if let Ok(cred) = store::load(path)
-        && usable(&cred, rejected_token)
-    {
-        return Ok(cred);
+    let owned_path = path.to_path_buf();
+    let prelim = run_blocking({
+        let p = owned_path.clone();
+        move || store::load(&p)
+    })
+    .await?;
+    if usable(&prelim, rejected_token) {
+        return Ok(prelim);
     }
 
-    let prelim = store::load(path)?;
-    let lock_key = if prelim.refresh_token.trim().is_empty() {
-        format!("path:{}", path.display())
-    } else {
-        prelim.refresh_token.clone()
-    };
+    let lock_key = refresh_lock_key(path, &prelim.refresh_token);
     let lock = lock_for_refresh_token(&lock_key).await;
-    let _guard = lock.lock().await;
+    let guard = lock.lock_owned().await;
 
-    let mut cred = store::load(path)?;
+    let mut cred = run_blocking({
+        let p = owned_path.clone();
+        move || store::load(&p)
+    })
+    .await?;
     if usable(&cred, rejected_token) {
         return Ok(cred);
     }
@@ -109,7 +108,13 @@ pub async fn ensure_credential_fresh(
     }
 
     if refresh_if_needed(&mut cred, proxy_url, REFRESH_SKEW_SECS).await? {
-        store::save_to(path, &cred)?;
+        let to_save = cred.clone();
+        run_blocking(move || {
+            let res = store::save_to(&owned_path, &to_save);
+            drop(guard);
+            res
+        })
+        .await?;
     }
 
     Ok(cred)

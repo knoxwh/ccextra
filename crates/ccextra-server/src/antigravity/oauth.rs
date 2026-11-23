@@ -119,32 +119,9 @@ async fn fetch_user_email_at(
 }
 
 /// 刷新结果错误分类:HTTP 5xx 与连接建立失败可重试;其余(请求已发出后的读/解码失败等)不盲重放
-#[derive(Debug)]
-pub struct RefreshError {
-    pub status: Option<u16>,
-    pub message: String,
-    pub retryable: bool,
-}
+pub use crate::oauth_common::{RefreshError, refresh_status_retryable};
 
-impl std::fmt::Display for RefreshError {
-    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        match self.status {
-            Some(s) => write!(
-                f,
-                "antigravity token refresh failed with status {s}: {}",
-                self.message
-            ),
-            None => write!(f, "antigravity token refresh failed: {}", self.message),
-        }
-    }
-}
-
-impl std::error::Error for RefreshError {}
-
-/// 仅明确 HTTP 5xx 可重试(对齐 Claude oauth::RefreshError)
-pub fn refresh_status_retryable(status: u16) -> bool {
-    status >= 500
-}
+const REFRESH_LABEL: &str = "antigravity";
 
 /// 传输错误是否可重试:仅连接建立失败——请求未发出,refresh token 不可能被消费;
 /// 发出后的读/超时失败上游可能已消费 refresh,仍不重放
@@ -169,11 +146,10 @@ fn error_chain(e: &dyn std::error::Error) -> String {
 pub async fn refresh_token(client: &Client, refresh: &str) -> Result<TokenResponse, RefreshError> {
     let refresh = refresh.trim();
     if refresh.is_empty() {
-        return Err(RefreshError {
-            status: None,
-            message: "missing refresh token".into(),
-            retryable: false,
-        });
+        return Err(RefreshError::non_retryable(
+            REFRESH_LABEL,
+            "missing refresh token",
+        ));
     }
     // 不设手动 Host 头:reqwest 0.13(hyper 1.x)下会与 :authority 并存,
     // Google 前端以 HTTP/2 PROTOCOL_ERROR RST 该流;端点本身即 oauth2.googleapis.com
@@ -193,49 +169,41 @@ pub async fn refresh_token(client: &Client, refresh: &str) -> Result<TokenRespon
         Ok(r) => r,
         // 传输错误:仅连接建立失败可重放(见 transport_error_retryable)
         Err(e) => {
-            return Err(RefreshError {
-                status: None,
-                message: format!("request failed: {}", error_chain(&e)),
-                retryable: transport_error_retryable(&e),
-            });
+            return Err(RefreshError::transport(
+                REFRESH_LABEL,
+                format!("request failed: {}", error_chain(&e)),
+                transport_error_retryable(&e),
+            ));
         }
     };
     let status = resp.status();
     if !status.is_success() {
         let text = crate::limits::read_error_text(resp).await;
-        let code = status.as_u16();
-        return Err(RefreshError {
-            status: Some(code),
-            message: text,
-            retryable: refresh_status_retryable(code),
-        });
+        return Err(RefreshError::http(REFRESH_LABEL, status.as_u16(), text));
     }
     let bytes = match crate::limits::read_success_body(resp).await {
         Ok(b) => b,
         Err(e) => {
-            return Err(RefreshError {
-                status: None,
-                message: format!("read response: {e}"),
-                retryable: false,
-            });
+            return Err(RefreshError::non_retryable(
+                REFRESH_LABEL,
+                format!("read response: {e}"),
+            ));
         }
     };
     let token: TokenResponse = match serde_json::from_slice(&bytes) {
         Ok(t) => t,
         Err(e) => {
-            return Err(RefreshError {
-                status: None,
-                message: format!("parse response: {e}"),
-                retryable: false,
-            });
+            return Err(RefreshError::non_retryable(
+                REFRESH_LABEL,
+                format!("parse response: {e}"),
+            ));
         }
     };
     if token.access_token.trim().is_empty() {
-        return Err(RefreshError {
-            status: None,
-            message: "empty access token".into(),
-            retryable: false,
-        });
+        return Err(RefreshError::non_retryable(
+            REFRESH_LABEL,
+            "empty access token",
+        ));
     }
     Ok(token)
 }

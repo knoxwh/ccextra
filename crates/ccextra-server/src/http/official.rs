@@ -211,6 +211,15 @@ pub(crate) fn count_tokens_header_wait() -> Duration {
     crate::upstream::SEND_TIMEOUT
 }
 
+pub(crate) struct OfficialRelayParams<'a> {
+    pub path: &'a str,
+    pub inbound_headers: &'a HeaderMap,
+    pub query: Option<&'a str>,
+    pub body_bytes: Bytes,
+    pub wait: Duration,
+    pub log_timing: bool,
+}
+
 pub(crate) async fn relay_messages(
     snapshot: &ConfigSnapshot,
     route: &RouteDecision,
@@ -222,12 +231,14 @@ pub(crate) async fn relay_messages(
     relay_official_with_timeout(
         snapshot,
         route,
-        "/v1/messages",
-        inbound_headers,
-        query,
-        body_bytes,
-        messages_header_wait(is_stream),
-        false,
+        OfficialRelayParams {
+            path: "/v1/messages",
+            inbound_headers,
+            query,
+            body_bytes,
+            wait: messages_header_wait(is_stream),
+            log_timing: false,
+        },
     )
     .await
 }
@@ -242,27 +253,31 @@ pub(crate) async fn relay_count_tokens(
     relay_official_with_timeout(
         snapshot,
         route,
-        "/v1/messages/count_tokens",
-        inbound_headers,
-        query,
-        body_bytes,
-        count_tokens_header_wait(),
-        true,
+        OfficialRelayParams {
+            path: "/v1/messages/count_tokens",
+            inbound_headers,
+            query,
+            body_bytes,
+            wait: count_tokens_header_wait(),
+            log_timing: true,
+        },
     )
     .await
 }
 
-#[expect(clippy::too_many_arguments)]
 pub(crate) async fn relay_official_with_timeout(
     snapshot: &ConfigSnapshot,
     route: &RouteDecision,
-    path: &str,
-    inbound_headers: &HeaderMap,
-    query: Option<&str>,
-    body_bytes: Bytes,
-    wait: Duration,
-    log_timing: bool,
+    params: OfficialRelayParams<'_>,
 ) -> Result<Response, AppError> {
+    let OfficialRelayParams {
+        path,
+        inbound_headers,
+        query,
+        body_bytes,
+        wait,
+        log_timing,
+    } = params;
     let outbound_headers = official_request_headers(inbound_headers);
     if !has_valid_authorization(&outbound_headers) {
         return Err(AppError::unauthorized(

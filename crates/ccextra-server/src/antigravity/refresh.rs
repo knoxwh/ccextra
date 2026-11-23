@@ -1,7 +1,7 @@
 use super::constants::{REFRESH_MAX_RETRIES, REFRESH_SKEW_SECS};
 use super::credential::AntigravityCredential;
 use super::{oauth, project, store};
-use crate::oauth_common::lock_for_refresh_token;
+use crate::oauth_common::{lock_for_refresh_token, refresh_lock_key, run_blocking};
 use anyhow::{Result, anyhow};
 use std::path::Path;
 
@@ -54,14 +54,10 @@ pub async fn refresh_if_needed(
             }
         }
     }
-    Err(anyhow!(
-        "{}",
-        last_err.unwrap_or_else(|| oauth::RefreshError {
-            status: None,
-            message: "antigravity token refresh failed".into(),
-            retryable: false,
-        })
-    ))
+    Err(match last_err {
+        Some(e) => anyhow!("{e}"),
+        None => anyhow!("antigravity token refresh failed"),
+    })
 }
 
 fn usable(cred: &AntigravityCredential, rejected_token: Option<&str>) -> bool {
@@ -123,22 +119,27 @@ pub async fn ensure_credential_fresh_with_ua(
     rejected_token: Option<&str>,
     request_ua: Option<&str>,
 ) -> Result<AntigravityCredential> {
-    let prelim = store::load(path)?;
+    let owned_path = path.to_path_buf();
+    let prelim = run_blocking({
+        let p = owned_path.clone();
+        move || store::load(&p)
+    })
+    .await?;
     let needs_refresh = !usable(&prelim, rejected_token);
     let needs_project = prelim.project_id.trim().is_empty();
     if !needs_refresh && !needs_project {
         return Ok(prelim);
     }
 
-    let lock_key = if prelim.refresh_token.trim().is_empty() {
-        format!("path:{}", path.display())
-    } else {
-        prelim.refresh_token.clone()
-    };
+    let lock_key = refresh_lock_key(path, &prelim.refresh_token);
     let lock = lock_for_refresh_token(&lock_key).await;
-    let _guard = lock.lock().await;
+    let guard = lock.lock_owned().await;
 
-    let mut cred = store::load(path)?;
+    let mut cred = run_blocking({
+        let p = owned_path.clone();
+        move || store::load(&p)
+    })
+    .await?;
     let mut dirty = false;
 
     if rejected_token == Some(cred.access_token.as_str()) {
@@ -157,7 +158,13 @@ pub async fn ensure_credential_fresh_with_ua(
     }
 
     if dirty {
-        store::save_to(path, &cred)?;
+        let to_save = cred.clone();
+        run_blocking(move || {
+            let res = store::save_to(&owned_path, &to_save);
+            drop(guard);
+            res
+        })
+        .await?;
     }
 
     Ok(cred)

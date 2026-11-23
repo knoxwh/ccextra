@@ -1088,12 +1088,14 @@ async fn test_24_local_error_mapping_502_408_and_wait_helpers() {
     let err = relay_official_with_timeout(
         &snapshot,
         &route,
-        "/v1/messages",
-        &headers,
-        None,
-        Bytes::from_static(br#"{"model":"claude-opus-5-5","messages":[]}"#),
-        Duration::from_millis(100),
-        false,
+        OfficialRelayParams {
+            path: "/v1/messages",
+            inbound_headers: &headers,
+            query: None,
+            body_bytes: Bytes::from_static(br#"{"model":"claude-opus-5-5","messages":[]}"#),
+            wait: Duration::from_millis(100),
+            log_timing: false,
+        },
     )
     .await
     .unwrap_err();

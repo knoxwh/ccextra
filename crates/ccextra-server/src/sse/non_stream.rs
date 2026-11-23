@@ -246,11 +246,13 @@ pub fn responses_to_anthropic(
         content,
         &stop_reason,
         stop_seq,
-        input_tokens,
-        output_tokens,
-        cached,
-        cache_write,
-        thinking_tokens,
+        MessageUsage {
+            input_tokens,
+            output_tokens,
+            cached,
+            cache_write,
+            thinking_tokens,
+        },
     ))
 }
 
@@ -399,11 +401,13 @@ pub fn openai_chat_to_anthropic(body: &Value) -> Option<Value> {
         content,
         stop_reason,
         None,
-        input_tokens,
-        output_tokens,
-        cached,
-        cache_write,
-        -1, // chat 路径无 thinking_tokens
+        MessageUsage {
+            input_tokens,
+            output_tokens,
+            cached,
+            cache_write,
+            thinking_tokens: -1, // chat 路径无 thinking_tokens
+        },
     ))
 }
 
@@ -417,18 +421,21 @@ fn map_nonstream_finish_reason(finish_reason: &str, has_tool_call: bool) -> &'st
     map_finish_reason(finish_reason)
 }
 
-/// 组装 Anthropic messages 非流式响应(基础形状)
-#[expect(clippy::too_many_arguments)]
-fn build_message(
-    source: &Value,
-    content: Vec<Value>,
-    stop_reason: &str,
-    stop_sequence: Option<String>,
+struct MessageUsage {
     input_tokens: i64,
     output_tokens: i64,
     cached: i64,
     cache_write: i64,
     thinking_tokens: i64,
+}
+
+/// 组装 Anthropic messages 非流式响应(基础形状)
+fn build_message(
+    source: &Value,
+    content: Vec<Value>,
+    stop_reason: &str,
+    stop_sequence: Option<String>,
+    usage: MessageUsage,
 ) -> Value {
     let mut out = json!({
         "id": source.get("id").and_then(|v| v.as_str()).unwrap_or(""),
@@ -438,17 +445,17 @@ fn build_message(
         "content": content,
         "stop_reason": stop_reason,
         "stop_sequence": stop_sequence.map_or(Value::Null, Value::String),
-        "usage": {"input_tokens": input_tokens, "output_tokens": output_tokens}
+        "usage": {"input_tokens": usage.input_tokens, "output_tokens": usage.output_tokens}
     });
-    if cached > 0 {
-        out["usage"]["cache_read_input_tokens"] = json!(cached);
+    if usage.cached > 0 {
+        out["usage"]["cache_read_input_tokens"] = json!(usage.cached);
     }
-    if cache_write > 0 {
-        out["usage"]["cache_creation_input_tokens"] = json!(cache_write);
+    if usage.cache_write > 0 {
+        out["usage"]["cache_creation_input_tokens"] = json!(usage.cache_write);
     }
     // 对齐 CPA e365ab0c:thinking_tokens ≥ 0 时写入
-    if thinking_tokens >= 0 {
-        out["usage"]["output_tokens_details"] = json!({"thinking_tokens": thinking_tokens});
+    if usage.thinking_tokens >= 0 {
+        out["usage"]["output_tokens_details"] = json!({"thinking_tokens": usage.thinking_tokens});
     }
     out
 }

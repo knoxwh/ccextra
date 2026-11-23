@@ -13,7 +13,7 @@ ccextra 将 Anthropic Messages 入口接到不同上游协议，同时尽量保�
 - `ccextra-server`：HTTP、上游请求、SSE、OAuth provider 运行时注入和响应状态机。
   - `http/`：请求处理与路由装配（`handlers/`、`auth`、`retry`、`claude_relay`、`official`、`error`、`unfit`、`session_tokens`、`access_log`）。
   - `sse/`：响应流状态机（含 `responses/` 专用子模块：`state_machine`、`function_call`、`thinking`、`compensations`、`web_search`）。
-  - `antigravity/`、`codex/`、`xai/`：三类 OAuth 订阅，各含 `credential`/`store`/`oauth`/`refresh`/`login`/`provider`/`models`；共用的凭证写回、刷新锁与登录辅助在 `oauth_common`。
+  - `antigravity/`、`codex/`、`xai/`：三类 OAuth 订阅，各含 `credential`/`store`/`oauth`/`refresh`/`login`/`provider`/`models`；共用的凭证写回、刷新锁、刷新错误分类、阻塞读写与登录辅助在 `oauth_common`。
   - `claude_tls_fp/`：`protocol: claude` 出站（静态 API / 中转）的 TLS 指纹客户端（对齐 Claude Code / Bun 基线，仅 HTTP/1.1）。
   - `upstream`：上游 HTTP 客户端（URL 轮转、请求体编码/压缩、协议头）。
 - `ccextra-cli`：命令行、YAML 配置加载、日志初始化和进程启动。用户 `models.json` 在此读取。

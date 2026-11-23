@@ -352,17 +352,8 @@ pub(crate) struct PreparedMessageRequest {
     pub tool_names: Option<Arc<HashMap<String, String>>>,
     /// 转换前 Claude 请求 tools 快照(仅 Gemini/AG;响应用来回剥占位 tool args)
     pub original_claude_request: Option<Arc<Value>>,
-    pub replay_scope: Option<(crate::sse::replay_cache::ReplayCache, String, String)>,
-    /// Antigravity thoughtSignature 账本 scope：(cache, key)，key 见 `ag_replay_session_key`
-    pub ag_replay_scope: Option<(crate::sse::antigravity_replay_cache::AgReplayCache, String)>,
-    /// 本请求读 AG 账本时的快照（对齐 CPA scope.cacheSnapshot，供 IfUnchanged 清理）
-    pub ag_replay_snapshot: crate::sse::antigravity_replay_cache::AgReplaySnapshot,
-    /// Kimi thinking replay：(cache, "{family}:{session}", applied)
-    pub kimi_replay_scope: Option<(
-        crate::sse::kimi_thinking_replay_cache::KimiThinkingReplayCache,
-        String,
-        bool,
-    )>,
+    /// 按协议互斥的响应侧 replay 作用域(Responses / Antigravity / Kimi)
+    pub replay: ReplayScope,
     pub signature_model: Option<Arc<str>>,
     /// 客户端入站 model 别名(body.model 路由前;Responses 回包 message_start 预填)
     pub inbound_model: Arc<str>,
@@ -373,10 +364,72 @@ pub(crate) struct PreparedMessageRequest {
     pub unfit_generation: u64,
 }
 
-pub(crate) struct ExecutedUpstream {
-    pub status: axum::http::StatusCode,
-    pub upstream: Option<UpstreamResponse>,
-    pub preloaded_stream: Option<SseStreamPin>,
+/// 按协议互斥的响应侧 replay 作用域(Responses / Antigravity / Kimi)
+pub(crate) enum ReplayScope {
+    None,
+    Responses {
+        cache: crate::sse::replay_cache::ReplayCache,
+        key: String,
+        fingerprint: String,
+    },
+    Antigravity {
+        cache: crate::sse::antigravity_replay_cache::AgReplayCache,
+        key: String,
+        snapshot: crate::sse::antigravity_replay_cache::AgReplaySnapshot,
+    },
+    Kimi {
+        cache: crate::sse::kimi_thinking_replay_cache::KimiThinkingReplayCache,
+        key: String,
+        applied: bool,
+    },
+}
+
+impl ReplayScope {
+    /// 401 / unfit 重试前失效缓存(AG 账本不清:对齐 CPA,仅 400 无效 signature 清理)
+    fn invalidate_for_retry(&self) {
+        match self {
+            Self::Responses { cache, key, .. } => cache.invalidate(key),
+            Self::Kimi { cache, key, .. } => cache.invalidate(key),
+            Self::None | Self::Antigravity { .. } => {}
+        }
+    }
+
+    fn stream_tap(&self, body_json: &Value) -> ReplayTap {
+        match self {
+            Self::None => ReplayTap::None,
+            Self::Responses {
+                cache,
+                key,
+                fingerprint,
+            } => ReplayTap::Responses(cache.clone(), key.clone(), fingerprint.clone()),
+            Self::Antigravity {
+                cache,
+                key,
+                snapshot,
+            } => {
+                let empty = Value::Object(Default::default());
+                ReplayTap::Antigravity(Box::new(AgStreamReplayExtractor::new(
+                    cache.clone(),
+                    key.clone(),
+                    snapshot.clone(),
+                    body_json.get("request").unwrap_or(&empty),
+                )))
+            }
+            Self::Kimi {
+                cache,
+                key,
+                applied,
+            } => ReplayTap::Kimi(cache.clone(), key.clone(), *applied),
+        }
+    }
+}
+
+pub(crate) enum ExecutedUpstream {
+    Raw(Box<UpstreamResponse>),
+    Preloaded {
+        status: axum::http::StatusCode,
+        stream: SseStreamPin,
+    },
 }
 
 pub(crate) async fn prepare_message_request(
@@ -665,9 +718,7 @@ pub(crate) async fn prepare_message_request(
         mut pool_refresh_token,
         upstream_proxy,
         provider_prompt_cache_key,
-        antigravity_refresh,
-        xai_refresh,
-        codex_refresh,
+        oauth_target,
     ) = {
         let provider = route
             .provider_config(providers)
@@ -680,26 +731,33 @@ pub(crate) async fn prepare_message_request(
         } else {
             None
         };
-        let credential_path = |provider_type: &str| {
-            meta.filter(|m| m.get("provider_type").map(|s| s.as_str()) == Some(provider_type))
-                .and_then(|m| m.get("credential_path").cloned())
-        };
-        let antigravity_refresh = if matches!(route.protocol, Protocol::Antigravity) {
-            meta.and_then(|m| m.get("credential_path")).cloned()
+        let oauth_target = if matches!(route.protocol, Protocol::Antigravity) {
+            meta.and_then(|m| m.get("credential_path"))
+                .cloned()
+                .map(|path| OAuthRefreshTarget::Antigravity { path })
         } else {
-            None
+            match meta
+                .and_then(|m| m.get("provider_type"))
+                .map(|s| s.as_str())
+            {
+                Some("xai") => meta
+                    .and_then(|m| m.get("credential_path"))
+                    .cloned()
+                    .map(|path| OAuthRefreshTarget::Xai { path }),
+                Some("codex") => meta
+                    .and_then(|m| m.get("credential_path"))
+                    .cloned()
+                    .map(|path| OAuthRefreshTarget::Codex { path }),
+                _ => None,
+            }
         };
-        let xai_refresh = credential_path("xai");
-        let codex_refresh = credential_path("codex");
         (
             provider.base_urls().to_vec(),
             provider.key.clone(),
             pool_refresh_token,
             provider.proxy_url.clone(),
             provider.prompt_cache_key,
-            antigravity_refresh,
-            xai_refresh,
-            codex_refresh,
+            oauth_target,
         )
     };
     // 空 base_url 列表会让轮转循环与内部重试越界,提前拒绝
@@ -712,11 +770,7 @@ pub(crate) async fn prepare_message_request(
 
     // OAuth 订阅:运行时 token 校验与自动刷新;失败硬失败,不得继续打旧 token
     let (oauth_refresh, codex_account_id) = ensure_oauth_credentials_fresh(
-        OAuthRefreshPaths {
-            antigravity: antigravity_refresh,
-            xai: xai_refresh,
-            codex: codex_refresh,
-        },
+        oauth_target,
         upstream_proxy.as_deref(),
         &mut upstream_key,
         &mut pool_refresh_token,
@@ -757,7 +811,8 @@ pub(crate) async fn prepare_message_request(
         cc_session.as_deref(),
         route.protocol,
         &body_json,
-    );
+    )
+    .await;
 
     let inbound_user_agent = if matches!(route.protocol, Protocol::Claude) {
         claude_inbound_user_agent(headers)
@@ -792,42 +847,35 @@ pub(crate) async fn prepare_message_request(
         (None, None)
     };
 
-    // Responses 专用；Antigravity 不占用本 scope（形状不兼容）。
-    let replay_scope = if matches!(route.protocol, Protocol::OpenAiResponses) {
-        session_id.map(|s| {
-            (
-                state.replay_cache.clone(),
-                format!("{}:{}", route.upstream_model, s),
-                request_fingerprint.clone(),
-            )
-        })
-    } else {
-        None
-    };
-
-    let ag_replay_scope = if matches!(route.protocol, Protocol::Antigravity)
-        && ccextra_core::antigravity_uses_reasoning_replay(&route.upstream_model)
-    {
-        ag_replay_key
-            .clone()
-            .map(|key| (state.ag_replay_cache.clone(), key))
-    } else {
-        None
-    };
-
-    let kimi_replay_scope = if matches!(route.protocol, Protocol::Claude)
-        && is_kimi_thinking_replay_model(&route.upstream_model)
-    {
-        cc_session.as_deref().map(|s| {
-            let family = kimi_thinking_replay_model_family(&route.upstream_model);
-            (
-                state.kimi_thinking_replay_cache.clone(),
-                format!("{family}:{s}"),
-                kimi_replay_applied,
-            )
-        })
-    } else {
-        None
+    // 按协议互斥构造响应侧 replay 作用域(Responses / Antigravity / Kimi)
+    let replay = match route.protocol {
+        Protocol::OpenAiResponses => {
+            session_id.map_or(ReplayScope::None, |s| ReplayScope::Responses {
+                cache: state.replay_cache.clone(),
+                key: format!("{}:{}", route.upstream_model, s),
+                fingerprint: request_fingerprint.clone(),
+            })
+        }
+        Protocol::Antigravity
+            if ccextra_core::antigravity_uses_reasoning_replay(&route.upstream_model) =>
+        {
+            ag_replay_key.map_or(ReplayScope::None, |key| ReplayScope::Antigravity {
+                cache: state.ag_replay_cache.clone(),
+                key,
+                snapshot: ag_replay_snapshot,
+            })
+        }
+        Protocol::Claude if is_kimi_thinking_replay_model(&route.upstream_model) => {
+            cc_session.as_deref().map_or(ReplayScope::None, |s| {
+                let family = kimi_thinking_replay_model_family(&route.upstream_model);
+                ReplayScope::Kimi {
+                    cache: state.kimi_thinking_replay_cache.clone(),
+                    key: format!("{family}:{s}"),
+                    applied: kimi_replay_applied,
+                }
+            })
+        }
+        _ => ReplayScope::None,
     };
 
     let signature_model: Option<Arc<str>> = matches!(route.protocol, Protocol::Antigravity)
@@ -860,10 +908,7 @@ pub(crate) async fn prepare_message_request(
         estimated_input_tokens,
         tool_names,
         original_claude_request,
-        replay_scope,
-        ag_replay_scope,
-        ag_replay_snapshot,
-        kimi_replay_scope,
+        replay,
         signature_model,
         inbound_model: Arc::from(model.as_str()),
         token_scope: session_id
@@ -873,94 +918,72 @@ pub(crate) async fn prepare_message_request(
     })
 }
 
-/// 动态 OAuth provider 的凭证文件路径(按 provider metadata 提取;非 OAuth 均为 None)
-struct OAuthRefreshPaths {
-    antigravity: Option<String>,
-    xai: Option<String>,
-    codex: Option<String>,
-}
-
 /// OAuth 订阅:运行时 token 校验与自动刷新;失败硬失败,不得继续打旧 token。
 /// 返回 (401 重试用的刷新目标, Codex 订阅账号 id)。
 async fn ensure_oauth_credentials_fresh(
-    paths: OAuthRefreshPaths,
+    target: Option<OAuthRefreshTarget>,
     upstream_proxy: Option<&str>,
     upstream_key: &mut String,
     pool_refresh_token: &mut Option<String>,
     body_json: &mut Value,
 ) -> Result<(Option<OAuthRefreshTarget>, Option<String>), AppError> {
-    let mut oauth_refresh: Option<OAuthRefreshTarget> = None;
+    let Some(target) = target else {
+        return Ok((None, None));
+    };
     let mut codex_account_id: Option<String> = None;
 
-    if let Some(path) = paths.antigravity {
-        match crate::antigravity::ensure_credential_fresh(
-            std::path::Path::new(&path),
-            upstream_proxy,
-            None,
-        )
-        .await
-        {
-            Ok(fresh_cred) => {
-                *upstream_key = fresh_cred.access_token;
-                if !fresh_cred.refresh_token.trim().is_empty() {
-                    *pool_refresh_token = Some(fresh_cred.refresh_token);
-                }
-                // 对齐 CPA projectIDForRequest:缺 project 硬失败;发现结果写回出站 body
-                let pid = fresh_cred.project_id.trim();
-                if pid.is_empty() {
-                    return Err(AppError::bad_request("antigravity auth missing project_id"));
-                }
-                body_json["project"] = serde_json::Value::String(pid.to_string());
-                oauth_refresh = Some(OAuthRefreshTarget::Antigravity { path });
-            }
-            Err(e) => {
-                return Err(AppError::unauthorized(format!(
-                    "Antigravity 凭证刷新失败,拒绝使用旧 token: {e}"
-                )));
-            }
-        }
-    }
-
-    if let Some(path) = paths.xai {
-        match crate::xai::ensure_credential_fresh(std::path::Path::new(&path), upstream_proxy, None)
+    match &target {
+        OAuthRefreshTarget::Antigravity { path } => {
+            let fresh_cred = crate::antigravity::ensure_credential_fresh(
+                std::path::Path::new(path),
+                upstream_proxy,
+                None,
+            )
             .await
-        {
-            Ok(fresh_cred) => {
-                *upstream_key = fresh_cred.access_token;
-                oauth_refresh = Some(OAuthRefreshTarget::Xai { path });
+            .map_err(|e| {
+                AppError::unauthorized(format!("Antigravity 凭证刷新失败,拒绝使用旧 token: {e}"))
+            })?;
+            *upstream_key = fresh_cred.access_token;
+            if !fresh_cred.refresh_token.trim().is_empty() {
+                *pool_refresh_token = Some(fresh_cred.refresh_token);
             }
-            Err(e) => {
-                return Err(AppError::unauthorized(format!(
-                    "xAI 凭证刷新失败,拒绝使用旧 token: {e}"
-                )));
+            // 对齐 CPA projectIDForRequest:缺 project 硬失败;发现结果写回出站 body
+            let pid = fresh_cred.project_id.trim();
+            if pid.is_empty() {
+                return Err(AppError::bad_request("antigravity auth missing project_id"));
+            }
+            body_json["project"] = serde_json::Value::String(pid.to_string());
+        }
+        OAuthRefreshTarget::Xai { path } => {
+            let fresh_cred = crate::xai::ensure_credential_fresh(
+                std::path::Path::new(path),
+                upstream_proxy,
+                None,
+            )
+            .await
+            .map_err(|e| {
+                AppError::unauthorized(format!("xAI 凭证刷新失败,拒绝使用旧 token: {e}"))
+            })?;
+            *upstream_key = fresh_cred.access_token;
+        }
+        OAuthRefreshTarget::Codex { path } => {
+            let fresh_cred = crate::codex::ensure_credential_fresh(
+                std::path::Path::new(path),
+                upstream_proxy,
+                None,
+            )
+            .await
+            .map_err(|e| {
+                AppError::unauthorized(format!("Codex 凭证刷新失败,拒绝使用旧 token: {e}"))
+            })?;
+            *upstream_key = fresh_cred.access_token;
+            if !fresh_cred.account_id.is_empty() {
+                codex_account_id = Some(fresh_cred.account_id);
             }
         }
     }
 
-    if let Some(path) = paths.codex {
-        match crate::codex::ensure_credential_fresh(
-            std::path::Path::new(&path),
-            upstream_proxy,
-            None,
-        )
-        .await
-        {
-            Ok(fresh_cred) => {
-                *upstream_key = fresh_cred.access_token;
-                if !fresh_cred.account_id.is_empty() {
-                    codex_account_id = Some(fresh_cred.account_id);
-                }
-                oauth_refresh = Some(OAuthRefreshTarget::Codex { path });
-            }
-            Err(e) => {
-                return Err(AppError::unauthorized(format!(
-                    "Codex 凭证刷新失败,拒绝使用旧 token: {e}"
-                )));
-            }
-        }
-    }
-
-    Ok((oauth_refresh, codex_account_id))
+    Ok((Some(target), codex_account_id))
 }
 
 /// payload 覆盖之后按目标上游剥离不支持的字段(GPT Codex OAuth / Grok Responses /
@@ -1037,14 +1060,16 @@ fn strip_upstream_unsupported_fields(
 }
 
 /// 诊断落盘:`logging.request_body` 开启时把脱敏入站头与最终出站 body 写入日志目录。
-fn dump_upstream_request(
+async fn dump_upstream_request(
     config_snapshot: &crate::http::ConfigSnapshot,
     headers: &HeaderMap,
     cc_session: Option<&str>,
     protocol: Protocol,
     body_json: &Value,
 ) {
-    let log_request_body = config_snapshot.runtime.logging.request_body;
+    if !config_snapshot.runtime.logging.request_body {
+        return;
+    }
     let sess = cc_session
         .map(|s| s.chars().take(8).collect::<String>())
         .unwrap_or_else(|| "nosess".into());
@@ -1052,31 +1077,31 @@ fn dump_upstream_request(
         .duration_since(std::time::UNIX_EPOCH)
         .map_or(0, |d| d.as_millis() as u64);
     let proto = format!("{protocol:?}").to_lowercase();
-    let request_seq = if log_request_body {
-        UPSTREAM_LOG_SEQUENCE.fetch_add(1, Ordering::Relaxed)
-    } else {
-        0
-    };
+    let request_seq = UPSTREAM_LOG_SEQUENCE.fetch_add(1, Ordering::Relaxed);
     let log_stem = upstream_log_stem(&sess, ts, request_seq, &proto);
-    if log_request_body {
-        let log_dir = config_snapshot
-            .runtime
-            .logging
-            .log_dir
-            .as_deref()
-            .unwrap_or_else(|| std::path::Path::new("logs"));
-        let _ = std::fs::create_dir_all(log_dir);
-        let dump_obj = json!({
-            "inbound_headers": inbound_headers_json(headers),
-            "upstream_body": body_json,
-        });
-        let path = log_dir.join(format!("upstream_request_{log_stem}.json"));
-        let dumped = serde_json::to_vec_pretty(&dump_obj)
+    let log_dir = config_snapshot
+        .runtime
+        .logging
+        .log_dir
+        .clone()
+        .unwrap_or_else(|| std::path::PathBuf::from("logs"));
+    let dump_obj = json!({
+        "inbound_headers": inbound_headers_json(headers),
+        "upstream_body": body_json,
+    });
+    let path = log_dir.join(format!("upstream_request_{log_stem}.json"));
+    let log_path = path.clone();
+    let dumped = tokio::task::spawn_blocking(move || {
+        let _ = std::fs::create_dir_all(&log_dir);
+        serde_json::to_vec_pretty(&dump_obj)
             .ok()
-            .and_then(|bytes| std::fs::write(&path, bytes).ok());
-        if dumped.is_none() {
-            tracing::warn!(path = %path.display(), "上游请求诊断信息落盘失败");
-        }
+            .and_then(|bytes| std::fs::write(&path, bytes).ok())
+    })
+    .await
+    .ok()
+    .flatten();
+    if dumped.is_none() {
+        tracing::warn!(path = %log_path.display(), "上游请求诊断信息落盘失败");
     }
 }
 
@@ -1190,22 +1215,7 @@ pub(crate) async fn execute_upstream_request(
         for (idx, base_url) in prepared.upstream_base_urls.iter().enumerate() {
             let has_next = idx + 1 < prepared.upstream_base_urls.len();
             match upstream_client
-                .request_encoded(
-                    base_url,
-                    &prepared.upstream_key,
-                    prepared.route.protocol,
-                    prepared.upstream_proxy.as_deref(),
-                    prepared.encoded_body.clone(),
-                    &prepared.body_json,
-                    prepared.is_stream,
-                    prepared.session_id.as_deref(),
-                    prepared.thread_id.as_deref(),
-                    &prepared.extra_headers,
-                    user_agents,
-                    prepared.inbound_user_agent.as_deref(),
-                    prepared.pool_refresh_token.as_deref(),
-                    prepared.inbound_query.as_deref(),
-                )
+                .request_encoded(prepared.upstream_request(base_url, user_agents))
                 .await
             {
                 Ok(resp) => {
@@ -1239,306 +1249,272 @@ pub(crate) async fn execute_upstream_request(
     };
     prepared.active_base_url = active_base_url;
     let mut upstream = match outcome {
-        Out::Ok(resp) | Out::Fail(resp) => Some(resp),
+        Out::Ok(resp) | Out::Fail(resp) => resp,
         // 网络错误已轮转完全部 base_url:直接返给客户端,不本地退避重试
         Out::Net(e) => return Err(e.into()),
     };
-    let mut status = upstream.as_ref().expect("上游响应应存在").status;
-    let mut preloaded_stream = None;
 
     if prepared.is_stream
         && matches!(
             prepared.route.protocol,
             Protocol::OpenAiChat | Protocol::OpenAiResponses
         )
-        && status.is_success()
+        && upstream.status.is_success()
     {
         for attempt in 0..=1 {
-            let current = upstream.take().expect("上游响应应存在");
-            status = current.status;
-            let mut out = relay_with_replay_tap(
-                current.body.bytes_stream(),
-                RelayParams {
-                    protocol: prepared.route.protocol,
-                    estimated_input_tokens: prepared.estimated_input_tokens,
-                    tool_names: prepared.tool_names.clone(),
-                    original_claude_request: prepared.original_claude_request.clone(),
-                    replay_tap: match prepared.replay_scope.clone() {
-                        Some((cache, key, fingerprint)) => {
-                            ReplayTap::Responses(cache, key, fingerprint)
-                        }
-                        None => ReplayTap::None,
-                    },
-                    signature_model: prepared.signature_model.clone(),
-                    inbound_model: Some(Arc::clone(&prepared.inbound_model)),
-                    token_scope: prepared.token_scope.clone(),
-                    drift_usage_scope: prepared.drift_usage_scope.clone(),
-                },
-            );
+            let status = upstream.status;
+            let mut out = build_stream_relay(prepared, upstream);
             // 首帧只认业务帧:跳过心跳注释帧,防 keepalive 骗过错误检测提前提交 200
-            let first = next_business_frame(&mut out).await;
-            let bad = match &first {
-                Some(Ok(frame)) => is_initial_sse_error(frame),
-                Some(Err(_)) | None => true,
-            };
-            if bad {
-                if attempt == 0 {
-                    tracing::warn!(
-                        protocol = ?prepared.route.protocol,
-                        retry_attempt = attempt + 1,
-                        "首帧转换失败，重试上游请求"
-                    );
-                    upstream = Some(prepared.send_retry(upstream_client, user_agents).await?);
-                    status = upstream.as_ref().expect("上游响应应存在").status;
-                    if !status.is_success() {
-                        break;
-                    }
-                    continue;
+            match next_business_frame(&mut out).await {
+                Some(Ok(frame)) if !is_initial_sse_error(&frame) => {
+                    return Ok(ExecutedUpstream::Preloaded {
+                        status,
+                        stream: prepend_sse_frame(Ok(frame), out),
+                    });
                 }
-                // 二次仍失败:不提交 200,转 502 HTTP 错误交客户端整回合重试
-                let msg = match &first {
-                    Some(Ok(frame)) => initial_sse_error_message(frame),
-                    Some(Err(e)) => e.to_string(),
-                    None => "上游流在首帧前结束".to_string(),
-                };
-                return Err(AppError::with_status(
-                    axum::http::StatusCode::BAD_GATEWAY,
-                    format!("上游首帧失败: {msg}"),
-                ));
+                bad_first => {
+                    if attempt == 0 {
+                        tracing::warn!(
+                            protocol = ?prepared.route.protocol,
+                            retry_attempt = attempt + 1,
+                            "首帧转换失败，重试上游请求"
+                        );
+                        upstream = prepared.send_retry(upstream_client, user_agents).await?;
+                        if !upstream.status.is_success() {
+                            return Ok(ExecutedUpstream::Raw(Box::new(upstream)));
+                        }
+                        continue;
+                    }
+                    // 二次仍失败:不提交 200,转 502 HTTP 错误交客户端整回合重试
+                    let msg = match &bad_first {
+                        Some(Ok(frame)) => initial_sse_error_message(frame),
+                        Some(Err(e)) => e.to_string(),
+                        None => "上游流在首帧前结束".to_string(),
+                    };
+                    return Err(AppError::with_status(
+                        axum::http::StatusCode::BAD_GATEWAY,
+                        format!("上游首帧失败: {msg}"),
+                    ));
+                }
             }
-            let first = first.expect("bad 为 false 时必有首帧");
-            preloaded_stream = Some(prepend_sse_frame(first, out));
-            break;
         }
     }
 
-    Ok(ExecutedUpstream {
-        status,
-        upstream,
-        preloaded_stream,
-    })
+    Ok(ExecutedUpstream::Raw(Box::new(upstream)))
+}
+
+struct UpstreamErrorState {
+    status: axum::http::StatusCode,
+    bytes: Bytes,
+    truncated: bool,
+    retry_after: Option<std::time::Duration>,
+}
+
+impl UpstreamErrorState {
+    async fn from_response(resp: UpstreamResponse) -> Result<Self, AppError> {
+        let status = resp.status;
+        // Retry-After 透传给客户端(对齐 codex 把 server retry advice 透出给上层):
+        // 429 快速失败后由客户端按上游声明退避,代理不代等
+        let retry_after = parse_retry_after(resp.body.headers());
+        let (bytes, truncated) =
+            crate::limits::read_error_body_or_anthropic(resp.body, status).await?;
+        Ok(Self {
+            status,
+            bytes,
+            truncated,
+            retry_after,
+        })
+    }
+
+    /// 发起一次恢复重试:2xx 直接返回成功响应,非 2xx 原地刷新错误快照供后续门禁检查。
+    async fn retry(
+        &mut self,
+        prepared: &PreparedMessageRequest,
+        upstream_client: &crate::upstream::UpstreamClient,
+        user_agents: &crate::http::UserAgentSet,
+    ) -> Result<Option<UpstreamResponse>, AppError> {
+        let retry = prepared.send_retry(upstream_client, user_agents).await?;
+        if retry.status.is_success() {
+            return Ok(Some(retry));
+        }
+        *self = Self::from_response(retry).await?;
+        Ok(None)
+    }
+
+    fn is_bad_request_body(&self) -> bool {
+        !self.truncated && (self.status.as_u16() == 400 || self.status.as_u16() == 422)
+    }
+}
+
+fn build_sse_response(
+    status: axum::http::StatusCode,
+    stream: SseStreamPin,
+) -> Result<Response, AppError> {
+    Response::builder()
+        .status(status)
+        .header(header::CONTENT_TYPE, "text/event-stream")
+        .header(header::CACHE_CONTROL, "no-cache")
+        .body(Body::from_stream(stream))
+        .map_err(|e| AppError::new(anyhow::anyhow!("构造流式响应失败: {e}")))
+}
+
+/// 上游非 2xx 恢复链路:401 刷新重试 / unfit 自适应降级 / 账本清理 / encrypted reasoning 剥离。
+/// 返回 `Ok(Ok(resp))` 表示重试已拿到 2xx;`Ok(Err(response))` 表示已构好最终 Anthropic 错误响应。
+async fn recover_upstream_error(
+    prepared: &mut PreparedMessageRequest,
+    failed: UpstreamResponse,
+    upstream_client: &crate::upstream::UpstreamClient,
+    user_agents: &crate::http::UserAgentSet,
+) -> Result<Result<UpstreamResponse, Response>, AppError> {
+    let mut err = UpstreamErrorState::from_response(failed).await?;
+
+    // 上游 401:OAuth 凭证强制刷新后重试一次;刷新失败硬失败,不得继续打旧 token
+    if err.status.as_u16() == 401 && prepared.refresh_rejected_token().await? {
+        tracing::info!(
+            protocol = ?prepared.route.protocol,
+            provider = %prepared.route.provider,
+            "上游 401,凭证已刷新,重试一次"
+        );
+        prepared.replay.invalidate_for_retry();
+        if let Some(ok) = err.retry(prepared, upstream_client, user_agents).await? {
+            return Ok(Ok(ok));
+        }
+    }
+
+    // Unfit 探测与自适应降级(对齐 magpie gateway.go:3440-3490)
+    if err.is_bad_request_body() {
+        let err_text = String::from_utf8_lossy(&err.bytes);
+        if let Some(kind) =
+            crate::http::unfit::detect_unfit_from_error(err.status.as_u16(), &err_text)
+        {
+            let registry = crate::http::unfit::global_registry();
+            registry.mark(
+                &prepared.route.provider,
+                &prepared.route.upstream_model,
+                kind,
+                prepared.unfit_generation,
+            );
+            // 原地修复请求并重试
+            if crate::http::unfit::adapt_request_for_unfit(
+                &mut prepared.body_json,
+                &prepared.route.provider,
+                &prepared.route.upstream_model,
+                registry.as_ref(),
+                prepared.route.protocol,
+            ) {
+                tracing::info!(
+                    provider = prepared.route.provider,
+                    model = prepared.route.upstream_model,
+                    kind = ?kind,
+                    "unfit detected, retrying with adapted request"
+                );
+                prepared.reencode_body().await?;
+                prepared.replay.invalidate_for_retry();
+                if let Some(ok) = err.retry(prepared, upstream_client, user_agents).await? {
+                    return Ok(Ok(ok));
+                }
+            }
+        }
+    }
+
+    if !err.truncated
+        && should_clear_ag_replay_on_error(prepared.route.protocol, err.status.as_u16(), &err.bytes)
+    {
+        tracing::warn!(
+            protocol = ?prepared.route.protocol,
+            "antigravity thoughtSignature 无效,清空 replay 账本"
+        );
+        if let ReplayScope::Antigravity {
+            cache,
+            key,
+            snapshot,
+        } = &prepared.replay
+        {
+            // 对齐 CPA DeleteAntigravityReasoningReplayItemsIfUnchanged(scope.cacheSnapshot)
+            cache.invalidate_if_unchanged(key, snapshot);
+        }
+    }
+
+    // Kimi：注入后仍 400/422 → 清账本（对齐 CPA shouldClearKimiThinkingReplayAfterError）
+    if err.is_bad_request_body()
+        && let ReplayScope::Kimi {
+            cache,
+            key,
+            applied: true,
+        } = &prepared.replay
+    {
+        tracing::warn!(
+            protocol = ?prepared.route.protocol,
+            "kimi thinking replay 注入后上游 400/422,清空账本"
+        );
+        cache.invalidate(key);
+    }
+
+    if err.is_bad_request_body()
+        && matches!(prepared.route.protocol, Protocol::OpenAiResponses)
+        && is_thinking_signature_invalid(&err.bytes)
+        && trim_encrypted_reasoning_items(&mut prepared.body_json)
+    {
+        tracing::warn!(
+            protocol = ?prepared.route.protocol,
+            "invalid_encrypted_content,剥离 reasoning 后重试一次"
+        );
+        prepared.reencode_body().await?;
+        if let ReplayScope::Responses { cache, key, .. } = &prepared.replay {
+            cache.invalidate(key);
+        }
+        if let Some(ok) = err.retry(prepared, upstream_client, user_agents).await? {
+            return Ok(Ok(ok));
+        }
+    }
+
+    // AG 封号:只打告警,不改凭证状态(provider 名含邮箱,不入日志)
+    if !err.truncated
+        && err.status.as_u16() == 403
+        && matches!(prepared.route.protocol, Protocol::Antigravity)
+        && let Some(appeal_url) = antigravity_tos_violation_appeal_url(&err.bytes)
+    {
+        tracing::warn!(
+            appeal_url = %appeal_url,
+            "Antigravity 上游 403 TOS_VIOLATION,账号疑似被封,需申诉后恢复"
+        );
+    }
+
+    Ok(Err(build_upstream_error_response(
+        prepared.route.protocol,
+        err.status,
+        &err.bytes,
+        err.truncated,
+        err.retry_after,
+    )?))
 }
 
 pub(crate) async fn deliver_response(
     state: &AppState,
     prepared: &mut PreparedMessageRequest,
-    mut executed: ExecutedUpstream,
+    executed: ExecutedUpstream,
     upstream_client: &crate::upstream::UpstreamClient,
     user_agents: &crate::http::UserAgentSet,
 ) -> Result<Response, AppError> {
-    let mut status = executed.status;
-
-    // 上游错误:转 anthropic error 形状
-    if !status.is_success() {
-        let failed = executed.upstream.take().expect("上游响应应存在");
-        // Retry-After 透传给客户端(对齐 codex 把 server retry advice 透出给上层):
-        // 429 快速失败后由客户端按上游声明退避,代理不代等
-        let mut retry_after = parse_retry_after(failed.body.headers());
-        let (err_bytes, err_truncated) =
-            crate::limits::read_error_body_or_anthropic(failed.body, status).await?;
-        let mut final_status = status;
-        let mut final_bytes = err_bytes;
-        let mut final_truncated = err_truncated;
-        let mut retried_ok = false;
-
-        // 上游 401:OAuth 凭证强制刷新后重试一次;刷新失败硬失败,不得继续打旧 token
-        if status.as_u16() == 401 {
-            match prepared.refresh_rejected_token().await {
-                Ok(true) => {
-                    tracing::info!(
-                        protocol = ?prepared.route.protocol,
-                        provider = %prepared.route.provider,
-                        "上游 401,凭证已刷新,重试一次"
-                    );
-                    if let Some((cache, key, _)) = prepared.replay_scope.as_ref() {
-                        cache.invalidate(key);
-                    }
-                    // AG 账本不清：对齐 CPA，401 只走凭证刷新重试，
-                    // clearAntigravityReasoningReplayOnInvalidSignature 仅处理 400
-                    if let Some((cache, key, _)) = prepared.kimi_replay_scope.as_ref() {
-                        cache.invalidate(key);
-                    }
-                    let retry = prepared.send_retry(upstream_client, user_agents).await?;
-                    final_status = retry.status;
-                    // 成败均采用重试码:后续 unfit / AG·Kimi 清账本 / encrypted trim
-                    // 必须看到最终上游结果,而非首发 401(401 不触发任何门禁)
-                    status = retry.status;
-                    if retry.status.is_success() {
-                        executed.upstream = Some(retry);
-                        retried_ok = true;
-                    } else {
-                        retry_after = parse_retry_after(retry.body.headers());
-                        let (bytes, truncated) =
-                            crate::limits::read_error_body_or_anthropic(retry.body, final_status)
-                                .await?;
-                        final_bytes = bytes;
-                        final_truncated = truncated;
-                    }
-                }
-                Ok(false) => {}
-                Err(e) => return Err(e),
+    let upstream = match executed {
+        ExecutedUpstream::Preloaded { status, stream } => {
+            return build_sse_response(status, stream);
+        }
+        ExecutedUpstream::Raw(resp) if resp.status.is_success() => *resp,
+        ExecutedUpstream::Raw(failed) => {
+            match recover_upstream_error(prepared, *failed, upstream_client, user_agents).await? {
+                Ok(recovered) => recovered,
+                Err(error_response) => return Ok(error_response),
             }
         }
-
-        // Unfit 探测与自适应降级(对齐 magpie gateway.go:3440-3490)
-        if !final_truncated && (status.as_u16() == 400 || status.as_u16() == 422) {
-            let err_text = String::from_utf8_lossy(&final_bytes);
-            if let Some(kind) =
-                crate::http::unfit::detect_unfit_from_error(status.as_u16(), &err_text)
-            {
-                let registry = crate::http::unfit::global_registry();
-                registry.mark(
-                    &prepared.route.provider,
-                    &prepared.route.upstream_model,
-                    kind,
-                    prepared.unfit_generation,
-                );
-
-                // 原地修复请求并重试
-                if crate::http::unfit::adapt_request_for_unfit(
-                    &mut prepared.body_json,
-                    &prepared.route.provider,
-                    &prepared.route.upstream_model,
-                    registry.as_ref(),
-                    prepared.route.protocol,
-                ) {
-                    tracing::info!(
-                        provider = prepared.route.provider,
-                        model = prepared.route.upstream_model,
-                        kind = ?kind,
-                        "unfit detected, retrying with adapted request"
-                    );
-                    prepared.reencode_body().await?;
-                    if let Some((cache, key, _)) = prepared.replay_scope.as_ref() {
-                        cache.invalidate(key);
-                    }
-                    // AG 账本不清：CPA 无 unfit 自适应重试路径，也无对应清理；重试结果仍由
-                    // 签名无效清理（400 + IfUnchanged）与成功提交（ReplaceIfUnchanged）处理
-                    if let Some((cache, key, _)) = prepared.kimi_replay_scope.as_ref() {
-                        cache.invalidate(key);
-                    }
-                    let retry = prepared.send_retry(upstream_client, user_agents).await?;
-                    final_status = retry.status;
-                    // 后续门禁(AG/Kimi 账本清理、trim)看重试后的状态,与 401 分支一致
-                    status = retry.status;
-                    if retry.status.is_success() {
-                        executed.upstream = Some(retry);
-                        retried_ok = true;
-                    } else {
-                        retry_after = parse_retry_after(retry.body.headers());
-                        let (bytes, truncated) =
-                            crate::limits::read_error_body_or_anthropic(retry.body, final_status)
-                                .await?;
-                        final_bytes = bytes;
-                        final_truncated = truncated;
-                    }
-                }
-            }
-        }
-
-        if !retried_ok
-            && !final_truncated
-            && should_clear_ag_replay_on_error(
-                prepared.route.protocol,
-                status.as_u16(),
-                &final_bytes,
-            )
-        {
-            tracing::warn!(
-                protocol = ?prepared.route.protocol,
-                "antigravity thoughtSignature 无效,清空 replay 账本"
-            );
-            if let Some((cache, key)) = prepared.ag_replay_scope.as_ref() {
-                // 对齐 CPA DeleteAntigravityReasoningReplayItemsIfUnchanged(scope.cacheSnapshot)
-                cache.invalidate_if_unchanged(key, &prepared.ag_replay_snapshot);
-            }
-        }
-
-        // Kimi：注入后仍 400/422 → 清账本（对齐 CPA shouldClearKimiThinkingReplayAfterError）
-        if !retried_ok
-            && !final_truncated
-            && (status.as_u16() == 400 || status.as_u16() == 422)
-            && let Some((cache, key, applied)) = prepared.kimi_replay_scope.as_ref()
-            && *applied
-        {
-            tracing::warn!(
-                protocol = ?prepared.route.protocol,
-                "kimi thinking replay 注入后上游 400/422,清空账本"
-            );
-            cache.invalidate(key);
-        }
-
-        if !retried_ok
-            && !final_truncated
-            && (status.as_u16() == 400 || status.as_u16() == 422)
-            && matches!(prepared.route.protocol, Protocol::OpenAiResponses)
-            && is_thinking_signature_invalid(&final_bytes)
-            && trim_encrypted_reasoning_items(&mut prepared.body_json)
-        {
-            tracing::warn!(
-                protocol = ?prepared.route.protocol,
-                "invalid_encrypted_content,剥离 reasoning 后重试一次"
-            );
-            prepared.reencode_body().await?;
-            if let Some((cache, key, _)) = prepared.replay_scope.as_ref() {
-                cache.invalidate(key);
-            }
-            let retry = prepared.send_retry(upstream_client, user_agents).await?;
-            final_status = retry.status;
-            // 后续门禁(AG/Kimi 账本清理、trim)看重试后的状态,与 401 分支一致
-            status = retry.status;
-            if retry.status.is_success() {
-                executed.upstream = Some(retry);
-                retried_ok = true;
-            } else {
-                retry_after = parse_retry_after(retry.body.headers());
-                let (bytes, truncated) =
-                    crate::limits::read_error_body_or_anthropic(retry.body, final_status).await?;
-                final_bytes = bytes;
-                final_truncated = truncated;
-            }
-        }
-
-        // AG 封号:只打告警,不改凭证状态(provider 名含邮箱,不入日志)
-        if !retried_ok
-            && !final_truncated
-            && final_status.as_u16() == 403
-            && matches!(prepared.route.protocol, Protocol::Antigravity)
-            && let Some(appeal_url) = antigravity_tos_violation_appeal_url(&final_bytes)
-        {
-            tracing::warn!(
-                appeal_url = %appeal_url,
-                "Antigravity 上游 403 TOS_VIOLATION,账号疑似被封,需申诉后恢复"
-            );
-        }
-
-        if !retried_ok {
-            return build_upstream_error_response(
-                prepared.route.protocol,
-                final_status,
-                &final_bytes,
-                final_truncated,
-                retry_after,
-            );
-        }
-    }
+    };
+    let status = upstream.status;
 
     // 响应转换
     if prepared.is_stream {
-        let out = if let Some(out) = executed.preloaded_stream {
-            out
-        } else {
-            let upstream = executed.upstream.take().expect("上游响应应存在");
-            build_stream_relay(prepared, upstream)
-        };
-        Ok(Response::builder()
-            .status(status)
-            .header(header::CONTENT_TYPE, "text/event-stream")
-            .header(header::CACHE_CONTROL, "no-cache")
-            .body(Body::from_stream(out))
-            .map_err(|e| AppError::new(anyhow::anyhow!("构造流式响应失败: {e}")))?)
+        let out = build_stream_relay(prepared, upstream);
+        build_sse_response(status, out)
     } else {
-        let upstream = executed.upstream.take().expect("上游响应应存在");
         let body_bytes = crate::limits::read_success_body_or_anthropic(upstream.body).await?;
         // 成功 body 只解析一次,供 replay / AG / Kimi / drift / 协议转换复用
         let parsed: Option<Value> = serde_json::from_slice(&body_bytes).ok();
@@ -1638,30 +1614,40 @@ impl PreparedMessageRequest {
         Ok(())
     }
 
+    fn upstream_request<'a>(
+        &'a self,
+        base_url: &'a str,
+        user_agents: &'a crate::http::UserAgentSet,
+    ) -> crate::upstream::UpstreamRequest<'a> {
+        crate::upstream::UpstreamRequest {
+            base_url,
+            api_key: &self.upstream_key,
+            protocol: self.route.protocol,
+            provider_proxy: self.upstream_proxy.as_deref(),
+            body_bytes: self.encoded_body.clone(),
+            body: &self.body_json,
+            is_stream: self.is_stream,
+            session_id: self.session_id.as_deref(),
+            thread_id: self.thread_id.as_deref(),
+            extra_headers: &self.extra_headers,
+            user_agents,
+            inbound_user_agent: self.inbound_user_agent.as_deref(),
+            pool_refresh_token: self.pool_refresh_token.as_deref(),
+            query: self.inbound_query.as_deref(),
+        }
+    }
+
     async fn send_retry(
         &self,
         client: &crate::upstream::UpstreamClient,
         user_agents: &crate::http::UserAgentSet,
     ) -> anyhow::Result<UpstreamResponse> {
+        let base_url = self
+            .active_base_url
+            .as_deref()
+            .unwrap_or(&self.upstream_base_urls[0]);
         client
-            .request_encoded(
-                self.active_base_url
-                    .as_deref()
-                    .unwrap_or(&self.upstream_base_urls[0]),
-                &self.upstream_key,
-                self.route.protocol,
-                self.upstream_proxy.as_deref(),
-                self.encoded_body.clone(),
-                &self.body_json,
-                self.is_stream,
-                self.session_id.as_deref(),
-                self.thread_id.as_deref(),
-                &self.extra_headers,
-                user_agents,
-                self.inbound_user_agent.as_deref(),
-                self.pool_refresh_token.as_deref(),
-                self.inbound_query.as_deref(),
-            )
+            .request_encoded(self.upstream_request(base_url, user_agents))
             .await
     }
 
@@ -1816,23 +1802,28 @@ pub async fn handle_messages(
 
 /// 非流成功旁路:Responses/AG/Kimi replay 落账与 drift cache usage 观测(只读响应)。
 fn observe_non_stream_success(prepared: &PreparedMessageRequest, v: &Value) {
-    if let Some((cache, key, fingerprint)) = prepared.replay_scope.as_ref()
-        && matches!(prepared.route.protocol, Protocol::OpenAiResponses)
-        && v.get("object").and_then(|o| o.as_str()) == Some("response")
-    {
-        let wrapped = json!({"response": v});
-        cache.store_from_completed(key, &wrapped, fingerprint);
-    }
-    if let Some((cache, key)) = prepared.ag_replay_scope.as_ref()
-        && matches!(prepared.route.protocol, Protocol::Antigravity)
-        && let Some(request) = prepared.body_json.get("request")
-    {
-        cache.store_from_response(key, &prepared.ag_replay_snapshot, request, v);
-    }
-    if let Some((cache, key, _)) = prepared.kimi_replay_scope.as_ref()
-        && matches!(prepared.route.protocol, Protocol::Claude)
-    {
-        cache.store_from_message_response(key, v);
+    match &prepared.replay {
+        ReplayScope::Responses {
+            cache,
+            key,
+            fingerprint,
+        } if v.get("object").and_then(|o| o.as_str()) == Some("response") => {
+            let wrapped = json!({"response": v});
+            cache.store_from_completed(key, &wrapped, fingerprint);
+        }
+        ReplayScope::Antigravity {
+            cache,
+            key,
+            snapshot,
+        } => {
+            if let Some(request) = prepared.body_json.get("request") {
+                cache.store_from_response(key, snapshot, request, v);
+            }
+        }
+        ReplayScope::Kimi { cache, key, .. } => {
+            cache.store_from_message_response(key, v);
+        }
+        ReplayScope::None | ReplayScope::Responses { .. } => {}
     }
     if let Some((drift, parent)) = prepared.drift_usage_scope.as_ref() {
         let (cache_read, cache_creation) = match prepared.route.protocol {
@@ -1995,21 +1986,6 @@ fn build_stream_relay(
     prepared: &PreparedMessageRequest,
     upstream: UpstreamResponse,
 ) -> SseStreamPin {
-    let replay_tap = if let Some((cache, key, fingerprint)) = prepared.replay_scope.clone() {
-        ReplayTap::Responses(cache, key, fingerprint)
-    } else if let Some((cache, key)) = prepared.ag_replay_scope.as_ref() {
-        let empty = Value::Object(Default::default());
-        ReplayTap::Antigravity(Box::new(AgStreamReplayExtractor::new(
-            cache.clone(),
-            key.clone(),
-            prepared.ag_replay_snapshot.clone(),
-            prepared.body_json.get("request").unwrap_or(&empty),
-        )))
-    } else if let Some((cache, key, applied)) = prepared.kimi_replay_scope.clone() {
-        ReplayTap::Kimi(cache, key, applied)
-    } else {
-        ReplayTap::None
-    };
     relay_with_replay_tap(
         upstream.body.bytes_stream(),
         RelayParams {
@@ -2017,7 +1993,7 @@ fn build_stream_relay(
             estimated_input_tokens: prepared.estimated_input_tokens,
             tool_names: prepared.tool_names.clone(),
             original_claude_request: prepared.original_claude_request.clone(),
-            replay_tap,
+            replay_tap: prepared.replay.stream_tap(&prepared.body_json),
             signature_model: prepared.signature_model.clone(),
             inbound_model: Some(Arc::clone(&prepared.inbound_model)),
             token_scope: prepared.token_scope.clone(),
@@ -2118,10 +2094,7 @@ mod tests {
             estimated_input_tokens: None,
             tool_names: None,
             original_claude_request: None,
-            replay_scope: None,
-            ag_replay_scope: None,
-            ag_replay_snapshot: Default::default(),
-            kimi_replay_scope: None,
+            replay: ReplayScope::None,
             signature_model: None,
             inbound_model: Arc::from("gpt-test"),
             token_scope: None,

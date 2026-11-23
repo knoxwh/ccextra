@@ -2,9 +2,10 @@ use crate::http::AppState;
 use crate::http::auth::check_secret;
 use crate::http::error::AppError;
 use axum::{
+    Json,
     extract::State,
-    http::{HeaderMap, StatusCode, header},
-    response::Response,
+    http::HeaderMap,
+    response::{IntoResponse, Response},
 };
 use ccextra_core::route::ProviderConfig;
 use serde_json::Value;
@@ -40,9 +41,5 @@ pub async fn handle_models(
     let snapshot = std::sync::Arc::clone(&*state.config.read().await);
     check_secret(&headers, &snapshot.runtime.secret).await?;
     let body = build_models_list(&snapshot.providers);
-    Response::builder()
-        .status(StatusCode::OK)
-        .header(header::CONTENT_TYPE, "application/json")
-        .body(axum::body::Body::from(serde_json::to_vec(&body).unwrap()))
-        .map_err(|e| AppError::new(anyhow::anyhow!("构造模型列表响应失败: {e}")))
+    Ok(Json(body).into_response())
 }

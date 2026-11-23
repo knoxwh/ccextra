@@ -481,6 +481,53 @@ fn digest_credential_scope(prefix: &str, secret: &str) -> String {
     format!("{prefix}{}", hex::encode(&digest[..8]))
 }
 
+/// 发起上游请求的参数包:避免按位置传十余个同类型 Option<&str> 错位
+pub(crate) struct UpstreamRequest<'a> {
+    pub base_url: &'a str,
+    pub api_key: &'a str,
+    pub protocol: Protocol,
+    pub provider_proxy: Option<&'a str>,
+    pub body_bytes: bytes::Bytes,
+    pub body: &'a serde_json::Value,
+    pub is_stream: bool,
+    pub session_id: Option<&'a str>,
+    pub thread_id: Option<&'a str>,
+    pub extra_headers: &'a axum::http::HeaderMap,
+    pub user_agents: &'a crate::http::UserAgentSet,
+    pub inbound_user_agent: Option<&'a str>,
+    pub pool_refresh_token: Option<&'a str>,
+    pub query: Option<&'a str>,
+}
+
+#[cfg(test)]
+impl<'a> UpstreamRequest<'a> {
+    pub(crate) fn for_test(
+        base_url: &'a str,
+        api_key: &'a str,
+        protocol: Protocol,
+        body: &'a serde_json::Value,
+        extra_headers: &'a axum::http::HeaderMap,
+        user_agents: &'a crate::http::UserAgentSet,
+    ) -> Self {
+        Self {
+            base_url,
+            api_key,
+            protocol,
+            provider_proxy: None,
+            body_bytes: bytes::Bytes::new(),
+            body,
+            is_stream: false,
+            session_id: None,
+            thread_id: None,
+            extra_headers,
+            user_agents,
+            inbound_user_agent: None,
+            pool_refresh_token: None,
+            query: None,
+        }
+    }
+}
+
 #[derive(Clone)]
 pub struct UpstreamClient {
     global_proxy: Option<String>,
@@ -751,42 +798,13 @@ impl UpstreamClient {
 
     /// 测试入口:自行编码 body 后委托 [`Self::request_encoded`]
     #[cfg(test)]
-    #[expect(clippy::too_many_arguments)]
     pub(crate) async fn request(
         &self,
-        base_url: &str,
-        api_key: &str,
-        protocol: Protocol,
-        provider_proxy: Option<&str>,
-        body: &serde_json::Value,
-        is_stream: bool,
-        session_id: Option<&str>,
-        thread_id: Option<&str>,
-        extra_headers: &axum::http::HeaderMap,
-        user_agents: &crate::http::UserAgentSet,
-        inbound_user_agent: Option<&str>,
-        pool_refresh_token: Option<&str>,
-        query: Option<&str>,
+        mut req: UpstreamRequest<'_>,
     ) -> anyhow::Result<UpstreamResponse> {
-        let compress = extra_headers.contains_key("chatgpt-account-id");
-        let body_bytes = encode_request_body(protocol, body, compress).await?;
-        self.request_encoded(
-            base_url,
-            api_key,
-            protocol,
-            provider_proxy,
-            body_bytes,
-            body,
-            is_stream,
-            session_id,
-            thread_id,
-            extra_headers,
-            user_agents,
-            inbound_user_agent,
-            pool_refresh_token,
-            query,
-        )
-        .await
+        let compress = req.extra_headers.contains_key("chatgpt-account-id");
+        req.body_bytes = encode_request_body(req.protocol, req.body, compress).await?;
+        self.request_encoded(req).await
     }
 
     /// 发起上游请求,返回原始响应(字节或流由调用方决定)
@@ -801,105 +819,62 @@ impl UpstreamClient {
     /// - `extra_headers`:Claude 直通为 [`crate::http::claude_passthrough_headers`] 最小透传头
     /// - `inbound_user_agent`:Claude 协议优先使用入站值,缺失时回退配置值
     /// - `query`:入站 URI query(不含 `?`);仅 Claude 直通接到 `/v1/messages`
-    #[expect(clippy::too_many_arguments)]
     pub(crate) async fn request_encoded(
         &self,
-        base_url: &str,
-        api_key: &str,
-        protocol: Protocol,
-        provider_proxy: Option<&str>,
-        body_bytes: bytes::Bytes,
-        body: &serde_json::Value,
-        is_stream: bool,
-        session_id: Option<&str>,
-        thread_id: Option<&str>,
-        extra_headers: &axum::http::HeaderMap,
-        user_agents: &crate::http::UserAgentSet,
-        inbound_user_agent: Option<&str>,
-        pool_refresh_token: Option<&str>,
-        query: Option<&str>,
+        req: UpstreamRequest<'_>,
     ) -> anyhow::Result<UpstreamResponse> {
-        let upstream_model = body.get("model").and_then(|v| v.as_str()).unwrap_or("");
+        let upstream_model = req.body.get("model").and_then(|v| v.as_str()).unwrap_or("");
         // 路由提示从压缩前的最终 body 构造(对齐 codex build_routing_hint_header)
-        let routing_hint = if extra_headers.contains_key("chatgpt-account-id")
-            && matches!(protocol, Protocol::OpenAiResponses)
+        let routing_hint = if req.extra_headers.contains_key("chatgpt-account-id")
+            && matches!(req.protocol, Protocol::OpenAiResponses)
         {
-            codex_routing_hint(upstream_model, body)
+            codex_routing_hint(upstream_model, req.body)
         } else {
             None
         };
         match self
-            .request_once(
-                base_url,
-                api_key,
-                protocol,
-                provider_proxy,
-                &body_bytes,
-                upstream_model,
-                routing_hint.as_deref(),
-                is_stream,
-                session_id,
-                thread_id,
-                extra_headers,
-                user_agents,
-                inbound_user_agent,
-                pool_refresh_token,
-                query,
-            )
+            .request_once(&req, upstream_model, routing_hint.as_deref())
             .await
         {
             Ok(resp) => Ok(resp),
             Err(e) if is_stale_connection(&e) => {
                 tracing::warn!(error = %e, "上游连接失效,丢缓存 Client 后重试一次");
                 self.drop_pooled_client(
-                    provider_proxy,
-                    protocol,
-                    extra_headers,
-                    api_key,
-                    pool_refresh_token,
+                    req.provider_proxy,
+                    req.protocol,
+                    req.extra_headers,
+                    req.api_key,
+                    req.pool_refresh_token,
                 );
-                self.request_once(
-                    base_url,
-                    api_key,
-                    protocol,
-                    provider_proxy,
-                    &body_bytes,
-                    upstream_model,
-                    routing_hint.as_deref(),
-                    is_stream,
-                    session_id,
-                    thread_id,
-                    extra_headers,
-                    user_agents,
-                    inbound_user_agent,
-                    pool_refresh_token,
-                    query,
-                )
-                .await
+                self.request_once(&req, upstream_model, routing_hint.as_deref())
+                    .await
             }
             Err(e) => Err(e),
         }
     }
 
-    #[expect(clippy::too_many_arguments)]
     async fn request_once(
         &self,
-        base_url: &str,
-        api_key: &str,
-        protocol: Protocol,
-        provider_proxy: Option<&str>,
-        body: &bytes::Bytes,
+        params: &UpstreamRequest<'_>,
         upstream_model: &str,
         routing_hint: Option<&str>,
-        is_stream: bool,
-        session_id: Option<&str>,
-        thread_id: Option<&str>,
-        extra_headers: &axum::http::HeaderMap,
-        user_agents: &crate::http::UserAgentSet,
-        inbound_user_agent: Option<&str>,
-        pool_refresh_token: Option<&str>,
-        query: Option<&str>,
     ) -> anyhow::Result<UpstreamResponse> {
+        let UpstreamRequest {
+            base_url,
+            api_key,
+            protocol,
+            provider_proxy,
+            ref body_bytes,
+            body: _,
+            is_stream,
+            session_id,
+            thread_id,
+            extra_headers,
+            user_agents,
+            inbound_user_agent,
+            pool_refresh_token,
+            query,
+        } = *params;
         #[cfg(test)]
         self.attempts.lock().unwrap().push(base_url.to_owned());
         if matches!(protocol, Protocol::AnthropicOfficial) {
@@ -917,19 +892,7 @@ impl UpstreamClient {
         );
         if crate::claude_tls_fp::should_use_fingerprint_lane(matches!(protocol, Protocol::Claude,))
         {
-            return self
-                .request_once_fp(
-                    base_url,
-                    api_key,
-                    &proxy_key,
-                    body,
-                    is_stream,
-                    extra_headers,
-                    user_agents,
-                    inbound_user_agent,
-                    query,
-                )
-                .await;
+            return self.request_once_fp(params, &proxy_key).await;
         }
         let client = self.client_for(&proxy_key, protocol, codex_subscription, &cred_scope)?;
 
@@ -1028,7 +991,7 @@ impl UpstreamClient {
         };
         let req = req
             .header(reqwest::header::CONTENT_TYPE, "application/json")
-            .body(bytes::Bytes::clone(body));
+            .body(bytes::Bytes::clone(body_bytes));
         let resp = send_with_timeout(req, accept_policy, header_wait(is_stream)).await?;
 
         let status = resp.status();
@@ -1039,34 +1002,31 @@ impl UpstreamClient {
     }
 
     /// Claude TLS fingerprint lane (wreq/BoringSSL):仅 Protocol::Claude messages 路径。
-    #[expect(clippy::too_many_arguments)]
     async fn request_once_fp(
         &self,
-        base_url: &str,
-        api_key: &str,
+        params: &UpstreamRequest<'_>,
         proxy_key: &str,
-        body: &bytes::Bytes,
-        is_stream: bool,
-        extra_headers: &axum::http::HeaderMap,
-        user_agents: &crate::http::UserAgentSet,
-        inbound_user_agent: Option<&str>,
-        query: Option<&str>,
     ) -> anyhow::Result<UpstreamResponse> {
         let client = self.fp_client_for(proxy_key, false)?;
-        let endpoint = append_inbound_query("/v1/messages", query);
-        let url = format!("{}{}", base_url.trim_end_matches('/'), endpoint);
-        let ua = user_agent(Protocol::Claude, "", user_agents, inbound_user_agent);
+        let endpoint = append_inbound_query("/v1/messages", params.query);
+        let url = format!("{}{}", params.base_url.trim_end_matches('/'), endpoint);
+        let ua = user_agent(
+            Protocol::Claude,
+            "",
+            params.user_agents,
+            params.inbound_user_agent,
+        );
         let mut req = client
             .post(&url)
             .header(wreq::header::USER_AGENT, ua)
-            .bearer_auth(api_key);
-        for (name, value) in extra_headers {
+            .bearer_auth(params.api_key);
+        for (name, value) in params.extra_headers {
             req = req.header(name, value);
         }
         let resp = send_with_timeout_wreq(
             req.header(wreq::header::CONTENT_TYPE, "application/json")
-                .body(bytes::Bytes::clone(body)),
-            header_wait(is_stream),
+                .body(bytes::Bytes::clone(&params.body_bytes)),
+            header_wait(params.is_stream),
         )
         .await?;
         let status = resp.status();
@@ -1559,24 +1519,13 @@ mod tests {
                     .build()
                     .unwrap(),
             );
-            let result = client
-                .request(
-                    &format!("http://{host}:{}", addr.port()),
-                    "sk-test",
-                    protocol,
-                    Some("direct"),
-                    &serde_json::json!({"model": model}),
-                    false,
-                    None,
-                    None,
-                    &axum::http::HeaderMap::new(),
-                    &mock_user_agents(),
-                    None,
-                    None,
-                    None,
-                )
-                .await
-                .unwrap();
+            let url = format!("http://{host}:{}", addr.port());
+            let body = serde_json::json!({"model": model});
+            let extra = axum::http::HeaderMap::new();
+            let uas = mock_user_agents();
+            let mut req = UpstreamRequest::for_test(&url, "sk-test", protocol, &body, &extra, &uas);
+            req.provider_proxy = Some("direct");
+            let result = client.request(req).await.unwrap();
             assert_eq!(result.status, axum::http::StatusCode::OK);
             assert_eq!(
                 captured.header("x-authenticateresponse").as_deref(),
@@ -1868,22 +1817,14 @@ mod tests {
                 axum::http::header::CONTENT_TYPE,
                 "application/json; charset=utf-8".parse().unwrap(),
             );
+            let body = serde_json::json!({"model": model});
+            let uas = mock_user_agents();
+            let mut req =
+                UpstreamRequest::for_test(&server.url, "sk-test", protocol, &body, &extra, &uas);
+            req.provider_proxy = Some("direct");
+            req.is_stream = stream;
             let result = UpstreamClient::new(Some("direct".into()))
-                .request(
-                    &server.url,
-                    "sk-test",
-                    protocol,
-                    Some("direct"),
-                    &serde_json::json!({"model": model}),
-                    stream,
-                    None,
-                    None,
-                    &extra,
-                    &mock_user_agents(),
-                    None,
-                    None,
-                    None,
-                )
+                .request(req)
                 .await
                 .unwrap();
             assert_eq!(result.status, axum::http::StatusCode::OK, "{protocol:?}");
@@ -2083,23 +2024,18 @@ mod tests {
         addr: std::net::SocketAddr,
         user_agents: &crate::http::UserAgentSet,
     ) -> anyhow::Result<crate::upstream::UpstreamResponse> {
+        let url = format!("http://{addr}");
         let body = serde_json::json!({"model": "gpt-4", "messages": []});
+        let extra = axum::http::HeaderMap::new();
         client
-            .request(
-                &format!("http://{addr}"),
+            .request(UpstreamRequest::for_test(
+                &url,
                 "sk-test",
                 Protocol::OpenAiChat,
-                None,
                 &body,
-                false,
-                None,
-                None,
-                &axum::http::HeaderMap::new(),
+                &extra,
                 user_agents,
-                None,
-                None,
-                None,
-            )
+            ))
             .await
     }
 
@@ -2299,23 +2235,18 @@ mod tests {
             axum::http::HeaderName::from_static("chatgpt-account-id"),
             "acct-123".parse().unwrap(),
         );
+        let url = format!("http://{source_addr}");
         let body = serde_json::json!({"model": "gpt-5.6-terra", "input": []});
+        let uas = mock_user_agents();
         let resp = client
-            .request(
-                &format!("http://{source_addr}"),
+            .request(UpstreamRequest::for_test(
+                &url,
                 "codex-access-token",
                 Protocol::OpenAiResponses,
-                None,
                 &body,
-                false,
-                None,
-                None,
                 &extra,
-                &mock_user_agents(),
-                None,
-                None,
-                None,
-            )
+                &uas,
+            ))
             .await
             .unwrap();
 
@@ -2359,23 +2290,19 @@ mod tests {
         });
 
         let client = UpstreamClient::new(Some("direct".into()));
+        let url = format!("http://{source_addr}");
         let body = serde_json::json!({"model": "gpt-5.6-terra", "input": []});
+        let extra = axum::http::HeaderMap::new();
+        let uas = mock_user_agents();
         let resp = client
-            .request(
-                &format!("http://{source_addr}"),
+            .request(UpstreamRequest::for_test(
+                &url,
                 "sk-test",
                 Protocol::OpenAiResponses,
-                None,
                 &body,
-                false,
-                None,
-                None,
-                &axum::http::HeaderMap::new(),
-                &mock_user_agents(),
-                None,
-                None,
-                None,
-            )
+                &extra,
+                &uas,
+            ))
             .await
             .unwrap();
 
@@ -2570,22 +2497,19 @@ mod tests {
             if subscription {
                 extra.insert("chatgpt-account-id", "acct-123".parse().unwrap());
             }
+            let uas = mock_user_agents();
+            let mut req = UpstreamRequest::for_test(
+                &server.url,
+                "sk-test",
+                Protocol::OpenAiResponses,
+                &body,
+                &extra,
+                &uas,
+            );
+            req.provider_proxy = Some("direct");
+            req.is_stream = true;
             let response = UpstreamClient::new(Some("direct".into()))
-                .request(
-                    &server.url,
-                    "sk-test",
-                    Protocol::OpenAiResponses,
-                    Some("direct"),
-                    &body,
-                    true,
-                    None,
-                    None,
-                    &extra,
-                    &mock_user_agents(),
-                    None,
-                    None,
-                    None,
-                )
+                .request(req)
                 .await
                 .unwrap();
             assert_eq!(response.status, axum::http::StatusCode::OK);

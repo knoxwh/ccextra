@@ -1,5 +1,5 @@
-// 四个 OAuth 模块(antigravity / claude / codex / xai)共用的纯工具函数:
-// 凭证原子写 + 锁、auth_dir 解析、文件名清洗、刷新单飞锁、登录辅助。
+// 三个 OAuth 模块(antigravity / codex / xai)共用的纯工具函数:
+// 凭证原子写 + 锁、auth_dir 解析、文件名清洗、刷新单飞锁、错误分类、登录辅助。
 // 各模块保留自身的凭证结构、文件命名与扫描规则。
 // (写回语义对齐 CPA sdk/auth/filestore.go:原子写、目录 0700、文件 0600)
 
@@ -13,7 +13,65 @@ use std::sync::{Arc, LazyLock, Mutex};
 #[cfg(unix)]
 use std::os::unix::fs::{OpenOptionsExt, PermissionsExt};
 
-/// 四个 OAuth 模块共用的控制面 HTTP client:30s 总超时(对齐 CPA fetch 路径,
+/// OAuth 刷新结果错误分类:供 refresh.rs 按 retryable 决定是否退避重试。
+#[derive(Debug)]
+pub struct RefreshError {
+    label: &'static str,
+    pub status: Option<u16>,
+    pub message: String,
+    pub retryable: bool,
+}
+
+impl RefreshError {
+    pub fn non_retryable(label: &'static str, message: impl Into<String>) -> Self {
+        Self {
+            label,
+            status: None,
+            message: message.into(),
+            retryable: false,
+        }
+    }
+
+    pub fn transport(label: &'static str, message: impl Into<String>, retryable: bool) -> Self {
+        Self {
+            label,
+            status: None,
+            message: message.into(),
+            retryable,
+        }
+    }
+
+    pub fn http(label: &'static str, status: u16, message: impl Into<String>) -> Self {
+        Self {
+            label,
+            status: Some(status),
+            message: message.into(),
+            retryable: refresh_status_retryable(status),
+        }
+    }
+}
+
+impl std::fmt::Display for RefreshError {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self.status {
+            Some(s) => write!(
+                f,
+                "{} token refresh failed with status {s}: {}",
+                self.label, self.message
+            ),
+            None => write!(f, "{} token refresh failed: {}", self.label, self.message),
+        }
+    }
+}
+
+impl std::error::Error for RefreshError {}
+
+/// 仅明确 HTTP 5xx 可重试
+pub fn refresh_status_retryable(status: u16) -> bool {
+    status >= 500
+}
+
+/// 三个 OAuth 模块共用的控制面 HTTP client:30s 总超时(对齐 CPA fetch 路径,
 /// 防端点不可达时启动/reload 挂死);代理按 `ccextra_core::proxy::parse_proxy` 解析,
 /// 未配置即报错,不继承环境变量或系统代理。
 pub fn oauth_http_client(proxy_url: Option<&str>, label: &str) -> Result<reqwest::Client> {
@@ -140,6 +198,26 @@ type RefreshLock = Arc<tokio::sync::Mutex<()>>;
 
 static REFRESH_LOCKS: LazyLock<tokio::sync::Mutex<HashMap<String, RefreshLock>>> =
     LazyLock::new(|| tokio::sync::Mutex::new(HashMap::new()));
+
+/// 按 refresh_token 推导单飞锁键;refresh_token 为空时退回文件路径
+pub(crate) fn refresh_lock_key(path: &Path, refresh_token: &str) -> String {
+    if refresh_token.trim().is_empty() {
+        format!("path:{}", path.display())
+    } else {
+        refresh_token.to_string()
+    }
+}
+
+/// 把凭证文件的同步读写 / 文件锁移出 Tokio async worker 线程
+pub(crate) async fn run_blocking<T, F>(f: F) -> Result<T>
+where
+    T: Send + 'static,
+    F: FnOnce() -> Result<T> + Send + 'static,
+{
+    tokio::task::spawn_blocking(f)
+        .await
+        .map_err(|e| anyhow!("blocking credential io task failed: {e}"))?
+}
 
 /// 按 refresh_token 单飞的刷新锁(对齐 CPA conductor_refresh refreshLocks 按凭证串行刷新)
 pub(crate) async fn lock_for_refresh_token(refresh_token: &str) -> RefreshLock {
