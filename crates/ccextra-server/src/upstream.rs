@@ -50,8 +50,6 @@ pub struct UpstreamResponse {
 pub enum UpstreamBody {
     Reqwest(reqwest::Response),
     Wreq(wreq::Response),
-    /// Antigravity `gohttp` 开关:经 ccextra-gohttp sidecar
-    GoHttp(crate::gohttp::GoHttpBody),
 }
 
 impl UpstreamBody {
@@ -59,7 +57,6 @@ impl UpstreamBody {
         match self {
             Self::Reqwest(r) => r.headers(),
             Self::Wreq(r) => r.headers(),
-            Self::GoHttp(r) => &r.headers,
         }
     }
 
@@ -75,10 +72,6 @@ impl UpstreamBody {
             ),
             Self::Wreq(r) => Box::pin(
                 r.bytes_stream()
-                    .map(|item| item.map_err(std::io::Error::other)),
-            ),
-            Self::GoHttp(r) => Box::pin(
-                http_body_util::BodyDataStream::new(r.body)
                     .map(|item| item.map_err(std::io::Error::other)),
             ),
         }
@@ -342,13 +335,6 @@ fn user_agent(
 /// 陈旧连接错误(CPA #5494);仅在显式启用时保留连接池。
 #[derive(Debug, Deserialize, Clone, Default)]
 pub struct AntigravityConfig {
-    /// 数据面经同目录 `ccextra-gohttp`(Go net/http)转发;默认 false = reqwest。
-    /// 走本次请求已解析的代理(direct 直连);非法代理在发连前报错。见 [`crate::gohttp`]
-    #[serde(default)]
-    pub gohttp: bool,
-    /// sidecar socket 目录(配置文件旁 `.cache`),由 CLI 加载配置时填入,不读 YAML
-    #[serde(skip)]
-    pub gohttp_socket_dir: Option<std::path::PathBuf>,
     /// 连接池子配置;字段缺失按默认值处理
     #[serde(default, rename = "connection-pool")]
     pub connection_pool: AntigravityConnectionPoolConfig,
@@ -505,8 +491,6 @@ pub struct UpstreamClient {
     official_clients: std::sync::Arc<Mutex<HashMap<String, wreq::Client>>>,
     /// Antigravity 连接池设置(短连接默认,对齐 CPA antigravity.executor)
     ant_pool: AntigravityPoolSettings,
-    /// `antigravity.gohttp` 打开时的 sidecar;拉起失败 / 已崩溃则请求时重拉一次,仍失败原样报出(不回退)
-    gohttp: Option<std::sync::Arc<crate::gohttp::Lane>>,
     #[cfg(test)]
     pub(crate) attempts: std::sync::Arc<Mutex<Vec<String>>>,
 }
@@ -526,23 +510,9 @@ impl UpstreamClient {
             fp_clients: std::sync::Arc::new(Mutex::new(HashMap::new())),
             official_clients: std::sync::Arc::new(Mutex::new(HashMap::new())),
             ant_pool: AntigravityPoolSettings::resolve(ant_cfg),
-            gohttp: ant_cfg.filter(|c| c.gohttp).map(|c| {
-                std::sync::Arc::new(crate::gohttp::Lane::new(c.gohttp_socket_dir.as_deref()))
-            }),
             #[cfg(test)]
             attempts: Default::default(),
         }
-    }
-
-    #[cfg(test)]
-    pub(crate) fn with_gohttp_lane(mut self, lane: std::sync::Arc<crate::gohttp::Lane>) -> Self {
-        self.gohttp = Some(lane);
-        self
-    }
-
-    #[cfg(test)]
-    pub(crate) fn gohttp_enabled(&self) -> bool {
-        self.gohttp.is_some()
     }
 
     /// 全局代理(供目录刷新等不经 upstream 的路径复用)
@@ -937,11 +907,6 @@ impl UpstreamClient {
             anyhow::bail!("内部错误: AnthropicOfficial 不应进入通用 request_once");
         }
         let proxy_key = self.resolve_proxy(provider_proxy)?;
-        // gohttp 开关只切 Antigravity 数据面;已解析代理(http/https/socks5h)随请求交给 sidecar
-        let gohttp = match (&self.gohttp, protocol) {
-            (Some(lane), Protocol::Antigravity) => Some(lane.get()?),
-            _ => None,
-        };
         // chatgpt-account-id 仅 Codex OAuth 订阅请求携带:禁 redirect + zstd 压缩标记
         let codex_subscription = extra_headers.contains_key("chatgpt-account-id");
         let cred_scope = ant_credential_scope(
@@ -1064,25 +1029,6 @@ impl UpstreamClient {
         let req = req
             .header(reqwest::header::CONTENT_TYPE, "application/json")
             .body(bytes::Bytes::clone(body));
-        if let Some(sidecar) = gohttp {
-            let mut built = req
-                .build()
-                .map_err(|e| anyhow::anyhow!("构建上游请求失败: {e}"))?;
-            scrub_outbound_request_headers(&mut built, accept_policy);
-            let proxy = (proxy_key != "direct").then_some(proxy_key.as_str());
-            let (status, body) = sidecar
-                .send(
-                    built,
-                    proxy,
-                    bytes::Bytes::clone(body),
-                    header_wait(is_stream),
-                )
-                .await?;
-            return Ok(UpstreamResponse {
-                status,
-                body: UpstreamBody::GoHttp(body),
-            });
-        }
         let resp = send_with_timeout(req, accept_policy, header_wait(is_stream)).await?;
 
         let status = resp.status();

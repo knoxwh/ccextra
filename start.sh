@@ -57,7 +57,7 @@ listen_pids() {
     lsof -ti :8222 -sTCP:LISTEN 2>/dev/null || true
 }
 
-# 只匹配 ccextra 本体:裸 "$BIN" 前缀也会命中同目录 ccextra-gohttp
+# 精确匹配 ccextra 本体路径（避免误命中同前缀可执行文件）
 BIN_RE="^${BIN}( |\$)"
 
 # 本仓库二进制的进程
