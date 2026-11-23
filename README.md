@@ -209,13 +209,6 @@ curl -H "Authorization: Bearer $ANTHROPIC_AUTH_TOKEN" http://127.0.0.1:8222/v1/m
 | xAI Grok | `.cache/xai` | 提前 5 分钟 | 启动扫描注入 |
 | Codex | `.cache/codex` | 提前 24 小时 | PKCE，回调端口默认 1455 |
 
-配额 / 模型目录：
-
-```bash
-./scripts/check_grok_quota.sh
-./scripts/check_codex_quota.sh
-```
-
 登录成功后会按 `--config` 的 `host`/`port` 自动 `POST /reload`（失败只提示）。保存配置文件也会热重载；手动：
 
 ```bash

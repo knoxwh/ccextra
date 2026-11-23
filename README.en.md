@@ -209,13 +209,6 @@ Pipeline: auth → route → normalize → protocol convert → payload override
 | xAI Grok | `.cache/xai` | 5 minutes early | Injected on startup scan |
 | Codex | `.cache/codex` | 24 hours early | PKCE; callback port default 1455 |
 
-Quota / model catalog:
-
-```bash
-./scripts/check_grok_quota.sh
-./scripts/check_codex_quota.sh
-```
-
 Successful login auto `POST /reload` against `--config` `host`/`port` (failure is a warning only). Saving the config file also hot-reloads; manual:
 
 ```bash
