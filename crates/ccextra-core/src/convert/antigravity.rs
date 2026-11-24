@@ -108,6 +108,16 @@ pub fn convert_to_antigravity_with(
             && v > cap
         {
             gc.insert("maxOutputTokens".to_string(), Value::from(cap));
+            // 对齐 CPA 16bcf5a0:Claude 要求 thinkingBudget < maxOutputTokens,封顶后预算 ≥ 上限则降为上限-1
+            if upstream_model.contains("claude")
+                && let Some(Value::Object(tc)) = gc.get_mut("thinkingConfig")
+                && tc
+                    .get("thinkingBudget")
+                    .and_then(|b| b.as_i64())
+                    .is_some_and(|b| b >= cap)
+            {
+                tc.insert("thinkingBudget".to_string(), Value::from(cap - 1));
+            }
         }
 
         // 对齐 CLIProxyAPI:非 claude 模型删除 maxOutputTokens(上游自管理)
@@ -326,6 +336,44 @@ mod tests {
         let (out, _) =
             convert_to_antigravity_with(&base_body(), "claude-sonnet-4-6", None, &reg, None);
         assert_eq!(out["request"]["generationConfig"]["maxOutputTokens"], 64000);
+    }
+
+    #[test]
+    fn test_claude_thinking_budget_reclamped_after_output_cap() {
+        // 对齐 CPA 16bcf5a0
+        let reg = |id: &str| {
+            vec![crate::thinking::ModelCapability {
+                id: id.into(),
+                reasoning_levels: vec![],
+                force_effort: None,
+                max_completion_tokens: Some(64000),
+            }]
+        };
+        let body = |budget: i64| {
+            json!({
+                "model": "claude-x", "max_tokens": 128000,
+                "thinking": {"type": "enabled", "budget_tokens": budget},
+                "messages": [{"role": "user", "content": "hi"}]
+            })
+        };
+        let gc = |out: &Value| out["request"]["generationConfig"].clone();
+        let reg_c = reg("claude-sonnet-4-6");
+        let (out, _) =
+            convert_to_antigravity_with(&body(100000), "claude-sonnet-4-6", None, &reg_c, None);
+        assert_eq!(gc(&out)["maxOutputTokens"], 64000);
+        assert_eq!(gc(&out)["thinkingConfig"]["thinkingBudget"], 63999);
+        // 预算本已低于上限:不动
+        let (out, _) =
+            convert_to_antigravity_with(&body(32000), "claude-sonnet-4-6", None, &reg_c, None);
+        assert_eq!(gc(&out)["thinkingConfig"]["thinkingBudget"], 32000);
+        // 未封顶(无注册表):不动
+        let (out, _) = convert_to_antigravity(&body(100000), "claude-sonnet-4-6", None);
+        assert_eq!(gc(&out)["thinkingConfig"]["thinkingBudget"], 100000);
+        // 非 Claude 模型:不动
+        let reg_g = reg("gemini-3.1-pro");
+        let (out, _) =
+            convert_to_antigravity_with(&body(100000), "gemini-3.1-pro", None, &reg_g, None);
+        assert_eq!(gc(&out)["thinkingConfig"]["thinkingBudget"], 100000);
     }
 
     #[test]

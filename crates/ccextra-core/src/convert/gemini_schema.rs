@@ -169,6 +169,10 @@ fn clean_json_schema(schema: &Value, opts: CleanOptions) -> Value {
     // Gemini protobuf 要求声明 items 的节点 type 为 ARRAY(对齐 CPA ffe6ad3c / Issue #6011)。
     // add_missing: 内联后仍缺 items 的 array 补占位(Phase 0 不能在 $ref 节点上预加,否则会盖掉定义里的真 items)。
     sanitize_array_items(&mut s, opts.add_missing_array_items);
+    // 元组约束 prefixItems 不被 Gemini/Antigravity 接受(对齐 CPA 65ba7863:非保留模式删除)
+    if !opts.preserve_json_schema_constraints {
+        remove_keywords(&mut s, &["prefixItems"]);
+    }
 
     // Phase 4: 空对象 schema 占位(Claude VALIDATED)
     if opts.add_placeholder {
@@ -920,6 +924,9 @@ const UNSUPPORTED_CONSTRAINTS: &[&str] = &[
     "pattern",
     "minItems",
     "maxItems",
+    // 对齐 CPA 65ba7863 / Issue #7917
+    "minProperties",
+    "maxProperties",
     "uniqueItems",
     "contains",
     "format",
@@ -1802,7 +1809,11 @@ fn add_empty_schema_placeholder(schema: &mut Value) {
             }
         }
 
-        let is_object = map.get("type").and_then(|t| t.as_str()) == Some("object");
+        // 大小写不敏感(对齐 CPA be39c4d5:大写 OBJECT 同样补占位)
+        let is_object = map
+            .get("type")
+            .and_then(|t| t.as_str())
+            .is_some_and(|t| t.eq_ignore_ascii_case("object"));
         if !is_object {
             return;
         }
@@ -4673,5 +4684,83 @@ mod tests {
         );
         assert!(out.get("$defs").is_none(), "{out}");
         assert!(out.pointer("/properties/a/$defs").is_none(), "{out}");
+    }
+}
+
+#[cfg(test)]
+mod cpa_7917_7925_tests {
+    use super::*;
+    use serde_json::json;
+
+    /// 对齐 CPA 65ba7863:AG 各 cleaner 删 minProperties/maxProperties/prefixItems,前两者留 description 提示
+    #[test]
+    fn antigravity_cleaners_strip_object_size_and_prefix_items() {
+        let input = json!({
+            "type": "object",
+            "minProperties": 1,
+            "maxProperties": 5,
+            "properties": {
+                "tags": {"type": "array", "prefixItems": [{"type": "string"}]},
+                "minProperties": {"type": "string"}
+            }
+        });
+        type Cleaner = fn(&Value) -> Value;
+        let cleaners: [(&str, Cleaner); 4] = [
+            ("antigravity", clean_json_schema_for_antigravity),
+            ("antigravity_tool", |s| {
+                clean_json_schema_for_antigravity_tool(s, false)
+            }),
+            (
+                "antigravity_claude_tool",
+                clean_json_schema_for_antigravity_claude_tool,
+            ),
+            ("antigravity_nested", clean_nested_schema_for_antigravity),
+        ];
+        for (name, clean) in cleaners {
+            let out = clean(&input);
+            assert!(out.get("minProperties").is_none(), "{name}: {out}");
+            assert!(out.get("maxProperties").is_none(), "{name}: {out}");
+            assert!(
+                out.pointer("/properties/tags/prefixItems").is_none(),
+                "{name}: {out}"
+            );
+            // 同名属性定义是数据,不删
+            assert!(
+                out.pointer("/properties/minProperties").is_some(),
+                "{name}: {out}"
+            );
+            let desc = out["description"].as_str().unwrap_or("");
+            assert!(desc.contains("minProperties: 1"), "{name}: {out}");
+            assert!(desc.contains("maxProperties: 5"), "{name}: {out}");
+        }
+    }
+
+    /// Gemini 直连 parametersJsonSchema 保留标准约束(不受 65ba7863 影响)
+    #[test]
+    fn gemini_direct_preserves_object_size_and_prefix_items() {
+        let input = json!({
+            "type": "object",
+            "minProperties": 1,
+            "properties": {"tags": {"type": "array", "prefixItems": [{"type": "string"}]}}
+        });
+        let out = clean_json_schema_for_gemini(&input);
+        assert_eq!(out["minProperties"], 1, "{out}");
+        assert!(
+            out.pointer("/properties/tags/prefixItems").is_some(),
+            "{out}"
+        );
+    }
+
+    /// 对齐 CPA be39c4d5:大写 OBJECT 空 schema 同样补必填 reason 占位
+    #[test]
+    fn uppercase_object_gets_reason_placeholder() {
+        for input in [
+            json!({"type": "OBJECT"}),
+            json!({"type": "OBJECT", "properties": {}}),
+        ] {
+            let out = clean_json_schema_for_antigravity(&input);
+            assert_eq!(out["properties"]["reason"]["type"], "string", "{out}");
+            assert_eq!(out["required"], json!(["reason"]), "{out}");
+        }
     }
 }

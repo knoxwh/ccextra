@@ -1975,10 +1975,27 @@ fn upstream_error_type_falls_back_by_status() {
 }
 
 const AG_429_RETRY_INFO: &str = r#"{"error":{"code":429,"message":"exhausted","status":"RESOURCE_EXHAUSTED","details":[{"@type":"type.googleapis.com/google.rpc.RetryInfo","retryDelay":"29.2s"}]}}"#;
+const AG_503_CAPACITY_RETRY_INFO: &str = r#"{"error":{"code":503,"status":"UNAVAILABLE","details":[{"@type":"type.googleapis.com/google.rpc.ErrorInfo","reason":"MODEL_CAPACITY_EXHAUSTED"},{"@type":"type.googleapis.com/google.rpc.RetryInfo","retryDelay":"17s"}]}}"#;
 
 /// 单 base_url provider 回 429(可选 Retry-After 头),返回客户端看到的 retry-after
 async fn retry_after_for_429(
     protocol: &str,
+    upstream_retry_after: Option<&'static str>,
+) -> Option<String> {
+    retry_after_for_status(
+        protocol,
+        StatusCode::TOO_MANY_REQUESTS,
+        AG_429_RETRY_INFO,
+        upstream_retry_after,
+    )
+    .await
+}
+
+/// 单 base_url provider 回指定状态与 body(可选 Retry-After 头),返回客户端看到的 retry-after
+async fn retry_after_for_status(
+    protocol: &str,
+    status: StatusCode,
+    body: &'static str,
     upstream_retry_after: Option<&'static str>,
 ) -> Option<String> {
     let server =
@@ -1988,7 +2005,7 @@ async fn retry_after_for_429(
             if let Some(ra) = upstream_retry_after {
                 headers.insert(header::RETRY_AFTER, ra.parse().unwrap());
             }
-            (StatusCode::TOO_MANY_REQUESTS, headers, AG_429_RETRY_INFO)
+            (status, headers, body)
         }))
         .await;
     let state = mock_state();
@@ -2001,7 +2018,7 @@ async fn retry_after_for_429(
         .providers
         .push(provider);
     let resp = post_test_request(state, "/v1/messages", "rl").await;
-    assert_eq!(resp.status(), StatusCode::TOO_MANY_REQUESTS);
+    assert_eq!(resp.status(), status);
     resp.headers()
         .get(header::RETRY_AFTER)
         .map(|v| v.to_str().unwrap().to_owned())
@@ -2024,6 +2041,29 @@ async fn antigravity_429_upstream_header_wins_over_body() {
             .as_deref(),
         Some("7")
     );
+}
+
+#[tokio::test]
+async fn antigravity_503_capacity_retry_info_fills_retry_after() {
+    // 对齐 CPA ae3d80f7:503 MODEL_CAPACITY_EXHAUSTED 同样按 body RetryInfo 补 Retry-After
+    let ag = |ra| {
+        retry_after_for_status(
+            "antigravity",
+            StatusCode::SERVICE_UNAVAILABLE,
+            AG_503_CAPACITY_RETRY_INFO,
+            ra,
+        )
+    };
+    assert_eq!(ag(None).await.as_deref(), Some("17"));
+    assert_eq!(ag(Some("45")).await.as_deref(), Some("45"));
+    let gemini = retry_after_for_status(
+        "gemini",
+        StatusCode::SERVICE_UNAVAILABLE,
+        AG_503_CAPACITY_RETRY_INFO,
+        None,
+    )
+    .await;
+    assert_eq!(gemini, None);
 }
 
 #[tokio::test]

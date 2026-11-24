@@ -1961,10 +1961,10 @@ fn build_upstream_error_response(
     } else {
         to_anthropic_error(final_bytes, final_status)
     };
-    // Antigravity 429 常不带 Retry-After 头,等待时长在 body 的 RetryInfo 等字段里;
-    // 上游头优先(对齐 CPA antigravity executor ParseRetryDelay)
+    // Antigravity 429 / 503(容量不足)常不带 Retry-After 头,等待时长在 body 的 RetryInfo 等字段里;
+    // 上游头优先(对齐 CPA antigravity executor ParseRetryDelay / ae3d80f7)
     if retry_after.is_none()
-        && final_status == axum::http::StatusCode::TOO_MANY_REQUESTS
+        && matches!(final_status.as_u16(), 429 | 503)
         && !final_truncated
         && matches!(protocol, Protocol::Antigravity)
     {

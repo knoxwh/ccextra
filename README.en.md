@@ -188,7 +188,7 @@ Pipeline: auth → route → normalize → protocol convert → payload override
 
 - **Compatibility**: OpenAI strips `required: null`; Chat maps schema-position `true`→`{}`; Gemini/AG fills `type: object`; blockage codes map to `refusal`; AG neutralizes Claude Code identity sentences and sanitizes non-standard session headers
 - **Streaming**: Claude body passthrough; others convert to Anthropic SSE; 10s `: keepalive` (`anthropic_official` bytes are verbatim, no keepalive)
-- **Retries**: same-round multi-`base_url` rotation on 429/5xx/network errors; exhaust → fail fast and pass through `Retry-After` (filled from the body RetryInfo for Antigravity 429s without the header); streaming first-frame error retries once internally
+- **Retries**: same-round multi-`base_url` rotation on 429/5xx/network errors; exhaust → fail fast and pass through `Retry-After` (filled from the body RetryInfo for Antigravity 429/503s without the header); streaming first-frame error retries once internally
 - **Read limits**: success body 16 MiB, error 256 KiB, idle 180s; OAuth / project / model reads 30s total timeout
 - **Claude headers**: keep permitted identity headers; `anthropic-beta` passthrough by default
 
