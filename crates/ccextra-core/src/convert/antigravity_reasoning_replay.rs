@@ -1792,9 +1792,10 @@ fn function_call_occurrence_key(fc: &Value) -> String {
     if name.is_empty() {
         return String::new();
     }
-    // 缺失 args 视为 {}（与稳定 id 派生、账本条目、下一轮 converter 补的 {} 一致）
+    // 缺失或 null 的 args 视为 {}（与稳定 id 派生、账本条目、下一轮 converter 补的 {} 一致）
     let args = fc
         .get("args")
+        .filter(|v| !v.is_null())
         .map(canonical_json)
         .unwrap_or_else(|| "{}".to_string());
     format!("{name}\0{args}")
@@ -1805,7 +1806,7 @@ fn function_call_occurrence_key(fc: &Value) -> String {
 pub struct AgReplayAccumulator {
     items: Vec<Value>,
     seen_signatures: std::collections::HashSet<String>,
-    seen_fc: std::collections::HashSet<String>,
+    seen_fc: std::collections::HashMap<String, usize>,
     content_index: i64,
     next_part_index: i64,
     pending_signatures: Vec<(String, String)>, // (sig, target_kind)
@@ -1814,6 +1815,7 @@ pub struct AgReplayAccumulator {
     visible_part_index: i64,
     thought_part_index: i64,
     last_response_kind: String,
+    last_function_call_index: Option<usize>,
     segment_occurrences: std::collections::HashMap<String, i64>,
     function_call_occurrences: std::collections::HashMap<String, i64>,
     /// 响应所在 content 之前的上下文指纹（对齐 CPA responseContextHash）
@@ -1997,9 +1999,10 @@ impl AgReplayAccumulator {
                 self.pending_signatures.retain(|(_, kind)| !kind.is_empty());
             }
             let name = fc.get("name").and_then(|v| v.as_str()).unwrap_or("");
-            // 缺失 args 视为 {}（同 function_call_occurrence_key）
+            // 缺失或 null 的 args 视为 {}（同 function_call_occurrence_key）
             let args_raw = fc
                 .get("args")
+                .filter(|v| !v.is_null())
                 .map(canonical_json)
                 .unwrap_or_else(|| "{}".to_string());
             let call_id = fc.get("id").and_then(|v| v.as_str()).unwrap_or("");
@@ -2009,10 +2012,12 @@ impl AgReplayAccumulator {
             } else {
                 format!("{key}\0{signature}")
             };
-            if self.seen_fc.contains(&dedupe) {
+            if let Some(&idx) = self.seen_fc.get(&dedupe) {
+                // 去重命中仍需记住上一块是该 functionCall,避免紧随其后的续传误绑到别的 call 或落进 pending
+                self.last_response_kind = "function_call".into();
+                self.last_function_call_index = Some(idx);
                 return;
             }
-            self.seen_fc.insert(dedupe);
             let occurrence_key = function_call_occurrence_key(fc);
             let occurrence = *self
                 .function_call_occurrences
@@ -2022,6 +2027,7 @@ impl AgReplayAccumulator {
                 self.function_call_occurrences
                     .insert(occurrence_key, occurrence + 1);
             }
+            let mut appended_index = None;
             if let Some(item) =
                 build_function_call_part_item(self.content_index, pi, occurrence, fc, &signature)
             {
@@ -2029,8 +2035,16 @@ impl AgReplayAccumulator {
                     self.seen_signatures.insert(signature.clone());
                 }
                 let item = stamp_context_hash(item, &self.response_context_hash);
+                let before_len = self.items.len();
                 self.append_item(item);
+                if self.items.len() > before_len {
+                    appended_index = Some(self.items.len() - 1);
+                }
             }
+            if let Some(idx) = appended_index {
+                self.seen_fc.insert(dedupe, idx);
+            }
+            self.last_function_call_index = appended_index;
             self.last_response_kind = "function_call".into();
             return;
         }
@@ -2105,6 +2119,7 @@ impl AgReplayAccumulator {
                 self.visible_text.push_str(text);
             }
             self.last_response_kind.clone_from(&target_kind);
+            self.last_function_call_index = None;
         }
 
         if !signature.is_empty() && !self.seen_signatures.contains(&signature) {
@@ -2173,19 +2188,27 @@ impl AgReplayAccumulator {
         self.seen_signatures.insert(signature);
     }
 
-    /// 续传 args 浅合并进最后一个 function_call_part;首块 args 存为 `idArgs` 供稳定 id 派生。
+    /// 续传 args 浅合并进上一个 function_call_part;首块 args 存为 `idArgs` 供稳定 id 派生。
     fn merge_args_into_last_function_call(&mut self, extra: &serde_json::Map<String, Value>) {
+        if self.overflow {
+            return;
+        }
+        let Some(idx) = self.last_function_call_index else {
+            return;
+        };
         let Some(item) = self
             .items
-            .iter_mut()
-            .rev()
-            .find(|i| i.get("type").and_then(|v| v.as_str()) == Some("function_call_part"))
+            .get_mut(idx)
+            .filter(|i| i.get("type").and_then(|v| v.as_str()) == Some("function_call_part"))
         else {
             return;
         };
-        let Some(mut merged) = item.get("args").and_then(|v| v.as_object()).cloned() else {
-            return;
+        let mut merged = match item.get("args") {
+            Some(Value::Object(map)) => map.clone(),
+            Some(Value::Null) | None => serde_json::Map::new(),
+            _ => return,
         };
+        let before_item = item.clone();
         let before = item.to_string().len();
         if item.get("idArgs").is_none() {
             item["idArgs"] = Value::Object(merged.clone());
@@ -2195,35 +2218,45 @@ impl AgReplayAccumulator {
         }
         item["args"] = Value::Object(merged);
         let after = item.to_string().len();
-        self.item_bytes += after.saturating_sub(before);
-        if self.item_bytes > MAX_BYTES_PER_ENTRY {
+        let delta = after.saturating_sub(before);
+        if self.item_bytes.saturating_add(delta) > MAX_BYTES_PER_ENTRY {
+            *item = before_item;
             self.overflow = true;
+            return;
         }
+        self.item_bytes += delta;
     }
 
     fn attach_detached_signature_to_last_function_call(&mut self, signature: &str) {
-        for item in self.items.iter_mut().rev() {
-            if item.get("type").and_then(|v| v.as_str()) != Some("function_call_part") {
-                continue;
-            }
-            // 对齐 CPA attachDetachedSignatureToLastFunctionCall :2401-2426：只看最后一个
-            // function_call_part，已有签名即停（不再往前找更早的 call）；写入受字节上限约束
-            if !str_field(item, "thoughtSignature").is_empty() {
-                return;
-            }
-            let before = item.to_string().len();
-            item["thoughtSignature"] = json!(signature);
-            let after = item.to_string().len();
-            if self.item_bytes.saturating_add(after.saturating_sub(before)) > MAX_BYTES_PER_ENTRY {
-                if let Some(obj) = item.as_object_mut() {
-                    obj.remove("thoughtSignature");
-                }
-                self.overflow = true;
-                return;
-            }
-            self.item_bytes += after.saturating_sub(before);
+        if self.overflow {
             return;
         }
+        let Some(idx) = self.last_function_call_index else {
+            return;
+        };
+        let Some(item) = self
+            .items
+            .get_mut(idx)
+            .filter(|i| i.get("type").and_then(|v| v.as_str()) == Some("function_call_part"))
+        else {
+            return;
+        };
+        // 对齐 CPA attachDetachedSignatureToLastFunctionCall :2401-2426：只看上一个
+        // function_call_part，已有签名即停（不再往前找更早的 call）；写入受字节上限约束
+        if !str_field(item, "thoughtSignature").is_empty() {
+            return;
+        }
+        let before = item.to_string().len();
+        item["thoughtSignature"] = json!(signature);
+        let after = item.to_string().len();
+        if self.item_bytes.saturating_add(after.saturating_sub(before)) > MAX_BYTES_PER_ENTRY {
+            if let Some(obj) = item.as_object_mut() {
+                obj.remove("thoughtSignature");
+            }
+            self.overflow = true;
+            return;
+        }
+        self.item_bytes += after.saturating_sub(before);
     }
 
     fn flush_pending_for_kind(&mut self, target_kind: &str) {
@@ -2348,8 +2381,12 @@ fn build_function_call_part_item(
     if name.is_empty() {
         return None;
     }
-    // 缺失 args 视为 {}（与稳定 id 派生、响应侧发给 Claude 的 input 一致）
-    let args = fc.get("args").cloned().unwrap_or_else(|| json!({}));
+    // 缺失或 null 的 args 视为 {}（与稳定 id 派生、响应侧发给 Claude 的 input 一致）
+    let args = fc
+        .get("args")
+        .filter(|v| !v.is_null())
+        .cloned()
+        .unwrap_or_else(|| json!({}));
     let mut item = json!({
         "type": "function_call_part",
         "contentIndex": content_index,
@@ -4390,5 +4427,81 @@ mod tests {
         assert_eq!(calls.len(), 1, "{items:?}");
         assert_eq!(calls[0]["thoughtSignature"], SIG_A);
         assert!(calls[0].get("idArgs").is_none());
+    }
+
+    #[test]
+    fn streaming_continuation_merges_into_initial_null_args() {
+        let base = base_request();
+        let mut acc = AgReplayAccumulator::new_from_request(&base);
+        acc.observe_response(&json!({"response": {"candidates": [{"content": {"parts": [
+            {"functionCall": {"id": "native-n", "name": "read_file", "args": null}}
+        ]}}]}}));
+        acc.observe_response(&json!({"response": {"candidates": [{"content": {"parts": [
+            {"thoughtSignature": SIG_A, "functionCall": {"args": {"path": "a.go"}}}
+        ]}, "finishReason": "STOP"}]}}));
+        let items = acc.take_commit_items().unwrap();
+        let calls: Vec<&Value> = items
+            .iter()
+            .filter(|i| i["type"] == "function_call_part")
+            .collect();
+        assert_eq!(calls.len(), 1, "{items:?}");
+        assert_eq!(calls[0]["args"], json!({"path": "a.go"}));
+        assert_eq!(calls[0]["idArgs"], json!({}));
+        assert_eq!(calls[0]["thoughtSignature"], SIG_A);
+
+        let sid = gemini_claude_tool_use_id("native-n", "read_file", Some(&Value::Null));
+        let mut req = base;
+        req["contents"].as_array_mut().unwrap().extend([
+            json!({"role": "model", "parts": [{"functionCall": {
+                "id": sid, "name": "read_file", "args": {"path": "a.go"}}}]}),
+            json!({"role": "user", "parts": [{"functionResponse": {
+                "id": sid, "name": "read_file", "response": {}}}]}),
+        ]);
+        assert!(apply_ag_replay_items(&mut req, &items));
+        assert_eq!(
+            req["contents"][1]["parts"][0]["functionCall"]["id"],
+            "native-n"
+        );
+        assert_eq!(req["contents"][1]["parts"][0]["thoughtSignature"], SIG_A);
+    }
+
+    #[test]
+    fn merge_args_overflow_rolls_back_and_stops_growth() {
+        let mut acc = AgReplayAccumulator::new_from_request(&base_request());
+        acc.observe_response(&json!({"response": {"candidates": [{"content": {"parts": [
+            {"functionCall": {"id": "c-ovf", "name": "write", "args": {"a": 1}}}
+        ]}}]}}));
+        let huge = "x".repeat(MAX_BYTES_PER_ENTRY + 128);
+        acc.observe_response(&json!({"response": {"candidates": [{"content": {"parts": [
+            {"functionCall": {"args": {"blob": huge}}}
+        ]}}]}}));
+        assert!(acc.overflow);
+        assert_eq!(acc.items()[0]["args"], json!({"a": 1}));
+        acc.observe_response(&json!({"response": {"candidates": [{"content": {"parts": [
+            {"functionCall": {"args": {"after": 2}}}
+        ]}, "finishReason": "STOP"}]}}));
+        assert_eq!(acc.items()[0]["args"], json!({"a": 1}));
+        assert_eq!(acc.take_commit_items(), Some(Vec::new()));
+    }
+
+    #[test]
+    fn deduped_function_call_tracks_target_for_following_continuation() {
+        let mut acc = AgReplayAccumulator::new_from_request(&base_request());
+        acc.observe_response(&json!({"response": {"candidates": [{"content": {"parts": [
+            {"thoughtSignature": SIG_A, "functionCall": {"id": "c1", "name": "Read", "args": {"a": 1}}},
+            {"thoughtSignature": "native-signature-for-call-b-0002", "functionCall": {"id": "c2", "name": "Write", "args": {"b": 2}}},
+            {"text": "interlude"},
+            {"thoughtSignature": SIG_A, "functionCall": {"id": "c1", "name": "Read", "args": {"a": 1}}},
+            {"functionCall": {"args": {"extra": 3}}}
+        ]}, "finishReason": "STOP"}]}}));
+        let items = acc.take_commit_items().unwrap();
+        let calls: Vec<&Value> = items
+            .iter()
+            .filter(|i| i["type"] == "function_call_part")
+            .collect();
+        assert_eq!(calls.len(), 2, "{items:?}");
+        assert_eq!(calls[0]["args"], json!({"a": 1, "extra": 3}));
+        assert_eq!(calls[0]["idArgs"], json!({"a": 1}));
+        assert_eq!(calls[1]["args"], json!({"b": 2}));
     }
 }

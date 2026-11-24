@@ -19,8 +19,6 @@ struct GeminiRelayState {
     finished: bool,
     upstream_failed: bool,
     saw_payload: bool,
-    /// 缺失 finishReason 的 clean EOF/`[DONE]` 时合成终态(Gemini 与 AG 均开启)。
-    synthesize_missing_finish: bool,
 }
 
 fn finish_gemini_relay(relay: &mut GeminiRelayState) -> Vec<Bytes> {
@@ -41,11 +39,11 @@ fn finish_gemini_relay(relay: &mut GeminiRelayState) -> Vec<Bytes> {
         return output;
     }
 
-    if relay.synthesize_missing_finish && !relay.stream.has_finish_reason() {
-        for event in force_finalize_gemini_stream(&mut relay.stream) {
-            let event_type = event["type"].as_str().unwrap_or("");
-            output.push(emit::sse(event_type, &event));
-        }
+    // 未完成终态收尾(缺 finishReason 或有 finishReason 但缺 usageMetadata)时强制关块并补终态,
+    // 确保 tool_use 开放 JSON 闭合 `}`、延迟签名刷出及 message_delta 完整。
+    for event in force_finalize_gemini_stream(&mut relay.stream) {
+        let event_type = event["type"].as_str().unwrap_or("");
+        output.push(emit::sse(event_type, &event));
     }
     if relay.stream.api_error_emitted {
         relay.upstream_failed = true;
@@ -191,7 +189,7 @@ fn process_gemini_events(
 
 /// Gemini SSE 流转 Anthropic SSE。
 ///
-/// 缺失 finishReason 时在 clean EOF/`[DONE]` 合成终态(与 Antigravity 一致)。
+/// 未完成终态收尾(缺 finishReason 或 usage)时在 clean EOF/`[DONE]` 强制收尾(与 Antigravity 一致)。
 /// 签名原样透传(CPA gemini/claude 响应侧不做归一化)。
 pub fn relay_gemini_to_anthropic<S>(
     stream: S,
@@ -206,7 +204,6 @@ where
         stream,
         estimated_input_tokens,
         tool_names,
-        true,
         None,
         original_claude_request,
     )
@@ -214,7 +211,7 @@ where
 
 /// Antigravity SSE 流转 Anthropic SSE。
 ///
-/// 缺失 finishReason 时按 CPA 在 clean EOF/`[DONE]` 合成终态 chunk。
+/// 缺失 finishReason 或 usage 时按 CPA 在 clean EOF/`[DONE]` 强制收尾。
 /// `signature_model` 为上游模型名,出站 thoughtSignature 按 CPA
 /// formatClaudeSignatureValue 归一化(claude 组解回原生 E 形)。
 pub fn relay_antigravity_to_anthropic<S>(
@@ -231,7 +228,6 @@ where
         stream,
         estimated_input_tokens,
         tool_names,
-        true,
         Some(signature_model),
         original_claude_request,
     )
@@ -241,7 +237,6 @@ fn relay_gemini_like_to_anthropic<S>(
     stream: S,
     estimated_input_tokens: Option<usize>,
     tool_names: Option<Arc<HashMap<String, String>>>,
-    synthesize_missing_finish: bool,
     signature_model: Option<Arc<str>>,
     original_claude_request: Option<Arc<serde_json::Value>>,
 ) -> SseStreamPin
@@ -253,10 +248,7 @@ where
 
     Box::pin(async_stream::stream! {
         let mut parser = SseParser::new();
-        let mut relay = GeminiRelayState {
-            synthesize_missing_finish,
-            ..Default::default()
-        };
+        let mut relay = GeminiRelayState::default();
 
         let input_tokens = estimated_input_tokens.unwrap_or(1);
 
@@ -388,13 +380,79 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn test_antigravity_done_with_finish_does_not_force_finalize() {
+    async fn test_antigravity_done_with_finish_without_usage_force_finalizes() {
         let output = collect_antigravity_output(stream::iter(vec![Ok(Bytes::from(
             "data: {\"response\":{\"candidates\":[{\"content\":{\"parts\":[{\"text\":\"hi\"}]},\"finishReason\":\"STOP\"}]}}\n\ndata: [DONE]\n\n",
         ))]))
         .await;
-        assert_eq!(output.matches("event: message_delta").count(), 0);
+        assert_eq!(output.matches("event: content_block_stop").count(), 1);
+        assert_eq!(output.matches("event: message_delta").count(), 1);
         assert_eq!(output.matches("event: message_stop").count(), 1);
+    }
+
+    #[tokio::test]
+    async fn test_antigravity_tool_continuation_finish_without_usage_closes_json_and_signature() {
+        let sig = "sig_tool_continuation_without_usage";
+        let output = collect_antigravity_output(stream::iter(vec![Ok(Bytes::from(format!(
+            "data: {{\"response\":{{\"candidates\":[{{\"content\":{{\"parts\":[{{\"functionCall\":{{\"name\":\"read_file\",\"args\":{{\"path\":\"a.go\"}}}}}}]}}}}]}}}} \n\n\
+             data: {{\"response\":{{\"candidates\":[{{\"content\":{{\"parts\":[{{\"thoughtSignature\":\"{sig}\",\"functionCall\":{{\"args\":{{\"line\":1}}}}}}]}},\"finishReason\":\"STOP\"}}]}}}}\n\n\
+             data: [DONE]\n\n"
+        )))]))
+        .await;
+        let partials: String = output
+            .lines()
+            .filter_map(|line| line.strip_prefix("data: "))
+            .filter_map(|raw| serde_json::from_str::<serde_json::Value>(raw).ok())
+            .filter(|v| {
+                v["type"] == "content_block_delta" && v["delta"]["type"] == "input_json_delta"
+            })
+            .filter_map(|v| v["delta"]["partial_json"].as_str().map(str::to_string))
+            .collect();
+        let parsed: serde_json::Value =
+            serde_json::from_str(&partials).expect("open tool_use JSON must be closed with `}`");
+        assert_eq!(parsed, serde_json::json!({"path": "a.go", "line": 1}));
+        assert!(
+            output.contains(sig),
+            "deferred thoughtSignature missing: {output}"
+        );
+        assert_eq!(
+            output.matches("event: message_delta").count(),
+            1,
+            "{output}"
+        );
+        assert!(output.contains("\"stop_reason\":\"tool_use\""), "{output}");
+        assert_eq!(output.matches("event: message_stop").count(), 1, "{output}");
+    }
+
+    #[tokio::test]
+    async fn test_gemini_tool_without_finish_or_usage_closes_json() {
+        let output = collect_output(stream::iter(vec![Ok(Bytes::from(
+            "data: {\"candidates\":[{\"content\":{\"parts\":[{\"functionCall\":{\"name\":\"read_file\",\"args\":{\"path\":\"a.go\"}}}]}}]}\n\ndata: [DONE]\n\n",
+        ))]))
+        .await;
+        let partials: String = output
+            .lines()
+            .filter_map(|line| line.strip_prefix("data: "))
+            .filter_map(|raw| serde_json::from_str::<serde_json::Value>(raw).ok())
+            .filter(|v| {
+                v["type"] == "content_block_delta" && v["delta"]["type"] == "input_json_delta"
+            })
+            .filter_map(|v| v["delta"]["partial_json"].as_str().map(str::to_string))
+            .collect();
+        let parsed: serde_json::Value = serde_json::from_str(&partials)
+            .expect("Gemini direct tool_use JSON must close with `}`");
+        assert_eq!(parsed, serde_json::json!({"path": "a.go"}));
+        assert_eq!(
+            output.matches("event: content_block_stop").count(),
+            1,
+            "{output}"
+        );
+        assert_eq!(
+            output.matches("event: message_delta").count(),
+            1,
+            "{output}"
+        );
+        assert_eq!(output.matches("event: message_stop").count(), 1, "{output}");
     }
 
     #[tokio::test]

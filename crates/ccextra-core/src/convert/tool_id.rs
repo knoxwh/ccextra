@@ -118,7 +118,7 @@ fn canonical_number(n: &serde_json::Number) -> String {
 
 /// 由上游原生 functionCall (id, name, args) 派生 Claude 侧稳定 tool_use id
 /// (对齐 CPA util.GeminiClaudeToolUseID:sha256(id\0name\0canonicalArgs) 前 16 字节 hex)。
-/// id 或 name 为空返回空串(调用方回落 `{name}-{counter}`)。缺失 args 视为 `{}`。
+/// id 或 name 为空返回空串(调用方回落 `{name}-{counter}`)。缺失或 null 的 args 视为 `{}`。
 pub fn gemini_claude_tool_use_id(call_id: &str, name: &str, args: Option<&Value>) -> String {
     let call_id = call_id.trim();
     let name = name.trim();
@@ -126,8 +126,8 @@ pub fn gemini_claude_tool_use_id(call_id: &str, name: &str, args: Option<&Value>
         return String::new();
     }
     let args = match args {
-        Some(v) => canonical_json(v),
-        None => "{}".to_string(),
+        Some(v) if !v.is_null() => canonical_json(v),
+        _ => "{}".to_string(),
     };
     let mut hasher = Sha256::new();
     hasher.update(call_id.as_bytes());
@@ -219,6 +219,10 @@ mod tests {
         assert_ne!(a, gemini_claude_tool_use_id("call-1", "Write", Some(&b)));
         assert_eq!(gemini_claude_tool_use_id("", "Read", None), "");
         assert_eq!(gemini_claude_tool_use_id("call-1", " ", None), "");
+        assert_eq!(
+            gemini_claude_tool_use_id("call-1", "Read", Some(&serde_json::Value::Null)),
+            gemini_claude_tool_use_id("call-1", "Read", None)
+        );
         assert!(!is_gemini_claude_tool_use_id("Read-3"));
         assert!(!is_gemini_claude_tool_use_id("ccx_gemini_xyz"));
     }

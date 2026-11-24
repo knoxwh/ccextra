@@ -169,10 +169,6 @@ fn clean_json_schema(schema: &Value, opts: CleanOptions) -> Value {
     // Gemini protobuf 要求声明 items 的节点 type 为 ARRAY(对齐 CPA ffe6ad3c / Issue #6011)。
     // add_missing: 内联后仍缺 items 的 array 补占位(Phase 0 不能在 $ref 节点上预加,否则会盖掉定义里的真 items)。
     sanitize_array_items(&mut s, opts.add_missing_array_items);
-    // 元组约束 prefixItems 不被 Gemini/Antigravity 接受(对齐 CPA 65ba7863:非保留模式删除)
-    if !opts.preserve_json_schema_constraints {
-        remove_keywords(&mut s, &["prefixItems"]);
-    }
 
     // Phase 4: 空对象 schema 占位(Claude VALIDATED)
     if opts.add_placeholder {
@@ -1616,7 +1612,8 @@ fn remove_unsupported_keywords(schema: &mut Value, opts: CleanOptions) {
         if opts.antigravity_semantics {
             keywords.extend(["minimum", "maximum", "multipleOf"]);
         }
-        keywords.push("additionalProperties");
+        // 元组约束 prefixItems 不被 Gemini/Antigravity 接受(对齐 CPA 65ba7863:非保留模式删除)
+        keywords.extend(["additionalProperties", "prefixItems"]);
     }
     keywords.extend([
         "$schema",

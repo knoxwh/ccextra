@@ -653,14 +653,10 @@ pub(crate) async fn prepare_message_request(
         Protocol::Antigravity => {
             original_claude_request = Some(Arc::new(tools_only_snapshot(&body_json)));
             if ccextra_core::antigravity_uses_reasoning_replay(&route.upstream_model) {
-                // 对齐 CPA 85225381：账本按凭证隔离（refresh_token 摘要，原值不入 key / 日志）
+                // 对齐 CPA 85225381：账本按凭证隔离（优先 refresh_token 摘要，无则回退 key，原值不入 key / 日志）
                 let credential_scope = route
                     .provider_config(providers)
-                    .and_then(|p| p.metadata.as_ref())
-                    .and_then(|m| m.get("refresh_token"))
-                    .map(|s| s.trim())
-                    .filter(|s| !s.is_empty())
-                    .map(crate::sse::antigravity_replay_cache::ag_replay_credential_scope)
+                    .map(ag_replay_credential_scope_for_provider)
                     .unwrap_or_default();
                 ag_replay_key = cc_session.as_deref().map(|sess| {
                     crate::sse::antigravity_replay_cache::ag_replay_session_key(
@@ -1113,6 +1109,22 @@ async fn dump_upstream_request(
     if dumped.is_none() {
         tracing::warn!(path = %log_path.display(), "上游请求诊断信息落盘失败");
     }
+}
+
+/// Antigravity 账本凭证隔离摘要：优先取 `metadata.refresh_token`（跨 access 刷新稳定），
+/// 静态 key 配置无 refresh_token 时回退 `provider.key`；两者均空返回空串。
+fn ag_replay_credential_scope_for_provider(
+    provider: &ccextra_core::route::ProviderConfig,
+) -> String {
+    provider
+        .metadata
+        .as_ref()
+        .and_then(|m| m.get("refresh_token"))
+        .map(|s| s.trim())
+        .filter(|s| !s.is_empty())
+        .or_else(|| Some(provider.key.trim()).filter(|s| !s.is_empty()))
+        .map(crate::sse::antigravity_replay_cache::ag_replay_credential_scope)
+        .unwrap_or_default()
 }
 
 /// Antigravity reasoning replay:有会话账本时注入并返回读账本快照;无会话仍做历史稳定 id 降级。
@@ -2310,5 +2322,52 @@ mod tests {
             .unwrap();
         assert!(!prepared.extra_headers.contains_key("chatgpt-account-id"));
         assert_eq!(prepared.encoded_body, before);
+    }
+
+    #[test]
+    fn ag_replay_credential_scope_prefers_refresh_token_and_falls_back_to_key() {
+        let with_refresh = ccextra_core::route::ProviderConfig::new(
+            "ag-oauth".into(),
+            Protocol::Antigravity,
+            vec!["https://daily-cloudcode-pa.googleapis.com".into()],
+            "access-key-a".into(),
+            None,
+            false,
+            vec![],
+        )
+        .with_metadata(HashMap::from([(
+            "refresh_token".into(),
+            "refresh-token-a".into(),
+        )]));
+        assert_eq!(
+            ag_replay_credential_scope_for_provider(&with_refresh),
+            crate::sse::antigravity_replay_cache::ag_replay_credential_scope("refresh-token-a")
+        );
+
+        let static_key = ccextra_core::route::ProviderConfig::new(
+            "ag-static".into(),
+            Protocol::Antigravity,
+            vec!["https://daily-cloudcode-pa.googleapis.com".into()],
+            "static-key-b".into(),
+            None,
+            false,
+            vec![],
+        );
+        assert_eq!(
+            ag_replay_credential_scope_for_provider(&static_key),
+            crate::sse::antigravity_replay_cache::ag_replay_credential_scope("static-key-b")
+        );
+
+        let empty_both = ccextra_core::route::ProviderConfig::new(
+            "ag-empty".into(),
+            Protocol::Antigravity,
+            vec!["https://daily-cloudcode-pa.googleapis.com".into()],
+            "   ".into(),
+            None,
+            false,
+            vec![],
+        )
+        .with_metadata(HashMap::from([("refresh_token".into(), " ".into())]));
+        assert_eq!(ag_replay_credential_scope_for_provider(&empty_both), "");
     }
 }

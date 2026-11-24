@@ -892,6 +892,9 @@ impl ToolArgStreamState {
             self.current_tool_pending_empty = false;
             return Some(partial);
         }
+        if self.current_tool_input_open {
+            return None;
+        }
         if !cleaned.is_empty() {
             self.current_tool_input_emitted = true;
             self.current_tool_pending_empty = false;
@@ -1143,5 +1146,23 @@ mod tests {
         let orig = json!({"tools": []});
         let args = json!({"reason": "x"});
         assert_eq!(clean_claude_tool_arguments(&args, "Missing", &orig), args);
+    }
+
+    #[test]
+    fn stream_open_object_ignores_non_object_continuation() {
+        let mut state = ToolArgStreamState::default();
+        state.begin_tool("read_file", None);
+        assert_eq!(
+            state
+                .clean_emitted_args(r#"{"path":"a.go"}"#, "read_file", None)
+                .as_deref(),
+            Some(r#"{"path":"a.go""#)
+        );
+        assert!(
+            state
+                .clean_emitted_args("null", "read_file", None)
+                .is_none()
+        );
+        assert_eq!(state.flush_on_block_close().as_deref(), Some("}"));
     }
 }

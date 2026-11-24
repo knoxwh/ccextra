@@ -318,9 +318,11 @@ pub fn convert_gemini_stream_chunk(
                     upstream_tool_name.to_string()
                 };
 
-                // 流式分块:名称为空表示续传
-                if state.response_type == ResponseType::Function && upstream_tool_name.is_empty() {
-                    if let Some(args) = function_call.get("args") {
+                // 流式分块:名称为空(含纯空白)表示续传
+                if state.response_type == ResponseType::Function
+                    && upstream_tool_name.trim().is_empty()
+                {
+                    if let Some(args) = function_call.get("args").filter(|v| v.is_object()) {
                         let tool_name = state.tool_args.current_tool_name.clone();
                         if let Some(partial) = state.tool_args.clean_emitted_args(
                             &args.to_string(),
@@ -382,7 +384,7 @@ pub fn convert_gemini_stream_chunk(
                     }
                 }));
 
-                if let Some(args) = function_call.get("args")
+                if let Some(args) = function_call.get("args").filter(|v| v.is_object())
                     && let Some(partial) = state.tool_args.clean_emitted_args(
                         &args.to_string(),
                         client_tool_name,
@@ -566,13 +568,14 @@ fn is_non_empty_function_call(fc: &Value) -> bool {
         .is_some_and(|m| !m.is_empty())
 }
 
-/// 流式续传块:当前在 tool 块内且 name 为空(与续传分支判定一致)。
+/// 流式续传块:当前在 tool 块内且 name 为空(含纯空白,与续传分支判定一致)。
 fn is_function_call_continuation(state: &GeminiStreamState, fc: &Value) -> bool {
     state.response_type == ResponseType::Function
         && fc
             .get("name")
             .and_then(|n| n.as_str())
             .unwrap_or("")
+            .trim()
             .is_empty()
 }
 
@@ -2394,5 +2397,47 @@ mod tests {
             .map(|e| e["index"].as_u64().unwrap())
             .collect();
         assert_eq!(starts, vec![0, 1, 2], "{events:?}");
+    }
+
+    /// 续传块 args 为 null 或空白 name 时不破坏已打开 JSON,也不拆新 tool_use 块。
+    #[test]
+    fn test_stream_continuation_null_args_and_whitespace_name() {
+        let mut state = GeminiStreamState::default();
+        let first = json!({"candidates": [{"content": {"parts": [
+            {"functionCall": {"name": "read_file", "args": {"path": "a.go"}}}
+        ]}}]});
+        let null_cont = json!({"candidates": [{"content": {"parts": [
+            {"functionCall": {"name": "  ", "args": null}}
+        ]}}]});
+        let second_cont = json!({"candidates": [{"content": {"parts": [
+            {"functionCall": {"name": " ", "args": {"line": 2}}}
+        ]}, "finishReason": "STOP"}], "usageMetadata": {"promptTokenCount": 1}});
+        let mut events =
+            convert_gemini_stream_chunk(&first, &mut state, &HashMap::new(), None, None);
+        events.extend(convert_gemini_stream_chunk(
+            &null_cont,
+            &mut state,
+            &HashMap::new(),
+            None,
+            None,
+        ));
+        events.extend(convert_gemini_stream_chunk(
+            &second_cont,
+            &mut state,
+            &HashMap::new(),
+            None,
+            None,
+        ));
+        events.extend(finalize_gemini_stream(&second_cont, &mut state));
+        let tool_starts = events
+            .iter()
+            .filter(|e| {
+                e["type"] == "content_block_start" && e["content_block"]["type"] == "tool_use"
+            })
+            .count();
+        assert_eq!(tool_starts, 1, "{events:?}");
+        let parsed: Value = serde_json::from_str(&joined_partial_json(&events))
+            .expect("partial_json must stay valid JSON");
+        assert_eq!(parsed, json!({"path": "a.go", "line": 2}));
     }
 }

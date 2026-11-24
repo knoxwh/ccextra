@@ -129,7 +129,7 @@ Grok 交互身份对齐 sub2api `ad05eda15`：Chat/Responses 的 identifier 为 
 
 非流响应 body 有界读取：成功 body 上限 16 MiB（恰好上限可读，多 1 字节拒绝），错误 body 最多保留 256 KiB（超出停止读取并标记截断，截断前缀不当作完整 JSON 解析）；读取停顿与流 chunk idle 共用 180s，每次非空数据后重置，空 chunk 不续期。成功 body 超限返回 502（`api_error`）、停顿返回 504（`timeout_error`，对齐 CPA Claude）；错误 body 截断或读取失败保留已知上游状态（429/401 不被改写），生成有界 Anthropic error，不再触发上游重试。OAuth/project/model 路径同样有界，保留各自 30s 请求总超时。非 Claude 协议非流响应 200 成功但转换层无输出（body 非 JSON、缺 `choices`/`response` 等关键字段、shape 不可识别）时返回 502 `api_error`，不透传上游字节；Claude 直通路径不受此限制。
 
-messages 路径不做本地退避重试：429、5xx（含 Cloudflare 52x）与网络错误在同轮内轮转多 `base_url`，耗尽后快速失败，把末次上游错误（Anthropic error 形状：官方 `error.type` 原样保留，百炼/OpenAI 裸类型按语义归类，其余按上游状态兜底——401 `authentication_error`、402 `billing_error`、403 `permission_error`、404 `not_found_error`、409 `conflict_error`、413 `request_too_large`、429 `rate_limit_error`、408/504 `timeout_error`、529 `overloaded_error`、其他 5xx `api_error`、其余 `invalid_request_error`，对齐 CPA `claudeErrorTypeFromStatus`；上游顶层 `request_id` 保留）返给客户端；退避重试交客户端（如 Claude Code 自带退避），`Retry-After` 头透传；Antigravity 429 与 503（容量不足 `MODEL_CAPACITY_EXHAUSTED`，对齐 CPA `ae3d80f7`）无该头时按 body 解析等待时长（`RetryInfo.retryDelay` → `ErrorInfo.metadata.quotaResetDelay` → message `after Ns` / `after 1h2m3s`，移植 CPA `ParseRetryDelay`），向上取整到秒且至少 1s（对齐 CPA `safeRetryAfterHeader`）后写回 `Retry-After`，上游头优先。429 不本地重试对齐 codex 传输层 `retry_429: false`。流式 OpenAI 请求声明 `Accept: text/event-stream` 和 `Cache-Control: no-cache`。
+messages 路径不做本地退避重试：429、5xx（含 Cloudflare 52x）与网络错误在同轮内轮转多 `base_url`，耗尽后快速失败，把末次上游错误（Anthropic error 形状：官方 `error.type` 原样保留，百炼/OpenAI 裸类型按语义归类，其余按上游状态兜底——401 `authentication_error`、402 `billing_error`、403 `permission_error`、404 `not_found_error`、409 `conflict_error`、413 `request_too_large`、429 `rate_limit_error`、408/504 `timeout_error`、529 `overloaded_error`、其他 5xx `api_error`、其余 `invalid_request_error`，对齐 CPA `claudeErrorTypeFromStatus`；上游顶层 `request_id` 保留）返给客户端；退避重试交客户端（如 Claude Code 自带退避），`Retry-After` 头透传；Antigravity 429 与 503（如容量不足 `MODEL_CAPACITY_EXHAUSTED`，对齐 CPA `ae3d80f7`）无该头时按 body 解析等待时长（`RetryInfo.retryDelay` → `ErrorInfo.metadata.quotaResetDelay` → message `after Ns` / `after 1h2m3s`，移植 CPA `ParseRetryDelay`），向上取整到秒且至少 1s（对齐 CPA `safeRetryAfterHeader`）后写回 `Retry-After`，上游头优先。429 不本地重试对齐 codex 传输层 `retry_429: false`。流式 OpenAI 请求声明 `Accept: text/event-stream` 和 `Cache-Control: no-cache`。
 
 上游 400/422 按错误文案识别特性不兼容（`response_format` / Responses `text.format`、reasoning `off`（须为独立词，offline/offset 不算）、`tool_choice`、tools+reasoning 冲突），按 `(provider, upstream_model)` 记入进程内 unfit 注册表并原地降级请求体重试一次：schema 注入 system/instructions 后剥 format——Chat/Claude 移除顶层 `response_format` / `output_config`，Responses 只剥 `text.format`（保留同级 `text.verbosity`，空则再删顶层 `text`）——effort `off`/`none` 提到 `low`，`tool_choice` 降为 `auto`，或移除 reasoning 配置；降级字段按目标协议形状写（Chat `messages`/`reasoning_effort`/字符串 `tool_choice`，Responses `instructions`/`reasoning.effort`，Claude `system`/`thinking`）。标记跨请求存活，已被标记的模型在首发前就按标记预降级，不再每请求先打一次 400；注入失败时不剥字段也不重试。`/reload` 清空注册表并增代，旧飞行请求的迟到标记丢弃。
 
@@ -145,7 +145,7 @@ Claude Code 会话 ID 优先取 `x-claude-code-session-id`，其次从 `metadata
 
 Responses 流会收集可回放 reasoning。服务端以模型和会话为键保存完整回合，在下一请求中按 tool call 和输入锚点插回兼容的 reasoning 项，防止 `store=false` 上游丢失推理上下文。签名检查按目标提供方族执行；支持 CAQS Envelope v4 容器 field 5 signature 回退与 v4+ 豁免；无效或不兼容的 thinking 不会发到上游。
 
-Antigravity（gemini/flash/agent，不含 claude）使用**独立的** thoughtSignature 账本（`AgReplayCache`），与 Responses 的 `input`/`encrypted_content` 缓存分离。账本 key 为 `{model}[:cred:{凭证摘要}]:claude:{session}:agent:{agent}[:context:{system lane}]`：凭证摘要取该 provider refresh_token 的 sha256 前 8 字节 hex，换账号 / 换凭证后签名不跨账号回放；原 token 不入 key、不打日志；无 refresh_token 时省略该段（对齐 CPA `85225381`）。
+Antigravity（gemini/flash/agent，不含 claude）使用**独立的** thoughtSignature 账本（`AgReplayCache`），与 Responses 的 `input`/`encrypted_content` 缓存分离。账本 key 为 `{model}[:cred:{凭证摘要}]:claude:{session}:agent:{agent}[:context:{system lane}]`：凭证摘要优先取该 provider `refresh_token`、无则回退 `key` 的 sha256 前 8 字节 hex，换账号 / 换凭证后签名不跨账号回放；原凭证不入 key、不打日志；两者均为空时省略该段（对齐 CPA `85225381`）。
 
 账本条目两种形状（对齐 CPA）：
 - `thought_signature`：`thoughtSignature` + 可选 `contentIndex` / `partIndex` / `targetKind`（`text`|`thought`）/ `targetHash` / `targetOccurrence` / `contextHash`
@@ -188,7 +188,7 @@ providers、payload、运行时配置及后台刷新参数保存在统一不可�
 以下行为经审计确认保留，不强制对齐对照实现（CPA / sub2api / Codex 等）：
 
 - Chat 的 `content_filter` 映射为 Anthropic `refusal`（非 `stop`）。
-- Gemini / Antigravity：上游缺 `finishReason` 时合成终态，避免流无终态挂起。
+- Gemini / Antigravity：到 `[DONE]` 或 clean EOF 时，只要尚未下发终态事件（缺 `finishReason` 或缺 `usageMetadata`），一律强制关块并补发终态，避免开放 tool_use JSON 截断或流无终态挂起。
 - Grok Responses 推理账本：空轮仍 append（跟 Codex，不因空内容跳过）。
 - `gemini_schema`：`const`→`enum` 求交与缺省 type 补齐比 CPA 更严。
 - Chat tool 结果抽图 notice 跟 sub2api（不跟 CPA）。
