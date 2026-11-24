@@ -89,7 +89,7 @@ OpenAI Chat 或 Responses 的 provider 级缓存桶标识。来自 Claude Code �
 ## 运行时术语
 
 **UpstreamClient**
-分池发送器：默认车道按 (proxy, antigravity, no_redirect, credential scope) 缓存 `reqwest::Client`；`protocol: claude` 走 Claude TLS fingerprint lane（wreq/BoringSSL），按 (proxy, no_redirect) 缓存进 `fp_clients`；`protocol: anthropic_official` 走独立 `official_clients` 池（同一指纹车道构建 wreq/BoringSSL、按代理键缓存、禁重定向、无总超时）。它选择协议端点、认证、User-Agent、Grok 会话头和流式头。Responses 序列化时先发顶层 `model`、`stream` 和已有 `service_tier`，供网关在大 input 到达前路由；其余键序与值不变。
+分池发送器：默认车道按 (proxy, antigravity, no_redirect, credential scope) 缓存 `reqwest::Client`；`protocol: claude` 走 Claude TLS fingerprint lane（wreq/BoringSSL），按 (proxy, no_redirect) 缓存进 `fp_clients`；`protocol: anthropic_official` 走独立 `official_clients` 池（同一指纹车道构建 wreq/BoringSSL、按代理键缓存、禁重定向、无总超时）。它选择协议端点、认证、User-Agent、Grok 会话头和流式头。Responses 序列化时先发顶层 `model`、`stream` 和已有 `service_tier`，供网关在大 input 到达前路由；其余键序与值不变。Antigravity 序列化时外层信封与 `request` 按官方 proto 字段序排键。
 
 **Grok CLI 身份**
 Grok Chat/Responses 请求使用 `x-grok-client-identifier: grok-pager`、`x-grok-client-mode: interactive` 与 `grok-pager/{version} grok-shell/{version} ({os}; {arch})`。版本默认 `1.0.46`，可由 `user_agents.grok_version` 覆盖；`x-authenticateresponse: authenticate-response` 仅官方 `cli-chat-proxy.grok.com` 添加，不用于普通 API 或其他模型/协议。
@@ -119,7 +119,7 @@ Responses 上游不保留完整会话时，服务端按模型和会话保存兼�
 Gemini 请求的对话表示。`contents` 是回合数组，`parts` 可含 text、`functionCall`、`functionResponse` 或内联图片。
 
 **Antigravity 信封**
-Antigravity 请求的外层对象，含 `model`、`request`、`project`、`requestId`、`requestType` 和 `userAgent`。实际 Gemini body 位于 `request`。
+Antigravity 请求的外层对象，含 `model`、`request`、`project`、`requestId`、`requestType` 和 `userAgent`。实际 Gemini body 位于 `request`。序列化时外层与 `request` 两层按官方 v1internal proto 字段序输出（见 design.md）。
 
 **VALIDATED 工具模式**
 Gemini 函数调用模式。Antigravity Claude 模型强制使用；Gemini 直连在任一工具带 `strict: true` 且 tool_choice 为 auto/缺省时使用。其工具 schema 需要可验证的 object properties，因此清洗器会补必要占位字段。响应侧会按原始 Claude tools 声明把注入的 `"reason"` / `"_"` 占位从 tool_use input 回剥（无参工具归一为 `{}`）。

@@ -138,6 +138,81 @@ pub fn convert_to_antigravity_with(
     (antigravity, short_to_original)
 }
 
+/// 官方 v1internal 外层信封字段序(agy 二进制 proto 序;缺的键跳过,未列出的键保持原序排后)。
+const ENVELOPE_KEY_ORDER: &[&str] = &[
+    "project",
+    "requestId",
+    "request",
+    "model",
+    "userPromptId",
+    "userAgent",
+    "requestType",
+    "enabledCreditTypes",
+];
+
+/// 内层 aiplatform GenerateContentRequest 字段序;toolConfig 紧跟 tools(同官方 proto,
+/// CPA b8e3bc66 未给它排位、落在最后)。
+const REQUEST_KEY_ORDER: &[&str] = &[
+    "contents",
+    "systemInstruction",
+    "tools",
+    "toolConfig",
+    "labels",
+    "safetySettings",
+    "generationConfig",
+    "sessionId",
+];
+
+/// 按官方 proto 字段序紧凑序列化 Antigravity 请求体(对齐 CPA b8e3bc66 的外层信封与
+/// `request` 两层,更深层不动)。只重排键、不克隆值;序列化时排序,OAuth 后补的 `project`
+/// 同样排到最前。非对象 body 原样序列化。
+pub fn serialize_antigravity_body(body: &Value) -> serde_json::Result<Vec<u8>> {
+    match body.as_object() {
+        Some(envelope) => serde_json::to_vec(&OrderedObject {
+            object: envelope,
+            order: ENVELOPE_KEY_ORDER,
+            request_order: Some(REQUEST_KEY_ORDER),
+        }),
+        None => serde_json::to_vec(body),
+    }
+}
+
+struct OrderedObject<'a> {
+    object: &'a serde_json::Map<String, Value>,
+    order: &'static [&'static str],
+    /// 仅外层:`request` 子对象按此序
+    request_order: Option<&'static [&'static str]>,
+}
+
+impl serde::Serialize for OrderedObject<'_> {
+    fn serialize<S: serde::Serializer>(&self, serializer: S) -> Result<S::Ok, S::Error> {
+        use serde::ser::SerializeMap;
+        let mut map = serializer.serialize_map(Some(self.object.len()))?;
+        let ranked = self
+            .order
+            .iter()
+            .filter_map(|key| self.object.get_key_value(*key));
+        let rest = self
+            .object
+            .iter()
+            .filter(|(key, _)| !self.order.contains(&key.as_str()));
+        for (key, value) in ranked.chain(rest) {
+            match (self.request_order, key.as_str(), value.as_object()) {
+                (Some(order), "request", Some(inner)) => map.serialize_entry(
+                    key,
+                    &OrderedObject {
+                        object: inner,
+                        order,
+                        request_order: None,
+                    },
+                )?,
+                _ => map.serialize_entry(key, value)?,
+            }
+        }
+        map.end()
+    }
+}
+
 /// 对齐 CPA dc21a426:归一化 generationConfig.responseJsonSchema → responseSchema
 /// 处理 generationConfig 和 generation_config 两种命名，以及 camelCase/snake_case schema 键
 fn normalize_generation_config_response_schema(request_obj: &mut serde_json::Map<String, Value>) {
@@ -608,11 +683,79 @@ mod tests {
         assert_eq!(step1, 1);
         assert_eq!(step2, 2);
         assert!(ms1 > 1_700_000_000_000);
-        // 键顺序不变:requestId 仍在 request 之前
+        // 内存键序不变(线上键序由 serialize_antigravity_body 决定)
         let keys: Vec<_> = out1.as_object().unwrap().keys().cloned().collect();
         assert_eq!(
             keys,
             ["model", "userAgent", "requestType", "requestId", "request"]
+        );
+    }
+
+    fn wire_keys(value: &Value) -> Vec<String> {
+        value.as_object().unwrap().keys().cloned().collect()
+    }
+
+    /// 对齐 CPA b8e3bc66(部分)+ 官方 v1internal proto:外层信封与 request 两层按官方字段序,
+    /// toolConfig 紧跟 tools;值不变、紧凑无空白;OAuth 后补的 project 也排最前。
+    #[test]
+    fn test_serialize_antigravity_body_uses_official_key_order() {
+        let req = json!({
+            "system": "sys",
+            "max_tokens": 64,
+            "tools": [{"name": "Read", "input_schema": {"type": "object", "properties": {"p": {"type": "string"}}}}],
+            "messages": [{"role": "user", "content": "hi"}]
+        });
+        let (out, _) = convert_to_antigravity_with(
+            &req,
+            "claude-sonnet-4-6",
+            Some("proj-1"),
+            &[],
+            Some("s-1"),
+        );
+        let bytes = serialize_antigravity_body(&out).unwrap();
+        assert!(!bytes.contains(&b'\n'));
+        let wire: Value = serde_json::from_slice(&bytes).unwrap();
+        assert_eq!(wire, out);
+        assert_eq!(
+            wire_keys(&wire),
+            [
+                "project",
+                "requestId",
+                "request",
+                "model",
+                "userAgent",
+                "requestType"
+            ]
+        );
+        assert_eq!(
+            wire_keys(&wire["request"]),
+            [
+                "contents",
+                "systemInstruction",
+                "tools",
+                "toolConfig",
+                "generationConfig",
+                "sessionId"
+            ]
+        );
+
+        let (mut late, _) =
+            convert_to_antigravity_with(&req, "gemini-3-pro-preview", None, &[], Some("s-1"));
+        late["project"] = json!("proj-late");
+        late["extraTopLevel"] = json!(1);
+        let wire: Value =
+            serde_json::from_slice(&serialize_antigravity_body(&late).unwrap()).unwrap();
+        assert_eq!(
+            wire_keys(&wire),
+            [
+                "project",
+                "requestId",
+                "request",
+                "model",
+                "userAgent",
+                "requestType",
+                "extraTopLevel"
+            ]
         );
     }
 

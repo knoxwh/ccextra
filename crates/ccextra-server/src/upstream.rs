@@ -117,6 +117,10 @@ fn serialize_request_body(
     body: &serde_json::Value,
 ) -> serde_json::Result<Vec<u8>> {
     use serde::ser::{SerializeMap, Serializer};
+    // 对齐官方 v1internal proto 字段序(CPA b8e3bc66 部分):外层信封 + request 两层
+    if matches!(protocol, Protocol::Antigravity) {
+        return ccextra_core::convert::serialize_antigravity_body(body);
+    }
     let Some(object) = body
         .as_object()
         .filter(|_| matches!(protocol, Protocol::OpenAiResponses))
@@ -2549,14 +2553,15 @@ mod tests {
             "input": [{"z": 1, "a": 2}], "service_tier": null, "stream": false, "model": "test"
         });
         let original = serde_json::to_vec(&body).unwrap();
-        for protocol in [
-            Protocol::Claude,
-            Protocol::OpenAiChat,
-            Protocol::Gemini,
-            Protocol::Antigravity,
-        ] {
+        for protocol in [Protocol::Claude, Protocol::OpenAiChat, Protocol::Gemini] {
             assert_eq!(serialize_request_body(protocol, &body).unwrap(), original);
         }
+        // Antigravity 按官方 proto 字段序(CPA b8e3bc66 部分):已知键前置,其余保持原序
+        assert_eq!(
+            std::str::from_utf8(&serialize_request_body(Protocol::Antigravity, &body).unwrap())
+                .unwrap(),
+            r#"{"model":"test","input":[{"z":1,"a":2}],"service_tier":null,"stream":false}"#
+        );
         assert_eq!(
             std::str::from_utf8(&serialize_request_body(Protocol::OpenAiResponses, &body).unwrap())
                 .unwrap(),

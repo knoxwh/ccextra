@@ -27,7 +27,9 @@ pub mod to_openai_responses;
 pub mod tool_id;
 pub mod tool_sanitize;
 
-pub use antigravity::{convert_to_antigravity, convert_to_antigravity_with};
+pub use antigravity::{
+    convert_to_antigravity, convert_to_antigravity_with, serialize_antigravity_body,
+};
 pub use antigravity_reasoning_replay::{
     AgReplayAccumulator, AgReplayPrepareReport, AgReplayToolContext, MAX_BYTES_PER_ENTRY,
     MAX_ITEMS_PER_ENTRY, claude_replay_system_lane, collect_ag_replay_from_response,
