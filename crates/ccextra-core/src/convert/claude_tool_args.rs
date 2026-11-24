@@ -823,6 +823,8 @@ pub struct ToolArgStreamState {
     pub current_tool_input_emitted: bool,
     /// 对齐 CPA CurrentToolPendingEmpty:隐式开放工具的 `{}` 延迟到关块再发。
     pub current_tool_pending_empty: bool,
+    /// 对齐 CPA 3a353935 CurrentToolInputOpen:对象参数已发 `{body`,等关块补 `}`。
+    pub current_tool_input_open: bool,
 }
 
 impl ToolArgStreamState {
@@ -832,6 +834,7 @@ impl ToolArgStreamState {
             original_request.is_some_and(|orig| claude_tool_is_parameterless(tool_name, orig));
         self.current_tool_input_emitted = false;
         self.current_tool_pending_empty = false;
+        self.current_tool_input_open = false;
     }
 
     /// 清洗并按无参/隐式开放规则决定是否发射。返回 None 表示本 delta 跳过(延迟空 `{}`)。
@@ -867,11 +870,43 @@ impl ToolArgStreamState {
             }
             return None;
         }
+        // 对齐 CPA 3a353935:对象参数按 `{body` / `,body` 增量发,`}` 留到关块,
+        // 续传块合并后 partial_json 仍是一个合法对象(而非 `{..}{..}`)
+        if serde_json::from_str::<Value>(&cleaned).is_ok_and(|v| v.is_object()) {
+            let body = cleaned
+                .trim()
+                .strip_prefix('{')
+                .and_then(|s| s.strip_suffix('}'))
+                .unwrap_or("")
+                .trim();
+            if body.is_empty() {
+                return None;
+            }
+            let partial = if self.current_tool_input_open {
+                format!(",{body}")
+            } else {
+                self.current_tool_input_open = true;
+                format!("{{{body}")
+            };
+            self.current_tool_input_emitted = true;
+            self.current_tool_pending_empty = false;
+            return Some(partial);
+        }
         if !cleaned.is_empty() {
             self.current_tool_input_emitted = true;
             self.current_tool_pending_empty = false;
         }
         Some(cleaned)
+    }
+
+    /// 关 tool 块时收尾:开放对象补 `}`,否则冲刷延迟的 `{}`(对齐 CPA 3a353935 flushPendingToolInput)。
+    pub fn flush_on_block_close(&mut self) -> Option<String> {
+        if self.current_tool_input_open {
+            self.current_tool_input_open = false;
+            self.current_tool_pending_empty = false;
+            return Some("}".to_string());
+        }
+        self.flush_pending_empty()
     }
 
     /// 关块 / finish 前冲刷延迟的 `{}`(对齐 CPA flushPendingToolInput)。
@@ -1066,16 +1101,19 @@ mod tests {
         let real = state
             .clean_emitted_args(r#"{"user":"v"}"#, "echo", Some(&orig))
             .unwrap();
-        assert_eq!(real, r#"{"user":"v"}"#);
+        // 对齐 CPA 3a353935:对象参数先发 `{body`,`}` 关块时补
+        assert_eq!(real, r#"{"user":"v""#);
         assert!(!state.current_tool_pending_empty);
         assert!(state.flush_pending_empty().is_none());
+        assert_eq!(state.flush_on_block_close().as_deref(), Some("}"));
+        assert!(state.flush_on_block_close().is_none());
 
         let mut state2 = ToolArgStreamState::default();
         state2.begin_tool("echo", Some(&orig));
         let first = state2
             .clean_emitted_args(r#"{"user":"v"}"#, "echo", Some(&orig))
             .unwrap();
-        assert_eq!(first, r#"{"user":"v"}"#);
+        assert_eq!(first, r#"{"user":"v""#);
         assert!(
             state2
                 .clean_emitted_args("{}", "echo", Some(&orig))

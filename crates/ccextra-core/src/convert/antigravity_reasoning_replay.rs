@@ -184,6 +184,10 @@ fn normalize_function_call_part_item(item: &Value) -> Option<Value> {
     if !call_id.is_empty() {
         out["call_id"] = json!(call_id);
     }
+    // 流式续传合并前的首块 args:稳定 tool_use id 由它派生(见 observe_nameless_function_call)
+    if let Some(id_args) = item.get("idArgs") {
+        out["idArgs"] = id_args.clone();
+    }
     if let Some(sig) = item
         .get("thoughtSignature")
         .and_then(|v| v.as_str())
@@ -1222,7 +1226,9 @@ fn apply_function_call_item(
     tools: &ReplayToolTable,
 ) -> FunctionCallReplay {
     let name = str_field(item, "name");
-    let stable_id = gemini_claude_tool_use_id(item_call_id(item), name, item.get("args"));
+    // 续传合并过 args 的条目用首块 args 派生(与流式 tool_use 起块时发出的稳定 id 一致)
+    let id_args = item.get("idArgs").or_else(|| item.get("args"));
+    let stable_id = gemini_claude_tool_use_id(item_call_id(item), name, id_args);
     if let Some((ci, pi)) = locate_function_call_part(contents, fp, index, item, &stable_id, tools)
     {
         // 对齐 CPA eligibility filter :812-821（顺序路径不合格即跳过，:414-416；批量路径
@@ -1971,6 +1977,10 @@ impl AgReplayAccumulator {
             .to_string();
 
         if let Some(fc) = part.get("functionCall") {
+            if str_field(fc, "name").trim().is_empty() {
+                self.observe_nameless_function_call(fc, signature);
+                return;
+            }
             if self.last_response_kind == "text" || self.last_response_kind == "thought" {
                 self.flush_pending_for_kind(&self.last_response_kind.clone());
             }
@@ -2129,6 +2139,65 @@ impl AgReplayAccumulator {
                     self.flush_pending_for_kind("thought");
                 }
             }
+        }
+    }
+
+    /// 无名 functionCall。紧跟 function_call 时是流式续传:args 合并进上一个 call、签名补到
+    /// 该 call(对齐 CPA 3a353935,响应侧同样把续传并入原 tool_use);否则是空 `functionCall:{}`,
+    /// 其签名记为未绑定 pending,交给下一个 functionCall(对齐 CPA f663935d 前向 carrier)。
+    fn observe_nameless_function_call(&mut self, fc: &Value, signature: String) {
+        if self.last_response_kind == "function_call" {
+            if let Some(extra) = fc.get("args").and_then(|v| v.as_object())
+                && !extra.is_empty()
+            {
+                self.merge_args_into_last_function_call(extra);
+            }
+            if !signature.is_empty() && !self.seen_signatures.contains(&signature) {
+                self.attach_detached_signature_to_last_function_call(&signature);
+                self.seen_signatures.insert(signature);
+            }
+            return;
+        }
+        if signature.is_empty() || self.seen_signatures.contains(&signature) {
+            return;
+        }
+        if self.pending_signatures.len() + self.items.len() + 1 > MAX_ITEMS_PER_ENTRY
+            || self.item_bytes.saturating_add(signature.len()) > MAX_BYTES_PER_ENTRY
+        {
+            self.overflow = true;
+            self.seen_signatures.insert(signature);
+            return;
+        }
+        self.pending_signatures
+            .push((signature.clone(), String::new()));
+        self.seen_signatures.insert(signature);
+    }
+
+    /// 续传 args 浅合并进最后一个 function_call_part;首块 args 存为 `idArgs` 供稳定 id 派生。
+    fn merge_args_into_last_function_call(&mut self, extra: &serde_json::Map<String, Value>) {
+        let Some(item) = self
+            .items
+            .iter_mut()
+            .rev()
+            .find(|i| i.get("type").and_then(|v| v.as_str()) == Some("function_call_part"))
+        else {
+            return;
+        };
+        let Some(mut merged) = item.get("args").and_then(|v| v.as_object()).cloned() else {
+            return;
+        };
+        let before = item.to_string().len();
+        if item.get("idArgs").is_none() {
+            item["idArgs"] = Value::Object(merged.clone());
+        }
+        for (k, v) in extra {
+            merged.insert(k.clone(), v.clone());
+        }
+        item["args"] = Value::Object(merged);
+        let after = item.to_string().len();
+        self.item_bytes += after.saturating_sub(before);
+        if self.item_bytes > MAX_BYTES_PER_ENTRY {
+            self.overflow = true;
         }
     }
 
@@ -4257,5 +4326,69 @@ mod tests {
         let once = reordered.clone();
         normalize_function_response_roles(&mut reordered);
         assert_eq!(reordered, once);
+    }
+
+    /// 对齐 CPA 3a353935 #7908:流式续传(无名 functionCall + args + 签名)并入上一个 call;
+    /// 下一轮客户端带合并后的 args 与首块派生的稳定 id 回传 → 签名回到 read_file、原生 id 换回。
+    #[test]
+    fn streaming_continuation_merges_args_and_signature_into_last_call() {
+        let base = base_request();
+        let mut acc = AgReplayAccumulator::new_from_request(&base);
+        acc.observe_response(&json!({"response": {"candidates": [{"content": {"parts": [
+            {"functionCall": {"id": "native-c", "name": "read_file", "args": {"path": "a.go"}}}
+        ]}}]}}));
+        acc.observe_response(&json!({"response": {"candidates": [{"content": {"parts": [
+            {"thoughtSignature": SIG_A, "functionCall": {"args": {"line": 1}}}
+        ]}, "finishReason": "STOP"}]}}));
+        let items = acc.take_commit_items().unwrap();
+        let calls: Vec<&Value> = items
+            .iter()
+            .filter(|i| i["type"] == "function_call_part")
+            .collect();
+        assert_eq!(calls.len(), 1, "{items:?}");
+        assert_eq!(calls[0]["args"], json!({"path": "a.go", "line": 1}));
+        assert_eq!(calls[0]["idArgs"], json!({"path": "a.go"}));
+        assert_eq!(calls[0]["thoughtSignature"], SIG_A);
+
+        let sid =
+            gemini_claude_tool_use_id("native-c", "read_file", Some(&json!({"path": "a.go"})));
+        let mut req = base;
+        req["contents"].as_array_mut().unwrap().extend([
+            json!({"role": "model", "parts": [{"functionCall": {
+                "id": sid, "name": "read_file", "args": {"path": "a.go", "line": 1}}}]}),
+            json!({"role": "user", "parts": [{"functionResponse": {
+                "id": sid, "name": "read_file", "response": {}}}]}),
+        ]);
+        assert!(apply_ag_replay_items(&mut req, &items));
+        let part = &req["contents"][1]["parts"][0];
+        assert_eq!(part["thoughtSignature"], SIG_A);
+        assert_eq!(part["functionCall"]["id"], "native-c");
+        assert_eq!(
+            part["functionCall"]["args"],
+            json!({"path": "a.go", "line": 1})
+        );
+        assert_eq!(
+            req["contents"][2]["parts"][0]["functionResponse"]["id"],
+            "native-c"
+        );
+    }
+
+    /// 对齐 CPA f663935d #7931:带签名的空 `functionCall:{}`(非续传)签名不丢,交给下一个 call。
+    #[test]
+    fn signed_empty_function_call_signature_binds_to_next_call() {
+        let base = base_request();
+        let mut acc = AgReplayAccumulator::new_from_request(&base);
+        acc.observe_response(&json!({"response": {"candidates": [{"content": {"parts": [
+            {"thoughtSignature": SIG_A, "functionCall": {}},
+            {"functionCall": {"id": "native-e", "name": "Read", "args": {"p": "/e"}}}
+        ]}, "finishReason": "STOP"}]}}));
+        let items = acc.take_commit_items().unwrap();
+        let calls: Vec<&Value> = items
+            .iter()
+            .filter(|i| i["type"] == "function_call_part")
+            .collect();
+        assert_eq!(calls.len(), 1, "{items:?}");
+        assert_eq!(calls[0]["thoughtSignature"], SIG_A);
+        assert!(calls[0].get("idArgs").is_none());
     }
 }

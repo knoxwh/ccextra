@@ -22,23 +22,38 @@ pub const AG_REPLAY_CACHE_TTL: Duration = Duration::from_secs(3600);
 /// 对齐 CPA CacheCleanupInterval（signature_cache.go:34，后台 purgeExpired 周期）
 pub const AG_REPLAY_CACHE_CLEANUP_INTERVAL: Duration = Duration::from_secs(600);
 
-/// AG 账本 key：`{model}:claude:{session}:agent:{agent}[:context:{system lane}]`。
+/// AG 账本 key：`{model}[:cred:{scope}]:claude:{session}:agent:{agent}[:context:{system lane}]`。
 ///
 /// 对齐 CPA `ClaudeCodeExecutionScope`（`claude:{session}:agent:{agent}`，缺省 `main`）
 /// 加 `:context:{lane}`（`antigravityClaudeReplaySystemLane`，见
 /// [`ccextra_core::convert::claude_replay_system_lane`]；无 system 时省略），
-/// 前缀 model 对应 CPA scope 的 modelName。读、写、清空必须共用本函数。
+/// 前缀 model 对应 CPA scope 的 modelName；`:cred:{scope}` 为凭证作用域
+/// （[`ag_replay_credential_scope`]，对齐 CPA 85225381 按凭证隔离签名缓存；空则省略）。
+/// 读、写、清空必须共用本函数。
 pub fn ag_replay_session_key(
     upstream_model: &str,
+    credential_scope: &str,
     session: &str,
     agent_id: &str,
     system_lane: &str,
 ) -> String {
-    if system_lane.is_empty() {
-        format!("{upstream_model}:claude:{session}:agent:{agent_id}")
+    let prefix = if credential_scope.is_empty() {
+        upstream_model.to_string()
     } else {
-        format!("{upstream_model}:claude:{session}:agent:{agent_id}:context:{system_lane}")
+        format!("{upstream_model}:cred:{credential_scope}")
+    };
+    if system_lane.is_empty() {
+        format!("{prefix}:claude:{session}:agent:{agent_id}")
+    } else {
+        format!("{prefix}:claude:{session}:agent:{agent_id}:context:{system_lane}")
     }
+}
+
+/// 账本凭证作用域：refresh_token 的 sha256 前 8 字节 hex（对齐 CPA 85225381）。
+/// 换账号 / 换凭证后旧签名不跨账号回放；原 token 不进 key、不打日志。
+pub fn ag_replay_credential_scope(refresh_token: &str) -> String {
+    use sha2::{Digest, Sha256};
+    hex::encode(&Sha256::digest(refresh_token.trim().as_bytes())[..8])
 }
 
 /// 账本条目（对齐 CPA antigravityReasoningReplayEntry 本地模式）。`deleted` 为 tombstone：
@@ -877,28 +892,50 @@ mod tests {
     #[test]
     fn session_key_has_agent_dimension() {
         assert_eq!(
-            ag_replay_session_key("gemini-flash", "sess", "main", ""),
+            ag_replay_session_key("gemini-flash", "", "sess", "main", ""),
             "gemini-flash:claude:sess:agent:main"
         );
         // 缺省头 → main，与显式 main 同一账本
         let missing =
             ccextra_core::session::extract_claude_code_agent_id(&axum::http::HeaderMap::new());
         assert_eq!(
-            ag_replay_session_key("gemini-flash", "sess", &missing, ""),
-            ag_replay_session_key("gemini-flash", "sess", "main", "")
+            ag_replay_session_key("gemini-flash", "", "sess", &missing, ""),
+            ag_replay_session_key("gemini-flash", "", "sess", "main", "")
         );
         assert_ne!(
-            ag_replay_session_key("gemini-flash", "sess", "main", ""),
-            ag_replay_session_key("gemini-flash", "sess", "agent-sub", "")
+            ag_replay_session_key("gemini-flash", "", "sess", "main", ""),
+            ag_replay_session_key("gemini-flash", "", "sess", "agent-sub", "")
         );
+    }
+
+    /// 对齐 CPA 85225381：不同 refresh_token → 不同账本 key；key 里只有摘要不含原 token。
+    #[test]
+    fn credential_scope_separates_ledgers() {
+        let scope_a = ag_replay_credential_scope("refresh-token-account-a");
+        let scope_b = ag_replay_credential_scope("refresh-token-account-b");
+        assert_eq!(scope_a.len(), 16);
+        assert_eq!(
+            scope_a,
+            ag_replay_credential_scope(" refresh-token-account-a ")
+        );
+        assert_ne!(scope_a, scope_b);
+        let key_a = ag_replay_session_key("gemini-flash", &scope_a, "sess", "main", "");
+        let key_b = ag_replay_session_key("gemini-flash", &scope_b, "sess", "main", "");
+        assert_ne!(key_a, key_b);
+        assert_eq!(
+            key_a,
+            format!("gemini-flash:cred:{scope_a}:claude:sess:agent:main")
+        );
+        assert!(!key_a.contains("refresh-token"));
+        cache_roundtrip_isolated(&key_a, &key_b);
     }
 
     /// 主代理与子代理同 session 不互相覆盖；清空只影响对应 agent。
     #[test]
     fn agent_ledgers_are_isolated_for_store_and_invalidate() {
         let cache = AgReplayCache::new(Duration::from_secs(60), 128);
-        let main = ag_replay_session_key("gemini-flash", "sess-a", "main", "");
-        let sub = ag_replay_session_key("gemini-flash", "sess-a", "agent-sub", "");
+        let main = ag_replay_session_key("gemini-flash", "", "sess-a", "main", "");
+        let sub = ag_replay_session_key("gemini-flash", "", "sess-a", "agent-sub", "");
         cache.replace_items(&main, vec![fc_item("sig-main-long-enough")]);
         cache.replace_items(&sub, vec![fc_item("sig-sub-long-enough-")]);
         assert_eq!(
@@ -932,8 +969,8 @@ mod tests {
         let lane_a = claude_replay_system_lane(&json!({"system": "You are A."}));
         let lane_b = claude_replay_system_lane(&json!({"system": "You are B."}));
         assert_ne!(lane_a, lane_b);
-        let key_a = ag_replay_session_key("gemini-flash", "sess", "main", &lane_a);
-        let key_b = ag_replay_session_key("gemini-flash", "sess", "main", &lane_b);
+        let key_a = ag_replay_session_key("gemini-flash", "", "sess", "main", &lane_a);
+        let key_b = ag_replay_session_key("gemini-flash", "", "sess", "main", &lane_b);
         assert_eq!(
             key_a,
             format!("gemini-flash:claude:sess:agent:main:context:{lane_a}")
@@ -1462,5 +1499,36 @@ mod tests {
             .await
             .expect("purge task exits after cache dropped")
             .unwrap();
+    }
+
+    /// 对齐 CPA 3a353935:流式续传经 `Drop` 提交后,账本里是一条合并 args + 续传签名的 call。
+    #[test]
+    fn stream_continuation_commits_merged_call_on_drop() {
+        let cache = AgReplayCache::new(Duration::from_secs(60), 128);
+        let key = ag_replay_session_key("gemini-flash", "", "sess-cont", "main", "");
+        let request = json!({"contents": [{"role": "user", "parts": [{"text": "hi"}]}]});
+        {
+            let mut extractor = AgStreamReplayExtractor::new(
+                cache.clone(),
+                key.clone(),
+                AgReplaySnapshot::default(),
+                &request,
+            );
+            extractor.push(
+                br#"data: {"response":{"candidates":[{"content":{"parts":[{"functionCall":{"id":"n1","name":"read_file","args":{"path":"a.go"}}}]}}]}}
+
+"#,
+            );
+            extractor.push(
+                br#"data: {"response":{"candidates":[{"content":{"parts":[{"thoughtSignature":"sig-cont-long-enough","functionCall":{"args":{"line":1}}}]},"finishReason":"STOP"}]}}
+
+"#,
+            );
+        }
+        let (items, _) = cache.get_items(&key).expect("committed on drop");
+        assert_eq!(items.len(), 1, "{items:?}");
+        assert_eq!(items[0]["args"], json!({"path": "a.go", "line": 1}));
+        assert_eq!(items[0]["idArgs"], json!({"path": "a.go"}));
+        assert_eq!(items[0]["thoughtSignature"], "sig-cont-long-enough");
     }
 }

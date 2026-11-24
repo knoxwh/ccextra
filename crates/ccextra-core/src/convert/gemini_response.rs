@@ -84,6 +84,8 @@ pub struct GeminiStreamState {
     pub api_error_emitted: bool,
     /// 工具参数清洗流状态(对齐 CPA CurrentTool*)
     pub tool_args: ToolArgStreamState,
+    /// 续传块带来的签名:关 tool 块后再发 carrier(对齐 CPA 3a353935 CurrentToolSignature)
+    pending_tool_signature: String,
     /// 是否见过 usageMetadata(对齐 CPA HasUsageMetadata)
     has_usage: bool,
     /// 是否见过 finishReason(对齐 CPA HasFinishReason)
@@ -160,9 +162,11 @@ fn append_signature_delta(events: &mut Vec<Value>, state: &mut GeminiStreamState
     state.has_content = true;
 }
 
-/// 关块前冲刷延迟的空 `{}`(对齐 CPA e1fb2521 flushPendingToolInput)。
+/// 关块前冲刷延迟的空 `{}` / 补开放对象的 `}`(对齐 CPA e1fb2521、3a353935 flushPendingToolInput);
+/// 关的是 tool 块且有延后的续传签名时,紧接着发独立 carrier(占用下一 index,调用方照常 +1)。
 fn push_content_block_stop(events: &mut Vec<Value>, state: &mut GeminiStreamState) {
-    if let Some(partial) = state.tool_args.flush_pending_empty() {
+    let closing_tool = state.response_type == ResponseType::Function;
+    if let Some(partial) = state.tool_args.flush_on_block_close() {
         events.push(json!({
             "type": "content_block_delta",
             "index": state.response_index,
@@ -176,6 +180,25 @@ fn push_content_block_stop(events: &mut Vec<Value>, state: &mut GeminiStreamStat
         "type": "content_block_stop",
         "index": state.response_index
     }));
+    if closing_tool && !state.pending_tool_signature.is_empty() {
+        let signature = std::mem::take(&mut state.pending_tool_signature);
+        state.response_index += 1;
+        events.push(json!({
+            "type": "content_block_start",
+            "index": state.response_index,
+            "content_block": {"type": "thinking", "thinking": ""}
+        }));
+        events.push(json!({
+            "type": "content_block_delta",
+            "index": state.response_index,
+            "delta": {"type": "signature_delta", "signature": signature}
+        }));
+        events.push(json!({
+            "type": "content_block_stop",
+            "index": state.response_index
+        }));
+        state.has_content = true;
+    }
 }
 
 pub fn convert_gemini_stream_chunk(
@@ -314,8 +337,9 @@ pub fn convert_gemini_stream_chunk(
                             }));
                         }
                     }
+                    // 对齐 CPA 3a353935:续传签名延后到 tool 块关闭后再发 carrier,不提前切断参数流
                     if has_thought_signature {
-                        append_carrier_thinking_block(&mut events, state, &signature_value);
+                        state.pending_tool_signature = signature_value;
                     }
                     continue;
                 }
@@ -1775,9 +1799,12 @@ mod tests {
                 convert_gemini_stream_chunk(&first, &mut state, &HashMap::new(), None, Some(&orig));
             let e2 =
                 convert_gemini_stream_chunk(&cont, &mut state, &HashMap::new(), None, Some(&orig));
+            // 对象参数的 `}` 在关块时补(对齐 CPA 3a353935)
+            let e3 = force_finalize_gemini_stream(&mut state);
             let partial: String = e1
                 .iter()
                 .chain(e2.iter())
+                .chain(e3.iter())
                 .filter(|e| e["delta"]["type"] == "input_json_delta")
                 .map(|e| {
                     e["delta"]["partial_json"]
@@ -2197,5 +2224,175 @@ mod tests {
         let content = out["content"].as_array().expect("content");
         assert_eq!(content.len(), 1, "{out}");
         assert_eq!(content[0]["type"], "text");
+    }
+
+    const CONT_SIG: &str = "sig-continuation-0123456789";
+
+    fn tool_first_chunk() -> Value {
+        json!({"candidates": [{"content": {"parts": [
+            {"functionCall": {"id": "native-r", "name": "read_file", "args": {"path": "a.go"}}}
+        ]}}]})
+    }
+
+    fn tool_continuation_chunk(finish: bool) -> Value {
+        let mut chunk = json!({"candidates": [{"content": {"parts": [
+            {"thoughtSignature": CONT_SIG, "functionCall": {"args": {"line": 1}}}
+        ]}}]});
+        if finish {
+            chunk["candidates"][0]["finishReason"] = json!("STOP");
+            chunk["usageMetadata"] = json!({"promptTokenCount": 3, "candidatesTokenCount": 2});
+        }
+        chunk
+    }
+
+    fn joined_partial_json(events: &[Value]) -> String {
+        events
+            .iter()
+            .filter(|e| e["delta"]["type"] == "input_json_delta")
+            .filter_map(|e| e["delta"]["partial_json"].as_str())
+            .collect()
+    }
+
+    /// 续传后:唯一 tool_use、参数合并为合法对象、tool 块关闭后紧跟承载续传签名的 carrier。
+    fn assert_continuation_shape(events: &[Value]) {
+        let tool_starts: Vec<usize> = events
+            .iter()
+            .enumerate()
+            .filter(|(_, e)| {
+                e["type"] == "content_block_start" && e["content_block"]["type"] == "tool_use"
+            })
+            .map(|(i, _)| i)
+            .collect();
+        assert_eq!(tool_starts.len(), 1, "{events:?}");
+        let partial = joined_partial_json(events);
+        let parsed: Value = serde_json::from_str(&partial).expect("valid partial_json");
+        assert_eq!(parsed, json!({"path": "a.go", "line": 1}));
+        let tool_index = events[tool_starts[0]]["index"].clone();
+        let stop = events
+            .iter()
+            .position(|e| e["type"] == "content_block_stop" && e["index"] == tool_index)
+            .expect("tool block closed");
+        // tool 块内不得插入其它块(续传签名不能提前切断参数流)
+        assert!(
+            events[tool_starts[0] + 1..stop]
+                .iter()
+                .all(|e| e["type"] == "content_block_delta"),
+            "{events:?}"
+        );
+        let carrier_index = tool_index.as_u64().unwrap() + 1;
+        assert_eq!(events[stop + 1]["type"], "content_block_start");
+        assert_eq!(events[stop + 1]["index"], carrier_index);
+        assert_eq!(events[stop + 1]["content_block"]["type"], "thinking");
+        assert_eq!(events[stop + 2]["delta"]["signature"], CONT_SIG);
+        assert_eq!(events[stop + 3]["type"], "content_block_stop");
+        assert_eq!(events[stop + 3]["index"], carrier_index);
+    }
+
+    /// 对齐 CPA 3a353935 #7908:AG 路径续传(无名 + args + 签名 + STOP)留在原 tool_use 块。
+    #[test]
+    fn test_stream_signed_continuation_keeps_single_valid_tool_use_antigravity() {
+        let model = Some("gemini-3-pro-preview");
+        let mut state = GeminiStreamState::default();
+        let first = tool_first_chunk();
+        let cont = tool_continuation_chunk(true);
+        let mut events =
+            convert_gemini_stream_chunk(&first, &mut state, &HashMap::new(), model, None);
+        events.extend(convert_gemini_stream_chunk(
+            &cont,
+            &mut state,
+            &HashMap::new(),
+            model,
+            None,
+        ));
+        events.extend(finalize_gemini_stream(&cont, &mut state));
+        assert_continuation_shape(&events);
+        assert_eq!(events.last().unwrap()["type"], "message_delta");
+        assert_eq!(events.last().unwrap()["delta"]["stop_reason"], "tool_use");
+    }
+
+    /// 同上,Gemini 直连(signature_model = None)。
+    #[test]
+    fn test_stream_signed_continuation_keeps_single_valid_tool_use_gemini_direct() {
+        let mut state = GeminiStreamState::default();
+        let first = tool_first_chunk();
+        let cont = tool_continuation_chunk(true);
+        let mut events =
+            convert_gemini_stream_chunk(&first, &mut state, &HashMap::new(), None, None);
+        events.extend(convert_gemini_stream_chunk(
+            &cont,
+            &mut state,
+            &HashMap::new(),
+            None,
+            None,
+        ));
+        events.extend(finalize_gemini_stream(&cont, &mut state));
+        assert_continuation_shape(&events);
+    }
+
+    /// 上游缺 finishReason 断流([DONE]/EOF force 收尾):仍补 `}` 并发出延后的 carrier。
+    #[test]
+    fn test_stream_continuation_force_finalize_closes_brace_and_emits_carrier() {
+        let model = Some("gemini-3-pro-preview");
+        let mut state = GeminiStreamState::default();
+        let first = tool_first_chunk();
+        let cont = tool_continuation_chunk(false);
+        let mut events =
+            convert_gemini_stream_chunk(&first, &mut state, &HashMap::new(), model, None);
+        events.extend(convert_gemini_stream_chunk(
+            &cont,
+            &mut state,
+            &HashMap::new(),
+            model,
+            None,
+        ));
+        assert!(!joined_partial_json(&events).ends_with('}'));
+        events.extend(force_finalize_gemini_stream(&mut state));
+        assert_continuation_shape(&events);
+    }
+
+    /// 续传后紧跟新工具:前一块补 `}` + carrier,新 tool_use 索引顺延不冲突。
+    #[test]
+    fn test_stream_continuation_then_new_tool_keeps_indices_monotonic() {
+        let mut state = GeminiStreamState::default();
+        let first = tool_first_chunk();
+        let cont = tool_continuation_chunk(false);
+        let next = json!({"candidates": [{"content": {"parts": [
+            {"functionCall": {"name": "list_dir", "args": {"dir": "."}}}
+        ]}, "finishReason": "STOP"}], "usageMetadata": {"promptTokenCount": 1}});
+        let mut events =
+            convert_gemini_stream_chunk(&first, &mut state, &HashMap::new(), None, None);
+        events.extend(convert_gemini_stream_chunk(
+            &cont,
+            &mut state,
+            &HashMap::new(),
+            None,
+            None,
+        ));
+        let split = events.len();
+        events.extend(convert_gemini_stream_chunk(
+            &next,
+            &mut state,
+            &HashMap::new(),
+            None,
+            None,
+        ));
+        events.extend(finalize_gemini_stream(&next, &mut state));
+        let first_tool: Vec<Value> = events[..split]
+            .iter()
+            .cloned()
+            .chain(
+                events[split..]
+                    .iter()
+                    .take_while(|e| e["content_block"]["type"] != "tool_use")
+                    .cloned(),
+            )
+            .collect();
+        assert_continuation_shape(&first_tool);
+        let starts: Vec<u64> = events
+            .iter()
+            .filter(|e| e["type"] == "content_block_start")
+            .map(|e| e["index"].as_u64().unwrap())
+            .collect();
+        assert_eq!(starts, vec![0, 1, 2], "{events:?}");
     }
 }

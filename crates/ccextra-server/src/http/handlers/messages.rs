@@ -653,9 +653,19 @@ pub(crate) async fn prepare_message_request(
         Protocol::Antigravity => {
             original_claude_request = Some(Arc::new(tools_only_snapshot(&body_json)));
             if ccextra_core::antigravity_uses_reasoning_replay(&route.upstream_model) {
+                // 对齐 CPA 85225381：账本按凭证隔离（refresh_token 摘要，原值不入 key / 日志）
+                let credential_scope = route
+                    .provider_config(providers)
+                    .and_then(|p| p.metadata.as_ref())
+                    .and_then(|m| m.get("refresh_token"))
+                    .map(|s| s.trim())
+                    .filter(|s| !s.is_empty())
+                    .map(crate::sse::antigravity_replay_cache::ag_replay_credential_scope)
+                    .unwrap_or_default();
                 ag_replay_key = cc_session.as_deref().map(|sess| {
                     crate::sse::antigravity_replay_cache::ag_replay_session_key(
                         &route.upstream_model,
+                        &credential_scope,
                         sess,
                         &extract_claude_code_agent_id(headers),
                         &ccextra_core::convert::claude_replay_system_lane(&body_json),

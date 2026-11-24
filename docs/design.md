@@ -135,7 +135,7 @@ messages 路径不做本地退避重试：429、5xx（含 Cloudflare 52x）与�
 
 ## 响应转发
 
-Claude 响应字节直通，只在完整事件边界（`\n\n` / `\r\n\r\n`，含跨 chunk 分隔符）放行：EOF 原样冲刷剩余字节，读失败或空闲超时丢弃半截事件再发 `error`，因此心跳与错误帧不会插进半截事件。OpenAI Chat、OpenAI Responses、Gemini 和 Antigravity 分别由状态机转换为 Anthropic SSE。状态机维护 content block、thinking、工具调用、usage（含 `output_tokens_details.reasoning_tokens`）和终态，避免上游事件交错破坏 Anthropic 事件顺序。Chat 状态机在工具块未关闭前缓存交错文本与思考并在 finalize 时按序输出。Responses 上游未输出 `output_text.delta` 时从 `response.completed` 恢复 terminal 文本；0 token 的 `response.incomplete` 会直接抛出错误。Gemini 保持活跃思考块跨空文本片段不中断。
+Claude 响应字节直通，只在完整事件边界（`\n\n` / `\r\n\r\n`，含跨 chunk 分隔符）放行：EOF 原样冲刷剩余字节，读失败或空闲超时丢弃半截事件再发 `error`，因此心跳与错误帧不会插进半截事件。OpenAI Chat、OpenAI Responses、Gemini 和 Antigravity 分别由状态机转换为 Anthropic SSE。状态机维护 content block、thinking、工具调用、usage（含 `output_tokens_details.reasoning_tokens`）和终态，避免上游事件交错破坏 Anthropic 事件顺序。Chat 状态机在工具块未关闭前缓存交错文本与思考并在 finalize 时按序输出。Responses 上游未输出 `output_text.delta` 时从 `response.completed` 恢复 terminal 文本；0 token 的 `response.incomplete` 会直接抛出错误。Gemini 保持活跃思考块跨空文本片段不中断。Gemini / Antigravity 流式工具调用的续传块（无名 `functionCall`）留在原 tool_use 块：对象参数按 `{…` / `,…` 增量发、关块（含 `[DONE]`/EOF 强制收尾）时补 `}`，合并后的 `partial_json` 是一个合法对象；续传块的 thoughtSignature 延后到 tool 块关闭后以独立空 thinking carrier 发出，不提前切断参数流（对齐 CPA `3a353935`）。
 
 OpenAI 首帧预读跳过 `: keepalive` 心跳帧，只认业务帧（心跳帧会骗过错误检测、提前提交 200 丧失重试窗口）；首帧 error 内部重试一次，仍失败返回 502 Anthropic error，不提交 200。已输出首帧后的错误、未满足终态的 EOF、空 Gemini 风格流、读取错误和上游 180s chunk idle 产生结构化 Anthropic error，而不是裸断开。终态事件（含 `message_stop`）完整下发后立即结束流并关闭上游连接，不等上游 EOF（上游在 keep-alive/HTTP2 复用连接上可能拖延关流）。每条流式路径统一包裹 10 秒空闲心跳 `: keepalive\n\n`（`anthropic_official` 除外，其响应字节原样回传）。非流 Claude 直通；其他路径转换为 Anthropic JSON，无法转换时保留上游原始 body。
 
@@ -145,13 +145,13 @@ Claude Code 会话 ID 优先取 `x-claude-code-session-id`，其次从 `metadata
 
 Responses 流会收集可回放 reasoning。服务端以模型和会话为键保存完整回合，在下一请求中按 tool call 和输入锚点插回兼容的 reasoning 项，防止 `store=false` 上游丢失推理上下文。签名检查按目标提供方族执行；支持 CAQS Envelope v4 容器 field 5 signature 回退与 v4+ 豁免；无效或不兼容的 thinking 不会发到上游。
 
-Antigravity（gemini/flash/agent，不含 claude）使用**独立的** thoughtSignature 账本（`AgReplayCache`），与 Responses 的 `input`/`encrypted_content` 缓存分离。
+Antigravity（gemini/flash/agent，不含 claude）使用**独立的** thoughtSignature 账本（`AgReplayCache`），与 Responses 的 `input`/`encrypted_content` 缓存分离。账本 key 为 `{model}[:cred:{凭证摘要}]:claude:{session}:agent:{agent}[:context:{system lane}]`：凭证摘要取该 provider refresh_token 的 sha256 前 8 字节 hex，换账号 / 换凭证后签名不跨账号回放；原 token 不入 key、不打日志；无 refresh_token 时省略该段（对齐 CPA `85225381`）。
 
 账本条目两种形状（对齐 CPA）：
 - `thought_signature`：`thoughtSignature` + 可选 `contentIndex` / `partIndex` / `targetKind`（`text`|`thought`）/ `targetHash` / `targetOccurrence` / `contextHash`
-- `function_call_part`：`name` + `args` + 可选 `call_id` / `thoughtSignature` + 同上索引字段
+- `function_call_part`：`name` + `args` + 可选 `call_id` / `thoughtSignature` / `idArgs` + 同上索引字段
 
-累积与提交：流式与非流式从上游 `candidates[].parts` 累积可回放项；`finishReason` **只标记 terminal**，不立即落库（后续帧仍可能带 signature / usage）。流式在 SSE 结束（`finish` / `Drop`）时若 terminal 才提交；非流在完整 body 观察后提交。terminal 但空或字节/条数溢出则清空该会话账本；非 terminal 不动缓存。
+累积与提交：流式与非流式从上游 `candidates[].parts` 累积可回放项；`finishReason` **只标记 terminal**，不立即落库（后续帧仍可能带 signature / usage）。流式在 SSE 结束（`finish` / `Drop`）时若 terminal 才提交；非流在完整 body 观察后提交。terminal 但空或字节/条数溢出则清空该会话账本；非 terminal 不动缓存。紧跟 functionCall 的无名续传 `functionCall` 把 args 浅合并进上一个 call、签名补到该 call（首块 args 存为 `idArgs`，回放时稳定 tool_use id 由它派生，与流式起块时发出的 id 一致；对齐 CPA `3a353935`）；不跟在 functionCall 后的带签名空 `functionCall:{}` 不再丢签名，记为未绑定签名交给下一个 functionCall（对齐 CPA `f663935d` 前向 carrier）。
 
 下一轮在已有 `request.contents` part 上补回 `thoughtSignature`，稳定 tool_use id（`ccx_gemini_…`）换回原生 `functionCall.id`，孤儿 `functionResponse` 按账本插回缺失的 functionCall（对齐 CPA）。上游 400 且 body 含 `signature` 时按读账本快照清空该会话账本（unfit 与 401 重试不清）。
 
