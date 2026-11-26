@@ -153,15 +153,15 @@ fn process_gemini_events(
 
         // Gemini 流式响应格式与 OpenAI 类似,但字段名和结构不同:
         if !relay.message_started {
-            let msg_id = chunk
-                .get("responseId")
-                .and_then(|value| value.as_str())
-                .unwrap_or("");
+            // 缺失/空白 responseId 合成 msg_ id(对齐 CPA da4396fd)
+            let msg_id = ccextra_core::convert::resolve_claude_message_id(
+                chunk.get("responseId").and_then(|value| value.as_str()),
+            );
             let model = chunk
                 .get("modelVersion")
                 .and_then(|value| value.as_str())
                 .unwrap_or("");
-            output.push(emit::message_start(msg_id, model, input_tokens, 0, true));
+            output.push(emit::message_start(&msg_id, model, input_tokens, 0, true));
             relay.message_started = true;
         }
 
@@ -454,6 +454,39 @@ mod tests {
             "{output}"
         );
         assert_eq!(output.matches("event: message_stop").count(), 1, "{output}");
+    }
+
+    /// 对齐 CPA da4396fd:流式 message_start 在 responseId 缺失/空白时合成 msg_ id,非空则去空白沿用
+    #[tokio::test]
+    async fn test_message_start_id_fallback_and_trim() {
+        let start_id = |output: &str| -> String {
+            let line = output
+                .lines()
+                .find(|l| l.starts_with("data: ") && l.contains("\"message_start\""))
+                .unwrap()
+                .to_string();
+            let v: serde_json::Value = serde_json::from_str(&line["data: ".len()..]).unwrap();
+            v["message"]["id"].as_str().unwrap().to_string()
+        };
+        let mut ids = Vec::new();
+        for rid in ["", ",\"responseId\":\"\"", ",\"responseId\":\"  \""] {
+            let frame = format!(
+                "data: {{\"response\":{{\"candidates\":[{{\"content\":{{\"role\":\"model\",\"parts\":[{{\"text\":\"hi\"}}]}},\"finishReason\":\"STOP\"}}]{rid}}}}}\n\n"
+            );
+            let output =
+                collect_antigravity_output(stream::iter(vec![Ok(Bytes::from(frame))])).await;
+            let id = start_id(&output);
+            assert!(id.starts_with("msg_") && id.len() > 4, "{output}");
+            ids.push(id);
+        }
+        ids.dedup();
+        assert_eq!(ids.len(), 3, "{ids:?}");
+
+        let output = collect_output(stream::iter(vec![Ok(Bytes::from(
+            "data: {\"responseId\":\"  resp_1  \",\"candidates\":[{\"content\":{\"parts\":[{\"text\":\"hi\"}]},\"finishReason\":\"STOP\"}]}\n\n",
+        ))]))
+        .await;
+        assert_eq!(start_id(&output), "resp_1");
     }
 
     #[tokio::test]

@@ -12,6 +12,23 @@ use super::tool_id::{claude_tool_id_for, gemini_claude_tool_use_id};
 /// 全局工具使用 ID 计数器
 static TOOL_USE_ID_COUNTER: AtomicU64 = AtomicU64::new(0);
 
+/// 合成 Claude message id 的进程级计数器(对齐 CPA claudeResponseIDCounter)
+static CLAUDE_MESSAGE_ID_COUNTER: AtomicU64 = AtomicU64::new(0);
+
+/// Claude message id(对齐 CPA da4396fd resolveAntigravityClaudeMessageID):
+/// 上游 `responseId` 去空白后非空则沿用;缺失或空白时合成 `msg_{unix 纳秒十六进制}_{计数}`,
+/// Claude Code 靠 message id 归并对话记录,不能为空。
+pub fn resolve_claude_message_id(response_id: Option<&str>) -> String {
+    if let Some(id) = response_id.map(str::trim).filter(|id| !id.is_empty()) {
+        return id.to_string();
+    }
+    let nanos = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map_or(0, |d| d.as_nanos());
+    let seq = CLAUDE_MESSAGE_ID_COUNTER.fetch_add(1, Ordering::Relaxed) + 1;
+    format!("msg_{nanos:x}_{seq}")
+}
+
 /// Claude 侧 tool_use id(对齐 CPA antigravityClaudeToolUseID):
 /// AG Gemini 族(与 reasoning replay 同门禁)且上游给了非空原生 `functionCall.id` 时,
 /// 用 (原生 id, name, args) 派生稳定 id,回放时据账本换回原生 id;
@@ -728,9 +745,9 @@ pub fn convert_gemini_response(
         }
     });
 
-    if let Some(response_id) = response.get("responseId").and_then(|r| r.as_str()) {
-        anthropic["id"] = json!(response_id);
-    }
+    anthropic["id"] = json!(resolve_claude_message_id(
+        response.get("responseId").and_then(|r| r.as_str())
+    ));
     if let Some(model) = response.get("modelVersion").and_then(|m| m.as_str()) {
         anthropic["model"] = json!(model);
     }
@@ -910,6 +927,28 @@ mod tests {
         assert_eq!(anthropic["role"], "assistant");
         assert_eq!(anthropic["model"], "gemini-2.0");
         assert_eq!(anthropic["id"], "resp_123");
+        // 对齐 CPA da4396fd:缺失/空/空白 responseId 合成唯一 msg_ id
+        for gemini in [
+            json!({"candidates": []}),
+            json!({"responseId": "", "candidates": []}),
+            json!({"responseId": "   ", "candidates": []}),
+        ] {
+            let id1 = convert_gemini_response(&gemini, &tool_map, None, None)["id"].clone();
+            let id2 = convert_gemini_response(&gemini, &tool_map, None, None)["id"].clone();
+            let id1 = id1.as_str().unwrap();
+            assert!(id1.starts_with("msg_") && id1.len() > 4, "{id1}");
+            assert!(id2.as_str().unwrap().starts_with("msg_"));
+            assert_ne!(id1, id2.as_str().unwrap());
+        }
+        assert_eq!(
+            convert_gemini_response(
+                &json!({"responseId": "  resp_trim  ", "candidates": []}),
+                &tool_map,
+                None,
+                None
+            )["id"],
+            "resp_trim"
+        );
         assert_eq!(anthropic["stop_reason"], "end_turn");
 
         let content = anthropic["content"].as_array().unwrap();

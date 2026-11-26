@@ -47,7 +47,7 @@ pub use fix_json::fix_json_quotes;
 pub use gemini::{convert_to_gemini, convert_to_gemini_with_registry};
 pub use gemini_response::{
     GeminiStreamState, convert_gemini_response, convert_gemini_stream_chunk,
-    finalize_gemini_stream, force_finalize_gemini_stream,
+    finalize_gemini_stream, force_finalize_gemini_stream, resolve_claude_message_id,
 };
 pub use gemini_schema::{
     clean_json_schema_for_antigravity, clean_json_schema_for_antigravity_claude_tool,
