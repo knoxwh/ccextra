@@ -710,7 +710,7 @@ mod tests {
         assert!(schema.get("$schema").is_none());
     }
 
-    /// AG Claude 模型不映射 output_config.format(CPA 另走 system 结构化输出路径,未移植)
+    /// AG Claude 模型保守不映射 output_config.format(CPA 5-5 走 system 结构化输出、其余原生下发,均未跟)
     #[test]
     fn test_output_config_json_schema_skipped_for_antigravity_claude() {
         let mut body = base_body();

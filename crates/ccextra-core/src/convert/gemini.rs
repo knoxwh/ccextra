@@ -192,10 +192,10 @@ pub fn convert_to_gemini_with_registry(
     }
     // output_config.format(json_schema)→ responseMimeType + responseJsonSchema(对齐 CPA
     // 32842348/ac415c08/62c419e0);Gemini 直连 schema 原样下发,Antigravity 由
-    // convert_to_antigravity 改名 responseSchema 并按响应 schema 清洗。AG Claude 模型不映射
-    // (CPA 对其另有把 schema 改写进 system 的结构化输出路径,ccextra 未移植)。
-    let is_antigravity_claude =
-        flavor == SchemaFlavor::Antigravity && upstream_model.to_lowercase().contains("claude");
+    // convert_to_antigravity 改名 responseSchema 并按响应 schema 清洗。AG Claude 模型保守不映射
+    // (CPA 对 claude-opus/sonnet-5-5 改写进 system 结构化输出,其余 Claude 原生下发
+    // responseSchema;两者 ccextra 均未跟,保持原先丢弃)。
+    let is_antigravity_claude = flavor == SchemaFlavor::Antigravity && is_claude_target;
     if !is_antigravity_claude && let Some(schema) = claude_output_json_schema(body) {
         generation_config.insert("responseMimeType".into(), "application/json".into());
         generation_config.insert("responseJsonSchema".into(), schema.clone());
