@@ -132,6 +132,9 @@ pub fn convert_to_antigravity_with(
         normalize_generation_config_response_schema(&mut request_obj);
         clean_generation_config_response_schema(&mut request_obj);
 
+        // 对齐 CPA 38067a29:systemInstruction 合并单段、functionResponse result → output
+        normalize_antigravity_request_format(&mut request_obj);
+
         request_obj.insert("sessionId".to_string(), Value::String(derived_session_id));
 
         antigravity["request"] = Value::Object(request_obj);
@@ -246,6 +249,72 @@ fn clean_generation_config_response_schema(request_obj: &mut serde_json::Map<Str
         for key in ["responseSchema", "response_schema"] {
             if let Some(schema) = gc.get_mut(key).filter(|s| s.is_object()) {
                 *schema = clean_json_schema_for_antigravity_response(schema);
+            }
+        }
+    }
+}
+
+/// 对齐 CPA 38067a29 NormalizeAntigravityRequestDoc(官方 Antigravity 线格式)
+fn normalize_antigravity_request_format(request_obj: &mut serde_json::Map<String, Value>) {
+    normalize_antigravity_system_instruction(request_obj);
+    normalize_antigravity_function_response_results(request_obj);
+}
+
+/// systemInstruction 置 `role: user`;parts 全为字符串 `text` 时,非空文本以 `\n\n` 合并成
+/// 单个 part,全空则删除 systemInstruction;含非文本 part 或 parts 为空时只置 role
+fn normalize_antigravity_system_instruction(request_obj: &mut serde_json::Map<String, Value>) {
+    let Some(Value::Object(instruction)) = request_obj.get_mut("systemInstruction") else {
+        return;
+    };
+    instruction.insert("role".to_string(), Value::String("user".to_string()));
+    let Some(parts) = instruction
+        .get("parts")
+        .and_then(Value::as_array)
+        .filter(|parts| !parts.is_empty())
+    else {
+        return;
+    };
+    let mut texts = Vec::with_capacity(parts.len());
+    for part in parts {
+        let Some(text) = part.get("text").and_then(Value::as_str) else {
+            return;
+        };
+        if !text.is_empty() {
+            texts.push(text);
+        }
+    }
+    if texts.is_empty() {
+        request_obj.remove("systemInstruction");
+        return;
+    }
+    let merged = texts.join("\n\n");
+    instruction.insert("parts".to_string(), serde_json::json!([{ "text": merged }]));
+}
+
+/// `functionResponse.response` 只有一个字符串 `result` 时改名为 `output`(兼容蛇形键)
+fn normalize_antigravity_function_response_results(
+    request_obj: &mut serde_json::Map<String, Value>,
+) {
+    let Some(Value::Array(contents)) = request_obj.get_mut("contents") else {
+        return;
+    };
+    for content in contents {
+        let Some(Value::Array(parts)) = content.get_mut("parts") else {
+            continue;
+        };
+        for part in parts {
+            for field in ["functionResponse", "function_response"] {
+                let Some(Value::Object(response)) =
+                    part.get_mut(field).and_then(|f| f.get_mut("response"))
+                else {
+                    continue;
+                };
+                if response.len() == 1
+                    && response.get("result").is_some_and(Value::is_string)
+                    && let Some(result) = response.remove("result")
+                {
+                    response.insert("output".to_string(), result);
+                }
             }
         }
     }
@@ -652,6 +721,126 @@ mod tests {
         for key in ["responseMimeType", "responseSchema", "responseJsonSchema"] {
             assert!(gc.get(key).is_none(), "{key}");
         }
+    }
+
+    /// 对齐 CPA 38067a29:多段文本 system 合并为单 part(`\n\n` 拼接),role=user
+    #[test]
+    fn test_system_instruction_text_parts_merged_into_one() {
+        let body = json!({
+            "model": "m", "max_tokens": 100,
+            "system": [
+                {"type": "text", "text": "First rule."},
+                {"type": "text", "text": "Second rule."}
+            ],
+            "messages": [{"role": "user", "content": "hi"}]
+        });
+        let (out, _) = convert_to_antigravity(&body, "gemini-3.8-flash-high", None);
+        let si = &out["request"]["systemInstruction"];
+        assert_eq!(si["role"], "user");
+        assert_eq!(
+            si["parts"],
+            json!([{"text": "First rule.\n\nSecond rule."}])
+        );
+    }
+
+    #[test]
+    fn test_normalize_system_instruction_edge_cases() {
+        // 全空文本 → 删除
+        let mut req = serde_json::Map::new();
+        req.insert(
+            "systemInstruction".into(),
+            json!({"parts": [{"text": ""}, {"text": ""}]}),
+        );
+        normalize_antigravity_system_instruction(&mut req);
+        assert!(req.get("systemInstruction").is_none());
+
+        // 空文本跳过,其余合并
+        let mut req = serde_json::Map::new();
+        req.insert(
+            "systemInstruction".into(),
+            json!({"role": "system", "parts": [{"text": "a"}, {"text": ""}, {"text": "b"}]}),
+        );
+        normalize_antigravity_system_instruction(&mut req);
+        assert_eq!(
+            req["systemInstruction"],
+            json!({"role": "user", "parts": [{"text": "a\n\nb"}]})
+        );
+
+        // 含非文本 part:只置 role,不合并
+        let mixed = json!([{"text": "a"}, {"inlineData": {"mimeType": "image/png", "data": "x"}}]);
+        let mut req = serde_json::Map::new();
+        req.insert("systemInstruction".into(), json!({"parts": mixed.clone()}));
+        normalize_antigravity_system_instruction(&mut req);
+        assert_eq!(req["systemInstruction"]["role"], "user");
+        assert_eq!(req["systemInstruction"]["parts"], mixed);
+
+        // parts 为空:保留,只置 role
+        let mut req = serde_json::Map::new();
+        req.insert("systemInstruction".into(), json!({"parts": []}));
+        normalize_antigravity_system_instruction(&mut req);
+        assert_eq!(
+            req["systemInstruction"],
+            json!({"parts": [], "role": "user"})
+        );
+    }
+
+    /// 对齐 CPA 38067a29:functionResponse.response 仅有字符串 result → output
+    #[test]
+    fn test_function_response_single_string_result_renamed_to_output() {
+        let body = json!({
+            "model": "m", "max_tokens": 100,
+            "messages": [
+                {"role": "user", "content": "read"},
+                {"role": "assistant", "content": [
+                    {"type": "tool_use", "id": "toolu_a", "name": "Read", "input": {"file_path": "/a"}},
+                    {"type": "tool_use", "id": "toolu_b", "name": "Bash", "input": {"command": "false"}}
+                ]},
+                {"role": "user", "content": [
+                    {"type": "tool_result", "tool_use_id": "toolu_a", "content": "A"},
+                    {"type": "tool_result", "tool_use_id": "toolu_b", "content": "exit 1", "is_error": true}
+                ]}
+            ]
+        });
+        let (out, _) = convert_to_antigravity(&body, "gemini-3.8-flash-high", None);
+        let responses: Vec<&Value> = out["request"]["contents"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .flat_map(|c| c["parts"].as_array().unwrap())
+            .filter_map(|p| p.get("functionResponse"))
+            .map(|fr| &fr["response"])
+            .collect();
+        assert_eq!(responses.len(), 2);
+        assert_eq!(*responses[0], json!({"output": "A"}));
+        // error 键不改
+        assert_eq!(*responses[1], json!({"error": "exit 1"}));
+    }
+
+    #[test]
+    fn test_normalize_function_response_only_exact_single_string_result() {
+        let mut req = serde_json::Map::new();
+        req.insert(
+            "contents".into(),
+            json!([{"role": "user", "parts": [
+                {"function_response": {"name": "a", "response": {"result": "x"}}},
+                {"functionResponse": {"name": "b", "response": {"result": {"k": 1}}}},
+                {"functionResponse": {"name": "c", "response": {"result": "x", "extra": 1}}}
+            ]}]),
+        );
+        normalize_antigravity_function_response_results(&mut req);
+        let parts = &req["contents"][0]["parts"];
+        assert_eq!(
+            parts[0]["function_response"]["response"],
+            json!({"output": "x"})
+        );
+        assert_eq!(
+            parts[1]["functionResponse"]["response"],
+            json!({"result": {"k": 1}})
+        );
+        assert_eq!(
+            parts[2]["functionResponse"]["response"],
+            json!({"result": "x", "extra": 1})
+        );
     }
 
     #[test]

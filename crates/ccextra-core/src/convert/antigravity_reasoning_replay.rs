@@ -3131,6 +3131,35 @@ mod tests {
         );
     }
 
+    /// 对齐 CPA 38067a29：多段 system 先合并为单 part 再进指纹；两次转换指纹一致，
+    /// 与旧的分段形态不同（账本按出站线格式记账，重启后旧账本自然失效）。
+    #[test]
+    fn context_fingerprint_uses_merged_system_instruction() {
+        let claude = json!({
+            "model": "gemini-3-flash",
+            "system": [{"type": "text", "text": "be brief"}, {"type": "text", "text": "answer in Chinese"}],
+            "messages": [{"role": "user", "content": "hi"}]
+        });
+        let convert = |c: &Value| {
+            let (body, _) = crate::convert::convert_to_antigravity(c, "gemini-3-flash", Some("p"));
+            body["request"].clone()
+        };
+        let fp = |r: &Value| {
+            let c = r["contents"].as_array().unwrap().clone();
+            ContextFingerprints::new(r).at(&c, c.len())
+        };
+        let (r1, r2) = (convert(&claude), convert(&claude));
+        assert_eq!(
+            r1["systemInstruction"]["parts"],
+            json!([{"text": "be brief\n\nanswer in Chinese"}])
+        );
+        assert_eq!(fp(&r1), fp(&r2));
+        let mut split = r1.clone();
+        split["systemInstruction"]["parts"] =
+            json!([{"text": "be brief"}, {"text": "answer in Chinese"}]);
+        assert_ne!(fp(&split), fp(&r1));
+    }
+
     /// 上下文漂移：按位置猜的文本签名、无原生 id 的 functionCall 签名都不写；
     /// 带 targetHash 的文本签名、稳定 id 精确命中的 functionCall（provenance）照写。
     #[test]
