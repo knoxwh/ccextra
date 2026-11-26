@@ -22,6 +22,20 @@ pub enum SchemaFlavor {
     Antigravity,
 }
 
+/// 对齐 CPA ClaudeOutputJSONSchema:`output_config.format` 为对象、`type` 去空白后
+/// 大小写不敏感等于 `json_schema`、`schema` 为对象时返回 schema
+fn claude_output_json_schema(body: &Value) -> Option<&Value> {
+    let format = body.pointer("/output_config/format")?.as_object()?;
+    let is_json_schema = format
+        .get("type")
+        .and_then(Value::as_str)
+        .is_some_and(|t| t.trim().eq_ignore_ascii_case("json_schema"));
+    if !is_json_schema {
+        return None;
+    }
+    format.get("schema").filter(|s| s.is_object())
+}
+
 /// 对齐 CPA useAntigravitySchema / requirePlaceholder:
 /// Claude VALIDATED 与 gemini-3-pro / gemini-3.1-pro 才补空 schema 占位。
 pub fn antigravity_requires_validated_placeholder(model: &str) -> bool {
@@ -175,6 +189,16 @@ pub fn convert_to_gemini_with_registry(
     }
     if let Some(stop) = body.get("stop_sequences") {
         generation_config.insert("stopSequences".into(), stop.clone());
+    }
+    // output_config.format(json_schema)→ responseMimeType + responseJsonSchema(对齐 CPA
+    // 32842348/ac415c08/62c419e0);Gemini 直连 schema 原样下发,Antigravity 由
+    // convert_to_antigravity 改名 responseSchema 并按响应 schema 清洗。AG Claude 模型不映射
+    // (CPA 对其另有把 schema 改写进 system 的结构化输出路径,ccextra 未移植)。
+    let is_antigravity_claude =
+        flavor == SchemaFlavor::Antigravity && upstream_model.to_lowercase().contains("claude");
+    if !is_antigravity_claude && let Some(schema) = claude_output_json_schema(body) {
+        generation_config.insert("responseMimeType".into(), "application/json".into());
+        generation_config.insert("responseJsonSchema".into(), schema.clone());
     }
 
     // thinking → thinkingConfig(对齐 CPA 字段名:thinkingBudget / thinkingLevel)
@@ -1319,6 +1343,47 @@ IMPORTANT: Assist with authorized security testing.
                 .get("strict")
                 .is_none()
         );
+    }
+
+    /// 对齐 CPA 32842348/ac415c08:Gemini 直连 output_config.format → responseJsonSchema(原样)
+    #[test]
+    fn test_output_config_json_schema_maps_to_gemini_response_json_schema() {
+        let schema = json!({
+            "type": "object",
+            "properties": {"city": {"type": "string"}},
+            "required": ["city"],
+            "additionalProperties": false
+        });
+        let body = json!({
+            "model": "m", "max_tokens": 256,
+            "output_config": {"effort": "high", "format": {"type": " JSON_Schema ", "schema": schema}},
+            "messages": [{"role": "user", "content": "Return Tokyo."}]
+        });
+        let (gemini, _) = convert_to_gemini(&body, "gemini-2.5-pro");
+        let gc = &gemini["generationConfig"];
+        assert_eq!(gc["responseMimeType"], "application/json");
+        assert_eq!(gc["responseJsonSchema"], schema);
+        assert!(gc.get("responseSchema").is_none());
+    }
+
+    #[test]
+    fn test_output_config_without_valid_json_schema_is_ignored() {
+        for format in [
+            json!({"type": "json_schema"}),
+            json!({"type": "json_schema", "schema": "x"}),
+            json!({"type": "text", "schema": {"type": "object"}}),
+            json!("json_schema"),
+        ] {
+            let body = json!({
+                "model": "m", "max_tokens": 16,
+                "output_config": {"format": format},
+                "messages": [{"role": "user", "content": "hi"}]
+            });
+            let (gemini, _) = convert_to_gemini(&body, "gemini-2.5-pro");
+            let gc = &gemini["generationConfig"];
+            assert!(gc.get("responseMimeType").is_none(), "{format}");
+            assert!(gc.get("responseJsonSchema").is_none(), "{format}");
+        }
     }
 
     #[test]

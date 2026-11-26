@@ -36,6 +36,12 @@ struct CleanOptions {
     /// 多分支 anyOf/oneOf 强制展平为最强单分支(对齐 CPA flattenMultiBranchUnions /
     /// CleanJSONSchemaForAntigravityClaudeTool / 5efe9758);仅 AG Claude 工具参数启用
     flatten_multi_branch_unions: bool,
+    /// 只丢 type=boolean 节点的 enum,其余 enum 保留(对齐 CPA dropBooleanEnums;
+    /// 仅 AG 响应 schema,工具 schema 在 antigravity 语义下仍丢全部 enum)
+    drop_boolean_enums_only: bool,
+    /// 保留 `additionalProperties: false`(对齐 CPA preserveAdditionalPropertiesFalse;
+    /// Antigravity 对响应 schema 原生执行该约束)
+    preserve_additional_properties_false: bool,
 }
 
 /// 占位 reason 属性的描述文本(对齐 CPA placeholderReasonDescription)
@@ -70,6 +76,21 @@ pub fn clean_json_schema_for_antigravity_tool(schema: &Value, require_placeholde
             remove_tool_title: !require_placeholder,
             add_missing_array_items: true,
             antigravity_semantics: true,
+            ..Default::default()
+        },
+    )
+}
+
+/// Antigravity 响应 schema 清洗(对齐 CPA CleanJSONSchemaForAntigravityResponse):
+/// 不做工具专用改写(无占位、不补 array items、保留 title),保留非 boolean enum、
+/// `nullable` 与 `additionalProperties: false`,多分支联合保留,本地 $ref 内联。
+pub fn clean_json_schema_for_antigravity_response(schema: &Value) -> Value {
+    clean_json_schema(
+        schema,
+        CleanOptions {
+            antigravity_semantics: true,
+            drop_boolean_enums_only: true,
+            preserve_additional_properties_false: true,
             ..Default::default()
         },
     )
@@ -136,7 +157,9 @@ fn clean_json_schema(schema: &Value, opts: CleanOptions) -> Value {
     drop_ignored_enums_to_hints(&mut s, opts);
     // 保留模式下 additionalProperties 与约束原样保留(对齐 CPA b532db9c)
     if !opts.preserve_json_schema_constraints {
-        add_additional_properties_hints(&mut s);
+        if !opts.preserve_additional_properties_false {
+            add_additional_properties_hints(&mut s);
+        }
         move_constraints_to_description(&mut s, opts);
     }
     if opts.antigravity_semantics {
@@ -880,9 +903,9 @@ fn add_enum_hints(schema: &mut Value) {
 }
 
 /// 对齐 CPA dropIgnoredEnumsToHints:
-/// antigravity(tool 语义)drop 全部 enum;单成员先补提示
+/// antigravity(tool 语义)drop 全部 enum;响应 schema 只 drop boolean enum;单成员先补提示
 fn drop_ignored_enums_to_hints(schema: &mut Value, opts: CleanOptions) {
-    if !opts.antigravity_semantics {
+    if !opts.antigravity_semantics && !opts.drop_boolean_enums_only {
         return;
     }
     let mut path = Vec::new();
@@ -890,6 +913,11 @@ fn drop_ignored_enums_to_hints(schema: &mut Value, opts: CleanOptions) {
         let Some(Value::Array(arr)) = map.get("enum") else {
             return;
         };
+        if opts.drop_boolean_enums_only
+            && map.get("type").and_then(Value::as_str) != Some("boolean")
+        {
+            return;
+        }
         if arr.len() == 1 {
             let v = arr[0]
                 .as_str()
@@ -1666,6 +1694,13 @@ fn remove_unsupported_keywords(schema: &mut Value, opts: CleanOptions) {
             return;
         }
         for key in &keywords {
+            // 响应 schema 保留 additionalProperties:false(对齐 CPA preserveAdditionalPropertiesFalse)
+            if opts.preserve_additional_properties_false
+                && *key == "additionalProperties"
+                && map.get(*key) == Some(&Value::Bool(false))
+            {
+                continue;
+            }
             map.shift_remove(*key);
         }
         // x-* 扩展字段
@@ -2285,6 +2320,47 @@ fn merge_string_slices(existing: &[String], promoted: &[String]) -> Vec<String> 
 mod tests {
     use super::*;
     use serde_json::json;
+
+    /// 对齐 CPA CleanJSONSchemaForAntigravityResponse:保留结构化输出契约
+    #[test]
+    fn test_antigravity_response_schema_keeps_output_contract() {
+        let schema = json!({
+            "$schema": "http://json-schema.org/draft-07/schema#",
+            "type": "object",
+            "title": "Answer",
+            "properties": {
+                "city": {"type": "string", "enum": ["Tokyo", "Paris"]},
+                "ok": {"type": "boolean", "enum": [true]},
+                "tags": {"type": "array"},
+                "meta": {"type": "object", "additionalProperties": {"type": "string"}},
+                "ref": {"$ref": "#/$defs/R"}
+            },
+            "required": ["city"],
+            "additionalProperties": false,
+            "$defs": {"R": {"type": "object", "properties": {"n": {"type": "integer"}}}}
+        });
+        let out = clean_json_schema_for_antigravity_response(&schema);
+        assert!(out.get("$schema").is_none());
+        assert!(out.get("$defs").is_none());
+        assert_eq!(out["title"], "Answer");
+        assert_eq!(out["additionalProperties"], json!(false));
+        assert_eq!(out["properties"]["city"]["enum"], json!(["Tokyo", "Paris"]));
+        assert!(out["properties"]["ok"].get("enum").is_none());
+        // 工具专用改写不做:不补 array items、不补占位
+        assert!(out["properties"]["tags"].get("items").is_none());
+        assert!(out["properties"].get("_").is_none());
+        // 非 false 的 additionalProperties 仍删除
+        assert!(
+            out["properties"]["meta"]
+                .get("additionalProperties")
+                .is_none()
+        );
+        assert_eq!(
+            out["properties"]["ref"]["properties"]["n"]["type"],
+            "integer"
+        );
+        assert_eq!(out["required"], json!(["city"]));
+    }
 
     #[test]
     fn test_gemini_enum_values_to_strings_and_type_forced() {

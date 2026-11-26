@@ -5,6 +5,7 @@ use serde_json::Value;
 use std::collections::HashMap;
 
 use super::gemini::{SchemaFlavor, convert_to_gemini_with_registry};
+use super::gemini_schema::clean_json_schema_for_antigravity_response;
 
 /// 转换 Anthropic 请求体为 Antigravity 格式
 ///
@@ -129,6 +130,7 @@ pub fn convert_to_antigravity_with(
 
         // 对齐 CPA dc21a426:归一化 responseJsonSchema/response_json_schema → responseSchema
         normalize_generation_config_response_schema(&mut request_obj);
+        clean_generation_config_response_schema(&mut request_obj);
 
         request_obj.insert("sessionId".to_string(), Value::String(derived_session_id));
 
@@ -229,6 +231,21 @@ fn normalize_generation_config_response_schema(request_obj: &mut serde_json::Map
                 if !has_response_schema {
                     gc.insert("responseSchema".to_string(), schema);
                 }
+            }
+        }
+    }
+}
+
+/// 对齐 CPA sanitizeAntigravityGenerationSchemas:generationConfig 响应 schema 按
+/// CleanJSONSchemaForAntigravityResponse 清洗(只动对象形态的 schema)
+fn clean_generation_config_response_schema(request_obj: &mut serde_json::Map<String, Value>) {
+    for container in ["generationConfig", "generation_config"] {
+        let Some(Value::Object(gc)) = request_obj.get_mut(container) else {
+            continue;
+        };
+        for key in ["responseSchema", "response_schema"] {
+            if let Some(schema) = gc.get_mut(key).filter(|s| s.is_object()) {
+                *schema = clean_json_schema_for_antigravity_response(schema);
             }
         }
     }
@@ -592,6 +609,48 @@ mod tests {
                 gc["responseSchema"]["properties"][property]["type"],
                 expected_type
             );
+        }
+    }
+
+    /// 对齐 CPA 32842348/ac415c08:AG output_config.format → request.generationConfig.responseSchema
+    /// (清洗后保留 additionalProperties:false 与非 boolean enum)
+    #[test]
+    fn test_output_config_json_schema_maps_to_antigravity_response_schema() {
+        let body = json!({
+            "model": "m", "max_tokens": 256,
+            "output_config": {"format": {"type": "json_schema", "schema": {
+                "$schema": "http://json-schema.org/draft-07/schema#",
+                "type": "object",
+                "properties": {"city": {"type": "string", "enum": ["Tokyo", "Paris"]}},
+                "required": ["city"],
+                "additionalProperties": false
+            }}},
+            "messages": [{"role": "user", "content": "Return Tokyo."}]
+        });
+        let (out, _) = convert_to_antigravity(&body, "gemini-3.8-flash-high", None);
+        let gc = &out["request"]["generationConfig"];
+        assert_eq!(gc["responseMimeType"], "application/json");
+        assert!(gc.get("responseJsonSchema").is_none());
+        let schema = &gc["responseSchema"];
+        assert_eq!(schema["properties"]["city"]["type"], "string");
+        assert_eq!(
+            schema["properties"]["city"]["enum"],
+            json!(["Tokyo", "Paris"])
+        );
+        assert_eq!(schema["additionalProperties"], json!(false));
+        assert!(schema.get("$schema").is_none());
+    }
+
+    /// AG Claude 模型不映射 output_config.format(CPA 另走 system 结构化输出路径,未移植)
+    #[test]
+    fn test_output_config_json_schema_skipped_for_antigravity_claude() {
+        let mut body = base_body();
+        body["output_config"] =
+            json!({"format": {"type": "json_schema", "schema": {"type": "object"}}});
+        let (out, _) = convert_to_antigravity(&body, "claude-opus-4-6-thinking", None);
+        let gc = &out["request"]["generationConfig"];
+        for key in ["responseMimeType", "responseSchema", "responseJsonSchema"] {
+            assert!(gc.get(key).is_none(), "{key}");
         }
     }
 
