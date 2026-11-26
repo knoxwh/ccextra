@@ -104,7 +104,8 @@ fn process_gemini_events(
         }) {
             let status = axum::http::StatusCode::from_u16(code)
                 .unwrap_or(axum::http::StatusCode::BAD_GATEWAY);
-            let body = crate::http::error::to_anthropic_error(event.data.as_bytes(), status);
+            // Google 输入 token 超限加 `prompt is too long: ` 前缀(对齐 CPA ff9339fe)
+            let body = crate::http::error::to_google_anthropic_error(event.data.as_bytes(), status);
             let mut buf = BytesMut::new();
             buf.put(b"event: error\ndata: " as &[u8]);
             buf.put(body.as_slice());
@@ -555,6 +556,23 @@ mod tests {
         assert!(!output.contains("ended before response start"), "{output}");
         assert!(!output.contains("event: message_start"), "{output}");
         assert_eq!(output.matches("event: error").count(), 1, "{output}");
+    }
+
+    #[tokio::test]
+    async fn test_data_error_frame_input_token_exceeded_gets_prompt_too_long() {
+        // 对齐 CPA ff9339fe:已提交流内的 400 输入 token 超限同样加前缀
+        let output = collect_antigravity_output(stream::iter(vec![Ok(Bytes::from(
+            "data: {\"error\":{\"code\":400,\"message\":\"The input token count exceeds the maximum number of tokens allowed (1048576).\",\"status\":\"INVALID_ARGUMENT\"}}\n\n",
+        ))]))
+        .await;
+        assert!(
+            output.contains("\"type\":\"invalid_request_error\""),
+            "{output}"
+        );
+        assert!(
+            output.contains("\"message\":\"prompt is too long: The input token count exceeds"),
+            "{output}"
+        );
     }
 
     #[tokio::test]

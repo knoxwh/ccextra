@@ -32,7 +32,7 @@ use std::sync::atomic::{AtomicU64, Ordering};
 
 use crate::http::auth::check_secret;
 use crate::http::claude_relay::{claude_inbound_user_agent, claude_passthrough_headers};
-use crate::http::error::{AppError, to_anthropic_error};
+use crate::http::error::{AppError, to_anthropic_error, to_google_anthropic_error};
 use crate::http::retry::{parse_google_retry_delay, parse_retry_after, retry_after_header_secs};
 use crate::http::{AppState, PayloadRule};
 use crate::sse::SseStreamPin;
@@ -1980,6 +1980,9 @@ fn build_upstream_error_response(
             }
         }))
         .unwrap_or_default()
+    } else if matches!(protocol, Protocol::Gemini | Protocol::Antigravity) {
+        // Google 输入 token 超限加 `prompt is too long: ` 前缀(对齐 CPA ff9339fe)
+        to_google_anthropic_error(final_bytes, final_status)
     } else {
         to_anthropic_error(final_bytes, final_status)
     };
@@ -2035,6 +2038,43 @@ mod tests {
 
     fn pinned(frames: Vec<Result<Bytes, std::io::Error>>) -> SseStreamPin {
         Box::pin(stream::iter(frames))
+    }
+
+    async fn error_response_json(protocol: Protocol, body: &[u8]) -> Value {
+        let resp = build_upstream_error_response(
+            protocol,
+            axum::http::StatusCode::BAD_REQUEST,
+            body,
+            false,
+            None,
+        )
+        .unwrap();
+        let bytes = axum::body::to_bytes(resp.into_body(), 1024 * 1024)
+            .await
+            .unwrap();
+        serde_json::from_slice(&bytes).unwrap()
+    }
+
+    /// 对齐 CPA ff9339fe:仅 Gemini / Antigravity 车道把输入 token 超限归一为 prompt is too long
+    #[tokio::test]
+    async fn google_token_exceeded_prefix_only_on_google_protocols() {
+        let msg = "The input token count (1050377) exceeds the maximum number of tokens allowed (1048576).";
+        let body = serde_json::to_vec(
+            &json!({"error": {"code": 400, "message": msg, "status": "INVALID_ARGUMENT"}}),
+        )
+        .unwrap();
+        for protocol in [Protocol::Gemini, Protocol::Antigravity] {
+            let v = error_response_json(protocol, &body).await;
+            assert_eq!(v["error"]["message"], format!("prompt is too long: {msg}"));
+        }
+        for protocol in [
+            Protocol::OpenAiChat,
+            Protocol::OpenAiResponses,
+            Protocol::Claude,
+        ] {
+            let v = error_response_json(protocol, &body).await;
+            assert_eq!(v["error"]["message"], msg);
+        }
     }
 
     /// 快照仅保留 tools:响应侧回剥只读 tools,其余字段不进快照

@@ -134,6 +134,55 @@ fn is_upstream_send_timeout(err: &anyhow::Error) -> bool {
 /// Anthropic 官方 type 原样保留;无法识别时按上游 `status` 兜底
 /// (对齐 CPA `claudeErrorTypeFromStatus`)。顶层字符串 `request_id` 保留(官方错误形状)。
 pub fn to_anthropic_error(body: &[u8], status: StatusCode) -> Vec<u8> {
+    serde_json::to_vec(&anthropic_error_value(body, status)).unwrap_or_default()
+}
+
+/// Gemini / Antigravity 上游错误 → anthropic 错误形状;`invalid_request_error` 且文案为
+/// Google 输入 token 超限时加 `prompt is too long: ` 前缀,让 Claude Code 识别上下文溢出
+/// 并自动压缩(对齐 CPA `ff9339fe` normalizeClaudePromptTooLongMessage)。
+pub fn to_google_anthropic_error(body: &[u8], status: StatusCode) -> Vec<u8> {
+    let mut out = anthropic_error_value(body, status);
+    if out["error"]["type"] == "invalid_request_error"
+        && let Some(prefixed) = out["error"]["message"]
+            .as_str()
+            .and_then(prompt_too_long_message)
+    {
+        out["error"]["message"] = Value::String(prefixed);
+    }
+    serde_json::to_vec(&out).unwrap_or_default()
+}
+
+/// 已带 `prompt is too long` 前缀(大小写不敏感)的不重复加;不匹配返回 None
+fn prompt_too_long_message(message: &str) -> Option<String> {
+    let lower = message.to_lowercase();
+    if lower.starts_with("prompt is too long") {
+        return None;
+    }
+    is_google_input_token_exceeded(&lower).then(|| format!("prompt is too long: {message}"))
+}
+
+/// 对齐 CPA isGoogleInputTokenExceededMessage:`input token count` 后(可选括号计数)
+/// 紧跟 `exceeds the maximum`;`output token count exceeds…; input token count: N` 不算
+fn is_google_input_token_exceeded(lower: &str) -> bool {
+    const PHRASE: &str = "input token count";
+    let mut remaining = lower;
+    while let Some(idx) = remaining.find(PHRASE) {
+        let after = &remaining[idx + PHRASE.len()..];
+        let mut rest = after.trim_start();
+        if rest.starts_with('(')
+            && let Some(end) = rest.find(')')
+        {
+            rest = rest[end + 1..].trim_start();
+        }
+        if rest.starts_with("exceeds the maximum") {
+            return true;
+        }
+        remaining = after;
+    }
+    false
+}
+
+fn anthropic_error_value(body: &[u8], status: StatusCode) -> Value {
     let (raw_type, raw_message) = extract_upstream_error(body);
     let err_type = match raw_type.to_lowercase().as_str() {
         t @ ("invalid_request_error"
@@ -171,7 +220,7 @@ pub fn to_anthropic_error(body: &[u8], status: StatusCode) -> Vec<u8> {
     {
         out["request_id"] = Value::String(id);
     }
-    serde_json::to_vec(&out).unwrap_or_default()
+    out
 }
 
 /// 无可识别 type 时按 HTTP 状态选 Anthropic error type(对齐 CPA `claudeErrorTypeFromStatus`)
@@ -293,6 +342,85 @@ mod tests {
         assert_eq!(resp.status(), StatusCode::GATEWAY_TIMEOUT);
         let v = body_json(resp).await;
         assert_eq!(v["error"]["type"], "timeout_error");
+    }
+
+    const GOOGLE_MSG: &str = "The input token count exceeds the maximum number of tokens allowed (1048576); input token count: 1050377.";
+
+    fn google_error(code: u16, message: &str, status: &str) -> Vec<u8> {
+        serde_json::to_vec(&json!({"error": {"code": code, "message": message, "status": status}}))
+            .unwrap()
+    }
+
+    fn google_out(body: &[u8], status: StatusCode) -> Value {
+        serde_json::from_slice(&to_google_anthropic_error(body, status)).unwrap()
+    }
+
+    /// 对齐 CPA ff9339fe:Google 400 输入 token 超限加 `prompt is too long: ` 前缀
+    #[test]
+    fn google_input_token_exceeded_gets_prompt_too_long_prefix() {
+        let out = google_out(
+            &google_error(400, GOOGLE_MSG, "INVALID_ARGUMENT"),
+            StatusCode::BAD_REQUEST,
+        );
+        assert_eq!(out["error"]["type"], "invalid_request_error");
+        assert_eq!(
+            out["error"]["message"],
+            format!("prompt is too long: {GOOGLE_MSG}")
+        );
+    }
+
+    #[test]
+    fn google_parenthesized_token_count_variant_gets_prefix() {
+        let msg = "The input token count (1050377) exceeds the maximum number of tokens allowed (1048576).";
+        let out = google_out(
+            &google_error(400, msg, "INVALID_ARGUMENT"),
+            StatusCode::BAD_REQUEST,
+        );
+        assert_eq!(
+            out["error"]["message"],
+            format!("prompt is too long: {msg}")
+        );
+    }
+
+    #[test]
+    fn already_prefixed_prompt_too_long_is_not_doubled() {
+        let msg = format!("Prompt is too long: {GOOGLE_MSG}");
+        let body = serde_json::to_vec(
+            &json!({"type": "error", "error": {"type": "invalid_request_error", "message": msg}}),
+        )
+        .unwrap();
+        let out = google_out(&body, StatusCode::BAD_REQUEST);
+        assert_eq!(out["error"]["message"], msg);
+    }
+
+    #[test]
+    fn google_token_exceeded_non_invalid_request_is_untouched() {
+        let out = google_out(
+            &google_error(500, GOOGLE_MSG, "INTERNAL"),
+            StatusCode::INTERNAL_SERVER_ERROR,
+        );
+        assert_eq!(out["error"]["type"], "api_error");
+        assert_eq!(out["error"]["message"], GOOGLE_MSG);
+    }
+
+    #[test]
+    fn output_token_limit_mentioning_input_count_is_untouched() {
+        let msg = "Requested output token count exceeds the maximum; input token count: 100.";
+        let out = google_out(
+            &google_error(400, msg, "INVALID_ARGUMENT"),
+            StatusCode::BAD_REQUEST,
+        );
+        assert_eq!(out["error"]["type"], "invalid_request_error");
+        assert_eq!(out["error"]["message"], msg);
+    }
+
+    /// 非 Google 车道(to_anthropic_error)不改写,只作用于 Gemini / Antigravity
+    #[test]
+    fn non_google_error_conversion_keeps_message() {
+        let body = google_error(400, GOOGLE_MSG, "INVALID_ARGUMENT");
+        let out: Value =
+            serde_json::from_slice(&to_anthropic_error(&body, StatusCode::BAD_REQUEST)).unwrap();
+        assert_eq!(out["error"]["message"], GOOGLE_MSG);
     }
 
     #[tokio::test]
