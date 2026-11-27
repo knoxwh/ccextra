@@ -1820,6 +1820,8 @@ pub struct AgReplayAccumulator {
     function_call_occurrences: std::collections::HashMap<String, i64>,
     /// 响应所在 content 之前的上下文指纹（对齐 CPA responseContextHash）
     response_context_hash: String,
+    /// 是否见过候选输出：非空文本、具名 functionCall 或非文本输出 part（对齐 CPA observedOutput）
+    observed_output: bool,
     pub terminal: bool,
     pub overflow: bool,
     item_bytes: usize,
@@ -1983,6 +1985,7 @@ impl AgReplayAccumulator {
                 self.observe_nameless_function_call(fc, signature);
                 return;
             }
+            self.observed_output = true;
             if self.last_response_kind == "text" || self.last_response_kind == "thought" {
                 self.flush_pending_for_kind(&self.last_response_kind.clone());
             }
@@ -2052,6 +2055,9 @@ impl AgReplayAccumulator {
         let thought = part.get("thought").and_then(|v| v.as_bool()) == Some(true);
         let text = part.get("text").and_then(|v| v.as_str()).unwrap_or("");
         let has_text = !text.is_empty();
+        if has_text || part_has_non_text_output(part) {
+            self.observed_output = true;
+        }
         let signature_only = !signature.is_empty() && !has_text;
 
         if signature_only && self.last_response_kind == "function_call" {
@@ -2330,6 +2336,15 @@ impl AgReplayAccumulator {
         self.pending_signatures.clear();
     }
 
+    /// 上游流无 finishReason 但干净 EOF 结束时标记 terminal（对齐 CPA 7fa46e9d MarkCleanEOF）。
+    /// 真实 AG 工具调用流常只发带签名的 functionCall 块就关闭；未见任何候选输出则不标记，
+    /// 保留旧账本。调用方负责确认 EOF 干净（非读错误 / 客户端取消 / 截断帧 / in-band error）。
+    pub fn mark_clean_eof(&mut self) {
+        if !self.terminal && self.observed_output {
+            self.terminal = true;
+        }
+    }
+
     /// 若 terminal 且未 overflow，返回可提交的规范化 items；
     /// terminal 但空/overflow → Some(empty) 表示应清空缓存；
     /// 非 terminal → None（不提交）。
@@ -2353,6 +2368,26 @@ impl AgReplayAccumulator {
     pub fn items(&self) -> &[Value] {
         &self.items
     }
+}
+
+/// 非文本候选输出 part（对齐 CPA antigravityReplayPartHasNonTextOutput）。
+fn part_has_non_text_output(part: &Value) -> bool {
+    let non_blank = |v: Option<&Value>| {
+        v.and_then(Value::as_str)
+            .is_some_and(|s| !s.trim().is_empty())
+    };
+    let obj = |keys: [&str; 2]| {
+        keys.iter()
+            .find_map(|k| part.get(*k).filter(|v| v.is_object()))
+    };
+    obj(["inlineData", "inline_data"]).is_some_and(|d| non_blank(d.get("data")))
+        || obj(["fileData", "file_data"])
+            .is_some_and(|d| non_blank(d.get("fileUri")) || non_blank(d.get("file_uri")))
+        || obj(["executableCode", "executable_code"]).is_some_and(|d| non_blank(d.get("code")))
+        || obj(["codeExecutionResult", "code_execution_result"])
+            .is_some_and(|d| non_blank(d.get("output")) || non_blank(d.get("outcome")))
+        || obj(["audioTranscription", "audio_transcription"])
+            .is_some_and(|d| non_blank(d.get("text")))
 }
 
 fn pending_model_content_index(contents: &[Value]) -> (usize, usize) {
@@ -4532,5 +4567,39 @@ mod tests {
         assert_eq!(calls[0]["args"], json!({"a": 1, "extra": 3}));
         assert_eq!(calls[0]["idArgs"], json!({"a": 1}));
         assert_eq!(calls[1]["args"], json!({"b": 2}));
+    }
+
+    /// 对齐 CPA 7fa46e9d：无 finishReason 的完整块在干净 EOF 后可提交；空候选不标 terminal。
+    #[test]
+    fn mark_clean_eof_requires_observed_output() {
+        let request = json!({"contents": [{"role": "user", "parts": [{"text": "hi"}]}]});
+        let mut acc = AgReplayAccumulator::new_from_request(&request);
+        acc.observe_response(&json!({"response": {"candidates": [{"content": {"parts": [{
+            "thoughtSignature": "sig-clean-eof-long-enough",
+            "functionCall": {"id": "c1", "name": "Bash", "args": {"command": "ls"}}
+        }]}}]}}));
+        assert!(
+            acc.take_commit_items().is_none(),
+            "无 finishReason 不算 terminal"
+        );
+        acc.mark_clean_eof();
+        let items = acc.take_commit_items().expect("clean EOF 后 terminal");
+        assert_eq!(items.len(), 1);
+        assert_eq!(items[0]["thoughtSignature"], "sig-clean-eof-long-enough");
+
+        let mut empty = AgReplayAccumulator::new_from_request(&request);
+        empty.observe_response(&json!({"response": {"candidates": [{"content": {"parts": []}}]}}));
+        empty.mark_clean_eof();
+        assert!(
+            empty.take_commit_items().is_none(),
+            "无候选输出不标 terminal"
+        );
+
+        let mut code = AgReplayAccumulator::new_from_request(&request);
+        code.observe_response(&json!({"response": {"candidates": [{"content": {"parts": [
+            {"executableCode": {"language": "PYTHON", "code": "print(1)"}}
+        ]}}]}}));
+        code.mark_clean_eof();
+        assert!(code.take_commit_items().is_some(), "非文本输出也算候选输出");
     }
 }

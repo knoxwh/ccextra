@@ -209,8 +209,9 @@ enum ReplayTap {
     ),
 }
 
-/// 每个上游 SSE 字节块喂给 replay 提取器
-type ReplayPush = Box<dyn FnMut(&[u8]) + Send>;
+/// 每个上游 SSE 字节块喂给 replay 提取器;`None` 表示上游干净 EOF
+/// (读错误或客户端取消时不会收到 `None`)
+type ReplayPush = Box<dyn FnMut(Option<&[u8]>) + Send>;
 
 /// Gemini/AG 响应侧回剥占位 tool args 只读原始请求的 tools;
 /// 快照仅保留 tools,避免长会话全量 body 深克隆。
@@ -253,19 +254,33 @@ where
         ReplayTap::None => Box::new(|_| {}),
         ReplayTap::Responses(cache, key, request_fingerprint) => {
             let mut extractor = StreamReplayExtractor::new(cache, key, request_fingerprint);
-            Box::new(move |bytes| extractor.push(bytes))
+            Box::new(move |bytes| bytes.into_iter().for_each(|b| extractor.push(b)))
         }
-        ReplayTap::Antigravity(mut extractor) => Box::new(move |bytes| extractor.push(bytes)),
+        // 干净 EOF:无 finishReason 的完整流也提交账本(对齐 CPA 7fa46e9d)
+        ReplayTap::Antigravity(mut extractor) => Box::new(move |bytes| match bytes {
+            Some(bytes) => extractor.push(bytes),
+            None => extractor.finish_clean_eof(),
+        }),
         ReplayTap::Kimi(cache, key, applied) => {
             let mut extractor = KimiStreamReplayExtractor::new(cache, key, applied);
-            Box::new(move |bytes| extractor.push(bytes))
+            Box::new(move |bytes| bytes.into_iter().for_each(|b| extractor.push(b)))
         }
     };
-    let stream = stream.inspect(move |result| {
-        if let Ok(bytes) = result {
-            push(bytes);
+    // 上游读到结尾且途中无读错误才发 `None`;客户端取消时流被提前丢弃,不会走到结尾
+    let stream = async_stream::stream! {
+        let mut stream = Box::pin(stream);
+        let mut failed = false;
+        while let Some(item) = stream.next().await {
+            match &item {
+                Ok(bytes) => push(Some(bytes)),
+                Err(_) => failed = true,
+            }
+            yield item;
         }
-    });
+        if !failed {
+            push(None);
+        }
+    };
     crate::sse::relay(
         params.protocol,
         stream,
@@ -2409,5 +2424,58 @@ mod tests {
         )
         .with_metadata(HashMap::from([("refresh_token".into(), " ".into())]));
         assert_eq!(ag_replay_credential_scope_for_provider(&empty_both), "");
+    }
+
+    /// 对齐 CPA 7fa46e9d:replay tap 仅在上游干净 EOF 时为无 finishReason 的流提交账本;
+    /// 读错误中断不提交。
+    #[tokio::test]
+    async fn antigravity_replay_tap_commits_only_on_clean_eof() {
+        use crate::sse::antigravity_replay_cache::{AgReplayCache, AgReplaySnapshot};
+        let sig = "sig-tap-clean-eof-long-enough";
+        let tool_frame = format!(
+            "data: {{\"response\":{{\"candidates\":[{{\"content\":{{\"role\":\"model\",\"parts\":[{{\"thoughtSignature\":\"{sig}\",\"functionCall\":{{\"name\":\"Bash\",\"args\":{{\"command\":\"ls\"}},\"id\":\"call_1\"}}}}]}}}}],\"usageMetadata\":{{\"promptTokenCount\":12,\"candidatesTokenCount\":3}}}}}}\n\n"
+        );
+        for (name, read_error) in [("clean", false), ("read-error", true)] {
+            let cache = AgReplayCache::new(std::time::Duration::from_secs(60), 128);
+            let key = format!("gemini-3-flash:sess-tap-{name}");
+            let request = json!({"contents": [{"role": "user", "parts": [{"text": "hi"}]}]});
+            let extractor = AgStreamReplayExtractor::new(
+                cache.clone(),
+                key.clone(),
+                AgReplaySnapshot::default(),
+                &request,
+            );
+            let mut frames = vec![frame(&tool_frame)];
+            if read_error {
+                frames.push(Err(std::io::Error::other("connection reset")));
+            }
+            let out = relay_with_replay_tap(
+                stream::iter(frames),
+                RelayParams {
+                    protocol: Protocol::Antigravity,
+                    estimated_input_tokens: None,
+                    tool_names: None,
+                    original_claude_request: None,
+                    replay_tap: ReplayTap::Antigravity(Box::new(extractor)),
+                    signature_model: Some(Arc::from("gemini-3-flash")),
+                    inbound_model: None,
+                    token_scope: None,
+                    drift_usage_scope: None,
+                },
+            );
+            let _: Vec<_> = out.collect().await;
+            let mut body = json!({"request": {"contents": [
+                {"role": "user", "parts": [{"text": "hi"}]},
+                {"role": "model", "parts": [
+                    {"functionCall": {"id": "call_1", "name": "Bash", "args": {"command": "ls"}}}
+                ]},
+                {"role": "user", "parts": [
+                    {"functionResponse": {"id": "call_1", "name": "Bash", "response": {"result": "ok"}}}
+                ]}
+            ]}});
+            cache.apply_to_antigravity_body(&key, &mut body);
+            let restored = body["request"]["contents"][1]["parts"][0]["thoughtSignature"] == sig;
+            assert_eq!(restored, !read_error, "{name}: {body}");
+        }
     }
 }

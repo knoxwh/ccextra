@@ -546,13 +546,16 @@ fn log_prepare_report(report: &AgReplayPrepareReport) {
 /// 流式提取：旁路解析上游 Gemini/AG SSE。
 ///
 /// 对齐 CPA：`finishReason` 只标记 terminal，不立即落库；signature / usage
-/// 可能跟在后续帧。仅在流结束（`finish` / `Drop`）时提交。
+/// 可能跟在后续帧。仅在流结束（`finish` / `Drop`）时提交；上游干净 EOF 但无
+/// finishReason 时由 `finish_clean_eof` 补标 terminal（对齐 CPA 7fa46e9d）。
 pub struct AgStreamReplayExtractor {
     cache: AgReplayCache,
     session_key: String,
     snapshot: AgReplaySnapshot,
     accumulator: AgReplayAccumulator,
     parser: super::parser::SseParser,
+    /// 见过 in-band `{"error":…}` 帧：干净 EOF 也不算正常完成
+    saw_error: bool,
     committed: bool,
 }
 
@@ -570,6 +573,7 @@ impl AgStreamReplayExtractor {
             snapshot,
             accumulator,
             parser: super::parser::SseParser::new(),
+            saw_error: false,
             committed: false,
         }
     }
@@ -580,8 +584,35 @@ impl AgStreamReplayExtractor {
             let Ok(value) = serde_json::from_str::<Value>(&event.data) else {
                 continue;
             };
-            self.accumulator.observe_response(&value);
+            self.observe(&value);
         }
+    }
+
+    fn observe(&mut self, value: &Value) {
+        if value.get("error").is_some() {
+            self.saw_error = true;
+        }
+        self.accumulator.observe_response(value);
+    }
+
+    /// 上游读到干净 EOF（非读错误、非客户端取消）时调用：flush SSE 残留，
+    /// 残留无截断帧且无 in-band error 时，无 finishReason 的流也标 terminal，再提交。
+    /// 取消 / 读错误不会走到这里，仍只靠 finishReason 判定（`Drop` → `finish`）。
+    pub fn finish_clean_eof(&mut self) {
+        if self.committed {
+            return;
+        }
+        let mut truncated = false;
+        for event in self.parser.finish() {
+            match serde_json::from_str::<Value>(&event.data) {
+                Ok(value) => self.observe(&value),
+                Err(_) => truncated |= event.data.trim() != "[DONE]",
+            }
+        }
+        if !truncated && !self.saw_error {
+            self.accumulator.mark_clean_eof();
+        }
+        self.commit();
     }
 
     /// 流结束：flush SSE 残留并在 terminal 时提交账本。
@@ -593,7 +624,7 @@ impl AgStreamReplayExtractor {
             let Ok(value) = serde_json::from_str::<Value>(&event.data) else {
                 continue;
             };
-            self.accumulator.observe_response(&value);
+            self.observe(&value);
         }
         self.commit();
     }
@@ -1530,5 +1561,92 @@ mod tests {
         assert_eq!(items[0]["args"], json!({"path": "a.go", "line": 1}));
         assert_eq!(items[0]["idArgs"], json!({"path": "a.go"}));
         assert_eq!(items[0]["thoughtSignature"], "sig-cont-long-enough");
+    }
+
+    const CLEAN_EOF_TOOL_FRAME: &[u8] = br#"data: {"response":{"candidates":[{"content":{"role":"model","parts":[{"thoughtSignature":"sig-clean-eof-long-enough","functionCall":{"name":"Bash","args":{"command":"ls"},"id":"call_1"}}]}}],"usageMetadata":{"promptTokenCount":12,"candidatesTokenCount":3}}}
+"#;
+
+    fn clean_eof_extractor(cache: &AgReplayCache, key: &str) -> AgStreamReplayExtractor {
+        let request = json!({"contents": [{"role": "user", "parts": [{"text": "hi"}]}]});
+        AgStreamReplayExtractor::new(
+            cache.clone(),
+            key.to_string(),
+            AgReplaySnapshot::default(),
+            &request,
+        )
+    }
+
+    fn seed_old_ledger(cache: &AgReplayCache, key: &str) {
+        cache.replace_items(
+            key,
+            vec![json!({
+                "type": "thought_signature",
+                "thoughtSignature": "old-signature-123456789",
+                "contentIndex": 1,
+                "partIndex": 0,
+            })],
+        );
+    }
+
+    /// 对齐 CPA 7fa46e9d：真实 AG 工具调用流无 finishReason、末帧无空行即干净 EOF，仍提交账本。
+    #[test]
+    fn stream_extractor_commits_on_clean_eof_without_finish_reason() {
+        let cache = AgReplayCache::new(Duration::from_secs(60), 128);
+        let key = "gemini-flash:sess-clean-eof";
+        let mut extractor = clean_eof_extractor(&cache, key);
+        extractor.push(CLEAN_EOF_TOOL_FRAME);
+        extractor.finish_clean_eof();
+        let (items, _) = cache.get_items(key).expect("clean EOF committed");
+        assert_eq!(items.len(), 1);
+        assert_eq!(items[0]["thoughtSignature"], "sig-clean-eof-long-enough");
+    }
+
+    /// 取消 / 读错误(只走 Drop → finish)、截断末帧、in-band error、空候选：均不动旧账本。
+    #[test]
+    fn stream_extractor_clean_eof_guards_keep_old_ledger() {
+        let cache = AgReplayCache::new(Duration::from_secs(60), 128);
+        let truncated: &[u8] =
+            br#"data: {"response":{"candidates":[{"content":{"parts":[{"text":"pa"#;
+        let error: &[u8] =
+            br#"data: {"error":{"code":503,"message":"overloaded","status":"UNAVAILABLE"}}
+
+"#;
+        let empty: &[u8] =
+            br#"data: {"response":{"candidates":[{"content":{"role":"model","parts":[]}}]}}
+
+"#;
+        let cases: [(&str, Vec<&[u8]>, bool); 4] = [
+            ("cancel", vec![CLEAN_EOF_TOOL_FRAME], false),
+            (
+                "truncated",
+                vec![CLEAN_EOF_TOOL_FRAME, b"\n", truncated],
+                true,
+            ),
+            (
+                "in-band-error",
+                vec![CLEAN_EOF_TOOL_FRAME, b"\n", error],
+                true,
+            ),
+            ("empty", vec![empty], true),
+        ];
+        for (name, frames, clean_eof) in cases {
+            let key = format!("gemini-flash:sess-guard-{name}");
+            seed_old_ledger(&cache, &key);
+            {
+                let mut extractor = clean_eof_extractor(&cache, &key);
+                for frame in frames {
+                    extractor.push(frame);
+                }
+                if clean_eof {
+                    extractor.finish_clean_eof();
+                }
+            }
+            let (items, _) = cache.get_items(&key).expect("旧账本仍在");
+            assert_eq!(items.len(), 1, "{name}");
+            assert_eq!(
+                items[0]["thoughtSignature"], "old-signature-123456789",
+                "{name}"
+            );
+        }
     }
 }

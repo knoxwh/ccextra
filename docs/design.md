@@ -151,7 +151,7 @@ Antigravity（gemini/flash/agent，不含 claude）使用**独立的** thoughtSi
 - `thought_signature`：`thoughtSignature` + 可选 `contentIndex` / `partIndex` / `targetKind`（`text`|`thought`）/ `targetHash` / `targetOccurrence` / `contextHash`
 - `function_call_part`：`name` + `args` + 可选 `call_id` / `thoughtSignature` / `idArgs` + 同上索引字段
 
-累积与提交：流式与非流式从上游 `candidates[].parts` 累积可回放项；`finishReason` **只标记 terminal**，不立即落库（后续帧仍可能带 signature / usage）。流式在 SSE 结束（`finish` / `Drop`）时若 terminal 才提交；非流在完整 body 观察后提交。terminal 但空或字节/条数溢出则清空该会话账本；非 terminal 不动缓存。紧跟 functionCall 的无名续传 `functionCall` 把 args 浅合并进上一个 call、签名补到该 call（首块 args 存为 `idArgs`，回放时稳定 tool_use id 由它派生，与流式起块时发出的 id 一致；对齐 CPA `3a353935`）；不跟在 functionCall 后的带签名空 `functionCall:{}` 不再丢签名，记为未绑定签名交给下一个 functionCall（对齐 CPA `f663935d` 前向 carrier）。
+累积与提交：流式与非流式从上游 `candidates[].parts` 累积可回放项；`finishReason` **只标记 terminal**，不立即落库（后续帧仍可能带 signature / usage）。流式在 SSE 结束（`finish` / `Drop`）时若 terminal 才提交；上游读到干净 EOF 但始终没有 finishReason 时（真实 AG 工具调用流常见），若见过候选输出（非空文本、具名 functionCall 或非文本输出 part）、末尾无截断帧且无 in-band error，也补标 terminal 并提交（对齐 CPA `7fa46e9d`）；读错误与客户端取消（如 Esc）不会走到 EOF，仍只看 finishReason。非流在完整 body 观察后提交。terminal 但空或字节/条数溢出则清空该会话账本；非 terminal 不动缓存。紧跟 functionCall 的无名续传 `functionCall` 把 args 浅合并进上一个 call、签名补到该 call（首块 args 存为 `idArgs`，回放时稳定 tool_use id 由它派生，与流式起块时发出的 id 一致；对齐 CPA `3a353935`）；不跟在 functionCall 后的带签名空 `functionCall:{}` 不再丢签名，记为未绑定签名交给下一个 functionCall（对齐 CPA `f663935d` 前向 carrier）。
 
 下一轮在已有 `request.contents` part 上补回 `thoughtSignature`，稳定 tool_use id（`ccx_gemini_…`）换回原生 `functionCall.id`，孤儿 `functionResponse` 按账本插回缺失的 functionCall（对齐 CPA）。上游 400 且 body 含 `signature` 时按读账本快照清空该会话账本（unfit 与 401 重试不清）。
 
