@@ -5,7 +5,8 @@ set -euo pipefail
 # - 始终管理 8222 主实例(复用 start.sh / stop.sh,LaunchAgent com.wanghao.ccextra)
 # - 按 config.yaml 顶层 official_instance(on/off,只读这一行)管理 8223 官方透传实例:
 #   on  → official-init(补齐运行目录、同步二进制)后安装 plist 并 bootstrap
-#         LaunchAgent com.wanghao.ccextra-official(登录自启、KeepAlive)
+#         LaunchAgent com.wanghao.ccextra-official(plist 装在 ~/Library/Application Support/ccextra/launchd/,
+#         登录不自启;KeepAlive 只拉回异常退出;旧版 ~/Library/LaunchAgents 里的同名 plist 会被迁移删除)
 #   off → bootout 并移除该 plist,确保 8223 未运行
 # - official-init:不看开关,只准备 $CCEXTRA_OFFICIAL_DIR(纯运行目录,可删后重建):
 #   logs/、仓库根 ./ccextra 的副本、由 scripts/official/config.yaml.example 生成的 config.yaml
@@ -36,7 +37,9 @@ OFFICIAL_SRC="$SCRIPT_DIR/scripts/macos/${OFFICIAL_LABEL}.plist"
 OFFICIAL_TEMPLATE="$SCRIPT_DIR/scripts/official/config.yaml.example"
 MAIN_BIN="$SCRIPT_DIR/ccextra"
 OFFICIAL_BIN_UPDATED=no
-OFFICIAL_DST="${HOME}/Library/LaunchAgents/${OFFICIAL_LABEL}.plist"
+OFFICIAL_LAUNCHD_DIR="${HOME}/Library/Application Support/ccextra/launchd"
+OFFICIAL_DST="${OFFICIAL_LAUNCHD_DIR}/${OFFICIAL_LABEL}.plist"
+OFFICIAL_LEGACY_DST="${HOME}/Library/LaunchAgents/${OFFICIAL_LABEL}.plist"
 # 匹配 launchd 拉起的绝对路径与手工 ./ccextra 两种命令行(转义路径正则元字符)
 OFFICIAL_CONFIG_RE=$(printf '%s' "$OFFICIAL_CONFIG" | sed 's/[.[\\*^$+?(){}|]/\\&/g')
 OFFICIAL_RE="ccextra --config ${OFFICIAL_CONFIG_RE}( |\$)"
@@ -163,9 +166,30 @@ official_fail_if_foreign_listener() {
     done
 }
 
-# 停 8223:bootout + 清掉非 launchd 残留;remove_plist=yes 时删 plist(登录不再自启)
+# 迁移:旧版 plist 在 ~/Library/LaunchAgents(登录自启)→ bootout(若已加载)后只删该确切路径
+official_migrate_legacy_plist() {
+    [ -f "$OFFICIAL_LEGACY_DST" ] || return 0
+    if official_loaded; then
+        echo "bootout $OFFICIAL_SERVICE (legacy plist)"
+        launchctl bootout "$OFFICIAL_SERVICE" 2>/dev/null || true
+    fi
+    rm -f "$OFFICIAL_LEGACY_DST"
+    echo "migrated: removed legacy $OFFICIAL_LEGACY_DST(不再登录自启,plist 改装到 $OFFICIAL_LAUNCHD_DIR)"
+}
+
+# 被禁用(如在登录项里关掉)时无法 bootstrap:明确报错,不自动 enable
+official_fail_if_disabled() {
+    if launchctl print-disabled "$DOMAIN" 2>/dev/null \
+        | grep -qF -e "\"${OFFICIAL_LABEL}\" => disabled" -e "\"${OFFICIAL_LABEL}\" => true"; then
+        echo "错误: ${OFFICIAL_LABEL} 已被禁用,无法 bootstrap;请先执行: launchctl enable ${OFFICIAL_SERVICE}" >&2
+        return 1
+    fi
+}
+
+# 停 8223:bootout + 清掉非 launchd 残留;remove_plist=yes 时删安装的 plist
 official_stop() {
     local remove_plist="$1" pid
+    official_migrate_legacy_plist
     if official_loaded; then
         echo "bootout $OFFICIAL_SERVICE"
         launchctl bootout "$OFFICIAL_SERVICE" 2>/dev/null || true
@@ -231,11 +255,13 @@ rotate_official_logs() {
 official_start() {
     local pid tmp_plist plist_changed=no
     official_init
+    official_migrate_legacy_plist
+    official_fail_if_disabled
     if [ ! -f "$OFFICIAL_SRC" ]; then
         echo "错误: 找不到 plist 模板 $OFFICIAL_SRC" >&2
         return 1
     fi
-    mkdir -p "${HOME}/Library/LaunchAgents" "$OFFICIAL_DIR/logs"
+    mkdir -p "$OFFICIAL_LAUNCHD_DIR" "$OFFICIAL_DIR/logs"
     tmp_plist="$OFFICIAL_DST.tmp.$$"
     if ! DIR="$OFFICIAL_DIR" awk '{ while ((i = index($0, "@DIR@")) > 0) $0 = substr($0, 1, i - 1) ENVIRON["DIR"] substr($0, i + 5); print }' "$OFFICIAL_SRC" > "$tmp_plist"; then
         rm -f "$tmp_plist"
@@ -319,7 +345,7 @@ case "${1:-}" in
     stop)
         sw=$(official_switch 2>/dev/null || echo unknown)
         "$SCRIPT_DIR/stop.sh"
-        # 开关为 on 时保留 plist(与 8222 一致:stop 只 bootout,登录仍自启)
+        # 开关为 on 时保留 plist(与 8222 一致:stop 只 bootout;plist 不在 LaunchAgents,登录不自启)
         if [ "$sw" = off ]; then official_stop yes; else official_stop no; fi
         ;;
     restart)

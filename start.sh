@@ -10,6 +10,8 @@ UID_NUM="$(id -u)"
 DOMAIN="gui/${UID_NUM}"
 SERVICE="${DOMAIN}/${LABEL}"
 INSTALL_SH="$SCRIPT_DIR/scripts/macos/install-launchagent.sh"
+# 与 install-launchagent.sh 的 DST 一致（不在 LaunchAgents，登录不自启）
+PLIST="${HOME}/Library/Application Support/ccextra/launchd/${LABEL}.plist"
 
 mkdir -p "$LOG_DIR"
 
@@ -32,7 +34,7 @@ find "$LOG_DIR" -name '*.log' | while read -r f; do
 done
 
 if [ ! -x "$BIN" ]; then
-    echo "错误: 未找到二进制 $BIN，请先运行 build.sh 或 deploy.sh" >&2
+    echo "错误: 未找到二进制 ${BIN}，请先运行 build.sh 或 deploy.sh" >&2
     exit 1
 fi
 
@@ -81,7 +83,7 @@ fail_if_foreign_listener() {
 }
 
 # 仅在 LaunchAgent 未 load 时调用：清掉本仓库二进制残留（含 ppid=1 孤儿）。
-# 已 load 时走 kickstart，禁止在此路径杀进程（KeepAlive 会立刻拉回）。
+# 已 load 时走 kickstart，禁止在此路径杀进程（KeepAlive 会拉回异常退出）。
 kill_stray_orphans() {
     local pid
     for pid in $(our_pids); do
@@ -168,8 +170,8 @@ else
         sleep 0.5
     fi
     rotate_launchd_logs
-    echo "bootstrap $DOMAIN <- ~/Library/LaunchAgents/${LABEL}.plist"
-    launchctl bootstrap "$DOMAIN" "${HOME}/Library/LaunchAgents/${LABEL}.plist"
+    echo "bootstrap $DOMAIN <- $PLIST"
+    launchctl bootstrap "$DOMAIN" "$PLIST"
 fi
 
 wait_health

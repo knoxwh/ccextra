@@ -29,7 +29,7 @@ cd ~/tools/ccextra
 ./service.sh start|stop|restart
 ```
 
-- `on`:`start` / `restart` 先 `official-init`,再安装 `~/Library/LaunchAgents/com.wanghao.ccextra-official.plist` 并拉起 8223(登录时自启,崩溃由 KeepAlive 重拉)。
+- `on`:`start` / `restart` 先 `official-init`,再安装 `~/Library/Application Support/ccextra/launchd/com.wanghao.ccextra-official.plist` 并拉起 8223(不在 LaunchAgents,登录不自启;崩溃 / 非零退出由 KeepAlive 重拉;旧版 `~/Library/LaunchAgents` 里的同名 plist 会被迁移删除;label 被禁用时报错提示 `launchctl enable`)。
 - `off`:bootout 并删除该 plist,8223 不运行,重启电脑也不会起;运行目录保留。
 - 改开关后执行 `./service.sh restart`(或 `start`)才生效;8222 进程本身不使用这个开关。
 

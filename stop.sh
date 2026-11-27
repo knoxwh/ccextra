@@ -48,7 +48,7 @@ log_stop_caller() {
 echo "=== Stopping ccextra ==="
 log_stop_caller
 
-# KeepAlive 下必须先 bootout，禁止只 kill
+# 必须先 bootout，禁止只 kill（KeepAlive 会拉回信号/非零退出）
 if launchctl print "$SERVICE" >/dev/null 2>&1; then
     echo "bootout $SERVICE"
     launchctl bootout "$SERVICE" 2>/dev/null || true

@@ -1,7 +1,8 @@
 #!/bin/bash
 set -euo pipefail
 
-# 安装/更新 ~/Library/LaunchAgents/com.wanghao.ccextra.plist
+# 安装/更新 ~/Library/Application Support/ccextra/launchd/com.wanghao.ccextra.plist
+# （不放 ~/Library/LaunchAgents：登录不自启，由 start.sh 手动 bootstrap；KeepAlive 只拉回异常退出）
 # 用法: install-launchagent.sh [--bootstrap]
 #   默认只写入 plist；加 --bootstrap 则 bootout(若已加载) 后再 bootstrap。
 
@@ -10,7 +11,9 @@ LABEL="com.wanghao.ccextra"
 UID_NUM="$(id -u)"
 DOMAIN="gui/${UID_NUM}"
 SRC="${REPO}/scripts/macos/${LABEL}.plist"
-DST="${HOME}/Library/LaunchAgents/${LABEL}.plist"
+LAUNCHD_DIR="${HOME}/Library/Application Support/ccextra/launchd"
+DST="${LAUNCHD_DIR}/${LABEL}.plist"
+LEGACY_DST="${HOME}/Library/LaunchAgents/${LABEL}.plist"
 DO_BOOTSTRAP=false
 
 for arg in "$@"; do
@@ -32,7 +35,24 @@ if [ ! -f "$SRC" ]; then
     exit 1
 fi
 
-mkdir -p "${HOME}/Library/LaunchAgents" "${REPO}/logs"
+# 迁移：旧版 plist 在 ~/Library/LaunchAgents（登录自启）→ bootout（若已加载）后只删该确切路径
+if [ -f "$LEGACY_DST" ]; then
+    if launchctl print "${DOMAIN}/${LABEL}" >/dev/null 2>&1; then
+        echo "bootout ${DOMAIN}/${LABEL} (legacy plist)"
+        launchctl bootout "${DOMAIN}/${LABEL}" 2>/dev/null || true
+    fi
+    rm -f "$LEGACY_DST"
+    echo "migrated: removed legacy ${LEGACY_DST}（不再登录自启，plist 改装到 ${LAUNCHD_DIR}）"
+fi
+
+# 被禁用（如在登录项里关掉）时无法 bootstrap：明确报错，不自动 enable
+if launchctl print-disabled "$DOMAIN" 2>/dev/null \
+    | grep -qF -e "\"${LABEL}\" => disabled" -e "\"${LABEL}\" => true"; then
+    echo "错误: ${LABEL} 已被禁用，无法 bootstrap；请先执行: launchctl enable ${DOMAIN}/${LABEL}" >&2
+    exit 1
+fi
+
+mkdir -p "$LAUNCHD_DIR" "${REPO}/logs"
 
 # @REPO@ → 本机绝对路径（路径含 & \ 时 sed 会炸；本仓库路径无此类字符）
 sed "s|@REPO@|${REPO}|g" "$SRC" > "$DST"

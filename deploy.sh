@@ -25,7 +25,7 @@ cargo build --release --locked
 
 echo "=== Build complete ==="
 
-# build 成功后再停服，避免编失败时无谓中断；KeepAlive 下必须走 stop.sh（bootout）
+# build 成功后再停服，避免编失败时无谓中断；停服必须走 stop.sh（bootout；KeepAlive 会拉回异常退出）
 if [ "$WAS_RUNNING" = true ]; then
     echo "=== Stopping running service ==="
     "$SCRIPT_DIR/stop.sh"
