@@ -24,12 +24,12 @@ pub const SANDBOX_DAILY_API_ENDPOINT: &str = "https://daily-cloudcode-pa.sandbox
 pub const API_VERSION: &str = "v1internal";
 
 /// 写死 hub 回退版本,不拉 updater manifest
-/// Cloud Code 拒绝 <2.23.0 客户端访问新模型,此版本必须 ≥2.23.0(对齐 CPA 8fb633c9;版本对齐 CPA f72f8bfd)
+/// Cloud Code 拒绝 <2.23.0 客户端访问新模型,此版本必须 ≥2.23.0(对齐 CPA 8fb633c9;版本对齐 CPA 54fc8c42 / 官方 manifest 2.35.2)
 /// 聊天 UA（user_agents.antigravity）与 fetch_models / login 缺省同源，避免版本分裂。
 /// 格式对齐官方 2.31.2 language_server 实测 UA，有意省略 cl（采集成本高、影响小）。
 macro_rules! antigravity_hub_ua {
     () => {
-        "antigravity/hub/2.31.2 (aidev_client; os_type=darwin; arch=arm64)"
+        "antigravity/hub/2.35.2 (aidev_client; os_type=darwin; arch=arm64)"
     };
 }
 pub const REQUEST_UA: &str = antigravity_hub_ua!();
@@ -39,8 +39,8 @@ pub const GOOG_API_CLIENT: &str = "gl-node/22.21.1";
 pub const TOKEN_REFRESH_UA: &str = "Go-http-client/2.0";
 
 const NODE_API_CLIENT_UA: &str = "google-api-nodejs-client/10.3.0";
-/// Cloud Code 拒绝 <2.23.0；解析失败时回退（对齐 CPA antigravityFallbackVersion / 8fb633c9;f72f8bfd 升 2.29.0；随官方 UA 升 2.31.2）。
-pub const IDE_VERSION_FALLBACK: &str = "2.31.2";
+/// Cloud Code 拒绝 <2.23.0；解析失败时回退（对齐 CPA antigravityFallbackVersion / 8fb633c9;f72f8bfd 升 2.29.0；随官方 UA 升 2.31.2；CPA 54fc8c42 / 官方 manifest 升 2.35.2）。
+pub const IDE_VERSION_FALLBACK: &str = "2.35.2";
 
 fn is_antigravity_family_ua(lower: &str) -> bool {
     lower.starts_with("antigravity/hub/") || lower.starts_with("antigravity/")
@@ -137,22 +137,22 @@ mod tests {
             version_from_user_agent("antigravity/1.23.2 windows/amd64"),
             "1.23.2"
         );
-        assert_eq!(version_from_user_agent(ONBOARD_UA), "2.31.2");
+        assert_eq!(version_from_user_agent(ONBOARD_UA), "2.35.2");
         assert_eq!(version_from_user_agent("curl/8"), IDE_VERSION_FALLBACK);
     }
 
     #[test]
     fn official_aidev_client_ua_format() {
-        let ua = "antigravity/hub/2.31.2 (aidev_client; os_type=darwin; arch=arm64)";
+        let ua = "antigravity/hub/2.35.2 (aidev_client; os_type=darwin; arch=arm64)";
         assert_eq!(REQUEST_UA, ua);
-        assert_eq!(version_from_user_agent(ua), "2.31.2");
+        assert_eq!(version_from_user_agent(ua), "2.35.2");
         assert_eq!(base_user_agent(ua), ua);
         assert_eq!(
             onboard_ua(ua),
             format!("{ua} google-api-nodejs-client/10.3.0")
         );
         assert_eq!(base_user_agent(&onboard_ua(ua)), ua);
-        assert_eq!(version_from_user_agent(&onboard_ua(ua)), "2.31.2");
+        assert_eq!(version_from_user_agent(&onboard_ua(ua)), "2.35.2");
         assert!(is_antigravity_family_ua(&ua.to_ascii_lowercase()));
     }
 
