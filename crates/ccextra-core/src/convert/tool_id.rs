@@ -2,8 +2,8 @@
 // translator/gemini/claude/gemini_claude_response.go 的 {name}-{counter}
 // 生成与反解;sanitize 规则取自 util/claude_tool_id.go)
 //
-// 流式/非流式响应侧统一生成 `{name}-{counter}` 形式(经 sanitize),
-// 请求侧可从该 id 反解工具名(去掉最后一个 "-" 段),保证
+// 流式/非流式响应侧兜底生成 `{name}-{unix纳秒}_{counter}` 形式(经 sanitize),
+// 跨进程重启唯一;请求侧可从该 id 反解工具名(去掉最后一个 "-" 段),保证
 // functionResponse.name 与模型发出的 functionCall.name 一致。
 
 use serde_json::Value;
@@ -38,9 +38,15 @@ pub fn sanitize_claude_tool_id(id: &str) -> String {
     cleaned
 }
 
-/// 生成 Claude 侧 tool_use id:`{name}-{counter}`(对齐 CPA 流/非流响应侧)
+/// 生成 Claude 侧兜底 tool_use id:`{name}-{unix纳秒}_{counter}`
+/// (对齐 CPA 5d2835c3 nextAntigravityClaudeFallbackToolUseID 的纳秒 + 进程计数,
+/// 跨 ccextra 重启也唯一,避免续接老会话时 Anthropic 报 `tool_use` ids must be unique)。
+/// 尾段用 `_` 连接、不含 `-`,反解工具名仍只去掉最后一段。
 pub fn claude_tool_id_for(name: &str, counter: u64) -> String {
-    sanitize_claude_tool_id(&format!("{name}-{counter}"))
+    let nanos = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map_or(0, |d| d.as_nanos());
+    sanitize_claude_tool_id(&format!("{name}-{nanos}_{counter}"))
 }
 
 /// 从 tool_use_id 反解工具名(对齐 CPA toolNameFromClaudeToolUseID):
@@ -181,10 +187,14 @@ mod tests {
 
     #[test]
     fn test_claude_tool_id_for() {
-        assert_eq!(claude_tool_id_for("Read", 3), "Read-3");
+        let id = claude_tool_id_for("Read", 3);
+        assert!(id.starts_with("Read-") && id.ends_with("_3"), "{id}");
+        assert_eq!(sanitize_claude_tool_id(&id), id);
+        assert_eq!(tool_name_from_claude_tool_use_id(&id), "Read");
+        let mcp = claude_tool_id_for("mcp__x__query-docs", 12);
         assert_eq!(
-            claude_tool_id_for("mcp__x__query-docs", 12),
-            "mcp__x__query-docs-12"
+            tool_name_from_claude_tool_use_id(&mcp),
+            "mcp__x__query-docs"
         );
     }
 

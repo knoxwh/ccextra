@@ -7,7 +7,10 @@ use std::sync::atomic::{AtomicU64, Ordering};
 use super::antigravity_tools::antigravity_upstream_tool_name_to_client;
 use super::claude_tool_args::{ToolArgStreamState, clean_claude_tool_arguments};
 use super::signature::{format_claude_signature_value, model_group};
-use super::tool_id::{claude_tool_id_for, gemini_claude_tool_use_id};
+use super::tool_id::{
+    claude_tool_id_for, gemini_claude_tool_use_id, is_gemini_claude_tool_use_id,
+    sanitize_claude_tool_id,
+};
 
 /// 全局工具使用 ID 计数器
 static TOOL_USE_ID_COUNTER: AtomicU64 = AtomicU64::new(0);
@@ -29,21 +32,24 @@ pub fn resolve_claude_message_id(response_id: Option<&str>) -> String {
     format!("msg_{nanos:x}_{seq}")
 }
 
-/// Claude 侧 tool_use id(对齐 CPA antigravityClaudeToolUseID):
-/// AG Gemini 族(与 reasoning replay 同门禁)且上游给了非空原生 `functionCall.id` 时,
-/// 用 (原生 id, name, args) 派生稳定 id,回放时据账本换回原生 id;
-/// 否则(含 plain Gemini、AG claude 族、原生 id 为空)保持 `{name}-{counter}`。
+/// Claude 侧 tool_use id(对齐 CPA antigravityClaudeToolUseID / 5d2835c3):
+/// - AG Gemini 族(与 reasoning replay 同门禁)且上游给了非空原生 `functionCall.id` 时,
+///   用 (原生 id, name, args) 派生稳定 id,回放时据账本换回原生 id;
+/// - AG 非 Gemini 族(claude 等)上游 id 非空:清洗后与原值相同且不落在稳定 id 保留命名空间
+///   则原样保留(如 `toolu_vrtx_…`),否则以清洗值为前缀加唯一后缀;
+/// - 其余(含 plain Gemini、原生 id 为空)兜底 `{name}-{unix纳秒}_{counter}`,跨重启唯一。
 fn claude_tool_use_id(
     signature_model: Option<&str>,
     function_call: &Value,
     fallback_name: &str,
 ) -> String {
+    let raw_id = function_call
+        .get("id")
+        .and_then(|v| v.as_str())
+        .unwrap_or("");
     if signature_model.is_some_and(crate::antigravity_uses_reasoning_replay) {
         let stable = gemini_claude_tool_use_id(
-            function_call
-                .get("id")
-                .and_then(|v| v.as_str())
-                .unwrap_or(""),
+            raw_id,
             function_call
                 .get("name")
                 .and_then(|v| v.as_str())
@@ -52,6 +58,17 @@ fn claude_tool_use_id(
         );
         if !stable.is_empty() {
             return stable;
+        }
+    } else if signature_model.is_some() && !raw_id.trim().is_empty() {
+        let sanitized = sanitize_claude_tool_id(raw_id.trim());
+        if !is_gemini_claude_tool_use_id(&sanitized) {
+            if sanitized == raw_id {
+                return sanitized;
+            }
+            return claude_tool_id_for(
+                &sanitized,
+                TOOL_USE_ID_COUNTER.fetch_add(1, Ordering::SeqCst),
+            );
         }
     }
     claude_tool_id_for(
@@ -793,7 +810,7 @@ pub fn convert_gemini_response(
                     }
                 }
 
-                // 工具调用:id 见 claude_tool_use_id(不直接透传上游 id),name 还原原名
+                // 工具调用:id 见 claude_tool_use_id(仅 AG 非 Gemini 族保留上游 id),name 还原原名
                 // 对齐 CPA cf07c78a:空 functionCall 跳过(非流无 carrier,签名随之丢弃)
                 if let Some(function_call) = part
                     .get("functionCall")
@@ -992,7 +1009,7 @@ mod tests {
         assert_eq!(content.len(), 1);
         assert_eq!(content[0]["type"], "tool_use");
         assert_eq!(content[0]["name"], "Read"); // 还原了原名
-        // 对齐 CPA:id 自生成 {name}-{counter},不透传上游 id
+        // plain Gemini:id 自生成 {name}-{unix纳秒}_{counter},不透传上游 id
         let id = content[0]["id"].as_str().unwrap();
         assert!(id.starts_with("Rd-"), "id={id}");
         assert_eq!(content[0]["input"]["path"], "/file.txt");
@@ -1885,7 +1902,7 @@ mod tests {
             .collect()
     }
 
-    /// AG Gemini 族 + 原生 id → 稳定 id（流式 / 非流式一致）；无原生 id → `{name}-{counter}`。
+    /// AG Gemini 族 + 原生 id → 稳定 id（流式 / 非流式一致）；无原生 id → `{name}-{nanos}_{counter}`。
     #[test]
     fn ag_gemini_native_call_id_emits_stable_tool_use_id() {
         use crate::convert::tool_id::{gemini_claude_tool_use_id, is_gemini_claude_tool_use_id};
@@ -1912,19 +1929,54 @@ mod tests {
         }
     }
 
-    /// 非 replay 路径（plain Gemini / AG claude 族）即使上游给了 id 也保持旧格式。
+    /// plain Gemini 即使上游给了 id 也走兜底 `{name}-{nanos}_{counter}`。
     #[test]
-    fn non_replay_paths_keep_counter_tool_use_id() {
+    fn plain_gemini_keeps_fallback_tool_use_id() {
         let fc = json!({"id": "native-1", "name": "Read", "args": {"file_path": "/a"}});
-        for model in [None, Some("claude-sonnet-4-6")] {
-            for ids in [
-                stream_tool_use_ids(model, fc.clone()),
-                nonstream_tool_use_ids(model, fc.clone()),
-            ] {
-                assert_eq!(ids.len(), 1);
-                assert!(ids[0].starts_with("Read-"), "{model:?} {ids:?}");
-            }
+        for ids in [
+            stream_tool_use_ids(None, fc.clone()),
+            nonstream_tool_use_ids(None, fc.clone()),
+        ] {
+            assert_eq!(ids.len(), 1);
+            assert!(ids[0].starts_with("Read-"), "{ids:?}");
+            assert_ne!(ids[0], "native-1");
         }
+    }
+
+    /// 对齐 CPA 5d2835c3:AG claude 族保留合法上游 id;需清洗的加唯一后缀;
+    /// 落在稳定 id 保留命名空间的不透传;无 id 走兜底。
+    #[test]
+    fn ag_claude_preserves_upstream_tool_use_id() {
+        use crate::convert::tool_id::{gemini_claude_tool_use_id, is_gemini_claude_tool_use_id};
+        let model = Some("claude-sonnet-4-6");
+        let fc = |id: &str| json!({"id": id, "name": "Read", "args": {"file_path": "/a"}});
+        for ids in [
+            stream_tool_use_ids(model, fc("toolu_vrtx_01AAA")),
+            nonstream_tool_use_ids(model, fc("toolu_vrtx_01AAA")),
+        ] {
+            assert_eq!(ids, vec!["toolu_vrtx_01AAA".to_string()]);
+        }
+
+        let colon = stream_tool_use_ids(model, fc("call:a"))[0].clone();
+        let slash = nonstream_tool_use_ids(model, fc("call/a"))[0].clone();
+        let valid = stream_tool_use_ids(model, fc("call_a"))[0].clone();
+        assert_eq!(valid, "call_a");
+        assert!(colon.starts_with("call_a-") && slash.starts_with("call_a-"));
+        assert!(colon != valid && slash != valid && colon != slash);
+        assert_eq!(sanitize_claude_tool_id(&colon), colon);
+
+        let reserved =
+            gemini_claude_tool_use_id("native-1", "Read", Some(&json!({"file_path": "/a"})));
+        let got = stream_tool_use_ids(model, fc(&reserved))[0].clone();
+        assert!(
+            !is_gemini_claude_tool_use_id(&got) && got.starts_with("Read-"),
+            "{got}"
+        );
+
+        let no_id = json!({"name": "Read", "args": {"file_path": "/a"}});
+        let a = stream_tool_use_ids(model, no_id.clone())[0].clone();
+        let b = nonstream_tool_use_ids(model, no_id)[0].clone();
+        assert!(a.starts_with("Read-") && b.starts_with("Read-") && a != b);
     }
 
     // ---- 对齐 CPA cf07c78a:MALFORMED 判定改「无可见输出」+ 空 functionCall 跳过 ----
